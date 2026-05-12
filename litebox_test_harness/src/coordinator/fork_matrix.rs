@@ -12,8 +12,128 @@
 //! - Non-PIE invocation method
 //! - Contamination pattern (non-PIE then PIE, various depths)
 
-use super::agents::AgentName;
+use std::process::Stdio;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
+
+use super::agents::{AgentHandle, AgentName};
 use super::registry::Registry;
+use super::run_context::RunContext;
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::protocol::Response;
+use crate::register_handler;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct BashArgs {
+    cmd: String,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ExecBinArgs {
+    argv: Vec<String>,
+    timeout_secs: Option<u64>,
+}
+
+const BASH: HandlerToken<BashArgs, Response> = HandlerToken::new("fork_matrix.bash");
+const EXEC_BIN: HandlerToken<ExecBinArgs, Response> = HandlerToken::new("fork_matrix.exec_bin");
+
+async fn handle_bash(args: BashArgs, _ctx: &mut HandlerCtx<'_>) -> Result<Response, HandlerError> {
+    Ok(run_exec_argv(
+        vec!["bash".into(), "-c".into(), args.cmd],
+        args.timeout_secs,
+    )
+    .await)
+}
+
+async fn handle_exec_bin(
+    args: ExecBinArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, HandlerError> {
+    Ok(run_exec_argv(args.argv, args.timeout_secs).await)
+}
+
+async fn dispatch_bash(
+    run: &mut RunContext<'_>,
+    handle: &AgentHandle,
+    cmd: String,
+    timeout_secs: Option<u64>,
+) -> Response {
+    run.send_named_typed(handle, &BASH, BashArgs { cmd, timeout_secs })
+        .await
+        .unwrap_or_else(|error| Response::Error { error })
+}
+
+async fn dispatch_exec_bin(
+    run: &mut RunContext<'_>,
+    handle: &AgentHandle,
+    argv: Vec<String>,
+    timeout_secs: Option<u64>,
+) -> Response {
+    run.send_named_typed(handle, &EXEC_BIN, ExecBinArgs { argv, timeout_secs })
+        .await
+        .unwrap_or_else(|error| Response::Error { error })
+}
+
+async fn run_exec_argv(argv: Vec<String>, timeout_secs: Option<u64>) -> Response {
+    if argv.is_empty() {
+        return Response::Error {
+            error: "exec: empty argv".into(),
+        };
+    }
+
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return Response::Error {
+                error: format!("exec spawn: {e}"),
+            };
+        }
+    };
+
+    let mut child_stdout = child.stdout.take().expect("stdout was piped");
+    let mut child_stderr = child.stderr.take().expect("stderr was piped");
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(10));
+    let result = tokio::time::timeout(timeout, async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (stdout_result, stderr_result, status) = tokio::join!(
+            child_stdout.read_to_end(&mut out),
+            child_stderr.read_to_end(&mut err),
+            child.wait(),
+        );
+        let _ = stdout_result;
+        let _ = stderr_result;
+        (out, err, status)
+    })
+    .await;
+
+    match result {
+        Ok((out, err, Ok(status))) => Response::ExecResult {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out).to_string(),
+            stderr: String::from_utf8_lossy(&err).to_string(),
+        },
+        Ok((_, _, Err(e))) => Response::Error {
+            error: format!("exec wait: {e}"),
+        },
+        Err(_) => {
+            let _ = child.start_kill();
+            Response::ExecTimeout {
+                stderr: format!(
+                    "process timed out after {}s (likely deadlocked)",
+                    timeout.as_secs()
+                ),
+            }
+        }
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // SHELL PATTERNS × DEPTH
@@ -355,6 +475,9 @@ const CONTAMINATION_CASES: &[ContaminationCase] = &[
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
+    register_handler!(BASH, handle_bash);
+    register_handler!(EXEC_BIN, handle_exec_bin);
+
     // Shell patterns x depth
     for &agent in DEPTH_AGENTS {
         for pat in SHELL_PATTERNS {
@@ -369,24 +492,23 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                     let handle = cx.require(agent);
                     Box::new(move |run| {
                         Box::pin(async move {
-                            let cmd = vec!["bash".into(), "-c".into(), cmd_str];
-                            let resp = run.send(&handle, super::exec(cmd)).await;
+                            let resp = dispatch_bash(run, &handle, cmd_str, None).await;
                             let pass = if expected.is_empty() {
                                 matches!(
                                     &resp,
-                                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
                                         if !stdout.trim().is_empty()
                                 )
                             } else {
                                 matches!(
                                     &resp,
-                                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
                                         if stdout.contains(&*expected)
                                 )
                             };
                             let timeout = matches!(
                                 &resp,
-                                crate::protocol::Response::ExecTimeout { stderr } if !stderr.is_empty()
+                                Response::ExecTimeout { stderr } if !stderr.is_empty()
                             );
                             super::TestOutcome::new(
                                 &agent_label,
@@ -410,19 +532,20 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     Box::pin(async move {
                         let expected = format!("node_{agent_label}_ok");
-                        let resp = run
-                            .send(
-                                &handle,
-                                super::exec(vec![
-                                    "/usr/local/bin/node".into(),
-                                    "-e".into(),
-                                    format!("console.log('node_{agent_label}_ok')"),
-                                ]),
-                            )
-                            .await;
+                        let resp = dispatch_exec_bin(
+                            run,
+                            &handle,
+                            vec![
+                                "/usr/local/bin/node".into(),
+                                "-e".into(),
+                                format!("console.log('node_{agent_label}_ok')"),
+                            ],
+                            None,
+                        )
+                        .await;
                         let pass = matches!(
                             &resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                            Response::ExecResult { exit_code: 0, stdout, .. }
                                 if stdout.contains(&expected)
                         );
                         super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
@@ -438,19 +561,20 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
             let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
-                    let resp = run
-                        .send(
-                            &handle,
-                            super::exec(vec![
-                                "/usr/local/bin/node".into(),
-                                "-e".into(),
-                                "process.stdout.write('stdout_write_ok\\n')".into(),
-                            ]),
-                        )
-                        .await;
+                    let resp = dispatch_exec_bin(
+                        run,
+                        &handle,
+                        vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "process.stdout.write('stdout_write_ok\\n')".into(),
+                        ],
+                        None,
+                    )
+                    .await;
                     let pass = matches!(
                         &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                        Response::ExecResult { exit_code: 0, stdout, .. }
                             if stdout.contains("stdout_write_ok")
                     );
                     super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -495,15 +619,10 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                 None => self_exe,
                             };
                             let cmd_str = template.replace("{self_exe}", &target);
-                            let resp = run
-                                .send(
-                                    &handle,
-                                    super::exec(vec!["bash".into(), "-c".into(), cmd_str]),
-                                )
-                                .await;
+                            let resp = dispatch_bash(run, &handle, cmd_str, None).await;
                             let pass = matches!(
                                 &resp,
-                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                Response::ExecResult { exit_code: 0, stdout, .. }
                                     if stdout.trim() == expected
                             );
                             super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
@@ -530,25 +649,23 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     let agent_label = agent_label.clone();
                     Box::pin(async move {
-                        let resp = run
-                            .send(
-                                &handle,
-                                super::exec_timeout(
-                                    vec![
-                                        "/usr/local/bin/node".into(),
-                                        "-e".into(),
-                                        "try { const r = require('os').networkInterfaces(); \
-                                         console.log('NETIF_OK:' + Object.keys(r).length); } \
-                                         catch(e) { console.log('NETIF_ERR:' + e.code); }"
-                                            .into(),
-                                    ],
-                                    30,
-                                ),
-                            )
-                            .await;
+                        let resp = dispatch_exec_bin(
+                            run,
+                            &handle,
+                            vec![
+                                "/usr/local/bin/node".into(),
+                                "-e".into(),
+                                "try { const r = require('os').networkInterfaces(); \
+                                 console.log('NETIF_OK:' + Object.keys(r).length); } \
+                                 catch(e) { console.log('NETIF_ERR:' + e.code); }"
+                                    .into(),
+                            ],
+                            Some(30),
+                        )
+                        .await;
                         let pass = matches!(
                             &resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                            Response::ExecResult { exit_code: 0, stdout, .. }
                                 if stdout
                                     .lines()
                                     .find_map(|l| l.strip_prefix("NETIF_OK:"))
@@ -606,7 +723,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                                 inner_cmd,
                                             ];
                                             args.extend(inner_args);
-                                            run.send(&handle, super::exec(args)).await
+                                            dispatch_exec_bin(run, &handle, args, None).await
                                         }
                                         DfInvocation::ScriptFile => {
                                             let test_id_safe = format!(
@@ -647,23 +764,16 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                                  XEOF\nchmod +x {script} && {script}; \
                                                  EXIT=$?; rm -f {script}; exit $EXIT",
                                             );
-                                            run.send(
-                                                &handle,
-                                                super::exec(vec!["bash".into(), "-c".into(), body]),
-                                            )
-                                            .await
+                                            dispatch_bash(run, &handle, body, None).await
                                         }
                                     };
 
                                     let not_found = matches!(
                                         &resp,
-                                        crate::protocol::Response::ExecResult {
-                                            exit_code: 127,
-                                            ..
-                                        }
+                                        Response::ExecResult { exit_code: 127, .. }
                                     ) || matches!(
                                         &resp,
-                                        crate::protocol::Response::Error { error }
+                                        Response::Error { error }
                                             if error.contains("not found")
                                     );
                                     if not_found {
@@ -676,7 +786,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
 
                                     let pass = matches!(
                                         &resp,
-                                        crate::protocol::Response::ExecResult {
+                                        Response::ExecResult {
                                             exit_code: 0, stdout, ..
                                         } if stdout.contains(&*binary_expected)
                                     );
@@ -704,22 +814,23 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                 Box::pin(async move {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
-                    let resp = run
-                        .send(
-                            &handle,
-                            super::exec(vec![
-                                target.clone(),
-                                "trigger-delayed-fork".into(),
-                                target.clone(),
-                                "trigger-delayed-fork".into(),
-                                target,
-                                "echo-test".into(),
-                            ]),
-                        )
-                        .await;
+                    let resp = dispatch_exec_bin(
+                        run,
+                        &handle,
+                        vec![
+                            target.clone(),
+                            "trigger-delayed-fork".into(),
+                            target.clone(),
+                            "trigger-delayed-fork".into(),
+                            target,
+                            "echo-test".into(),
+                        ],
+                        None,
+                    )
+                    .await;
                     let pass = matches!(
                         &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                        Response::ExecResult { exit_code: 0, stdout, .. }
                             if stdout.contains("ECHO_TEST_OK")
                     );
                     super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -752,10 +863,10 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                 let mut args =
                                     vec![target, "stress-exec".into(), "10".into(), mode_s];
                                 args.extend(extra);
-                                let resp = run.send(&handle, super::exec(args)).await;
+                                let resp = dispatch_exec_bin(run, &handle, args, None).await;
                                 let pass = matches!(
                                     &resp,
-                                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
                                         if stdout.contains("STRESS_START")
                                             && stdout.contains("STRESS_END failures=0")
                                 );
@@ -784,9 +895,11 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                             let target_bin = crate::binary_path(bt, &self_exe);
                             let resp = match &bash_cmd {
                                 None => {
-                                    run.send(
+                                    dispatch_exec_bin(
+                                        run,
                                         &handle,
-                                        super::exec(vec![target_bin.clone(), "echo-test".into()]),
+                                        vec![target_bin.clone(), "echo-test".into()],
+                                        None,
                                     )
                                     .await
                                 }
@@ -794,21 +907,15 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                     let resolved = cmd
                                         .replace("/nonpie-bin", &target_bin)
                                         .replace("/nonpie-cmd", &format!("{target_bin} echo-test"));
-                                    run.send(
-                                        &handle,
-                                        super::exec(vec!["bash".into(), "-c".into(), resolved]),
-                                    )
-                                    .await
+                                    dispatch_bash(run, &handle, resolved, None).await
                                 }
                             };
                             let not_found =
-                                matches!(
-                                    &resp,
-                                    crate::protocol::Response::ExecResult { exit_code: 127, .. }
-                                ) || matches!(&resp, crate::protocol::Response::Error { .. });
+                                matches!(&resp, Response::ExecResult { exit_code: 127, .. })
+                                    || matches!(&resp, Response::Error { .. });
                             let skipped = matches!(
                                 &resp,
-                                crate::protocol::Response::ExecResult { stdout, .. }
+                                Response::ExecResult { stdout, .. }
                                     if stdout.contains("SKIP")
                             );
                             if not_found || skipped {
@@ -820,7 +927,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                             }
                             let pass = matches!(
                                 &resp,
-                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                Response::ExecResult { exit_code: 0, stdout, .. }
                                     if stdout.contains("ECHO_TEST_OK")
                             );
                             super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -842,14 +949,16 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                         let self_exe = run.self_exe().to_string();
                         let nonpie_bin = crate::nonpie_binary();
                         let target = crate::binary_path(bt, &self_exe);
-                        let resp = run
-                            .send(&handle, super::exec(vec![nonpie_bin, "echo-test".into()]))
-                            .await;
+                        let resp = dispatch_exec_bin(
+                            run,
+                            &handle,
+                            vec![nonpie_bin, "echo-test".into()],
+                            None,
+                        )
+                        .await;
                         let not_found =
-                            matches!(
-                                &resp,
-                                crate::protocol::Response::ExecResult { exit_code: 127, .. }
-                            ) || matches!(&resp, crate::protocol::Response::Error { .. });
+                            matches!(&resp, Response::ExecResult { exit_code: 127, .. })
+                                || matches!(&resp, Response::Error { .. });
                         if not_found {
                             return super::TestOutcome::new(
                                 "A",
@@ -857,12 +966,12 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                 "FAIL: nonpie binary not found",
                             );
                         }
-                        let resp2 = run
-                            .send(&handle, super::exec(vec![target, "echo-test".into()]))
-                            .await;
+                        let resp2 =
+                            dispatch_exec_bin(run, &handle, vec![target, "echo-test".into()], None)
+                                .await;
                         let pass = matches!(
                             &resp2,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                            Response::ExecResult { exit_code: 0, stdout, .. }
                                 if stdout.trim() == "ECHO_TEST_OK"
                         );
                         super::TestOutcome::new("A", pass, format!("{resp2:?}"))
@@ -911,15 +1020,10 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                 .replace("{self_exe}", &target)
                                 .replace("/nonpie-bin", &nonpie_bin)
                                 .replace("/nonpie-cmd", &nonpie_cmd);
-                            let resp = run
-                                .send(
-                                    &handle,
-                                    super::exec(vec!["bash".into(), "-c".into(), cmd_str]),
-                                )
-                                .await;
+                            let resp = dispatch_bash(run, &handle, cmd_str, None).await;
                             let skipped = matches!(
                                 &resp,
-                                crate::protocol::Response::ExecResult { stdout, .. }
+                                Response::ExecResult { stdout, .. }
                                     if stdout.contains("SKIP")
                             );
                             if skipped {
@@ -931,7 +1035,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                             }
                             let pass = matches!(
                                 &resp,
-                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                Response::ExecResult { exit_code: 0, stdout, .. }
                                     if stdout.contains(&*expected)
                             );
                             super::TestOutcome::new("A", pass, format!("{resp:?}"))
