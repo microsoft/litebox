@@ -216,6 +216,7 @@ fn detect_runtime_environment() -> String {
 }
 
 /// Create an Exec command with default 10s timeout.
+#[allow(dead_code)]
 pub(crate) fn exec(args: Vec<String>) -> Command {
     Command::Exec {
         args,
