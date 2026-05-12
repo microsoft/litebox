@@ -5,14 +5,13 @@
 //! writes responses to stdout. Intermediate nodes forward commands to
 //! their children.
 
-use crate::protocol::{Command, Response, SockOpt, SockOptValue, WaitPredicate};
+use crate::protocol::{Command, Response};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::time::Duration;
 
 struct ChildHandle {
@@ -24,22 +23,18 @@ struct ChildHandle {
 
 struct ListenerEntry {
     fd: OwnedFd,
+    #[allow(dead_code)]
     task: tokio::task::JoinHandle<()>,
     #[allow(dead_code)]
     accepted: Arc<AtomicUsize>,
 }
 
-struct EventfdEntry {
-    fd: OwnedFd,
-    #[allow(dead_code)] // Was read by eventfd_epollet_probe (now migrated).
-    flags: String,
-    authorized_readers: Vec<String>,
-}
-
 enum BackgroundProcess {
     Tokio {
         process: tokio::process::Child,
+        #[allow(dead_code)] // ready-marker scanners write here; no consumer remains
         stdout: Arc<Mutex<Vec<u8>>>,
+        #[allow(dead_code)] // ready-marker scanners write here; no consumer remains
         stderr: Arc<Mutex<Vec<u8>>>,
         drains: Vec<tokio::task::JoinHandle<()>>,
     },
@@ -106,8 +101,6 @@ pub(crate) struct AgentState {
     unix_listeners: HashMap<String, tokio::task::JoinHandle<()>>,
     unix_pair_listeners: HashMap<String, StdUnixListener>,
     unix_pairs: HashMap<u64, OwnedFd>,
-    eventfds: HashMap<u64, EventfdEntry>,
-    next_eventfd_id: u64,
     background_pids: HashMap<u32, BackgroundProcess>,
 }
 
@@ -119,8 +112,6 @@ impl AgentState {
             unix_listeners: HashMap::new(),
             unix_pair_listeners: HashMap::new(),
             unix_pairs: HashMap::new(),
-            eventfds: HashMap::new(),
-            next_eventfd_id: 1,
             background_pids: HashMap::new(),
         }
     }
@@ -168,8 +159,6 @@ async fn agent_loop(self_exe: &str) {
         unix_listeners,
         unix_pair_listeners,
         unix_pairs,
-        eventfds,
-        next_eventfd_id,
         background_pids,
     } = &mut state;
 
@@ -245,11 +234,6 @@ async fn agent_loop(self_exe: &str) {
                 .await;
             }
 
-            Command::FsRead { path } => match tokio::fs::read_to_string(&path).await {
-                Ok(data) => respond(&Response::Ok { data: Some(data) }).await,
-                Err(_) => respond(&Response::NotFound).await,
-            },
-
             Command::Fork {
                 name,
                 binary,
@@ -287,159 +271,6 @@ async fn agent_loop(self_exe: &str) {
                     Err(e) => {
                         respond(&Response::Error {
                             error: format!("fork {name}: {e}"),
-                        })
-                        .await;
-                    }
-                }
-            }
-
-            Command::GetPid => {
-                let pid = std::process::id();
-                respond(&Response::Ok {
-                    data: Some(pid.to_string()),
-                })
-                .await;
-            }
-
-            Command::FsWrite { path, data } => {
-                if let Some(parent) = std::path::Path::new(&path).parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                match tokio::fs::write(&path, &data).await {
-                    Ok(()) => respond(&Response::Ok { data: None }).await,
-                    Err(e) => {
-                        respond(&Response::Error {
-                            error: format!("write: {e}"),
-                        })
-                        .await;
-                    }
-                }
-            }
-
-            Command::FsDelete { path } => match tokio::fs::remove_file(&path).await {
-                Ok(()) => respond(&Response::Ok { data: None }).await,
-                Err(e) => {
-                    respond(&Response::Error {
-                        error: format!("delete: {e}"),
-                    })
-                    .await;
-                }
-            },
-
-            Command::FsSymlink { target, link } => match tokio::fs::symlink(&target, &link).await {
-                Ok(()) => respond(&Response::Ok { data: None }).await,
-                Err(e) => {
-                    respond(&Response::Error {
-                        error: format!("symlink: {e}"),
-                    })
-                    .await;
-                }
-            },
-
-            Command::FsReadlink { path } => match tokio::fs::read_link(&path).await {
-                Ok(target) => {
-                    respond(&Response::Ok {
-                        data: Some(target.to_string_lossy().into_owned()),
-                    })
-                    .await;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    respond(&Response::NotFound).await;
-                }
-                Err(e) => {
-                    respond(&Response::Error {
-                        error: format!("readlink: {e}"),
-                    })
-                    .await;
-                }
-            },
-
-            Command::FsStat { path } => match tokio::fs::symlink_metadata(&path).await {
-                Ok(meta) => {
-                    let kind = if meta.is_symlink() {
-                        "symlink"
-                    } else if meta.is_dir() {
-                        "dir"
-                    } else {
-                        "file"
-                    };
-                    respond(&Response::Ok {
-                        data: Some(kind.to_string()),
-                    })
-                    .await;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    respond(&Response::NotFound).await;
-                }
-                Err(e) => {
-                    respond(&Response::Error {
-                        error: format!("stat: {e}"),
-                    })
-                    .await;
-                }
-            },
-
-            Command::NetListen {
-                port,
-                pre_bind_options,
-            } => match create_listener_entry(port, &pre_bind_options) {
-                Ok((actual_port, entry)) => {
-                    listeners.entry(actual_port).or_default().push(entry);
-                    respond(&Response::Listening { port: actual_port }).await;
-                }
-                Err(e) => {
-                    respond(&Response::Error {
-                        error: format!("bind {port}: {e}"),
-                    })
-                    .await;
-                }
-            },
-
-            Command::NetUnlisten { port } => {
-                if let Some(entries) = listeners.remove(&port) {
-                    for entry in entries {
-                        entry.task.abort();
-                        let _ = entry.task.await;
-                    }
-                }
-                respond(&Response::Ok { data: None }).await;
-            }
-
-            Command::NetConnect { addr, data } => {
-                match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    tokio::net::TcpStream::connect(&addr),
-                )
-                .await
-                {
-                    Ok(Ok(mut stream)) => {
-                        let _ = stream.write_all(data.as_bytes()).await;
-                        let _ = stream.flush().await;
-                        let mut buf = [0u8; 4096];
-                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-                            .await
-                        {
-                            Ok(Ok(n)) if n > 0 => {
-                                let echo = String::from_utf8_lossy(&buf[..n]).to_string();
-                                respond(&Response::Connected { echo }).await;
-                            }
-                            _ => {
-                                respond(&Response::ConnectFailed {
-                                    error: "no echo response".to_string(),
-                                })
-                                .await;
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        respond(&Response::ConnectFailed {
-                            error: format!("{e}"),
-                        })
-                        .await;
-                    }
-                    Err(_) => {
-                        respond(&Response::ConnectFailed {
-                            error: "connect timeout".to_string(),
                         })
                         .await;
                     }
@@ -754,238 +585,7 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
-            Command::WaitReady {
-                agent,
-                timeout_secs,
-            } => {
-                if agent.is_empty() || agent == "self" {
-                    respond(&Response::Ready).await;
-                } else if let Some(child) = children.get_mut(&agent) {
-                    let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
-                    let ready_cmd = Command::WaitReady {
-                        agent: "self".to_string(),
-                        timeout_secs,
-                    };
-                    let wait = send_to_child(child, &ready_cmd);
-                    match tokio::time::timeout(timeout, wait).await {
-                        Ok(Response::Ready) => respond(&Response::Ready).await,
-                        Ok(resp) => respond(&resp).await,
-                        Err(_) => {
-                            respond(&Response::Error {
-                                error: format!(
-                                    "agent {agent} not ready within {}s",
-                                    timeout.as_secs()
-                                ),
-                            })
-                            .await;
-                        }
-                    }
-                } else {
-                    respond(&Response::Error {
-                        error: format!("unknown child: {agent}"),
-                    })
-                    .await;
-                }
-            }
-
-            Command::WaitBackground { pid, timeout_secs } => {
-                let Some(bg) = background_pids.remove(&pid) else {
-                    respond(&Response::Error {
-                        error: format!("unknown background pid: {pid}"),
-                    })
-                    .await;
-                    continue;
-                };
-                let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
-                match bg {
-                    BackgroundProcess::Tokio {
-                        mut process,
-                        stdout,
-                        stderr,
-                        drains,
-                    } => match tokio::time::timeout(timeout, process.wait()).await {
-                        Ok(Ok(status)) => {
-                            for drain in drains {
-                                let _ = drain.await;
-                            }
-                            let stdout = stdout.lock().expect("stdout buffer mutex").clone();
-                            let stderr = stderr.lock().expect("stderr buffer mutex").clone();
-                            respond(&Response::ExecResult {
-                                exit_code: status.code().unwrap_or(-1),
-                                stdout: String::from_utf8_lossy(&stdout).to_string(),
-                                stderr: String::from_utf8_lossy(&stderr).to_string(),
-                            })
-                            .await;
-                        }
-                        Ok(Err(e)) => {
-                            respond(&Response::Error {
-                                error: format!("wait_background: {e}"),
-                            })
-                            .await;
-                        }
-                        Err(_) => {
-                            let _ = process.start_kill();
-                            for drain in drains {
-                                drain.abort();
-                            }
-                            respond(&Response::ExecTimeout {
-                                stderr: format!(
-                                    "background process timed out after {}s",
-                                    timeout.as_secs()
-                                ),
-                            })
-                            .await;
-                        }
-                    },
-                }
-            }
-
-            Command::WaitFor {
-                predicate,
-                timeout_secs,
-            } => {
-                let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
-                let deadline = tokio::time::Instant::now() + timeout;
-                loop {
-                    let satisfied = match &predicate {
-                        WaitPredicate::PortListening { port, host } => tokio::time::timeout(
-                            Duration::from_millis(200),
-                            tokio::net::TcpStream::connect(format!("{host}:{port}")),
-                        )
-                        .await
-                        .is_ok_and(|r| r.is_ok()),
-                        WaitPredicate::FileExists { path } => {
-                            tokio::fs::metadata(path).await.is_ok()
-                        }
-                    };
-                    if satisfied {
-                        respond(&Response::Ready).await;
-                        break;
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        respond(&Response::Error {
-                            error: format!(
-                                "wait_for {predicate:?} not satisfied within {}s",
-                                timeout.as_secs()
-                            ),
-                        })
-                        .await;
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            }
-
-            Command::EnvGet { var } => {
-                let val = std::env::var(&var).unwrap_or_else(|_| "NOT_SET".to_string());
-                respond(&Response::Ok { data: Some(val) }).await;
-            }
-
-            Command::EventfdOpen { initval, flags } => {
-                let id = *next_eventfd_id;
-                if id == u64::MAX {
-                    respond(&Response::Error {
-                        error: "eventfd id space exhausted".to_string(),
-                    })
-                    .await;
-                    continue;
-                }
-                match open_eventfd(initval, &flags) {
-                    Ok(fd) => {
-                        *next_eventfd_id += 1;
-                        eventfds.insert(
-                            id,
-                            EventfdEntry {
-                                fd,
-                                flags,
-                                authorized_readers: Vec::new(),
-                            },
-                        );
-                        respond(&Response::EventfdHandle { id }).await;
-                    }
-                    Err(error) => respond(&Response::Error { error }).await,
-                }
-            }
-
-            Command::EventfdRead { id } => {
-                let Some(entry) = eventfds.get(&id) else {
-                    respond(&Response::Error {
-                        error: format!("unknown eventfd {id}"),
-                    })
-                    .await;
-                    continue;
-                };
-                match read_eventfd_value(entry.fd.as_raw_fd()) {
-                    Ok(value) => respond(&Response::EventfdValue { value }).await,
-                    Err(error) => respond(&Response::Error { error }).await,
-                }
-            }
-
-            Command::EventfdReadShared { id, reader } => {
-                let Some(entry) = eventfds.get(&id) else {
-                    respond(&Response::Error {
-                        error: format!("unknown eventfd {id}"),
-                    })
-                    .await;
-                    continue;
-                };
-                if !entry
-                    .authorized_readers
-                    .iter()
-                    .any(|authorized| authorized == &reader)
-                {
-                    respond(&Response::Error {
-                        error: format!("eventfd {id} reader {reader} is not authorized"),
-                    })
-                    .await;
-                    continue;
-                }
-                match read_eventfd_value(entry.fd.as_raw_fd()) {
-                    Ok(value) => respond(&Response::EventfdValue { value }).await,
-                    Err(error) => respond(&Response::Error { error }).await,
-                }
-            }
-
-            Command::EventfdClose { id } => {
-                if eventfds.remove(&id).is_some() {
-                    respond(&Response::Closed).await;
-                } else {
-                    respond(&Response::Error {
-                        error: format!("unknown eventfd {id}"),
-                    })
-                    .await;
-                }
-            }
-
-            Command::EventfdShare { id, target } => {
-                let Some(entry) = eventfds.get_mut(&id) else {
-                    respond(&Response::Error {
-                        error: format!("unknown eventfd {id}"),
-                    })
-                    .await;
-                    continue;
-                };
-                if !entry
-                    .authorized_readers
-                    .iter()
-                    .any(|reader| reader == &target)
-                {
-                    entry.authorized_readers.push(target.clone());
-                }
-                // Layer 1 sharing is creator-registry based: a peer's logical
-                // read is forwarded back through this creator agent. We record
-                // the intended reader here, but do not pass the fd with SCM_RIGHTS.
-                respond(&Response::Ok {
-                    data: Some(format!(
-                        "eventfd {id} shared with {target}; readers={}",
-                        entry.authorized_readers.join(",")
-                    )),
-                })
-                .await;
-            }
-
             Command::Exit => {
-                eventfds.clear();
                 // Abort all TCP echo servers.
                 for (_, entries) in listeners.drain() {
                     for entry in entries {
@@ -1032,150 +632,6 @@ fn terminate_background(child: BackgroundProcess) {
                 drain.abort();
             }
         }
-    }
-}
-
-fn create_listener_entry(
-    port: u16,
-    pre_bind_options: &[(SockOpt, SockOptValue)],
-) -> Result<(u16, ListenerEntry), String> {
-    // SAFETY: socket creates a fresh descriptor on success; it is immediately
-    // wrapped in OwnedFd so all later error paths close it exactly once.
-    let raw_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if raw_fd < 0 {
-        return Err(format!("socket: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: raw_fd was just returned by socket and is uniquely owned here.
-    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-
-    for &(option, value) in pre_bind_options {
-        set_sockopt_value(fd.as_raw_fd(), option, value)?;
-    }
-
-    let addr = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: port.to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: libc::INADDR_ANY,
-        },
-        sin_zero: [0; 8],
-    };
-    // SAFETY: addr points to a valid IPv4 sockaddr for the duration of the
-    // call, and fd is a live TCP socket not aliased mutably elsewhere.
-    let bind_rc = unsafe {
-        libc::bind(
-            fd.as_raw_fd(),
-            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
-    if bind_rc != 0 {
-        return Err(format!("bind: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: fd is a live bound TCP socket; listen does not take ownership.
-    let listen_rc = unsafe { libc::listen(fd.as_raw_fd(), 128) };
-    if listen_rc != 0 {
-        return Err(format!("listen: {}", std::io::Error::last_os_error()));
-    }
-
-    // SAFETY: fd is a live listening socket; zeroed sockaddr_in is an acceptable
-    // output buffer for getsockname, which initializes len bytes on success.
-    let mut actual_addr = unsafe { std::mem::zeroed::<libc::sockaddr_in>() };
-    let mut actual_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-    // SAFETY: actual_addr and actual_len point to writable storage valid for
-    // the call; fd remains owned by this function.
-    let name_rc = unsafe {
-        libc::getsockname(
-            fd.as_raw_fd(),
-            std::ptr::addr_of_mut!(actual_addr).cast::<libc::sockaddr>(),
-            &mut actual_len,
-        )
-    };
-    let actual_port = if name_rc == 0 {
-        u16::from_be(actual_addr.sin_port)
-    } else {
-        port
-    };
-
-    // SAFETY: into_raw_fd transfers the uniquely owned listening socket to the
-    // standard library TcpListener, which now closes it on drop.
-    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) };
-    std_listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("set_nonblocking: {e}"))?;
-    let registry_fd = dup_fd_cloexec(std_listener.as_raw_fd())?;
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let task = spawn_tcp_echo_task(std_listener, accepted.clone())?;
-    Ok((
-        actual_port,
-        ListenerEntry {
-            fd: registry_fd,
-            task,
-            accepted,
-        },
-    ))
-}
-
-fn spawn_tcp_echo_task(
-    std_listener: std::net::TcpListener,
-    accepted: Arc<AtomicUsize>,
-) -> Result<tokio::task::JoinHandle<()>, String> {
-    let listener = TcpListener::from_std(std_listener).map_err(|e| format!("from_std: {e}"))?;
-    Ok(tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            accepted.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if stream.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    }))
-}
-
-fn sockopt_level_name(option: SockOpt) -> (i32, i32, &'static str, bool) {
-    match option {
-        SockOpt::ReuseAddr => (libc::SOL_SOCKET, libc::SO_REUSEADDR, "SO_REUSEADDR", true),
-        SockOpt::ReusePort => (libc::SOL_SOCKET, libc::SO_REUSEPORT, "SO_REUSEPORT", true),
-        SockOpt::KeepAlive => (libc::SOL_SOCKET, libc::SO_KEEPALIVE, "SO_KEEPALIVE", true),
-        SockOpt::RecvBuf => (libc::SOL_SOCKET, libc::SO_RCVBUF, "SO_RCVBUF", false),
-        SockOpt::SendBuf => (libc::SOL_SOCKET, libc::SO_SNDBUF, "SO_SNDBUF", false),
-        SockOpt::NoDelay => (libc::IPPROTO_TCP, libc::TCP_NODELAY, "TCP_NODELAY", true),
-    }
-}
-
-fn set_sockopt_value(fd: i32, option: SockOpt, value: SockOptValue) -> Result<(), String> {
-    let (level, optname, name, _) = sockopt_level_name(option);
-    let raw: libc::c_int = match value {
-        SockOptValue::Bool(enabled) => i32::from(enabled),
-        SockOptValue::U32(value) => value as libc::c_int,
-    };
-    // SAFETY: fd is a live socket descriptor owned by the agent registry; raw
-    // points to a properly aligned c_int value for the duration of the call.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            optname,
-            std::ptr::addr_of!(raw).cast::<libc::c_void>(),
-            std::mem::size_of_val(&raw) as libc::socklen_t,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "setsockopt {name}: {}",
-            std::io::Error::last_os_error()
-        ))
     }
 }
 
@@ -1238,72 +694,21 @@ fn prepare_inherited_listeners(
         ));
     }
     let mut inherited = Vec::with_capacity(ports.len());
+    let bridge = litebox_test_harness::inherit_bridge()
+        .lock()
+        .expect("inherit bridge mutex");
     for (index, port) in ports.iter().copied().enumerate() {
-        let entry = listeners
-            .get(&port)
-            .and_then(|entries| entries.first())
-            .ok_or_else(|| format!("no listener registered for port {port}"))?;
+        let raw_fd = if let Some(entry) = listeners.get(&port).and_then(|e| e.first()) {
+            entry.fd.as_raw_fd()
+        } else if let Some(owned) = bridge.get(&port) {
+            owned.as_raw_fd()
+        } else {
+            return Err(format!("no listener registered for port {port}"));
+        };
         let slot = INHERITED_LISTEN_FD_BASE + index as i32;
-        inherited.push((port, dup_fd_to_inherited_slot(entry.fd.as_raw_fd(), slot)?));
+        inherited.push((port, dup_fd_to_inherited_slot(raw_fd, slot)?));
     }
     Ok(inherited)
-}
-
-fn parse_eventfd_flags(flags: &str) -> Result<i32, String> {
-    let mut bits = 0;
-    for raw in flags.split('|') {
-        let flag = raw.trim();
-        if flag.is_empty() {
-            continue;
-        }
-        match flag.to_ascii_lowercase().as_str() {
-            "semaphore" | "efd_semaphore" => bits |= libc::EFD_SEMAPHORE,
-            "nonblock" | "efd_nonblock" => bits |= libc::EFD_NONBLOCK,
-            "cloexec" | "efd_cloexec" => bits |= libc::EFD_CLOEXEC,
-            other => return Err(format!("unknown eventfd flag {other:?}")),
-        }
-    }
-    Ok(bits)
-}
-
-fn open_eventfd(initval: u64, flags: &str) -> Result<OwnedFd, String> {
-    let init = u32::try_from(initval)
-        .map_err(|_| format!("eventfd initval {initval} exceeds u32::MAX"))?;
-    let flag_bits = parse_eventfd_flags(flags)?;
-    // SAFETY: eventfd creates a new file descriptor and does not alias memory.
-    let fd = unsafe { libc::eventfd(init, flag_bits) };
-    if fd < 0 {
-        return Err(format!(
-            "eventfd(initval={initval}, flags={flags:?}): {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `fd` is a newly returned descriptor owned by this process.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn read_eventfd_value(fd: i32) -> Result<u64, String> {
-    let mut value = 0u64;
-    loop {
-        // SAFETY: `value` points to valid writable memory for exactly 8 bytes;
-        // eventfd read does not take ownership of `fd`.
-        let rc = unsafe {
-            libc::read(
-                fd,
-                (&raw mut value).cast::<libc::c_void>(),
-                std::mem::size_of::<u64>(),
-            )
-        };
-        if rc == std::mem::size_of::<u64>() as isize {
-            return Ok(value);
-        }
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::EAGAIN) => return Err("eventfd read: EAGAIN".to_string()),
-            _ => return Err(format!("eventfd read: {err}")),
-        }
-    }
 }
 
 fn dup_fd_cloexec(fd: i32) -> Result<OwnedFd, String> {

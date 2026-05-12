@@ -504,46 +504,80 @@ async fn handle_pf_net_listen(
     args: PfNetListenArgs,
     _ctx: &mut HandlerCtx<'_>,
 ) -> Result<Response, HandlerError> {
-    match tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, args.port)).await {
-        Ok(listener) => {
-            let port = match listener.local_addr() {
-                Ok(addr) => addr.port(),
-                Err(e) => {
-                    return Ok(Response::Error {
-                        error: format!("local_addr: {e}"),
-                    });
-                }
-            };
-            let task = tokio::spawn(async move {
-                while let Ok((mut stream, _)) = listener.accept().await {
-                    tokio::spawn(async move {
-                        let mut buf = [0_u8; 4096];
-                        loop {
-                            match stream.read(&mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if stream.write_all(&buf[..n]).await.is_err() {
-                                        break;
-                                    }
-                                }
+    // Bind with std::net so we can pull out the OwnedFd for the
+    // inherit_bridge, then re-wrap as a tokio listener for the accept
+    // task.
+    let std_listener =
+        match std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, args.port)) {
+            Ok(l) => l,
+            Err(e) => {
+                return Ok(Response::Error {
+                    error: format!("bind {}: {e}", args.port),
+                });
+            }
+        };
+    let port = match std_listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            return Ok(Response::Error {
+                error: format!("local_addr: {e}"),
+            });
+        }
+    };
+    // Dup the fd so the bridge owns one copy (for Fork inheritance)
+    // and the tokio listener owns the other (for the accept task).
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&std_listener);
+    // SAFETY: F_DUPFD_CLOEXEC duplicates a valid open fd; ownership of the
+    // returned descriptor is moved into OwnedFd::from_raw_fd below.
+    let dup = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
+    if dup < 0 {
+        return Ok(Response::Error {
+            error: format!("dup fd for bridge: {}", std::io::Error::last_os_error()),
+        });
+    }
+    // SAFETY: `dup` was just returned by fcntl F_DUPFD_CLOEXEC.
+    let bridge_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
+    if let Some(old) = crate::inherit_bridge()
+        .lock()
+        .expect("inherit bridge")
+        .insert(port, bridge_owned)
+    {
+        drop(old);
+    }
+    let _ = std_listener.set_nonblocking(true);
+    let listener = match tokio::net::TcpListener::from_std(std_listener) {
+        Ok(l) => l,
+        Err(e) => {
+            return Ok(Response::Error {
+                error: format!("from_std: {e}"),
+            });
+        }
+    };
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                break;
                             }
                         }
-                    });
+                    }
                 }
             });
-            if let Some(old) = pf_tcp_listeners()
-                .lock()
-                .expect("tcp listener registry poisoned")
-                .insert(port, task)
-            {
-                old.abort();
-            }
-            Ok(Response::Listening { port })
         }
-        Err(e) => Ok(Response::Error {
-            error: format!("bind {}: {e}", args.port),
-        }),
+    });
+    if let Some(old) = pf_tcp_listeners()
+        .lock()
+        .expect("tcp listener registry poisoned")
+        .insert(port, task)
+    {
+        old.abort();
     }
+    Ok(Response::Listening { port })
 }
 
 async fn handle_pf_net_unlisten(
@@ -557,6 +591,10 @@ async fn handle_pf_net_unlisten(
     {
         task.abort();
     }
+    crate::inherit_bridge()
+        .lock()
+        .expect("inherit bridge")
+        .remove(&args.port);
     Ok(Response::Ok { data: None })
 }
 
@@ -774,6 +812,44 @@ async fn handle_accept_inherited(
     });
     Ok(DetailOut {
         detail: format!("accepting on port {}", args.port),
+    })
+}
+
+#[derive(Deserialize, Serialize)]
+struct ClosePortArgs {
+    port: u16,
+}
+
+const CLOSE_INHERITED: HandlerToken<ClosePortArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.close_inherited");
+
+async fn handle_close_inherited(
+    args: ClosePortArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let spec = std::env::var("LITEBOX_TEST_HARNESS_INHERITED_LISTEN_FDS")
+        .map_err(|e| HandlerError(format!("missing inherited listener env: {e}")))?;
+    let fd = spec
+        .split(',')
+        .find_map(|item| {
+            let (port_s, fd_s) = item.split_once('=')?;
+            if port_s.parse::<u16>().ok()? == args.port {
+                fd_s.parse::<i32>().ok()
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            HandlerError(format!(
+                "no inherited fd for port {} in {spec:?}",
+                args.port
+            ))
+        })?;
+    // SAFETY: closing an inherited listener fd published by the agent;
+    // takes ownership via OwnedFd so the drop closes it exactly once.
+    let _owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    Ok(DetailOut {
+        detail: format!("closed inherited listener fd for port {}", args.port),
     })
 }
 
@@ -3620,6 +3696,7 @@ async fn fklc_child_accept_ready(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
     register_handler!(ACCEPT_INHERITED, handle_accept_inherited);
+    register_handler!(CLOSE_INHERITED, handle_close_inherited);
     // FKLC.listen_unlisten: A listens then immediately unlistens,
     // B connects — should get RST.
     reg.test(
@@ -3976,11 +4053,18 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     )
                     .await;
                 let close1_resp = run
-                    .forward(&child, InfraCommand::NetUnlisten { port })
+                    .forward(
+                        &child,
+                        InfraCommand::Run {
+                            handler: CLOSE_INHERITED.name().to_string(),
+                            args: serde_json::to_value(ClosePortArgs { port })
+                                .expect("close args serialize"),
+                        },
+                    )
                     .await;
                 if !matches!(
                     (&fork2_resp, &close1_resp),
-                    (Response::Ok { .. }, Response::Ok { .. })
+                    (Response::Ok { .. }, Response::Result { ok: true, .. })
                 ) {
                     let _ = run.forward(&child, InfraCommand::Exit).await;
                     return super::TestOutcome::new(

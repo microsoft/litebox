@@ -59,13 +59,7 @@ impl<'a> RunContext<'a> {
     /// returning its response.
     pub async fn send(&mut self, handle: &AgentHandle, cmd: Command) -> Response {
         let wire = handle.name().name();
-        // Track contact for the over-spawn validator. Init bypasses
-        // `runner.send()` (it goes straight to `exec_local`), so we
-        // record it explicitly here.
         self.runner.contacted_agents.insert(wire.to_string());
-        if wire == "init" {
-            return self.runner.exec_local(&cmd).await;
-        }
         self.runner.send(wire, cmd).await
     }
 

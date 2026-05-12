@@ -77,49 +77,6 @@ pub enum Command {
         inherit_listen_ports: Vec<u16>,
     },
 
-    /// Report the agent's process ID.
-    #[serde(rename = "get_pid")]
-    GetPid,
-
-    /// Read a file and report contents (or `not_found`).
-    #[serde(rename = "fs_read")]
-    FsRead { path: String },
-
-    /// Write data to a file.
-    #[serde(rename = "fs_write")]
-    FsWrite { path: String, data: String },
-
-    /// Delete a file.
-    #[serde(rename = "fs_delete")]
-    FsDelete { path: String },
-
-    /// Create a symbolic link.
-    #[serde(rename = "fs_symlink")]
-    FsSymlink { target: String, link: String },
-
-    /// Read the target of a symbolic link.
-    #[serde(rename = "fs_readlink")]
-    FsReadlink { path: String },
-
-    /// Stat a path — returns type (file/dir/symlink/notfound).
-    #[serde(rename = "fs_stat")]
-    FsStat { path: String },
-
-    /// Bind a TCP listener on the given port. Starts an echo handler.
-    #[serde(rename = "net_listen")]
-    NetListen {
-        port: u16,
-        pre_bind_options: Vec<(SockOpt, SockOptValue)>,
-    },
-
-    /// Stop listening on a port.
-    #[serde(rename = "net_unlisten")]
-    NetUnlisten { port: u16 },
-
-    /// Connect to addr, send data, read echo response.
-    #[serde(rename = "net_connect")]
-    NetConnect { addr: String, data: String },
-
     /// Forward a command to a named child and return its response.
     #[serde(rename = "forward")]
     Forward { target: String, inner: Box<Command> },
@@ -183,64 +140,6 @@ pub enum Command {
         stream: String,
     },
 
-    /// Wait until this agent or a named child agent has accepted protocol
-    /// commands. A child agent can only answer after its init phase entered
-    /// the command loop, making this a process-ready beacon.
-    #[serde(rename = "wait_ready")]
-    WaitReady {
-        agent: String,
-        #[serde(default)]
-        timeout_secs: Option<u64>,
-    },
-
-    /// Wait for a previously backgrounded process to exit and return its
-    /// captured output. For plain Exec background commands stdout/stderr are
-    /// empty; `ExecReady` backgrounds retain captured output.
-    #[serde(rename = "wait_background")]
-    WaitBackground {
-        pid: u32,
-        #[serde(default)]
-        timeout_secs: Option<u64>,
-    },
-
-    /// Wait for an observed state predicate on this agent. This is a bounded
-    /// protocol-level replacement for coordinator sleeps.
-    #[serde(rename = "wait_for")]
-    WaitFor {
-        predicate: WaitPredicate,
-        #[serde(default)]
-        timeout_secs: Option<u64>,
-    },
-
-    /// Report an environment variable value.
-    #[serde(rename = "env_get")]
-    EnvGet { var: String },
-
-    /// Open an eventfd and register it in this agent's local registry.
-    /// Flags are parsed from strings like "semaphore|nonblock|cloexec".
-    #[serde(rename = "eventfd_open")]
-    EventfdOpen { initval: u64, flags: String },
-
-    /// Read one u64 from a registered eventfd. Nonblocking empty reads return
-    /// [`Response::Error`] with EAGAIN.
-    #[serde(rename = "eventfd_read")]
-    EventfdRead { id: u64 },
-
-    /// Read one u64 on behalf of a reader authorized via `EventfdShare`. This
-    /// models the layer-1 forward-via-creator path without passing fds.
-    #[serde(rename = "eventfd_read_shared")]
-    EventfdReadShared { id: u64, reader: String },
-
-    /// Close and unregister a registered eventfd.
-    #[serde(rename = "eventfd_close")]
-    EventfdClose { id: u64 },
-
-    /// Mark a named agent as an authorized reader of this creator-local
-    /// eventfd. Layer 1 deliberately models sharing as forwarding a command
-    /// through the creator's registry, not as `SCM_RIGHTS` fd passing.
-    #[serde(rename = "eventfd_share")]
-    EventfdShare { id: u64, target: String },
-
     /// Shut down gracefully.
     #[serde(rename = "exit")]
     Exit,
@@ -283,11 +182,6 @@ pub enum Response {
     #[serde(rename = "not_found")]
     NotFound,
 
-    /// Agent has entered the command loop and is ready to accept further
-    /// commands. Sent in reply to `Command::WaitReady`.
-    #[serde(rename = "ready")]
-    Ready,
-
     /// Terminal event for a `Command::Run`. The handler's typed
     /// `Out` is encoded as a `serde_json` `Value` in `data`. On
     /// failure, `ok` is false and `error` carries the message.
@@ -318,18 +212,6 @@ pub enum Response {
     /// TCP connection + echo result.
     #[serde(rename = "connected")]
     Connected { echo: String },
-
-    /// Stateful TCP connection closed.
-    #[serde(rename = "closed")]
-    Closed,
-
-    /// Eventfd registry handle.
-    #[serde(rename = "eventfd_handle")]
-    EventfdHandle { id: u64 },
-
-    /// Eventfd read value.
-    #[serde(rename = "eventfd_value")]
-    EventfdValue { value: u64 },
 
     /// TCP connection failed.
     #[serde(rename = "connect_failed")]

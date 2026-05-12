@@ -303,9 +303,6 @@ impl TestRunner {
 
     #[allow(clippy::similar_names)] // `rest` (routing tail) vs `resp` (response).
     async fn send(&mut self, target: &str, cmd: Command) -> Response {
-        if target == "init" {
-            return self.exec_local(&cmd).await;
-        }
         // Track for lazy-matrix validation: any agent contacted via
         // send() must be in spawned_agents at end-of-run.
         self.contacted_agents.insert(target.to_string());
@@ -621,106 +618,6 @@ impl TestRunner {
             );
             eprintln!("[coord] LAZY MATRIX VALIDATION FAILED (over-spawn): {detail}");
             self.record("__lazy_matrix.over_spawn", "?", false, &detail);
-        }
-    }
-
-    async fn exec_local(&self, cmd: &Command) -> Response {
-        match cmd {
-            Command::FsRead { path } => match tokio::fs::read_to_string(path).await {
-                Ok(data) => Response::Ok { data: Some(data) },
-                Err(_) => Response::NotFound,
-            },
-            Command::FsWrite { path, data } => {
-                if let Some(parent) = std::path::Path::new(path).parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                match tokio::fs::write(path, data).await {
-                    Ok(()) => Response::Ok { data: None },
-                    Err(e) => Response::Error {
-                        error: format!("{e}"),
-                    },
-                }
-            }
-            Command::FsDelete { path } => match tokio::fs::remove_file(path).await {
-                Ok(()) => Response::Ok { data: None },
-                Err(e) => Response::Error {
-                    error: format!("{e}"),
-                },
-            },
-            Command::FsSymlink { target, link } => {
-                #[cfg(unix)]
-                match tokio::fs::symlink(target, link).await {
-                    Ok(()) => Response::Ok { data: None },
-                    Err(e) => Response::Error {
-                        error: format!("symlink: {e}"),
-                    },
-                }
-                #[cfg(not(unix))]
-                Response::Error {
-                    error: "symlink not supported on this platform".to_string(),
-                }
-            }
-            Command::FsReadlink { path } => match tokio::fs::read_link(path).await {
-                Ok(target) => Response::Ok {
-                    data: Some(target.to_string_lossy().into_owned()),
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
-                Err(e) => Response::Error {
-                    error: format!("readlink: {e}"),
-                },
-            },
-            Command::FsStat { path } => match tokio::fs::symlink_metadata(path).await {
-                Ok(meta) => {
-                    let kind = if meta.is_symlink() {
-                        "symlink"
-                    } else if meta.is_dir() {
-                        "dir"
-                    } else {
-                        "file"
-                    };
-                    Response::Ok {
-                        data: Some(kind.to_string()),
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
-                Err(e) => Response::Error {
-                    error: format!("stat: {e}"),
-                },
-            },
-            Command::NetConnect { addr, data } => {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    tokio::net::TcpStream::connect(addr),
-                )
-                .await
-                {
-                    Ok(Ok(mut stream)) => {
-                        let _ = stream.write_all(data.as_bytes()).await;
-                        let _ = stream.flush().await;
-                        let mut buf = [0u8; 4096];
-                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-                            .await
-                        {
-                            Ok(Ok(n)) if n > 0 => Response::Connected {
-                                echo: String::from_utf8_lossy(&buf[..n]).to_string(),
-                            },
-                            _ => Response::ConnectFailed {
-                                error: "no echo".to_string(),
-                            },
-                        }
-                    }
-                    Ok(Err(e)) => Response::ConnectFailed {
-                        error: format!("{e}"),
-                    },
-                    Err(_) => Response::ConnectFailed {
-                        error: "timeout".to_string(),
-                    },
-                }
-            }
-            _ => Response::Error {
-                error: "not implemented locally".to_string(),
-            },
         }
     }
 }
@@ -1317,18 +1214,6 @@ pub(crate) async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
                 | Command::ExecReady {
                     timeout_secs: Some(t),
                     ..
-                }
-                | Command::WaitReady {
-                    timeout_secs: Some(t),
-                    ..
-                }
-                | Command::WaitBackground {
-                    timeout_secs: Some(t),
-                    ..
-                }
-                | Command::WaitFor {
-                    timeout_secs: Some(t),
-                    ..
                 } => break Some(*t),
                 Command::Spawn { .. } | Command::SpawnRemote { .. } => break Some(60),
                 _ => break None,
@@ -1416,12 +1301,11 @@ mod tests {
         let child = spawn_child(&runner.self_exe).unwrap();
         runner.children.insert("T".to_string(), child);
 
-        // Verify it works before poisoning.
+        // Verify it works before poisoning. Use Spawn with an empty
+        // children list as a no-op probe (returns Ok with a count).
         let resp = send_cmd(
             runner.children.get_mut("T").unwrap(),
-            &Command::EnvGet {
-                var: "HOME".to_string(),
-            },
+            &Command::Spawn { children: vec![] },
         )
         .await;
         assert!(
@@ -1435,14 +1319,7 @@ mod tests {
         assert!(!runner.children.contains_key("T"));
 
         // Sends to poisoned agent should return immediate error.
-        let resp = runner
-            .send(
-                "T",
-                Command::EnvGet {
-                    var: "HOME".to_string(),
-                },
-            )
-            .await;
+        let resp = runner.send("T", Command::Spawn { children: vec![] }).await;
         match &resp {
             Response::Error { error } => {
                 assert!(
