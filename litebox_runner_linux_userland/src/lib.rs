@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
+pub mod broker_pidfd_provider;
 
 /// Run Linux programs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
@@ -2850,11 +2851,19 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     let _join = litebox_platform_linux_userland::spawn_host_thread(move || {
         NotificationDispatcher::run_reader_loop(&mut receiver, &callbacks);
     });
-    let provider = Arc::new(
-        crate::broker_eventfd_provider::RunnerBrokerEventfdProvider::new(client, dispatcher),
+    let eventfd_provider = Arc::new(
+        crate::broker_eventfd_provider::RunnerBrokerEventfdProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
     );
-    litebox_shim_linux::syscalls::set_broker_eventfd_provider(provider)
-        .map_err(|_| anyhow!("provider already set"))?;
+    litebox_shim_linux::syscalls::set_broker_eventfd_provider(eventfd_provider)
+        .map_err(|_| anyhow!("eventfd provider already set"))?;
+
+    let pidfd_provider =
+        Arc::new(crate::broker_pidfd_provider::RunnerBrokerPidfdProvider::new(client, dispatcher));
+    litebox_shim_linux::syscalls::set_broker_pidfd_provider(pidfd_provider)
+        .map_err(|_| anyhow!("pidfd provider already set"))?;
     Ok(())
 }
 
