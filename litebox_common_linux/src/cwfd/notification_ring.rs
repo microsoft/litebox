@@ -47,8 +47,8 @@
 use std::io::{self, Read, Write};
 
 use crate::notification_frame::{
-    NOTIFICATION_FRAME_LEN, NotificationError, NotificationFrame, decode_notification,
-    encode_notification,
+    NOTIFICATION_FRAME_HEADER_LEN, NotificationError, NotificationFrame, decode_notification,
+    encode_notification, encoded_notification_len,
 };
 use crate::shmem_ring::{RingReader, RingWriter};
 
@@ -73,10 +73,10 @@ impl NotificationSender {
     /// (the ring writer blocks for backpressure, so a normal-load
     /// `send` does not return `WouldBlock`).
     ///
-    /// `frame.events` must lie within
+    /// `frame.events()` must lie within
     /// [`crate::notification_frame::NOTIFY_EVENT_MASK_ALL`]; otherwise
     /// the underlying encoder rejects with `EncodeUnknownEvents`.
-    pub fn send(&mut self, frame: NotificationFrame) -> io::Result<()> {
+    pub fn send(&mut self, frame: &NotificationFrame) -> io::Result<()> {
         let bytes = encode_notification(frame).map_err(io_error)?;
         self.writer.write_all(&bytes)
     }
@@ -112,8 +112,15 @@ impl NotificationReceiver {
     ///   non-recoverable — the broker is misbehaving — and tear down
     ///   the ring.
     pub fn recv(&mut self) -> io::Result<NotificationFrame> {
-        let mut buf = [0u8; NOTIFICATION_FRAME_LEN];
-        self.reader.read_exact(&mut buf)?;
+        let mut header = [0u8; NOTIFICATION_FRAME_HEADER_LEN];
+        self.reader.read_exact(&mut header)?;
+        let total = encoded_notification_len(&header).map_err(io_error)?;
+        let mut buf = header.to_vec();
+        buf.resize(total, 0);
+        if total > NOTIFICATION_FRAME_HEADER_LEN {
+            self.reader
+                .read_exact(&mut buf[NOTIFICATION_FRAME_HEADER_LEN..])?;
+        }
         decode_notification(&buf).map_err(io_error)
     }
 }
@@ -154,11 +161,8 @@ mod tests {
     #[test]
     fn send_recv_round_trip() {
         let (mut sender, mut receiver) = make_pair();
-        let frame = NotificationFrame {
-            subscription_id: 7,
-            events: NOTIFY_EVENT_IN,
-        };
-        sender.send(frame).expect("send");
+        let frame = NotificationFrame::fixed(7, NOTIFY_EVENT_IN);
+        sender.send(&frame).expect("send");
         let got = receiver.recv().expect("recv");
         assert_eq!(got, frame);
     }
@@ -167,25 +171,13 @@ mod tests {
     fn send_multiple_frames_recv_in_order() {
         let (mut sender, mut receiver) = make_pair();
         let frames = [
-            NotificationFrame {
-                subscription_id: 1,
-                events: NOTIFY_EVENT_IN,
-            },
-            NotificationFrame {
-                subscription_id: 2,
-                events: NOTIFY_EVENT_OUT,
-            },
-            NotificationFrame {
-                subscription_id: 3,
-                events: NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP,
-            },
-            NotificationFrame {
-                subscription_id: 4,
-                events: NOTIFY_EVENT_ERR,
-            },
+            NotificationFrame::fixed(1, NOTIFY_EVENT_IN),
+            NotificationFrame::fixed(2, NOTIFY_EVENT_OUT),
+            NotificationFrame::fixed(3, NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP),
+            NotificationFrame::fixed(4, NOTIFY_EVENT_ERR),
         ];
         for f in &frames {
-            sender.send(*f).expect("send");
+            sender.send(f).expect("send");
         }
         for expected in frames {
             let got = receiver.recv().expect("recv");
@@ -203,15 +195,12 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
 
         sender
-            .send(NotificationFrame {
-                subscription_id: 99,
-                events: NOTIFY_EVENT_IN,
-            })
+            .send(&NotificationFrame::fixed(99, NOTIFY_EVENT_IN))
             .expect("send");
 
         let got = reader_handle.join().expect("reader thread");
-        assert_eq!(got.subscription_id, 99);
-        assert_eq!(got.events, NOTIFY_EVENT_IN);
+        assert_eq!(got.subscription_id()(), 99);
+        assert_eq!(got.events()(), NOTIFY_EVENT_IN);
     }
 
     #[test]
@@ -222,18 +211,14 @@ mod tests {
         let (mut sender, mut receiver) = make_pair();
         let writer = thread::spawn(move || {
             for i in 0..N {
-                sender
-                    .send(NotificationFrame {
-                        subscription_id: i,
-                        events: NOTIFY_EVENT_IN,
-                    })
-                    .expect("send");
+                let frame = NotificationFrame::fixed(i, NOTIFY_EVENT_IN);
+                sender.send(&frame).expect("send");
             }
         });
         for i in 0..N {
             let f = receiver.recv().expect("recv");
-            assert_eq!(f.subscription_id, i);
-            assert_eq!(f.events, NOTIFY_EVENT_IN);
+            assert_eq!(f.subscription_id(), i);
+            assert_eq!(f.events(), NOTIFY_EVENT_IN);
         }
         writer.join().expect("writer thread");
     }
@@ -251,11 +236,8 @@ mod tests {
     #[test]
     fn encode_event_outside_mask_returns_error() {
         let (mut sender, _receiver) = make_pair();
-        let bad = NotificationFrame {
-            subscription_id: 1,
-            events: 0x4000, // outside NOTIFY_EVENT_MASK_ALL
-        };
-        match sender.send(bad) {
+        let bad = NotificationFrame::fixed(1, 0x4000); // outside NOTIFY_EVENT_MASK_ALL
+        match sender.send(&bad) {
             Err(e) => {
                 let s = format!("{e}");
                 assert!(

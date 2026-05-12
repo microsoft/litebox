@@ -516,8 +516,8 @@ mod tests {
         assert_eq!(sub.frame.status, StatusCode::Ok);
 
         let priming = receiver.recv().unwrap();
-        assert_eq!(priming.subscription_id, 42);
-        assert_eq!(priming.events, NOTIFY_EVENT_OUT);
+        assert_eq!(priming.subscription_id(), 42);
+        assert_eq!(priming.events(), NOTIFY_EVENT_OUT);
 
         // Write 1 → counter=1; IN+OUT ready.
         let write = run(
@@ -527,14 +527,14 @@ mod tests {
         );
         assert_eq!(write.frame.status, StatusCode::Ok);
         let frame = receiver.recv().unwrap();
-        assert_eq!(frame.subscription_id, 42);
-        assert_eq!(frame.events, NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT);
+        assert_eq!(frame.subscription_id(), 42);
+        assert_eq!(frame.events(), NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT);
 
         // Read drains → counter=0; only OUT ready.
         let read = run(&registry, &mut conn, &build_read_eventfd_request(handle_id));
         assert_eq!(read.frame.status, StatusCode::Ok);
         let frame = receiver.recv().unwrap();
-        assert_eq!(frame.events, NOTIFY_EVENT_OUT);
+        assert_eq!(frame.events(), NOTIFY_EVENT_OUT);
     }
 
     #[test]

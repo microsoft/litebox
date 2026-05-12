@@ -103,10 +103,10 @@ impl NotificationDispatcher {
             };
             let cb = {
                 let map = callbacks.lock().expect("callbacks mutex poisoned");
-                map.get(&frame.subscription_id).cloned()
+                map.get(&frame.subscription_id()).cloned()
             };
             if let Some(cb) = cb {
-                cb.on_events(frame.events);
+                cb.on_events(frame.events());
             }
         }
     }
@@ -322,22 +322,13 @@ mod tests {
         dispatcher.register_callback(2, Arc::clone(&cb_b) as Arc<dyn NotificationCallback>);
 
         sender
-            .send(NotificationFrame {
-                subscription_id: 1,
-                events: NOTIFY_EVENT_IN,
-            })
+            .send(&NotificationFrame::fixed(1, NOTIFY_EVENT_IN))
             .unwrap();
         sender
-            .send(NotificationFrame {
-                subscription_id: 2,
-                events: NOTIFY_EVENT_OUT,
-            })
+            .send(&NotificationFrame::fixed(2, NOTIFY_EVENT_OUT))
             .unwrap();
         sender
-            .send(NotificationFrame {
-                subscription_id: 1,
-                events: NOTIFY_EVENT_OUT,
-            })
+            .send(&NotificationFrame::fixed(1, NOTIFY_EVENT_OUT))
             .unwrap();
 
         cb_a.wait_for_count(2, 1000);
@@ -360,16 +351,10 @@ mod tests {
         dispatcher.register_callback(1, Arc::clone(&cb_a) as Arc<dyn NotificationCallback>);
 
         sender
-            .send(NotificationFrame {
-                subscription_id: 42, // not registered
-                events: NOTIFY_EVENT_IN,
-            })
+            .send(&NotificationFrame::fixed(42, NOTIFY_EVENT_IN))
             .unwrap();
         sender
-            .send(NotificationFrame {
-                subscription_id: 1,
-                events: NOTIFY_EVENT_IN,
-            })
+            .send(&NotificationFrame::fixed(1, NOTIFY_EVENT_IN))
             .unwrap();
 
         cb_a.wait_for_count(1, 1000);
@@ -396,10 +381,7 @@ mod tests {
         dispatcher.unregister_callback(1);
 
         sender
-            .send(NotificationFrame {
-                subscription_id: 1,
-                events: NOTIFY_EVENT_IN,
-            })
+            .send(&NotificationFrame::fixed(1, NOTIFY_EVENT_IN))
             .unwrap();
 
         // Give the reader a moment to process.
@@ -438,12 +420,7 @@ mod tests {
                 } else {
                     NOTIFY_EVENT_OUT
                 };
-                sender
-                    .send(NotificationFrame {
-                        subscription_id: id,
-                        events,
-                    })
-                    .unwrap();
+                sender.send(&NotificationFrame::fixed(id, events)).unwrap();
             }
         }
 
@@ -494,10 +471,7 @@ mod tests {
         dispatcher.register_callback(7, Arc::clone(&cb) as Arc<dyn NotificationCallback>);
         for _ in 0..100 {
             sender
-                .send(NotificationFrame {
-                    subscription_id: 7,
-                    events: NOTIFY_EVENT_IN,
-                })
+                .send(&NotificationFrame::fixed(7, NOTIFY_EVENT_IN))
                 .unwrap();
         }
 

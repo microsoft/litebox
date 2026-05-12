@@ -361,8 +361,8 @@ mod tests {
         let (sender, mut receiver) = make_pair();
         s.subscribe(1, NOTIFY_EVENT_IN, sender).unwrap();
         let f = receiver.recv().unwrap();
-        assert_eq!(f.subscription_id, 1);
-        assert_eq!(f.events, NOTIFY_EVENT_IN);
+        assert_eq!(f.subscription_id(), 1);
+        assert_eq!(f.events(), NOTIFY_EVENT_IN);
     }
 
     #[test]
@@ -375,8 +375,8 @@ mod tests {
         // Then write — should notify.
         s.write(1).unwrap();
         let f = receiver.recv().unwrap();
-        assert_eq!(f.subscription_id, 1);
-        assert_eq!(f.events, NOTIFY_EVENT_IN);
+        assert_eq!(f.subscription_id(), 1);
+        assert_eq!(f.events(), NOTIFY_EVENT_IN);
     }
 
     #[test]
@@ -387,18 +387,18 @@ mod tests {
             .unwrap();
         // Priming: counter=0 → only OUT ready.
         let f = receiver.recv().unwrap();
-        assert_eq!(f.events, NOTIFY_EVENT_OUT);
+        assert_eq!(f.events(), NOTIFY_EVENT_OUT);
 
         // Write 5 → IN+OUT ready.
         s.write(5).unwrap();
         let f = receiver.recv().unwrap();
-        assert_eq!(f.events, NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT);
+        assert_eq!(f.events(), NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT);
 
         // Read drains → counter=0, only OUT ready.
         let v = s.read().unwrap();
         assert_eq!(v, 5);
         let f = receiver.recv().unwrap();
-        assert_eq!(f.events, NOTIFY_EVENT_OUT);
+        assert_eq!(f.events(), NOTIFY_EVENT_OUT);
     }
 
     #[test]
@@ -413,8 +413,8 @@ mod tests {
         s.write(1).unwrap();
         let f1 = r1.recv().unwrap();
         let f2 = r2.recv().unwrap();
-        assert_eq!(f1.subscription_id, 10);
-        assert_eq!(f2.subscription_id, 20);
+        assert_eq!(f1.subscription_id(), 10);
+        assert_eq!(f2.subscription_id(), 20);
     }
 
     #[test]

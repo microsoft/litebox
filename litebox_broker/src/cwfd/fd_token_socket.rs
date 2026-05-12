@@ -516,20 +516,20 @@ mod tests {
             .subscribe_eventfd(handle, 42, NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT)
             .expect("subscribe");
         let priming = receiver.recv().expect("recv priming");
-        assert_eq!(priming.subscription_id, 42);
-        assert_eq!(priming.events, NOTIFY_EVENT_OUT);
+        assert_eq!(priming.subscription_id(), 42);
+        assert_eq!(priming.events(), NOTIFY_EVENT_OUT);
 
         // Write a value; expect notification for IN+OUT.
         client.write_eventfd(handle, 7).expect("write");
         let notif = receiver.recv().expect("recv after write");
-        assert_eq!(notif.subscription_id, 42);
-        assert_eq!(notif.events, NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT);
+        assert_eq!(notif.subscription_id(), 42);
+        assert_eq!(notif.events(), NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT);
 
         // Read; expect 7 + notification for OUT only.
         let value = client.read_eventfd(handle).expect("read");
         assert_eq!(value, 7);
         let notif = receiver.recv().expect("recv after read");
-        assert_eq!(notif.events, NOTIFY_EVENT_OUT);
+        assert_eq!(notif.events(), NOTIFY_EVENT_OUT);
 
         // Read on empty: WouldBlock.
         match client.read_eventfd(handle) {
