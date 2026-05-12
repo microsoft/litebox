@@ -283,6 +283,11 @@ pub enum Response {
     #[serde(rename = "not_found")]
     NotFound,
 
+    /// Agent has entered the command loop and is ready to accept further
+    /// commands. Sent in reply to `Command::WaitReady`.
+    #[serde(rename = "ready")]
+    Ready,
+
     /// Terminal event for a `Command::Run`. The handler's typed
     /// `Out` is encoded as a `serde_json` `Value` in `data`. On
     /// failure, `ok` is false and `error` carries the message.
@@ -314,44 +319,9 @@ pub enum Response {
     #[serde(rename = "connected")]
     Connected { echo: String },
 
-    /// Stateful TCP connection opened.
-    #[serde(rename = "opened")]
-    Opened { conn: u64 },
-
-    /// Registered Unix socketpair endpoint handles.
-    #[serde(rename = "unix_pair_handle")]
-    UnixPairHandle { left: u64, right: u64 },
-
-    /// Fds received through `SCM_RIGHTS` and registered locally.
-    #[serde(rename = "received_fd")]
-    ReceivedFd {
-        received: Vec<FdRef>,
-        payload: String,
-    },
-
-    /// Stateful TCP bytes sent.
-    #[serde(rename = "sent")]
-    Sent,
-
-    /// Stateful TCP bytes received.
-    #[serde(rename = "received")]
-    Received { data: String },
-
-    /// Stateful TCP shutdown completed.
-    #[serde(rename = "shutdown_ok")]
-    ShutdownOk,
-
     /// Stateful TCP connection closed.
     #[serde(rename = "closed")]
     Closed,
-
-    /// Socket option value returned by `NetGetSockOpt`.
-    #[serde(rename = "sockopt_result")]
-    SockOptResult { value: SockOptValue },
-
-    /// Per-listener accept counts for a TCP port.
-    #[serde(rename = "listener_stats")]
-    ListenerStats { counts: Vec<u64> },
 
     /// Eventfd registry handle.
     #[serde(rename = "eventfd_handle")]
@@ -384,10 +354,6 @@ pub enum Response {
     /// Background process reached its readiness marker.
     #[serde(rename = "background_ready")]
     BackgroundReady { pid: u32 },
-
-    /// Readiness or wait predicate satisfied.
-    #[serde(rename = "ready")]
-    Ready,
 
     /// Error.
     #[serde(rename = "error")]
