@@ -19,6 +19,7 @@ pub mod leaf_subcommand;
 pub(crate) mod matrix;
 pub(crate) mod pipe_bridge;
 pub(crate) mod platform_fixes;
+pub(crate) mod platform_fixes_leaf_subcmd;
 pub(crate) mod port_router;
 pub(crate) mod pty;
 pub(crate) mod registry;

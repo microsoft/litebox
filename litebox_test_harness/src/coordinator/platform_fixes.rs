@@ -2393,6 +2393,34 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
 
 pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
     register_platform_fix_handlers();
+    // Register the M1-M4 + BS1-BS3 leaf subcommands. These stay as
+    // argv subcommands (not handlers) because they test fresh-process
+    // stdio inheritance across fork+exec; see
+    // `coordinator/platform_fixes_leaf_subcmd.rs` for the rationale.
+    use crate::coordinator::platform_fixes_leaf_subcmd as m;
+    crate::register_leaf_subcommand!("M1-tokio-spawn-nonpie", m::subcmd_m1_tokio_spawn_nonpie);
+    crate::register_leaf_subcommand!("M2-libc-spawn-nonpie", m::subcmd_m2_libc_spawn_nonpie);
+    crate::register_leaf_subcommand!(
+        "M3-tokio-spawn-nonpie-then-work",
+        m::subcmd_m3_tokio_spawn_nonpie_then_work
+    );
+    crate::register_leaf_subcommand!(
+        "M4-tokio-spawn-nonpie-repeated",
+        m::subcmd_m4_tokio_spawn_nonpie_repeated
+    );
+    crate::register_leaf_subcommand!(
+        "BS1-tokio-spawn-nonpie-stderr",
+        m::subcmd_bs1_tokio_spawn_nonpie_stderr
+    );
+    crate::register_leaf_subcommand!(
+        "BS2-tokio-spawn-nonpie-stdin-echo",
+        m::subcmd_bs2_tokio_spawn_nonpie_stdin_echo
+    );
+    crate::register_leaf_subcommand!(
+        "BS3-tokio-spawn-nonpie-large-stdout",
+        m::subcmd_bs3_tokio_spawn_nonpie_large_stdout
+    );
+
     const M_LAUNCHERS: &[AgentName] = &[
         AgentName::Dpg1,
         AgentName::Dpg1Dpg1,

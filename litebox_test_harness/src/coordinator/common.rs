@@ -504,6 +504,32 @@ mod leaf_subcmd {
         }
         0
     }
+
+    /// Print "ECHO_TEST_OK" and exit. Argv-reachable counterpart of
+    /// the [`super::ECHO_TEST`] handler — needed when a test invokes
+    /// this leaf via `common::BASH` (bash inside the pipeline can only
+    /// `exec` an argv subcommand, not call a handler).
+    pub(super) fn subcmd_echo_test(_args: &[String]) -> i32 {
+        println!("ECHO_TEST_OK");
+        0
+    }
+
+    /// Argv counterpart of [`super::WRITE_KNOWN`]. See echo_test note.
+    pub(super) fn subcmd_write_known(args: &[String]) -> i32 {
+        let tag = args.get(2).map_or("default", String::as_str);
+        println!("PIPEDATA:{tag}");
+        0
+    }
+
+    /// Argv counterpart of [`super::EXIT_WITH`]. See echo_test note.
+    /// Exits with the requested code via `std::process::exit` so the
+    /// parent observes the exact exit code (the same semantic the
+    /// handler form preserves by calling `std::process::exit` inside
+    /// its handler body).
+    pub(super) fn subcmd_exit_with(args: &[String]) -> i32 {
+        let code: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        std::process::exit(code);
+    }
 }
 
 async fn run_to_completion(
@@ -553,4 +579,10 @@ pub(crate) fn register_common_handlers(_reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!("large-stdout-test", leaf_subcmd::subcmd_large_stdout_test);
     crate::register_leaf_subcommand!("stderr-only-test", leaf_subcmd::subcmd_stderr_only_test);
     crate::register_leaf_subcommand!("stdin-echo-test", leaf_subcmd::subcmd_stdin_echo_test);
+    // Argv counterparts of the simple handlers above, needed for tests
+    // that invoke these leaves via `common::BASH` pipelines (where bash
+    // can only `exec` argv subcommands).
+    crate::register_leaf_subcommand!("echo-test", leaf_subcmd::subcmd_echo_test);
+    crate::register_leaf_subcommand!("write-known", leaf_subcmd::subcmd_write_known);
+    crate::register_leaf_subcommand!("exit-with", leaf_subcmd::subcmd_exit_with);
 }
