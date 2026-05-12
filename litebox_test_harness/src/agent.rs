@@ -143,6 +143,16 @@ pub fn run(self_exe: &str) {
 }
 
 #[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
+//
+// The match-arm dispatch below is **closed to test-specific additions**.
+// New test behavior is expressed as a registered handler (see
+// `crate::handlers` + `register_handler!`), invoked through
+// `Command::Run { handler, args }` and `dispatch_run` below. The
+// remaining `Command::*` arms are generic primitives (process
+// lifecycle, fs / net / unix / eventfd I/O) shared across many
+// handlers. If you are about to add a new arm here for a single test
+// family, write a handler in `coordinator/<family>.rs` instead. See
+// `litebox_test_harness/CLAUDE.md` "Handler Model" for the pattern.
 async fn agent_loop(self_exe: &str) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);

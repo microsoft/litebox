@@ -32,6 +32,14 @@ pub enum SockOptValue {
 }
 
 /// Command sent from parent to child via stdin.
+///
+/// **This enum is closed to test-specific additions.** It carries only
+/// generic wire primitives (process lifecycle, fs / net / unix / eventfd
+/// I/O) plus the `Run { handler, args }` dispatch envelope. New test
+/// behavior must be expressed as a registered handler in
+/// `coordinator/<family>.rs` — see `litebox_test_harness/CLAUDE.md`
+/// "Handler Model" for the pattern. If you find yourself wanting a new
+/// `Command::Foo` for a single test family, write a handler instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
 pub enum Command {

@@ -409,7 +409,112 @@ the path-encoded taxonomy) do not exercise distinct shim code paths
 beyond the shallower equivalents (`Dpg1Dng` / `Dpg1DngDpg`) and have
 been removed.
 
-## Test Categories
+## Handler Model
+
+The harness uses a **registered-handler dispatch model**. The wire
+protocol (`litebox_test_harness/src/protocol.rs`) is intentionally
+small and generic:
+
+- Process lifecycle: `Spawn`, `SpawnRemote`, `Fork`, `Exec`,
+  `ExecReady`, `Wait*`, `Exit`, `GetPid`, `Forward`.
+- Fs / Net / Unix / Eventfd primitives: `FsRead`, `FsWrite`,
+  `NetListen`, `NetConnect`, `NetUnlisten`, `UnixListen` /
+  `UnixConnect` / `UnixSendFd` / `UnixRecvFd`, `EventfdOpen` /
+  `EventfdRead` / `EventfdWrite` / `EventfdShare`, …
+- **The dispatch envelope**: `Command::Run { handler, args }` +
+  `Response::Result { data }` (and `Response::Checkpoint { tag }` /
+  `Command::Resume { tag }` for multi-agent rendezvous).
+
+**Test-specific behavior is implemented as handlers**, not as new wire
+variants. The `Command` enum and the `agent_loop` match in `agent.rs`
+are **closed** to test additions:
+
+> When you would otherwise be tempted to add a `Command::PtyTiocgpgrp`,
+> a `Command::Clone3 { kind: ... }`, a `Command::IoUringSetup`, or a
+> new `agent_loop` match arm — write a handler.
+
+### Authoring a handler
+
+In `coordinator/<family>.rs`:
+
+```rust
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::register_handler;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MyArgs { /* fields */ }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MyOut { /* fields */ }
+
+const MY: HandlerToken<MyArgs, MyOut> = HandlerToken::new("family.my");
+
+async fn handle_my(args: MyArgs, ctx: &mut HandlerCtx<'_>) -> Result<MyOut, HandlerError> {
+    // Run on the agent. Do raw libc / std::fs / std::process / crate::os::* here.
+    // For multi-agent rendezvous: ctx.checkpoint("tag").await blocks the
+    // handler until the coordinator sends Command::Resume { tag }.
+    Ok(MyOut { /* … */ })
+}
+
+pub(crate) fn register_my(reg: &mut Registry<'_>) {
+    register_handler!(MY, handle_my);
+    reg.test("suite", "group", "MY.case_id")
+        .timeout(60)
+        .build(|cx| {
+            let h = cx.require(AgentName::Dpg1);
+            Box::new(move |run| Box::pin(async move {
+                let out = run.send_named_typed(&h, &MY, MyArgs { /* … */ }).await;
+                // assert on `out`, return super::TestOutcome
+            }))
+        });
+}
+```
+
+### Multi-agent rendezvous
+
+Use `RunContext::rendezvous_pair` (or the lower-level `run_multi`)
+when two agents must coordinate via a shared resource (fd, file,
+socket). Each side runs its own handler; checkpoints synchronize them.
+See `coordinator/inotify.rs` and `coordinator/scm_rights.rs`.
+
+**Same-pipe rendezvous gotcha**: two handlers running on agents that
+share a single bidirectional pipe to the coordinator cannot make
+progress concurrently — stage them sequentially. Handlers on agents
+with independent pipes (the common case) can run concurrently.
+
+### Single-agent multi-step tests
+
+Use `Registry::single_agent_handler_test` (see `coordinator/sockopt.rs`
+or `coordinator/iouring_discovery.rs`) — one helper covers
+register-token + drive-test for the "agent runs a handler, coordinator
+asserts on the result" pattern.
+
+### `crate::os::*` wrappers
+
+When a handler needs idiomatic Rust over a libc-shaped primitive,
+prefer reusing or extending `crate::os::*`:
+
+| Module | Wraps |
+|---|---|
+| `os::socket` | TCP sockets (bind/listen/connect/send/recv/shutdown). |
+| `os::unix_socket` | Unix domain sockets incl. `sendmsg`/`recvmsg` + SCM_RIGHTS. |
+| `os::inotify`, `os::eventfd`, `os::epoll`, `os::pty` | The obvious primitives. |
+
+### When you genuinely need a new wire primitive
+
+The Command enum is "closed to test variants", not "closed forever".
+New primitives are acceptable when:
+
+1. Many handlers across families need it (i.e., it is genuinely a
+   primitive, not a test).
+2. It cannot be expressed by composing existing primitives + a
+   handler.
+3. You add the corresponding agent-side execution in `agent_loop`
+   and an idiomatic `crate::os::*` wrapper where appropriate.
+
+If a handler would suffice, write the handler.
+
+
 
 **Self-contained tests** depend only on bash and the test harness binaries.
 These are preferred. They run everywhere: WSL2 chroot, litebox, CI.
@@ -448,9 +553,27 @@ iterations.
    bash + test harness. Before adding a node/VS Code-dependent test,
    add an equivalent self-contained test for the underlying capability.
 
-2. **Minimal test cases use protocol commands, not bash** — use FsRead,
-   FsWrite, NetListen, Exec with self_exe subcommands. Bash is only
-   justified when testing bash-specific fork behavior.
+2. **Test-specific behavior lives in handlers, not in new `Command::*`
+   variants.** The `Command` enum (`litebox_test_harness/src/protocol.rs`)
+   is **closed to test-specific additions**. It carries only generic
+   wire primitives (process lifecycle, fs I/O, socket I/O, fd-passing,
+   the `Run { handler, args }` dispatch envelope) — everything
+   test-specific is a registered handler.
+
+   For a new test:
+   - Define a typed `HandlerToken<Args, Out>` in your family file
+     (`coordinator/<family>.rs`).
+   - Implement the handler as a plain `async fn(args, ctx) -> Result<Out, _>`.
+   - Register it with `register_handler!(TOKEN, fn)`.
+   - Drive the test with `run.send_named_typed(handle, &TOKEN, args)` or
+     (for multi-agent rendezvous) `run.rendezvous_pair`.
+
+   See `coordinator/inotify.rs` / `eventfd.rs` / `tcp_state.rs` /
+   `clone3_matrix.rs` for reference patterns. Bash is justified only when
+   testing bash-specific fork behavior (the `concurrent_fork.rs::BASH`
+   handler is the standard runner for those cases). If you find yourself
+   reaching for a new `Command::Foo` variant or a new `agent_loop` match
+   arm, write a handler instead.
 
 3. **No silent failures** — missing dependencies must cause loud FAIL
    with a clear error message, never a silent skip.
