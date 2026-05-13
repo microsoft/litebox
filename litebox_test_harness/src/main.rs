@@ -1337,6 +1337,14 @@ fn main() {
             let sub = args.get(2).map_or("help", String::as_str);
             std::process::exit(fs_tests::run(sub, &args));
         }
+        "pidfd-test" => {
+            let sub = args.get(2).map_or("help", String::as_str);
+            std::process::exit(pidfd_tests_subcommand::run(sub, &args));
+        }
+        "signalfd-test" => {
+            let sub = args.get(2).map_or("help", String::as_str);
+            std::process::exit(signalfd_tests_subcommand::run(sub, &args));
+        }
         // Check if the pre-warmed code-server is running (reads pid.txt + log.txt)
         "cross-worker-file" => {
             // Minimal reproduction: forked child execs a binary that writes
@@ -5673,5 +5681,299 @@ mod fs_tests {
                 1
             }
         }
+    }
+}
+
+/// Subcommands for the `PIDF.*` coordinator family. These are
+/// purpose-built child entry points the test-driving handler
+/// fork+execvs into, so the *driver* stays handler-native (in
+/// `coordinator/pidfd_tests.rs`) while the *child* (the inheritor of
+/// the pidfd across binary-type fork+exec) is a tiny self-contained
+/// program.
+///
+/// Subcommands:
+/// - `pidfd-test poll-inherited <fd> <timeout_ms>`
+///     Polls the inherited pidfd (at the given fd number) for POLLIN.
+///     Exits 0 on POLLIN fired, 1 on poll error / no POLLIN,
+///     2 on argument-parse error. Used by `PIDF.exit_inherit.<bt>`.
+mod pidfd_tests_subcommand {
+    pub fn run(sub: &str, args: &[String]) -> i32 {
+        match sub {
+            "self-test" => self_test(),
+            "poll-inherited" => poll_inherited(args),
+            other => {
+                eprintln!("pidfd-test: unknown subcommand: {other}");
+                2
+            }
+        }
+    }
+
+    /// Self-contained pidfd dance for `PIDF.exit_self.<bt>`: fork a
+    /// 1-second sleep grandchild, `pidfd_open` it, poll for POLLIN
+    /// up to 5 s, waitpid to reap. Exits 0 on POLLIN fired.
+    fn self_test() -> i32 {
+        // SAFETY: fork; child execs only async-signal-safe libc.
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            eprintln!(
+                "pidfd-test self-test: fork: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if child == 0 {
+            // SAFETY: child terminates immediately after sleeping.
+            unsafe {
+                libc::sleep(1);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: pidfd_open syscall on a real pid.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child as libc::pid_t, 0) } as i32;
+        if pidfd < 0 {
+            eprintln!(
+                "pidfd-test self-test: pidfd_open: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: kill+waitpid on the known pid.
+            unsafe {
+                libc::kill(child, libc::SIGKILL);
+                let mut s = 0;
+                libc::waitpid(child, std::ptr::from_mut(&mut s), 0);
+            }
+            return 1;
+        }
+        let mut pfd = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is a live initialised pollfd; len 1 matches.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, 5000) };
+        // SAFETY: pidfd was returned by pidfd_open and is owned by us.
+        unsafe {
+            libc::close(pidfd);
+        }
+        if rc <= 0 || pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "pidfd-test self-test: poll rc={} revents={}",
+                rc, pfd.revents
+            );
+            // SAFETY: waitpid on the known pid to clean up.
+            unsafe {
+                let mut s = 0;
+                libc::waitpid(child, std::ptr::from_mut(&mut s), 0);
+            }
+            return 1;
+        }
+        // SAFETY: waitpid on the known pid.
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(child, std::ptr::from_mut(&mut status), 0) };
+        if waited != child {
+            eprintln!(
+                "pidfd-test self-test: waitpid({child}) returned {waited}: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        0
+    }
+
+    fn poll_inherited(args: &[String]) -> i32 {
+        let fd: i32 = match args.get(3).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!("pidfd-test poll-inherited: bad fd arg");
+                return 2;
+            }
+        };
+        let timeout_ms: i32 = match args.get(4).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!("pidfd-test poll-inherited: bad timeout_ms arg");
+                return 2;
+            }
+        };
+        // poll(pidfd, POLLIN, timeout). On pidfd this fires when the
+        // target process exits. We don't waitid here — pidfd's child
+        // may be a sibling of this child, not its own child, so
+        // waitid would ECHILD. Polling for POLLIN is the canonical
+        // exit-detection probe.
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is a live initialised pollfd; len 1 matches.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+        if rc < 0 {
+            eprintln!(
+                "pidfd-test poll-inherited: poll failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if rc == 0 {
+            eprintln!(
+                "pidfd-test poll-inherited: timeout (revents={})",
+                pfd.revents
+            );
+            return 1;
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "pidfd-test poll-inherited: poll returned but no POLLIN (revents={})",
+                pfd.revents
+            );
+            return 1;
+        }
+        0
+    }
+}
+
+/// Subcommands for the `SFD.*` coordinator family. Same model as
+/// `pidfd-test`: child entry points the test-driving handler invokes
+/// across a binary-type-fork+exec boundary.
+///
+/// Subcommands:
+/// - `signalfd-test self-raise <signo>`
+///     Self-contained: blocks `<signo>`, creates a signalfd for it,
+///     `raise(signo)`, reads one siginfo, asserts `ssi_signo` matches.
+///     Exits 0 on success, 1 on mismatch / I/O error.
+/// - `signalfd-test read-inherited <fd> <expected_signo>`
+///     Reads one siginfo from the inherited signalfd, asserts
+///     `ssi_signo == expected_signo`. Exits 0 on match, 1 otherwise.
+mod signalfd_tests_subcommand {
+    pub fn run(sub: &str, args: &[String]) -> i32 {
+        match sub {
+            "self-raise" => self_raise(args),
+            "read-inherited" => read_inherited(args),
+            other => {
+                eprintln!("signalfd-test: unknown subcommand: {other}");
+                2
+            }
+        }
+    }
+
+    fn block_signal(signo: i32) -> i32 {
+        // SAFETY: sigset_t POD.
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: mask is a freshly initialised sigset_t.
+        unsafe {
+            libc::sigemptyset(std::ptr::from_mut(&mut mask));
+            libc::sigaddset(std::ptr::from_mut(&mut mask), signo);
+        }
+        // SAFETY: mask is live; SIG_BLOCK is defined.
+        unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_BLOCK,
+                std::ptr::from_ref(&mask),
+                std::ptr::null_mut(),
+            )
+        }
+    }
+
+    fn parse_signo(s: &str) -> Option<i32> {
+        match s {
+            "SIGUSR1" => Some(libc::SIGUSR1),
+            "SIGUSR2" => Some(libc::SIGUSR2),
+            "SIGTERM" => Some(libc::SIGTERM),
+            "SIGCHLD" => Some(libc::SIGCHLD),
+            other => other.parse().ok(),
+        }
+    }
+
+    fn self_raise(args: &[String]) -> i32 {
+        let signo = match args.get(3).and_then(|s| parse_signo(s)) {
+            Some(v) => v,
+            None => {
+                eprintln!("signalfd-test self-raise: bad signo arg");
+                return 2;
+            }
+        };
+        if block_signal(signo) != 0 {
+            eprintln!("signalfd-test self-raise: pthread_sigmask failed");
+            return 1;
+        }
+        // SAFETY: sigset_t POD.
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(std::ptr::from_mut(&mut mask));
+            libc::sigaddset(std::ptr::from_mut(&mut mask), signo);
+        }
+        // SAFETY: mask is live; signalfd creates a fresh fd.
+        let sfd = unsafe { libc::signalfd(-1, std::ptr::from_ref(&mask), 0) };
+        if sfd < 0 {
+            eprintln!(
+                "signalfd-test self-raise: signalfd: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        // SAFETY: raise sends signo to self; the signal is blocked,
+        // so it queues onto the signalfd instead of running default
+        // handlers.
+        if unsafe { libc::raise(signo) } != 0 {
+            eprintln!(
+                "signalfd-test self-raise: raise: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        let mut buf = [0u8; 128];
+        // SAFETY: buf is a 128-byte buffer; sfd is open.
+        let n = unsafe { libc::read(sfd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        // SAFETY: sfd is closed unconditionally.
+        unsafe {
+            libc::close(sfd);
+        }
+        if n != 128 {
+            eprintln!(
+                "signalfd-test self-raise: short signalfd read: {n} ({})",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        let got = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+        if got != signo as u32 {
+            eprintln!("signalfd-test self-raise: ssi_signo mismatch: got {got} expected {signo}");
+            return 1;
+        }
+        0
+    }
+
+    fn read_inherited(args: &[String]) -> i32 {
+        let fd: i32 = match args.get(3).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!("signalfd-test read-inherited: bad fd arg");
+                return 2;
+            }
+        };
+        let expected_signo: i32 = match args.get(4).and_then(|s| parse_signo(s)) {
+            Some(v) => v,
+            None => {
+                eprintln!("signalfd-test read-inherited: bad signo arg");
+                return 2;
+            }
+        };
+        let mut buf = [0u8; 128];
+        // SAFETY: buf is a 128-byte buffer; fd was inherited.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n != 128 {
+            eprintln!(
+                "signalfd-test read-inherited: short read: {n} ({})",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        let got = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+        if got != expected_signo as u32 {
+            eprintln!(
+                "signalfd-test read-inherited: ssi_signo mismatch: got {got} expected {expected_signo}"
+            );
+            return 1;
+        }
+        0
     }
 }

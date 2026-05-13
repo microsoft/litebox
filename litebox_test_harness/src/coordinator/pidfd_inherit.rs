@@ -47,7 +47,7 @@ async fn handle_pidfd_spawn_and_open(
     let child_pid = u32::try_from(child).map_err(|e| HandlerError(e.to_string()))?;
     let pidfd = Pidfd::open(child_pid).map_err(|e| HandlerError(format!("pidfd_open: {e}")))?;
     let fired = pidfd
-        .poll(5000)
+        .poll_exit_in(5000)
         .map_err(|e| HandlerError(format!("pidfd poll: {e}")))?;
     let mut status = 0;
     // SAFETY: waiting for the child pid returned by fork.
