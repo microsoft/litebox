@@ -525,6 +525,10 @@ pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
     fs::register_fs_io(reg);
 }
 
+pub(super) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
+    fs::register_cross_worker_file_tests(reg);
+}
+
 pub(super) fn register_capture_pipe(reg: &mut Registry<'_>) {
     capture_pipe::register_capture_pipe(reg);
 }
