@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! exit/terminal special-case argv leaves.
+//! exit/terminal special-case argv leaves and EXITD (bridge-thread join before
+//! exit) data integrity tests.
 
 use super::*;
 
@@ -256,4 +257,66 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
             crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// EXITD: bridge thread join before exit (fix 2def3ac6)
+// ═══════════════════════════════════════════════════════════════════
+
+const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
+const EXITD_DEPTH_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
+
+fn fork_binary_label(bt: crate::BinaryType) -> &'static str {
+    match bt {
+        crate::BinaryType::PieGlibc => "self",
+        crate::BinaryType::NonPieGlibc => "nonpie",
+        crate::BinaryType::StaticPieGlibc => "static-pie-glibc",
+        crate::BinaryType::StaticPieMusl => "static-pie-musl",
+        crate::BinaryType::NonPieStaticMusl => "non-pie-static-musl",
+    }
+}
+
+pub(super) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
+    for &size in EXIT_SIZES {
+        for &binary in crate::BinaryType::ALL {
+            for &agent in EXITD_DEPTH_AGENTS {
+                let agent_s = agent.to_string();
+                let binary_label = binary.label();
+                reg.test(
+                    "fork",
+                    "exit_data_integrity",
+                    format!("EXITD.{size}.{binary_label}.{agent}"),
+                )
+                .timeout(60)
+                .build(move |cx| {
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("ExitData_{size}_{binary_label}_{agent}"),
+                        SpawnKind::Fork {
+                            binary: fork_binary_label(binary),
+                            inherit_listen_ports: vec![],
+                        },
+                    );
+                    Box::new(move |run| {
+                        let a = agent_s.clone();
+                        Box::pin(async move {
+                            let result = run
+                                .run_leaf(
+                                    &leaf,
+                                    &crate::coordinator::common::WRITE_THEN_EXIT,
+                                    crate::coordinator::common::WriteThenExitArgs { size },
+                                )
+                                .await;
+                            let pass = matches!(&result, Ok(out) if out.data.len() == size);
+                            let detail = match &result {
+                                Ok(out) => format!("got {} bytes, expected {size}", out.data.len()),
+                                Err(e) => e.clone(),
+                            };
+                            crate::coordinator::TestOutcome::new(&a, pass, detail)
+                        })
+                    })
+                });
+            }
+        }
+    }
 }

@@ -517,6 +517,10 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
     exit::register_node_exit(reg);
 }
 
+pub(super) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
+    exit::register_exit_data_integrity_tests(reg);
+}
+
 pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
     fs::register_fs_io(reg);
 }
