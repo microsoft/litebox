@@ -702,6 +702,22 @@ async fn handle_fork_exec_pie(
             return Err(format!("fork: {}", std::io::Error::last_os_error()));
         }
         if pid == 0 {
+            // The grandchild inherits the leaf agent's stdout/stderr,
+            // which IS the protocol pipe back to the coordinator. If
+            // the grandchild prints anything, it corrupts the next
+            // JSON response read. Redirect to /dev/null — the test
+            // only checks exit code, not stdout.
+            // SAFETY: open with a NUL-terminated literal returns a
+            // fresh fd; dup2 onto fds 1/2 is well-defined; close drops
+            // the now-redundant fd.
+            unsafe {
+                let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+                if devnull >= 0 {
+                    libc::dup2(devnull, 1);
+                    libc::dup2(devnull, 2);
+                    libc::close(devnull);
+                }
+            }
             let bin = std::ffi::CString::new(args.binary.as_str()).expect("binary has no NUL");
             let sub =
                 std::ffi::CString::new(args.subcommand.as_str()).expect("subcommand has no NUL");
