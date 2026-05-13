@@ -636,14 +636,15 @@ pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &H
     let offset: usize = if patch_data.size == 1 && patch_data.pa[0] == precomputed_patch.pa[0] {
         0 // step 3
     } else if patch_data.size == precomputed_patch.size - 1 {
-        let Some(precomputed_pa_0_plus_1) = precomputed_patch.pa[0].checked_add(1) else {
+        let Some(precomputed_patch_second_byte_pa) = precomputed_patch.pa[0].checked_add(1) else {
             return false;
         };
-        let precomputed_pa_0_plus_1_aligned =
-            precomputed_pa_0_plus_1.is_multiple_of(Size4KiB::SIZE);
+        let precomputed_patch_second_byte_pa_aligned =
+            precomputed_patch_second_byte_pa.is_multiple_of(Size4KiB::SIZE);
 
-        if patch_data.pa[0] != precomputed_pa_0_plus_1
-            && !(patch_data.pa[0] == precomputed_patch.pa[1] && precomputed_pa_0_plus_1_aligned)
+        if patch_data.pa[0] != precomputed_patch_second_byte_pa
+            && !(patch_data.pa[0] == precomputed_patch.pa[1]
+                && precomputed_patch_second_byte_pa_aligned)
         {
             return false;
         }
@@ -651,7 +652,8 @@ pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &H
         // step 2. `apply_vtl0_text_patch` uses `patch_data.pa[1]` only when
         // `patch_data.pa[0]` leaves the remainder of the patch on the next page.
         // For a legitimate step 2, that next page is the precomputed patch's pa[1].
-        if !precomputed_pa_0_plus_1_aligned && patch_data.pa[1] != precomputed_patch.pa[1] {
+        if !precomputed_patch_second_byte_pa_aligned && patch_data.pa[1] != precomputed_patch.pa[1]
+        {
             return false;
         }
         1
