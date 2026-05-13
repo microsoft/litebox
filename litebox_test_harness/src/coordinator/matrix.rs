@@ -26,119 +26,130 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
+use std::os::fd::FromRawFd;
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone, Serialize, Deserialize)]
-struct FsPathArgs {
-    path: String,
+pub(crate) struct FsPathArgs {
+    pub path: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct FsWriteArgs {
+pub(crate) struct FsWriteArgs {
     path: String,
     data: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct FsSymlinkArgs {
+pub(crate) struct FsSymlinkArgs {
     target: String,
     link: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct NetListenArgs {
-    port: u16,
+pub(crate) struct NetListenArgs {
+    pub port: u16,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct NetConnectArgs {
-    addr: String,
-    data: String,
+pub(crate) struct NetConnectArgs {
+    pub addr: String,
+    pub data: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct UnixConnectArgs {
+pub(crate) struct UnixConnectArgs {
     path: String,
     data: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct UnixEchoServerArgs {
+pub(crate) struct UnixEchoServerArgs {
     socket_path: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-struct UnixEchoServerOut {
+pub(crate) struct UnixEchoServerOut {
     bytes_received: usize,
     echo: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct UnixEchoClientArgs {
+pub(crate) struct UnixEchoClientArgs {
     socket_path: String,
     data: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-struct UnixEchoClientOut {
+pub(crate) struct UnixEchoClientOut {
     bytes_sent: usize,
     echo: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct ExecArgs {
-    args: Vec<String>,
-    timeout_secs: Option<u64>,
-    stdin: Option<String>,
-    background: bool,
-    env: Vec<(String, String)>,
+pub(crate) struct ExecArgs {
+    pub args: Vec<String>,
+    pub timeout_secs: Option<u64>,
+    pub stdin: Option<String>,
+    pub background: bool,
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct ExecReadyArgs {
-    args: Vec<String>,
-    ready_marker: String,
-    timeout_secs: Option<u64>,
-    stdin: Option<String>,
-    stream: String,
+pub(crate) struct ExecReadyArgs {
+    pub args: Vec<String>,
+    pub ready_marker: String,
+    pub timeout_secs: Option<u64>,
+    pub stdin: Option<String>,
+    pub stream: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct KillArgs {
-    pid: u32,
+pub(crate) struct KillArgs {
+    pub pid: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct EnvGetArgs {
+pub(crate) struct EnvGetArgs {
     var: String,
 }
 
-const FS_READ: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.fs_read");
-const FS_WRITE: HandlerToken<FsWriteArgs, Response> = HandlerToken::new("matrix.fs_write");
-const FS_DELETE: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.fs_delete");
-const FS_SYMLINK: HandlerToken<FsSymlinkArgs, Response> = HandlerToken::new("matrix.fs_symlink");
-const FS_READLINK: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.fs_readlink");
-const FS_STAT: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.fs_stat");
-const NET_LISTEN: HandlerToken<NetListenArgs, Response> = HandlerToken::new("matrix.net_listen");
-const NET_UNLISTEN: HandlerToken<NetListenArgs, Response> =
+pub(crate) const FS_READ: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.fs_read");
+pub(crate) const FS_WRITE: HandlerToken<FsWriteArgs, Response> =
+    HandlerToken::new("matrix.fs_write");
+pub(crate) const FS_DELETE: HandlerToken<FsPathArgs, Response> =
+    HandlerToken::new("matrix.fs_delete");
+pub(crate) const FS_SYMLINK: HandlerToken<FsSymlinkArgs, Response> =
+    HandlerToken::new("matrix.fs_symlink");
+pub(crate) const FS_READLINK: HandlerToken<FsPathArgs, Response> =
+    HandlerToken::new("matrix.fs_readlink");
+pub(crate) const FS_STAT: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.fs_stat");
+pub(crate) const NET_LISTEN: HandlerToken<NetListenArgs, Response> =
+    HandlerToken::new("matrix.net_listen");
+pub(crate) const NET_UNLISTEN: HandlerToken<NetListenArgs, Response> =
     HandlerToken::new("matrix.net_unlisten");
-const NET_CONNECT: HandlerToken<NetConnectArgs, Response> = HandlerToken::new("matrix.net_connect");
-const UNIX_LISTEN: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.unix_listen");
-const UNIX_UNLISTEN: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.unix_unlisten");
-const UNIX_CONNECT: HandlerToken<UnixConnectArgs, Response> =
+pub(crate) const NET_CONNECT: HandlerToken<NetConnectArgs, Response> =
+    HandlerToken::new("matrix.net_connect");
+pub(crate) const UNIX_LISTEN: HandlerToken<FsPathArgs, Response> =
+    HandlerToken::new("matrix.unix_listen");
+pub(crate) const UNIX_UNLISTEN: HandlerToken<FsPathArgs, Response> =
+    HandlerToken::new("matrix.unix_unlisten");
+pub(crate) const UNIX_CONNECT: HandlerToken<UnixConnectArgs, Response> =
     HandlerToken::new("matrix.unix_connect");
-const UNIX_ECHO_SERVER: HandlerToken<UnixEchoServerArgs, UnixEchoServerOut> =
+pub(crate) const UNIX_ECHO_SERVER: HandlerToken<UnixEchoServerArgs, UnixEchoServerOut> =
     HandlerToken::new("matrix.unix_echo_server");
-const UNIX_ECHO_CLIENT: HandlerToken<UnixEchoClientArgs, UnixEchoClientOut> =
+pub(crate) const UNIX_ECHO_CLIENT: HandlerToken<UnixEchoClientArgs, UnixEchoClientOut> =
     HandlerToken::new("matrix.unix_echo_client");
-const EXEC: HandlerToken<ExecArgs, Response> = HandlerToken::new("matrix.exec");
-const EXEC_READY: HandlerToken<ExecReadyArgs, Response> = HandlerToken::new("matrix.exec_ready");
-const KILL: HandlerToken<KillArgs, Response> = HandlerToken::new("matrix.kill");
-const ENV_GET: HandlerToken<EnvGetArgs, Response> = HandlerToken::new("matrix.env_get");
-const CWD_GET: HandlerToken<(), Response> = HandlerToken::new("matrix.cwd_get");
+pub(crate) const EXEC: HandlerToken<ExecArgs, Response> = HandlerToken::new("matrix.exec");
+pub(crate) const EXEC_READY: HandlerToken<ExecReadyArgs, Response> =
+    HandlerToken::new("matrix.exec_ready");
+pub(crate) const KILL: HandlerToken<KillArgs, Response> = HandlerToken::new("matrix.kill");
+pub(crate) const ENV_GET: HandlerToken<EnvGetArgs, Response> = HandlerToken::new("matrix.env_get");
+pub(crate) const CWD_GET: HandlerToken<(), Response> = HandlerToken::new("matrix.cwd_get");
+pub(crate) const GET_PID: HandlerToken<(), Response> = HandlerToken::new("matrix.get_pid");
 
 static TCP_LISTENERS: OnceLock<Mutex<HashMap<u16, tokio::task::JoinHandle<()>>>> = OnceLock::new();
 static UNIX_LISTENERS: OnceLock<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
@@ -155,7 +166,10 @@ fn unix_listeners() -> &'static Mutex<HashMap<String, tokio::task::JoinHandle<()
 async fn local_fs_read(args: FsPathArgs) -> Response {
     match tokio::fs::read_to_string(&args.path).await {
         Ok(data) => Response::Ok { data: Some(data) },
-        Err(_) => Response::NotFound,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
+        Err(e) => Response::Error {
+            error: format!("read {}: {e}", args.path),
+        },
     }
 }
 
@@ -174,8 +188,9 @@ async fn local_fs_write(args: FsWriteArgs) -> Response {
 async fn local_fs_delete(args: FsPathArgs) -> Response {
     match tokio::fs::remove_file(&args.path).await {
         Ok(()) => Response::Ok { data: None },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
         Err(e) => Response::Error {
-            error: format!("delete: {e}"),
+            error: format!("delete {}: {e}", args.path),
         },
     }
 }
@@ -636,13 +651,97 @@ async fn handle_net_listen(
     args: NetListenArgs,
     _ctx: &mut HandlerCtx<'_>,
 ) -> Result<Response, crate::handlers::HandlerError> {
-    Ok(local_net_listen(args).await)
+    // Bind with std::net so we can pull out the OwnedFd for the
+    // inherit_bridge, then re-wrap as a tokio listener for the accept
+    // task.
+    let std_listener =
+        match std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, args.port)) {
+            Ok(l) => l,
+            Err(e) => {
+                return Ok(Response::Error {
+                    error: format!("bind {}: {e}", args.port),
+                });
+            }
+        };
+    let port = match std_listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            return Ok(Response::Error {
+                error: format!("local_addr: {e}"),
+            });
+        }
+    };
+    // Dup the fd so the bridge owns one copy (for Fork inheritance)
+    // and the tokio listener owns the other (for the accept task).
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&std_listener);
+    // SAFETY: F_DUPFD_CLOEXEC duplicates a valid open fd; ownership of the
+    // returned descriptor is moved into OwnedFd::from_raw_fd below.
+    let dup = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
+    if dup < 0 {
+        return Ok(Response::Error {
+            error: format!("dup fd for bridge: {}", std::io::Error::last_os_error()),
+        });
+    }
+    // SAFETY: `dup` was just returned by fcntl F_DUPFD_CLOEXEC.
+    let bridge_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
+    if let Some(old) = crate::inherit_bridge()
+        .lock()
+        .expect("inherit bridge")
+        .insert(port, bridge_owned)
+    {
+        drop(old);
+    }
+    let _ = std_listener.set_nonblocking(true);
+    let listener = match tokio::net::TcpListener::from_std(std_listener) {
+        Ok(l) => l,
+        Err(e) => {
+            return Ok(Response::Error {
+                error: format!("from_std: {e}"),
+            });
+        }
+    };
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if let Some(old) = tcp_listeners()
+        .lock()
+        .expect("tcp listener registry poisoned")
+        .insert(port, task)
+    {
+        old.abort();
+    }
+    Ok(Response::Listening { port })
 }
 async fn handle_net_unlisten(
     args: NetListenArgs,
     _ctx: &mut HandlerCtx<'_>,
 ) -> Result<Response, crate::handlers::HandlerError> {
-    Ok(local_net_unlisten(args).await)
+    if let Some(task) = tcp_listeners()
+        .lock()
+        .expect("tcp listener registry poisoned")
+        .remove(&args.port)
+    {
+        task.abort();
+    }
+    crate::inherit_bridge()
+        .lock()
+        .expect("inherit bridge")
+        .remove(&args.port);
+    Ok(Response::Ok { data: None })
 }
 async fn handle_net_connect(
     args: NetConnectArgs,
@@ -761,6 +860,14 @@ async fn handle_cwd_get(
 ) -> Result<Response, crate::handlers::HandlerError> {
     Ok(local_cwd_get(args).await)
 }
+async fn handle_get_pid(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(Response::Ok {
+        data: Some(std::process::id().to_string()),
+    })
+}
 
 fn register_matrix_handlers() {
     register_handler!(FS_READ, handle_fs_read);
@@ -782,6 +889,7 @@ fn register_matrix_handlers() {
     register_handler!(KILL, handle_kill);
     register_handler!(ENV_GET, handle_env_get);
     register_handler!(CWD_GET, handle_cwd_get);
+    register_handler!(GET_PID, handle_get_pid);
 }
 
 async fn send_response<A, F, Fut>(

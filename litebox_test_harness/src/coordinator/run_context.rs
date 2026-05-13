@@ -210,6 +210,27 @@ impl<'a> RunContext<'a> {
         serde_json::from_value(data).map_err(|e| format!("typed deserialize: {e}"))
     }
 
+    /// Send a typed handler request and convert any infrastructure
+    /// error (timeout, malformed JSON, missing handler, ...) into a
+    /// `Response::Error`. The handler's own `Result<Response, _>` is
+    /// returned as-is on success.
+    ///
+    /// Equivalent to `send_named_typed(...).await.unwrap_or_else(|e| Response::Error { error: e })`,
+    /// but avoids the boilerplate at every call site.
+    pub async fn typed_or_error<A>(
+        &mut self,
+        handle: &AgentHandle,
+        token: &'static crate::handlers::HandlerToken<A, Response>,
+        args: A,
+    ) -> Response
+    where
+        A: serde::Serialize + Send,
+    {
+        self.send_named_typed(handle, token, args)
+            .await
+            .unwrap_or_else(|e| Response::Error { error: e })
+    }
+
     /// Spawn an ephemeral leaf and start a typed handler on it without
     /// waiting for the response. Pair with `run_leaf_read_checkpoint`,
     /// `run_leaf_resume`, and `run_leaf_read_result` for leaf handlers
