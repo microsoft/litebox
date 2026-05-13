@@ -132,6 +132,7 @@ impl Task {
 
         if extra_data_size > TA_DERIVED_EXTRA_DATA_MAX_SIZE
             || !(TA_DERIVED_KEY_MIN_SIZE..=TA_DERIVED_KEY_MAX_SIZE).contains(&subkey_size)
+            || (extra_data_size > 0 && extra_data_addr == 0)
             || subkey_addr == 0
         {
             return Err(TeeResult::BadParameters);
