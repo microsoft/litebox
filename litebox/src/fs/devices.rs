@@ -826,9 +826,27 @@ impl<
         Err(TruncateError::IsTerminalDevice)
     }
 
-    #[expect(unused_variables, reason = "unimplemented")]
-    fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        unimplemented!()
+    fn chmod(&self, path: impl Arg, _mode: Mode) -> Result<(), ChmodError> {
+        // Only accept chmod on PTY paths (/dev/ptmx, /dev/pts/N). This
+        // is what dropbear's grantpt() needs when allocating a PTY
+        // slave for an incoming SSH session — without it, the sandbox
+        // crashed at the unimplemented! below for every PTY-requesting
+        // session. We don't honour the mode bits in the sandbox
+        // (there's no real permission boundary to enforce on a
+        // sandbox-internal PTY), but accepting the syscall is what the
+        // native kernel does for root on these paths.
+        //
+        // Other device chmod targets (/dev/null, /dev/urandom, …)
+        // return NotTheOwner (EPERM); on native Linux non-root chmod
+        // on those devices also fails. Nothing in the workloads we
+        // have so far calls chmod on them, and refusing is safer than
+        // silently accepting until we know the semantics each caller
+        // expects.
+        let path_str = path.as_rust_str().map_err(|_| ChmodError::NotTheOwner)?;
+        if path_str == "/dev/ptmx" || path_str.starts_with("/dev/pts/") {
+            return Ok(());
+        }
+        Err(ChmodError::NotTheOwner)
     }
 
     #[expect(unused_variables, reason = "unimplemented")]
