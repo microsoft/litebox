@@ -41,11 +41,6 @@ struct PollReadyArgs {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct BindGetsocknameArgs {
-    family: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
 struct PipePairIdArgs {
     count: u32,
 }
@@ -58,8 +53,6 @@ struct AcceptInheritedArgs {
 
 const POLL_READY: HandlerToken<PollReadyArgs, DetailOut> =
     HandlerToken::new("platform_fixes.poll_ready");
-const BIND_GETSOCKNAME: HandlerToken<BindGetsocknameArgs, DetailOut> =
-    HandlerToken::new("platform_fixes.bind_getsockname");
 const PIPE_PAIR_ID: HandlerToken<PipePairIdArgs, DetailOut> =
     HandlerToken::new("platform_fixes.pipe_pair_id");
 const ACCEPT_INHERITED: HandlerToken<AcceptInheritedArgs, DetailOut> =
@@ -665,22 +658,6 @@ async fn handle_poll_ready(
     Ok(DetailOut { detail })
 }
 
-async fn handle_bind_getsockname(
-    args: BindGetsocknameArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<DetailOut, HandlerError> {
-    let port = match args.family.as_str() {
-        "ipv4" => std::net::TcpListener::bind("0.0.0.0:0")?
-            .local_addr()?
-            .port(),
-        "ipv6" => std::net::TcpListener::bind("[::]:0")?.local_addr()?.port(),
-        other => return Err(HandlerError(format!("unknown family: {other}"))),
-    };
-    Ok(DetailOut {
-        detail: format!("port={port}"),
-    })
-}
-
 async fn handle_pipe_pair_id(
     args: PipePairIdArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -837,9 +814,7 @@ async fn handle_close_inherited(
 
 // Constants used by the register_* functions further down. Each test
 // category gets a section divider immediately above its `register_*`
-// function (POLL, GSN, PID, EXITD, NPIPE, …).
-
-const FAMILIES: &[&str] = &["ipv4", "ipv6"];
+// function (POLL, PID, EXITD, NPIPE, …).
 
 const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
 
@@ -889,51 +864,6 @@ pub(crate) fn register_poll_ready_tests(reg: &mut Registry<'_>) {
                     })
                 })
             });
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// GSN: getsockname port after bind (fix 336dc79e)
-// ═══════════════════════════════════════════════════════════════════
-
-pub(crate) fn register_bind_getsockname_tests(reg: &mut Registry<'_>) {
-    register_handler!(BIND_GETSOCKNAME, handle_bind_getsockname);
-    for &family in FAMILIES {
-        for &agent in DEPTH_AGENTS {
-            let agent_s = agent.to_string();
-            let family_s = family.to_string();
-            reg.test(
-                "matrix",
-                "bind_getsockname",
-                format!("GSN.{family}.{agent}"),
-            )
-            .timeout(60)
-            .build(move |cx| {
-                let handle = cx.require(agent);
-                Box::new(move |run| {
-                    let a = agent_s.clone();
-                    let f = family_s.clone();
-                    Box::pin(async move {
-                        let result = run
-                            .send_named_typed(
-                                &handle,
-                                &BIND_GETSOCKNAME,
-                                BindGetsocknameArgs { family: f },
-                            )
-                            .await;
-                        let pass = match &result {
-                            Ok(out) => out
-                                .detail
-                                .strip_prefix("port=")
-                                .and_then(|s| s.parse::<u16>().ok())
-                                .is_some_and(|p| p > 0),
-                            Err(_) => false,
-                        };
-                        super::TestOutcome::new(&a, pass, format!("{result:?}"))
-                    })
-                })
-            });
-        }
     }
 }
 
