@@ -943,7 +943,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_fork_from_worker_exec_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_minimal_canary_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_stdin_pipe_subst_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_cross_worker_file_tests(&mut registry::Registry::new(&mut tests));
+    special_cases::register_cross_worker_file_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_subst_capture_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_concurrent_fork_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_touch_redirect_tests(&mut registry::Registry::new(&mut tests));
