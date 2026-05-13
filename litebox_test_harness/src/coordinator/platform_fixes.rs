@@ -127,7 +127,7 @@ fn exec_timeout_args(args: Vec<String>, timeout_secs: u64) -> ExecArgs {
 /// handlers that are unique to this family). Canonical handlers
 /// (`EXEC`, `FS_READ`, `NET_LISTEN`, etc.) are registered by
 /// `register_matrix_handlers` in `matrix.rs`.
-fn register_pf_specific_handlers() {
+pub(crate) fn register_pf_specific_handlers() {
     register_handler!(CLI_STARTUP_MIMIC, handle_cli_startup_mimic);
     register_handler!(FORK_EXEC_PIE, handle_fork_exec_pie);
     register_handler!(PIPE_NONBLOCK, handle_pipe_nonblock);
@@ -2644,98 +2644,6 @@ pub(crate) fn register_subst_capture_tests(reg: &mut Registry<'_>) {
                                 &resp,
                                 Response::ExecResult { stdout, .. }
                                     if check(stdout)
-                            );
-                            super::TestOutcome::new(&a, pass, format!("{resp:?}"))
-                        })
-                    })
-                });
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// CC: Concurrent fork/exec/pipe tests
-// ═══════════════════════════════════════════════════════════════════
-
-pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
-    register_pf_specific_handlers();
-    struct Def {
-        name: &'static str,
-        script_template: &'static str,
-        check: fn(&str) -> bool,
-    }
-    let defs: &[Def] = &[
-        Def {
-            name: "echo",
-            script_template: "echo $(echo hello) > {path}",
-            check: |s| s.trim() == "hello",
-        },
-        Def {
-            name: "fork_exec",
-            script_template: "{exe} echo-test > {path} 2>&1",
-            check: |s| s.contains("ECHO_TEST_OK"),
-        },
-        Def {
-            name: "pipe_capture",
-            script_template: "echo $(echo data | cat) > {path}",
-            check: |s| s.trim() == "data",
-        },
-        Def {
-            name: "file_write",
-            script_template: "echo agent-wrote-{agent} > {path}",
-            check: |s| s.contains("agent-wrote-"),
-        },
-    ];
-    for def in defs {
-        for &agent in AGENTS {
-            let agent_s = agent.to_string();
-            let template: String = def.script_template.into();
-            let check = def.check;
-            let name = def.name;
-            reg.test("fork", "concurrent_fork", format!("CC.{name}.{agent}"))
-                .timeout(60)
-                .build(move |cx| {
-                    let handle = cx.require(agent);
-                    Box::new(move |run| {
-                        let a = agent_s.clone();
-                        let t = template.clone();
-                        let self_exe = run.self_exe().to_string();
-                        Box::pin(async move {
-                            let path = format!("/shared/cc-{name}-{a}.txt");
-                            let script = t
-                                .replace("{path}", &path)
-                                .replace("{exe}", &self_exe)
-                                .replace("{agent}", &a);
-                            let resp = run
-                                .typed_or_error(
-                                    &handle,
-                                    &EXEC,
-                                    ExecArgs {
-                                        args: vec!["bash".into(), "-c".into(), script],
-                                        timeout_secs: Some(10),
-                                        stdin: None,
-                                        background: false,
-                                        env: vec![],
-                                    },
-                                )
-                                .await;
-                            if !matches!(&resp, Response::ExecResult { exit_code: 0, .. }) {
-                                return super::TestOutcome::new(
-                                    &a,
-                                    false,
-                                    format!("writer failed: {resp:?}"),
-                                );
-                            }
-                            let resp = run
-                                .typed_or_error(
-                                    &handle,
-                                    &FS_READ,
-                                    FsPathArgs { path: path.clone() },
-                                )
-                                .await;
-                            let pass = matches!(
-                                &resp,
-                                Response::Ok { data: Some(d) } if check(d)
                             );
                             super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                         })
