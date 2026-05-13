@@ -268,6 +268,18 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             .descriptor_table_mut()
             .insert(event_file);
 
+        // Pre-subscribe so the child binary's blocking read() on the
+        // inherited eventfd can be woken by the parent's broker write.
+        // Without this, the broker subscription is only set up by
+        // epoll's register_observer path, and direct read() hangs.
+        self.task
+            .global
+            .litebox
+            .descriptor_table()
+            .with_entry(&typed_fd, |ef: &syscalls::eventfd::EventFile<Platform>| {
+                ef.pre_subscribe_for_broker_blocking_read();
+            });
+
         let files = self.task.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
 

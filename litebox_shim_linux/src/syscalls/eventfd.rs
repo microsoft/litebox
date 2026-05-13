@@ -712,6 +712,32 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
     }
 }
 
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
+    EventFile<Platform>
+{
+    /// Pre-subscribe a broker-backed EventFile so the dispatcher
+    /// thread can wake `self.pollee` even before any
+    /// `register_observer` call (i.e. for guests that do a blocking
+    /// `read()` without first poll/epoll). Idempotent. No-op for
+    /// non-broker variants.
+    ///
+    /// Required for Phase 2.F follow-up `install_broker_eventfd_fd`:
+    /// the cross-binary-type exec'd child binary may read the
+    /// inherited eventfd directly, which would otherwise hang
+    /// waiting on a pollee that never fires because the broker
+    /// subscription is only set up lazily by the epoll path.
+    pub(crate) fn pre_subscribe_for_broker_blocking_read(&self) {
+        let inner = self.inner.lock();
+        match &*inner {
+            EventFileInner::BrokerBacked { common, .. }
+            | EventFileInner::PidfdBrokerBacked { common, .. } => {
+                common.ensure_subscribed(&self.pollee);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> TimerFileState<Platform> {
     fn current_time(&self) -> Result<Duration, Errno> {
         match self.clockid {
