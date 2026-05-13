@@ -19,7 +19,6 @@ pub mod leaf_subcommand;
 pub(crate) mod matrix;
 pub(crate) mod pidfd_tests;
 pub(crate) mod pipe_bridge;
-pub(crate) mod platform_fixes;
 pub(crate) mod port_router;
 pub(crate) mod pty;
 pub(crate) mod registry;
@@ -937,7 +936,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     tcp_state::register_tcp_listen_busy_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_bash_fork_exec_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_fork_from_worker_exec_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_minimal_canary_tests(&mut registry::Registry::new(&mut tests));
+    common::register_minimal_canary_tests(&mut registry::Registry::new(&mut tests));
     shell::register_stdin_pipe_subst_tests(&mut registry::Registry::new(&mut tests));
     special_cases::register_cross_worker_file_tests(&mut registry::Registry::new(&mut tests));
     shell::register_subst_capture_tests(&mut registry::Registry::new(&mut tests));

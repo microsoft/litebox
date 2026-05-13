@@ -591,7 +591,6 @@ pub(crate) fn register_concurrent_fs_rwlock(reg: &mut Registry<'_>) {
 /// Register CC.* concurrent fork/exec/pipe correctness tests.
 #[allow(clippy::items_after_statements)]
 pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
-    super::platform_fixes::register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script_template: &'static str,

@@ -22,20 +22,20 @@ use crate::register_handler;
 #[derive(Serialize, Deserialize, Debug)]
 struct CliStartupMimicArgs {}
 
-const CLI_STARTUP_MIMIC: HandlerToken<CliStartupMimicArgs, super::platform_fixes::DetailOut> =
+const CLI_STARTUP_MIMIC: HandlerToken<CliStartupMimicArgs, super::common::DetailOut> =
     HandlerToken::new("platform_fixes.cli_startup_mimic");
 
 async fn handle_cli_startup_mimic(
     _args: CliStartupMimicArgs,
     _ctx: &mut HandlerCtx<'_>,
-) -> Result<super::platform_fixes::DetailOut, HandlerError> {
+) -> Result<super::common::DetailOut, HandlerError> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| HandlerError::from(format!("bind cli startup mimic listener: {e}")))?;
     let addr = listener
         .local_addr()
         .map_err(|e| HandlerError::from(format!("listener addr: {e}")))?;
-    Ok(super::platform_fixes::DetailOut {
+    Ok(super::common::DetailOut {
         detail: format!("CLI_STARTUP_MIMIC_OK {addr}"),
     })
 }
@@ -47,7 +47,7 @@ pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
 
     for &delivery in CSM_DELIVERIES {
         for &bt in crate::BinaryType::ALL {
-            for &agent in super::platform_fixes::AGENTS {
+            for &agent in super::common::CANARY_AGENTS {
                 let agent_s = agent.to_string();
                 let bt_label = bt.label();
                 let test_id = format!("CSM.{delivery}.{bt_label}.{agent}");
@@ -58,7 +58,7 @@ pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
                             agent,
                             format!("CliStartupMimic_{delivery}_{bt_label}_{agent}"),
                             SpawnKind::Fork {
-                                binary: super::platform_fixes::fork_binary_label(bt),
+                                binary: super::common::fork_binary_label(bt),
                                 inherit_listen_ports: vec![],
                             },
                         );

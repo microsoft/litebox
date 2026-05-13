@@ -3,8 +3,7 @@
 
 //! Shell-redirect and substitution test families.
 //!
-//! Hosts six bash-driven test clusters that were lifted from
-//! `platform_fixes.rs` to keep that file manageable:
+//! Hosts six bash-driven test clusters:
 //!
 //! | Prefix | Cluster |
 //! |--------|---------|
@@ -30,7 +29,6 @@ const AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_stdin_pipe_subst_tests(reg: &mut Registry<'_>) {
-    super::platform_fixes::register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script: &'static str,
@@ -114,7 +112,6 @@ pub(crate) fn register_stdin_pipe_subst_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_subst_capture_tests(reg: &mut Registry<'_>) {
-    super::platform_fixes::register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script: &'static str,
@@ -211,7 +208,6 @@ pub(crate) fn register_subst_capture_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
-    super::platform_fixes::register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script_template: &'static str,
@@ -313,7 +309,6 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
-    super::platform_fixes::register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script_template: &'static str,
@@ -438,7 +433,6 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
-    super::platform_fixes::register_pf_specific_handlers();
     #[derive(Clone, Copy)]
     struct Def {
         name: &'static str,
@@ -536,7 +530,6 @@ pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_bg_redirect_stdin_poll_tests(reg: &mut Registry<'_>) {
-    super::platform_fixes::register_pf_specific_handlers();
     #[derive(Clone, Copy)]
     struct Def {
         name: &'static str,
