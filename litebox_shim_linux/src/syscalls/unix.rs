@@ -2268,8 +2268,10 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     Err(Errno::ENOPROTOOPT)
                 }
-                // We use fixed buffer size for now
-                SocketOption::RCVBUF | SocketOption::SNDBUF => Err(Errno::EOPNOTSUPP),
+                // SO_RCVBUF / SO_SNDBUF are advisory hints; silently accept and
+                // use the fixed UNIX_BUF_SIZE for the actual buffer. Matches
+                // the precedent in net.rs for TCP/UDP sockets.
+                SocketOption::RCVBUF | SocketOption::SNDBUF => Ok(()),
             },
             SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }

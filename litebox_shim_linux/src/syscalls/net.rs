@@ -416,8 +416,13 @@ impl<FS: ShimFS> GlobalState<FS> {
                 | SocketOption::REUSEPORT
                 | SocketOption::BROADCAST
                 | SocketOption::KEEPALIVE => unreachable!(),
-                // We use fixed buffer size for now
-                SocketOption::RCVBUF | SocketOption::SNDBUF => return Err(Errno::EOPNOTSUPP),
+                // SO_RCVBUF / SO_SNDBUF are advisory hints on Linux (the kernel
+                // may clip to /proc/sys/net/core/{r,w}mem_max), and Node's TLS
+                // socket code treats EOPNOTSUPP as fatal in some paths
+                // (cascading to "fetch failed" / "uncaught exception"). Silently
+                // accept; we use a fixed buffer size internally, which is what
+                // getsockopt(2) will report. Same precedent as IP_TOS above.
+                SocketOption::RCVBUF | SocketOption::SNDBUF => return Ok(()),
                 // Socket does not support these options
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     return Err(Errno::ENOPROTOOPT);
