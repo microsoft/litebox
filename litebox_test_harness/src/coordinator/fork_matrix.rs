@@ -11,6 +11,11 @@
 //! - Stress exec: mode × spawn method
 //! - Non-PIE invocation method
 //! - Contamination pattern (non-PIE then PIE, various depths)
+//!
+//! Hosted test-ID prefixes:
+//! `X*`, `BSF`, `PIF`, `SXF` (original fork-matrix families),
+//! `BASH.*` (bash fork/exec), `FWE.*` (fork+exec from non-PIE worker-exec
+//! hosts), `SK.*` (SIGKILL subtree teardown).
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -19,10 +24,11 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 use super::agents::{AgentHandle, AgentName, SpawnKind};
+use super::matrix::{EXEC, ExecArgs};
 use super::registry::Registry;
 use super::run_context::RunContext;
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
-use crate::protocol::Response;
+use crate::protocol::{Command as InfraCommand, Response};
 use crate::register_handler;
 use crate::register_leaf_subcommand;
 
@@ -724,6 +730,84 @@ mod leaf_subcmd {
         }
         let _ = gpid;
         0
+    }
+
+    /// `fork-exec-pie` — drives the FWE test family.
+    ///
+    /// Stays as an argv subcommand because the test specifically exercises
+    /// the legacy two-level fork+exec path: agent → subcommand-dispatched
+    /// child (this fn) → grandchild of the target binary type. Converting
+    /// the child to a leaf agent changed the test surface to "agent → leaf
+    /// agent → grandchild", which exercises a different code path that hit
+    /// timeouts in the litebox shim.
+    ///
+    /// Usage: `fork-exec-pie <binary> [subcommand]`
+    /// Forks a child that exec's the given binary with the given subcommand
+    /// (default `echo-test`), waits up to 15 s, prints
+    /// `FORK_EXEC_PIE_OK` or `FORK_EXEC_PIE_FAIL:reason`.
+    pub(super) fn subcmd_fork_exec_pie(args: &[String]) -> i32 {
+        let binary = args.get(2).map_or_else(
+            || {
+                for p in ["/opt/litebox/litebox_test_harness"] {
+                    if std::path::Path::new(p).exists() {
+                        return p;
+                    }
+                }
+                "/opt/litebox/litebox_test_harness"
+            },
+            String::as_str,
+        );
+        let sub = args.get(3).map_or("echo-test", String::as_str);
+        eprintln!(
+            "[fork-exec-pie] pid={} forking child to exec {binary} {sub}",
+            std::process::id()
+        );
+
+        // SAFETY: libc::fork() takes no arguments and returns child pid (0 in child).
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            eprintln!(
+                "[fork-exec-pie] fork failed: {}",
+                std::io::Error::last_os_error()
+            );
+            println!("FORK_EXEC_PIE_FAIL:fork");
+            return 1;
+        }
+        if pid == 0 {
+            use std::ffi::CString;
+            let bin = CString::new(binary).expect("binary has no NUL");
+            let arg_sub = CString::new(sub).expect("sub has no NUL");
+            let exec_argv = [bin.as_ptr(), arg_sub.as_ptr(), core::ptr::null()];
+            // SAFETY: NUL-terminated argv; execv replaces the process image.
+            unsafe { libc::execv(bin.as_ptr(), exec_argv.as_ptr()) };
+            let err = std::io::Error::last_os_error();
+            eprintln!("[fork-exec-pie] child execv failed: {err}");
+            std::process::exit(127);
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut status = 0i32;
+        loop {
+            // SAFETY: waitpid takes a live child pid and a writable status pointer.
+            let ret = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+            if ret > 0 {
+                if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                    println!("FORK_EXEC_PIE_OK");
+                    return 0;
+                }
+                println!("FORK_EXEC_PIE_FAIL:exit={status}");
+                return 1;
+            }
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: pid is the child being timed out.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                // SAFETY: reap the child after SIGKILL.
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                println!("FORK_EXEC_PIE_FAIL:timeout");
+                return 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
 
@@ -1727,4 +1811,365 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                 });
         }
     }
+}
+
+/// Convenience: build an `ExecArgs` with just an argv and sensible defaults.
+fn exec_args(args: Vec<String>) -> ExecArgs {
+    ExecArgs {
+        args,
+        timeout_secs: None,
+        stdin: None,
+        background: false,
+        env: vec![],
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BASH: bash fork/exec tests (lifted from platform_fixes.rs)
+// ═══════════════════════════════════════════════════════════════════
+
+pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
+    for &agent in &[AgentName::Dpg1, AgentName::Dpg2] {
+        let agent_s = agent.to_string();
+
+        // BASH.fork_ls: bash -c running ls
+        let a = agent_s.clone();
+        reg.test("fork", "bash_fork_exec", format!("BASH.fork_ls.{agent}"))
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let a = a.clone();
+                    Box::pin(async move {
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                exec_args(vec![
+                                    "bash".into(),
+                                    "-c".into(),
+                                    "ls / > /dev/null && echo LS_OK".into(),
+                                ]),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains("LS_OK")
+                        );
+                        super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                    })
+                })
+            });
+
+        // BASH.fork_subst: bash -c with command substitution
+        let a = agent_s.clone();
+        reg.test("fork", "bash_fork_exec", format!("BASH.fork_subst.{agent}"))
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let a = a.clone();
+                    Box::pin(async move {
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                exec_args(vec![
+                                    "bash".into(),
+                                    "-c".into(),
+                                    "echo HOST=$(cat /etc/hostname)".into(),
+                                ]),
+                            )
+                            .await;
+                        // Substituted hostname must be non-empty (the substitution
+                        // actually ran). `hostname -I` worked above on the same
+                        // container, so /etc/hostname is non-empty.
+                        let pass = matches!(
+                            &resp,
+                            Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.starts_with("HOST=")
+                                    && stdout.trim_end().len() > "HOST=".len()
+                        );
+                        super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                    })
+                })
+            });
+
+        // BASH.fork_bg_fg: bash -c with background + foreground
+        let a = agent_s.clone();
+        reg.test("fork", "bash_fork_exec", format!("BASH.fork_bg_fg.{agent}"))
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let a = a.clone();
+                    Box::pin(async move {
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                exec_args(vec![
+                                    "bash".into(),
+                                    "-c".into(),
+                                    // The bg subshell must actually run and emit
+                                    // BG_DONE; the fg leg must run too. Wait for
+                                    // bg before printing FG_DONE so output
+                                    // ordering is deterministic.
+                                    "(sleep 0.05 && echo BG_DONE) & \
+                                     cat /etc/hostname > /dev/null; \
+                                     wait; \
+                                     echo FG_DONE"
+                                        .into(),
+                                ]),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains("BG_DONE") && stdout.contains("FG_DONE")
+                        );
+                        super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                    })
+                })
+            });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FWE: fork+exec from non-PIE worker-exec hosts
+// ═══════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
+pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
+    // Register the `fork-exec-pie` leaf subcommand. This stays as an
+    // argv subcommand (not a handler) because the test specifically
+    // verifies the legacy two-level fork+exec path: agent →
+    // subcommand-dispatched child (fork-exec-pie) → grandchild of
+    // the target binary type. Converting the child to a leaf agent
+    // would change the test surface to "agent → leaf agent → grandchild",
+    // which exercises a different code path that hit timeouts in the
+    // litebox shim. Body lives in `mod leaf_subcmd` at the bottom of
+    // this file.
+    crate::register_leaf_subcommand!("fork-exec-pie", leaf_subcmd::subcmd_fork_exec_pie);
+    // FWE matrix:
+    //   - launcher = init   (agent A, PIE) ─► fork+execv each BinaryType
+    //   - launcher = NP     (worker-exec host, non-PIE) ─► same
+    //
+    // Both arms use the `fork-exec-pie` subcommand (which is plain
+    // fork+execv with no PIE-specific logic; the historical name is
+    // kept for backwards compatibility). The binary executed is
+    // resolved per `BinaryType` via `binary_path()`.
+    for &bt in crate::BinaryType::ALL {
+        for (launcher_label, launcher_agent, sub_timeout) in [
+            ("from_init", AgentName::Dpg1, 20_u64),
+            ("from_worker_exec", AgentName::Dpg1Dng, 30_u64),
+        ] {
+            let bt_label = bt.label();
+            let test_id = format!("FWE.{bt_label}.{launcher_label}");
+            let outcome_label = format!("{launcher_agent}");
+            reg.test("fork", "fork_from_worker_exec", test_id.clone())
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(launcher_agent);
+                    Box::new(move |run| {
+                        let outcome_label = outcome_label.clone();
+                        let self_exe = run.self_exe().to_string();
+                        Box::pin(async move {
+                            let target = crate::binary_path(bt, &self_exe);
+                            // The launcher binary depends on which
+                            // agent we're running on: agent A is PIE,
+                            // agent NP is non-PIE.
+                            let launcher_bin = match launcher_agent {
+                                AgentName::Dpg1 => self_exe.clone(),
+                                AgentName::Dpg1Dng => crate::nonpie_binary(),
+                                _ => unreachable!(),
+                            };
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    ExecArgs {
+                                        args: vec![
+                                            launcher_bin,
+                                            "fork-exec-pie".into(),
+                                            target,
+                                            "echo-test".into(),
+                                        ],
+                                        timeout_secs: Some(sub_timeout),
+                                        stdin: None,
+                                        background: false,
+                                        env: vec![],
+                                    },
+                                )
+                                .await;
+                            let pass = matches!(
+                                &resp,
+                                Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.contains("FORK_EXEC_PIE_OK")
+                            );
+                            super::TestOutcome::new(&outcome_label, pass, format!("{resp:?}"))
+                        })
+                    })
+                });
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SK: SIGKILL of a parent agent whose subtree contains SpawnRemote
+// (non-PIE) descendants. Reproduces the production hang we hit in
+// `cargo test -- 'litebox::PN.B.eof'`: the harness coordinator
+// SIGKILLs agent A in teardown, but A's vfork-child stub thread that
+// did `wait_worker_host(NP_host_pid)` blocks A's process from being
+// reaped because the non-PIE host worker (NP) is never sent a signal.
+// The cascading effect is that the coordinator's `Child::wait()` for A
+// can hang indefinitely, plus orphan host workers remain alive after
+// container shutdown.
+//
+// Each test spawns its own fresh agent E — independent of the global
+// matrix — builds the suspect subtree shape, then SIGKILLs E and
+// asserts that the wait completes within a small wall-clock budget.
+// On native this is sub-second; under litebox with the platform bug
+// unfixed the wait will not return and these tests time out (FAIL).
+//
+// No `xfail` is recorded: a real FAIL on litebox is the desired
+// signal that the underlying platform bug needs fixing. The test
+// harness's own teardown is wrapped in a 10-s timeout (commit
+// f99cac06), so a FAIL here does not stall the docker container.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Wall-clock budget for `Child::wait()` after SIGKILL. Native
+/// completes in < 50 ms; we give 5 s to absorb tokio scheduling
+/// jitter under heavy parallelism without masking real hangs.
+const SK_WAIT_BUDGET_SECS: u64 = 5;
+
+/// Per-test outer budget. Must exceed `SpawnRemote` setup cost
+/// (the broker rewrites a 124 MB binary on first use, plus the
+/// well-known `spawn_nonpie_subtree` 30-s timeout under litebox).
+const SK_TEST_TIMEOUT_SECS: u64 = 90;
+
+pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
+    // SK.subtree.direct — SIGKILL E whose immediate child is a
+    // non-PIE worker spawned via SpawnRemote. Reproduces the exact
+    // shape that hung the PN.B.eof teardown.
+    reg.test("matrix", "subtree_kill", "SK.subtree.direct".to_string())
+        .timeout(SK_TEST_TIMEOUT_SECS)
+        .build(move |cx| {
+            let e = cx.require(AgentName::Dpg3);
+            let npx = cx.declare_ephemeral(AgentName::Dpg3, "NPx", SpawnKind::NonPie);
+            Box::new(move |run| {
+                let e = e.clone();
+                let npx = npx.clone();
+                Box::pin(async move {
+                    let _ = crate::nonpie_binary();
+                    let r = run.spawn_ephemeral(&npx).await;
+                    if !super::ok_spawned_response(&r) {
+                        return super::TestOutcome::new(
+                            "E",
+                            false,
+                            format!("setup: spawn_ephemeral(NPx) failed: {r:?}"),
+                        );
+                    }
+                    run_subtree_kill(run, &e).await
+                })
+            })
+        });
+
+    // SK.subtree.deep — SIGKILL E whose subtree is
+    // E → EE → NPx (non-PIE leaf). Generalizes the depth axis: tests
+    // that the wait4 stub at the *grandchild* level still propagates
+    // back when the *root* is SIGKILLed.
+    reg.test("matrix", "subtree_kill", "SK.subtree.deep".to_string())
+        .timeout(SK_TEST_TIMEOUT_SECS)
+        .build(move |cx| {
+            let e = cx.require(AgentName::Dpg3);
+            let _ee = cx.require(AgentName::Dpg3Dpg);
+            // NPx is a non-PIE child of EE, two levels below E.
+            let npx = cx.declare_ephemeral(AgentName::Dpg3Dpg, "NPx", SpawnKind::NonPie);
+            Box::new(move |run| {
+                let e = e.clone();
+                let npx = npx.clone();
+                Box::pin(async move {
+                    let _ = crate::nonpie_binary();
+                    // EE was already spawned under E by spawn_tree when
+                    // the test declared AgentName::Dpg3Dpg. Ask EE to spawn
+                    // its own non-PIE descendant.
+                    let r = run.spawn_ephemeral(&npx).await;
+                    if !super::ok_spawned_response(&r) {
+                        return super::TestOutcome::new(
+                            "E",
+                            false,
+                            format!("setup: spawn_ephemeral(NPx via EE) failed: {r:?}"),
+                        );
+                    }
+                    run_subtree_kill(run, &e).await
+                })
+            })
+        });
+
+    // SK.subtree.exit_then_kill — cooperative Exit on the non-PIE
+    // descendant first, then SIGKILL the root. Inverts the timing
+    // relative to direct_nonpie: by the time the root is killed, the
+    // wait_worker_host stub thread has already seen its host worker
+    // exit. SIGKILL+wait should be especially fast. If this also
+    // hangs, the bug is in stub-thread cleanup itself, not in
+    // worker-exit-signal propagation.
+    reg.test(
+        "matrix",
+        "subtree_kill",
+        "SK.subtree.exit_then_kill".to_string(),
+    )
+    .timeout(SK_TEST_TIMEOUT_SECS)
+    .build(move |cx| {
+        let e = cx.require(AgentName::Dpg3);
+        let npx = cx.declare_ephemeral(AgentName::Dpg3, "NPx", SpawnKind::NonPie);
+        Box::new(move |run| {
+            let e = e.clone();
+            let npx = npx.clone();
+            Box::pin(async move {
+                let _ = crate::nonpie_binary();
+                let r = run.spawn_ephemeral(&npx).await;
+                if !super::ok_spawned_response(&r) {
+                    return super::TestOutcome::new(
+                        "E",
+                        false,
+                        format!("setup: spawn_ephemeral(NPx) failed: {r:?}"),
+                    );
+                }
+                // Cooperative shutdown of the non-PIE descendant
+                // before we kill the root. Forward(Exit) reaches NPx
+                // via E. If the response stream desyncs we ignore —
+                // the goal is just to make NPx exit.
+                let _ = run.forward(&npx, InfraCommand::Exit).await;
+                run_subtree_kill(run, &e).await
+            })
+        })
+    });
+}
+
+/// SIGKILL the static `E` agent and time how long the wait takes.
+/// Returns pass=true iff wait completes within `SK_WAIT_BUDGET_SECS`.
+async fn run_subtree_kill(cx: &mut RunContext<'_>, e: &AgentHandle) -> super::TestOutcome {
+    let budget = Duration::from_secs(SK_WAIT_BUDGET_SECS);
+    let result = cx.kill_and_wait(e, budget).await;
+    let (pass, detail) = match result {
+        Ok(elapsed) => (
+            true,
+            format!(
+                "kill_and_wait Ok elapsed={}ms budget={}s",
+                elapsed.as_millis(),
+                SK_WAIT_BUDGET_SECS,
+            ),
+        ),
+        Err(elapsed) => (
+            false,
+            format!(
+                "kill_and_wait TIMEOUT elapsed={}ms budget={}s",
+                elapsed.as_millis(),
+                SK_WAIT_BUDGET_SECS,
+            ),
+        ),
+    };
+    super::TestOutcome::new("E", pass, detail)
 }

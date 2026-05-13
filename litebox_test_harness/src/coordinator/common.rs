@@ -1,32 +1,30 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Shared handlers and test families used across coordinator modules.
+//! Shared bash + arbitrary-binary exec handlers.
 //!
-//! ## Handlers
+//! These two handlers replace the legacy `super::exec()` /
+//! `super::exec_timeout()` helpers used across test families. They run
+//! inside the agent (via `Command::Run`) and execute the requested
+//! child process via `tokio::process::Command`, so the wire-level
+//! `Command::Exec` + `Command::ExecReady` arms in `agent.rs` no longer
+//! need to be involved in any test-logic dispatch.
+//!
+//! Reach for these in any new test that needs to spawn a child process
+//! on an agent. Prefer over `super::exec*`.
 //!
 //! The `BASH` token runs a single bash one-liner (`bash -c <cmd>`).
 //! The `EXEC_BIN` token runs an arbitrary `argv[0]` with `argv[1..]`.
 //! Neither returns until the child has exited (or `timeout_ms`
 //! expires). For background semantics, write a per-family handler
 //! that records the child PID and returns immediately.
-//!
-//! ## Test families
-//!
-//! `register_minimal_canary_tests` — the M1-M4 / BS1-BS3 minimal
-//! canary repros for the wave-0 SpawnRemote/non-PIE bug. Lifted
-//! from `platform_fixes.rs` so this smoke family can be found
-//! without wading through the full platform-fix catalogue.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::agents::AgentName;
-use super::matrix::{EXEC, ExecArgs};
 use super::registry::Registry;
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
-use crate::protocol::Response;
 use crate::register_handler;
 
 #[derive(Serialize, Deserialize)]
@@ -587,131 +585,4 @@ pub(crate) fn register_common_handlers(_reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!("echo-test", leaf_subcmd::subcmd_echo_test);
     crate::register_leaf_subcommand!("write-known", leaf_subcmd::subcmd_write_known);
     crate::register_leaf_subcommand!("exit-with", leaf_subcmd::subcmd_exit_with);
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// M1-M4: Minimal canary repros for SpawnRemote/non-PIE bug
-// ═══════════════════════════════════════════════════════════════════
-//
-// These are the minimal repros for the wave-0 canary cascade. The
-// canary itself runs `Exec [self_exe, "echo-test"]` on agent A. It
-// times out under litebox not because echo-test is broken, but
-// because spawn_tree's earlier SpawnRemote NP call killed agent A
-// as a side effect.
-//
-// Each M test runs as `Exec [self_exe, "M{N}-..."]` from a launcher
-// agent. The M subprocess then spawns a non-PIE child via the
-// indicated mechanism and verifies the parent process is still
-// alive after wait. If the parent dies before printing M{N}_OK,
-// the launcher's Exec times out or returns a bad exit code, and
-// the test FAILs.
-//
-// Matrix: 4 M variants × 5 launchers (A, AA, D3, D4, D5):
-//   - A, AA, D3, D5 are PIE — they exec a PIE M-subprocess. The
-//     canary mechanism (PIE process tokio runtime spawning non-PIE
-//     child) is reproduced inside the M subprocess.
-//   - D4 is non-PIE — it execs a non-PIE M-subprocess. This tests
-//     the related non-PIE → non-PIE spawn path.
-//
-// Native must pass all 20 tests.
-
-pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
-    use crate::coordinator::platform_fixes_leaf_subcmd as m;
-
-    const M_LAUNCHERS: &[AgentName] = &[
-        AgentName::Dpg1,
-        AgentName::Dpg1Dpg1,
-        AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dng,
-        AgentName::Dpg1DngDpg,
-    ];
-    const M_VARIANTS: &[(&str, &str, &str, u64)] = &[
-        // (id_prefix, subcommand, expected_stdout_marker, exec_timeout_secs)
-        ("M1", "M1-tokio-spawn-nonpie", "M1_OK", 30),
-        ("M2", "M2-libc-spawn-nonpie", "M2_OK", 30),
-        ("M3", "M3-tokio-spawn-nonpie-then-work", "M3_OK", 30),
-        ("M4", "M4-tokio-spawn-nonpie-repeated", "M4_OK", 60),
-        // BS-variants: minimal stdio-direction repros for Bug B.
-        // Same matrix shape as M1-M4. See main.rs comments for what
-        // each subcommand exercises.
-        ("BS1", "BS1-tokio-spawn-nonpie-stderr", "BS1_OK", 30),
-        ("BS2", "BS2-tokio-spawn-nonpie-stdin-echo", "BS2_OK", 30),
-        ("BS3", "BS3-tokio-spawn-nonpie-large-stdout", "BS3_OK", 30),
-    ];
-
-    super::platform_fixes::register_pf_specific_handlers();
-    // Register the M1-M4 + BS1-BS3 leaf subcommands. These stay as
-    // argv subcommands (not handlers) because they test fresh-process
-    // stdio inheritance across fork+exec; see
-    // `coordinator/platform_fixes_leaf_subcmd.rs` for the rationale.
-    crate::register_leaf_subcommand!("M1-tokio-spawn-nonpie", m::subcmd_m1_tokio_spawn_nonpie);
-    crate::register_leaf_subcommand!("M2-libc-spawn-nonpie", m::subcmd_m2_libc_spawn_nonpie);
-    crate::register_leaf_subcommand!(
-        "M3-tokio-spawn-nonpie-then-work",
-        m::subcmd_m3_tokio_spawn_nonpie_then_work
-    );
-    crate::register_leaf_subcommand!(
-        "M4-tokio-spawn-nonpie-repeated",
-        m::subcmd_m4_tokio_spawn_nonpie_repeated
-    );
-    crate::register_leaf_subcommand!(
-        "BS1-tokio-spawn-nonpie-stderr",
-        m::subcmd_bs1_tokio_spawn_nonpie_stderr
-    );
-    crate::register_leaf_subcommand!(
-        "BS2-tokio-spawn-nonpie-stdin-echo",
-        m::subcmd_bs2_tokio_spawn_nonpie_stdin_echo
-    );
-    crate::register_leaf_subcommand!(
-        "BS3-tokio-spawn-nonpie-large-stdout",
-        m::subcmd_bs3_tokio_spawn_nonpie_large_stdout
-    );
-
-    for &launcher in M_LAUNCHERS {
-        for &(id_prefix, subcommand, marker, timeout_secs) in M_VARIANTS {
-            for &target_bt in crate::BinaryType::ALL {
-                let launcher_s = launcher.to_string();
-                let subcommand_s: String = subcommand.into();
-                let marker_s: String = marker.into();
-                let target_label = target_bt.label();
-                let test_id = format!("{id_prefix}.{launcher_s}.{target_label}");
-                reg.test("fork", "minimal_canary", test_id)
-                    .timeout(timeout_secs + 10)
-                    .build(move |cx| {
-                        let handle = cx.require(launcher);
-                        Box::new(move |run| {
-                            let l = launcher_s.clone();
-                            let sc = subcommand_s.clone();
-                            let m = marker_s.clone();
-                            let self_exe = run.self_exe().to_string();
-                            Box::pin(async move {
-                                let target = crate::binary_path(target_bt, &self_exe);
-                                // Inject the target binary path into
-                                // the M/BS subcommand via the
-                                // `LITEBOX_M_TARGET_BINARY` env var.
-                                let resp = run
-                                    .typed_or_error(
-                                        &handle,
-                                        &EXEC,
-                                        ExecArgs {
-                                            args: vec![self_exe, sc],
-                                            timeout_secs: Some(timeout_secs),
-                                            stdin: None,
-                                            background: false,
-                                            env: vec![("LITEBOX_M_TARGET_BINARY".into(), target)],
-                                        },
-                                    )
-                                    .await;
-                                let pass = matches!(
-                                    &resp,
-                                    Response::ExecResult { exit_code: 0, stdout, .. }
-                                        if stdout.contains(m.as_str())
-                                );
-                                super::TestOutcome::new(&l, pass, format!("{resp:?}"))
-                            })
-                        })
-                    });
-            }
-        }
-    }
 }
