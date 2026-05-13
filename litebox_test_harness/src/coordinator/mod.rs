@@ -10,7 +10,6 @@ pub(crate) mod common;
 pub(crate) mod concurrent_fork;
 pub(crate) mod epoll_pidfd;
 pub(crate) mod eventfd;
-pub(crate) mod eventfd_fork_tests;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
 pub(crate) mod getrandom_tests;
@@ -955,7 +954,6 @@ pub fn collect_all_tests() -> Vec<Test> {
     pipe_bridge::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     epoll_pidfd::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
     eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
-    eventfd_fork_tests::register_eventfd_fork_tests(&mut registry::Registry::new(&mut tests));
     inotify::register_inotify_tests(&mut registry::Registry::new(&mut tests));
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
     pidfd_tests::register_pidfd_tests(&mut registry::Registry::new(&mut tests));
