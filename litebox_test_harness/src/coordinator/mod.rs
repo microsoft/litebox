@@ -929,7 +929,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     epoll_pidfd::register_poll_ready_tests(&mut registry::Registry::new(&mut tests));
     sockopt::register_bind_getsockname_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_pair_id_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_exit_data_integrity_tests(&mut registry::Registry::new(&mut tests));
+    special_cases::register_exit_data_integrity_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_nonpie_pipe_chain_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bpipe_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_cross_worker_first_connect_tests(&mut registry::Registry::new(

@@ -595,8 +595,6 @@ async fn handle_close_inherited(
 // category gets a section divider immediately above its `register_*`
 // function (POLL, PID, EXITD, NPIPE, …).
 
-const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
-
 const NPIPE_REPS: &[usize] = &[1, 5, 10];
 // Pipe-bridge churn ("npipe") fan-out parents. Each entry is a
 // long-lived agent the test runs in; the agent's binary type
@@ -639,56 +637,6 @@ pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
                     })
                 })
             });
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// EXITD: bridge thread join before exit (fix 2def3ac6)
-// ═══════════════════════════════════════════════════════════════════
-
-pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
-    register_pf_specific_handlers();
-    for &size in EXIT_SIZES {
-        for &binary in crate::BinaryType::ALL {
-            for &agent in DEPTH_AGENTS {
-                let agent_s = agent.to_string();
-                let binary_label = binary.label();
-                reg.test(
-                    "fork",
-                    "exit_data_integrity",
-                    format!("EXITD.{size}.{binary_label}.{agent}"),
-                )
-                .timeout(60)
-                .build(move |cx| {
-                    let leaf = cx.declare_ephemeral(
-                        agent,
-                        format!("ExitData_{size}_{binary_label}_{agent}"),
-                        SpawnKind::Fork {
-                            binary: fork_binary_label(binary),
-                            inherit_listen_ports: vec![],
-                        },
-                    );
-                    Box::new(move |run| {
-                        let a = agent_s.clone();
-                        Box::pin(async move {
-                            let result = run
-                                .run_leaf(
-                                    &leaf,
-                                    &super::common::WRITE_THEN_EXIT,
-                                    super::common::WriteThenExitArgs { size },
-                                )
-                                .await;
-                            let pass = matches!(&result, Ok(out) if out.data.len() == size);
-                            let detail = match &result {
-                                Ok(out) => format!("got {} bytes, expected {size}", out.data.len()),
-                                Err(e) => e.clone(),
-                            };
-                            super::TestOutcome::new(&a, pass, detail)
-                        })
-                    })
-                });
-            }
-        }
     }
 }
 
