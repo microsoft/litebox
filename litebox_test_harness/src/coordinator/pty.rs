@@ -199,6 +199,11 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(RESIZE, handle_resize);
     register_handler!(EXEC_SHELL_SESSION, handle_exec_shell_session);
 
+    crate::register_leaf_subcommand!("pty-tiocgpgrp", leaf_subcmd::subcmd_pty_tiocgpgrp);
+    crate::register_leaf_subcommand!("pty-tiocspgrp", leaf_subcmd::subcmd_pty_tiocspgrp);
+    crate::register_leaf_subcommand!("pty-tiocsctty", leaf_subcmd::subcmd_pty_tiocsctty);
+    crate::register_leaf_subcommand!("pty-resize", leaf_subcmd::subcmd_pty_resize);
+
     for &agent in PTY_AGENTS {
         for def in PTY_SCENARIOS {
             // Per-binary-type scenarios fan out across BinaryType::ALL;
@@ -340,5 +345,97 @@ fn check_detail(out: &PtyOut) -> Result<String, String> {
         Err("empty pty detail".into())
     } else {
         Ok(out.detail.clone())
+    }
+}
+
+/// Argv-dispatched leaf programs invoked by the PTY tests via `EXEC_BIN { argv: [bt, "pty-…"] }`.
+/// These cannot be handlers because the child's stdin must BE the PTY slave (set up by the parent
+/// before execve via openpty + dup2), and an agent's stdin is its protocol pipe.
+mod leaf_subcmd {
+    use std::io::Write as _;
+
+    static PTY_SIGWINCH_SEEN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" fn pty_sigwinch_handler(_: i32) {
+        PTY_SIGWINCH_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(super) fn subcmd_pty_tiocgpgrp(_args: &[String]) -> i32 {
+        let mut pgrp: libc::pid_t = 0;
+        // SAFETY: TIOCGPGRP writes a pid_t to the provided pointer for fd 0.
+        if unsafe { libc::ioctl(0, libc::TIOCGPGRP, &mut pgrp) } != 0 {
+            eprintln!("TIOCGPGRP failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        println!("TIOCGPGRP pgrp={pgrp}");
+        0
+    }
+
+    pub(super) fn subcmd_pty_tiocspgrp(_args: &[String]) -> i32 {
+        // SAFETY: getpgrp has no preconditions.
+        let pgrp = unsafe { libc::getpgrp() };
+        let mut set = pgrp;
+        // SAFETY: TIOCSPGRP reads a pid_t from the provided pointer for fd 0.
+        if unsafe { libc::ioctl(0, libc::TIOCSPGRP, &mut set) } != 0 {
+            eprintln!("TIOCSPGRP failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        let mut got: libc::pid_t = 0;
+        // SAFETY: TIOCGPGRP writes a pid_t to the provided pointer for fd 0.
+        if unsafe { libc::ioctl(0, libc::TIOCGPGRP, &mut got) } != 0 {
+            eprintln!(
+                "TIOCGPGRP after set failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        println!("TIOCSPGRP pgrp={pgrp} got={got}");
+        0
+    }
+
+    pub(super) fn subcmd_pty_tiocsctty(_args: &[String]) -> i32 {
+        let path = std::ffi::CString::new("/dev/tty").expect("static path");
+        // SAFETY: open reads a valid nul-terminated static path.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            eprintln!("open /dev/tty failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        let msg = b"TTY_OK\n";
+        // SAFETY: msg is valid readable memory and fd is a live /dev/tty fd.
+        let rc = unsafe { libc::write(fd, msg.as_ptr().cast(), msg.len()) };
+        // SAFETY: fd is owned by this process and no longer used.
+        let _ = unsafe { libc::close(fd) };
+        if rc != msg.len() as isize {
+            eprintln!("write /dev/tty failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        0
+    }
+
+    pub(super) fn subcmd_pty_resize(_args: &[String]) -> i32 {
+        PTY_SIGWINCH_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: installing a simple signal handler function for SIGWINCH.
+        unsafe {
+            libc::signal(
+                libc::SIGWINCH,
+                pty_sigwinch_handler as *const () as libc::sighandler_t,
+            );
+        }
+        println!("READY");
+        let _ = std::io::stdout().flush();
+        while !PTY_SIGWINCH_SEEN.load(std::sync::atomic::Ordering::SeqCst) {
+            // SAFETY: pause waits for a signal; EINTR is expected after SIGWINCH.
+            unsafe { libc::pause() };
+        }
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: TIOCGWINSZ writes winsize to the provided pointer for fd 0.
+        if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } != 0 {
+            eprintln!("TIOCGWINSZ failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        println!("RESIZE rows={} cols={}", ws.ws_row, ws.ws_col);
+        0
     }
 }

@@ -553,6 +553,56 @@ New primitives are acceptable only when:
 
 If a handler would suffice, write the handler.
 
+### Two surfaces for test-side code: handler + (rarely) argv subcommand
+
+**Handler is the default for test logic.** Most tests now use the
+`run.run_leaf(&leaf, &TOKEN, args)` pattern to spawn an ephemeral
+leaf agent of a chosen binary type (`SpawnKind::Fork{binary=bt, …}`)
+and invoke a registered handler on it. The handler body lives in
+`coordinator/<family>.rs` alongside the test that drives it, and the
+fork+exec round-trip across binary types is exercised by
+`Command::Fork{binary}` exactly as it was when the leaf was an argv
+subcommand.
+
+**Argv subcommands are an escape hatch** for the small set of leaf
+programs that cannot be handlers because the test specifically needs
+*fresh-process* semantics that an agent cannot model:
+
+- PTY tests: the child's stdin must BE a PTY slave (set up by the
+  parent via `openpty` + `dup2` before `execve`); an agent's stdin
+  is its protocol pipe.
+- Stdio-inheritance tests: the test verifies bytes flow through
+  `fork+exec` stdio in a specific way (e.g., capture-pipe, the
+  M1-M4/BS1-BS3 minimal canaries); the agent owns those pipes.
+- Long-running probes (`wait-forever`): would jam an agent loop.
+- Bash-child invocations: a leaf invoked by `bash -c "{exe} subcmd"`
+  inside a `common::BASH` pipeline runs as a non-protocol child by
+  definition; the parent of that exec is bash, not an agent.
+
+These leaves live in `mod leaf_subcmd` blocks inside the family file
+(or a sibling submodule, e.g.
+`coordinator/platform_fixes_leaf_subcmd.rs` for the M/BS canaries),
+each with a doc-comment naming **why** this leaf cannot be a handler.
+They are registered via `register_leaf_subcommand!("name", fn)` from
+the family's `register_*(reg)` function and dispatched at process
+entry by `coordinator::leaf_subcommand::dispatch`. `main.rs` is
+purely a router: 3 dispatcher arms (`spawn-tree`, `agent`,
+`agent-listen`) + a one-line registry lookup + a catch-all error.
+
+#### Authoring a new test
+
+1. Pick the family that owns the behaviour (existing
+   `coordinator/<family>.rs`).
+2. Default to a handler: `register_handler!(TOKEN, fn)`; drive it
+   via `run.send_named_typed(handle, &TOKEN, args)` (single agent),
+   `run.rendezvous_pair(...)` (multi-agent), or
+   `run.run_leaf(&leaf, &TOKEN, args)` (ephemeral leaf agent of a
+   chosen binary type).
+3. Only if the test specifically requires fresh-process semantics
+   from the categories above, write an argv leaf instead. Use
+   `register_leaf_subcommand!("name", fn)` and add a doc-comment
+   explaining why.
+
 
 
 **Self-contained tests** depend only on bash and the test harness binaries.

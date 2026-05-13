@@ -1,0 +1,584 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Filesystem and pipe-lifecycle special-case argv leaves.
+
+use super::*;
+
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use serde::{Deserialize, Serialize};
+use std::process::{Command as StdCommand, Stdio};
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct LeafArgs {
+    pub sub: String,
+    pub extra: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct LeafOut {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+use std::io::Write;
+
+pub fn run(sub: &str, args: &[String]) -> i32 {
+    match sub {
+        "io" => {
+            let op = args.get(3).map_or("write-read", String::as_str);
+            let path = args.get(4).map_or("/tmp/fs-test.txt", String::as_str);
+            test_io(op, path)
+        }
+        "exec-write" => {
+            let bin_type = args.get(3).map_or("pie", String::as_str);
+            let path = args.get(4).map_or("/tmp/fs-exec.txt", String::as_str);
+            test_exec_write(bin_type, path)
+        }
+        // fs-test exec-open-read <binary-type> <path>
+        // Fork+exec child that writes AND keeps fd open; parent reads while child alive.
+        "exec-open-read" => {
+            let bin_type = args.get(3).map_or("pie", String::as_str);
+            let path = args.get(4).map_or("/tmp/fs-open.txt", String::as_str);
+            test_exec_open_read(bin_type, path)
+        }
+        // Diagnostic: pinpoint where exec-open-read hangs
+        // Helper: write to file then sleep (keeps process alive with file written)
+        "do-write-sleep" => {
+            let path = args.get(3).map_or("/tmp/fs-open.txt", String::as_str);
+            let data = args.get(4).map_or("OPEN_WRITE_DATA", String::as_str);
+            std::fs::write(path, data.as_bytes()).unwrap_or_else(|e| {
+                eprintln!("do-write-sleep: write failed: {e}");
+                std::process::exit(1);
+            });
+            // Keep alive so the parent can read while we're still running
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            0
+        }
+        // Called by exec-write to actually write the file
+        "do-write" => {
+            let path = args.get(3).map_or("/tmp/fs-exec.txt", String::as_str);
+            let data = args.get(4).map_or("EXEC_WRITE_DATA", String::as_str);
+            match std::fs::write(path, data.as_bytes()) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("do-write: {e}");
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!("fs-test subcommands: io, exec-write, do-write");
+            1
+        }
+    }
+}
+
+/// Fork+exec a binary to write a file, then read it from the parent.
+fn test_exec_write(bin_type: &str, path: &str) -> i32 {
+    let _ = std::fs::remove_file(path);
+    let self_exe = std::env::current_exe().unwrap();
+    let self_exe = self_exe.to_str().unwrap();
+    let data = "EXEC_WRITE_OK";
+
+    let child = match bin_type {
+        "pie" => std::process::Command::new(self_exe)
+            .args(["fs-test", "do-write", path, data])
+            .output(),
+        "nonpie" => {
+            let bin = crate::nonpie_binary();
+            std::process::Command::new(&bin)
+                .args(["fs-test", "do-write", path, data])
+                .output()
+        }
+        other => {
+            println!("FS_ERR:op=exec-write,unknown_bin_type={other}");
+            return 1;
+        }
+    };
+
+    match child {
+        Ok(out) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            println!(
+                "FS_ERR:op=exec-write,bin={bin_type},path={path},exit={},err={}",
+                out.status.code().unwrap_or(-1),
+                stderr.lines().next().unwrap_or("")
+            );
+            return 1;
+        }
+        Err(e) => {
+            println!("FS_ERR:op=exec-write,bin={bin_type},path={path},spawn_err={e}");
+            return 1;
+        }
+        _ => {}
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(s) if s == data => {
+            println!("FS_OK:op=exec-write,bin={bin_type},path={path}");
+            0
+        }
+        Ok(s) => {
+            println!(
+                "FS_ERR:op=exec-write,bin={bin_type},path={path},got={}",
+                s.escape_default()
+            );
+            1
+        }
+        Err(e) => {
+            println!("FS_ERR:op=exec-write,bin={bin_type},path={path},read_err={e}");
+            1
+        }
+    }
+}
+
+/// Fork+exec child that writes AND keeps running; parent reads while child alive.
+/// This is the exact pre-warm pattern — tests 9P coherence for open files on remote workers.
+fn test_exec_open_read(bin_type: &str, path: &str) -> i32 {
+    let _ = std::fs::remove_file(path);
+    let self_exe = std::env::current_exe().unwrap();
+    let self_exe = self_exe.to_str().unwrap();
+    let data = "OPEN_READ_DATA";
+
+    let bin = match bin_type {
+        "pie" => self_exe.to_string(),
+        "nonpie" => crate::nonpie_binary(),
+        other => {
+            println!("FS_ERR:op=exec-open-read,unknown_bin_type={other}");
+            return 1;
+        }
+    };
+
+    // Spawn child that writes then sleeps (keeps process alive).
+    // Use null stdout/stderr so the child doesn't hold the parent's
+    // piped stdout open (which would prevent the agent from reading EOF).
+    let mut child = match std::process::Command::new(&bin)
+        .args(["fs-test", "do-write-sleep", path, data])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            println!("FS_ERR:op=exec-open-read,bin={bin_type},path={path},spawn_err={e}");
+            return 1;
+        }
+    };
+
+    // Wait for child to write the file
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Read while child still alive — print result BEFORE kill/wait
+    let result = std::fs::read_to_string(path);
+    match &result {
+        Ok(s) if s == data => {
+            println!("FS_OK:op=exec-open-read,bin={bin_type},path={path}");
+        }
+        Ok(s) => {
+            println!(
+                "FS_ERR:op=exec-open-read,bin={bin_type},path={path},got={}",
+                s.escape_default()
+            );
+        }
+        Err(e) => {
+            println!("FS_ERR:op=exec-open-read,bin={bin_type},path={path},read_err={e}");
+        }
+    }
+
+    // Clean up — kill may hang on wait, so don't block on it
+    let _ = child.kill();
+    // Don't call child.wait() — it can hang in litebox
+    result.map_or(1, |s| i32::from(s != data))
+}
+
+#[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
+fn test_io(op: &str, path: &str) -> i32 {
+    let _ = std::fs::remove_file(path);
+    match op {
+        // FS1: Simple write then read (same process, sequential)
+        "write-read" => {
+            std::fs::write(path, b"FS_DATA_42").unwrap_or_else(|e| {
+                println!("FS_ERR:op={op},path={path},phase=write,err={e}");
+                std::process::exit(1);
+            });
+            match std::fs::read_to_string(path) {
+                Ok(s) if s == "FS_DATA_42" => {
+                    println!("FS_OK:op={op},path={path}");
+                    0
+                }
+                Ok(s) => {
+                    println!("FS_ERR:op={op},path={path},phase=read,got={s}");
+                    1
+                }
+                Err(e) => {
+                    println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                    1
+                }
+            }
+        }
+        // FS2: Append then read
+        "append-read" => {
+            std::fs::write(path, b"LINE1\n").unwrap_or_else(|e| {
+                println!("FS_ERR:op={op},path={path},phase=write1,err={e}");
+                std::process::exit(1);
+            });
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap_or_else(|e| {
+                    println!("FS_ERR:op={op},path={path},phase=open-append,err={e}");
+                    std::process::exit(1);
+                });
+            f.write_all(b"LINE2\n").unwrap();
+            drop(f);
+            match std::fs::read_to_string(path) {
+                Ok(s) if s == "LINE1\nLINE2\n" => {
+                    println!("FS_OK:op={op},path={path}");
+                    0
+                }
+                Ok(s) => {
+                    println!(
+                        "FS_ERR:op={op},path={path},phase=read,got={}",
+                        s.escape_default()
+                    );
+                    1
+                }
+                Err(e) => {
+                    println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                    1
+                }
+            }
+        }
+        // FS3: Write in background thread, read from main thread (concurrent)
+        "write-bg-read" => {
+            let p = path.to_string();
+            let handle = std::thread::spawn(move || {
+                let mut f = std::fs::File::create(&p).unwrap();
+                f.write_all(b"BG_DATA").unwrap();
+                f.sync_all().unwrap();
+            });
+            handle.join().unwrap();
+            // Writer is done and joined — file should be readable
+            match std::fs::read_to_string(path) {
+                Ok(s) if s == "BG_DATA" => {
+                    println!("FS_OK:op={op},path={path}");
+                    0
+                }
+                Ok(s) => {
+                    println!("FS_ERR:op={op},path={path},phase=read,got={s}");
+                    1
+                }
+                Err(e) => {
+                    println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                    1
+                }
+            }
+        }
+        // FS4: Shell redirect (like code-server pre-warm) — background write, foreground read
+        // This is the exact pattern: `cmd > file &` then `cat file`
+        "redirect-bg-read" => {
+            let p = path.to_string();
+            // Write via a child process with stdout redirected to file
+            let child = std::process::Command::new("/usr/bin/bash")
+                .args(["-c", &format!("echo REDIRECT_DATA > {p}")])
+                .output();
+            match child {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    println!(
+                        "FS_ERR:op={op},path={path},phase=write,exit={}",
+                        out.status.code().unwrap_or(-1)
+                    );
+                    return 1;
+                }
+                Err(e) => {
+                    println!("FS_ERR:op={op},path={path},phase=spawn,err={e}");
+                    return 1;
+                }
+            }
+            match std::fs::read_to_string(path) {
+                Ok(s) if s.trim() == "REDIRECT_DATA" => {
+                    println!("FS_OK:op={op},path={path}");
+                    0
+                }
+                Ok(s) => {
+                    println!(
+                        "FS_ERR:op={op},path={path},phase=read,got={}",
+                        s.escape_default()
+                    );
+                    1
+                }
+                Err(e) => {
+                    println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                    1
+                }
+            }
+        }
+        // FS5: Fork child writes, parent reads (cross-process, still open fd)
+        "fork-write-read" => {
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                println!("FS_ERR:op={op},path={path},phase=fork");
+                return 1;
+            }
+            if pid == 0 {
+                // Child: write to file and exit
+                match std::fs::write(path, b"FORK_DATA") {
+                    Ok(()) => std::process::exit(0),
+                    Err(_) => std::process::exit(1),
+                }
+            }
+            // Parent: wait for child, then read
+            let mut status: i32 = 0;
+            unsafe { libc::waitpid(pid, &raw mut status, 0) };
+            match std::fs::read_to_string(path) {
+                Ok(s) if s == "FORK_DATA" => {
+                    println!("FS_OK:op={op},path={path}");
+                    0
+                }
+                Ok(s) => {
+                    println!("FS_ERR:op={op},path={path},phase=read,got={s}");
+                    1
+                }
+                Err(e) => {
+                    println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                    1
+                }
+            }
+        }
+        // FS6: Background process writes to file via redirect, WHILE file is still open,
+        // another process reads. This is the exact code-server pre-warm pattern.
+        "bg-open-read" => {
+            let p = path.to_string();
+            // Start a background writer that keeps the file open.
+            // Intentionally never wait()ed — wait can hang under
+            // litebox; we kill() before returning.
+            #[allow(clippy::zombie_processes)]
+            let mut child = std::process::Command::new("/usr/bin/bash")
+                .args([
+                    "-c",
+                    &format!("echo LINE1 > {p}; sleep 1; echo LINE2 >> {p}; sleep 5"),
+                ])
+                .spawn()
+                .unwrap_or_else(|e| {
+                    println!("FS_ERR:op={op},path={path},phase=spawn,err={e}");
+                    std::process::exit(1);
+                });
+
+            // Wait for first line to be written
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            // Try to read while writer still has file open
+            let result = std::fs::read_to_string(path);
+
+            // Print result BEFORE kill/wait (wait can hang in litebox)
+            let rc = match &result {
+                Ok(s) if s.contains("LINE1") => {
+                    println!(
+                        "FS_OK:op={op},path={path},content={}",
+                        s.trim().escape_default()
+                    );
+                    0
+                }
+                Ok(s) => {
+                    println!(
+                        "FS_ERR:op={op},path={path},phase=read,got={}",
+                        s.escape_default()
+                    );
+                    1
+                }
+                Err(e) => {
+                    println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                    1
+                }
+            };
+
+            let _ = child.kill();
+            rc
+        }
+        // FS7: Parent opens file for writing, forks, child writes via inherited fd,
+        // parent reads. This is the pre-warm pattern: bash opens log.txt with >,
+        // backgrounds code-server (fork), child writes to inherited stdout=log.txt,
+        // later the CLI reads log.txt.
+        "parent-open-fork-read" => {
+            let f = std::fs::File::create(path).unwrap_or_else(|e| {
+                println!("FS_ERR:op={op},path={path},phase=create,err={e}");
+                std::process::exit(1);
+            });
+            let fd = {
+                use std::os::unix::io::AsRawFd;
+                f.as_raw_fd()
+            };
+
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                println!("FS_ERR:op={op},path={path},phase=fork");
+                return 1;
+            }
+            if pid == 0 {
+                // Child: write to inherited fd, then sleep (keep fd open)
+                let msg = b"CHILD_WROTE_THIS\n";
+                unsafe { libc::write(fd, msg.as_ptr().cast(), msg.len()) };
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                std::process::exit(0);
+            }
+
+            // Parent: close our copy of the write fd, wait a bit, then read
+            drop(f);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            let result = std::fs::read_to_string(path);
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            match result {
+                Ok(s) if s.contains("CHILD_WROTE_THIS") => {
+                    println!("FS_OK:op={op},path={path}");
+                    0
+                }
+                Ok(s) => {
+                    println!(
+                        "FS_ERR:op={op},path={path},phase=read,got={}",
+                        s.escape_default()
+                    );
+                    1
+                }
+                Err(e) => {
+                    println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                    1
+                }
+            }
+        }
+        other => {
+            println!("FS_ERR:unknown_op={other}");
+            1
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(super) const RUN: HandlerToken<LeafArgs, LeafOut> = HandlerToken::new("special_cases.fs.run");
+
+#[allow(dead_code)]
+pub(super) async fn handle_run(
+    args: LeafArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<LeafOut, HandlerError> {
+    let output = StdCommand::new(std::env::current_exe()?)
+        .arg("fs-test")
+        .arg(args.sub)
+        .args(args.extra)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    Ok(LeafOut {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+/// Register argv leaves used by exec-driven filesystem/pipe-lifecycle tests.
+pub(super) fn register() {
+    crate::register_handler!(RUN, handle_run);
+    crate::register_leaf_subcommand!("fs-test", subcmd_fs_test);
+}
+
+fn subcmd_fs_test(args: &[String]) -> i32 {
+    run(args.get(2).map_or("help", String::as_str), args)
+}
+
+/// Register FS I/O matrix tests.
+pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
+    register();
+    let ops: &[&str] = &[
+        "write-read",
+        "append-read",
+        "write-bg-read",
+        "redirect-bg-read",
+        "fork-write-read",
+        "bg-open-read",
+        "parent-open-fork-read",
+    ];
+    let paths: &[(&str, &str)] = &[("/tmp/fs-test.txt", "tmp"), ("/root/fs-test.txt", "root")];
+
+    for &op in ops {
+        for &(path, dir) in paths {
+            for &bt in crate::BinaryType::ALL {
+                let id = format!("FS.{op}.{dir}.{}", bt.label());
+                let op = op.to_string();
+                let path = path.to_string();
+                typed_test!(
+                    reg,
+                    "matrix",
+                    "fs_io",
+                    id,
+                    timeout = 60,
+                    agents[a = AgentName::Dpg1],
+                    |run| {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(bt, &self_exe);
+                        let resp = run
+                            .send_named_typed(
+                                &a,
+                                &EXEC_BIN,
+                                ExecBinArgs {
+                                    argv: vec![target, "fs-test".into(), "io".into(), op, path],
+                                    timeout_ms: Some(15 * 1000),
+                                    stdin: None,
+                                    env: vec![],
+                                },
+                            )
+                            .await;
+                        let pass = matches!(&resp, Ok(out) if out.stdout.contains("FS_OK"));
+                        crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    }
+                );
+            }
+        }
+    }
+
+    for &mode in &["exec-write", "exec-open-read"] {
+        let prefix = if mode == "exec-write" { "exec" } else { "open" };
+        for &bin in &["pie", "nonpie"] {
+            for &bt in crate::BinaryType::ALL {
+                let path = "/tmp/fs-exec.txt";
+                let pname = "fs-exec.txt";
+                let id = format!("FS.{prefix}_{bin}_{pname}.{}", bt.label());
+                let mode = mode.to_string();
+                let bin = bin.to_string();
+                let path = path.to_string();
+                typed_test!(
+                    reg,
+                    "matrix",
+                    "fs_io",
+                    id,
+                    timeout = 60,
+                    agents[a = AgentName::Dpg1],
+                    |run| {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(bt, &self_exe);
+                        let resp = run
+                            .send_named_typed(
+                                &a,
+                                &EXEC_BIN,
+                                ExecBinArgs {
+                                    argv: vec![target, "fs-test".into(), mode, bin, path],
+                                    timeout_ms: Some(30 * 1000),
+                                    stdin: None,
+                                    env: vec![],
+                                },
+                            )
+                            .await;
+                        let pass = matches!(&resp, Ok(out) if out.stdout.contains("FS_OK"));
+                        crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    }
+                );
+            }
+        }
+    }
+}

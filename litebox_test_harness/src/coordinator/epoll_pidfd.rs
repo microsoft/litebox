@@ -361,6 +361,8 @@ fn spawn_tcp_echo_task(
 }
 
 pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
+    crate::register_leaf_subcommand!("wait-forever", leaf_subcmd::subcmd_wait_forever);
+
     register_handler!(PIDFD_EXIT, handle_pidfd_exit);
     register_handler!(MULTI_SOCKET, handle_multi_socket);
     register_handler!(EVENTFD_WAKEUP, handle_eventfd_wakeup);
@@ -562,4 +564,13 @@ fn ready_socket_ids(events: &[EpollEvent]) -> Vec<u64> {
 
 fn has_in(event: &EpollEvent) -> bool {
     event.observed_events.split('|').any(|part| part == "in")
+}
+
+/// Argv-dispatched leaf subcommands. `wait-forever` stays as a subcommand because it blocks indefinitely — converting it to an agent handler would jam the agent loop.
+mod leaf_subcmd {
+    pub(super) fn subcmd_wait_forever(_args: &[String]) -> i32 {
+        loop {
+            std::thread::park();
+        }
+    }
 }
