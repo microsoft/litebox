@@ -231,11 +231,12 @@ fn crng_seed_from_prk_and_rdrand(
     prk: &[u8; PRK_LEN],
     rdrand_seed: <rand_chacha::ChaCha20Rng as SeedableRng>::Seed,
 ) -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(b"litebox-lvbs-crng-seed-v1");
-    hasher.update(prk);
-    hasher.update(rdrand_seed);
-    hasher.finalize().into()
+    sha2::Sha256::new()
+        .chain_update(b"litebox-lvbs-crng-seed-v1")
+        .chain_update(prk)
+        .chain_update(rdrand_seed)
+        .finalize()
+        .into()
 }
 
 fn crng_reseed_from_rdrand_and_state(
@@ -243,12 +244,13 @@ fn crng_reseed_from_rdrand_and_state(
     reseed_counter: usize,
     current_state: &[u8; CRNG_RESEED_STATE_BYTES],
 ) -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(b"litebox-lvbs-crng-reseed-v1");
-    hasher.update(rdrand_seed);
-    hasher.update(reseed_counter.to_le_bytes());
-    hasher.update(current_state);
-    hasher.finalize().into()
+    sha2::Sha256::new()
+        .chain_update(b"litebox-lvbs-crng-reseed-v1")
+        .chain_update(rdrand_seed)
+        .chain_update(reseed_counter.to_le_bytes())
+        .chain_update(current_state)
+        .finalize()
+        .into()
 }
 
 pub struct HostLvbsInterface;
