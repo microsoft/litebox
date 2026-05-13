@@ -579,15 +579,40 @@ programs that cannot be handlers because the test specifically needs
   inside a `common::BASH` pipeline runs as a non-protocol child by
   definition; the parent of that exec is bash, not an agent.
 
-These leaves live in `mod leaf_subcmd` blocks inside the family file
-(or a sibling submodule, e.g.
-`coordinator/platform_fixes_leaf_subcmd.rs` for the M/BS canaries),
+These leaves live in `mod leaf_subcmd` blocks inside the family file,
 each with a doc-comment naming **why** this leaf cannot be a handler.
 They are registered via `register_leaf_subcommand!("name", fn)` from
 the family's `register_*(reg)` function and dispatched at process
 entry by `coordinator::leaf_subcommand::dispatch`. `main.rs` is
 purely a router: 3 dispatcher arms (`spawn-tree`, `agent`,
 `agent-listen`) + a one-line registry lookup + a catch-all error.
+
+#### Topical layout (post-Wave-9)
+
+Tests are organized by *subject*, not by historical bug-fix arc.
+Each `coordinator/<topic>.rs` hosts one or more related test-prefix
+families:
+
+| Topic file                              | Hosted test prefixes                          |
+|-----------------------------------------|-----------------------------------------------|
+| `concurrent_fork.rs`                    | `CF.*`, `CC.*`                                |
+| `epoll_pidfd.rs`                        | `EPI.*`, `EP.*`, `POLL.*`                     |
+| `fork_matrix.rs`                        | `X*`, `BSF`, `PIF`, `SXF`, `BASH.*`, `FWE.*`, `SK.*` |
+| `pipe_bridge.rs`                        | `PB.*`, `PN.*`, `PID.*`, `NPIPE.*`, `BPIPE.*` |
+| `tcp_state.rs`                          | `TCS.*`, `THC.*`, `TLB.*`, `XCONN.*`, `FKLC.*` |
+| `vscode_shape.rs`                       | `VS.*`, `CSM.*`                               |
+| `sockopt.rs`                            | `SOCKOPT.*`, `GSN.*`                          |
+| `shell.rs` *(new)*                      | `SP.*`, `SC.*`, `TR.*`, `FR.*`, `BR.*`, `BRS.*` |
+| `special_cases/exit.rs`                 | exit semantics, `EXITD.*`                     |
+| `special_cases/fs.rs`                   | filesystem misc, `CWF.*`                      |
+| `special_cases/proc.rs` *(new)*         | `/proc` reads, `PROC.*`, `KP.*`, `KPX.*`      |
+| `platform_fixes.rs`                     | minimal_canary (M*/BS*) + shared helpers      |
+
+`platform_fixes.rs` is now small and houses only the minimal_canary
+smoke test, the M1-M4 / BS1-BS3 leaf-subcommand canaries, and a few
+shared helpers (`AGENTS`, `DetailOut`, `fork_binary_label`,
+`register_pf_specific_handlers`) that the lifted families still
+reference.
 
 #### Authoring a new test
 
