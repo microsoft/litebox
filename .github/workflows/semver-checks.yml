@@ -1,7 +1,14 @@
 name: SemverChecks
 
-# Run on pull requests, merge groups, or if triggered manually
-on: [pull_request, merge_group, workflow_dispatch]
+# Run on pull requests or merge groups
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+  merge_group:
 
 # If a new commit is pushed to the branch before ongoing runs finish, cancel the ongoing runs
 concurrency:
@@ -27,8 +34,9 @@ jobs:
         id: baseline
         run: |
           BASE_REF="${{ github.event.pull_request.base.ref }}"
-          # Fallback for merge_group / workflow_dispatch where base.ref is empty
-          BASE_REF="${BASE_REF:-main}"
+          MERGE_GROUP_BASE_REF="${{ github.event.merge_group.base_ref }}"
+          MERGE_GROUP_BASE_REF="${MERGE_GROUP_BASE_REF#refs/heads/}"
+          BASE_REF="${BASE_REF:-$MERGE_GROUP_BASE_REF}"
           echo "ref=$BASE_REF" >> "$GITHUB_OUTPUT"
       - name: Fetch baseline branch
         run: git fetch origin "${{ steps.baseline.outputs.ref }}:${{ steps.baseline.outputs.ref }}"
@@ -88,8 +96,8 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           BASE_NOTE=""
-          if [ "${{ steps.baseline.outputs.ref }}" != "main" ]; then
-            BASE_NOTE=":information_source: **Note:** This semver check was run against the \`${{ steps.baseline.outputs.ref }}\` branch, not \`main\`.\n\n"
+          if [ "${{ steps.baseline.outputs.ref }}" != "main" ] && [ "${{ steps.baseline.outputs.ref }}" != "ulitebox" ]; then
+            BASE_NOTE=":information_source: **Note:** This semver check was run against the \`${{ steps.baseline.outputs.ref }}\` branch, not \`main\` or \`ulitebox\`.\n\n"
           fi
           curl -L \
           -X POST \
