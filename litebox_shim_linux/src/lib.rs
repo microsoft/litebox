@@ -1189,6 +1189,67 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }
         }
 
+        // Phase 2.F.3: Recreate EventFd entries that carry a broker_handle
+        // reference. Re-attach to the same broker handle via the local
+        // provider's `dup_handle` semantics — the parent already dup'd
+        // the handle at snapshot capture, so adopting the existing ref
+        // requires no additional refcount changes.
+        //
+        // Entries without `broker_handle` (e.g. Eventfd with no provider
+        // available at snapshot time, or Timerfd) fall through to a
+        // fresh local fd at the next branch.
+        {
+            use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::EventFd {
+                    continue;
+                }
+                let Some(broker_handle) = entry.metadata.broker_handle else {
+                    continue;
+                };
+                let event_file: Option<syscalls::eventfd::EventFile<Platform>> = match broker_handle
+                    .kind
+                {
+                    BrokerHandleKind::Eventfd => syscalls::eventfd::broker_eventfd_provider()
+                        .map(|provider| {
+                            syscalls::eventfd::EventFile::new_broker_backed(
+                                provider,
+                                broker_handle.handle_id,
+                                litebox_common_linux::EfdFlags::empty(),
+                            )
+                        }),
+                    BrokerHandleKind::Pidfd => {
+                        syscalls::eventfd::broker_pidfd_provider().map(|provider| {
+                            syscalls::eventfd::EventFile::new_pidfd_broker_backed(
+                                provider,
+                                broker_handle.handle_id,
+                                false,
+                            )
+                        })
+                    }
+                    BrokerHandleKind::Signalfd => None,
+                };
+                let Some(event_file) = event_file else {
+                    continue;
+                };
+                let file = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<syscalls::eventfd::EventfdSubsystem>(event_file);
+                let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
+                let success = rds.fd_into_specific_raw_integer(file, entry.fd);
+                debug_assert!(
+                    success,
+                    "eventfd fd slot {} occupied during restore",
+                    entry.fd
+                );
+            }
+        }
+
         // --- 11. Build credentials. -----------------------------------------
         let child_credentials = Arc::new(syscalls::process::Credentials {
             uid: id.credentials.uid,
@@ -3913,6 +3974,15 @@ struct ForkContext {
     /// When true, `commit_delayed_fork` must not replace the parent's
     /// pipe fds because the parent shares the grandparent's fd table.
     parent_is_delayed_fork: bool,
+    /// Phase 2.F: rollback list of broker handles dup'd during
+    /// fork-snapshot capture. Each entry represents a transit ref
+    /// held in the snapshot for the child to consume. On success
+    /// path the child's restore-side BrokerBacked adopts that ref
+    /// (entries dropped on `commit_delayed_fork` success). On
+    /// failure path we drain this list and call `release` on each
+    /// to undo the dup so the broker refcount returns to baseline.
+    fork_snapshot_broker_transit:
+        Vec<crate::syscalls::fork_snapshot::ForkSnapshotBrokerTransit>,
 }
 
 const SHELL_WRITE_SCAN_LEN: usize = 1024;

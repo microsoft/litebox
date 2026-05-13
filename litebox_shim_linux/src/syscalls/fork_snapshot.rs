@@ -298,6 +298,34 @@ impl BrokerHandleKind {
     }
 }
 
+/// Phase 2.F: rollback ledger entry for a broker handle dup'd into a
+/// fork snapshot. Held in `ForkContext.fork_snapshot_broker_transit`
+/// from snapshot capture until `commit_delayed_fork` completes.
+///
+/// On rollback (snapshot consumption failed): caller drains the list
+/// and invokes `release` to undo the `dup_handle` so the broker
+/// refcount returns to baseline.
+///
+/// Stored as `Arc<dyn BrokerSubscribable>` to be kind-agnostic — all
+/// broker provider traits extend `BrokerSubscribable` which exposes
+/// `release(handle)`.
+pub struct ForkSnapshotBrokerTransit {
+    pub releaser: alloc::sync::Arc<
+        dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+    >,
+    pub handle_id: u64,
+    pub kind: BrokerHandleKind,
+}
+
+impl core::fmt::Debug for ForkSnapshotBrokerTransit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ForkSnapshotBrokerTransit")
+            .field("kind", &self.kind)
+            .field("handle_id", &self.handle_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Classification of a file descriptor for export/import decisions.
 ///
 /// The first version supports only a narrow set; unsupported classes cause
