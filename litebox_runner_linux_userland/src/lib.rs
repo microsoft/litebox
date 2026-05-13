@@ -213,6 +213,16 @@ pub struct CliArgs {
     #[arg(long = "pipe-bridge", hide = true)]
     pub pipe_bridge: Vec<String>,
 
+    /// Internal: broker-backed eventfd bridge specs for worker-exec.
+    /// Each value has the format `guest_fd:kind:handle_id` where kind is
+    /// `eventfd`, `pidfd`, or `signalfd`. Used by Phase 2.F follow-up
+    /// to seed broker-backed EventFile entries at the right fd slots
+    /// before the worker binary runs, so cross-binary-type exec
+    /// inherits eventfd/pidfd state through the broker rather than
+    /// dropping it.
+    #[arg(long = "broker-eventfd-bridge", hide = true)]
+    pub broker_eventfd_bridge: Vec<String>,
+
     /// Internal: inherited socketpair fd for the stream multiplexer.
     #[arg(long = "mux-fd", hide = true, requires = "fork_restore")]
     pub mux_fd: Option<i32>,
@@ -2207,6 +2217,39 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             program
                 .entrypoints
                 .install_host_pipe_fd(bridge.guest_fd, bridge.host_fd, direction);
+        }
+
+        // Phase 2.F follow-up: install broker-backed EventFile entries for
+        // fds inherited across the cross-binary-type exec boundary. Specs
+        // are encoded as `guest_fd:kind:handle_id` on `--broker-eventfd-bridge`.
+        for spec in &cli_args.broker_eventfd_bridge {
+            let parts: Vec<&str> = spec.split(':').collect();
+            if parts.len() != 3 {
+                anyhow::bail!("broker-eventfd-bridge: bad spec {spec:?}");
+            }
+            let guest_fd: usize = parts[0]
+                .parse()
+                .map_err(|e| anyhow!("broker-eventfd-bridge: bad fd {:?}: {e}", parts[0]))?;
+            let kind = match parts[1] {
+                "eventfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Eventfd,
+                "pidfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Pidfd,
+                "signalfd" => {
+                    litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Signalfd
+                }
+                other => anyhow::bail!("broker-eventfd-bridge: bad kind {other:?}"),
+            };
+            let handle_id: u64 = parts[2]
+                .parse()
+                .map_err(|e| anyhow!("broker-eventfd-bridge: bad handle {:?}: {e}", parts[2]))?;
+            program
+                .entrypoints
+                .install_broker_eventfd_fd(guest_fd, kind, handle_id)
+                .map_err(|()| {
+                    anyhow!(
+                        "broker-eventfd-bridge: no provider for kind {:?} (spec {spec:?})",
+                        parts[1]
+                    )
+                })?;
         }
 
         run_program(

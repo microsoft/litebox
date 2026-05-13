@@ -223,6 +223,64 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         let ok = rds.fd_into_specific_raw_integer(pipe_fd, guest_fd);
         debug_assert!(ok, "install_mux_pipe_fd: slot {guest_fd} still occupied");
     }
+
+    /// Phase 2.F follow-up: install a broker-backed EventFile at the
+    /// given guest fd slot. Called by the runner during worker-exec
+    /// startup to reattach to a broker handle that the parent dup'd
+    /// before spawning the worker, so the worker sees the same
+    /// shared eventfd / pidfd state as the parent across the
+    /// cross-binary-type exec boundary.
+    ///
+    /// Returns `Err(())` if no broker provider is installed for the
+    /// requested kind (the worker will then have no fd at the slot
+    /// and the binary's read on it will fail with EBADF — a clean
+    /// failure mode for misconfigured workers).
+    pub fn install_broker_eventfd_fd(
+        &self,
+        guest_fd: usize,
+        kind: syscalls::fork_snapshot::BrokerHandleKind,
+        handle_id: u64,
+    ) -> Result<(), ()> {
+        use syscalls::fork_snapshot::BrokerHandleKind;
+        let event_file: syscalls::eventfd::EventFile<Platform> = match kind {
+            BrokerHandleKind::Eventfd => {
+                let provider = syscalls::eventfd::broker_eventfd_provider().ok_or(())?;
+                syscalls::eventfd::EventFile::new_broker_backed(
+                    provider,
+                    handle_id,
+                    litebox_common_linux::EfdFlags::empty(),
+                )
+            }
+            BrokerHandleKind::Pidfd => {
+                let provider = syscalls::eventfd::broker_pidfd_provider().ok_or(())?;
+                syscalls::eventfd::EventFile::new_pidfd_broker_backed(
+                    provider,
+                    handle_id,
+                    false,
+                )
+            }
+            BrokerHandleKind::Signalfd => return Err(()),
+        };
+        let typed_fd: litebox::fd::TypedFd<syscalls::eventfd::EventfdSubsystem> = self
+            .task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert(event_file);
+
+        let files = self.task.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+
+        // Remove any existing entry at the slot (stdio placeholder etc.).
+        let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+
+        let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
+        debug_assert!(
+            ok,
+            "install_broker_eventfd_fd: slot {guest_fd} still occupied"
+        );
+        Ok(())
+    }
 }
 
 impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {

@@ -1964,14 +1964,15 @@ impl<FS: ShimFS> Task<FS> {
             && (!flags.contains(CloneFlags::VM) || flags.contains(CloneFlags::VFORK));
 
         if is_fork {
-            // Keep fork-like clone3 on the native fallback path for now.  The
-            // thread-clone subset is supported below, but process creation via
-            // clone3 needs separate fd/stdio semantics from the legacy clone
-            // path and is better reported as unsupported than partially emulated.
-            if clone3 {
-                log_unsupported!("fork-like clone3");
-                return Err(Errno::ENOSYS);
-            }
+            // Phase 2.F follow-up: route fork-like clone3 through the same
+            // do_fork path as legacy clone. Without this, modern glibc's
+            // `fork()` (which goes via clone3) returns ENOSYS and falls
+            // back to no fork at all — blocking cross-binary-type
+            // tests like EV.fork_inherit.nonpie-glibc.
+            //
+            // The `clone3` flag is plumbed into do_fork so any clone3-
+            // specific accounting can branch on it; the actual fork
+            // semantics (fd table, stdio, vfork parking) are identical.
             return self.do_fork(ctx, args, flags, clone3);
         }
 
@@ -8940,7 +8941,85 @@ impl<FS: ShimFS> Task<FS> {
             usize,
             super::host_pipe::HostPipeDirection,
         )> = Vec::new();
+        // Phase 2.F follow-up: broker-backed EventFile bridges
+        // (guest_fd:kind:handle_id strings) for inherited eventfd /
+        // pidfd state. Each entry corresponds to one fd whose
+        // EventFile was promoted to broker-backed and a transit ref
+        // was dup'd. The worker reattaches via --broker-eventfd-bridge.
+        let mut broker_eventfd_specs: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let mut broker_eventfd_transit_release: alloc::vec::Vec<(
+            alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            >,
+            u64,
+        )> = alloc::vec::Vec::new();
         {
+            // Collect EventfdSubsystem fds (non-stdio) and promote each to
+            // broker-backed if not already. Skip on broker-provider absence
+            // (worker will have no fd at the slot, binary read → EBADF).
+            let eventfd_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::eventfd::EventfdSubsystem>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if raw_fd <= 2 || !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in eventfd_fds {
+                let eventfd_provider = super::eventfd::broker_eventfd_provider();
+                let pidfd_provider = super::eventfd::broker_pidfd_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let result = dt_local.with_entry(
+                    &typed,
+                    |ef: &super::eventfd::EventFile<crate::Platform>| {
+                        ef.ensure_broker_backed_for_fork(
+                            eventfd_provider.as_ref(),
+                            pidfd_provider.as_ref(),
+                        )
+                    },
+                );
+                drop(dt_local);
+                if let Some(Ok(Some((kind, handle_id)))) = result {
+                    use super::fork_snapshot::BrokerHandleKind;
+                    let kind_str = match kind {
+                        BrokerHandleKind::Eventfd => "eventfd",
+                        BrokerHandleKind::Pidfd => "pidfd",
+                        BrokerHandleKind::Signalfd => "signalfd",
+                    };
+                    let releaser: Option<
+                        alloc::sync::Arc<
+                            dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                        >,
+                    > = match kind {
+                        BrokerHandleKind::Eventfd => eventfd_provider
+                            .as_ref()
+                            .map(|p| alloc::sync::Arc::clone(p) as _),
+                        BrokerHandleKind::Pidfd => pidfd_provider
+                            .as_ref()
+                            .map(|p| alloc::sync::Arc::clone(p) as _),
+                        BrokerHandleKind::Signalfd => None,
+                    };
+                    if let Some(releaser) = releaser
+                        && releaser.dup_handle(handle_id).is_ok()
+                    {
+                        broker_eventfd_specs
+                            .push(alloc::format!("{raw_fd}:{kind_str}:{handle_id}"));
+                        broker_eventfd_transit_release.push((releaser, handle_id));
+                    }
+                }
+            }
+
             // Phase 1a: collect unix socket fds and pair_ids under read lock.
             let socket_info: Vec<(
                 usize,
@@ -9094,6 +9173,7 @@ impl<FS: ShimFS> Task<FS> {
                 // PIE parent's epoll interest after the remote handoff.
                 use_direct_stdio,
                 &extra_fds,
+                &broker_eventfd_specs,
             )
             .map_err(|_err| {
                 #[cfg(feature = "trace_syscalls")]
@@ -9112,6 +9192,11 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 for &(_, parent_fd, _, _) in &parent_pipe_replacements {
                     self.global.platform.close_host_fd(parent_fd);
+                }
+                // Release broker eventfd transit refs that the worker
+                // never adopted (spawn failed).
+                for (releaser, handle_id) in &broker_eventfd_transit_release {
+                    releaser.release(*handle_id);
                 }
                 signal_on_error(&vfork_info);
                 Errno::ENOMEM

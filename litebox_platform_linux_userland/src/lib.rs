@@ -1303,6 +1303,7 @@ impl LinuxUserland {
         stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
         direct_pipe_io: bool,
         extra_fds: &[(usize, i32)],
+        broker_eventfd_specs: &[alloc::string::String],
     ) -> Result<WorkerExecSpawnResult, i32>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -1452,6 +1453,15 @@ impl LinuxUserland {
             let _ = self.clear_cloexec(host_fd);
             spawn_argv.push(CString::new("--pipe-bridge").unwrap());
             spawn_argv.push(CString::new(format!("{guest_fd}:b:{guest_fd}")).map_err(|_| -1_i32)?);
+        }
+
+        // Phase 2.F follow-up: add --broker-eventfd-bridge for inherited
+        // broker-backed eventfd/pidfd entries. The parent has already
+        // promoted the local EventFile to broker-backed and dup'd the
+        // handle so the worker can reattach without racing on refcount.
+        for spec in broker_eventfd_specs {
+            spawn_argv.push(CString::new("--broker-eventfd-bridge").unwrap());
+            spawn_argv.push(CString::new(spec.as_bytes()).map_err(|_| -1_i32)?);
         }
 
         spawn_argv.push(CString::new("--").unwrap());
