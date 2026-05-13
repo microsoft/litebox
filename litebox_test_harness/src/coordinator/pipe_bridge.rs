@@ -1,20 +1,32 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Pipe bridge tests — extra pipe/socketpair fds across fork+exec.
+//! Pipe bridge tests — extra pipe/socketpair fds across fork+exec, plus
+//! pipe non-blocking, pipe pair-id, and non-PIE pipe chain tests.
 //!
-//! Tests the VS Code `child_process.fork()` pattern where extra pipes
-//! beyond stdio (fds 0-2) must survive exec.  In litebox, non-PIE exec
-//! goes through `exec_on_remote_host`, which currently only bridges
-//! unix socket fds.  Regular pipe fds are NOT bridged, causing the
-//! parent to block forever (the code-server ↔ ptyHost IPC bug).
+//! **Test families hosted here:**
 //!
-//! Test axes:
-//!   - Direction: child→parent (c2p), parent→child (p2c)
-//!   - Fd type: pipe (unidirectional), socketpair (bidirectional)
-//!   - Binary: PIE (in-process exec), non-PIE (`exec_on_remote_host`)
-//!   - Count: single pipe, multiple pipes
-//!   - Agent topology: various depths (A, AA, B, NP, D4)
+//! - `PB.*` — extra pipe/socketpair fd bridging across fork+exec.
+//!   Tests the VS Code `child_process.fork()` pattern where extra pipes
+//!   beyond stdio (fds 0-2) must survive exec.  In litebox, non-PIE exec
+//!   goes through `exec_on_remote_host`, which currently only bridges
+//!   unix socket fds.  Regular pipe fds are NOT bridged, causing the
+//!   parent to block forever (the code-server ↔ ptyHost IPC bug).
+//!
+//! - `PN.*` — pipe non-blocking: `O_NONBLOCK` flag, `EAGAIN` on empty
+//!   read, data-available read, EOF after writer close, and the
+//!   cross-process (dropbear) pattern.
+//!
+//! - `PID.*` — monotonic pipe pair-id: verifies that successive
+//!   `pipe(2)` calls never reuse the same inode after all fds are
+//!   closed, catching the litebox ghost-fd pool regression.
+//!
+//! - `NPIPE.*` — non-PIE pipe chain integrity: sequential and
+//!   interleaved PIE+nonPIE `fork`+`exec` whose stdout flows through a
+//!   pipe to the parent.
+//!
+//! - `BPIPE.*` — per-binary-type pipe chain: extends `NPIPE` to all
+//!   five `BinaryType` legs.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -23,8 +35,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::agents::{AgentName, SpawnKind};
+use super::matrix::{EXEC, ExecArgs};
 use super::registry::Registry;
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::protocol::Response;
 use crate::{register_handler, register_leaf_subcommand};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1255,4 +1269,657 @@ fn subcmd_delayed_write_on_fd(args: &[String]) -> i32 {
         unsafe { libc::close(fd) };
     }
     i32::from(!ok)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Shared helpers for lifted PN / PID / NPIPE / BPIPE families.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Agents common to PN.* and PID.* tests.
+const AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
+
+/// Depth-1 and depth-2 PIE-glibc agents; used by PN.child.* and BPIPE.*.
+const DEPTH_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
+
+/// Repetition counts for NPIPE/BPIPE pipe-chain stress.
+const NPIPE_REPS: &[usize] = &[1, 5, 10];
+
+/// Pipe-bridge churn ("npipe") fan-out parents.  Each entry is a
+/// long-lived agent whose binary type exercises a different parent-side
+/// bridge / pipe-host code path.
+const NPIPE_AGENTS: &[AgentName] = &[
+    AgentName::Dpg1,       // PIE-glibc
+    AgentName::Dpg1Dpg1,   // PIE-glibc, depth-2
+    AgentName::Dpg2,       // PIE-glibc, sibling subtree
+    AgentName::Dpg1Dng,    // non-PIE-glibc (node form)
+    AgentName::Dpg1DngDng, // bash → bash recursion (VS Code hot path)
+    AgentName::Dpg1DngSpm, // bash → cli (VS Code hot path)
+    AgentName::Dpg1Spg,    // static-PIE-glibc (still uses ld.so)
+    AgentName::Dpg1Spm,    // static-PIE-musl (no ld.so) — cli form
+    AgentName::Dpg1SpmDng, // cli → node (VS Code's signature transition)
+    AgentName::Dpg1Snm,    // non-PIE-static-musl
+];
+
+/// Convenience: build an `ExecArgs` with just an argv and sensible defaults.
+fn exec_args_default(args: Vec<String>) -> ExecArgs {
+    ExecArgs {
+        args,
+        timeout_secs: None,
+        stdin: None,
+        background: false,
+        env: vec![],
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PID: monotonic pipe pair_id (fix c2d0abdc)
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PipePairIdArgs {
+    count: u32,
+}
+
+const PIPE_PAIR_ID: HandlerToken<PipePairIdArgs, PipeBridgeOut> =
+    HandlerToken::new("platform_fixes.pipe_pair_id");
+
+async fn handle_pipe_pair_id(
+    args: PipePairIdArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    use std::collections::HashSet;
+    let mut first_batch = HashSet::new();
+    let mut fds = Vec::new();
+    for _ in 0..args.count {
+        let mut pipe_fds = [0i32; 2];
+        // SAFETY: pipe writes two fresh fds into pipe_fds on success.
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            return Err(HandlerError(format!(
+                "pipe: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: zeroed stat is a valid output buffer for fstat.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: pipe_fds[0] is a live fd and stat is writable.
+        if unsafe { libc::fstat(pipe_fds[0], &raw mut stat) } == 0 {
+            first_batch.insert(stat.st_ino);
+        }
+        fds.push(pipe_fds);
+    }
+    for pipe_fds in fds.drain(..) {
+        // SAFETY: fds were created by this handler and are still owned here.
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+    }
+    let mut collisions = 0u32;
+    for _ in 0..args.count {
+        let mut pipe_fds = [0i32; 2];
+        // SAFETY: pipe writes two fresh fds into pipe_fds on success.
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            return Err(HandlerError(format!(
+                "pipe: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: zeroed stat is a valid output buffer for fstat.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: pipe_fds[0] is a live fd and stat is writable.
+        if unsafe { libc::fstat(pipe_fds[0], &raw mut stat) } == 0
+            && first_batch.contains(&stat.st_ino)
+        {
+            collisions += 1;
+        }
+        // SAFETY: fds were created by this handler and are still owned here.
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+    }
+    if collisions == 0 {
+        Ok(PipeBridgeOut {
+            detail: "unique".to_string(),
+        })
+    } else {
+        Err(HandlerError(format!(
+            "collision: {collisions}/{} ids reused",
+            args.count
+        )))
+    }
+}
+
+pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
+    register_handler!(PIPE_PAIR_ID, handle_pipe_pair_id);
+    for &agent in AGENTS {
+        let agent_s = agent.to_string();
+        reg.test("matrix", "pipe_pair_id", format!("PID.{agent}"))
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let a = agent_s.clone();
+                    Box::pin(async move {
+                        let result = run
+                            .send_named_typed(&handle, &PIPE_PAIR_ID, PipePairIdArgs { count: 100 })
+                            .await;
+                        let pass = matches!(&result, Ok(out) if out.detail == "unique");
+                        super::TestOutcome::new(&a, pass, format!("{result:?}"))
+                    })
+                })
+            });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PN: Pipe Non-blocking
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PipeNonblockArgs {}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PipeChildNonblockArgs {}
+
+const PIPE_NONBLOCK: HandlerToken<PipeNonblockArgs, PipeBridgeOut> =
+    HandlerToken::new("platform_fixes.pipe_nonblock");
+const PIPE_CHILD_NONBLOCK: HandlerToken<PipeChildNonblockArgs, PipeBridgeOut> =
+    HandlerToken::new("platform_fixes.pipe_child_nonblock");
+
+async fn handle_pipe_nonblock(
+    _args: PipeNonblockArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    let detail = (|| -> Result<String, String> {
+        let mut out = Vec::new();
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe initializes two fds on success.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+        }
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        // SAFETY: read_fd is a valid pipe fd.
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        // SAFETY: read_fd is valid and flags are from F_GETFL.
+        let ret = unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        out.push(format!(
+            "PIPE_NB_SETFL={}",
+            if ret == 0 { "OK" } else { "FAIL" }
+        ));
+        let mut buf = [0u8; 64];
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        // SAFETY: errno is thread-local and read just failed or returned.
+        let errno = unsafe { *libc::__errno_location() };
+        if n == -1 && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
+            out.push("PIPE_NB_EMPTY=EAGAIN".into());
+        } else {
+            out.push(format!("PIPE_NB_EMPTY=UNEXPECTED n={n} errno={errno}"));
+        }
+        let msg = b"HELLO";
+        // SAFETY: write_fd is valid and msg points to readable bytes.
+        unsafe { libc::write(write_fd, msg.as_ptr().cast(), msg.len()) };
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        out.push(if n == 5 {
+            "PIPE_NB_DATA=OK".into()
+        } else {
+            format!("PIPE_NB_DATA=UNEXPECTED n={n}")
+        });
+        // SAFETY: write_fd is a valid fd and is no longer used after close.
+        unsafe { libc::close(write_fd) };
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n == 0 {
+            out.push("PIPE_NB_EOF=OK".into());
+        } else {
+            // SAFETY: errno is thread-local and read just returned unexpectedly.
+            let errno = unsafe { *libc::__errno_location() };
+            out.push(format!("PIPE_NB_EOF=UNEXPECTED n={n} errno={errno}"));
+        }
+        // SAFETY: read_fd is a valid fd and is no longer used after close.
+        unsafe { libc::close(read_fd) };
+        Ok(out.join("\n"))
+    })()?;
+    Ok(PipeBridgeOut { detail })
+}
+
+async fn handle_pipe_child_nonblock(
+    _args: PipeChildNonblockArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    let detail = (|| -> Result<String, String> {
+        let mut out = Vec::new();
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe initializes two fds on success.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+        }
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        // SAFETY: fork duplicates the current process; child exits below.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: child owns these fds after fork.
+            unsafe { libc::close(read_fd) };
+            std::thread::sleep(Duration::from_millis(500));
+            let msg = b"X";
+            // SAFETY: write_fd is valid and msg is readable.
+            unsafe { libc::write(write_fd, msg.as_ptr().cast(), 1) };
+            // SAFETY: child is done with write_fd.
+            unsafe { libc::close(write_fd) };
+            std::process::exit(0);
+        }
+        if pid < 0 {
+            return Err(format!("fork: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: parent is done with write_fd.
+        unsafe { libc::close(write_fd) };
+        // SAFETY: read_fd is a valid pipe fd.
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        // SAFETY: read_fd is valid and flags are from F_GETFL.
+        unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        let mut buf = [0u8; 1];
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 1) };
+        // SAFETY: errno is thread-local and read just returned.
+        let errno = unsafe { *libc::__errno_location() };
+        if n == -1 && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
+            out.push("PCHILD_INITIAL=EAGAIN".into());
+        } else {
+            out.push(format!("PCHILD_INITIAL=UNEXPECTED n={n} errno={errno}"));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 1) };
+        if n == 1 {
+            out.push("PCHILD_DATA=OK".into());
+        } else {
+            // SAFETY: errno is thread-local and read just returned unexpectedly.
+            let errno = unsafe { *libc::__errno_location() };
+            out.push(format!("PCHILD_DATA=UNEXPECTED n={n} errno={errno}"));
+        }
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 1) };
+        if n == 0 {
+            out.push("PCHILD_EOF=OK".into());
+        } else {
+            // SAFETY: errno is thread-local and read just returned unexpectedly.
+            let errno = unsafe { *libc::__errno_location() };
+            out.push(format!("PCHILD_EOF=UNEXPECTED n={n} errno={errno}"));
+        }
+        // SAFETY: cleanup live fd and reap the child pid.
+        unsafe { libc::close(read_fd) };
+        // SAFETY: pid is a child process from fork.
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        Ok(out.join("\n"))
+    })()?;
+    Ok(PipeBridgeOut { detail })
+}
+
+pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
+    register_handler!(PIPE_NONBLOCK, handle_pipe_nonblock);
+    register_handler!(PIPE_CHILD_NONBLOCK, handle_pipe_child_nonblock);
+    // Part 1: basic pipe non-blocking (single process)
+    for &agent in AGENTS {
+        for &(suffix, marker) in &[
+            ("setfl", "PIPE_NB_SETFL=OK"),
+            ("empty_eagain", "PIPE_NB_EMPTY=EAGAIN"),
+            ("data", "PIPE_NB_DATA=OK"),
+            ("eof", "PIPE_NB_EOF=OK"),
+        ] {
+            let agent_s = agent.to_string();
+            let marker_s: String = marker.into();
+            reg.test("matrix", "pipe_nonblock", format!("PN.{agent}.{suffix}"))
+                .timeout(60)
+                .build(move |cx| {
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("PipeNonblock_{agent}_{suffix}"),
+                        SpawnKind::Fork {
+                            binary: "self",
+                            inherit_listen_ports: vec![],
+                        },
+                    );
+                    Box::new(move |run| {
+                        let a = agent_s.clone();
+                        let m = marker_s.clone();
+                        Box::pin(async move {
+                            let result = run
+                                .run_leaf(&leaf, &PIPE_NONBLOCK, PipeNonblockArgs {})
+                                .await;
+                            let pass = matches!(&result, Ok(out) if out.detail.contains(&*m));
+                            super::TestOutcome::new(&a, pass, format!("{result:?}"))
+                        })
+                    })
+                });
+        }
+    }
+
+    // Part 2: cross-process pipe non-blocking (dropbear pattern)
+    for &agent in DEPTH_AGENTS {
+        for &(suffix, marker) in &[
+            ("eagain", "PCHILD_INITIAL=EAGAIN"),
+            ("data", "PCHILD_DATA=OK"),
+            ("eof", "PCHILD_EOF=OK"),
+        ] {
+            let agent_s = agent.to_string();
+            let marker_s: String = marker.into();
+            reg.test(
+                "matrix",
+                "pipe_nonblock",
+                format!("PN.child.{agent}.{suffix}"),
+            )
+            .timeout(60)
+            .build(move |cx| {
+                let leaf = cx.declare_ephemeral(
+                    agent,
+                    format!("PipeChildNonblock_{agent}_{suffix}"),
+                    SpawnKind::Fork {
+                        binary: "self",
+                        inherit_listen_ports: vec![],
+                    },
+                );
+                Box::new(move |run| {
+                    let a = agent_s.clone();
+                    let m = marker_s.clone();
+                    Box::pin(async move {
+                        let result = run
+                            .run_leaf(&leaf, &PIPE_CHILD_NONBLOCK, PipeChildNonblockArgs {})
+                            .await;
+                        let pass = matches!(&result, Ok(out) if out.detail.contains(&*m));
+                        super::TestOutcome::new(&a, pass, format!("{result:?}"))
+                    })
+                })
+            });
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NPIPE: non-PIE pipe chain integrity (fix febc3e41)
+// ═══════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
+pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
+    for &reps in NPIPE_REPS {
+        for &agent in NPIPE_AGENTS {
+            let agent_s = agent.to_string();
+            // Sequential non-PIE pattern.
+            reg.test(
+                "fork",
+                "nonpie_pipe_chain",
+                format!("NPIPE.seq.x{reps}.{agent}"),
+            )
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let a = agent_s.clone();
+                    let _self_exe = run.self_exe().to_string();
+                    Box::pin(async move {
+                        let nonpie = crate::nonpie_binary();
+                        let mut all_clean = true;
+                        let mut detail = String::new();
+                        for i in 0..reps {
+                            let tag = format!("seq_{a}_{i}");
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    exec_args_default(vec![
+                                        nonpie.clone(),
+                                        "write-known".into(),
+                                        tag.clone(),
+                                    ]),
+                                )
+                                .await;
+                            let expected = format!("PIPEDATA:{tag}");
+                            let ok = matches!(
+                                &resp,
+                                Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.trim() == expected
+                            );
+                            if !ok {
+                                all_clean = false;
+                                detail = format!("iter {i}: expected '{expected}', got {resp:?}");
+                                break;
+                            }
+                        }
+                        if all_clean {
+                            detail = format!("{reps} sequential non-PIE execs all clean");
+                        }
+                        super::TestOutcome::new(&a, all_clean, detail)
+                    })
+                })
+            });
+
+            // Interleaved PIE + non-PIE pattern.
+            let agent_s2 = agent.to_string();
+            reg.test(
+                "fork",
+                "nonpie_pipe_chain",
+                format!("NPIPE.interleaved.x{reps}.{agent}"),
+            )
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let a = agent_s2.clone();
+                    let self_exe = run.self_exe().to_string();
+                    Box::pin(async move {
+                        let nonpie = crate::nonpie_binary();
+                        let mut all_clean = true;
+                        let mut detail = String::new();
+                        for i in 0..reps {
+                            let np_tag = format!("np_{a}_{i}");
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    exec_args_default(vec![
+                                        nonpie.clone(),
+                                        "write-known".into(),
+                                        np_tag.clone(),
+                                    ]),
+                                )
+                                .await;
+                            let expected = format!("PIPEDATA:{np_tag}");
+                            let ok = matches!(
+                                &resp,
+                                Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.trim() == expected
+                            );
+                            if !ok {
+                                all_clean = false;
+                                detail =
+                                    format!("iter {i} nonpie: expected '{expected}', got {resp:?}");
+                                break;
+                            }
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    exec_args_default(vec![self_exe.clone(), "echo-test".into()]),
+                                )
+                                .await;
+                            let ok = matches!(
+                                &resp,
+                                Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.trim() == "ECHO_TEST_OK"
+                            );
+                            if !ok {
+                                all_clean = false;
+                                detail =
+                                    format!("iter {i} pie: expected 'ECHO_TEST_OK', got {resp:?}");
+                                break;
+                            }
+                        }
+                        if all_clean {
+                            detail = format!("{reps} interleaved PIE+nonPIE execs all clean");
+                        }
+                        super::TestOutcome::new(&a, all_clean, detail)
+                    })
+                })
+            });
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BPIPE: per-binary-type pipe chain integrity (extends NPIPE)
+//
+// NPIPE above covers the non-PIE-glibc leg as a singleton matrix.
+// BPIPE expands the same patterns (sequential and interleaved
+// fork+execs whose stdout flows through a pipe to the parent) to the
+// other four legs of `BinaryType` so the platform's pipe-chain
+// integrity is exercised across every binary mode the shim might
+// dispatch differently:
+//
+//   BPIPE.{pie-glibc,static-pie-glibc,
+//          static-pie-musl,non-pie-static-musl}
+//        .{seq,interleaved}
+//        .x{reps}
+//        .{A,AA}
+//
+// `interleaved` alternates the under-test leg with the always-PIE-glibc
+// `self_exe` so the test catches pollution between legs.
+// ═══════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
+pub(crate) fn register_bpipe_tests(reg: &mut Registry<'_>) {
+    // Exercise every binary type with uniform per-leg IDs.
+    for &bt in crate::BinaryType::ALL {
+        let leg_label = bt.label();
+        for &reps in NPIPE_REPS {
+            for &agent in DEPTH_AGENTS {
+                let agent_s = agent.to_string();
+                reg.test(
+                    "fork",
+                    "bpipe",
+                    format!("BPIPE.{leg_label}.seq.x{reps}.{agent}"),
+                )
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let a = agent_s.clone();
+                        let self_exe = run.self_exe().to_string();
+                        Box::pin(async move {
+                            let target = crate::binary_path(bt, &self_exe);
+                            let mut all_clean = true;
+                            let mut detail = String::new();
+                            for i in 0..reps {
+                                let tag = format!("seq_{leg_label}_{a}_{i}");
+                                let resp = run
+                                    .typed_or_error(
+                                        &handle,
+                                        &EXEC,
+                                        exec_args_default(vec![
+                                            target.clone(),
+                                            "write-known".into(),
+                                            tag.clone(),
+                                        ]),
+                                    )
+                                    .await;
+                                let expected = format!("PIPEDATA:{tag}");
+                                let ok = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.trim() == expected
+                                );
+                                if !ok {
+                                    all_clean = false;
+                                    detail =
+                                        format!("iter {i}: expected '{expected}', got {resp:?}");
+                                    break;
+                                }
+                            }
+                            if all_clean {
+                                detail = format!("{reps} sequential {leg_label} execs all clean");
+                            }
+                            super::TestOutcome::new(&a, all_clean, detail)
+                        })
+                    })
+                });
+
+                let agent_s2 = agent.to_string();
+                reg.test(
+                    "fork",
+                    "bpipe",
+                    format!("BPIPE.{leg_label}.interleaved.x{reps}.{agent}"),
+                )
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let a = agent_s2.clone();
+                        let self_exe = run.self_exe().to_string();
+                        Box::pin(async move {
+                            let target = crate::binary_path(bt, &self_exe);
+                            let mut all_clean = true;
+                            let mut detail = String::new();
+                            for i in 0..reps {
+                                let tag = format!("itr_{leg_label}_{a}_{i}");
+                                let resp = run
+                                    .typed_or_error(
+                                        &handle,
+                                        &EXEC,
+                                        exec_args_default(vec![
+                                            target.clone(),
+                                            "write-known".into(),
+                                            tag.clone(),
+                                        ]),
+                                    )
+                                    .await;
+                                let expected = format!("PIPEDATA:{tag}");
+                                let ok = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.trim() == expected
+                                );
+                                if !ok {
+                                    all_clean = false;
+                                    detail = format!(
+                                        "iter {i} {leg_label}: expected '{expected}', got {resp:?}"
+                                    );
+                                    break;
+                                }
+                                let resp = run
+                                    .typed_or_error(
+                                        &handle,
+                                        &EXEC,
+                                        exec_args_default(vec![
+                                            self_exe.clone(),
+                                            "echo-test".into(),
+                                        ]),
+                                    )
+                                    .await;
+                                let ok = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.trim() == "ECHO_TEST_OK"
+                                );
+                                if !ok {
+                                    all_clean = false;
+                                    detail = format!(
+                                        "iter {i} pie-glibc: expected 'ECHO_TEST_OK', got {resp:?}"
+                                    );
+                                    break;
+                                }
+                            }
+                            if all_clean {
+                                detail = format!(
+                                    "{reps} interleaved {leg_label}+pie-glibc execs all clean"
+                                );
+                            }
+                            super::TestOutcome::new(&a, all_clean, detail)
+                        })
+                    })
+                });
+            }
+        }
+    }
 }
