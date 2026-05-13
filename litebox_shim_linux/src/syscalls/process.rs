@@ -9305,6 +9305,33 @@ impl<FS: ShimFS> Task<FS> {
         // promptly so parent-side posix_spawn handshakes can observe EOF.
         self.close_on_exec();
 
+        // Phase 2.F follow-up: the placeholder is a stub that just waits
+        // for the remote worker — it has no further use for any inherited
+        // fds. Close every non-stdio fd in the placeholder so OFD refcounts
+        // drop. This lets the parent's read on the spawn-helper pipe (or
+        // any other pipe whose write end was shared via the fork-copy)
+        // observe EOF.
+        //
+        // Some FD_CLOEXEC flags can fail to propagate through
+        // `duplicate_raw_fd`'s metadata copy (observed: stderr pipe ends
+        // from `pipe2(O_CLOEXEC)` lose their CLOEXEC bit in the child fd
+        // table), which left close_on_exec above as a partial cleanup.
+        // Closing the rest unconditionally is safe here because the
+        // placeholder never runs guest code that could reference these
+        // fds again.
+        {
+            let files = self.files.borrow();
+            let alive_fds: Vec<usize> =
+                files.raw_descriptor_store.read().iter_alive().collect();
+            drop(files);
+            for raw_fd in alive_fds {
+                if raw_fd <= 2 {
+                    continue;
+                }
+                let _ = self.do_close(raw_fd);
+            }
+        }
+
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
