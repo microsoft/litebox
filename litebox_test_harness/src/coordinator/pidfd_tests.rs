@@ -243,6 +243,15 @@ pub(crate) fn register_pidfd_tests(reg: &mut Registry<'_>) {
     register_handler!(SPAWN_AND_OPEN, handle_spawn_and_open);
     register_handler!(EXIT_SELF, handle_exit_self);
     register_handler!(EXIT_INHERIT, handle_exit_inherit);
+    // pidfd-test argv subcommand: the PIDF.* tests invoke
+    // `<target_bt> pidfd-test self-test|poll-inherited …` directly via
+    // tokio::process::Command (not through a handler) to exercise the
+    // fresh-process loader/libc path. Body lives in `mod leaf_subcmd`
+    // at the bottom of this file.
+    crate::register_leaf_subcommand!("pidfd-test", |args: &[String]| -> i32 {
+        let sub = args.get(2).map_or("help", String::as_str);
+        leaf_subcmd::run(sub, args)
+    });
 
     // PIDF.spawn_and_open — single-agent sanity (was legacy PIFH.basic)
     reg.test("vscode", "pidfd", "PIDF.spawn_and_open")
@@ -352,5 +361,139 @@ pub(crate) fn register_pidfd_tests(reg: &mut Registry<'_>) {
                     })
                 })
             });
+    }
+}
+mod leaf_subcmd {
+    pub(super) fn run(sub: &str, args: &[String]) -> i32 {
+        match sub {
+            "self-test" => self_test(),
+            "poll-inherited" => poll_inherited(args),
+            other => {
+                eprintln!("pidfd-test: unknown subcommand: {other}");
+                2
+            }
+        }
+    }
+
+    /// Self-contained pidfd dance for `PIDF.exit_self.<bt>`: fork a
+    /// 1-second sleep grandchild, `pidfd_open` it, poll for POLLIN
+    /// up to 5 s, waitpid to reap. Exits 0 on POLLIN fired.
+    fn self_test() -> i32 {
+        // SAFETY: fork; child execs only async-signal-safe libc.
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            eprintln!(
+                "pidfd-test self-test: fork: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if child == 0 {
+            // SAFETY: child terminates immediately after sleeping.
+            unsafe {
+                libc::sleep(1);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: pidfd_open syscall on a real pid.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child as libc::pid_t, 0) } as i32;
+        if pidfd < 0 {
+            eprintln!(
+                "pidfd-test self-test: pidfd_open: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: kill+waitpid on the known pid.
+            unsafe {
+                libc::kill(child, libc::SIGKILL);
+                let mut s = 0;
+                libc::waitpid(child, std::ptr::from_mut(&mut s), 0);
+            }
+            return 1;
+        }
+        let mut pfd = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is a live initialised pollfd; len 1 matches.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, 5000) };
+        // SAFETY: pidfd was returned by pidfd_open and is owned by us.
+        unsafe {
+            libc::close(pidfd);
+        }
+        if rc <= 0 || pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "pidfd-test self-test: poll rc={} revents={}",
+                rc, pfd.revents
+            );
+            // SAFETY: waitpid on the known pid to clean up.
+            unsafe {
+                let mut s = 0;
+                libc::waitpid(child, std::ptr::from_mut(&mut s), 0);
+            }
+            return 1;
+        }
+        // SAFETY: waitpid on the known pid.
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(child, std::ptr::from_mut(&mut status), 0) };
+        if waited != child {
+            eprintln!(
+                "pidfd-test self-test: waitpid({child}) returned {waited}: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        0
+    }
+
+    fn poll_inherited(args: &[String]) -> i32 {
+        let fd: i32 = match args.get(3).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!("pidfd-test poll-inherited: bad fd arg");
+                return 2;
+            }
+        };
+        let timeout_ms: i32 = match args.get(4).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!("pidfd-test poll-inherited: bad timeout_ms arg");
+                return 2;
+            }
+        };
+        // poll(pidfd, POLLIN, timeout). On pidfd this fires when the
+        // target process exits. We don't waitid here — pidfd's child
+        // may be a sibling of this child, not its own child, so
+        // waitid would ECHILD. Polling for POLLIN is the canonical
+        // exit-detection probe.
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is a live initialised pollfd; len 1 matches.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+        if rc < 0 {
+            eprintln!(
+                "pidfd-test poll-inherited: poll failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if rc == 0 {
+            eprintln!(
+                "pidfd-test poll-inherited: timeout (revents={})",
+                pfd.revents
+            );
+            return 1;
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "pidfd-test poll-inherited: poll returned but no POLLIN (revents={})",
+                pfd.revents
+            );
+            return 1;
+        }
+        0
     }
 }

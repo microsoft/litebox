@@ -164,6 +164,15 @@ async fn handle_inherit_self_raise(
 pub(crate) fn register_signalfd_tests(reg: &mut Registry<'_>) {
     register_handler!(BASIC_SELF, handle_basic_self);
     register_handler!(INHERIT_SELF_RAISE, handle_inherit_self_raise);
+    // signalfd-test argv subcommand: the SFD.* tests invoke
+    // `<target_bt> signalfd-test self-raise|read-inherited …` directly
+    // via tokio::process::Command (not through a handler) to exercise
+    // the fresh-process loader/libc path. Body lives in `mod leaf_subcmd`
+    // at the bottom of this file.
+    crate::register_leaf_subcommand!("signalfd-test", |args: &[String]| -> i32 {
+        let sub = args.get(2).map_or("help", String::as_str);
+        leaf_subcmd::run(sub, args)
+    });
 
     // SFD.basic_self.<bt> — per-binary-type self-contained capability
     // test. Native: 5/5 pass. Litebox: status depends on whether the
@@ -237,5 +246,139 @@ pub(crate) fn register_signalfd_tests(reg: &mut Registry<'_>) {
                 })
             })
         });
+    }
+}
+mod leaf_subcmd {
+    pub(super) fn run(sub: &str, args: &[String]) -> i32 {
+        match sub {
+            "self-raise" => self_raise(args),
+            "read-inherited" => read_inherited(args),
+            other => {
+                eprintln!("signalfd-test: unknown subcommand: {other}");
+                2
+            }
+        }
+    }
+
+    fn block_signal(signo: i32) -> i32 {
+        // SAFETY: sigset_t POD.
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: mask is a freshly initialised sigset_t.
+        unsafe {
+            libc::sigemptyset(std::ptr::from_mut(&mut mask));
+            libc::sigaddset(std::ptr::from_mut(&mut mask), signo);
+        }
+        // SAFETY: mask is live; SIG_BLOCK is defined.
+        unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_BLOCK,
+                std::ptr::from_ref(&mask),
+                std::ptr::null_mut(),
+            )
+        }
+    }
+
+    fn parse_signo(s: &str) -> Option<i32> {
+        match s {
+            "SIGUSR1" => Some(libc::SIGUSR1),
+            "SIGUSR2" => Some(libc::SIGUSR2),
+            "SIGTERM" => Some(libc::SIGTERM),
+            "SIGCHLD" => Some(libc::SIGCHLD),
+            other => other.parse().ok(),
+        }
+    }
+
+    fn self_raise(args: &[String]) -> i32 {
+        let signo = match args.get(3).and_then(|s| parse_signo(s)) {
+            Some(v) => v,
+            None => {
+                eprintln!("signalfd-test self-raise: bad signo arg");
+                return 2;
+            }
+        };
+        if block_signal(signo) != 0 {
+            eprintln!("signalfd-test self-raise: pthread_sigmask failed");
+            return 1;
+        }
+        // SAFETY: sigset_t POD.
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(std::ptr::from_mut(&mut mask));
+            libc::sigaddset(std::ptr::from_mut(&mut mask), signo);
+        }
+        // SAFETY: mask is live; signalfd creates a fresh fd.
+        let sfd = unsafe { libc::signalfd(-1, std::ptr::from_ref(&mask), 0) };
+        if sfd < 0 {
+            eprintln!(
+                "signalfd-test self-raise: signalfd: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        // SAFETY: raise sends signo to self; the signal is blocked,
+        // so it queues onto the signalfd instead of running default
+        // handlers.
+        if unsafe { libc::raise(signo) } != 0 {
+            eprintln!(
+                "signalfd-test self-raise: raise: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        let mut buf = [0u8; 128];
+        // SAFETY: buf is a 128-byte buffer; sfd is open.
+        let n = unsafe { libc::read(sfd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        // SAFETY: sfd is closed unconditionally.
+        unsafe {
+            libc::close(sfd);
+        }
+        if n != 128 {
+            eprintln!(
+                "signalfd-test self-raise: short signalfd read: {n} ({})",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        let got = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+        if got != signo as u32 {
+            eprintln!("signalfd-test self-raise: ssi_signo mismatch: got {got} expected {signo}");
+            return 1;
+        }
+        0
+    }
+
+    fn read_inherited(args: &[String]) -> i32 {
+        let fd: i32 = match args.get(3).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!("signalfd-test read-inherited: bad fd arg");
+                return 2;
+            }
+        };
+        let expected_signo: i32 = match args.get(4).and_then(|s| parse_signo(s)) {
+            Some(v) => v,
+            None => {
+                eprintln!("signalfd-test read-inherited: bad signo arg");
+                return 2;
+            }
+        };
+        let mut buf = [0u8; 128];
+        // SAFETY: buf is a 128-byte buffer; fd was inherited.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n != 128 {
+            eprintln!(
+                "signalfd-test read-inherited: short read: {n} ({})",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        let got = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+        if got != expected_signo as u32 {
+            eprintln!(
+                "signalfd-test read-inherited: ssi_signo mismatch: got {got} expected {expected_signo}"
+            );
+            return 1;
+        }
+        0
     }
 }
