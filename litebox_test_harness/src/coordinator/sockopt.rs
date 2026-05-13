@@ -1,14 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! SOCKOPT tests for socket option behaviors used by VS Code.
+//! `SOCKOPT.*` and `GSN.*` tests.
 //!
-//! Migrated to the handler-refactor protocol. Each scenario is one
-//! `Command::Run` to a registered handler that performs the entire
-//! setsockopt / getsockopt / bind / connect sequence inline in
-//! straight-line Rust. The Net* legacy commands are no longer used
-//! by this family (they remain in `agent.rs` for other families
-//! that still rely on them; that's a batched-migration concern).
+//! **SOCKOPT**: socket option behaviors used by VS Code — `SO_REUSEADDR`,
+//! `SO_REUSEPORT`, `SO_KEEPALIVE`. Migrated to the handler-refactor protocol;
+//! each scenario is one `Command::Run` to a registered handler that performs
+//! the entire setsockopt / getsockopt / bind / connect sequence inline in
+//! straight-line Rust.
+//!
+//! **GSN**: `getsockname` port-after-bind correctness (fix 336dc79e). Verifies
+//! that after `bind("0.0.0.0:0")` / `bind("[::]:0")` the kernel returns a
+//! non-zero ephemeral port via `getsockname`.
 
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -23,6 +26,10 @@ use crate::register_handler;
 
 use super::agents::AgentName;
 use super::registry::Registry;
+
+const GSN_FAMILIES: &[&str] = &["ipv4", "ipv6"];
+
+const GSN_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
 
 const SOCKOPT_AGENTS: &[AgentName] = &[
     AgentName::Dpg1,     // PIE-glibc
@@ -231,6 +238,41 @@ async fn handle_keepalive_roundtrip(
     Ok(KeepaliveOut { set_ok, get_value })
 }
 
+// ─── GSN types ──────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct BindGetsocknameArgs {
+    family: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct GsnOut {
+    detail: String,
+}
+
+// ─── GSN token ──────────────────────────────────────────────────────
+
+const BIND_GETSOCKNAME: HandlerToken<BindGetsocknameArgs, GsnOut> =
+    HandlerToken::new("platform_fixes.bind_getsockname");
+
+// ─── GSN handler ────────────────────────────────────────────────────
+
+async fn handle_bind_getsockname(
+    args: BindGetsocknameArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<GsnOut, HandlerError> {
+    let port = match args.family.as_str() {
+        "ipv4" => std::net::TcpListener::bind("0.0.0.0:0")?
+            .local_addr()?
+            .port(),
+        "ipv6" => std::net::TcpListener::bind("[::]:0")?.local_addr()?.port(),
+        other => return Err(HandlerError(format!("unknown family: {other}"))),
+    };
+    Ok(GsnOut {
+        detail: format!("port={port}"),
+    })
+}
+
 // ─── Registration ──────────────────────────────────────────────────
 
 pub(crate) fn register_sockopt_tests(reg: &mut Registry<'_>) {
@@ -279,5 +321,50 @@ pub(crate) fn register_sockopt_tests(reg: &mut Registry<'_>) {
                 }
             },
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GSN: getsockname port after bind (fix 336dc79e)
+// ═══════════════════════════════════════════════════════════════════
+
+pub(crate) fn register_bind_getsockname_tests(reg: &mut Registry<'_>) {
+    register_handler!(BIND_GETSOCKNAME, handle_bind_getsockname);
+    for &family in GSN_FAMILIES {
+        for &agent in GSN_AGENTS {
+            let agent_s = agent.to_string();
+            let family_s = family.to_string();
+            reg.test(
+                "matrix",
+                "bind_getsockname",
+                format!("GSN.{family}.{agent}"),
+            )
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let a = agent_s.clone();
+                    let f = family_s.clone();
+                    Box::pin(async move {
+                        let result = run
+                            .send_named_typed(
+                                &handle,
+                                &BIND_GETSOCKNAME,
+                                BindGetsocknameArgs { family: f },
+                            )
+                            .await;
+                        let pass = match &result {
+                            Ok(out) => out
+                                .detail
+                                .strip_prefix("port=")
+                                .and_then(|s| s.parse::<u16>().ok())
+                                .is_some_and(|p| p > 0),
+                            Err(_) => false,
+                        };
+                        super::TestOutcome::new(&a, pass, format!("{result:?}"))
+                    })
+                })
+            });
+        }
     }
 }
