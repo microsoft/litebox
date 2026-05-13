@@ -690,7 +690,7 @@ mod tests {
     fn patch(pa: [u64; 2], code: &[u8]) -> HekiPatch {
         let mut patch = HekiPatch::default();
         patch.pa = pa;
-        patch.size = code.len() as u8;
+        patch.size = u8::try_from(code.len()).expect("test patch code is too length");
         patch.code[..code.len()].copy_from_slice(code);
         patch
     }
