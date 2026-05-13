@@ -33,7 +33,20 @@ pub(crate) fn init() {
     let syscall_entry_addr = syscall_entry_wrapper as *const () as u64;
     LStar::write(VirtAddr::new(syscall_entry_addr));
 
-    let rflags = RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::ALIGNMENT_CHECK;
+    // Mask some important bits of the FLAGS register.
+    //
+    // - IF: to block interrupts during syscall handling
+    // - DF: to maintain the direction of some instructions like `movs`.
+    // - AC: to maintain SMAP
+    // - TF: to prevent kernel-mode single-stepping
+    // - NT and IOPL: Defense-in-depth. ring-3 cannot set these bits.
+    let rflags = RFlags::INTERRUPT_FLAG
+        | RFlags::DIRECTION_FLAG
+        | RFlags::ALIGNMENT_CHECK
+        | RFlags::TRAP_FLAG
+        | RFlags::NESTED_TASK
+        | RFlags::IOPL_LOW
+        | RFlags::IOPL_HIGH;
     SFMask::write(rflags);
 
     // configure STAR MSR for CS/SS selectors
