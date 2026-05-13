@@ -27,12 +27,12 @@ use super::matrix::{
 use super::registry::Registry;
 use super::run_context::RunContext;
 
-const AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
+pub(super) const AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
 const DEPTH_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
 
 #[derive(Serialize, Deserialize, Debug)]
-struct DetailOut {
-    detail: String,
+pub(super) struct DetailOut {
+    pub(super) detail: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -66,9 +66,6 @@ const ACCEPT_INHERITED: HandlerToken<AcceptInheritedArgs, DetailOut> =
     HandlerToken::new("platform_fixes.accept_inherited");
 
 #[derive(Serialize, Deserialize, Debug)]
-struct CliStartupMimicArgs {}
-
-#[derive(Serialize, Deserialize, Debug)]
 struct ForkExecPieArgs {
     binary: String,
     subcommand: String,
@@ -92,8 +89,6 @@ struct CrossWorkerFileArgs {
     path: String,
 }
 
-const CLI_STARTUP_MIMIC: HandlerToken<CliStartupMimicArgs, DetailOut> =
-    HandlerToken::new("platform_fixes.cli_startup_mimic");
 const FORK_EXEC_PIE: HandlerToken<ForkExecPieArgs, DetailOut> =
     HandlerToken::new("platform_fixes.fork_exec_pie");
 const PIPE_NONBLOCK: HandlerToken<PipeNonblockArgs, DetailOut> =
@@ -128,7 +123,6 @@ fn exec_timeout_args(args: Vec<String>, timeout_secs: u64) -> ExecArgs {
 /// (`EXEC`, `FS_READ`, `NET_LISTEN`, etc.) are registered by
 /// `register_matrix_handlers` in `matrix.rs`.
 fn register_pf_specific_handlers() {
-    register_handler!(CLI_STARTUP_MIMIC, handle_cli_startup_mimic);
     register_handler!(FORK_EXEC_PIE, handle_fork_exec_pie);
     register_handler!(PIPE_NONBLOCK, handle_pipe_nonblock);
     register_handler!(PIPE_CHILD_NONBLOCK, handle_pipe_child_nonblock);
@@ -138,21 +132,6 @@ fn register_pf_specific_handlers() {
     crate::register_leaf_subcommand!("cross-worker-file", leaf_subcmd::subcmd_cross_worker_file);
     crate::register_leaf_subcommand!("proc-probe", leaf_subcmd::subcmd_proc_probe);
     crate::register_leaf_subcommand!("check-ppid", leaf_subcmd::subcmd_check_ppid);
-}
-
-async fn handle_cli_startup_mimic(
-    _args: CliStartupMimicArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<DetailOut, HandlerError> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| HandlerError::from(format!("bind cli startup mimic listener: {e}")))?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| HandlerError::from(format!("listener addr: {e}")))?;
-    Ok(DetailOut {
-        detail: format!("CLI_STARTUP_MIMIC_OK {addr}"),
-    })
 }
 
 async fn handle_fork_exec_pie(
@@ -518,7 +497,7 @@ fn epoll_socket_detail(port: u16, variant: &str) -> Result<String, HandlerError>
     Ok(out.join("\n"))
 }
 
-fn fork_binary_label(bt: crate::BinaryType) -> &'static str {
+pub(super) fn fork_binary_label(bt: crate::BinaryType) -> &'static str {
     match bt {
         crate::BinaryType::PieGlibc => "self",
         crate::BinaryType::NonPieGlibc => "nonpie",
@@ -3264,47 +3243,6 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
                                         if check(stdout)
                                 );
                                 super::TestOutcome::new(&a, pass, format!("{resp:?}"))
-                            })
-                        })
-                    });
-            }
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// CSM: CLI Startup Mimic — VS Code CLI link-mode startup shape
-// ═══════════════════════════════════════════════════════════════════
-
-pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
-    register_pf_specific_handlers();
-    const DELIVERIES: &[&str] = &["tokio_pipe", "bash_heredoc_pipe"];
-
-    for &delivery in DELIVERIES {
-        for &bt in crate::BinaryType::ALL {
-            for &agent in AGENTS {
-                let agent_s = agent.to_string();
-                let bt_label = bt.label();
-                let test_id = format!("CSM.{delivery}.{bt_label}.{agent}");
-                reg.test("fork", "cli_startup_mimic", test_id)
-                    .timeout(60)
-                    .build(move |cx| {
-                        let leaf = cx.declare_ephemeral(
-                            agent,
-                            format!("CliStartupMimic_{delivery}_{bt_label}_{agent}"),
-                            SpawnKind::Fork {
-                                binary: fork_binary_label(bt),
-                                inherit_listen_ports: vec![],
-                            },
-                        );
-                        Box::new(move |run| {
-                            let a = agent_s.clone();
-                            Box::pin(async move {
-                                let result = run
-                                    .run_leaf(&leaf, &CLI_STARTUP_MIMIC, CliStartupMimicArgs {})
-                                    .await;
-                                let pass = matches!(&result, Ok(out) if out.detail.contains("CLI_STARTUP_MIMIC_OK"));
-                                super::TestOutcome::new(&a, pass, format!("{result:?}"))
                             })
                         })
                     });

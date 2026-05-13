@@ -952,7 +952,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     getrandom_tests::register_getrandom_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_cross_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_cli_startup_mimic_tests(&mut registry::Registry::new(&mut tests));
+    vscode_shape::register_cli_startup_mimic_tests(&mut registry::Registry::new(&mut tests));
     vscode_shape::register_vscode_shape_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bg_redirect_poll_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bg_redirect_stdin_poll_tests(&mut registry::Registry::new(&mut tests));
