@@ -947,10 +947,10 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_subst_capture_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_concurrent_fork_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_touch_redirect_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
+    special_cases::register_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     iouring_discovery::register_iouring_discovery_tests(&mut registry::Registry::new(&mut tests));
     getrandom_tests::register_getrandom_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_cross_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
+    special_cases::register_cross_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_cli_startup_mimic_tests(&mut registry::Registry::new(&mut tests));
     vscode_shape::register_vscode_shape_tests(&mut registry::Registry::new(&mut tests));
@@ -969,7 +969,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_proc_filesystem_tests(&mut registry::Registry::new(&mut tests));
+    special_cases::register_proc_filesystem_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_subtree_kill_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_fork_matrix(&mut registry::Registry::new(&mut tests));
     special_cases::register_unix_socket(&mut registry::Registry::new(&mut tests));
