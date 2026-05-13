@@ -3,9 +3,7 @@
 
 //! /proc filesystem and PID-visibility tests (PROC.*, KP.*, KPX.*).
 //!
-//! This module hosts three families of tests that were lifted from
-//! `platform_fixes.rs` so they live alongside the other special-case
-//! clusters:
+//! This module hosts three families of tests:
 //!
 //! * `PROC.*` — basic /proc filesystem readability (self/stat, uptime, …).
 //! * `KP.*` — per-agent PID visibility after delayed-fork migration.
@@ -17,10 +15,8 @@
 use super::*;
 
 use crate::coordinator::TestOutcome;
+use crate::coordinator::common::CANARY_AGENTS as AGENTS;
 use crate::coordinator::matrix::{EXEC, ExecArgs, FS_READ, FsPathArgs, GET_PID};
-use crate::coordinator::platform_fixes::register_pf_specific_handlers;
-
-const AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
 
 // ─── PROC helpers ────────────────────────────────────────────────────────────
 
@@ -134,7 +130,7 @@ fn kpx_observe_proc_pass(resp: &Response) -> bool {
 // ─── Registration functions ───────────────────────────────────────────────────
 
 pub(super) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
-    register_pf_specific_handlers();
+    register_proc_leaf_subcommands();
     for &agent in AGENTS {
         let agent_s = agent.to_string();
 
@@ -237,7 +233,7 @@ pub(super) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(super) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
-    register_pf_specific_handlers();
+    register_proc_leaf_subcommands();
     struct Def {
         name: &'static str,
         script_template: &'static str,
@@ -397,7 +393,7 @@ pub(super) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive pair matrix
 pub(super) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
-    register_pf_specific_handlers();
+    register_proc_leaf_subcommands();
     for &case in KPX_PROC_CASES {
         let observer = case.observer;
         let target = case.target;
@@ -438,5 +434,77 @@ pub(super) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
                     })
                 })
             });
+    }
+}
+
+// ─── proc-probe / check-ppid leaf subcommands ────────────────────────────────
+
+fn register_proc_leaf_subcommands() {
+    crate::register_leaf_subcommand!("proc-probe", proc_leaf_subcmd::subcmd_proc_probe);
+    crate::register_leaf_subcommand!("check-ppid", proc_leaf_subcmd::subcmd_check_ppid);
+}
+
+mod proc_leaf_subcmd {
+    // Safety comments below: libc FFI calls operate on the calling
+    // process's own PID / parent PID and signal 0 (no-op); these are
+    // always safe to invoke.
+
+    pub(super) fn subcmd_check_ppid(_args: &[String]) -> i32 {
+        // Safety: getppid is always safe.
+        let ppid = unsafe { libc::getppid() };
+        let proc_exists = std::path::Path::new(&format!("/proc/{ppid}")).exists();
+        // Safety: kill(ppid, 0) merely checks process existence.
+        let kill_ret = unsafe { libc::kill(ppid, 0) };
+        let kill_errno = if kill_ret != 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        } else {
+            0
+        };
+        let kill_ok = kill_ret == 0;
+        println!("ppid={ppid} proc={proc_exists} kill0={kill_ok} errno={kill_errno}");
+        0
+    }
+
+    pub(super) fn subcmd_proc_probe(args: &[String]) -> i32 {
+        // Safety: getpid / getppid are always safe.
+        let pid = unsafe { libc::getpid() };
+        let parent_pid = unsafe { libc::getppid() };
+        let self_exists = std::path::Path::new("/proc/self").exists();
+        let self_cmdline = std::fs::read_to_string("/proc/self/cmdline")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let self_stat = std::fs::read_to_string("/proc/self/stat")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let own_proc = std::path::Path::new(&format!("/proc/{pid}")).exists();
+        let own_cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let ppid_proc = std::path::Path::new(&format!("/proc/{parent_pid}")).exists();
+        let ppid_cmdline = std::fs::read_to_string(format!("/proc/{parent_pid}/cmdline"))
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        // Safety: kill(parent_pid, 0) merely checks process existence.
+        let ppid_kill0_ret = unsafe { libc::kill(parent_pid, 0) };
+        let ppid_kill0_errno = if ppid_kill0_ret != 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        } else {
+            0
+        };
+        let ppid_kill0 = ppid_kill0_ret == 0;
+        print!("pid={pid} ppid={parent_pid}");
+        print!(" self={self_exists} self_cmdline={self_cmdline} self_stat={self_stat}");
+        print!(" own_proc={own_proc} own_cmdline={own_cmdline}");
+        print!(
+            " ppid_proc={ppid_proc} ppid_cmdline={ppid_cmdline} ppid_kill0={ppid_kill0} ppid_kill0_errno={ppid_kill0_errno}"
+        );
+        if let Some(target) = args.get(2).and_then(|s| s.parse::<i32>().ok()) {
+            let t_proc = std::path::Path::new(&format!("/proc/{target}")).exists();
+            // Safety: kill(target, 0) merely checks process existence.
+            let t_kill0 = unsafe { libc::kill(target, 0) } == 0;
+            print!(" target={target} target_proc={t_proc} target_kill0={t_kill0}");
+        }
+        println!();
+        0
     }
 }

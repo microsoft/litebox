@@ -1825,7 +1825,7 @@ fn exec_args(args: Vec<String>) -> ExecArgs {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// BASH: bash fork/exec tests (lifted from platform_fixes.rs)
+// BASH: bash fork/exec tests (bash fork/exec tests)
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {

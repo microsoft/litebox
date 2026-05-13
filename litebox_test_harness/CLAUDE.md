@@ -365,8 +365,8 @@ fork-parent slots:
 | Array | Module | Slots | Use for |
 |---|---|---|---|
 | `EXEC_AGENTS` | `matrix.rs` | 11 | exec-style tests (EXITD, BR.exec_*, FWE, M, BS, …) — fans across PIE-glibc depth-1/2/3, non-PIE-glibc, static-leg parents, and the VS-Code-shape transition slots. |
-| `NPIPE_AGENTS` | `platform_fixes.rs` | 10 | pipe-bridge churn tests (npipe family). |
-| EP agent loop | `platform_fixes.rs::register_epoll_socket_tests` | 11 | epoll/socket tests (EP.direct.*, EP.tokio.*) — has a per-agent port table to keep concurrent runs from colliding. |
+| `NPIPE_AGENTS` | `pipe_bridge.rs` | 10 | pipe-bridge churn tests (npipe family). |
+| EP agent loop | `epoll_pidfd.rs::register_epoll_socket_tests` | 11 | epoll/socket tests (EP.direct.*, EP.tokio.*) — has a per-agent port table to keep concurrent runs from colliding. |
 | US6 / P1 fan-out | `special_cases.rs` | 11 | UDS socketpair (US6) and pipe-EOF-fork (P1) families. |
 | `RAND_AGENTS` | `getrandom_tests.rs` | 4 | getrandom contract — covers glibc + musl libc-bootstrap differences. |
 | `INO_AGENTS` | `inotify.rs` | 5 | inotify file-watcher tests. |
@@ -605,14 +605,8 @@ families:
 | `shell.rs` *(new)*                      | `SP.*`, `SC.*`, `TR.*`, `FR.*`, `BR.*`, `BRS.*` |
 | `special_cases/exit.rs`                 | exit semantics, `EXITD.*`                     |
 | `special_cases/fs.rs`                   | filesystem misc, `CWF.*`                      |
-| `special_cases/proc.rs` *(new)*         | `/proc` reads, `PROC.*`, `KP.*`, `KPX.*`      |
-| `platform_fixes.rs`                     | minimal_canary (M*/BS*) + shared helpers      |
-
-`platform_fixes.rs` is now small and houses only the minimal_canary
-smoke test, the M1-M4 / BS1-BS3 leaf-subcommand canaries, and a few
-shared helpers (`AGENTS`, `DetailOut`, `fork_binary_label`,
-`register_pf_specific_handlers`) that the lifted families still
-reference.
+| `special_cases/proc.rs` *(new)*         | `/proc` reads, `PROC.*`, `KP.*`, `KPX.*`, `proc-probe` / `check-ppid` leaf subcmds |
+| `common.rs`                             | shared handlers, `CANARY_AGENTS`, `DetailOut`, `fork_binary_label`, minimal_canary (M*/BS*) |
 
 #### Authoring a new test
 
