@@ -6,6 +6,8 @@
 pub mod epoll;
 pub mod eventfd;
 pub mod inotify;
+pub mod pidfd;
 pub mod pty;
+pub mod signalfd;
 pub mod socket;
 pub mod unix_socket;
