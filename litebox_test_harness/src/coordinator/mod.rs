@@ -926,7 +926,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     special_cases::register_stdin_script(&mut registry::Registry::new(&mut tests));
     special_cases::register_xsi_stdin_script(&mut registry::Registry::new(&mut tests));
     matrix::register_matrix(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_poll_ready_tests(&mut registry::Registry::new(&mut tests));
+    epoll_pidfd::register_poll_ready_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bind_getsockname_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_pair_id_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_exit_data_integrity_tests(&mut registry::Registry::new(&mut tests));
@@ -957,7 +957,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_bg_redirect_poll_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bg_redirect_stdin_poll_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
+    epoll_pidfd::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
     eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
     inotify::register_inotify_tests(&mut registry::Registry::new(&mut tests));
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
