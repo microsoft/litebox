@@ -213,10 +213,11 @@ fn huk_subkey_derive_inner(huk: &[u8], params: KDFParams<'_>) -> Result<(), TeeR
         return Err(TeeResult::BadParameters);
     }
 
-    let mut hmac = HmacSha256::new_from_slice(huk).map_err(|_| TeeResult::BadParameters)?;
-    hmac.update(params.context);
-
-    let mut hmac_bytes = hmac.finalize().into_bytes();
+    let mut hmac_bytes = HmacSha256::new_from_slice(huk)
+        .map_err(|_| TeeResult::BadParameters)?
+        .chain_update(params.context)
+        .finalize()
+        .into_bytes();
     params.output.copy_from_slice(&hmac_bytes[..subkey_len]);
     hmac_bytes.zeroize();
     Ok(())

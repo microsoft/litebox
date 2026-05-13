@@ -120,6 +120,10 @@ pub(crate) const PRK_LEN: usize = 32;
 
 static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 
+// Do not expose a raw PRK getter (i.e., no `get_platform_root_key`).
+// Consumers should provide key derivation function and context
+// through `DerivedKeyProvider` so PRK access stays in this module.
+
 /// Sets the Platform Root Key (PRK) for this platform.
 ///
 /// This should be called once during platform initialization with a key derived
@@ -139,18 +143,15 @@ pub(crate) fn set_platform_root_key(key: &[u8]) {
 impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
     fn derive_key<E>(
         &self,
-        shim_kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
+        kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
         params: litebox::platform::KDFParams,
     ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
         let Some(prk) = PRK_ONCE.get() else {
             return Err(litebox::platform::DerivedKeyError::UnsupportedRebootPersistentKey);
         };
-        match shim_kdf {
-            None => {
-                // LVBS platform doesn't have its own KDF implementation.
-                Err(litebox::platform::DerivedKeyError::ShimKDFRequired)
-            }
-            Some(shim_kdf) => Ok(shim_kdf(prk, params)?),
+        match kdf {
+            None => Err(litebox::platform::DerivedKeyError::ShimKDFRequired),
+            Some(kdf) => Ok(kdf(prk, params)?),
         }
     }
 }
