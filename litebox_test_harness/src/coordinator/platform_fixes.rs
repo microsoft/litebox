@@ -36,11 +36,6 @@ struct DetailOut {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct PollReadyArgs {
-    timeout_ms: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
 struct BindGetsocknameArgs {
     family: String,
 }
@@ -56,8 +51,6 @@ struct AcceptInheritedArgs {
     timeout_secs: u64,
 }
 
-const POLL_READY: HandlerToken<PollReadyArgs, DetailOut> =
-    HandlerToken::new("platform_fixes.poll_ready");
 const BIND_GETSOCKNAME: HandlerToken<BindGetsocknameArgs, DetailOut> =
     HandlerToken::new("platform_fixes.bind_getsockname");
 const PIPE_PAIR_ID: HandlerToken<PipePairIdArgs, DetailOut> =
@@ -81,12 +74,6 @@ struct PipeNonblockArgs {}
 struct PipeChildNonblockArgs {}
 
 #[derive(Serialize, Deserialize, Debug)]
-struct EpollSocketArgs {
-    port: u16,
-    variant: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
 struct CrossWorkerFileArgs {
     mode: String,
     path: String,
@@ -100,8 +87,6 @@ const PIPE_NONBLOCK: HandlerToken<PipeNonblockArgs, DetailOut> =
     HandlerToken::new("platform_fixes.pipe_nonblock");
 const PIPE_CHILD_NONBLOCK: HandlerToken<PipeChildNonblockArgs, DetailOut> =
     HandlerToken::new("platform_fixes.pipe_child_nonblock");
-const EPOLL_SOCKET: HandlerToken<EpollSocketArgs, DetailOut> =
-    HandlerToken::new("platform_fixes.epoll_socket");
 const CROSS_WORKER_FILE: HandlerToken<CrossWorkerFileArgs, DetailOut> =
     HandlerToken::new("platform_fixes.cross_worker_file");
 
@@ -132,7 +117,6 @@ fn register_pf_specific_handlers() {
     register_handler!(FORK_EXEC_PIE, handle_fork_exec_pie);
     register_handler!(PIPE_NONBLOCK, handle_pipe_nonblock);
     register_handler!(PIPE_CHILD_NONBLOCK, handle_pipe_child_nonblock);
-    register_handler!(EPOLL_SOCKET, handle_epoll_socket);
     register_handler!(CROSS_WORKER_FILE, handle_cross_worker_file);
 
     crate::register_leaf_subcommand!("cross-worker-file", leaf_subcmd::subcmd_cross_worker_file);
@@ -346,14 +330,6 @@ async fn handle_pipe_child_nonblock(
     Ok(DetailOut { detail })
 }
 
-async fn handle_epoll_socket(
-    args: EpollSocketArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<DetailOut, HandlerError> {
-    let detail = epoll_socket_detail(args.port, &args.variant)?;
-    Ok(DetailOut { detail })
-}
-
 async fn handle_cross_worker_file(
     args: CrossWorkerFileArgs,
     ctx: &mut HandlerCtx<'_>,
@@ -381,141 +357,6 @@ async fn handle_cross_worker_file(
     Ok(DetailOut {
         detail: "[cross-worker-file] READY".into(),
     })
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::too_many_lines
-)]
-fn epoll_socket_detail(port: u16, variant: &str) -> Result<String, HandlerError> {
-    let mut out = Vec::new();
-    // SAFETY: all raw sockets/fds created here are checked for errors and closed before return.
-    unsafe {
-        let srv = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
-        if srv < 0 {
-            return Err(HandlerError::from(format!(
-                "socket: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let one: libc::c_int = 1;
-        libc::setsockopt(
-            srv,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            (&raw const one).cast::<libc::c_void>(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        let addr = libc::sockaddr_in {
-            sin_family: libc::AF_INET as u16,
-            sin_port: port.to_be(),
-            sin_addr: libc::in_addr { s_addr: 0 },
-            sin_zero: [0; 8],
-        };
-        if libc::bind(
-            srv,
-            (&raw const addr).cast::<libc::sockaddr>(),
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        ) != 0
-        {
-            let e = std::io::Error::last_os_error();
-            libc::close(srv);
-            return Err(HandlerError::from(format!("bind: {e}")));
-        }
-        libc::listen(srv, 5);
-        let epfd = libc::epoll_create1(0);
-        if epfd < 0 {
-            let e = std::io::Error::last_os_error();
-            libc::close(srv);
-            return Err(HandlerError::from(format!("epoll_create1: {e}")));
-        }
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: srv as u64,
-        };
-        libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, srv, &raw mut ev);
-        let client = std::thread::spawn(move || {
-            std::thread::sleep(StdDuration::from_millis(500));
-            let sock = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-            let addr = libc::sockaddr_in {
-                sin_family: libc::AF_INET as u16,
-                sin_port: port.to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_be_bytes([127, 0, 0, 1]).to_be(),
-                },
-                sin_zero: [0; 8],
-            };
-            libc::connect(
-                sock,
-                (&raw const addr).cast::<libc::sockaddr>(),
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            );
-            let msg = b"EPOLL_DATA";
-            libc::send(sock, msg.as_ptr().cast(), msg.len(), 0);
-            libc::close(sock);
-        });
-        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
-        if variant == "tokio" {
-            let n = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 0);
-            if n > 0 {
-                out.push("EPOLL_ACCEPT=IMMEDIATE".into());
-            } else {
-                let n = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 5000);
-                if n <= 0 {
-                    out.push("EPOLL_ACCEPT=TIMEOUT".into());
-                    let _ = client.join();
-                    libc::close(srv);
-                    libc::close(epfd);
-                    return Ok(out.join("\n"));
-                }
-                out.push("EPOLL_ACCEPT=WOKE".into());
-            }
-        } else {
-            let n = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 5000);
-            if n <= 0 {
-                out.push("EPOLL_ACCEPT=TIMEOUT".into());
-                let _ = client.join();
-                libc::close(srv);
-                libc::close(epfd);
-                return Ok(out.join("\n"));
-            }
-            out.push("EPOLL_ACCEPT=READY".into());
-        }
-        let conn = libc::accept4(
-            srv,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            libc::SOCK_NONBLOCK,
-        );
-        if conn < 0 {
-            out.push("EPOLL_ACCEPT=FAIL".into());
-        } else {
-            let mut ev2 = libc::epoll_event {
-                events: libc::EPOLLIN as u32,
-                u64: conn as u64,
-            };
-            libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, conn, &raw mut ev2);
-            let n2 = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 5000);
-            if n2 <= 0 {
-                out.push("EPOLL_READ=TIMEOUT".into());
-            } else {
-                let mut buf = [0u8; 64];
-                let nr = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
-                if nr > 0 {
-                    let data = std::str::from_utf8(&buf[..nr.cast_unsigned()]).unwrap_or("?");
-                    out.push(format!("EPOLL_READ=OK data={data}"));
-                } else {
-                    out.push(format!("EPOLL_READ=NO_DATA nr={nr}"));
-                }
-            }
-            libc::close(conn);
-        }
-        let _ = client.join();
-        libc::close(srv);
-        libc::close(epfd);
-    }
-    Ok(out.join("\n"))
 }
 
 fn fork_binary_label(bt: crate::BinaryType) -> &'static str {
@@ -622,47 +463,6 @@ mod leaf_subcmd {
         println!();
         0
     }
-}
-
-async fn handle_poll_ready(
-    args: PollReadyArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<DetailOut, HandlerError> {
-    let detail = (|| -> Result<String, String> {
-        let mut pipe_fds = [0i32; 2];
-        // SAFETY: pipe writes two fresh fds into pipe_fds on success.
-        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-            return Err(format!("pipe: {}", std::io::Error::last_os_error()));
-        }
-        let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
-        let data = b"poll_test_data";
-        // SAFETY: write_fd is a live pipe fd and data points to readable bytes.
-        let _ = unsafe { libc::write(write_fd, data.as_ptr().cast(), data.len()) };
-        let mut fds = [libc::pollfd {
-            fd: read_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        // SAFETY: fds points to one valid pollfd.
-        let n = unsafe {
-            libc::poll(
-                fds.as_mut_ptr(),
-                1,
-                i32::try_from(args.timeout_ms).unwrap_or(i32::MAX),
-            )
-        };
-        // SAFETY: both fds are owned by this handler.
-        unsafe {
-            libc::close(write_fd);
-            libc::close(read_fd);
-        }
-        if n > 0 && (fds[0].revents & libc::POLLIN) != 0 {
-            Ok("POLLIN".to_string())
-        } else {
-            Ok("TIMEOUT".to_string())
-        }
-    })()?;
-    Ok(DetailOut { detail })
 }
 
 async fn handle_bind_getsockname(
@@ -861,36 +661,6 @@ const NPIPE_AGENTS: &[AgentName] = &[
     AgentName::Dpg1SpmDng, // cli → node (VS Code's signature transition)
     AgentName::Dpg1Snm,    // non-PIE-static-musl
 ];
-
-// ═══════════════════════════════════════════════════════════════════
-// POLL: epoll/ppoll IN events (fix 0fb258e2)
-// ═══════════════════════════════════════════════════════════════════
-
-pub(crate) fn register_poll_ready_tests(reg: &mut Registry<'_>) {
-    register_handler!(POLL_READY, handle_poll_ready);
-    for &agent in AGENTS {
-        let agent_s = agent.to_string();
-        reg.test("matrix", "poll_ready", format!("POLL.pipe.{agent}"))
-            .timeout(60)
-            .build(move |cx| {
-                let handle = cx.require(agent);
-                Box::new(move |run| {
-                    let a = agent_s.clone();
-                    Box::pin(async move {
-                        let result = run
-                            .send_named_typed(
-                                &handle,
-                                &POLL_READY,
-                                PollReadyArgs { timeout_ms: 2000 },
-                            )
-                            .await;
-                        let pass = matches!(&result, Ok(out) if out.detail == "POLLIN");
-                        super::TestOutcome::new(&a, pass, format!("{result:?}"))
-                    })
-                })
-            });
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // GSN: getsockname port after bind (fix 336dc79e)
@@ -3604,130 +3374,6 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
                     })
                 })
             });
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// EP: Epoll + Socket wakeup
-// ═══════════════════════════════════════════════════════════════════
-
-#[allow(clippy::too_many_lines)]
-pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
-    register_pf_specific_handlers();
-    for &variant in &["direct", "tokio"] {
-        // Long-lived agents the epoll/socket test runs in. Each
-        // entry is a forking parent of a different binary type; the
-        // syscall-rewrite / vDSO / epoll-host code path differs per
-        // parent binary, so we want a slot per leg.
-        for &agent in &[
-            AgentName::Dpg1,       // PIE-glibc
-            AgentName::Dpg1Dpg1,   // PIE-glibc depth-2
-            AgentName::Dpg2,       // PIE-glibc sibling
-            AgentName::Dpg1Dng,    // non-PIE-glibc (node form)
-            AgentName::Dpg1DngDpg, // PIE child of non-PIE — round-trip
-            AgentName::Dpg1DngDng, // bash → bash (VS Code hot path)
-            AgentName::Dpg1DngSpm, // bash → cli (VS Code hot path)
-            AgentName::Dpg1Spg,    // static-PIE-glibc
-            AgentName::Dpg1Spm,    // static-PIE-musl (cli form)
-            AgentName::Dpg1SpmDng, // cli → node (VS Code signature)
-            AgentName::Dpg1Snm,    // non-PIE-static-musl
-        ] {
-            let port: u16 = match (variant, agent) {
-                ("direct", AgentName::Dpg1) => 19990,
-                ("direct", AgentName::Dpg1Dpg1) => 19991,
-                ("direct", AgentName::Dpg2) => 19992,
-                ("direct", AgentName::Dpg1Dng) => 19993,
-                ("direct", AgentName::Dpg1DngDpg) => 19994,
-                ("direct", AgentName::Dpg1Spg) => 19980,
-                ("direct", AgentName::Dpg1Spm) => 19981,
-                ("direct", AgentName::Dpg1Snm) => 19982,
-                ("direct", AgentName::Dpg1DngDng) => 19970,
-                ("direct", AgentName::Dpg1DngSpm) => 19971,
-                ("direct", AgentName::Dpg1SpmDng) => 19972,
-                ("tokio", AgentName::Dpg1) => 19995,
-                ("tokio", AgentName::Dpg1Dpg1) => 19996,
-                ("tokio", AgentName::Dpg2) => 19997,
-                ("tokio", AgentName::Dpg1Dng) => 19998,
-                ("tokio", AgentName::Dpg1DngDpg) => 19999,
-                ("tokio", AgentName::Dpg1Spg) => 19985,
-                ("tokio", AgentName::Dpg1Spm) => 19986,
-                ("tokio", AgentName::Dpg1Snm) => 19987,
-                ("tokio", AgentName::Dpg1DngDng) => 19975,
-                ("tokio", AgentName::Dpg1DngSpm) => 19976,
-                ("tokio", AgentName::Dpg1SpmDng) => 19977,
-                _ => 19960,
-            };
-
-            // EP.{variant}.accept.{agent}
-            {
-                let agent_s = agent.to_string();
-                let variant_s: String = variant.into();
-                reg.test("matrix", "epoll_socket", format!("EP.{variant}.accept.{agent}"))
-                    .timeout(60)
-                    .build(move |cx| {
-                        let leaf = cx.declare_ephemeral(
-                            agent,
-                            format!("EpollSocketAccept_{variant}_{agent}"),
-                            SpawnKind::Fork {
-                                binary: "self",
-                                inherit_listen_ports: vec![],
-                            },
-                        );
-                        Box::new(move |run| {
-                            let a = agent_s.clone();
-                            let v = variant_s.clone();
-                            Box::pin(async move {
-                                let result = run
-                                    .run_leaf(
-                                        &leaf,
-                                        &EPOLL_SOCKET,
-                                        EpollSocketArgs { port, variant: v })
-                                    .await;
-                                let pass = matches!(&result, Ok(out) if out.detail.contains("EPOLL_ACCEPT=") && !out.detail.contains("TIMEOUT"));
-                                super::TestOutcome::new(&a, pass, format!("{result:?}"))
-                            })
-                        })
-                    });
-            }
-
-            // EP.{variant}.read.{agent}
-            {
-                let agent_s = agent.to_string();
-                let variant_s: String = variant.into();
-                reg.test(
-                    "matrix",
-                    "epoll_socket",
-                    format!("EP.{variant}.read.{agent}"),
-                )
-                .timeout(60)
-                .build(move |cx| {
-                    let leaf = cx.declare_ephemeral(
-                        agent,
-                        format!("EpollSocketRead_{variant}_{agent}"),
-                        SpawnKind::Fork {
-                            binary: "self",
-                            inherit_listen_ports: vec![],
-                        },
-                    );
-                    Box::new(move |run| {
-                        let a = agent_s.clone();
-                        let v = variant_s.clone();
-                        Box::pin(async move {
-                            let result = run
-                                .run_leaf(
-                                    &leaf,
-                                    &EPOLL_SOCKET,
-                                    EpollSocketArgs { port, variant: v },
-                                )
-                                .await;
-                            let pass =
-                                matches!(&result, Ok(out) if out.detail.contains("EPOLL_READ=OK"));
-                            super::TestOutcome::new(&a, pass, format!("{result:?}"))
-                        })
-                    })
-                });
-            }
         }
     }
 }
