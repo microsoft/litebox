@@ -9,10 +9,7 @@
 
 #![allow(clippy::items_after_statements)]
 
-use std::collections::HashMap;
 use std::os::fd::FromRawFd;
-use std::process::Stdio;
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -20,10 +17,13 @@ use serde::{Deserialize, Serialize};
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::protocol::{Command as InfraCommand, Response};
 use crate::register_handler;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Duration;
 
 use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
+use super::matrix::{
+    EXEC, EXEC_READY, ExecArgs, ExecReadyArgs, FS_DELETE, FS_READ, FsPathArgs, GET_PID, KILL,
+    KillArgs, NET_CONNECT, NET_LISTEN, NET_UNLISTEN, NetConnectArgs, NetListenArgs,
+};
 use super::registry::Registry;
 use super::run_context::RunContext;
 
@@ -56,45 +56,6 @@ struct AcceptInheritedArgs {
     timeout_secs: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct PfExecArgs {
-    args: Vec<String>,
-    timeout_secs: Option<u64>,
-    stdin: Option<String>,
-    background: bool,
-    env: Vec<(String, String)>,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct PfExecReadyArgs {
-    args: Vec<String>,
-    ready_marker: String,
-    timeout_secs: Option<u64>,
-    stdin: Option<String>,
-    stream: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct PfPathArgs {
-    path: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct PfKillArgs {
-    pid: u32,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct PfNetListenArgs {
-    port: u16,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct PfNetConnectArgs {
-    addr: String,
-    data: String,
-}
-
 const POLL_READY: HandlerToken<PollReadyArgs, DetailOut> =
     HandlerToken::new("platform_fixes.poll_ready");
 const BIND_GETSOCKNAME: HandlerToken<BindGetsocknameArgs, DetailOut> =
@@ -103,21 +64,6 @@ const PIPE_PAIR_ID: HandlerToken<PipePairIdArgs, DetailOut> =
     HandlerToken::new("platform_fixes.pipe_pair_id");
 const ACCEPT_INHERITED: HandlerToken<AcceptInheritedArgs, DetailOut> =
     HandlerToken::new("platform_fixes.accept_inherited");
-
-const PF_EXEC: HandlerToken<PfExecArgs, Response> = HandlerToken::new("platform_fixes.exec");
-const PF_EXEC_READY: HandlerToken<PfExecReadyArgs, Response> =
-    HandlerToken::new("platform_fixes.exec_ready");
-const PF_FS_READ: HandlerToken<PfPathArgs, Response> = HandlerToken::new("platform_fixes.fs_read");
-const PF_FS_DELETE: HandlerToken<PfPathArgs, Response> =
-    HandlerToken::new("platform_fixes.fs_delete");
-const PF_KILL: HandlerToken<PfKillArgs, Response> = HandlerToken::new("platform_fixes.kill");
-const PF_GET_PID: HandlerToken<(), Response> = HandlerToken::new("platform_fixes.get_pid");
-const PF_NET_LISTEN: HandlerToken<PfNetListenArgs, Response> =
-    HandlerToken::new("platform_fixes.net_listen");
-const PF_NET_UNLISTEN: HandlerToken<PfNetListenArgs, Response> =
-    HandlerToken::new("platform_fixes.net_unlisten");
-const PF_NET_CONNECT: HandlerToken<PfNetConnectArgs, Response> =
-    HandlerToken::new("platform_fixes.net_connect");
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CliStartupMimicArgs {}
@@ -159,15 +105,9 @@ const EPOLL_SOCKET: HandlerToken<EpollSocketArgs, DetailOut> =
 const CROSS_WORKER_FILE: HandlerToken<CrossWorkerFileArgs, DetailOut> =
     HandlerToken::new("platform_fixes.cross_worker_file");
 
-static PF_TCP_LISTENERS: OnceLock<Mutex<HashMap<u16, tokio::task::JoinHandle<()>>>> =
-    OnceLock::new();
-
-fn pf_tcp_listeners() -> &'static Mutex<HashMap<u16, tokio::task::JoinHandle<()>>> {
-    PF_TCP_LISTENERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn pf_exec_args(args: Vec<String>) -> PfExecArgs {
-    PfExecArgs {
+/// Convenience: build an `ExecArgs` with just an argv and sensible defaults.
+fn exec_args(args: Vec<String>) -> ExecArgs {
+    ExecArgs {
         args,
         timeout_secs: None,
         stdin: None,
@@ -176,495 +116,18 @@ fn pf_exec_args(args: Vec<String>) -> PfExecArgs {
     }
 }
 
-fn pf_exec_timeout_args(args: Vec<String>, timeout_secs: u64) -> PfExecArgs {
-    PfExecArgs {
+fn exec_timeout_args(args: Vec<String>, timeout_secs: u64) -> ExecArgs {
+    ExecArgs {
         timeout_secs: Some(timeout_secs),
-        ..pf_exec_args(args)
+        ..exec_args(args)
     }
 }
 
-async fn pf_send_response<A>(
-    run: &mut RunContext<'_>,
-    handle: &AgentHandle,
-    token: &'static HandlerToken<A, Response>,
-    args: A,
-) -> Response
-where
-    A: serde::Serialize,
-{
-    run.send_named_typed(handle, token, args)
-        .await
-        .unwrap_or_else(|e| Response::Error { error: e })
-}
-
-async fn pf_exec(run: &mut RunContext<'_>, handle: &AgentHandle, args: Vec<String>) -> Response {
-    pf_send_response(run, handle, &PF_EXEC, pf_exec_args(args)).await
-}
-
-async fn pf_exec_full(
-    run: &mut RunContext<'_>,
-    handle: &AgentHandle,
-    args: Vec<String>,
-    timeout_secs: Option<u64>,
-    stdin: Option<String>,
-    env: Vec<(String, String)>,
-) -> Response {
-    pf_send_response(
-        run,
-        handle,
-        &PF_EXEC,
-        PfExecArgs {
-            args,
-            timeout_secs,
-            stdin,
-            background: false,
-            env,
-        },
-    )
-    .await
-}
-
-async fn pf_exec_ready(
-    run: &mut RunContext<'_>,
-    handle: &AgentHandle,
-    args: Vec<String>,
-    ready_marker: String,
-    timeout_secs: Option<u64>,
-    stdin: Option<String>,
-    stream: String,
-) -> Response {
-    pf_send_response(
-        run,
-        handle,
-        &PF_EXEC_READY,
-        PfExecReadyArgs {
-            args,
-            ready_marker,
-            timeout_secs,
-            stdin,
-            stream,
-        },
-    )
-    .await
-}
-
-async fn pf_fs_read(run: &mut RunContext<'_>, handle: &AgentHandle, path: String) -> Response {
-    pf_send_response(run, handle, &PF_FS_READ, PfPathArgs { path }).await
-}
-
-async fn pf_fs_delete(run: &mut RunContext<'_>, handle: &AgentHandle, path: String) -> Response {
-    pf_send_response(run, handle, &PF_FS_DELETE, PfPathArgs { path }).await
-}
-
-async fn pf_kill(run: &mut RunContext<'_>, handle: &AgentHandle, pid: u32) -> Response {
-    pf_send_response(run, handle, &PF_KILL, PfKillArgs { pid }).await
-}
-
-async fn pf_get_pid(run: &mut RunContext<'_>, handle: &AgentHandle) -> Response {
-    pf_send_response(run, handle, &PF_GET_PID, ()).await
-}
-
-async fn pf_net_listen(run: &mut RunContext<'_>, handle: &AgentHandle, port: u16) -> Response {
-    pf_send_response(run, handle, &PF_NET_LISTEN, PfNetListenArgs { port }).await
-}
-
-async fn pf_net_unlisten(run: &mut RunContext<'_>, handle: &AgentHandle, port: u16) -> Response {
-    pf_send_response(run, handle, &PF_NET_UNLISTEN, PfNetListenArgs { port }).await
-}
-
-async fn pf_net_connect(
-    run: &mut RunContext<'_>,
-    handle: &AgentHandle,
-    addr: String,
-    data: String,
-) -> Response {
-    pf_send_response(
-        run,
-        handle,
-        &PF_NET_CONNECT,
-        PfNetConnectArgs { addr, data },
-    )
-    .await
-}
-
-async fn handle_pf_exec(
-    args: PfExecArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<Response, HandlerError> {
-    if args.args.is_empty() {
-        return Ok(Response::Error {
-            error: "exec requires args".to_string(),
-        });
-    }
-    let mut cmd = tokio::process::Command::new(&args.args[0]);
-    cmd.args(&args.args[1..]);
-    for (key, value) in &args.env {
-        cmd.env(key, value);
-    }
-    if args.stdin.is_some() {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
-    }
-    if args.background {
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        match cmd.spawn() {
-            Ok(mut child) => {
-                if let Some(content) = args.stdin
-                    && let Some(mut stdin) = child.stdin.take()
-                {
-                    let _ = stdin.write_all(content.as_bytes()).await;
-                }
-                Ok(Response::Background {
-                    pid: child.id().unwrap_or(0),
-                })
-            }
-            Err(e) => Ok(Response::Error {
-                error: format!("exec spawn: {e}"),
-            }),
-        }
-    } else {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                return Ok(Response::Error {
-                    error: format!("exec spawn: {e}"),
-                });
-            }
-        };
-        if let Some(content) = args.stdin
-            && let Some(mut stdin) = child.stdin.take()
-        {
-            let _ = stdin.write_all(content.as_bytes()).await;
-        }
-        let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(10));
-        match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(output)) => Ok(Response::ExecResult {
-                exit_code: output.status.code().unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            }),
-            Ok(Err(e)) => Ok(Response::Error {
-                error: format!("exec wait: {e}"),
-            }),
-            Err(_) => Ok(Response::ExecTimeout {
-                stderr: format!(
-                    "process timed out after {}s (likely deadlocked)",
-                    timeout.as_secs()
-                ),
-            }),
-        }
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-async fn handle_pf_exec_ready(
-    args: PfExecReadyArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<Response, HandlerError> {
-    if args.args.is_empty() {
-        return Ok(Response::Error {
-            error: "exec_ready requires args".to_string(),
-        });
-    }
-    if !matches!(args.stream.as_str(), "stdout" | "stderr" | "either") {
-        return Ok(Response::Error {
-            error: format!(
-                "invalid marker stream {:?}; expected stdout, stderr, or either",
-                args.stream
-            ),
-        });
-    }
-    let mut cmd = std::process::Command::new(&args.args[0]);
-    cmd.args(&args.args[1..]);
-    if args.stdin.is_some() {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            return Ok(Response::Error {
-                error: format!("exec_ready spawn: {e}"),
-            });
-        }
-    };
-    if let Some(content) = args.stdin
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        let _ = std::io::Write::write_all(&mut stdin, content.as_bytes());
-    }
-    let Some(stdout) = child.stdout.take() else {
-        return Ok(Response::Error {
-            error: "exec_ready: stdout pipe missing".to_string(),
-        });
-    };
-    let Some(stderr) = child.stderr.take() else {
-        return Ok(Response::Error {
-            error: "exec_ready: stderr pipe missing".to_string(),
-        });
-    };
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let marker = args.ready_marker.clone();
-    let stream = args.stream.clone();
-    if matches!(stream.as_str(), "stdout" | "either") {
-        let tx = tx.clone();
-        let marker = marker.clone();
-        std::thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(stdout);
-            let mut seen = Vec::new();
-            let mut byte = [0_u8; 1];
-            while let Ok(1) = std::io::Read::read(&mut reader, &mut byte) {
-                seen.push(byte[0]);
-                if String::from_utf8_lossy(&seen).contains(&marker) {
-                    let _ = tx.send("ready".to_string());
-                    break;
-                }
-            }
-        });
-    }
-    if matches!(stream.as_str(), "stderr" | "either") {
-        let tx = tx.clone();
-        let marker = marker.clone();
-        std::thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(stderr);
-            let mut seen = Vec::new();
-            let mut byte = [0_u8; 1];
-            while let Ok(1) = std::io::Read::read(&mut reader, &mut byte) {
-                seen.push(byte[0]);
-                if String::from_utf8_lossy(&seen).contains(&marker) {
-                    let _ = tx.send("ready".to_string());
-                    break;
-                }
-            }
-        });
-    }
-    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(30));
-    let start = Instant::now();
-    loop {
-        if rx.try_recv().is_ok() {
-            let pid = child.id();
-            std::mem::forget(child);
-            return Ok(Response::BackgroundReady { pid });
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return Ok(Response::Error {
-                    error: format!("process exited before ready_marker (status={status})"),
-                });
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return Ok(Response::Error {
-                    error: format!("exec_ready poll: {e}"),
-                });
-            }
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            return Ok(Response::Error {
-                error: format!("ready_marker not observed within {}s", timeout.as_secs()),
-            });
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn handle_pf_fs_read(
-    args: PfPathArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<Response, HandlerError> {
-    match tokio::fs::read_to_string(&args.path).await {
-        Ok(data) => Ok(Response::Ok { data: Some(data) }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Response::NotFound),
-        Err(e) => Ok(Response::Error {
-            error: format!("read {}: {e}", args.path),
-        }),
-    }
-}
-
-async fn handle_pf_fs_delete(
-    args: PfPathArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<Response, HandlerError> {
-    match tokio::fs::remove_file(&args.path).await {
-        Ok(()) => Ok(Response::Ok { data: None }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Response::NotFound),
-        Err(e) => Ok(Response::Error {
-            error: format!("delete {}: {e}", args.path),
-        }),
-    }
-}
-
-async fn handle_pf_kill(
-    args: PfKillArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<Response, HandlerError> {
-    let Ok(pid) = libc::pid_t::try_from(args.pid) else {
-        return Ok(Response::Error {
-            error: format!("kill {}: pid out of range", args.pid),
-        });
-    };
-    // SAFETY: libc::kill is called with a PID returned by a previous background spawn and a constant signal.
-    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
-    if rc == 0 {
-        Ok(Response::Ok { data: None })
-    } else {
-        Ok(Response::Error {
-            error: format!("kill {}: {}", args.pid, std::io::Error::last_os_error()),
-        })
-    }
-}
-
-async fn handle_pf_get_pid(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<Response, HandlerError> {
-    Ok(Response::Ok {
-        data: Some(std::process::id().to_string()),
-    })
-}
-
-async fn handle_pf_net_listen(
-    args: PfNetListenArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<Response, HandlerError> {
-    // Bind with std::net so we can pull out the OwnedFd for the
-    // inherit_bridge, then re-wrap as a tokio listener for the accept
-    // task.
-    let std_listener =
-        match std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, args.port)) {
-            Ok(l) => l,
-            Err(e) => {
-                return Ok(Response::Error {
-                    error: format!("bind {}: {e}", args.port),
-                });
-            }
-        };
-    let port = match std_listener.local_addr() {
-        Ok(addr) => addr.port(),
-        Err(e) => {
-            return Ok(Response::Error {
-                error: format!("local_addr: {e}"),
-            });
-        }
-    };
-    // Dup the fd so the bridge owns one copy (for Fork inheritance)
-    // and the tokio listener owns the other (for the accept task).
-    let raw = std::os::fd::AsRawFd::as_raw_fd(&std_listener);
-    // SAFETY: F_DUPFD_CLOEXEC duplicates a valid open fd; ownership of the
-    // returned descriptor is moved into OwnedFd::from_raw_fd below.
-    let dup = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
-    if dup < 0 {
-        return Ok(Response::Error {
-            error: format!("dup fd for bridge: {}", std::io::Error::last_os_error()),
-        });
-    }
-    // SAFETY: `dup` was just returned by fcntl F_DUPFD_CLOEXEC.
-    let bridge_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) };
-    if let Some(old) = crate::inherit_bridge()
-        .lock()
-        .expect("inherit bridge")
-        .insert(port, bridge_owned)
-    {
-        drop(old);
-    }
-    let _ = std_listener.set_nonblocking(true);
-    let listener = match tokio::net::TcpListener::from_std(std_listener) {
-        Ok(l) => l,
-        Err(e) => {
-            return Ok(Response::Error {
-                error: format!("from_std: {e}"),
-            });
-        }
-    };
-    let task = tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut buf = [0_u8; 4096];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if stream.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-    if let Some(old) = pf_tcp_listeners()
-        .lock()
-        .expect("tcp listener registry poisoned")
-        .insert(port, task)
-    {
-        old.abort();
-    }
-    Ok(Response::Listening { port })
-}
-
-async fn handle_pf_net_unlisten(
-    args: PfNetListenArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<Response, HandlerError> {
-    if let Some(task) = pf_tcp_listeners()
-        .lock()
-        .expect("tcp listener registry poisoned")
-        .remove(&args.port)
-    {
-        task.abort();
-    }
-    crate::inherit_bridge()
-        .lock()
-        .expect("inherit bridge")
-        .remove(&args.port);
-    Ok(Response::Ok { data: None })
-}
-
-async fn handle_pf_net_connect(
-    args: PfNetConnectArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<Response, HandlerError> {
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::TcpStream::connect(&args.addr),
-    )
-    .await
-    {
-        Ok(Ok(mut stream)) => {
-            let _ = stream.write_all(args.data.as_bytes()).await;
-            let _ = stream.flush().await;
-            let mut buf = [0_u8; 4096];
-            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => Ok(Response::Connected {
-                    echo: String::from_utf8_lossy(&buf[..n]).to_string(),
-                }),
-                _ => Ok(Response::ConnectFailed {
-                    error: "no echo response".to_string(),
-                }),
-            }
-        }
-        Ok(Err(e)) => Ok(Response::ConnectFailed {
-            error: format!("{e}"),
-        }),
-        Err(_) => Ok(Response::ConnectFailed {
-            error: "connect timeout".to_string(),
-        }),
-    }
-}
-
-fn register_platform_fix_handlers() {
-    register_handler!(PF_EXEC, handle_pf_exec);
-    register_handler!(PF_EXEC_READY, handle_pf_exec_ready);
-    register_handler!(PF_FS_READ, handle_pf_fs_read);
-    register_handler!(PF_FS_DELETE, handle_pf_fs_delete);
-    register_handler!(PF_KILL, handle_pf_kill);
-    register_handler!(PF_GET_PID, handle_pf_get_pid);
-    register_handler!(PF_NET_LISTEN, handle_pf_net_listen);
-    register_handler!(PF_NET_UNLISTEN, handle_pf_net_unlisten);
-    register_handler!(PF_NET_CONNECT, handle_pf_net_connect);
+/// Register the platform-fixes-specific handlers (non-canonical
+/// handlers that are unique to this family). Canonical handlers
+/// (`EXEC`, `FS_READ`, `NET_LISTEN`, etc.) are registered by
+/// `register_matrix_handlers` in `matrix.rs`.
+fn register_pf_specific_handlers() {
     register_handler!(CLI_STARTUP_MIMIC, handle_cli_startup_mimic);
     register_handler!(FORK_EXEC_PIE, handle_fork_exec_pie);
     register_handler!(PIPE_NONBLOCK, handle_pipe_nonblock);
@@ -1505,7 +968,7 @@ pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     for &size in EXIT_SIZES {
         for &binary in crate::BinaryType::ALL {
             for &agent in DEPTH_AGENTS {
@@ -1556,7 +1019,7 @@ pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     for &reps in NPIPE_REPS {
         for &agent in NPIPE_AGENTS {
             let agent_s = agent.to_string();
@@ -1578,12 +1041,17 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
                         let mut detail = String::new();
                         for i in 0..reps {
                             let tag = format!("seq_{a}_{i}");
-                            let resp = pf_exec(
-                                run,
-                                &handle,
-                                vec![nonpie.clone(), "write-known".into(), tag.clone()],
-                            )
-                            .await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    exec_args(vec![
+                                        nonpie.clone(),
+                                        "write-known".into(),
+                                        tag.clone(),
+                                    ]),
+                                )
+                                .await;
                             let expected = format!("PIPEDATA:{tag}");
                             let ok = matches!(
                                 &resp,
@@ -1623,12 +1091,17 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
                         let mut detail = String::new();
                         for i in 0..reps {
                             let np_tag = format!("np_{a}_{i}");
-                            let resp = pf_exec(
-                                run,
-                                &handle,
-                                vec![nonpie.clone(), "write-known".into(), np_tag.clone()],
-                            )
-                            .await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    exec_args(vec![
+                                        nonpie.clone(),
+                                        "write-known".into(),
+                                        np_tag.clone(),
+                                    ]),
+                                )
+                                .await;
                             let expected = format!("PIPEDATA:{np_tag}");
                             let ok = matches!(
                                 &resp,
@@ -1641,9 +1114,13 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
                                     format!("iter {i} nonpie: expected '{expected}', got {resp:?}");
                                 break;
                             }
-                            let resp =
-                                pf_exec(run, &handle, vec![self_exe.clone(), "echo-test".into()])
-                                    .await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    exec_args(vec![self_exe.clone(), "echo-test".into()]),
+                                )
+                                .await;
                             let ok = matches!(
                                 &resp,
                                 Response::ExecResult { exit_code: 0, stdout, .. }
@@ -1689,7 +1166,7 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_bpipe_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     // Exercise every binary type with uniform per-leg IDs.
     for &bt in crate::BinaryType::ALL {
         let leg_label = bt.label();
@@ -1713,12 +1190,17 @@ pub(crate) fn register_bpipe_tests(reg: &mut Registry<'_>) {
                             let mut detail = String::new();
                             for i in 0..reps {
                                 let tag = format!("seq_{leg_label}_{a}_{i}");
-                                let resp = pf_exec(
-                                    run,
-                                    &handle,
-                                    vec![target.clone(), "write-known".into(), tag.clone()],
-                                )
-                                .await;
+                                let resp = run
+                                    .typed_or_error(
+                                        &handle,
+                                        &EXEC,
+                                        exec_args(vec![
+                                            target.clone(),
+                                            "write-known".into(),
+                                            tag.clone(),
+                                        ]),
+                                    )
+                                    .await;
                                 let expected = format!("PIPEDATA:{tag}");
                                 let ok = matches!(
                                     &resp,
@@ -1758,12 +1240,17 @@ pub(crate) fn register_bpipe_tests(reg: &mut Registry<'_>) {
                             let mut detail = String::new();
                             for i in 0..reps {
                                 let tag = format!("itr_{leg_label}_{a}_{i}");
-                                let resp = pf_exec(
-                                    run,
-                                    &handle,
-                                    vec![target.clone(), "write-known".into(), tag.clone()],
-                                )
-                                .await;
+                                let resp = run
+                                    .typed_or_error(
+                                        &handle,
+                                        &EXEC,
+                                        exec_args(vec![
+                                            target.clone(),
+                                            "write-known".into(),
+                                            tag.clone(),
+                                        ]),
+                                    )
+                                    .await;
                                 let expected = format!("PIPEDATA:{tag}");
                                 let ok = matches!(
                                     &resp,
@@ -1777,12 +1264,13 @@ pub(crate) fn register_bpipe_tests(reg: &mut Registry<'_>) {
                                     );
                                     break;
                                 }
-                                let resp = pf_exec(
-                                    run,
-                                    &handle,
-                                    vec![self_exe.clone(), "echo-test".into()],
-                                )
-                                .await;
+                                let resp = run
+                                    .typed_or_error(
+                                        &handle,
+                                        &EXEC,
+                                        exec_args(vec![self_exe.clone(), "echo-test".into()]),
+                                    )
+                                    .await;
                                 let ok = matches!(
                                     &resp,
                                     Response::ExecResult { exit_code: 0, stdout, .. }
@@ -1816,7 +1304,7 @@ pub(crate) fn register_bpipe_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     // XCONN.cross_first: A listens, B connects — first attempt must succeed.
     reg.test(
         "xworker",
@@ -1830,7 +1318,9 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19900u16;
-                let listen_resp = pf_net_listen(run, &handle_a, port).await;
+                let listen_resp = run
+                    .typed_or_error(&handle_a, &NET_LISTEN, NetListenArgs { port })
+                    .await;
                 if super::expect_listening_port(&listen_resp, port).is_err() {
                     return super::TestOutcome::new(
                         "B",
@@ -1838,16 +1328,21 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                         format!("listen failed: {listen_resp:?}"),
                     );
                 }
-                let conn_resp = pf_net_connect(
-                    run,
-                    &handle_b,
-                    format!("127.0.0.1:{port}"),
-                    "first_connect".into(),
-                )
-                .await;
+                let conn_resp = run
+                    .typed_or_error(
+                        &handle_b,
+                        &NET_CONNECT,
+                        NetConnectArgs {
+                            addr: format!("127.0.0.1:{port}"),
+                            data: "first_connect".into(),
+                        },
+                    )
+                    .await;
                 let ok =
                     matches!(&conn_resp, Response::Connected { echo } if echo == "first_connect");
-                let _ = pf_net_unlisten(run, &handle_a, port).await;
+                let _ = run
+                    .typed_or_error(&handle_a, &NET_UNLISTEN, NetListenArgs { port })
+                    .await;
                 super::TestOutcome::new("B", ok, format!("{conn_resp:?}"))
             })
         })
@@ -1865,7 +1360,9 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19901u16;
-                let listen_resp = pf_net_listen(run, &handle_b, port).await;
+                let listen_resp = run
+                    .typed_or_error(&handle_b, &NET_LISTEN, NetListenArgs { port })
+                    .await;
                 if super::expect_listening_port(&listen_resp, port).is_err() {
                     return super::TestOutcome::new(
                         "AA",
@@ -1873,15 +1370,20 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                         format!("listen on B failed: {listen_resp:?}"),
                     );
                 }
-                let conn_resp = pf_net_connect(
-                    run,
-                    &handle_aa,
-                    format!("127.0.0.1:{port}"),
-                    "deep_cross".into(),
-                )
-                .await;
+                let conn_resp = run
+                    .typed_or_error(
+                        &handle_aa,
+                        &NET_CONNECT,
+                        NetConnectArgs {
+                            addr: format!("127.0.0.1:{port}"),
+                            data: "deep_cross".into(),
+                        },
+                    )
+                    .await;
                 let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "deep_cross");
-                let _ = pf_net_unlisten(run, &handle_b, port).await;
+                let _ = run
+                    .typed_or_error(&handle_b, &NET_UNLISTEN, NetListenArgs { port })
+                    .await;
                 super::TestOutcome::new("AA", ok, format!("{conn_resp:?}"))
             })
         })
@@ -1895,7 +1397,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
         Box::new(move |run| {
                 Box::pin(async move {
                     let port = 19902u16;
-                    let listen_resp = pf_net_listen(run, &handle_a, port).await;
+                    let listen_resp = run.typed_or_error(&handle_a, &NET_LISTEN, NetListenArgs { port }).await;
                     if super::expect_listening_port(&listen_resp, port).is_err() {
                         return super::TestOutcome::new(
                             "B",
@@ -1906,7 +1408,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                     let mut all_ok = true;
                     let mut fail_detail = String::new();
                     for i in 0..3 {
-                        let conn_resp = pf_net_connect(run, &handle_b, format!("127.0.0.1:{port}"), format!("seq_{i}")).await;
+                        let conn_resp = run.typed_or_error(&handle_b, &NET_CONNECT, NetConnectArgs { addr: format!("127.0.0.1:{port}"), data: format!("seq_{i}") }).await;
                         if !matches!(&conn_resp, Response::Connected { echo } if echo == &format!("seq_{i}"))
                         {
                             all_ok = false;
@@ -1914,7 +1416,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                             break;
                         }
                     }
-                    let _ = pf_net_unlisten(run, &handle_a, port).await;
+                    let _ = run.typed_or_error(&handle_a, &NET_UNLISTEN, NetListenArgs { port }).await;
                     let detail = if all_ok {
                         "3/3 sequential OK".into()
                     } else {
@@ -1932,7 +1434,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     // XCONN.self_A: A listens, A connects to itself.
     reg.test(
         "xworker",
@@ -1945,7 +1447,9 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19910u16;
-                let listen_resp = pf_net_listen(run, &handle_a, port).await;
+                let listen_resp = run
+                    .typed_or_error(&handle_a, &NET_LISTEN, NetListenArgs { port })
+                    .await;
                 if super::expect_listening_port(&listen_resp, port).is_err() {
                     return super::TestOutcome::new(
                         "A",
@@ -1953,16 +1457,21 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                         format!("listen failed: {listen_resp:?}"),
                     );
                 }
-                let conn_resp = pf_net_connect(
-                    run,
-                    &handle_a,
-                    format!("127.0.0.1:{port}"),
-                    "self_loopback".into(),
-                )
-                .await;
+                let conn_resp = run
+                    .typed_or_error(
+                        &handle_a,
+                        &NET_CONNECT,
+                        NetConnectArgs {
+                            addr: format!("127.0.0.1:{port}"),
+                            data: "self_loopback".into(),
+                        },
+                    )
+                    .await;
                 let ok =
                     matches!(&conn_resp, Response::Connected { echo } if echo == "self_loopback");
-                let _ = pf_net_unlisten(run, &handle_a, port).await;
+                let _ = run
+                    .typed_or_error(&handle_a, &NET_UNLISTEN, NetListenArgs { port })
+                    .await;
                 super::TestOutcome::new("A", ok, format!("{conn_resp:?}"))
             })
         })
@@ -1980,7 +1489,9 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19911u16;
-                let listen_resp = pf_net_listen(run, &handle_a, port).await;
+                let listen_resp = run
+                    .typed_or_error(&handle_a, &NET_LISTEN, NetListenArgs { port })
+                    .await;
                 if super::expect_listening_port(&listen_resp, port).is_err() {
                     return super::TestOutcome::new(
                         "AA",
@@ -1988,16 +1499,21 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                         format!("listen failed: {listen_resp:?}"),
                     );
                 }
-                let conn_resp = pf_net_connect(
-                    run,
-                    &handle_aa,
-                    format!("127.0.0.1:{port}"),
-                    "parent_child".into(),
-                )
-                .await;
+                let conn_resp = run
+                    .typed_or_error(
+                        &handle_aa,
+                        &NET_CONNECT,
+                        NetConnectArgs {
+                            addr: format!("127.0.0.1:{port}"),
+                            data: "parent_child".into(),
+                        },
+                    )
+                    .await;
                 let ok =
                     matches!(&conn_resp, Response::Connected { echo } if echo == "parent_child");
-                let _ = pf_net_unlisten(run, &handle_a, port).await;
+                let _ = run
+                    .typed_or_error(&handle_a, &NET_UNLISTEN, NetListenArgs { port })
+                    .await;
                 super::TestOutcome::new("AA", ok, format!("{conn_resp:?}"))
             })
         })
@@ -2015,7 +1531,9 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19912u16;
-                let listen_resp = pf_net_listen(run, &handle_aa, port).await;
+                let listen_resp = run
+                    .typed_or_error(&handle_aa, &NET_LISTEN, NetListenArgs { port })
+                    .await;
                 if super::expect_listening_port(&listen_resp, port).is_err() {
                     return super::TestOutcome::new(
                         "A",
@@ -2023,16 +1541,21 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                         format!("listen failed: {listen_resp:?}"),
                     );
                 }
-                let conn_resp = pf_net_connect(
-                    run,
-                    &handle_a,
-                    format!("127.0.0.1:{port}"),
-                    "child_parent".into(),
-                )
-                .await;
+                let conn_resp = run
+                    .typed_or_error(
+                        &handle_a,
+                        &NET_CONNECT,
+                        NetConnectArgs {
+                            addr: format!("127.0.0.1:{port}"),
+                            data: "child_parent".into(),
+                        },
+                    )
+                    .await;
                 let ok =
                     matches!(&conn_resp, Response::Connected { echo } if echo == "child_parent");
-                let _ = pf_net_unlisten(run, &handle_aa, port).await;
+                let _ = run
+                    .typed_or_error(&handle_aa, &NET_UNLISTEN, NetListenArgs { port })
+                    .await;
                 super::TestOutcome::new("A", ok, format!("{conn_resp:?}"))
             })
         })
@@ -2050,7 +1573,9 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19913u16;
-                let listen_resp = pf_net_listen(run, &handle_a, port).await;
+                let listen_resp = run
+                    .typed_or_error(&handle_a, &NET_LISTEN, NetListenArgs { port })
+                    .await;
                 if super::expect_listening_port(&listen_resp, port).is_err() {
                     return super::TestOutcome::new(
                         "AB",
@@ -2058,16 +1583,21 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                         format!("listen failed: {listen_resp:?}"),
                     );
                 }
-                let conn_resp = pf_net_connect(
-                    run,
-                    &handle_ab,
-                    format!("127.0.0.1:{port}"),
-                    "sibling_connect".into(),
-                )
-                .await;
+                let conn_resp = run
+                    .typed_or_error(
+                        &handle_ab,
+                        &NET_CONNECT,
+                        NetConnectArgs {
+                            addr: format!("127.0.0.1:{port}"),
+                            data: "sibling_connect".into(),
+                        },
+                    )
+                    .await;
                 let ok =
                     matches!(&conn_resp, Response::Connected { echo } if echo == "sibling_connect");
-                let _ = pf_net_unlisten(run, &handle_a, port).await;
+                let _ = run
+                    .typed_or_error(&handle_a, &NET_UNLISTEN, NetListenArgs { port })
+                    .await;
                 super::TestOutcome::new("AB", ok, format!("{conn_resp:?}"))
             })
         })
@@ -2095,7 +1625,9 @@ async fn run_tlb_listen_busy_case(
     data: &str,
     delay_secs: u64,
 ) -> super::TestOutcome {
-    let listen_resp = pf_net_listen(run, listener, 0).await;
+    let listen_resp = run
+        .typed_or_error(listener, &NET_LISTEN, NetListenArgs { port: 0 })
+        .await;
     let port = match super::expect_listening_port(&listen_resp, 0) {
         Ok(port) => port,
         Err(e) => {
@@ -2107,17 +1639,23 @@ async fn run_tlb_listen_busy_case(
         }
     };
 
-    let sleep_resp = pf_exec_full(
-        run,
-        listener,
-        vec!["sleep".into(), delay_secs.to_string()],
-        Some(delay_secs + 5),
-        None,
-        vec![],
-    )
-    .await;
+    let sleep_resp = run
+        .typed_or_error(
+            listener,
+            &EXEC,
+            ExecArgs {
+                args: vec!["sleep".into(), delay_secs.to_string()],
+                timeout_secs: Some(delay_secs + 5),
+                stdin: None,
+                background: false,
+                env: vec![],
+            },
+        )
+        .await;
     if !matches!(&sleep_resp, Response::ExecResult { exit_code: 0, .. }) {
-        let _ = pf_net_unlisten(run, listener, port).await;
+        let _ = run
+            .typed_or_error(listener, &NET_UNLISTEN, NetListenArgs { port })
+            .await;
         return super::TestOutcome::new(
             connector_name,
             false,
@@ -2125,14 +1663,19 @@ async fn run_tlb_listen_busy_case(
         );
     }
 
-    let conn_resp = pf_net_connect(
-        run,
-        connector,
-        format!("127.0.0.1:{port}"),
-        data.to_string(),
-    )
-    .await;
-    let _ = pf_net_unlisten(run, listener, port).await;
+    let conn_resp = run
+        .typed_or_error(
+            connector,
+            &NET_CONNECT,
+            NetConnectArgs {
+                addr: format!("127.0.0.1:{port}"),
+                data: data.to_string(),
+            },
+        )
+        .await;
+    let _ = run
+        .typed_or_error(listener, &NET_UNLISTEN, NetListenArgs { port })
+        .await;
     let pass = matches!(&conn_resp, Response::Connected { echo } if echo == data);
     super::TestOutcome::new(
         connector_name,
@@ -2144,7 +1687,7 @@ async fn run_tlb_listen_busy_case(
 }
 
 pub(crate) fn register_tcp_listen_busy_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     let defs = [
         TlbListenBusyDef {
             name: "same_agent",
@@ -2212,7 +1755,7 @@ pub(crate) fn register_tcp_listen_busy_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     for &agent in &[AgentName::Dpg1, AgentName::Dpg2] {
         let agent_s = agent.to_string();
 
@@ -2225,16 +1768,17 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     let a = a.clone();
                     Box::pin(async move {
-                        let resp = pf_exec(
-                            run,
-                            &handle,
-                            vec![
-                                "bash".into(),
-                                "-c".into(),
-                                "ls / > /dev/null && echo LS_OK".into(),
-                            ],
-                        )
-                        .await;
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                exec_args(vec![
+                                    "bash".into(),
+                                    "-c".into(),
+                                    "ls / > /dev/null && echo LS_OK".into(),
+                                ]),
+                            )
+                            .await;
                         let pass = matches!(
                             &resp,
                             Response::ExecResult { exit_code: 0, stdout, .. }
@@ -2254,16 +1798,17 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     let a = a.clone();
                     Box::pin(async move {
-                        let resp = pf_exec(
-                            run,
-                            &handle,
-                            vec![
-                                "bash".into(),
-                                "-c".into(),
-                                "echo HOST=$(cat /etc/hostname)".into(),
-                            ],
-                        )
-                        .await;
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                exec_args(vec![
+                                    "bash".into(),
+                                    "-c".into(),
+                                    "echo HOST=$(cat /etc/hostname)".into(),
+                                ]),
+                            )
+                            .await;
                         // Substituted hostname must be non-empty (the substitution
                         // actually ran). `hostname -I` worked above on the same
                         // container, so /etc/hostname is non-empty.
@@ -2287,24 +1832,25 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     let a = a.clone();
                     Box::pin(async move {
-                        let resp = pf_exec(
-                            run,
-                            &handle,
-                            vec![
-                                "bash".into(),
-                                "-c".into(),
-                                // The bg subshell must actually run and emit
-                                // BG_DONE; the fg leg must run too. Wait for
-                                // bg before printing FG_DONE so output
-                                // ordering is deterministic.
-                                "(sleep 0.05 && echo BG_DONE) & \
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                exec_args(vec![
+                                    "bash".into(),
+                                    "-c".into(),
+                                    // The bg subshell must actually run and emit
+                                    // BG_DONE; the fg leg must run too. Wait for
+                                    // bg before printing FG_DONE so output
+                                    // ordering is deterministic.
+                                    "(sleep 0.05 && echo BG_DONE) & \
                                      cat /etc/hostname > /dev/null; \
                                      wait; \
                                      echo FG_DONE"
-                                    .into(),
-                            ],
-                        )
-                        .await;
+                                        .into(),
+                                ]),
+                            )
+                            .await;
                         let pass = matches!(
                             &resp,
                             Response::ExecResult { exit_code: 0, stdout, .. }
@@ -2323,7 +1869,7 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     // Register the `fork-exec-pie` leaf subcommand. This stays as an
     // argv subcommand (not a handler) because the test specifically
     // verifies the legacy two-level fork+exec path: agent →
@@ -2370,24 +1916,24 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
                                 AgentName::Dpg1Dng => crate::nonpie_binary(),
                                 _ => unreachable!(),
                             };
-                            let resp = pf_send_response(
-                                run,
-                                &handle,
-                                &PF_EXEC,
-                                PfExecArgs {
-                                    args: vec![
-                                        launcher_bin,
-                                        "fork-exec-pie".into(),
-                                        target,
-                                        "echo-test".into(),
-                                    ],
-                                    timeout_secs: Some(sub_timeout),
-                                    stdin: None,
-                                    background: false,
-                                    env: vec![],
-                                },
-                            )
-                            .await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    ExecArgs {
+                                        args: vec![
+                                            launcher_bin,
+                                            "fork-exec-pie".into(),
+                                            target,
+                                            "echo-test".into(),
+                                        ],
+                                        timeout_secs: Some(sub_timeout),
+                                        stdin: None,
+                                        background: false,
+                                        env: vec![],
+                                    },
+                                )
+                                .await;
                             let pass = matches!(
                                 &resp,
                                 Response::ExecResult { exit_code: 0, stdout, .. }
@@ -2428,7 +1974,7 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
 // Native must pass all 20 tests.
 
 pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     // Register the M1-M4 + BS1-BS3 leaf subcommands. These stay as
     // argv subcommands (not handlers) because they test fresh-process
     // stdio inheritance across fork+exec; see
@@ -2500,15 +2046,19 @@ pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
                                 // Inject the target binary path into
                                 // the M/BS subcommand via the
                                 // `LITEBOX_M_TARGET_BINARY` env var.
-                                let resp = pf_exec_full(
-                                    run,
-                                    &handle,
-                                    vec![self_exe, sc],
-                                    Some(timeout_secs),
-                                    None,
-                                    vec![("LITEBOX_M_TARGET_BINARY".into(), target)],
-                                )
-                                .await;
+                                let resp = run
+                                    .typed_or_error(
+                                        &handle,
+                                        &EXEC,
+                                        ExecArgs {
+                                            args: vec![self_exe, sc],
+                                            timeout_secs: Some(timeout_secs),
+                                            stdin: None,
+                                            background: false,
+                                            env: vec![("LITEBOX_M_TARGET_BINARY".into(), target)],
+                                        },
+                                    )
+                                    .await;
                                 let pass = matches!(
                                     &resp,
                                     Response::ExecResult { exit_code: 0, stdout, .. }
@@ -2528,7 +2078,7 @@ pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_stdin_pipe_subst_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script: &'static str,
@@ -2581,15 +2131,19 @@ pub(crate) fn register_stdin_pipe_subst_tests(reg: &mut Registry<'_>) {
                         let s = script.clone();
                         let exp = expected.clone();
                         Box::pin(async move {
-                            let resp = pf_exec_full(
-                                run,
-                                &handle,
-                                vec!["/bin/sh".into()],
-                                Some(15),
-                                Some(s),
-                                vec![],
-                            )
-                            .await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    ExecArgs {
+                                        args: vec!["/bin/sh".into()],
+                                        timeout_secs: Some(15),
+                                        stdin: Some(s),
+                                        background: false,
+                                        env: vec![],
+                                    },
+                                )
+                                .await;
                             let pass = matches!(
                                 &resp,
                                 Response::ExecResult { stdout, .. }
@@ -2609,7 +2163,7 @@ pub(crate) fn register_stdin_pipe_subst_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     for &agent in AGENTS {
         let agent_s = agent.to_string();
 
@@ -2645,7 +2199,13 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             if let Err(e) = result {
                                 return super::TestOutcome::new(&a, false, e);
                             }
-                            let resp = pf_fs_read(run, &handle, path.clone()).await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &FS_READ,
+                                    FsPathArgs { path: path.clone() },
+                                )
+                                .await;
                             let pass = matches!(
                                 &resp,
                                 Response::Ok { data: Some(d) } if d.starts_with("line0")
@@ -2698,7 +2258,9 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         {
                             return super::TestOutcome::new(&a, false, e);
                         }
-                        let resp = pf_fs_read(run, &handle, path.clone()).await;
+                        let resp = run
+                            .typed_or_error(&handle, &FS_READ, FsPathArgs { path: path.clone() })
+                            .await;
                         let pass = matches!(
                             &resp,
                             Response::Ok { data: Some(d) } if d.starts_with("line0")
@@ -2750,7 +2312,13 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             {
                                 return super::TestOutcome::new(&a, false, e);
                             }
-                            let resp = pf_fs_read(run, &handle, path.clone()).await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &FS_READ,
+                                    FsPathArgs { path: path.clone() },
+                                )
+                                .await;
                             let pass = matches!(
                                 &resp,
                                 Response::Ok { data: Some(d) } if d.starts_with("line0")
@@ -2787,7 +2355,9 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                     let a = a.clone();
                     Box::pin(async move {
                         let path = format!("/shared/cwf-self-{a}.txt");
-                        let _ = pf_fs_delete(run, &handle, path.clone()).await;
+                        let _ = run
+                            .typed_or_error(&handle, &FS_DELETE, FsPathArgs { path: path.clone() })
+                            .await;
                         if let Err(e) = run
                             .run_leaf_write(
                                 &leaf,
@@ -2807,7 +2377,9 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         {
                             return super::TestOutcome::new(&a, false, e);
                         }
-                        let resp = pf_fs_read(run, &handle, path.clone()).await;
+                        let resp = run
+                            .typed_or_error(&handle, &FS_READ, FsPathArgs { path: path.clone() })
+                            .await;
                         let pass = matches!(
                             &resp,
                             Response::Ok { data: Some(d) } if d.starts_with("line0")
@@ -2846,16 +2418,19 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             path = path,
                             exe = self_exe,
                         );
-                        let resp = pf_exec_ready(
-                            run,
-                            &handle,
-                            vec!["bash".into(), "-c".into(), script],
-                            "[cross-worker-file] READY".into(),
-                            Some(15),
-                            None,
-                            "stderr".into(),
-                        )
-                        .await;
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC_READY,
+                                ExecReadyArgs {
+                                    args: vec!["bash".into(), "-c".into(), script],
+                                    ready_marker: "[cross-worker-file] READY".into(),
+                                    timeout_secs: Some(15),
+                                    stdin: None,
+                                    stream: "stderr".into(),
+                                },
+                            )
+                            .await;
                         let pid = match &resp {
                             Response::BackgroundReady { pid } => Some(*pid),
                             _ => {
@@ -2866,13 +2441,15 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                 );
                             }
                         };
-                        let resp = pf_fs_read(run, &handle, path.clone()).await;
+                        let resp = run
+                            .typed_or_error(&handle, &FS_READ, FsPathArgs { path: path.clone() })
+                            .await;
                         let pass = matches!(
                             &resp,
                             Response::Ok { data: Some(d) } if d.contains("line0")
                         );
                         if let Some(pid) = pid {
-                            let _ = pf_kill(run, &handle, pid).await;
+                            let _ = run.typed_or_error(&handle, &KILL, KillArgs { pid }).await;
                         }
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
@@ -2906,15 +2483,19 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             path = path,
                             exe = self_exe,
                         );
-                        let resp = pf_exec_full(
-                            run,
-                            &handle,
-                            vec!["bash".into(), "-c".into(), script],
-                            Some(15),
-                            None,
-                            vec![],
-                        )
-                        .await;
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                ExecArgs {
+                                    args: vec!["bash".into(), "-c".into(), script],
+                                    timeout_secs: Some(15),
+                                    stdin: None,
+                                    background: false,
+                                    env: vec![],
+                                },
+                            )
+                            .await;
                         let pass = matches!(
                             &resp,
                             Response::ExecResult { stdout, .. }
@@ -2949,15 +2530,19 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             ),
                             path = path,
                         );
-                        let resp = pf_exec_full(
-                            run,
-                            &handle,
-                            vec!["bash".into(), "-c".into(), script],
-                            Some(10),
-                            None,
-                            vec![],
-                        )
-                        .await;
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                ExecArgs {
+                                    args: vec!["bash".into(), "-c".into(), script],
+                                    timeout_secs: Some(10),
+                                    stdin: None,
+                                    background: false,
+                                    env: vec![],
+                                },
+                            )
+                            .await;
                         let pass = matches!(
                             &resp,
                             Response::ExecResult { stdout, .. }
@@ -2976,7 +2561,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_subst_capture_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script: &'static str,
@@ -3042,15 +2627,19 @@ pub(crate) fn register_subst_capture_tests(reg: &mut Registry<'_>) {
                         let a = agent_s.clone();
                         let s = script.clone();
                         Box::pin(async move {
-                            let resp = pf_exec_full(
-                                run,
-                                &handle,
-                                vec!["bash".into(), "-c".into(), s],
-                                Some(10),
-                                None,
-                                vec![],
-                            )
-                            .await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    ExecArgs {
+                                        args: vec!["bash".into(), "-c".into(), s],
+                                        timeout_secs: Some(10),
+                                        stdin: None,
+                                        background: false,
+                                        env: vec![],
+                                    },
+                                )
+                                .await;
                             let pass = matches!(
                                 &resp,
                                 Response::ExecResult { stdout, .. }
@@ -3069,7 +2658,7 @@ pub(crate) fn register_subst_capture_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script_template: &'static str,
@@ -3117,15 +2706,19 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
                                 .replace("{path}", &path)
                                 .replace("{exe}", &self_exe)
                                 .replace("{agent}", &a);
-                            let resp = pf_exec_full(
-                                run,
-                                &handle,
-                                vec!["bash".into(), "-c".into(), script],
-                                Some(10),
-                                None,
-                                vec![],
-                            )
-                            .await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    ExecArgs {
+                                        args: vec!["bash".into(), "-c".into(), script],
+                                        timeout_secs: Some(10),
+                                        stdin: None,
+                                        background: false,
+                                        env: vec![],
+                                    },
+                                )
+                                .await;
                             if !matches!(&resp, Response::ExecResult { exit_code: 0, .. }) {
                                 return super::TestOutcome::new(
                                     &a,
@@ -3133,7 +2726,13 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
                                     format!("writer failed: {resp:?}"),
                                 );
                             }
-                            let resp = pf_fs_read(run, &handle, path.clone()).await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &FS_READ,
+                                    FsPathArgs { path: path.clone() },
+                                )
+                                .await;
                             let pass = matches!(
                                 &resp,
                                 Response::Ok { data: Some(d) } if check(d)
@@ -3151,7 +2750,7 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script_template: &'static str,
@@ -3221,15 +2820,19 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
                         Box::pin(async move {
                             let path = format!("/shared/tr-{name}-{a}.txt");
                             let script = t.replace("{path}", &path).replace("{exe}", &self_exe);
-                            let resp = pf_exec_full(
-                                run,
-                                &handle,
-                                vec!["bash".into(), "-c".into(), script],
-                                Some(10),
-                                None,
-                                vec![],
-                            )
-                            .await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    ExecArgs {
+                                        args: vec!["bash".into(), "-c".into(), script],
+                                        timeout_secs: Some(10),
+                                        stdin: None,
+                                        background: false,
+                                        env: vec![],
+                                    },
+                                )
+                                .await;
                             let pass = matches!(
                                 &resp,
                                 Response::ExecResult { stdout, .. }
@@ -3249,7 +2852,7 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script_template: &'static str,
@@ -3381,15 +2984,19 @@ pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
                         let self_exe = run.self_exe().to_string();
                         Box::pin(async move {
                             let script = t.replace("{exe}", &self_exe);
-                            let resp = pf_exec_full(
-                                run,
-                                &handle,
-                                vec!["bash".into(), "-c".into(), script],
-                                Some(15),
-                                None,
-                                vec![],
-                            )
-                            .await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &EXEC,
+                                    ExecArgs {
+                                        args: vec!["bash".into(), "-c".into(), script],
+                                        timeout_secs: Some(15),
+                                        stdin: None,
+                                        background: false,
+                                        env: vec![],
+                                    },
+                                )
+                                .await;
                             let pass = matches!(
                                 &resp,
                                 Response::ExecResult { stdout, .. }
@@ -3471,7 +3078,7 @@ fn kpx_pid(resp: &Response) -> Result<u32, String> {
     }
 }
 
-fn kpx_observe_proc_args(pid: u32) -> PfExecArgs {
+fn kpx_observe_proc_args(pid: u32) -> ExecArgs {
     let script = format!(
         "pid={pid}\n\
          if test -d \"/proc/$pid\"; then echo PROC_DIR_OK; else echo PROC_DIR_FAIL; fi\n\
@@ -3479,7 +3086,7 @@ fn kpx_observe_proc_args(pid: u32) -> PfExecArgs {
          printf '\\n'\n\
          if kill -0 \"$pid\" 2>/dev/null; then echo KILL0_OK; else echo KILL0_FAIL; fi\n"
     );
-    pf_exec_timeout_args(vec!["/bin/sh".into(), "-c".into(), script], 10)
+    exec_timeout_args(vec!["/bin/sh".into(), "-c".into(), script], 10)
 }
 
 fn kpx_observe_proc_pass(resp: &Response) -> bool {
@@ -3497,7 +3104,7 @@ fn kpx_observe_proc_pass(resp: &Response) -> bool {
 
 #[allow(clippy::too_many_lines)] // exhaustive pair matrix
 pub(crate) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     for &case in KPX_PROC_CASES {
         let observer = case.observer;
         let target = case.target;
@@ -3509,7 +3116,7 @@ pub(crate) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
                 let target_handle = cx.require(target);
                 Box::new(move |run| {
                     Box::pin(async move {
-                        let pid_resp = pf_get_pid(run, &target_handle).await;
+                        let pid_resp = run.typed_or_error(&target_handle, &GET_PID, ()).await;
                         let pid = match kpx_pid(&pid_resp) {
                             Ok(pid) => pid,
                             Err(e) => {
@@ -3520,10 +3127,9 @@ pub(crate) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
                                 );
                             }
                         };
-                        let observe_resp = pf_send_response(
-                            run,
+                        let observe_resp = run.typed_or_error(
                             &observer_handle,
-                            &PF_EXEC,
+                            &EXEC,
                             kpx_observe_proc_args(pid),
                         )
                         .await;
@@ -3547,7 +3153,7 @@ pub(crate) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     struct Def {
         name: &'static str,
         script_template: &'static str,
@@ -3639,15 +3245,19 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
                                     Some(bt) => crate::binary_path(bt, &self_exe),
                                 };
                                 let script = t.replace("{path}", &path).replace("{exe}", &exe_path);
-                                let resp = pf_exec_full(
-                                    run,
-                                    &handle,
-                                    vec!["bash".into(), "-c".into(), script],
-                                    Some(10),
-                                    None,
-                                    vec![],
-                                )
-                                .await;
+                                let resp = run
+                                    .typed_or_error(
+                                        &handle,
+                                        &EXEC,
+                                        ExecArgs {
+                                            args: vec!["bash".into(), "-c".into(), script],
+                                            timeout_secs: Some(10),
+                                            stdin: None,
+                                            background: false,
+                                            env: vec![],
+                                        },
+                                    )
+                                    .await;
                                 let pass = matches!(
                                     &resp,
                                     Response::ExecResult { stdout, .. }
@@ -3667,7 +3277,7 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     const DELIVERIES: &[&str] = &["tokio_pipe", "bash_heredoc_pipe"];
 
     for &delivery in DELIVERIES {
@@ -3709,7 +3319,7 @@ pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     #[derive(Clone, Copy)]
     struct Def {
         name: &'static str,
@@ -3786,7 +3396,7 @@ pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
                                     path,
                                     path,
                                 );
-                                let resp = pf_exec_full(run, &handle, vec!["bash".into(), "-c".into(), script], Some(10), None, vec![]).await;
+                                let resp = run.typed_or_error(&handle, &EXEC, ExecArgs { args: vec!["bash".into(), "-c".into(), script], timeout_secs: Some(10), stdin: None, background: false, env: vec![] }).await;
                                 let pass = matches!(
                                     &resp,
                                     Response::ExecResult { exit_code: 0, stdout, .. }
@@ -3807,7 +3417,7 @@ pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_bg_redirect_stdin_poll_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     #[derive(Clone, Copy)]
     struct Def {
         name: &'static str,
@@ -3898,14 +3508,7 @@ pub(crate) fn register_bg_redirect_stdin_poll_tests(reg: &mut Registry<'_>) {
                                         let script = format!(
                                             "{producer_script}PID=$!\nfor _ in 1 2 3 4 5 6 7 8 9 10; do\n  if grep -q '{marker}' '{path}'; then\n    wait $PID 2>/dev/null\n    cat '{path}'\n    exit 0\n  fi\n  sleep 0.1\ndone\nkill $PID 2>/dev/null; wait $PID 2>/dev/null\ncat '{path}' 2>/dev/null\nexit 1\n"
                                         );
-                                        let resp = pf_exec_full(
-                                            run,
-                                            &handle,
-                                            vec![shell_bin.into(), "-c".into(), script],
-                                            Some(10),
-                                            stdin,
-                                            vec![],
-                                        )
+                                        let resp = run.typed_or_error(&handle, &EXEC, ExecArgs { args: vec![shell_bin.into(), "-c".into(), script], timeout_secs: Some(10), stdin, background: false, env: vec![] })
                                         .await;
                                         let pass = matches!(
                                             &resp,
@@ -3928,7 +3531,7 @@ pub(crate) fn register_bg_redirect_stdin_poll_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     // Part 1: basic pipe non-blocking (single process)
     for &agent in AGENTS {
         for &(suffix, marker) in &[
@@ -4011,7 +3614,7 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     for &variant in &["direct", "tokio"] {
         // Long-lived agents the epoll/socket test runs in. Each
         // entry is a forking parent of a different binary type; the
@@ -4079,8 +3682,7 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                                     .run_leaf(
                                         &leaf,
                                         &EPOLL_SOCKET,
-                                        EpollSocketArgs { port, variant: v },
-                                    )
+                                        EpollSocketArgs { port, variant: v })
                                     .await;
                                 let pass = matches!(&result, Ok(out) if out.detail.contains("EPOLL_ACCEPT=") && !out.detail.contains("TIMEOUT"));
                                 super::TestOutcome::new(&a, pass, format!("{result:?}"))
@@ -4208,13 +3810,16 @@ async fn fklc_connect_from_agent(
     port: u16,
     payload: &str,
 ) -> Result<Response, String> {
-    let resp = pf_net_connect(
-        run,
-        connector,
-        format!("127.0.0.1:{port}"),
-        payload.to_string(),
-    )
-    .await;
+    let resp = run
+        .typed_or_error(
+            connector,
+            &NET_CONNECT,
+            NetConnectArgs {
+                addr: format!("127.0.0.1:{port}"),
+                data: payload.to_string(),
+            },
+        )
+        .await;
     match &resp {
         Response::Connected { echo } if echo == payload => Ok(resp),
         _ => Err(format!("connect via agent failed: {resp:?}")),
@@ -4264,7 +3869,9 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19920u16;
-                let listen_resp = pf_net_listen(run, &handle_a, port).await;
+                let listen_resp = run
+                    .typed_or_error(&handle_a, &NET_LISTEN, NetListenArgs { port })
+                    .await;
                 if let Err(e) = super::expect_listening_port(&listen_resp, port) {
                     return super::TestOutcome::new(
                         "B",
@@ -4272,14 +3879,19 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                         format!("listen failed: {e}; resp={listen_resp:?}"),
                     );
                 }
-                let _ = pf_net_unlisten(run, &handle_a, port).await;
-                let conn_resp = pf_net_connect(
-                    run,
-                    &handle_b,
-                    format!("127.0.0.1:{port}"),
-                    "listen_unlisten".into(),
-                )
-                .await;
+                let _ = run
+                    .typed_or_error(&handle_a, &NET_UNLISTEN, NetListenArgs { port })
+                    .await;
+                let conn_resp = run
+                    .typed_or_error(
+                        &handle_b,
+                        &NET_CONNECT,
+                        NetConnectArgs {
+                            addr: format!("127.0.0.1:{port}"),
+                            data: "listen_unlisten".into(),
+                        },
+                    )
+                    .await;
                 let got_rst = matches!(
                     &conn_resp,
                     Response::ConnectFailed { error }
@@ -4401,7 +4013,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     );
                     Box::new(move |run| {
                         Box::pin(async move {
-                            let listen_resp = pf_net_listen(run, &parent_handle, port).await;
+                            let listen_resp = run.typed_or_error(&parent_handle, &NET_LISTEN, NetListenArgs { port }).await;
                             if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                                 return super::TestOutcome::new(
                                     "B",
@@ -4417,7 +4029,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                                     format!("fork failed: {fork_resp:?}"),
                                 );
                             }
-                            let _ = pf_net_unlisten(run, &parent_handle, port).await;
+                            let _ = run.typed_or_error(&parent_handle, &NET_UNLISTEN, NetListenArgs { port }).await;
                             if let Err(e) = fklc_child_accept_ready(run, &child, port).await {
                                 let _ = run.forward(&child, InfraCommand::Exit).await;
                                 return super::TestOutcome::new("B", false, e);
@@ -4466,7 +4078,9 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 for port in [19922u16, 19923] {
-                    let listen_resp = pf_net_listen(run, &parent, port).await;
+                    let listen_resp = run
+                        .typed_or_error(&parent, &NET_LISTEN, NetListenArgs { port })
+                        .await;
                     if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                         return super::TestOutcome::new(
                             "B",
@@ -4484,7 +4098,9 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     );
                 }
                 for port in [19922u16, 19923] {
-                    let _ = pf_net_unlisten(run, &parent, port).await;
+                    let _ = run
+                        .typed_or_error(&parent, &NET_UNLISTEN, NetListenArgs { port })
+                        .await;
                 }
                 let ready_first = fklc_child_accept_ready(run, &child, 19922).await;
                 let ready_second = fklc_child_accept_ready(run, &child, 19923).await;
@@ -4522,7 +4138,9 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19924u16;
-                let listen_resp = pf_net_listen(run, &parent, port).await;
+                let listen_resp = run
+                    .typed_or_error(&parent, &NET_LISTEN, NetListenArgs { port })
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "B",
@@ -4531,7 +4149,9 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     );
                 }
                 let fork_resp = run.spawn_ephemeral(&child).await;
-                let close_resp = pf_net_unlisten(run, &parent, port).await;
+                let close_resp = run
+                    .typed_or_error(&parent, &NET_UNLISTEN, NetListenArgs { port })
+                    .await;
                 if !matches!(
                     (&fork_resp, &close_resp),
                     (Response::Ok { .. }, Response::Ok { .. })
@@ -4578,7 +4198,9 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19925u16;
-                let listen_resp = pf_net_listen(run, &parent, port).await;
+                let listen_resp = run
+                    .typed_or_error(&parent, &NET_LISTEN, NetListenArgs { port })
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "B",
@@ -4587,7 +4209,9 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     );
                 }
                 let fork1_resp = run.spawn_ephemeral(&child).await;
-                let _ = pf_net_unlisten(run, &parent, port).await;
+                let _ = run
+                    .typed_or_error(&parent, &NET_UNLISTEN, NetListenArgs { port })
+                    .await;
                 if !matches!(&fork1_resp, Response::Ok { .. }) {
                     return super::TestOutcome::new(
                         "B",
@@ -4689,7 +4313,9 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19926u16;
-                let listen_resp = pf_net_listen(run, &parent, port).await;
+                let listen_resp = run
+                    .typed_or_error(&parent, &NET_LISTEN, NetListenArgs { port })
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "A",
@@ -4698,7 +4324,9 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     );
                 }
                 let server_resp = run.spawn_ephemeral(&server).await;
-                let _ = pf_net_unlisten(run, &parent, port).await;
+                let _ = run
+                    .typed_or_error(&parent, &NET_UNLISTEN, NetListenArgs { port })
+                    .await;
                 if !matches!(&server_resp, Response::Ok { .. }) {
                     return super::TestOutcome::new(
                         "B",
@@ -4727,7 +4355,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
-    register_platform_fix_handlers();
+    register_pf_specific_handlers();
     for &agent in AGENTS {
         let agent_s = agent.to_string();
 
@@ -4745,7 +4373,15 @@ pub(crate) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     let a = a.clone();
                     Box::pin(async move {
-                        let resp = pf_fs_read(run, &handle, "/proc/self/stat".into()).await;
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &FS_READ,
+                                FsPathArgs {
+                                    path: "/proc/self/stat".into(),
+                                },
+                            )
+                            .await;
                         let pass =
                             matches!(&resp, Response::Ok { data: Some(d) } if d.contains(") "));
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
@@ -4768,17 +4404,18 @@ pub(crate) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     let a = a.clone();
                     Box::pin(async move {
-                        let resp = pf_exec(
-                            run,
-                            &handle,
-                            vec![
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                exec_args(vec![
                                 "sh".into(),
                                 "-c".into(),
                                 "dd if=/proc/self/stat bs=1 skip=0 count=10 2>/dev/null | wc -c"
                                     .into(),
-                            ],
-                        )
-                        .await;
+                            ]),
+                            )
+                            .await;
                         let pass = matches!(
                             &resp,
                             Response::ExecResult { exit_code: 0, stdout, .. }
@@ -4800,7 +4437,15 @@ pub(crate) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
                     Box::new(move |run| {
                         let a = a.clone();
                         Box::pin(async move {
-                            let resp = pf_fs_read(run, &handle, "/proc/uptime".into()).await;
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &FS_READ,
+                                    FsPathArgs {
+                                        path: "/proc/uptime".into(),
+                                    },
+                                )
+                                .await;
                             let pass =
                                 matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty());
                             super::TestOutcome::new(&a, pass, format!("{resp:?}"))
