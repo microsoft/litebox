@@ -146,7 +146,9 @@ impl Task {
                 .ok_or(TeeResult::BadParameters)?
         };
 
-        // In LiteBox for LVBS, TA's address space is always in the secure world.
+        // Unlike OP-TEE OS, `UserMutPtr` (and `UserConstPtr`) in LiteBox ensure this
+        // pointer can never be used to access normal-world memory. That is, we don't
+        // need extra security check for detecting key leakage here.
         let subkey_ptr = UserMutPtr::<u8>::from_usize(subkey_addr.truncate());
 
         // subkey = KDF(huk, usage || ta_uuid || extra_data)
