@@ -260,6 +260,10 @@ impl Task {
             )
             .ok_or(TeeResult::AccessConflict)?
         };
+        start
+            .as_usize()
+            .checked_add(aligned_len.as_usize())
+            .ok_or(TeeResult::AccessConflict)?;
         if let Some(perms) = self.global.pm.get_memory_permissions(start, aligned_len) {
             if (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_READ)
                 && !perms.contains(MemoryRegionPermissions::READ))
