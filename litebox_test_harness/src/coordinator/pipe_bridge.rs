@@ -635,6 +635,18 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
     register_handler!(EPOLL_SOCKETPAIR_BRIDGE, handle_epoll_socketpair_bridge);
     register_handler!(BIDIRECTIONAL, handle_bidirectional);
     register_leaf_subcommand!("pipe-test", subcmd_pipe_test);
+    // Also expose `bidirectional` as an argv subcommand for the
+    // US3 test family. The leaf-agent form (via run_leaf on
+    // BIDIRECTIONAL) times out under litebox for PIE-glibc — the
+    // test internally does libc::fork inside the leaf agent's
+    // handler, which interacts poorly with the litebox shim for
+    // some binary types. The argv form preserves the pre-wave-8
+    // semantics (test runs in a fresh exec'd subcommand child).
+    register_leaf_subcommand!("bidirectional", |_args: &[String]| -> i32 {
+        let out = test_bidirectional();
+        println!("{out}");
+        if out == "US3_BIDI_OK" { 0 } else { 1 }
+    });
 
     struct PbCase {
         mode: &'static str,

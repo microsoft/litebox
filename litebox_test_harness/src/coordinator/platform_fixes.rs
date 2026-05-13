@@ -2324,19 +2324,31 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
     register_platform_fix_handlers();
+    // Register the `fork-exec-pie` leaf subcommand. This stays as an
+    // argv subcommand (not a handler) because the test specifically
+    // verifies the legacy two-level fork+exec path: agent →
+    // subcommand-dispatched child (fork-exec-pie) → grandchild of
+    // the target binary type. Converting the child to a leaf agent
+    // would change the test surface to "agent → leaf agent → grandchild",
+    // which exercises a different code path that hit timeouts in the
+    // litebox shim. See `coordinator/platform_fixes_leaf_subcmd.rs`
+    // for the body.
+    crate::register_leaf_subcommand!(
+        "fork-exec-pie",
+        crate::coordinator::platform_fixes_leaf_subcmd::subcmd_fork_exec_pie
+    );
     // FWE matrix:
     //   - launcher = init   (agent A, PIE) ─► fork+execv each BinaryType
     //   - launcher = NP     (worker-exec host, non-PIE) ─► same
     //
-    // Both arms use the fork-exec-pie handler (which is plain
+    // Both arms use the `fork-exec-pie` subcommand (which is plain
     // fork+execv with no PIE-specific logic; the historical name is
     // kept for backwards compatibility). The binary executed is
     // resolved per `BinaryType` via `binary_path()`.
-    //
     for &bt in crate::BinaryType::ALL {
-        for (launcher_label, launcher_agent) in [
-            ("from_init", AgentName::Dpg1),
-            ("from_worker_exec", AgentName::Dpg1Dng),
+        for (launcher_label, launcher_agent, sub_timeout) in [
+            ("from_init", AgentName::Dpg1, 20_u64),
+            ("from_worker_exec", AgentName::Dpg1Dng, 30_u64),
         ] {
             let bt_label = bt.label();
             let test_id = format!("FWE.{bt_label}.{launcher_label}");
@@ -2344,36 +2356,44 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
             reg.test("fork", "fork_from_worker_exec", test_id.clone())
                 .timeout(60)
                 .build(move |cx| {
-                    let launcher_binary = match launcher_agent {
-                        AgentName::Dpg1 => "self",
-                        AgentName::Dpg1Dng => "nonpie",
-                        _ => unreachable!(),
-                    };
-                    let leaf = cx.declare_ephemeral(
-                        launcher_agent,
-                        format!("ForkExecPie_{bt_label}_{launcher_label}"),
-                        SpawnKind::Fork {
-                            binary: launcher_binary,
-                            inherit_listen_ports: vec![],
-                        },
-                    );
+                    let handle = cx.require(launcher_agent);
                     Box::new(move |run| {
                         let outcome_label = outcome_label.clone();
                         let self_exe = run.self_exe().to_string();
                         Box::pin(async move {
                             let target = crate::binary_path(bt, &self_exe);
-                            let result = run
-                                .run_leaf(
-                                    &leaf,
-                                    &FORK_EXEC_PIE,
-                                    ForkExecPieArgs {
-                                        binary: target,
-                                        subcommand: "echo-test".into(),
-                                    },
-                                )
-                                .await;
-                            let pass = matches!(&result, Ok(out) if out.detail.contains("FORK_EXEC_PIE_OK"));
-                            super::TestOutcome::new(&outcome_label, pass, format!("{result:?}"))
+                            // The launcher binary depends on which
+                            // agent we're running on: agent A is PIE,
+                            // agent NP is non-PIE.
+                            let launcher_bin = match launcher_agent {
+                                AgentName::Dpg1 => self_exe.clone(),
+                                AgentName::Dpg1Dng => crate::nonpie_binary(),
+                                _ => unreachable!(),
+                            };
+                            let resp = pf_send_response(
+                                run,
+                                &handle,
+                                &PF_EXEC,
+                                PfExecArgs {
+                                    args: vec![
+                                        launcher_bin,
+                                        "fork-exec-pie".into(),
+                                        target,
+                                        "echo-test".into(),
+                                    ],
+                                    timeout_secs: Some(sub_timeout),
+                                    stdin: None,
+                                    background: false,
+                                    env: vec![],
+                                },
+                            )
+                            .await;
+                            let pass = matches!(
+                                &resp,
+                                Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.contains("FORK_EXEC_PIE_OK")
+                            );
+                            super::TestOutcome::new(&outcome_label, pass, format!("{resp:?}"))
                         })
                     })
                 });

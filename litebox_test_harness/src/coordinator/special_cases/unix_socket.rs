@@ -1367,41 +1367,28 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
             reg.test("xworker", "unix_socket", id)
                 .timeout(60)
                 .build(move |cx| {
-                    let a = (sub != "bidirectional").then(|| cx.require(AgentName::Dpg1));
-                    let leaf = (sub == "bidirectional").then(|| {
-                        cx.declare_ephemeral(
-                            AgentName::Dpg1,
-                            format!("Us3_{}", bt.short_label()),
-                            SpawnKind::Fork {
-                                binary: pipe_bridge::fork_binary_label(bt),
-                                inherit_listen_ports: vec![],
-                            },
-                        )
-                    });
+                    let a = cx.require(AgentName::Dpg1);
                     Box::new(move |run| {
-                        let a = a.clone();
-                        let leaf = leaf.clone();
                         Box::pin(async move {
-                            if sub == "bidirectional" {
-                                let resp = run
-                                    .run_leaf(
-                                        leaf.as_ref().expect("bidirectional leaf"),
-                                        &pipe_bridge::BIDIRECTIONAL,
-                                        (),
-                                    )
-                                    .await;
-                                let pass = matches!(&resp, Ok(out) if out.detail.contains(&*expected));
-                                return crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"));
-                            }
-
                             let self_exe = run.self_exe().to_string();
                             let target = crate::binary_path(bt, &self_exe);
+                            // US3 (`bidirectional`) is registered as a
+                            // top-level argv subcommand by
+                            // `pipe_bridge::register_pipe_bridge`, so its
+                            // argv is `[target, "bidirectional"]`.
+                            // All other US tests are sub-subcommands of
+                            // `unix-socket-test`.
+                            let argv = if sub == "bidirectional" {
+                                vec![target, sub.clone()]
+                            } else {
+                                vec![target, "unix-socket-test".into(), sub.clone()]
+                            };
                             let resp = run
                                 .send_named_typed(
-                                    a.as_ref().expect("unix socket argv handle"),
+                                    &a,
                                     &EXEC_BIN,
                                     ExecBinArgs {
-                                        argv: vec![target, "unix-socket-test".into(), sub],
+                                        argv,
                                         timeout_ms: Some(10 * 1000),
                                         stdin: None,
                                         env: vec![],

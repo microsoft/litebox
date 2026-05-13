@@ -10,7 +10,8 @@
 
 use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
 use super::common::{BASH, BashArgs, EXEC_BIN, ExecBinArgs};
-use super::pipe_bridge;
+// pipe_bridge import removed — US3.bidirectional now uses the
+// argv-subcommand path registered by pipe_bridge::register_pipe_bridge.
 use super::registry::Registry;
 use super::run_context::RunContext;
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};

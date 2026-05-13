@@ -390,3 +390,81 @@ pub(crate) fn subcmd_bs3_tokio_spawn_nonpie_large_stdout(_args: &[String]) -> i3
     }
     0
 }
+
+/// `fork-exec-pie` — drives the FWE test family.
+///
+/// Stays as an argv subcommand because the test specifically exercises
+/// the legacy two-level fork+exec path: agent → subcommand-dispatched
+/// child (this fn) → grandchild of the target binary type. Converting
+/// the child to a leaf agent changed the test surface to "agent → leaf
+/// agent → grandchild", which exercises a different code path that hit
+/// timeouts in the litebox shim.
+///
+/// Usage: `fork-exec-pie <binary> [subcommand]`
+/// Forks a child that exec's the given binary with the given subcommand
+/// (default `echo-test`), waits up to 15 s, prints
+/// `FORK_EXEC_PIE_OK` or `FORK_EXEC_PIE_FAIL:reason`.
+pub(crate) fn subcmd_fork_exec_pie(args: &[String]) -> i32 {
+    let binary = args.get(2).map_or_else(
+        || {
+            for p in ["/opt/litebox/litebox_test_harness"] {
+                if std::path::Path::new(p).exists() {
+                    return p;
+                }
+            }
+            "/opt/litebox/litebox_test_harness"
+        },
+        String::as_str,
+    );
+    let sub = args.get(3).map_or("echo-test", String::as_str);
+    eprintln!(
+        "[fork-exec-pie] pid={} forking child to exec {binary} {sub}",
+        std::process::id()
+    );
+
+    // SAFETY: libc::fork() takes no arguments and returns child pid (0 in child).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        eprintln!(
+            "[fork-exec-pie] fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        println!("FORK_EXEC_PIE_FAIL:fork");
+        return 1;
+    }
+    if pid == 0 {
+        use std::ffi::CString;
+        let bin = CString::new(binary).expect("binary has no NUL");
+        let arg_sub = CString::new(sub).expect("sub has no NUL");
+        let exec_argv = [bin.as_ptr(), arg_sub.as_ptr(), core::ptr::null()];
+        // SAFETY: NUL-terminated argv; execv replaces the process image.
+        unsafe { libc::execv(bin.as_ptr(), exec_argv.as_ptr()) };
+        let err = std::io::Error::last_os_error();
+        eprintln!("[fork-exec-pie] child execv failed: {err}");
+        std::process::exit(127);
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut status = 0i32;
+    loop {
+        // SAFETY: waitpid takes a live child pid and a writable status pointer.
+        let ret = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+        if ret > 0 {
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                println!("FORK_EXEC_PIE_OK");
+                return 0;
+            }
+            println!("FORK_EXEC_PIE_FAIL:exit={status}");
+            return 1;
+        }
+        if std::time::Instant::now() >= deadline {
+            // SAFETY: pid is the child being timed out.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            // SAFETY: reap the child after SIGKILL.
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            println!("FORK_EXEC_PIE_FAIL:timeout");
+            return 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
