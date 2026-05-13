@@ -51,6 +51,7 @@ mod fs;
 mod net;
 mod netlink;
 mod pipe_lifecycle;
+mod proc;
 mod term;
 mod unix_socket;
 
@@ -531,6 +532,18 @@ pub(super) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
 
 pub(super) fn register_capture_pipe(reg: &mut Registry<'_>) {
     capture_pipe::register_capture_pipe(reg);
+}
+
+pub(super) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
+    proc::register_proc_filesystem_tests(reg);
+}
+
+pub(super) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
+    proc::register_pid_visibility_tests(reg);
+}
+
+pub(super) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
+    proc::register_cross_pid_visibility_tests(reg);
 }
 
 /// Register stdin-piped script tests.
