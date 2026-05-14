@@ -44,9 +44,6 @@ pub enum VsmError {
     #[error("invalid physical address")]
     InvalidPhysicalAddress,
 
-    #[error("physical address range overlaps with VTL1 memory")]
-    Vtl1MemoryOverlap,
-
     // Memory/Data Errors
     #[error("invalid memory attributes")]
     MemoryAttributeInvalid,
@@ -178,8 +175,7 @@ impl From<VsmError> for Errno {
             | VsmError::BootSignalWriteFailed
             | VsmError::CpuOnlineMaskCopyFailed
             | VsmError::HekiPagesCopyFailed
-            | VsmError::Vtl0CopyFailed
-            | VsmError::Vtl1MemoryOverlap => Errno::EFAULT,
+            | VsmError::Vtl0CopyFailed => Errno::EFAULT,
 
             // Not found errors
             VsmError::SystemCertificatesNotFound

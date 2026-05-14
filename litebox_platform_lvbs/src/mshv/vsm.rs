@@ -1384,23 +1384,57 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
     Some(heki_pages)
 }
 
-/// This function protects a VTL0 physical memory range from potentially compromised VTL0 by
-/// restricting its access permissions using VTL protection mask (e.g., kernel code integrity).
-/// It is a safe wrapper for `hv_modify_vtl_protection_mask`. `phys_frame_range` specifies the
-/// physical frame range to protect (must belong to VTL0) `mem_attr` specifies the memory
-/// attributes (VTL0's allowed access) to be applied to the range
-#[inline]
+/// Protects a VTL0 physical memory range from potentially compromised VTL0 by restricting its
+/// access permissions using VTL protection mask (e.g., kernel code integrity).
+///
+/// If the requested range overlaps with VTL1 working memory, the VTL1 portion is silently
+/// skipped and only the remaining VTL0 portions are protected. If the range falls entirely
+/// within VTL1, this function returns `Ok(())` without issuing a hypercall.
+///
+/// `phys_frame_range` specifies the physical frame range to protect (must belong to VTL0).
+/// `mem_attr` specifies the memory attributes (VTL0's allowed access) to be applied.
 pub(crate) fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     mem_attr: MemAttr,
 ) -> Result<(), VsmError> {
     let vtl1_range = crate::platform_low().vtl1_phys_frame_range();
-    if phys_frame_range.start < vtl1_range.end && vtl1_range.start < phys_frame_range.end {
-        return Err(VsmError::Vtl1MemoryOverlap);
+
+    // Fast path: no overlap with VTL1 — protect the entire range directly.
+    let overlaps_vtl1 =
+        phys_frame_range.start < vtl1_range.end && vtl1_range.start < phys_frame_range.end;
+
+    if !overlaps_vtl1 {
+        let pa = phys_frame_range.start.start_address().as_u64();
+        let num_pages = phys_frame_range.count() as u64;
+        hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
+            .map_err(VsmError::HypercallFailed)?;
+        return Ok(());
     }
-    let pa = phys_frame_range.start.start_address().as_u64();
-    let num_pages = phys_frame_range.count() as u64;
-    if num_pages > 0 {
+
+    // Range fully within VTL1 — nothing to protect for VTL0.
+    if phys_frame_range.start >= vtl1_range.start && phys_frame_range.end <= vtl1_range.end {
+        return Ok(());
+    }
+
+    // Partial overlap: split into the portions before and after VTL1, skipping VTL1 pages.
+    let sub_ranges: [PhysFrameRange<Size4KiB>; 2] = {
+        let before = PhysFrame::range(
+            phys_frame_range.start,
+            core::cmp::min(phys_frame_range.end, vtl1_range.start),
+        );
+        let after = PhysFrame::range(
+            core::cmp::max(phys_frame_range.start, vtl1_range.end),
+            phys_frame_range.end,
+        );
+        [before, after]
+    };
+
+    for sub_range in sub_ranges {
+        if sub_range.start >= sub_range.end {
+            continue;
+        }
+        let pa = sub_range.start.start_address().as_u64();
+        let num_pages = sub_range.count() as u64;
         hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
             .map_err(VsmError::HypercallFailed)?;
     }
