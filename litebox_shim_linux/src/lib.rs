@@ -255,7 +255,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 let provider = syscalls::eventfd::broker_pidfd_provider().ok_or(())?;
                 syscalls::eventfd::EventFile::new_pidfd_broker_backed(provider, handle_id, false)
             }
-            BrokerHandleKind::Signalfd => return Err(()),
+            BrokerHandleKind::Signalfd | BrokerHandleKind::Pty => return Err(()),
         };
         let typed_fd: litebox::fd::TypedFd<syscalls::eventfd::EventfdSubsystem> = self
             .task
@@ -1291,7 +1291,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                                 )
                             })
                         }
-                        BrokerHandleKind::Signalfd => None,
+                        BrokerHandleKind::Signalfd | BrokerHandleKind::Pty => None,
                     };
                 let Some(event_file) = event_file else {
                     continue;

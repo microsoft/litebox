@@ -23,6 +23,7 @@ pub mod fd_token_socket;
 pub mod fd_tokens;
 pub mod pidfd_state;
 pub mod process_state;
+pub mod pty_state;
 pub mod signalfd_state;
 pub mod state_registry;
 pub mod state_service;

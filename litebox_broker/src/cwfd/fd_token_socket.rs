@@ -341,6 +341,11 @@ pub fn handle_control_connection(
                     | Opcode::WriteEventfd
                     | Opcode::CreateSignalfd
                     | Opcode::ReadSiginfo
+                    | Opcode::CreatePty
+                    | Opcode::PtyRead
+                    | Opcode::PtyWrite
+                    | Opcode::SubscribePty
+                    | Opcode::PtyIoctl
                     | Opcode::SubscribeEventfd
                     | Opcode::Unsubscribe
                     | Opcode::DupHandle => {
