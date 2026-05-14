@@ -4534,6 +4534,65 @@ impl<FS: ShimFS> Task<FS> {
             (f, flags.contains(OFlags::CLOEXEC))
         };
 
+        // Phase C.3 (WIP): eager-broker `sys_pipe2`. Disabled by default
+        // because activation regresses PB.* tests — pid 2 in coord's
+        // shim exits status 127 BEFORE `sys_execve` is even entered.
+        // Root cause not yet diagnosed; keep the codepath buildable by
+        // gating on an env var (`LITEBOX_EAGER_BROKER_PIPE`) so the
+        // structural scaffolding (provider, install path, bridge specs,
+        // subscribe direction fix) can land while the activation work
+        // is iterated on separately.
+        let eager_broker = false; // TODO(Phase C.3): replace with env-var check or proper enablement once diagnosed.
+        if eager_broker
+            && let Some(provider) = super::broker_pipe::broker_pipe_provider()
+        {
+            let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
+            let handle = provider
+                .create_pipe(
+                    DEFAULT_PIPE_BUF_SIZE as u64,
+                    // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
+                    4096,
+                )
+                .map_err(|_| Errno::ENODEV)?;
+
+            let writer_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
+                alloc::sync::Arc::clone(&provider),
+                handle,
+                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
+                entry_flags,
+            );
+            let reader_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
+                provider,
+                handle,
+                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
+                entry_flags,
+            );
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            let writer = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(writer_entry);
+            let reader = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(reader_entry);
+            if cloexec {
+                let _ = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC);
+                let _ = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC);
+            }
+            drop(dt);
+
+            let files = self.files.borrow();
+            let wr_raw_fd = files.insert_raw_fd(writer).map_err(|writer| {
+                let _ = self.global.litebox.descriptor_table_mut().remove(&writer);
+                Errno::EMFILE
+            })?;
+            let rd_raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
+                let _ = self.do_close(wr_raw_fd);
+                let _ = self.global.litebox.descriptor_table_mut().remove(&reader);
+                Errno::EMFILE
+            })?;
+            return Ok((
+                rd_raw_fd.try_into().map_err(|_| Errno::EMFILE)?,
+                wr_raw_fd.try_into().map_err(|_| Errno::EMFILE)?,
+            ));
+        }
+
+        // Legacy fallback: in-shim local pipe (no broker provider).
         let (writer, reader) = self.global.pipes.create_pipe(
             DEFAULT_PIPE_BUF_SIZE,
             pipe_flags,

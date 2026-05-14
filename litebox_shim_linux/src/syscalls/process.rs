@@ -7059,6 +7059,13 @@ impl<FS: ShimFS> Task<FS> {
                     // Host-backed pipe (from a prior delayed-fork bridge).
                     (FdClass::Pipe, Some(fd.object_id()), None, None)
                 } else if let Ok(fd) =
+                    rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+                {
+                    // Phase C.3: eager-broker pipe. Classify as Pipe so the
+                    // broker-handle metadata is emitted below and the restored
+                    // worker can re-attach to the same broker `PipeState`.
+                    (FdClass::Pipe, Some(fd.object_id()), None, None)
+                } else if let Ok(fd) =
                     rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
                 {
                     (FdClass::EventFd, Some(fd.object_id()), None, None)
@@ -7231,6 +7238,51 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                         _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else if class == FdClass::Pipe {
+                // Phase C.3: emit a broker-Pipe handle snapshot when the fd
+                // is a `BrokerPipeSubsystem` entry. Local `Pipes<Platform>`
+                // and `HostPipeSubsystem` pipes don't have broker identity
+                // and fall through to `None`.
+                if let Ok(typed) =
+                    rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+                {
+                    let pipe_provider = super::broker_pipe::broker_pipe_provider();
+                    let entry_result = dt.with_entry(
+                        &typed,
+                        |bp_fd: &super::broker_pipe::BrokerPipeFd<crate::Platform>| {
+                            bp_fd.fork_snapshot_handle()
+                        },
+                    );
+                    match entry_result {
+                        Some((kind, handle_id)) => {
+                            let releaser_opt: Option<
+                                alloc::sync::Arc<
+                                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                                >,
+                            > = pipe_provider
+                                .as_ref()
+                                .map(|p| alloc::sync::Arc::clone(p) as _);
+                            if let Some(releaser) = releaser_opt {
+                                match releaser.dup_handle(handle_id) {
+                                    Ok(()) => {
+                                        broker_transit.push(ForkSnapshotBrokerTransit {
+                                            releaser,
+                                            handle_id,
+                                            kind,
+                                        });
+                                        Some(BrokerHandleSnapshot { kind, handle_id })
+                                    }
+                                    Err(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
                     }
                 } else {
                     None
@@ -9080,6 +9132,59 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            // Phase C.3: collect BrokerPipeSubsystem fds and emit bridge
+            // specs so the remote worker re-installs broker pipes at the
+            // matching slots. Eager-broker pipes are already broker-backed
+            // (no promote step needed); just dup the handle and ship it.
+            let broker_pipe_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::broker_pipe::BrokerPipeSubsystem>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) = rds
+                        .fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in broker_pipe_fds {
+                let pipe_provider = super::broker_pipe::broker_pipe_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let pipe_info = dt_local.with_entry(
+                    &typed,
+                    |bp_fd: &super::broker_pipe::BrokerPipeFd<crate::Platform>| {
+                        (bp_fd.handle(), bp_fd.direction())
+                    },
+                );
+                drop(dt_local);
+                if let (Some(provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
+                    let releaser: alloc::sync::Arc<
+                        dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                    > = alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_ok() {
+                        // Phase C.3 spec format: `fd:pipe:handle_id:r|w`.
+                        // Direction is critical for the receiver to pick
+                        // the right end when constructing the BrokerPipeFd.
+                        let dir_char = match direction {
+                            litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
+                            litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
+                        };
+                        broker_eventfd_specs.push(alloc::format!(
+                            "{raw_fd}:pipe:{handle_id}:{dir_char}"
+                        ));
+                        broker_eventfd_transit_release.push((releaser, handle_id));
+                    }
+                }
+            }
+
             // Phase 1a: collect unix socket fds and pair_ids under read lock.
             let socket_info: Vec<(
                 usize,
@@ -10279,6 +10384,13 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
         return false;
     }
 
+    // BrokerPipeSubsystem (Phase C.3): supported. The bridge install
+    // path (`--broker-fd-bridge`) wires the broker-pipe fd in the
+    // worker after spawn; the spawn binding itself is `Close`.
+    if files.try_broker_pipe_fd(raw_fd).is_some() {
+        return false;
+    }
+
     log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
     true
 }
@@ -10354,6 +10466,13 @@ fn worker_exec_input_binding<FS: ShimFS>(
         {
             return WorkerExecInputBinding::HostPipe { fd: host_fd };
         }
+        return WorkerExecInputBinding::Close;
+    }
+
+    // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
+    // before exec; the `--broker-fd-bridge` install path will install
+    // the broker pipe fd at the same slot during worker startup.
+    if files.try_broker_pipe_fd(raw_fd).is_some() {
         return WorkerExecInputBinding::Close;
     }
 
@@ -10475,6 +10594,13 @@ fn worker_exec_output_binding<FS: ShimFS>(
         {
             return WorkerExecOutputBinding::HostPipe { fd: host_fd };
         }
+        return WorkerExecOutputBinding::Close;
+    }
+
+    // BrokerPipeSubsystem (Phase C.3): close the worker's output slot
+    // before exec; the `--broker-fd-bridge` install path will install
+    // the broker pipe fd at the same slot during worker startup.
+    if files.try_broker_pipe_fd(raw_fd).is_some() {
         return WorkerExecOutputBinding::Close;
     }
 

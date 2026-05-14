@@ -31,4 +31,20 @@ pub trait BrokerPipeProvider: BrokerSubscribable {
     fn write_pipe(&self, handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError>;
     fn incref_pipe_end(&self, handle: u64, end: BrokerPipeEnd) -> Result<(), BrokerOpError>;
     fn close_pipe_end(&self, handle: u64, end: BrokerPipeEnd);
+
+    /// Subscribe to broker pipe events for a specific end of the pipe.
+    ///
+    /// The generic `BrokerSubscribable::subscribe` impl cannot carry
+    /// per-end direction. Callers that need correct read-vs-write event
+    /// routing MUST use this method instead.
+    ///
+    /// Returns the broker-assigned subscription id (same as
+    /// `BrokerSubscribable::subscribe`).
+    fn subscribe_pipe_end(
+        &self,
+        handle: u64,
+        end: BrokerPipeEnd,
+        events_mask: u32,
+        callback: alloc::sync::Arc<dyn BrokerEventCallback>,
+    ) -> Result<u64, BrokerOpError>;
 }

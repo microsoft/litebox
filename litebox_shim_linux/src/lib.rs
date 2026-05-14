@@ -224,49 +224,102 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         debug_assert!(ok, "install_mux_pipe_fd: slot {guest_fd} still occupied");
     }
 
-    /// Phase 2.F follow-up: install a broker-backed EventFile at the
-    /// given guest fd slot. Called by the runner during worker-exec
-    /// startup to reattach to a broker handle that the parent dup'd
-    /// before spawning the worker, so the worker sees the same
-    /// shared eventfd / pidfd state as the parent across the
-    /// cross-binary-type exec boundary.
+    /// Install a broker-backed shim fd entry at `guest_fd`, materializing
+    /// it from a broker handle that the parent dup'd before spawn. Called
+    /// by the runner during worker-exec startup for every `--broker-fd-bridge`
+    /// spec, so the worker sees the same shared broker state as the parent
+    /// across the cross-binary-type exec boundary.
     ///
     /// Returns `Err(())` if no broker provider is installed for the
     /// requested kind (the worker will then have no fd at the slot
     /// and the binary's read on it will fail with EBADF — a clean
     /// failure mode for misconfigured workers).
-    pub fn install_broker_eventfd_fd(
+    ///
+    /// `pipe_direction` MUST be `Some(_)` when `kind == Pipe` and SHOULD be
+    /// `None` otherwise. The parser supplies it from the optional `r`/`w`
+    /// suffix on the bridge spec (`fd:pipe:handle_id:r|w`).
+    pub fn install_broker_bridge_fd(
         &self,
         guest_fd: usize,
         kind: syscalls::fork_snapshot::BrokerHandleKind,
         handle_id: u64,
+        pipe_direction: Option<
+            litebox_common_linux::broker_pipe_provider::BrokerPipeEnd,
+        >,
     ) -> Result<(), ()> {
         use syscalls::fork_snapshot::BrokerHandleKind;
-        let event_file: syscalls::eventfd::EventFile<Platform> = match kind {
+        let files = self.task.files.borrow();
+        match kind {
             BrokerHandleKind::Eventfd => {
                 let provider = syscalls::eventfd::broker_eventfd_provider().ok_or(())?;
-                syscalls::eventfd::EventFile::new_broker_backed(
+                let event_file = syscalls::eventfd::EventFile::new_broker_backed(
                     provider,
                     handle_id,
                     litebox_common_linux::EfdFlags::empty(),
-                )
+                );
+                self.install_eventfd_at_slot(event_file, guest_fd, &files);
+                Ok(())
             }
             BrokerHandleKind::Pidfd => {
                 let target_pid =
                     litebox::process::ProcessId(u32::try_from(handle_id).map_err(|_| ())?);
                 let subscription =
                     syscalls::guest_pid::try_subscribe_broker_process_exit(target_pid).ok_or(())?;
-                syscalls::eventfd::EventFile::new_broker_process_pidfd(
+                let event_file = syscalls::eventfd::EventFile::new_broker_process_pidfd(
                     target_pid,
                     subscription,
                     false,
                     None,
-                )
+                );
+                self.install_eventfd_at_slot(event_file, guest_fd, &files);
+                Ok(())
             }
-            BrokerHandleKind::Signalfd | BrokerHandleKind::Pty | BrokerHandleKind::Pipe => {
-                return Err(());
+            BrokerHandleKind::Pipe => {
+                let provider = syscalls::broker_pipe::broker_pipe_provider().ok_or(())?;
+                let direction = pipe_direction.ok_or(())?;
+                let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
+                    provider,
+                    handle_id,
+                    direction,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem> = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(bp_fd);
+                let mut rds = files.raw_descriptor_store.write();
+                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+                debug_assert!(
+                    ok,
+                    "install_broker_bridge_fd(pipe): slot {guest_fd} still occupied"
+                );
+                Ok(())
             }
-        };
+            BrokerHandleKind::Signalfd | BrokerHandleKind::Pty => Err(()),
+        }
+    }
+
+    /// Backwards-compatible alias retained until all runner callers move to
+    /// the new name. `pipe_direction` is unsupported in this entry point;
+    /// callers that need it must use `install_broker_bridge_fd` directly.
+    pub fn install_broker_eventfd_fd(
+        &self,
+        guest_fd: usize,
+        kind: syscalls::fork_snapshot::BrokerHandleKind,
+        handle_id: u64,
+    ) -> Result<(), ()> {
+        self.install_broker_bridge_fd(guest_fd, kind, handle_id, None)
+    }
+
+    fn install_eventfd_at_slot(
+        &self,
+        event_file: syscalls::eventfd::EventFile<Platform>,
+        guest_fd: usize,
+        files: &syscalls::file::FilesState<FS>,
+    ) {
         let typed_fd: litebox::fd::TypedFd<syscalls::eventfd::EventfdSubsystem> = self
             .task
             .global
@@ -285,7 +338,6 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             },
         );
 
-        let files = self.task.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
 
         // Remove any existing entry at the slot (stdio placeholder etc.).
@@ -294,9 +346,8 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
         debug_assert!(
             ok,
-            "install_broker_eventfd_fd: slot {guest_fd} still occupied"
+            "install_broker_bridge_fd(eventfd): slot {guest_fd} still occupied"
         );
-        Ok(())
     }
 }
 
