@@ -1550,8 +1550,6 @@ impl<FS: ShimFS> Task<FS> {
         msg_ptr: MutPtr<litebox_common_linux::UserMsgHdr<Platform>>,
         flags: ReceiveFlags,
     ) -> Result<usize, Errno> {
-        const MAX_LEN: usize = 65536;
-
         let Ok(sockfd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
@@ -1579,12 +1577,9 @@ impl<FS: ShimFS> Task<FS> {
 
         let iovs = msg_iov.to_owned_slice(msg_iovlen).ok_or(Errno::EFAULT)?;
 
-        // Compute total buffer capacity across all non-empty iovecs, capped at MAX_LEN.
-        let total_iov_capacity: usize = iovs
-            .iter()
-            .map(|iov| iov.iov_len)
-            .fold(0usize, usize::saturating_add)
-            .min(MAX_LEN);
+        let total_iov_capacity = iovs.iter().try_fold(0usize, |capacity, iov| {
+            capacity.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
+        })?;
 
         // Perform a single recv into a contiguous buffer.
         let want_source = msg_name.as_usize() != 0;
@@ -1592,7 +1587,11 @@ impl<FS: ShimFS> Task<FS> {
         let mut ret_flags = ReceiveFlags::empty();
 
         // Heap-allocate the recv buffer to avoid stack overflow for large iovecs.
-        let mut buffer = alloc::vec![0u8; total_iov_capacity];
+        let mut buffer = alloc::vec::Vec::new();
+        buffer
+            .try_reserve_exact(total_iov_capacity)
+            .map_err(|_| Errno::ENOMEM)?;
+        buffer.resize(total_iov_capacity, 0);
         let recv_buf = &mut buffer[..];
         let size = self.do_recvfrom(
             sockfd,

@@ -1358,7 +1358,7 @@ mod tests {
         let read = channel
             .try_read(&mut buf, super::super::ReceiveFlags::empty(), None)
             .unwrap();
-        assert_eq!(read, 10); // Only returns what fits in buffer
+        assert_eq!(read, data.len());
     }
 
     #[test]
