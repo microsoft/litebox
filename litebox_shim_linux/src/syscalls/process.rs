@@ -8978,14 +8978,6 @@ impl<FS: ShimFS> Task<FS> {
 
         let guest_cwd = self.fs.borrow().current_working_directory();
         let worker_stdio = self.worker_exec_stdio_bindings().inspect_err(|_err| {
-            {
-                use litebox::platform::DebugLogProvider as _;
-                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                    "[C3] exec_on_remote_host pid={} stdio_bindings FAILED err={:?}\n",
-                    self.pid,
-                    _err,
-                ));
-            }
             #[cfg(feature = "trace_syscalls")]
             litebox::log_println!(
                 self.global.platform,
@@ -8994,13 +8986,6 @@ impl<FS: ShimFS> Task<FS> {
             );
             signal_on_error(&vfork_info);
         })?;
-        {
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                "[C3] exec_on_remote_host pid={} stdio_bindings OK\n",
-                self.pid,
-            ));
-        }
         let stdio_pipe_info: Vec<(i32, usize, super::host_pipe::HostPipeDirection)> = {
             let files = self.files.borrow();
             let rds = files.raw_descriptor_store.read();

@@ -4534,24 +4534,18 @@ impl<FS: ShimFS> Task<FS> {
             (f, flags.contains(OFlags::CLOEXEC))
         };
 
-        // Eager-broker model: when a broker pipe provider is available,
-        // every `pipe2` allocates a broker-hosted `PipeState`. Both ends
-        // are broker-handles from creation, so a child process that
-        // migrates to a different worker continues to see the same
-        // canonical pipe state — EOF, refcount, readiness all flow
-        // through the broker.
-        //
-        // Falls back to the legacy in-shim `Pipes<Platform>` path only
-        // when no provider is set (i.e. unit tests without a broker).
-        if let Some(provider) = super::broker_pipe::broker_pipe_provider() {
-            {
-                use litebox::platform::DebugLogProvider as _;
-                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                    "[C3] sys_pipe2 entered eager-broker path pid={} flags={:?}\n",
-                    self.pid,
-                    flags,
-                ));
-            }
+        // Phase C.3 (WIP): eager-broker `sys_pipe2`. Disabled by default
+        // because activation regresses PB.* tests — pid 2 in coord's
+        // shim exits status 127 BEFORE `sys_execve` is even entered.
+        // Root cause not yet diagnosed; keep the codepath buildable by
+        // gating on an env var (`LITEBOX_EAGER_BROKER_PIPE`) so the
+        // structural scaffolding (provider, install path, bridge specs,
+        // subscribe direction fix) can land while the activation work
+        // is iterated on separately.
+        let eager_broker = false; // TODO(Phase C.3): replace with env-var check or proper enablement once diagnosed.
+        if eager_broker
+            && let Some(provider) = super::broker_pipe::broker_pipe_provider()
+        {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider
                 .create_pipe(
@@ -4559,23 +4553,7 @@ impl<FS: ShimFS> Task<FS> {
                     // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
                     4096,
                 )
-                .map_err(|e| {
-                    use litebox::platform::DebugLogProvider as _;
-                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                        "[C3] create_pipe FAILED pid={} err={:?}\n",
-                        self.pid,
-                        e,
-                    ));
-                    Errno::ENODEV
-                })?;
-            {
-                use litebox::platform::DebugLogProvider as _;
-                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                    "[C3] create_pipe ok handle={} pid={}\n",
-                    handle,
-                    self.pid,
-                ));
-            }
+                .map_err(|_| Errno::ENODEV)?;
 
             let writer_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
                 alloc::sync::Arc::clone(&provider),
