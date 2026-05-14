@@ -25,9 +25,66 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libtest_mimic::{Arguments, Failed, Trial};
+
+// ── Per-test timing telemetry ────────────────────────────────────────
+//
+// Each test produces JSONL lines in `target/test-logs/per-test-timing.jsonl`:
+//   * One synchronous line emitted from run_one_test once the JSON
+//     result is observed: includes t_acquire_ms / t_docker_start_ms /
+//     t_useful_ms / verdict. Always present, even if drain gets cut.
+//   * One optional drain line emitted from spawn_drain when the
+//     container actually exits: `{test, pass, t_drain_ms}`. Joined
+//     to the main line by (test, pass) in the analyzer. May be missing
+//     if cargo-test exits before the drain thread completes.
+//
+// Used to verify that subsequent perf optimizations (cgroup limits,
+// docker overhead trims, timeout budgets) actually help. See plan in
+// `~/.copilot/session-state/.../plan.md`.
+
+fn timing_file() -> &'static Mutex<std::fs::File> {
+    static FILE: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = log_dir().join("per-test-timing.jsonl");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        Mutex::new(f)
+    })
+}
+
+fn emit_timing_main(
+    test: &str,
+    pass: &str,
+    t_acquire_ms: u128,
+    t_docker_start_ms: u128,
+    t_useful_ms: u128,
+    verdict: &str,
+    jobs: usize,
+) {
+    use std::io::Write as _;
+    let line = format!(
+        "{{\"test\":\"{test}\",\"pass\":\"{pass}\",\
+         \"t_acquire_ms\":{t_acquire_ms},\"t_docker_start_ms\":{t_docker_start_ms},\
+         \"t_useful_ms\":{t_useful_ms},\"verdict\":\"{verdict}\",\"jobs\":{jobs}}}\n",
+    );
+    if let Ok(mut f) = timing_file().lock() {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn emit_timing_drain(test: &str, pass: &str, t_drain_ms: u128) {
+    use std::io::Write as _;
+    let line = format!("{{\"test\":\"{test}\",\"pass\":\"{pass}\",\"t_drain_ms\":{t_drain_ms}}}\n");
+    if let Ok(mut f) = timing_file().lock() {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
 
 // ── Per-test docker run model ────────────────────────────────────────
 //
@@ -124,12 +181,20 @@ impl Drop for SemaphoreGuard {
 static ACTIVE_JOBS: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
 static DRAIN_BACKLOG: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
 
-fn active_jobs() -> &'static Semaphore {
-    ACTIVE_JOBS.get_or_init(|| {
-        let n = std::env::var("LITEBOX_TEST_JOBS")
+static JOBS_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn current_jobs_cap() -> usize {
+    *JOBS_CAP.get_or_init(|| {
+        std::env::var("LITEBOX_TEST_JOBS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
+            .unwrap_or(5)
+    })
+}
+
+fn active_jobs() -> &'static Semaphore {
+    ACTIVE_JOBS.get_or_init(|| {
+        let n = current_jobs_cap();
         eprintln!("[integration] LITEBOX_TEST_JOBS={n}");
         Semaphore::new(n)
     })
@@ -273,7 +338,10 @@ fn log_path_for(pass: &str, test_id: &str, kind: &str) -> PathBuf {
 /// the moment we return — no need for a drain-side join hook.
 fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> {
     use std::io::Write as _;
+    let t_start = Instant::now();
     let permit = active_jobs().acquire();
+    let t_acquired = Instant::now();
+    let t_acquire_ms = t_acquired.duration_since(t_start).as_millis();
     let (_, bins) = setup();
     let container_name = format!(
         "litebox-{}-{}{}-{}-{}",
@@ -298,6 +366,7 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     ));
 
     let label = format!("{pass}[{test_id}]");
+    let t_spawn = Instant::now();
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("docker spawn failed for {label}: {e}"));
@@ -310,8 +379,12 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     let mut stdout_log_file = std::fs::File::create(&stdout_log)
         .unwrap_or_else(|e| panic!("create {}: {e}", stdout_log.display()));
     let mut found: Option<serde_json::Value> = None;
+    let mut t_first_byte: Option<Instant> = None;
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
+        if t_first_byte.is_none() {
+            t_first_byte = Some(Instant::now());
+        }
         let _ = writeln!(stdout_log_file, "{line}");
         if found.is_none()
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
@@ -326,12 +399,50 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
             break;
         }
     }
+    let t_json = Instant::now();
+
+    let t_first_byte = t_first_byte.unwrap_or(t_json);
+    let t_docker_start_ms = t_first_byte.duration_since(t_spawn).as_millis();
+    let t_useful_ms = t_json.duration_since(t_first_byte).as_millis();
+    let verdict: &'static str = match &found {
+        Some(v) => match v.get("result").and_then(|r| r.as_str()) {
+            Some("pass") => "pass",
+            Some("FAIL") => "FAIL",
+            _ => "other",
+        },
+        None => "no_result",
+    };
+    let pass_static: &'static str = match pass {
+        "native" => "native",
+        "litebox" => "litebox",
+        _ => "unknown",
+    };
+    let jobs = current_jobs_cap();
+
+    // Emit the main timing line synchronously (drain may get cut off
+    // if cargo-test exits early).
+    emit_timing_main(
+        test_id,
+        pass_static,
+        t_acquire_ms,
+        t_docker_start_ms,
+        t_useful_ms,
+        verdict,
+        jobs,
+    );
 
     // Hand off the still-running child to a drain worker. It just
     // waits for clean exit so we bound zombies / per-host docker
     // population. Logs are already on disk (stderr via Stdio::from,
-    // stdout via the tee above).
-    spawn_drain(child, container_name.clone());
+    // stdout via the tee above). The drain thread emits its own
+    // t_drain_ms line when wait() returns.
+    spawn_drain(
+        child,
+        container_name.clone(),
+        test_id.to_string(),
+        pass_static,
+        t_json,
+    );
     drop(permit);
 
     found.ok_or_else(|| {
@@ -381,7 +492,13 @@ fn drain_timeout_secs() -> u64 {
 ///     of internal state.
 ///   * `kill(docker_run_pid, SIGTERM)` — unblocks our `wait()` even
 ///     if dockerd isn't responsive.
-fn spawn_drain(mut child: std::process::Child, container_name: String) {
+fn spawn_drain(
+    mut child: std::process::Child,
+    container_name: String,
+    test_id: String,
+    pass: &'static str,
+    t_drain_start: Instant,
+) {
     let backlog_permit = drain_backlog().acquire();
     std::thread::spawn(move || {
         let _hold_backlog = backlog_permit;
@@ -391,12 +508,8 @@ fn spawn_drain(mut child: std::process::Child, container_name: String) {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let watchdog = std::thread::spawn(move || {
             if rx.recv_timeout(timeout).is_ok() {
-                // Child exited cleanly — nothing to do.
                 return;
             }
-            // Defensive force-down. Both calls are best-effort:
-            // if the container/process has already exited they
-            // simply error out (ESRCH / "no such container").
             eprintln!(
                 "[drain] timeout after {} s; forcing teardown of {cname}",
                 timeout.as_secs()
@@ -416,6 +529,8 @@ fn spawn_drain(mut child: std::process::Child, container_name: String) {
         let _ = child.wait();
         let _ = tx.send(());
         let _ = watchdog.join();
+        let t_drain_ms = t_drain_start.elapsed().as_millis();
+        emit_timing_drain(&test_id, pass, t_drain_ms);
     });
 }
 
