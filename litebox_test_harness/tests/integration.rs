@@ -213,12 +213,23 @@ static DRAIN_BACKLOG: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new(
 
 static JOBS_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+fn default_jobs() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    // Roughly num_cpus / 1.5, clamped to a reasonable range. Past
+    // jobs=10 dockerd serializes container creation badly enough that
+    // further parallelism gives diminishing returns (verified by
+    // phase-2 measurement: jobs=5→10 cut wall by ~9% on PB.* family).
+    ((cpus as f32 / 1.5) as usize).clamp(2, 10)
+}
+
 fn current_jobs_cap() -> usize {
     *JOBS_CAP.get_or_init(|| {
         std::env::var("LITEBOX_TEST_JOBS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(5)
+            .unwrap_or_else(default_jobs)
     })
 }
 
@@ -235,7 +246,11 @@ fn drain_backlog() -> &'static Semaphore {
         let n = std::env::var("LITEBOX_DRAIN_BACKLOG")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(20);
+            // Scale with active_jobs: containers finishing their
+            // useful phase queue up in the drain backlog while still
+            // owning their docker pid/cgroup. ~4× jobs gives enough
+            // headroom that we never back-pressure the test loop.
+            .unwrap_or_else(|| current_jobs_cap() * 4);
         Semaphore::new(n)
     })
 }
