@@ -25,9 +25,9 @@
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, StatusCode,
     build_create_eventfd_request, build_materialize_request, build_read_eventfd_request,
-    build_register_notification_ring_request, build_register_request, build_release_request,
-    build_subscribe_eventfd_request, build_unsubscribe_request, build_write_eventfd_request,
-    decode, parse_handle_body,
+    build_register_notification_ring_request, build_register_process_request,
+    build_register_request, build_release_request, build_subscribe_eventfd_request,
+    build_unsubscribe_request, build_write_eventfd_request, decode, parse_handle_body,
 };
 use std::format;
 use std::io;
@@ -209,6 +209,26 @@ impl FdTokenClient {
         }
         match resp.status {
             StatusCode::Ok => Ok(()),
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    // ---- Process state-object ops (Phase 1: pid allocation) -------------
+
+    /// Asks the broker to allocate a new globally-unique guest pid
+    /// and register a corresponding `ProcessState` entry in the
+    /// process registry with refcount = 1. The returned handle id IS
+    /// the Linux guest pid (low 32 bits of the u64 handle).
+    pub fn register_process(&self) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_register_process_request(), None)?;
+        let (resp_bytes, _attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::RegisterProcessResponse)?;
+        match resp.status {
+            StatusCode::Ok => {
+                parse_handle_body(resp.body, resp.opcode).map_err(ClientError::Protocol)
+            }
             s => Err(map_status_no_handle(resp.opcode, s)),
         }
     }

@@ -110,6 +110,12 @@ pub enum SubsystemTag {
     /// `SOCK_STREAM` AF_INET / AF_INET6 sockets. Listening sockets are
     /// distinguished only after materialisation via `SO_ACCEPTCONN`.)
     TcpSocket,
+    /// Broker-hosted process identity. Wire value `3`. The
+    /// [`StateHandle.id`] of a `Process`-tagged entry is the
+    /// globally-unique Linux guest pid (truncated to `u32` at the
+    /// shim boundary). The payload is empty in the initial phase;
+    /// later phases attach parent/children/exit state.
+    Process,
     /// Tag that this receiver doesn't recognise. Carries the raw u8
     /// value so the receiver can log diagnostics; callers should reject
     /// the specific fd while continuing to deliver the rest of the
@@ -123,6 +129,7 @@ impl SubsystemTag {
         match self {
             SubsystemTag::Eventfd => 1,
             SubsystemTag::TcpSocket => 2,
+            SubsystemTag::Process => 3,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -134,6 +141,7 @@ impl SubsystemTag {
         match raw {
             1 => SubsystemTag::Eventfd,
             2 => SubsystemTag::TcpSocket,
+            3 => SubsystemTag::Process,
             other => SubsystemTag::Unknown(other),
         }
     }

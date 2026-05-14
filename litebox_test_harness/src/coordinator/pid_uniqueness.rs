@@ -95,8 +95,7 @@ struct PidTreeOut {
     combined_stdout: String,
 }
 
-const PID_TREE: HandlerToken<PidTreeArgs, PidTreeOut> =
-    HandlerToken::new("pid_uniqueness.tree");
+const PID_TREE: HandlerToken<PidTreeArgs, PidTreeOut> = HandlerToken::new("pid_uniqueness.tree");
 
 // ─── Handler (runs as the root in dpg1) ────────────────────────────
 
@@ -130,8 +129,8 @@ async fn handle_pid_tree(
 /// subcommand.
 fn spawn_and_collect(out: &mut String, spec: &ChildSpec) -> Result<(), String> {
     use core::fmt::Write as _;
-    let nested = serde_json::to_string(&spec.recurse)
-        .map_err(|e| format!("encode recurse: {e}"))?;
+    let nested =
+        serde_json::to_string(&spec.recurse).map_err(|e| format!("encode recurse: {e}"))?;
     let mut cmd = Command::new(&spec.binary);
     cmd.args([
         "pid-uniq-tree",
@@ -141,7 +140,9 @@ fn spawn_and_collect(out: &mut String, spec: &ChildSpec) -> Result<(), String> {
     ])
     .stdout(Stdio::piped())
     .stderr(Stdio::null());
-    let child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", spec.binary))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", spec.binary))?;
     let child_pid = child.id();
     let _ = writeln!(
         out,
@@ -292,11 +293,9 @@ pub(crate) fn register_pid_uniqueness_tests(reg: &mut Registry<'_>) {
                             .await;
                         match result {
                             Ok(out) => validate(&out.combined_stdout, name),
-                            Err(e) => TestOutcome::new(
-                                "Dpg1",
-                                false,
-                                format!("handler error: {e}"),
-                            ),
+                            Err(e) => {
+                                TestOutcome::new("Dpg1", false, format!("handler error: {e}"))
+                            }
                         }
                     })
                 })
@@ -375,18 +374,13 @@ fn validate(combined: &str, variant_name: &str) -> TestOutcome {
         for (pid, roles) in &duplicates {
             msg.push_str(&format!("  pid={pid} used by roles {:?}\n", roles));
         }
-        msg.push_str(&format!(
-            "all pids: {:?}\n---stdout---\n{}",
-            pids, combined
-        ));
+        msg.push_str(&format!("all pids: {:?}\n---stdout---\n{}", pids, combined));
         return TestOutcome::new("Dpg1", false, msg);
     }
 
     // 3. Preservation check.
-    let p_by_role: std::collections::HashMap<&str, &ProcessLine> = processes
-        .iter()
-        .map(|p| (p.role.as_str(), p))
-        .collect();
+    let p_by_role: std::collections::HashMap<&str, &ProcessLine> =
+        processes.iter().map(|p| (p.role.as_str(), p)).collect();
     let mut pres_failures: Vec<String> = Vec::new();
     for s in &spawns {
         match p_by_role.get(s.role.as_str()) {
