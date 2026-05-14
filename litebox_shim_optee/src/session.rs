@@ -116,13 +116,14 @@ pub struct TaInstance {
     /// after initialization because it contains internal state that may not survive moves.
     pub loaded_program: alloc::boxed::Box<LoadedProgram>,
     /// The task page table ID associated with this TA instance. Valid only
-    /// while `dead == false`.
+    /// while `closed == false`.
     pub task_page_table_id: usize,
-    /// Set when the TA panics or its last session closes. Any lock holder
-    /// should first check whether `dead == true` and if it is, bail without
-    /// touching `task_page_table_id`. `shim` and `loaded_program` remain
-    /// valid until the last `Arc` is dropped.
-    pub dead: bool,
+    /// Set when the TA is committed to teardown because it panicked or its last
+    /// session closed. Any lock holder should first check whether
+    /// `closed == true` and if it is, bail without touching
+    /// `task_page_table_id`. `shim` and `loaded_program` remain valid until
+    /// the last `Arc` is dropped.
+    pub closed: bool,
 }
 
 // SAFETY: TaInstance is protected by SpinMutex and try_lock (`SessionEntry`)
@@ -248,6 +249,7 @@ impl SingleInstanceCache {
         self.inner.lock().remove(uuid)
     }
 
+    /// Remove a cached single-instance TA only if it is the expected instance.
     fn remove_if_same(&self, uuid: &TeeUuid, expected: &Arc<SpinMutex<TaInstance>>) -> bool {
         let mut guard = self.inner.lock();
         match guard.get(uuid) {
