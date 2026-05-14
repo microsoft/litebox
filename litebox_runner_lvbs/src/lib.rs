@@ -530,9 +530,10 @@ fn handle_open_session(
 
 /// Outcome of [`open_session_single_instance`].
 enum OpenSessionOutcome {
-    /// Session was successfully opened (or a TA-level error was written back).
+    /// Session was successfully opened, TA returned a non-fatal error, or TA panicked
+    /// and the instance was destroyed inline. No extra cleanup effort is needed.
     Done,
-    /// The cached `TaInstance` is closed and must not be entered.
+    /// The cached `TaInstance` is `closed` and must not be entered.
     InstanceDestroyed,
 }
 
@@ -543,6 +544,8 @@ enum OpenSessionOutcome {
 /// Returns [`OpenSessionOutcome::InstanceDestroyed`] if the cached TA is closed.
 ///
 /// If the TA's OpenSession entry point returns an error, the session is not registered.
+/// On TARGET_DEAD the cached instance is destroyed unconditionally; any sibling sessions
+/// become orphans that fail-fast on next access via the `instance.closed` check.
 /// For cleanup semantics, see OP-TEE OS `tee_ta_open_session()` in `tee_ta_manager.c`.
 #[allow(clippy::type_complexity)]
 fn open_session_single_instance(
@@ -893,15 +896,15 @@ fn open_session_new_instance(
         closed: false,
     }));
 
-    // Cache single-instance TAs for future sessions
-    if ta_flags.is_single_instance() {
-        session_manager().cache_single_instance(ta_uuid, instance.clone());
-    }
-
     // Disarm the guard: ownership transfers to session manager via register_session.
     // Safe to unwrap: guard has not been disarmed yet.
     let runner_session_id = session_id_guard.disarm().unwrap();
     session_manager().register_session(runner_session_id, instance.clone(), ta_uuid, ta_flags);
+
+    // Cache single-instance TAs only after the opening session owns the instance.
+    if ta_flags.is_single_instance() {
+        session_manager().cache_single_instance(ta_uuid, instance.clone());
+    }
 
     // Write success response back to normal world
     write_msg_args_to_normal_world(
@@ -1019,7 +1022,9 @@ fn handle_invoke_command(
         let ta_uuid = session_entry.ta_uuid;
         let ta_flags = session_entry.ta_flags;
 
-        // Remove this session from the map
+        // Remove this session from the map. Sibling sessions on the same
+        // single-instance TA will be cleaned up lazily on their next
+        // invoke/close via the `instance.closed` check.
         session_manager().unregister_session(session_id);
 
         // Write response BEFORE switching page tables (accesses user memory)
@@ -1035,8 +1040,9 @@ fn handle_invoke_command(
         // Clear single-instance cache so new OpenSessions for this UUID
         // create a fresh instance instead of hitting the zombie one.
         if ta_flags.is_single_instance() {
-            let _ =
+            let removed =
                 session_manager().remove_single_instance_if_same(&ta_uuid, &session_entry.instance);
+            debug_assert!(removed, "single-instance cache entry unexpectedly missing");
         }
 
         instance.closed = true;
@@ -1180,8 +1186,9 @@ fn handle_close_session(
 
             // Clear single-instance cache if this was a single-instance TA
             if entry.ta_flags.is_single_instance() {
-                let _ =
+                let removed =
                     session_manager().remove_single_instance_if_same(&entry.ta_uuid, &instance_arc);
+                debug_assert!(removed, "single-instance cache entry unexpectedly missing");
             }
             instance.closed = true;
 

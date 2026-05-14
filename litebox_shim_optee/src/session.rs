@@ -118,11 +118,11 @@ pub struct TaInstance {
     /// The task page table ID associated with this TA instance. Valid only
     /// while `closed == false`.
     pub task_page_table_id: usize,
-    /// Set when the TA is committed to teardown because it panicked or its last
-    /// session closed. Any lock holder should first check whether
-    /// `closed == true` and if it is, bail without touching
-    /// `task_page_table_id`. `shim` and `loaded_program` remain valid until
-    /// the last `Arc` is dropped.
+    /// Set when the TA is committed to teardown (panic or last session closed). Any lock
+    /// holders should check `closed` before touching `task_page_table_id` and bail if true.
+    ///
+    /// The per-instance lock must be held when setting `closed = true` and across
+    /// the subsequent `teardown_ta_page_table`.
     pub closed: bool,
 }
 
