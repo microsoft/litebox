@@ -111,19 +111,33 @@ fn emit_timing_drain(test: &str, pass: &str, t_drain_ms: u128) {
 // PIE-only tests) that this model is competitive with the old
 // single-docker-per-pass cache.
 
-/// Cached test IDs from `collect_all_tests` (direct library call, no subprocess).
-static TEST_IDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+/// Cached test (id, timeout_secs) tuples from `collect_all_tests`
+/// (direct library call, no subprocess).
+static TEST_METADATA: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
 
-fn get_test_ids() -> &'static Vec<String> {
-    TEST_IDS.get_or_init(|| {
+fn get_test_metadata() -> &'static Vec<(String, u64)> {
+    TEST_METADATA.get_or_init(|| {
         let tests = litebox_test_harness::coordinator::collect_all_tests();
-        let ids: Vec<String> = tests.into_iter().map(|t| t.id).collect();
-        eprintln!(
-            "[integration] {} test IDs from collect_all_tests",
-            ids.len()
-        );
-        ids
+        let meta: Vec<(String, u64)> =
+            tests.into_iter().map(|t| (t.id, t.timeout_secs)).collect();
+        eprintln!("[integration] {} test IDs from collect_all_tests", meta.len());
+        meta
     })
+}
+
+fn get_test_ids() -> Vec<String> {
+    get_test_metadata().iter().map(|(id, _)| id.clone()).collect()
+}
+
+/// Lookup the harness-declared per-test timeout (the `.timeout(N)` value
+/// the coordinator enforces). Returns 60s as a defensive fallback if
+/// the test ID isn't in the registry (shouldn't happen).
+fn test_timeout_secs(test_id: &str) -> u64 {
+    get_test_metadata()
+        .iter()
+        .find(|(id, _)| id == test_id)
+        .map(|(_, t)| *t)
+        .unwrap_or(60)
 }
 
 /// Whether to keep docker containers after exit (for debugging).
@@ -327,7 +341,14 @@ fn build_docker_cmd(
                 .arg(&filter);
         }
         "litebox" => {
-            cmd.args(["timeout", "--signal=KILL", "120"])
+            // Outer timeout = per-test harness budget + 15 s grace
+            // for teardown_tree (5 s cap) and container shutdown.
+            // Replaces the previous blanket 120 s, which made
+            // failing fast-tests cost 120 s each.
+            let outer = test_timeout_secs(test_id).saturating_add(15);
+            let outer_str = outer.to_string();
+            cmd.args(["timeout", "--signal=KILL"])
+                .arg(&outer_str)
                 .args([
                     "/opt/litebox/litebox_tool_executor",
                     "--rootfs",
