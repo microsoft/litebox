@@ -54,7 +54,10 @@ impl<'a, FS: ShimFS> ElfFile<'a, FS> {
 
 impl<FS: ShimFS> Drop for ElfFile<'_, FS> {
     fn drop(&mut self) {
-        self.task.sys_close(self.fd).expect("failed to close fd");
+        // Cross-worker exec restore can race descriptor-table replacement for
+        // restored stdio slots. Linux close(2) treats an already-closed fd as a
+        // syscall error, but Drop must not panic during exec cleanup.
+        let _ = self.task.sys_close(self.fd);
     }
 }
 
