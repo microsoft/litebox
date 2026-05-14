@@ -347,6 +347,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
 
     let mut system_certs_mem = MemoryContainer::new();
     let mut kexec_trampoline_metadata = KexecMemoryMetadata::new();
+    let mut kexec_trampoline_insert_failed = false;
     let mut patch_info_mem = MemoryContainer::new();
     let mut kinfo_mem = MemoryContainer::new();
     let mut kdata_mem = MemoryContainer::new();
@@ -361,7 +362,12 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
                     .extend_range(heki_range)
                     .map_err(|_| VsmError::InvalidInputAddress)?,
                 HekiKdataType::KexecTrampoline => {
-                    kexec_trampoline_metadata.insert_heki_range(heki_range)?;
+                    if let Err(e) = kexec_trampoline_metadata.insert_heki_range(heki_range) {
+                        debug_serial_println!(
+                            "VSM: KexecTrampoline insert_heki_range failed ({e:?}); skipping kexec trampoline protection"
+                        );
+                        kexec_trampoline_insert_failed = true;
+                    }
                 }
                 HekiKdataType::PatchInfo => patch_info_mem
                     .extend_range(heki_range)
@@ -412,11 +418,17 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     vtl0_info.set_system_certificates(certs.clone());
     debug_serial_println!("VSM: Loaded {} system certificate(s)", certs.len());
 
-    for kexec_trampoline_range in &kexec_trampoline_metadata {
-        protect_physical_memory_range(
-            kexec_trampoline_range.phys_frame_range,
-            MemAttr::MEM_ATTR_READ,
-        )?;
+    // ToDo: Remove kexec_trampoline_insert_failed and protect kexec_trampoline_metadata
+    // once we have a better solution to handle the non-page-aligned kexec trampoline metadata.
+    // The current solution is to skip protecting kexec trampoline metadata if its insert_heki_range
+    // fails, letting kdata load proceed so that heki is not broken.
+    if !kexec_trampoline_insert_failed {
+        for kexec_trampoline_range in &kexec_trampoline_metadata {
+            protect_physical_memory_range(
+                kexec_trampoline_range.phys_frame_range,
+                MemAttr::MEM_ATTR_READ,
+            )?;
+        }
     }
 
     // pre-computed patch data for the kernel text
@@ -1752,9 +1764,9 @@ impl KexecMemoryRange {
             virt_addr: VirtAddr::new(virt_addr),
             phys_frame_range: PhysFrame::range(
                 PhysFrame::from_start_address(phys_start)
-                    .expect("validated kexec memory start address is page-aligned"),
+                    .expect("kexec memory start address is not page-aligned"),
                 PhysFrame::from_start_address(phys_end)
-                    .expect("validated kexec memory end address is page-aligned"),
+                    .expect("kexec memory end address is not page-aligned"),
             ),
         }
     }
