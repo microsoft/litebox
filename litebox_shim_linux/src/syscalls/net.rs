@@ -2687,7 +2687,8 @@ impl<FS: ShimFS> Task<FS> {
                     | SubsystemTag::Signalfd
                     | SubsystemTag::Timerfd
                     | SubsystemTag::Inotify
-                    | SubsystemTag::Pipe => {
+                    | SubsystemTag::Pipe
+                    | SubsystemTag::Pty => {
                         // Reserved for P2.A/B/C and later phases.
                         // Until those subphases land, the receive
                         // path drops the fd cleanly rather than

@@ -278,6 +278,7 @@ pub enum BrokerHandleKind {
     Pidfd = 1,
     Eventfd = 2,
     Signalfd = 3,
+    Pty = 4,
 }
 
 impl BrokerHandleKind {
@@ -293,6 +294,7 @@ impl BrokerHandleKind {
             1 => Self::Pidfd,
             2 => Self::Eventfd,
             3 => Self::Signalfd,
+            4 => Self::Pty,
             _ => return None,
         })
     }
@@ -2010,6 +2012,7 @@ mod tests {
             BrokerHandleKind::Pidfd,
             BrokerHandleKind::Eventfd,
             BrokerHandleKind::Signalfd,
+            BrokerHandleKind::Pty,
         ] {
             let mut meta = FdMetadataSnapshot::default();
             meta.broker_handle = Some(BrokerHandleSnapshot {

@@ -7231,6 +7231,9 @@ impl<FS: ShimFS> Task<FS> {
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
                                 BrokerHandleKind::Signalfd => None,
+                                BrokerHandleKind::Pty => super::eventfd::broker_pty_provider()
+                                    .as_ref()
+                                    .map(|p| alloc::sync::Arc::clone(p) as _),
                             };
                             if let Some(releaser) = releaser_opt {
                                 match releaser.dup_handle(handle_id) {
@@ -9063,6 +9066,7 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Eventfd => "eventfd",
                         BrokerHandleKind::Pidfd => "pidfd",
                         BrokerHandleKind::Signalfd => "signalfd",
+                        BrokerHandleKind::Pty => "pty",
                     };
                     let releaser: Option<
                         alloc::sync::Arc<
@@ -9076,6 +9080,9 @@ impl<FS: ShimFS> Task<FS> {
                             .as_ref()
                             .map(|p| alloc::sync::Arc::clone(p) as _),
                         BrokerHandleKind::Signalfd => None,
+                        BrokerHandleKind::Pty => super::eventfd::broker_pty_provider()
+                            .as_ref()
+                            .map(|p| alloc::sync::Arc::clone(p) as _),
                     };
                     if let Some(releaser) = releaser
                         && releaser.dup_handle(handle_id).is_ok()

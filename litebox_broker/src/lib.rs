@@ -21,5 +21,5 @@ pub mod sock_compat;
 // `litebox_broker::eventfd_state::*` etc. import paths working.
 pub use cwfd::{
     eventfd_state, fd_token_service, fd_token_socket, fd_tokens, pidfd_state, pipe_state,
-    process_state, signalfd_state, state_registry, state_service, subscription_list,
+    process_state, pty_state, signalfd_state, state_registry, state_service, subscription_list,
 };

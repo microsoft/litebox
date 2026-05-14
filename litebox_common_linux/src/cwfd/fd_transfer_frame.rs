@@ -130,6 +130,10 @@ pub enum SubsystemTag {
     Process,
     /// Broker-hosted anonymous pipe. Wire value `9`. Phase C.
     Pipe,
+    /// Broker-hosted pseudo-terminal endpoint. Wire value `10`.
+    /// Phase E reserves this tag for PTY master/slave identity that
+    /// must survive cross-worker `exec_on_remote_host`.
+    Pty,
     /// Tag that this receiver doesn't recognise. Carries the raw u8
     /// value so the receiver can log diagnostics; callers should reject
     /// the specific fd while continuing to deliver the rest of the
@@ -150,6 +154,7 @@ impl SubsystemTag {
             SubsystemTag::Inotify => 7,
             SubsystemTag::Process => 8,
             SubsystemTag::Pipe => 9,
+            SubsystemTag::Pty => 10,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -168,6 +173,7 @@ impl SubsystemTag {
             7 => SubsystemTag::Inotify,
             8 => SubsystemTag::Process,
             9 => SubsystemTag::Pipe,
+            10 => SubsystemTag::Pty,
             other => SubsystemTag::Unknown(other),
         }
     }

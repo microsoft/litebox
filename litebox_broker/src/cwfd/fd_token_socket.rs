@@ -370,6 +370,11 @@ pub fn handle_control_connection(
                     | Opcode::WritePipe
                     | Opcode::SubscribePipe
                     | Opcode::ClosePipeEnd
+                    | Opcode::CreatePty
+                    | Opcode::PtyRead
+                    | Opcode::PtyWrite
+                    | Opcode::SubscribePty
+                    | Opcode::PtyIoctl
                     | Opcode::SubscribeEventfd
                     | Opcode::DupHandle => {
                         // State-object opcodes: route to state_service on the fd-state registry.
