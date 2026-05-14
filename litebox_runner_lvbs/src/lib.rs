@@ -515,7 +515,7 @@ fn handle_open_session(
                 ta_uuid,
                 &ta_req_info,
             )? {
-                OpenSessionOutcome::Done => Ok(()),
+                OpenSessionOutcome::Handled => Ok(()),
                 OpenSessionOutcome::InstanceDestroyed => {
                     // Evict the zombie. Analog of OP-TEE's `maybe_release_ta_ctx`
                     // removing the dead ctx from `tee_ctxes`.
@@ -532,7 +532,7 @@ fn handle_open_session(
 enum OpenSessionOutcome {
     /// Session was successfully opened, TA returned a non-fatal error, or TA panicked
     /// and the instance was destroyed inline. No extra cleanup effort is needed.
-    Done,
+    Handled,
     /// The cached `TaInstance` is `closed` and must not be entered.
     InstanceDestroyed,
 }
@@ -632,23 +632,23 @@ fn open_session_single_instance(
             return_code
         );
 
+        // Write error response BEFORE switching page tables (accesses user memory).
+        // Keep the instance lock held until this completes so another core cannot
+        // tear down the active page table while this core is copying TA outputs.
+        let write_result = write_msg_args_to_normal_world(
+            msg_args,
+            msg_args_phys_addr,
+            return_code,
+            None, // No session ID on failure
+            Some(&ta_params),
+            Some(ta_req_info),
+        );
+
         // For single-instance TAs, only clean up on TARGET_DEAD (panic).
         // Regular errors (access denied, bad params, etc.) don't mean the TA is dead -
         // it can still serve future OpenSession requests from other clients.
         if return_code == TeeResult::TargetDead {
             debug_serial_println!("Single-instance TA panicked during OpenSession, cleaning up");
-
-            // Write error response BEFORE switching page tables (accesses user memory).
-            // Keep the instance lock held until this completes so another core cannot
-            // tear down the active page table while this core is copying TA outputs.
-            let write_result = write_msg_args_to_normal_world(
-                msg_args,
-                msg_args_phys_addr,
-                return_code,
-                None, // No session ID on failure
-                Some(&ta_params),
-                Some(ta_req_info),
-            );
 
             let _ = session_manager().remove_single_instance_if_same(&ta_uuid, &instance_arc);
             instance.closed = true;
@@ -657,44 +657,46 @@ fn open_session_single_instance(
             // no references to user-space memory will be held afterwards.
             unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
 
-            drop(instance);
-
             // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
             // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
             // cleaning it up. Currently we always clean up on panic.
-
-            write_result?;
-            return Ok(OpenSessionOutcome::Done);
         }
 
-        // Write error response back to normal world
-        write_msg_args_to_normal_world(
-            msg_args,
-            msg_args_phys_addr,
-            return_code,
-            None, // No session ID on failure
-            Some(&ta_params),
-            Some(ta_req_info),
-        )?;
-
         drop(instance);
-
-        return Ok(OpenSessionOutcome::Done);
+        write_result?;
+        return Ok(OpenSessionOutcome::Handled);
     }
 
-    // Success: register session and disarm the guard (ownership transfers to session map)
-    // Safe to unwrap: guard has not been disarmed yet.
-    let runner_session_id = session_id_guard.disarm().unwrap();
-    session_manager().register_session(runner_session_id, instance_arc.clone(), ta_uuid, ta_flags);
-
-    write_msg_args_to_normal_world(
+    // Treat write-back failure as OpenSession failure: do not publish the session.
+    let runner_session_id = session_id_guard.id().unwrap();
+    let write_result = write_msg_args_to_normal_world(
         msg_args,
         msg_args_phys_addr,
         return_code,
         Some(runner_session_id),
         Some(&ta_params),
         Some(ta_req_info),
-    )?;
+    );
+
+    if write_result.is_err()
+        && !ta_flags.is_keep_alive()
+        && session_manager()
+            .sessions()
+            .count_sessions_for_instance(&instance_arc)
+            == 0
+    {
+        let _ = session_manager().remove_single_instance_if_same(&ta_uuid, &instance_arc);
+        instance.closed = true;
+
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
+    }
+    write_result?;
+
+    // Success: register session and disarm the guard (ownership transfers to session map)
+    session_manager().register_session(runner_session_id, instance_arc.clone(), ta_uuid, ta_flags);
+    session_id_guard.disarm();
 
     drop(instance);
 
@@ -703,7 +705,7 @@ fn open_session_single_instance(
         runner_session_id
     );
 
-    Ok(OpenSessionOutcome::Done)
+    Ok(OpenSessionOutcome::Handled)
 }
 
 /// Create a new TA instance for a session.
@@ -888,6 +890,25 @@ fn open_session_new_instance(
         return Ok(());
     }
 
+    // Write back BEFORE publishing the instance. If the write fails, the
+    // session is neither registered nor cached, so we just tear down the
+    // local resources and let `session_id_guard` recycle the ID on drop.
+    // Safe to unwrap: guard has not been disarmed yet.
+    let runner_session_id = session_id_guard.id().unwrap();
+    write_msg_args_to_normal_world(
+        msg_args,
+        msg_args_phys_addr,
+        return_code,
+        Some(runner_session_id),
+        Some(&ta_params),
+        Some(ta_req_info),
+    )
+    .inspect_err(|_| {
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+    })?;
+
     // Success: create TA instance - loaded_program is already boxed, no move happens
     let instance = Arc::new(SpinMutex::new(TaInstance {
         shim,
@@ -896,25 +917,14 @@ fn open_session_new_instance(
         closed: false,
     }));
 
-    // Disarm the guard: ownership transfers to session manager via register_session.
-    // Safe to unwrap: guard has not been disarmed yet.
-    let runner_session_id = session_id_guard.disarm().unwrap();
+    // Ownership of the session ID transfers to the session manager.
+    session_id_guard.disarm();
     session_manager().register_session(runner_session_id, instance.clone(), ta_uuid, ta_flags);
 
     // Cache single-instance TAs only after the opening session owns the instance.
     if ta_flags.is_single_instance() {
         session_manager().cache_single_instance(ta_uuid, instance.clone());
     }
-
-    // Write success response back to normal world
-    write_msg_args_to_normal_world(
-        msg_args,
-        msg_args_phys_addr,
-        return_code,
-        Some(runner_session_id),
-        Some(&ta_params),
-        Some(ta_req_info),
-    )?;
 
     debug_serial_println!(
         "OpenSession complete: session_id={}, single_instance={}",
@@ -1010,6 +1020,18 @@ fn handle_invoke_command(
     let return_code: u32 = ctx.rax.truncate();
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
+    // Write response BEFORE switching page tables (accesses user memory).
+    // Keep the instance lock held until this completes so another core cannot
+    // tear down the active page table while this core is copying TA outputs.
+    let write_result = write_msg_args_to_normal_world(
+        msg_args,
+        msg_args_phys_addr,
+        return_code,
+        None,
+        Some(&ta_params),
+        Some(&ta_req_info),
+    );
+
     // Per OP-TEE OS: if TA panics (TARGET_DEAD), the TA context is
     // unrecoverable; all sessions on the same single-instance TA are
     // implicitly dead (Ref: tee_ta_invoke_command() in tee_ta_manager.c).
@@ -1027,22 +1049,11 @@ fn handle_invoke_command(
         // invoke/close via the `instance.closed` check.
         session_manager().unregister_session(session_id);
 
-        // Write response BEFORE switching page tables (accesses user memory)
-        let write_result = write_msg_args_to_normal_world(
-            msg_args,
-            msg_args_phys_addr,
-            return_code,
-            None,
-            Some(&ta_params),
-            Some(&ta_req_info),
-        );
-
         // Clear single-instance cache so new OpenSessions for this UUID
         // create a fresh instance instead of hitting the zombie one.
         if ta_flags.is_single_instance() {
-            let removed =
+            let _ =
                 session_manager().remove_single_instance_if_same(&ta_uuid, &session_entry.instance);
-            debug_assert!(removed, "single-instance cache entry unexpectedly missing");
         }
 
         instance.closed = true;
@@ -1062,21 +1073,9 @@ fn handle_invoke_command(
         // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
         // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
         // cleaning it up. Currently we always clean up on panic.
-
-        write_result?;
-        return Ok(());
     }
 
-    write_msg_args_to_normal_world(
-        msg_args,
-        msg_args_phys_addr,
-        return_code,
-        None,
-        Some(&ta_params),
-        Some(&ta_req_info),
-    )?;
-
-    Ok(())
+    write_result
 }
 
 /// Handle CloseSession command.
@@ -1186,9 +1185,8 @@ fn handle_close_session(
 
             // Clear single-instance cache if this was a single-instance TA
             if entry.ta_flags.is_single_instance() {
-                let removed =
+                let _ =
                     session_manager().remove_single_instance_if_same(&entry.ta_uuid, &instance_arc);
-                debug_assert!(removed, "single-instance cache entry unexpectedly missing");
             }
             instance.closed = true;
 

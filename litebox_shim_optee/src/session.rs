@@ -445,11 +445,6 @@ impl SessionManager {
         entry
     }
 
-    /// Remove a single-instance TA from the cache.
-    pub fn remove_single_instance(&self, uuid: &TeeUuid) -> Option<Arc<SpinMutex<TaInstance>>> {
-        self.single_instance_cache.remove(uuid)
-    }
-
     /// Remove a single-instance TA from the cache only if the currently
     /// cached `Arc` is the same as `expected`.
     pub fn remove_single_instance_if_same(
