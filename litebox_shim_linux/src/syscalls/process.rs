@@ -6624,7 +6624,8 @@ impl<FS: ShimFS> Task<FS> {
         let thread = self.snapshot_thread(ctx, flags, args);
         let signal = self.snapshot_signal();
         let fs = self.snapshot_fs();
-        let mut _true_fork_transit: Vec<super::fork_snapshot::ForkSnapshotBrokerTransit> = Vec::new();
+        let mut _true_fork_transit: Vec<super::fork_snapshot::ForkSnapshotBrokerTransit> =
+            Vec::new();
         let fd_table = self.snapshot_fd_table(&mut reject, &mut _true_fork_transit);
         let memory = self.snapshot_memory(&mut reject);
 
@@ -7203,15 +7204,13 @@ impl<FS: ShimFS> Task<FS> {
                 {
                     let eventfd_provider = super::eventfd::broker_eventfd_provider();
                     let pidfd_provider = super::eventfd::broker_pidfd_provider();
-                    let result = dt.with_entry(
-                        &typed,
-                        |ef: &super::eventfd::EventFile<crate::Platform>| {
+                    let result =
+                        dt.with_entry(&typed, |ef: &super::eventfd::EventFile<crate::Platform>| {
                             ef.ensure_broker_backed_for_fork(
                                 eventfd_provider.as_ref(),
                                 pidfd_provider.as_ref(),
                             )
-                        },
-                    );
+                        });
                     match result {
                         Some(Ok(Some((kind, handle_id)))) => {
                             // Dup the handle so the snapshot's
@@ -9012,7 +9011,8 @@ impl<FS: ShimFS> Task<FS> {
         // pidfd state. Each entry corresponds to one fd whose
         // EventFile was promoted to broker-backed and a transit ref
         // was dup'd. The worker reattaches via --broker-eventfd-bridge.
-        let mut broker_eventfd_specs: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let mut broker_eventfd_specs: alloc::vec::Vec<alloc::string::String> =
+            alloc::vec::Vec::new();
         let mut broker_eventfd_transit_release: alloc::vec::Vec<(
             alloc::sync::Arc<
                 dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
@@ -9387,8 +9387,7 @@ impl<FS: ShimFS> Task<FS> {
         // fds again.
         {
             let files = self.files.borrow();
-            let alive_fds: Vec<usize> =
-                files.raw_descriptor_store.read().iter_alive().collect();
+            let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
             drop(files);
             for raw_fd in alive_fds {
                 if raw_fd <= 2 {
@@ -9824,6 +9823,28 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         self.init_thread_context(ctx);
+
+        // Register this task's thread handle in `process_thread_handles` so
+        // cross-process signals (kill, tgkill) can interrupt the new program.
+        // For a same-shim fork+exec child, the child Task was created via
+        // clone but never went through `handle_init_request`, so its handle
+        // is still unset. Without registration, `sys_kill` looking up the
+        // child's `ProcessId` finds no handle and cannot wake the child
+        // from a sleep — SIGKILL silently fails to terminate it.
+        //
+        // `OnceBox::set` is a no-op if already set (e.g. when the same Task
+        // is re-execing). The `BTreeMap::insert` overwrites any stale entry
+        // for the (possibly newly assigned) `process_id` key.
+        let _ = self
+            .thread
+            .remote
+            .handle
+            .set(Box::new(self.wait_state.thread_handle()));
+        let proc_key = self.process_id.0.cast_signed();
+        self.global
+            .process_thread_handles
+            .write()
+            .insert(proc_key, self.thread.remote.clone());
 
         // Reinitialize guest FP/SIMD state so the new process starts with a
         // clean FP state (MXCSR=0x1F80, zeroed XMM) rather than inheriting

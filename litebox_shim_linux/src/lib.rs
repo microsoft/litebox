@@ -253,11 +253,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             }
             BrokerHandleKind::Pidfd => {
                 let provider = syscalls::eventfd::broker_pidfd_provider().ok_or(())?;
-                syscalls::eventfd::EventFile::new_pidfd_broker_backed(
-                    provider,
-                    handle_id,
-                    false,
-                )
+                syscalls::eventfd::EventFile::new_pidfd_broker_backed(provider, handle_id, false)
             }
             BrokerHandleKind::Signalfd => return Err(()),
         };
@@ -272,13 +268,12 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         // inherited eventfd can be woken by the parent's broker write.
         // Without this, the broker subscription is only set up by
         // epoll's register_observer path, and direct read() hangs.
-        self.task
-            .global
-            .litebox
-            .descriptor_table()
-            .with_entry(&typed_fd, |ef: &syscalls::eventfd::EventFile<Platform>| {
+        self.task.global.litebox.descriptor_table().with_entry(
+            &typed_fd,
+            |ef: &syscalls::eventfd::EventFile<Platform>| {
                 ef.pre_subscribe_for_broker_blocking_read();
-            });
+            },
+        );
 
         let files = self.task.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
@@ -1277,28 +1272,27 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 let Some(broker_handle) = entry.metadata.broker_handle else {
                     continue;
                 };
-                let event_file: Option<syscalls::eventfd::EventFile<Platform>> = match broker_handle
-                    .kind
-                {
-                    BrokerHandleKind::Eventfd => syscalls::eventfd::broker_eventfd_provider()
-                        .map(|provider| {
-                            syscalls::eventfd::EventFile::new_broker_backed(
-                                provider,
-                                broker_handle.handle_id,
-                                litebox_common_linux::EfdFlags::empty(),
-                            )
-                        }),
-                    BrokerHandleKind::Pidfd => {
-                        syscalls::eventfd::broker_pidfd_provider().map(|provider| {
-                            syscalls::eventfd::EventFile::new_pidfd_broker_backed(
-                                provider,
-                                broker_handle.handle_id,
-                                false,
-                            )
-                        })
-                    }
-                    BrokerHandleKind::Signalfd => None,
-                };
+                let event_file: Option<syscalls::eventfd::EventFile<Platform>> =
+                    match broker_handle.kind {
+                        BrokerHandleKind::Eventfd => syscalls::eventfd::broker_eventfd_provider()
+                            .map(|provider| {
+                                syscalls::eventfd::EventFile::new_broker_backed(
+                                    provider,
+                                    broker_handle.handle_id,
+                                    litebox_common_linux::EfdFlags::empty(),
+                                )
+                            }),
+                        BrokerHandleKind::Pidfd => {
+                            syscalls::eventfd::broker_pidfd_provider().map(|provider| {
+                                syscalls::eventfd::EventFile::new_pidfd_broker_backed(
+                                    provider,
+                                    broker_handle.handle_id,
+                                    false,
+                                )
+                            })
+                        }
+                        BrokerHandleKind::Signalfd => None,
+                    };
                 let Some(event_file) = event_file else {
                     continue;
                 };
@@ -4051,8 +4045,7 @@ struct ForkContext {
     /// (entries dropped on `commit_delayed_fork` success). On
     /// failure path we drain this list and call `release` on each
     /// to undo the dup so the broker refcount returns to baseline.
-    fork_snapshot_broker_transit:
-        Vec<crate::syscalls::fork_snapshot::ForkSnapshotBrokerTransit>,
+    fork_snapshot_broker_transit: Vec<crate::syscalls::fork_snapshot::ForkSnapshotBrokerTransit>,
 }
 
 const SHELL_WRITE_SCAN_LEN: usize = 1024;

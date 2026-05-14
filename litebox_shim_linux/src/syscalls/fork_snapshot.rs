@@ -310,9 +310,8 @@ impl BrokerHandleKind {
 /// broker provider traits extend `BrokerSubscribable` which exposes
 /// `release(handle)`.
 pub struct ForkSnapshotBrokerTransit {
-    pub releaser: alloc::sync::Arc<
-        dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-    >,
+    pub releaser:
+        alloc::sync::Arc<dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable>,
     pub handle_id: u64,
     pub kind: BrokerHandleKind,
 }
@@ -1123,8 +1122,9 @@ impl FdMetadataSnapshot {
             0 => None,
             1 => {
                 let kind_byte = r.read_u8()?;
-                let kind = BrokerHandleKind::from_u8(kind_byte)
-                    .ok_or(SnapshotDeserializeError::InvalidEnum("BrokerHandleKind", kind_byte))?;
+                let kind = BrokerHandleKind::from_u8(kind_byte).ok_or(
+                    SnapshotDeserializeError::InvalidEnum("BrokerHandleKind", kind_byte),
+                )?;
                 let handle_id = r.read_u64()?;
                 Some(BrokerHandleSnapshot { kind, handle_id })
             }
