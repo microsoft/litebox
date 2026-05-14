@@ -168,6 +168,9 @@ impl<FS: ShimFS> Task<FS> {
     /// Resolve a path against the current working directory.
     fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
         let path_str = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
+        if path_str.is_empty() {
+            return Err(Errno::ENOENT);
+        }
         if path_str.starts_with('/') {
             CString::new(path_str.to_string()).map_err(|_| Errno::EINVAL)
         } else {
@@ -177,26 +180,48 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    /// Handle syscall `umask`
-    pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
-        let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
-        let old_mask = self
-            .fs
-            .borrow()
-            .umask
-            .swap(new_mask.bits(), Ordering::Relaxed);
-        Mode::from_bits_retain(old_mask)
+    /// Resolve a path relative to a dirfd.
+    ///
+    /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
+    fn resolve_path_at(&self, dirfd: i32, pathname: impl path::Arg) -> Result<CString, Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        match fs_path {
+            FsPath::Absolute { path } => Ok(path),
+            FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+            FsPath::FdRelative { fd: _, path: _ } => {
+                log_unsupported!("path resolution with FsPath::FdRelative");
+                Err(Errno::EINVAL)
+            }
+        }
     }
 
-    /// Handle syscall `open`
-    pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
-        let path = self.resolve_path(path)?;
+    fn do_open(
+        &self,
+        path: impl path::Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<FS>, Errno> {
         let mode = mode & !self.get_umask();
-        let file = self
-            .files
+        self.files
             .borrow()
             .fs
-            .open(path, flags - OFlags::CLOEXEC, mode)?;
+            .open(path, flags - OFlags::CLOEXEC, mode)
+            .map_err(Errno::from)
+    }
+
+    fn do_openat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<FS>, Errno> {
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        self.do_open(path, flags, mode)
+    }
+
+    fn insert_raw_file_fd(&self, file: TypedFd<FS>, flags: OFlags) -> Result<u32, Errno> {
         if flags.contains(OFlags::CLOEXEC) {
             let None = self
                 .global
@@ -215,6 +240,24 @@ impl<FS: ShimFS> Task<FS> {
         Ok(u32::try_from(raw_fd).unwrap())
     }
 
+    /// Handle syscall `umask`
+    pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
+        let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
+        let old_mask = self
+            .fs
+            .borrow()
+            .umask
+            .swap(new_mask.bits(), Ordering::Relaxed);
+        Mode::from_bits_retain(old_mask)
+    }
+
+    /// Handle syscall `open`
+    pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
+        let path = self.resolve_path(path)?;
+        let file = self.do_open(path, flags, mode)?;
+        self.insert_raw_file_fd(file, flags)
+    }
+
     /// Handle syscall `openat`
     pub fn sys_openat(
         &self,
@@ -223,20 +266,8 @@ impl<FS: ShimFS> Task<FS> {
         flags: OFlags,
         mode: Mode,
     ) -> Result<u32, Errno> {
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        match fs_path {
-            FsPath::Absolute { path } => self.sys_open(path, flags, mode),
-            FsPath::Cwd => self.sys_open(get_cwd(), flags, mode),
-            FsPath::Fd(_fd) => {
-                log_unsupported!("openat with FsPath::Fd");
-                Err(Errno::EINVAL)
-            }
-            FsPath::FdRelative { fd: _, path: _ } => {
-                log_unsupported!("openat with FsPath::FdRelative");
-                Err(Errno::EINVAL)
-            }
-        }
+        let file = self.do_openat(dirfd, pathname, flags, mode)?;
+        self.insert_raw_file_fd(file, flags)
     }
 
     /// Handle syscall `ftruncate`
@@ -278,13 +309,14 @@ impl<FS: ShimFS> Task<FS> {
         match file_type {
             InodeType::File => {
                 let mode = Mode::from_bits_truncate(mode_and_type & !FILE_TYPE_MASK);
-                let fd = self.sys_openat(
+                let file = self.do_openat(
                     dirfd,
                     pathname,
                     OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                     mode,
                 )?;
-                self.sys_close(fd.cast_signed())?;
+                let files = self.files.borrow();
+                let _ = files.fs.close(&file);
             }
             // TODO: Named pipe, socket, block and char files are not supported
             InodeType::NamedPipe
@@ -308,18 +340,11 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        match fs_path {
-            FsPath::Absolute { path } => {
-                if flags.contains(AtFlags::AT_REMOVEDIR) {
-                    self.files.borrow().fs.rmdir(path).map_err(Errno::from)
-                } else {
-                    self.files.borrow().fs.unlink(path).map_err(Errno::from)
-                }
-            }
-            FsPath::Cwd => Err(Errno::EINVAL),
-            FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
+        let path = self.resolve_path_at(dirfd, pathname)?;
+        if flags.contains(AtFlags::AT_REMOVEDIR) {
+            self.files.borrow().fs.rmdir(path).map_err(Errno::from)
+        } else {
+            self.files.borrow().fs.unlink(path).map_err(Errno::from)
         }
     }
 
@@ -779,18 +804,8 @@ impl<FS: ShimFS> Task<FS> {
         pathname: impl path::Arg,
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fspath = FsPath::new(dirfd, pathname, get_cwd)?;
-        let path = match fspath {
-            FsPath::Absolute { path } => {
-                self.do_readlink(path.to_str().map_err(|_| Errno::EINVAL)?)
-            }
-            FsPath::Cwd => {
-                let cwd = self.fs.borrow().cwd.read().clone();
-                self.do_readlink(&cwd)
-            }
-            FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
-        }?;
+        let pathname = self.resolve_path_at(dirfd, pathname)?;
+        let path = self.do_readlink(pathname.to_str().map_err(|_| Errno::EINVAL)?)?;
         let bytes = path.as_bytes();
         let min_len = core::cmp::min(buf.len(), bytes.len());
         buf[..min_len].copy_from_slice(&bytes[..min_len]);
@@ -1014,7 +1029,8 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<FileStat, Errno> {
         let current_support_flags = AtFlags::AT_EMPTY_PATH;
         if flags.contains(current_support_flags.complement()) {
-            todo!("unsupported flags");
+            log_unsupported!("unsupported flags: {flags:?}");
+            return Err(Errno::EINVAL);
         }
 
         let files = self.files.borrow();
@@ -1024,14 +1040,17 @@ impl<FS: ShimFS> Task<FS> {
             FsPath::Absolute { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
             }
-            FsPath::Cwd => files.fs.file_status(get_cwd())?.into(),
-            FsPath::Fd(fd) => {
-                let Ok(raw_fd) = usize::try_from(fd) else {
-                    return Err(Errno::EBADF);
-                };
-                descriptor_stat(raw_fd, self)?
+            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                files.fs.file_status(get_cwd())?.into()
             }
-            FsPath::FdRelative { .. } => todo!(),
+            FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                descriptor_stat(fd as usize, self)?
+            }
+            FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
+            FsPath::FdRelative { .. } => {
+                log_unsupported!("relative fstatat with AT_EMPTY_PATH unset is not supported yet");
+                return Err(Errno::EINVAL);
+            }
         };
         Ok(fstat)
     }
@@ -2268,6 +2287,75 @@ mod tests {
         let len = task.sys_getcwd(&mut buf).unwrap();
         let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
         assert_eq!(cwd, "/rel_parent/");
+    }
+
+    #[test]
+    fn mknodat_regular_file_does_not_consume_fd_limit() {
+        use litebox_common_linux::{Rlimit, RlimitResource};
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let old_limit = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
+        task.do_prlimit(
+            RlimitResource::NOFILE,
+            Some(Rlimit {
+                rlim_cur: 3,
+                rlim_max: old_limit.rlim_max,
+            }),
+        )
+        .unwrap();
+        let path = "/mknodat_at_fd_limit";
+
+        let result = task.sys_mknodat(
+            litebox_common_linux::AT_FDCWD,
+            path,
+            InodeType::File as u32 | (Mode::RUSR | Mode::WUSR).bits(),
+            0,
+        );
+
+        assert!(
+            task.sys_stat(path).is_ok(),
+            "mknodat created the file before returning {result:?}"
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn empty_pathnames_return_enoent() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        assert_eq!(
+            task.sys_open("", OFlags::RDONLY, Mode::empty())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(
+            task.sys_open("", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(task.sys_stat("").unwrap_err(), Errno::ENOENT);
+        assert_eq!(
+            task.sys_unlinkat(litebox_common_linux::AT_FDCWD, "", AtFlags::empty())
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(task.sys_mkdir("", 0o755).unwrap_err(), Errno::ENOENT);
+        assert_eq!(
+            task.sys_mknodat(
+                litebox_common_linux::AT_FDCWD,
+                "",
+                InodeType::File as u32 | Mode::RWXU.bits(),
+                0,
+            )
+            .unwrap_err(),
+            Errno::ENOENT
+        );
+        let mut buffer = [0u8; 16];
+        assert_eq!(
+            task.sys_readlinkat(litebox_common_linux::AT_FDCWD, "", &mut buffer)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
     }
 
     /// Verify every path-taking syscall resolves relative paths after `chdir`.

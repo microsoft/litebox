@@ -740,9 +740,8 @@ impl<
             .litebox
             .descriptor_table()
             .with_entry(fd, |descriptor| {
-                if !descriptor.entry.flags.contains(OFlags::RDONLY)
-                    && !descriptor.entry.flags.contains(OFlags::RDWR)
-                {
+                let access_mode = descriptor.entry.flags & (OFlags::WRONLY | OFlags::RDWR);
+                if access_mode == OFlags::WRONLY {
                     Err(ReadError::NotForReading)
                 } else {
                     Ok(Arc::clone(&descriptor.entry.entry))

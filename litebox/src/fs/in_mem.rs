@@ -195,14 +195,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             unimplemented!("{flags:?}")
         }
         let path = self.absolute_path(path)?;
-        let entry = if flags.contains(OFlags::CREAT) {
+        let (entry, created) = if flags.contains(OFlags::CREAT) {
             let mut root = self.root.write();
             let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
             if let Some(entry) = entry {
                 if flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
-                entry
+                (entry, false)
             } else {
                 let Some((_, parent)) = parent else {
                     // Only `/` does not have a parent; any other scenario (e.g., missing ancestor)
@@ -233,7 +233,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 })));
                 let old = root.entries.insert(path, entry.clone());
                 assert!(old.is_none());
-                entry
+                (entry, true)
             }
         } else {
             let root = self.root.read();
@@ -241,18 +241,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
             let Some(entry) = entry else {
                 return Err(PathError::NoSuchFileOrDirectory)?;
             };
-            entry
+            (entry, false)
         };
-        let read_allowed = if flags.contains(OFlags::RDONLY) || flags.contains(OFlags::RDWR) {
-            if !self.current_user.can_read(&entry.perms()) {
+        let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
+        let read_allowed = if access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR {
+            if !created && !self.current_user.can_read(&entry.perms()) {
                 return Err(OpenError::AccessNotAllowed);
             }
             true
         } else {
             false
         };
-        let write_allowed = if flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR) {
-            if !self.current_user.can_write(&entry.perms()) {
+        let write_allowed = if access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR {
+            if !created && !self.current_user.can_write(&entry.perms()) {
                 return Err(OpenError::AccessNotAllowed);
             }
             true

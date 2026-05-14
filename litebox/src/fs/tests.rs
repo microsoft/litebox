@@ -61,6 +61,58 @@ mod in_mem {
     }
 
     #[test]
+    fn write_only_open_does_not_require_read_permission() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to create /tmp");
+        });
+
+        let path = "/tmp/write_only";
+        let fd = fs
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::WUSR)
+            .expect("Failed to create write-only file");
+        fs.write(&fd, b"x", None).expect("Failed to write file");
+
+        let mut buffer = [0];
+        assert!(matches!(
+            fs.read(&fd, &mut buffer, None),
+            Err(crate::fs::errors::ReadError::NotForReading)
+        ));
+        fs.close(&fd).expect("Failed to close file");
+
+        assert!(matches!(
+            fs.open(path, OFlags::RDONLY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::AccessNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn newly_created_file_does_not_require_its_own_permissions() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to create /tmp");
+        });
+
+        let path = "/tmp/zero_mode";
+        let fd = fs
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::empty())
+            .expect("Failed to create zero-mode file");
+        fs.write(&fd, b"x", None).expect("Failed to write file");
+        fs.close(&fd).expect("Failed to close file");
+
+        let status = fs.file_status(path).expect("Failed to stat file");
+        assert_eq!(status.mode, Mode::empty());
+        assert!(matches!(
+            fs.open(path, OFlags::WRONLY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::AccessNotAllowed)
+        ));
+    }
+
+    #[test]
     fn root_directory_creation_and_removal() {
         let litebox = LiteBox::new(MockPlatform::new());
 
