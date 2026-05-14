@@ -252,8 +252,16 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 )
             }
             BrokerHandleKind::Pidfd => {
-                let provider = syscalls::eventfd::broker_pidfd_provider().ok_or(())?;
-                syscalls::eventfd::EventFile::new_pidfd_broker_backed(provider, handle_id, false)
+                let target_pid =
+                    litebox::process::ProcessId(u32::try_from(handle_id).map_err(|_| ())?);
+                let subscription =
+                    syscalls::guest_pid::try_subscribe_broker_process_exit(target_pid).ok_or(())?;
+                syscalls::eventfd::EventFile::new_broker_process_pidfd(
+                    target_pid,
+                    subscription,
+                    false,
+                    None,
+                )
             }
             BrokerHandleKind::Signalfd | BrokerHandleKind::Pty => return Err(()),
         };
@@ -1283,12 +1291,17 @@ impl<FS: ShimFS> LinuxShim<FS> {
                                 )
                             }),
                         BrokerHandleKind::Pidfd => {
-                            syscalls::eventfd::broker_pidfd_provider().map(|provider| {
-                                syscalls::eventfd::EventFile::new_pidfd_broker_backed(
-                                    provider,
-                                    broker_handle.handle_id,
-                                    false,
-                                )
+                            u32::try_from(broker_handle.handle_id).ok().and_then(|pid| {
+                                let target_pid = litebox::process::ProcessId(pid);
+                                syscalls::guest_pid::try_subscribe_broker_process_exit(target_pid)
+                                    .map(|subscription| {
+                                        syscalls::eventfd::EventFile::new_broker_process_pidfd(
+                                            target_pid,
+                                            subscription,
+                                            false,
+                                            None,
+                                        )
+                                    })
                             })
                         }
                         BrokerHandleKind::Signalfd | BrokerHandleKind::Pty => None,
