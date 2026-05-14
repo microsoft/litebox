@@ -21,22 +21,26 @@
 
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
 use crate::eventfd_state::{EventfdError, EventfdState};
+use crate::pipe_state::{PipeEndKind, PipeError, PipeState};
 use crate::process_state::ProcessState;
 use crate::signalfd_state::SignalfdState;
 use crate::state_registry::{BrokerStateRegistry, StateHandle, StateRegistryError};
 use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use litebox_common_linux::fd_token_protocol::{
-    Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
-    build_create_pidfd_response_ok, build_create_signalfd_response_ok, build_error_response,
+    Frame, Opcode, OwnedFrame, StatusCode, build_close_pipe_end_response_ok,
+    build_create_eventfd_response_ok, build_create_pidfd_response_ok,
+    build_create_pipe_response_ok, build_create_signalfd_response_ok, build_error_response,
     build_mark_process_exited_response_ok, build_pidfd_exited_response_ok,
-    build_read_eventfd_response_ok, build_read_siginfo_response_ok,
+    build_read_eventfd_response_ok, build_read_pipe_response_ok, build_read_siginfo_response_ok,
     build_register_notification_ring_response_ok, build_register_process_response_ok,
     build_release_response_ok, build_subscribe_eventfd_response_ok,
-    build_subscribe_process_exit_response_ok, build_unsubscribe_response_ok,
-    build_write_eventfd_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
-    parse_create_signalfd_body, parse_handle_body, parse_mark_process_exited_body,
-    parse_pidfd_exited_request, parse_subscribe_eventfd_body, parse_subscribe_process_exit_body,
-    parse_unsubscribe_body, parse_write_eventfd_body,
+    build_subscribe_pipe_response_ok, build_subscribe_process_exit_response_ok,
+    build_unsubscribe_response_ok, build_write_eventfd_response_ok, build_write_pipe_response_ok,
+    parse_close_pipe_end_body, parse_create_eventfd_body, parse_create_pidfd_body,
+    parse_create_pipe_body, parse_create_signalfd_body, parse_handle_body,
+    parse_mark_process_exited_body, parse_pidfd_exited_request, parse_read_pipe_body,
+    parse_subscribe_eventfd_body, parse_subscribe_pipe_body, parse_subscribe_process_exit_body,
+    parse_unsubscribe_body, parse_write_eventfd_body, parse_write_pipe_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -83,6 +87,11 @@ pub fn handle_request(
         Opcode::ReadEventfd => handle_read_eventfd(registry, request, in_fds),
         Opcode::WriteEventfd => handle_write_eventfd(registry, request, in_fds),
         Opcode::CreateSignalfd => handle_create_signalfd(registry, request, in_fds),
+        Opcode::CreatePipe => handle_create_pipe(registry, request, in_fds),
+        Opcode::ReadPipe => handle_read_pipe(registry, request, in_fds),
+        Opcode::WritePipe => handle_write_pipe(registry, request, in_fds),
+        Opcode::SubscribePipe => handle_subscribe_pipe(registry, conn, request, in_fds),
+        Opcode::ClosePipeEnd => handle_close_pipe_end(registry, request, in_fds),
         Opcode::ReadSiginfo => handle_read_siginfo(registry, request, in_fds),
         Opcode::SubscribeEventfd => handle_subscribe_eventfd(registry, conn, request, in_fds),
         Opcode::Unsubscribe => handle_unsubscribe(registry, request, in_fds),
@@ -407,6 +416,187 @@ fn handle_write_eventfd(
         Err(EventfdError::InvalidWriteValue(_)) => {
             status_err(Opcode::WriteEventfdResponse, StatusCode::InvalidValue)
         }
+    }
+}
+
+fn handle_create_pipe(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::CreatePipeResponse);
+    }
+    let (capacity, atomic) = match parse_create_pipe_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::CreatePipeResponse),
+    };
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return protocol_err(Opcode::CreatePipeResponse);
+    };
+    let Ok(atomic) = usize::try_from(atomic) else {
+        return protocol_err(Opcode::CreatePipeResponse);
+    };
+    let state = PipeState::new(capacity, atomic);
+    let handle = registry.register(state);
+    HandlerResult {
+        frame: build_create_pipe_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn resolve_pipe(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+) -> Result<Arc<dyn crate::state_registry::StateObject>, StatusCode> {
+    match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Pipe) {
+        Ok(s) => Ok(s),
+        Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
+        Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
+        Err(_) => Err(StatusCode::Internal),
+    }
+}
+
+fn handle_read_pipe(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::ReadPipeResponse);
+    }
+    let (handle_id, max_len) = match parse_read_pipe_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::ReadPipeResponse),
+    };
+    let Ok(max_len) = usize::try_from(max_len) else {
+        return protocol_err(Opcode::ReadPipeResponse);
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::ReadPipeResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match pipe.read(max_len) {
+        Ok(bytes) => HandlerResult {
+            frame: build_read_pipe_response_ok(&bytes),
+            out_fd: None,
+        },
+        Err(PipeError::WouldBlock) => status_err(Opcode::ReadPipeResponse, StatusCode::WouldBlock),
+        Err(_) => status_err(Opcode::ReadPipeResponse, StatusCode::InvalidValue),
+    }
+}
+
+fn handle_write_pipe(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::WritePipeResponse);
+    }
+    let (handle_id, bytes) = match parse_write_pipe_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::WritePipeResponse),
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::WritePipeResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match pipe.write(&bytes) {
+        Ok(n) => HandlerResult {
+            frame: build_write_pipe_response_ok(n as u64),
+            out_fd: None,
+        },
+        Err(PipeError::WouldBlock) => status_err(Opcode::WritePipeResponse, StatusCode::WouldBlock),
+        Err(PipeError::PeerClosed) => {
+            status_err(Opcode::WritePipeResponse, StatusCode::InvalidValue)
+        }
+        Err(_) => status_err(Opcode::WritePipeResponse, StatusCode::Internal),
+    }
+}
+
+fn handle_subscribe_pipe(
+    registry: &BrokerStateRegistry,
+    conn: &ConnState,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SubscribePipeResponse);
+    }
+    let (handle_id, subscription_id, events_mask, end) =
+        match parse_subscribe_pipe_body(request.body) {
+            Ok(t) => t,
+            Err(_) => return protocol_err(Opcode::SubscribePipeResponse),
+        };
+    let Some(end) = PipeEndKind::from_u8(end) else {
+        return protocol_err(Opcode::SubscribePipeResponse);
+    };
+    let Some(sender) = conn.notification_sender.as_ref().cloned() else {
+        return status_err(
+            Opcode::SubscribePipeResponse,
+            StatusCode::NoNotificationRing,
+        );
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::SubscribePipeResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match pipe.subscribe_end(end, subscription_id, events_mask, sender) {
+        Ok(()) => HandlerResult {
+            frame: build_subscribe_pipe_response_ok(),
+            out_fd: None,
+        },
+        Err(SubscribeError::DuplicateId(_)) => status_err(
+            Opcode::SubscribePipeResponse,
+            StatusCode::DuplicateSubscription,
+        ),
+        Err(SubscribeError::UnknownEventBits { .. }) => protocol_err(Opcode::SubscribePipeResponse),
+    }
+}
+
+fn handle_close_pipe_end(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::ClosePipeEndResponse);
+    }
+    let (handle_id, end) = match parse_close_pipe_end_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::ClosePipeEndResponse),
+    };
+    let Some(end) = PipeEndKind::from_u8(end) else {
+        return protocol_err(Opcode::ClosePipeEndResponse);
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::ClosePipeEndResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match end {
+        PipeEndKind::Read => pipe.decref_read_end(),
+        PipeEndKind::Write => pipe.decref_write_end(),
+    }
+    HandlerResult {
+        frame: build_close_pipe_end_response_ok(),
+        out_fd: None,
     }
 }
 

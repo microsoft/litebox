@@ -24,14 +24,17 @@
 
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, StatusCode,
-    build_create_eventfd_request, build_create_pidfd_request, build_create_signalfd_request,
-    build_mark_process_exited_request, build_materialize_request, build_pidfd_exited_request,
-    build_read_eventfd_request, build_read_siginfo_request,
+    build_close_pipe_end_request, build_create_eventfd_request, build_create_pidfd_request,
+    build_create_pipe_request, build_create_signalfd_request, build_mark_process_exited_request,
+    build_materialize_request, build_pidfd_exited_request, build_read_eventfd_request,
+    build_read_pipe_request, build_read_siginfo_request,
     build_register_notification_ring_request, build_register_process_request,
     build_register_request, build_release_request, build_subscribe_eventfd_request,
-    build_subscribe_process_exit_request, build_unsubscribe_request, build_write_eventfd_request,
-    decode, parse_create_pidfd_response_ok, parse_handle_body, parse_pidfd_exited_response_ok,
+    build_subscribe_pipe_request, build_subscribe_process_exit_request, build_unsubscribe_request,
+    build_write_eventfd_request, build_write_pipe_request, decode, parse_create_pidfd_response_ok,
+    parse_handle_body, parse_pidfd_exited_response_ok, parse_read_pipe_response_body,
     parse_read_siginfo_response_body, parse_subscribe_process_exit_response_ok,
+    parse_write_pipe_response_ok,
 };
 use std::format;
 use std::io;
@@ -441,6 +444,125 @@ impl FdTokenClient {
                 .map(Some)
                 .map_err(ClientError::Protocol),
             StatusCode::WouldBlock => Ok(None),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    /// Asks the broker to create a pipe state. The returned handle starts
+    /// with one read-end ref and one write-end ref.
+    pub fn create_pipe(&self, capacity: u64, atomic_write_size: u64) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_create_pipe_request(capacity, atomic_write_size),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::CreatePipeResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_handle_body(resp.body, resp.opcode).map_err(ClientError::Protocol)
+            }
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    pub fn read_pipe(&self, handle_id: u64, max_len: u64) -> Result<Vec<u8>, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_read_pipe_request(handle_id, max_len), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::ReadPipeResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_read_pipe_response_body(resp.body).map_err(ClientError::Protocol)
+            }
+            StatusCode::WouldBlock => Err(ClientError::WouldBlock),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn write_pipe(&self, handle_id: u64, bytes: &[u8]) -> Result<usize, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_write_pipe_request(handle_id, bytes), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::WritePipeResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_write_pipe_response_ok(resp.body)
+                .map(|n| n as usize)
+                .map_err(ClientError::Protocol),
+            StatusCode::WouldBlock => Err(ClientError::WouldBlock),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: 0 }),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn subscribe_pipe(
+        &self,
+        handle_id: u64,
+        subscription_id: u64,
+        events_mask: u32,
+        end: u8,
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_subscribe_pipe_request(handle_id, subscription_id, events_mask, end),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::SubscribePipeResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::DuplicateSubscription => {
+                Err(ClientError::DuplicateSubscription(subscription_id))
+            }
+            StatusCode::NoNotificationRing => Err(ClientError::NoNotificationRing),
+            StatusCode::SubsystemMismatch => Err(ClientError::SubsystemMismatch),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn close_pipe_end(&self, handle_id: u64, end: u8) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_close_pipe_end_request(handle_id, end), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::ClosePipeEndResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }

@@ -365,6 +365,11 @@ pub fn handle_control_connection(
                     | Opcode::WriteEventfd
                     | Opcode::CreateSignalfd
                     | Opcode::ReadSiginfo
+                    | Opcode::CreatePipe
+                    | Opcode::ReadPipe
+                    | Opcode::WritePipe
+                    | Opcode::SubscribePipe
+                    | Opcode::ClosePipeEnd
                     | Opcode::SubscribeEventfd
                     | Opcode::DupHandle => {
                         // State-object opcodes: route to state_service on the fd-state registry.
