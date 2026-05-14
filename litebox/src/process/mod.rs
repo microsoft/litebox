@@ -336,6 +336,8 @@ pub enum CreateProcessError {
     NoSuchParent,
     /// A root (init) process already exists; only one is allowed.
     InitAlreadyExists,
+    /// `create_process_with_id` was called with a pid already in the registry.
+    PidAlreadyExists,
 }
 
 /// Errors from [`ProcessRegistry::set_pgid`].
@@ -509,26 +511,54 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         exit_signal: i32,
     ) -> Result<ProcessId, CreateProcessError> {
         let raw = self.next_pid.fetch_add(1, Ordering::Relaxed);
-        let new_pid = ProcessId(raw);
+        self.create_process_with_id(ProcessId(raw), parent, exit_signal)
+    }
 
+    /// Like [`create_process`], but uses an explicit, externally-allocated
+    /// `pid` rather than the per-registry monotonic counter.
+    ///
+    /// Used by the shim's fork path when a broker-hosted pid allocator
+    /// (`broker.RegisterProcess`) is available — every guest pid then
+    /// comes from the broker, so two shims that fork concurrently never
+    /// collide. Also keeps `next_pid` ahead of `pid` so future
+    /// counter-allocated pids don't clash with broker-allocated ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CreateProcessError::NoSuchParent`] if `parent` is `Some` but
+    /// the parent PID is not in the registry,
+    /// [`CreateProcessError::InitAlreadyExists`] if `parent` is `None` and a
+    /// root process already exists, or
+    /// [`CreateProcessError::PidAlreadyExists`] if `pid` is already in the
+    /// registry (e.g., a same-shim sibling has it).
+    pub fn create_process_with_id(
+        &self,
+        pid: ProcessId,
+        parent: Option<ProcessId>,
+        exit_signal: i32,
+    ) -> Result<ProcessId, CreateProcessError> {
         let mut table = self.table.write();
+
+        if table.contains_key(&pid) {
+            return Err(CreateProcessError::PidAlreadyExists);
+        }
 
         let (pgid, sid) = if let Some(parent_pid) = parent {
             let parent_entry = table
                 .get_mut(&parent_pid)
                 .ok_or(CreateProcessError::NoSuchParent)?;
-            parent_entry.children.push(new_pid);
+            parent_entry.children.push(pid);
             (parent_entry.context.pgid, parent_entry.context.sid)
         } else {
             if table.values().any(|e| e.context.parent.is_none()) {
                 return Err(CreateProcessError::InitAlreadyExists);
             }
-            (ProcessGroupId::from(new_pid), SessionId::from(new_pid))
+            (ProcessGroupId::from(pid), SessionId::from(pid))
         };
 
         let entry = ProcessEntry {
             context: ProcessContext {
-                id: new_pid,
+                id: pid,
                 parent,
                 pgid,
                 sid,
@@ -541,10 +571,19 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             exit_subject: Arc::new(Subject::new()),
         };
 
-        let prev = table.insert(new_pid, entry);
-        debug_assert!(prev.is_none(), "PID collision: {}", new_pid.0);
+        let prev = table.insert(pid, entry);
+        debug_assert!(prev.is_none(), "PID collision: {}", pid.0);
 
-        Ok(new_pid)
+        // Keep next_pid ahead of any externally-allocated pid so subsequent
+        // counter-allocated `create_process` calls don't collide.
+        let next = pid.0.saturating_add(1);
+        let _ = self
+            .next_pid
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if cur < next { Some(next) } else { None }
+            });
+
+        Ok(pid)
     }
 
     /// Remove a process that was never started (e.g., fork setup failed).

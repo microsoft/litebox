@@ -2258,22 +2258,62 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        // 1. Register child process in the core ProcessRegistry.
+        // 1. Allocate the child's pid.
+        //
+        // Phase K: in production (broker-hosted GuestPidProvider
+        // installed), every guest pid comes from the broker so:
+        // - ProcessId is globally unique across all shim instances by
+        //   construction; coord's "pid 2" and dpg1's "pid 2" cannot
+        //   collide.
+        // - Phase B.2's broker-only `sys_pidfd_open` always finds the
+        //   pid in the broker's process registry.
+        // - cross-worker waitpid identity is unambiguous.
+        //
+        // Without a broker provider (single-worker test scenarios),
+        // fall back to the per-shim `next_pid` counter via the legacy
+        // `create_process`.
         let exit_signal = i32::try_from(args.exit_signal).map_err(|_| Errno::EINVAL)?;
-        let child_process_id = self
-            .global
-            .litebox
-            .process_registry()
-            .create_process(Some(self.process_id), exit_signal)
-            .map_err(|_| {
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[FORK] pid={}: create_process failed (ENOMEM)",
-                    self.pid,
-                );
-                Errno::ENOMEM
-            })?;
+        let broker_pid_opt = crate::syscalls::guest_pid::try_register_broker_guest_pid();
+        let child_process_id = match broker_pid_opt {
+            Some(broker_pid) => {
+                let pid = litebox::process::ProcessId(broker_pid);
+                self.global
+                    .litebox
+                    .process_registry()
+                    .create_process_with_id(pid, Some(self.process_id), exit_signal)
+                    .map_err(|err| {
+                        #[cfg(feature = "trace_syscalls")]
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[FORK] pid={}: create_process_with_id({}) failed: {:?}",
+                            self.pid,
+                            broker_pid,
+                            err,
+                        );
+                        let _ = err;
+                        // The broker handed us a pid we can't register
+                        // locally (e.g. PidAlreadyExists collision).
+                        // Release the broker pid so it isn't leaked.
+                        crate::syscalls::guest_pid::try_release_broker_guest_pid(broker_pid);
+                        Errno::ENOMEM
+                    })?;
+                pid
+            }
+            None => self
+                .global
+                .litebox
+                .process_registry()
+                .create_process(Some(self.process_id), exit_signal)
+                .map_err(|_| {
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FORK] pid={}: create_process failed (ENOMEM)",
+                        self.pid,
+                    );
+                    Errno::ENOMEM
+                })?,
+        };
 
         // 2. Fork address space: allocate a VA partition for the child.
         let parent_as_id = self.process_state.borrow().address_space_id;
@@ -2328,35 +2368,24 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(not(target_arch = "x86_64"))]
         let delayed_fork = false;
 
-        // 3. Allocate a TID for the child.
-        //
-        // PID allocation strategy: if a broker-hosted `GuestPidProvider`
-        // is installed (multi-worker mode with fd-token broker), allocate
-        // a globally-unique pid via the broker so cross-worker forks
-        // cannot collide with the migrated init's `--guest-pid` (the
-        // root cause of the PIDUNIQ.cross_bt_* failures). If no provider
-        // is available (single-worker scenarios), fall back to using the
-        // per-shim `ProcessId.0` as the pid — preserves existing
-        // behaviour where no migration occurs and collisions are
-        // impossible.
+        // 3. Derive the guest pid from the child's ProcessId. Phase K:
+        // `ProcessId.0` is the broker-allocated pid (when a provider is
+        // installed) or the per-shim counter pid (test scenarios) —
+        // either way, it's THE pid for this child. The legacy split
+        // between "internal ProcessId" and "external guest pid" went
+        // away with Phase K.
         //
         // The TID for the initial thread is set equal to the pid, matching
         // Linux's `tgid == pid` invariant for a process's leader thread.
-        let child_pid_u32 = match crate::syscalls::guest_pid::try_register_broker_guest_pid() {
-            Some(broker_pid) => broker_pid,
-            None => u32::try_from(child_process_id.0).map_err(|_| {
-                self.global
-                    .litebox
-                    .process_registry()
-                    .remove_process(child_process_id);
-                Errno::EAGAIN
-            })?,
-        };
+        let child_pid_u32 = child_process_id.0;
         let child_pid = i32::try_from(child_pid_u32).map_err(|_| {
             self.global
                 .litebox
                 .process_registry()
                 .remove_process(child_process_id);
+            if let Some(broker_pid) = broker_pid_opt {
+                crate::syscalls::guest_pid::try_release_broker_guest_pid(broker_pid);
+            }
             Errno::EAGAIN
         })?;
         let child_initial_tid = child_pid;

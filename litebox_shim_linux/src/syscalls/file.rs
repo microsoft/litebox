@@ -4542,7 +4542,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // TODO(Phase C.4): re-enable after Phase K routes forks through broker.RegisterProcess so sys_pidfd_open works for locally-forked children.
+        let eager_broker = false; // Phase K Step 1 in; still gated off — subscribe_process_exit(forked pid) returns Io, needs Phase K Step 2 (init via broker too).
         if eager_broker
             && let Some(provider) = super::broker_pipe::broker_pipe_provider()
         {
