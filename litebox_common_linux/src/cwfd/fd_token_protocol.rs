@@ -123,6 +123,11 @@ pub enum Opcode {
     DupHandle = 0x15,
     CreatePidfd = 0x20,
     PidfdExited = 0x21,
+    /// Broker-hosted process registration. Allocates a globally-
+    /// unique guest pid in the broker's `process_registry`. The
+    /// response carries the new pid as a `StateHandle` id (low 32
+    /// bits are the Linux pid). Phase 1: empty request body.
+    RegisterProcess = 0x70,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -138,6 +143,7 @@ pub enum Opcode {
     DupHandleResponse = 0x95,
     CreatePidfdResponse = 0xA0,
     PidfdExitedResponse = 0xA1,
+    RegisterProcessResponse = 0xF0,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -157,6 +163,10 @@ pub mod opcode_ranges {
     /// Signalfd state (P2.C): create / read-siginfo / subscribe.
     pub const SIGNALFD_BASE: u8 = 0x40;
     pub const SIGNALFD_RESPONSE_BASE: u8 = 0xC0;
+
+    /// Process state (Phase 1 of process-registry rework): registration.
+    pub const PROCESS_BASE: u8 = 0x70;
+    pub const PROCESS_RESPONSE_BASE: u8 = 0xF0;
 }
 
 impl Opcode {
@@ -178,6 +188,7 @@ impl Opcode {
             Opcode::DupHandle => Some(Opcode::DupHandleResponse),
             Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
             Opcode::PidfdExited => Some(Opcode::PidfdExitedResponse),
+            Opcode::RegisterProcess => Some(Opcode::RegisterProcessResponse),
             _ => None,
         }
     }
@@ -200,6 +211,7 @@ impl Opcode {
                 | Opcode::DupHandle
                 | Opcode::CreatePidfd
                 | Opcode::PidfdExited
+                | Opcode::RegisterProcess
         )
     }
 
@@ -237,6 +249,7 @@ impl TryFrom<u8> for Opcode {
             0x15 => Ok(Opcode::DupHandle),
             0x20 => Ok(Opcode::CreatePidfd),
             0x21 => Ok(Opcode::PidfdExited),
+            0x70 => Ok(Opcode::RegisterProcess),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -251,6 +264,7 @@ impl TryFrom<u8> for Opcode {
             0x95 => Ok(Opcode::DupHandleResponse),
             0xA0 => Ok(Opcode::CreatePidfdResponse),
             0xA1 => Ok(Opcode::PidfdExitedResponse),
+            0xF0 => Ok(Opcode::RegisterProcessResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -545,6 +559,24 @@ pub fn build_release_response_ok() -> OwnedFrame {
         opcode: Opcode::ReleaseResponse,
         status: StatusCode::Ok,
         body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::RegisterProcess`]: empty (allocates a fresh pid).
+pub fn build_register_process_request() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::RegisterProcess,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::RegisterProcessResponse`]: handle id (= pid as u64).
+pub fn build_register_process_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::RegisterProcessResponse,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
     }
 }
 

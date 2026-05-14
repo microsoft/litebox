@@ -24,6 +24,7 @@ pub mod broker_signalfd_provider;
 pub mod broker_subscribable;
 pub mod fd_token_protocol;
 pub mod fd_transfer_frame;
+pub mod guest_pid_provider;
 pub mod notification_frame;
 
 #[cfg(all(feature = "std", unix))]

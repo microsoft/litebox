@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Filesystem and pipe-lifecycle special-case argv leaves.
+//! Filesystem and pipe-lifecycle special-case argv leaves, and CWF.*
+//! (cross-worker file I/O) tests.
 
 use super::*;
 
@@ -579,6 +580,504 @@ pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
                     }
                 );
             }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CWF: cross-worker file I/O
+// ═══════════════════════════════════════════════════════════════════
+
+/// Agents exercised by cross-worker-file tests.
+const CWF_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CrossWorkerFileArgs {
+    mode: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CwfOut {
+    detail: String,
+}
+
+const CROSS_WORKER_FILE: HandlerToken<CrossWorkerFileArgs, CwfOut> =
+    HandlerToken::new("platform_fixes.cross_worker_file");
+
+async fn handle_cross_worker_file(
+    args: CrossWorkerFileArgs,
+    ctx: &mut HandlerCtx<'_>,
+) -> Result<CwfOut, HandlerError> {
+    use std::io::Write;
+    let keep_open = args.mode == "write-and-hold";
+    let checkpoint = keep_open || args.mode == "write-and-sleep";
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&args.path)
+        .map_err(|e| HandlerError::from(format!("open {}: {e}", args.path)))?;
+    for i in 0..5 {
+        writeln!(f, "line{i}").map_err(|e| HandlerError::from(format!("write: {e}")))?;
+    }
+    f.flush()
+        .map_err(|e| HandlerError::from(format!("flush: {e}")))?;
+    if !keep_open {
+        drop(f);
+    }
+    if checkpoint {
+        ctx.checkpoint("cross-worker-file-ready").await?;
+    }
+    Ok(CwfOut {
+        detail: "[cross-worker-file] READY".into(),
+    })
+}
+
+/// Argv-dispatched leaf: writes lines to a file, optionally holding the fd open.
+///
+/// Lives as a leaf subcommand because the `CWF.redirect_stdout` variant spawns
+/// the binary via `bash -c "{exe} cross-worker-file write-stdout > {path} &"`,
+/// where stdout must be the write-fd rather than the agent protocol pipe.
+fn subcmd_cross_worker_file(args: &[String]) -> i32 {
+    use std::io::Write;
+    let sub = args.get(2).map_or("", String::as_str);
+    if sub == "write-and-sleep" || sub == "write-and-exit" || sub == "write-and-hold" {
+        let path = args.get(3).map_or("/tmp/cwf.log", String::as_str);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        for i in 0..5 {
+            writeln!(f, "line{i}").unwrap();
+        }
+        f.flush().unwrap();
+        eprintln!("[cross-worker-file] READY");
+        if sub == "write-and-hold" {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            drop(f);
+        } else {
+            drop(f);
+            if sub == "write-and-sleep" {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+        }
+        return 0;
+    }
+    if sub == "write-stdout" {
+        for i in 0..5 {
+            println!("line{i}");
+        }
+        std::io::stdout().flush().unwrap();
+        eprintln!("[cross-worker-file] READY");
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        return 0;
+    }
+    1
+}
+
+fn register_cwf_handlers() {
+    crate::register_handler!(CROSS_WORKER_FILE, handle_cross_worker_file);
+    crate::register_leaf_subcommand!("cross-worker-file", subcmd_cross_worker_file);
+}
+
+/// Register CWF.* (cross-worker file I/O) tests.
+#[allow(clippy::too_many_lines)]
+pub(super) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
+    use super::super::matrix::{
+        EXEC, EXEC_READY, ExecArgs, ExecReadyArgs, FS_DELETE, FS_READ, FsPathArgs, KILL, KillArgs,
+    };
+    register_cwf_handlers();
+    for &agent in CWF_AGENTS {
+        let agent_s = agent.to_string();
+
+        // CWF.seq: child writes, exits, parent reads.
+        {
+            let a = agent_s.clone();
+            reg.test("xworker", "cross_worker_file", format!("CWF.seq.{agent}"))
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("CrossWorkerFileSeq_{agent}"),
+                        SpawnKind::Fork {
+                            binary: "self",
+                            inherit_listen_ports: vec![],
+                        },
+                    );
+                    Box::new(move |run| {
+                        let a = a.clone();
+                        Box::pin(async move {
+                            let path = format!("/shared/cwf-seq-{a}.txt");
+                            let result = run
+                                .run_leaf(
+                                    &leaf,
+                                    &CROSS_WORKER_FILE,
+                                    CrossWorkerFileArgs {
+                                        mode: "write-and-exit".into(),
+                                        path: path.clone(),
+                                    },
+                                )
+                                .await;
+                            if let Err(e) = result {
+                                return crate::coordinator::TestOutcome::new(&a, false, e);
+                            }
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &FS_READ,
+                                    FsPathArgs { path: path.clone() },
+                                )
+                                .await;
+                            let pass = matches!(
+                                &resp,
+                                Response::Ok { data: Some(d) } if d.starts_with("line0")
+                            );
+                            crate::coordinator::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                        })
+                    })
+                });
+        }
+
+        // CWF.concurrent: child writes, closes fd, stays alive, parent reads.
+        {
+            let a = agent_s.clone();
+            reg.test(
+                "xworker",
+                "cross_worker_file",
+                format!("CWF.concurrent.{agent}"),
+            )
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                let leaf = cx.declare_ephemeral(
+                    agent,
+                    format!("CrossWorkerFileConcurrent_{agent}"),
+                    SpawnKind::Fork {
+                        binary: "self",
+                        inherit_listen_ports: vec![],
+                    },
+                );
+                Box::new(move |run| {
+                    let a = a.clone();
+                    Box::pin(async move {
+                        let path = format!("/shared/cwf-conc-{a}.txt");
+                        if let Err(e) = run
+                            .run_leaf_write(
+                                &leaf,
+                                &CROSS_WORKER_FILE,
+                                CrossWorkerFileArgs {
+                                    mode: "write-and-sleep".into(),
+                                    path: path.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            return crate::coordinator::TestOutcome::new(&a, false, e);
+                        }
+                        if let Err(e) = run
+                            .run_leaf_read_checkpoint(&leaf, "cross-worker-file-ready")
+                            .await
+                        {
+                            return crate::coordinator::TestOutcome::new(&a, false, e);
+                        }
+                        let resp = run
+                            .typed_or_error(&handle, &FS_READ, FsPathArgs { path: path.clone() })
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            Response::Ok { data: Some(d) } if d.starts_with("line0")
+                        );
+                        let _ = run.run_leaf_resume(&leaf, "cross-worker-file-ready").await;
+                        let _ = run.run_leaf_read_result(&leaf, &CROSS_WORKER_FILE).await;
+                        let _ = run.run_leaf_exit(&leaf).await;
+                        crate::coordinator::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                    })
+                })
+            });
+        }
+
+        // CWF.hold: child writes, keeps fd OPEN, parent reads.
+        {
+            let a = agent_s.clone();
+            reg.test("xworker", "cross_worker_file", format!("CWF.hold.{agent}"))
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("CrossWorkerFileHold_{agent}"),
+                        SpawnKind::Fork {
+                            binary: "self",
+                            inherit_listen_ports: vec![],
+                        },
+                    );
+                    Box::new(move |run| {
+                        let a = a.clone();
+                        Box::pin(async move {
+                            let path = format!("/shared/cwf-hold-{a}.txt");
+                            let started = run
+                                .run_leaf_write(
+                                    &leaf,
+                                    &CROSS_WORKER_FILE,
+                                    CrossWorkerFileArgs {
+                                        mode: "write-and-hold".into(),
+                                        path: path.clone(),
+                                    },
+                                )
+                                .await;
+                            if let Err(e) = started {
+                                return crate::coordinator::TestOutcome::new(&a, false, e);
+                            }
+                            if let Err(e) = run
+                                .run_leaf_read_checkpoint(&leaf, "cross-worker-file-ready")
+                                .await
+                            {
+                                return crate::coordinator::TestOutcome::new(&a, false, e);
+                            }
+                            let resp = run
+                                .typed_or_error(
+                                    &handle,
+                                    &FS_READ,
+                                    FsPathArgs { path: path.clone() },
+                                )
+                                .await;
+                            let pass = matches!(
+                                &resp,
+                                Response::Ok { data: Some(d) } if d.starts_with("line0")
+                            );
+                            let _ = run.run_leaf_resume(&leaf, "cross-worker-file-ready").await;
+                            let _ = run.run_leaf_read_result(&leaf, &CROSS_WORKER_FILE).await;
+                            let _ = run.run_leaf_exit(&leaf).await;
+                            crate::coordinator::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                        })
+                    })
+                });
+        }
+
+        // CWF.self_open: child opens file itself (no inherited fd).
+        {
+            let a = agent_s.clone();
+            reg.test(
+                "xworker",
+                "cross_worker_file",
+                format!("CWF.self_open.{agent}"),
+            )
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                let leaf = cx.declare_ephemeral(
+                    agent,
+                    format!("CrossWorkerFileSelfOpen_{agent}"),
+                    SpawnKind::Fork {
+                        binary: "self",
+                        inherit_listen_ports: vec![],
+                    },
+                );
+                Box::new(move |run| {
+                    let a = a.clone();
+                    Box::pin(async move {
+                        let path = format!("/shared/cwf-self-{a}.txt");
+                        let _ = run
+                            .typed_or_error(&handle, &FS_DELETE, FsPathArgs { path: path.clone() })
+                            .await;
+                        if let Err(e) = run
+                            .run_leaf_write(
+                                &leaf,
+                                &CROSS_WORKER_FILE,
+                                CrossWorkerFileArgs {
+                                    mode: "write-and-hold".into(),
+                                    path: path.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            return crate::coordinator::TestOutcome::new(&a, false, e);
+                        }
+                        if let Err(e) = run
+                            .run_leaf_read_checkpoint(&leaf, "cross-worker-file-ready")
+                            .await
+                        {
+                            return crate::coordinator::TestOutcome::new(&a, false, e);
+                        }
+                        let resp = run
+                            .typed_or_error(&handle, &FS_READ, FsPathArgs { path: path.clone() })
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            Response::Ok { data: Some(d) } if d.starts_with("line0")
+                        );
+                        let _ = run.run_leaf_resume(&leaf, "cross-worker-file-ready").await;
+                        let _ = run.run_leaf_read_result(&leaf, &CROSS_WORKER_FILE).await;
+                        let _ = run.run_leaf_exit(&leaf).await;
+                        crate::coordinator::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                    })
+                })
+            });
+        }
+
+        // CWF.redirect_stdout: bash `cmd > file &` pattern.
+        {
+            let a = agent_s.clone();
+            reg.test(
+                "xworker",
+                "cross_worker_file",
+                format!("CWF.redirect_stdout.{agent}"),
+            )
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let a = a.clone();
+                    let self_exe = run.self_exe().to_string();
+                    Box::pin(async move {
+                        let path = format!("/shared/cwf-rstdout-{a}.txt");
+                        let script = format!(
+                            concat!(
+                                "rm -f {path}; ",
+                                "{exe} cross-worker-file write-stdout > {path} &\n",
+                                "wait $!\n",
+                            ),
+                            path = path,
+                            exe = self_exe,
+                        );
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC_READY,
+                                ExecReadyArgs {
+                                    args: vec!["bash".into(), "-c".into(), script],
+                                    ready_marker: "[cross-worker-file] READY".into(),
+                                    timeout_secs: Some(15),
+                                    stdin: None,
+                                    stream: "stderr".into(),
+                                },
+                            )
+                            .await;
+                        let pid = match &resp {
+                            Response::BackgroundReady { pid } => Some(*pid),
+                            _ => {
+                                return crate::coordinator::TestOutcome::new(
+                                    &a,
+                                    false,
+                                    format!("bg spawn failed: {resp:?}"),
+                                );
+                            }
+                        };
+                        let resp = run
+                            .typed_or_error(&handle, &FS_READ, FsPathArgs { path: path.clone() })
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            Response::Ok { data: Some(d) } if d.contains("line0")
+                        );
+                        if let Some(pid) = pid {
+                            let _ = run.typed_or_error(&handle, &KILL, KillArgs { pid }).await;
+                        }
+                        crate::coordinator::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                    })
+                })
+            });
+        }
+
+        // CWF.redirect_exit: child exits quickly, data becomes visible.
+        {
+            let a = agent_s.clone();
+            reg.test(
+                "xworker",
+                "cross_worker_file",
+                format!("CWF.redirect_exit.{agent}"),
+            )
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let a = a.clone();
+                    let self_exe = run.self_exe().to_string();
+                    Box::pin(async move {
+                        let path = format!("/shared/cwf-rexit-{a}.txt");
+                        let script = format!(
+                            concat!(
+                                "rm -f {path}; ",
+                                "{exe} echo-test ",
+                                "> {path} 2>&1\n",
+                                "cat {path}\n",
+                            ),
+                            path = path,
+                            exe = self_exe,
+                        );
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                ExecArgs {
+                                    args: vec!["bash".into(), "-c".into(), script],
+                                    timeout_secs: Some(15),
+                                    stdin: None,
+                                    background: false,
+                                    env: vec![],
+                                },
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            Response::ExecResult { stdout, .. }
+                                if stdout.contains("ECHO_TEST_OK")
+                        );
+                        crate::coordinator::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                    })
+                })
+            });
+        }
+
+        // CWF.builtin_redirect: shell builtin redirected to file.
+        {
+            let a = agent_s.clone();
+            reg.test(
+                "xworker",
+                "cross_worker_file",
+                format!("CWF.builtin_redirect.{agent}"),
+            )
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let a = a.clone();
+                    Box::pin(async move {
+                        let path = format!("/shared/cwf-builtin-{a}.txt");
+                        let script = format!(
+                            concat!(
+                                "rm -f {path}; ",
+                                "echo builtin-data > {path}\n",
+                                "cat {path}\n",
+                            ),
+                            path = path,
+                        );
+                        let resp = run
+                            .typed_or_error(
+                                &handle,
+                                &EXEC,
+                                ExecArgs {
+                                    args: vec!["bash".into(), "-c".into(), script],
+                                    timeout_secs: Some(10),
+                                    stdin: None,
+                                    background: false,
+                                    env: vec![],
+                                },
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            Response::ExecResult { stdout, .. }
+                                if stdout.contains("builtin-data")
+                        );
+                        crate::coordinator::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                    })
+                })
+            });
         }
     }
 }

@@ -122,6 +122,12 @@ pub enum SubsystemTag {
     Timerfd,
     /// Linux `inotify_init1(2)`-created fd. Wire value `7` (future).
     Inotify,
+    /// Broker-hosted process identity. Wire value `8`. The
+    /// [`StateHandle.id`] of a `Process`-tagged entry is the
+    /// globally-unique Linux guest pid (truncated to `u32` at the
+    /// shim boundary). The payload is empty in the initial phase;
+    /// later phases attach parent/children/exit state.
+    Process,
     /// Tag that this receiver doesn't recognise. Carries the raw u8
     /// value so the receiver can log diagnostics; callers should reject
     /// the specific fd while continuing to deliver the rest of the
@@ -140,6 +146,7 @@ impl SubsystemTag {
             SubsystemTag::Signalfd => 5,
             SubsystemTag::Timerfd => 6,
             SubsystemTag::Inotify => 7,
+            SubsystemTag::Process => 8,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -156,6 +163,7 @@ impl SubsystemTag {
             5 => SubsystemTag::Signalfd,
             6 => SubsystemTag::Timerfd,
             7 => SubsystemTag::Inotify,
+            8 => SubsystemTag::Process,
             other => SubsystemTag::Unknown(other),
         }
     }

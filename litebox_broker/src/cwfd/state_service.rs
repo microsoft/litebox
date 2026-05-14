@@ -21,6 +21,7 @@
 
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
 use crate::eventfd_state::{EventfdError, EventfdState};
+use crate::process_state::ProcessState;
 use crate::signalfd_state::SignalfdState;
 use crate::state_registry::{BrokerStateRegistry, StateHandle, StateRegistryError};
 use crate::subscription_list::{SubscribeError, UnsubscribeError};
@@ -28,8 +29,8 @@ use litebox_common_linux::fd_token_protocol::{
     Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
     build_create_pidfd_response_ok, build_create_signalfd_response_ok, build_error_response,
     build_pidfd_exited_response_ok, build_read_eventfd_response_ok, build_read_siginfo_response_ok,
-    build_register_notification_ring_response_ok, build_release_response_ok,
-    build_subscribe_eventfd_response_ok, build_unsubscribe_response_ok,
+    build_register_notification_ring_response_ok, build_register_process_response_ok,
+    build_release_response_ok, build_subscribe_eventfd_response_ok, build_unsubscribe_response_ok,
     build_write_eventfd_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
     parse_create_signalfd_body, parse_handle_body, parse_pidfd_exited_request,
     parse_subscribe_eventfd_body, parse_unsubscribe_body, parse_write_eventfd_body,
@@ -84,6 +85,7 @@ pub fn handle_request(
         Opcode::Unsubscribe => handle_unsubscribe(registry, request, in_fds),
         Opcode::Release => handle_release_state(registry, request, in_fds),
         Opcode::DupHandle => handle_dup_handle(registry, request, in_fds),
+        Opcode::RegisterProcess => handle_register_process(registry, request, in_fds),
         other => HandlerResult {
             frame: build_error_response(
                 other.response_for().unwrap_or(Opcode::ReleaseResponse),
@@ -200,6 +202,29 @@ fn handle_pidfd_exited(
     };
     HandlerResult {
         frame: build_pidfd_exited_response_ok(pidfd.exited()),
+        out_fd: None,
+    }
+}
+
+fn handle_register_process(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::RegisterProcessResponse);
+    }
+    if !request.body.is_empty() {
+        return protocol_err(Opcode::RegisterProcessResponse);
+    }
+    // ProcessState payload is empty in Phase 1; the StateHandle id IS
+    // the globally-unique guest pid. The registry's monotonic
+    // allocator yields sequential u64 ids; this registry instance is
+    // dedicated to processes, so the low 32 bits of the handle are a
+    // valid Linux pid.
+    let handle = registry.register(ProcessState::arc());
+    HandlerResult {
+        frame: build_register_process_response_ok(handle.id()),
         out_fd: None,
     }
 }

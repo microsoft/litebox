@@ -31,7 +31,7 @@ pub mod vmap;
 // paths working.
 pub use cwfd::{
     broker_eventfd_provider, broker_pidfd_provider, broker_signalfd_provider, fd_token_protocol,
-    fd_transfer_frame, notification_frame,
+    fd_transfer_frame, guest_pid_provider, notification_frame,
 };
 
 #[cfg(feature = "std")]

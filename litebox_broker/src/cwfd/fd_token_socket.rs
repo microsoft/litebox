@@ -248,6 +248,7 @@ pub fn handle_control_connection(
     stream: UnixStream,
     fd_registry: Arc<BrokerFdTokenRegistry>,
     state_registry: Arc<BrokerStateRegistry>,
+    process_registry: Arc<BrokerStateRegistry>,
 ) {
     let mut conn_state = ConnState::new();
     loop {
@@ -284,9 +285,9 @@ pub fn handle_control_connection(
                         }
                     }
                     Opcode::Release => {
-                        // Release: try host-fd registry first; if unknown there, try state registry.
-                        // Both registries use independent monotonic id spaces, so an id will
-                        // never be in both. Easy disambiguation.
+                        // Release: cascade host-fd registry → state registry → process registry.
+                        // All three registries use independent monotonic id spaces, so an id
+                        // will never be in more than one. Easy disambiguation by UnknownHandle.
                         let fds: Vec<OwnedFd> = in_fds;
                         if !fds.is_empty() {
                             warn!("fd-token control: Release with attached fds; closing");
@@ -308,9 +309,24 @@ pub fn handle_control_connection(
                                 &frame,
                                 Vec::new(),
                             );
-                            SocketHandlerResult {
-                                frame: state_result.frame,
-                                out_fd: state_result.out_fd,
+                            if state_result.frame.status
+                                == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
+                            {
+                                let proc_result = state_handle_request(
+                                    &process_registry,
+                                    &mut conn_state,
+                                    &frame,
+                                    Vec::new(),
+                                );
+                                SocketHandlerResult {
+                                    frame: proc_result.frame,
+                                    out_fd: proc_result.out_fd,
+                                }
+                            } else {
+                                SocketHandlerResult {
+                                    frame: state_result.frame,
+                                    out_fd: state_result.out_fd,
+                                }
                             }
                         } else {
                             SocketHandlerResult {
@@ -328,12 +344,28 @@ pub fn handle_control_connection(
                     | Opcode::SubscribeEventfd
                     | Opcode::Unsubscribe
                     | Opcode::DupHandle => {
-                        // State-object opcodes: route to state_service.
+                        // State-object opcodes: route to state_service on the fd-state registry.
                         let state_result =
                             state_handle_request(&state_registry, &mut conn_state, &frame, in_fds);
                         SocketHandlerResult {
                             frame: state_result.frame,
                             out_fd: state_result.out_fd,
+                        }
+                    }
+                    Opcode::RegisterProcess => {
+                        // Process registration: route to state_service on the *process*
+                        // registry. state_service dispatches RegisterProcess via the same
+                        // tag-checked Insert + handle-id-return path it uses for eventfd
+                        // create.
+                        let proc_result = state_handle_request(
+                            &process_registry,
+                            &mut conn_state,
+                            &frame,
+                            in_fds,
+                        );
+                        SocketHandlerResult {
+                            frame: proc_result.frame,
+                            out_fd: proc_result.out_fd,
                         }
                     }
                     other => {
@@ -364,11 +396,12 @@ struct SocketHandlerResult {
 }
 
 /// Spawns a thread that listens on `path` and handles each accepted
-/// connection on its own thread, with both registries available.
+/// connection on its own thread, with all three registries available.
 pub fn spawn_control_listener(
     path: &Path,
     fd_registry: Arc<BrokerFdTokenRegistry>,
     state_registry: Arc<BrokerStateRegistry>,
+    process_registry: Arc<BrokerStateRegistry>,
 ) -> std::io::Result<JoinHandle<()>> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
@@ -382,11 +415,17 @@ pub fn spawn_control_listener(
                     Ok(stream) => {
                         let fd_registry = Arc::clone(&fd_registry);
                         let state_registry = Arc::clone(&state_registry);
+                        let process_registry = Arc::clone(&process_registry);
                         if let Err(e) =
                             thread::Builder::new()
                                 .name("fd-token-conn".into())
                                 .spawn(move || {
-                                    handle_control_connection(stream, fd_registry, state_registry)
+                                    handle_control_connection(
+                                        stream,
+                                        fd_registry,
+                                        state_registry,
+                                        process_registry,
+                                    )
                                 })
                         {
                             warn!(error = %e, "failed to spawn fd-token connection thread");
@@ -422,26 +461,32 @@ mod tests {
         std::path::PathBuf,
         Arc<BrokerFdTokenRegistry>,
         Arc<BrokerStateRegistry>,
+        Arc<BrokerStateRegistry>,
     ) {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fd-token.sock");
         let fd_registry = Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = Arc::new(BrokerStateRegistry::new());
-        let _ =
-            spawn_control_listener(&path, Arc::clone(&fd_registry), Arc::clone(&state_registry))
-                .expect("spawn");
+        let process_registry = Arc::new(BrokerStateRegistry::new());
+        let _ = spawn_control_listener(
+            &path,
+            Arc::clone(&fd_registry),
+            Arc::clone(&state_registry),
+            Arc::clone(&process_registry),
+        )
+        .expect("spawn");
         for _ in 0..100 {
             if path.exists() {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(10));
         }
-        (dir, path, fd_registry, state_registry)
+        (dir, path, fd_registry, state_registry, process_registry)
     }
 
     #[test]
     fn end_to_end_host_fd_lifecycle() {
-        let (_dir, path, registry, _state) = spawn_test_listener();
+        let (_dir, path, registry, _state, _proc) = spawn_test_listener();
         let client = FdTokenClient::connect(&path).expect("connect");
 
         let (r, w) = pipe_pair();
@@ -464,7 +509,7 @@ mod tests {
 
     #[test]
     fn unknown_handle_returns_typed_error() {
-        let (_dir, path, _registry, _state) = spawn_test_listener();
+        let (_dir, path, _registry, _state, _proc) = spawn_test_listener();
         let client = FdTokenClient::connect(&path).expect("connect");
 
         match client.materialize(99_999) {
@@ -480,7 +525,7 @@ mod tests {
 
     #[test]
     fn many_requests_over_one_connection() {
-        let (_dir, path, registry, _state) = spawn_test_listener();
+        let (_dir, path, registry, _state, _proc) = spawn_test_listener();
         let client = FdTokenClient::connect(&path).expect("connect");
         for _ in 0..50 {
             let (r, _w) = pipe_pair();
@@ -491,12 +536,38 @@ mod tests {
     }
 
     #[test]
+    fn register_process_allocates_sequential_pids() {
+        let (_dir, path, _fd, _state, process_registry) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        let pid1 = client.register_process().expect("register_process 1");
+        let pid2 = client.register_process().expect("register_process 2");
+        let pid3 = client.register_process().expect("register_process 3");
+
+        // BrokerStateRegistry monotonically allocates ids starting at 1.
+        // The process_registry is dedicated to processes (no other
+        // SubsystemTag uses it), so allocations are sequential and
+        // small u32-sized.
+        assert_eq!(pid1, 1);
+        assert_eq!(pid2, 2);
+        assert_eq!(pid3, 3);
+        assert_eq!(process_registry.live_handle_count(), 3);
+
+        // Release flows through the cascading Release dispatcher to the
+        // process registry.
+        client.release(pid1).expect("release pid1");
+        client.release(pid2).expect("release pid2");
+        client.release(pid3).expect("release pid3");
+        assert_eq!(process_registry.live_handle_count(), 0);
+    }
+
+    #[test]
     fn end_to_end_eventfd_via_client() {
         use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
         use litebox_common_linux::notification_ring::NotificationReceiver;
         use litebox_common_linux::shmem_ring::ShmemRingPair;
 
-        let (_dir, path, _fd_registry, state_registry) = spawn_test_listener();
+        let (_dir, path, _fd_registry, state_registry, _proc) = spawn_test_listener();
         let client = FdTokenClient::connect(&path).expect("connect");
 
         // Set up the notification ring. Worker creates the pair; broker
@@ -567,7 +638,7 @@ mod tests {
             }
         }
 
-        let (_dir, path, _fd_registry, state_registry) = spawn_test_listener();
+        let (_dir, path, _fd_registry, state_registry, _proc) = spawn_test_listener();
         let client = Arc::new(FdTokenClient::connect(&path).expect("connect"));
 
         // Set up the notification ring.

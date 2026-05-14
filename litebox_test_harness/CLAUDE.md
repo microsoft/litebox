@@ -365,8 +365,8 @@ fork-parent slots:
 | Array | Module | Slots | Use for |
 |---|---|---|---|
 | `EXEC_AGENTS` | `matrix.rs` | 11 | exec-style tests (EXITD, BR.exec_*, FWE, M, BS, …) — fans across PIE-glibc depth-1/2/3, non-PIE-glibc, static-leg parents, and the VS-Code-shape transition slots. |
-| `NPIPE_AGENTS` | `platform_fixes.rs` | 10 | pipe-bridge churn tests (npipe family). |
-| EP agent loop | `platform_fixes.rs::register_epoll_socket_tests` | 11 | epoll/socket tests (EP.direct.*, EP.tokio.*) — has a per-agent port table to keep concurrent runs from colliding. |
+| `NPIPE_AGENTS` | `pipe_bridge.rs` | 10 | pipe-bridge churn tests (npipe family). |
+| EP agent loop | `epoll_pidfd.rs::register_epoll_socket_tests` | 11 | epoll/socket tests (EP.direct.*, EP.tokio.*) — has a per-agent port table to keep concurrent runs from colliding. |
 | US6 / P1 fan-out | `special_cases.rs` | 11 | UDS socketpair (US6) and pipe-EOF-fork (P1) families. |
 | `RAND_AGENTS` | `getrandom_tests.rs` | 4 | getrandom contract — covers glibc + musl libc-bootstrap differences. |
 | `INO_AGENTS` | `inotify.rs` | 5 | inotify file-watcher tests. |
@@ -579,15 +579,34 @@ programs that cannot be handlers because the test specifically needs
   inside a `common::BASH` pipeline runs as a non-protocol child by
   definition; the parent of that exec is bash, not an agent.
 
-These leaves live in `mod leaf_subcmd` blocks inside the family file
-(or a sibling submodule, e.g.
-`coordinator/platform_fixes_leaf_subcmd.rs` for the M/BS canaries),
+These leaves live in `mod leaf_subcmd` blocks inside the family file,
 each with a doc-comment naming **why** this leaf cannot be a handler.
 They are registered via `register_leaf_subcommand!("name", fn)` from
 the family's `register_*(reg)` function and dispatched at process
 entry by `coordinator::leaf_subcommand::dispatch`. `main.rs` is
 purely a router: 3 dispatcher arms (`spawn-tree`, `agent`,
 `agent-listen`) + a one-line registry lookup + a catch-all error.
+
+#### Topical layout (post-Wave-9)
+
+Tests are organized by *subject*, not by historical bug-fix arc.
+Each `coordinator/<topic>.rs` hosts one or more related test-prefix
+families:
+
+| Topic file                              | Hosted test prefixes                          |
+|-----------------------------------------|-----------------------------------------------|
+| `concurrent_fork.rs`                    | `CF.*`, `CC.*`                                |
+| `epoll_pidfd.rs`                        | `EPI.*`, `EP.*`, `POLL.*`                     |
+| `fork_matrix.rs`                        | `X*`, `BSF`, `PIF`, `SXF`, `BASH.*`, `FWE.*`, `SK.*` |
+| `pipe_bridge.rs`                        | `PB.*`, `PN.*`, `PID.*`, `NPIPE.*`, `BPIPE.*` |
+| `tcp_state.rs`                          | `TCS.*`, `THC.*`, `TLB.*`, `XCONN.*`, `FKLC.*` |
+| `vscode_shape.rs`                       | `VS.*`, `CSM.*`                               |
+| `sockopt.rs`                            | `SOCKOPT.*`, `GSN.*`                          |
+| `shell.rs` *(new)*                      | `SP.*`, `SC.*`, `TR.*`, `FR.*`, `BR.*`, `BRS.*` |
+| `special_cases/exit.rs`                 | exit semantics, `EXITD.*`                     |
+| `special_cases/fs.rs`                   | filesystem misc, `CWF.*`                      |
+| `special_cases/proc.rs` *(new)*         | `/proc` reads, `PROC.*`, `KP.*`, `KPX.*`, `proc-probe` / `check-ppid` leaf subcmds |
+| `common.rs`                             | shared handlers, `CANARY_AGENTS`, `DetailOut`, `fork_binary_label`, minimal_canary (M*/BS*) |
 
 #### Authoring a new test
 

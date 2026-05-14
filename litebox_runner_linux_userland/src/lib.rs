@@ -14,6 +14,7 @@ extern crate alloc;
 pub mod broker_eventfd_provider;
 pub mod broker_pidfd_provider;
 pub mod broker_signalfd_provider;
+pub mod guest_pid_provider;
 
 /// Run Linux programs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
@@ -429,6 +430,30 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 path = broker_path.as_str(),
                 "fd-token-broker setup failed; falling back to local EventFile",
             );
+        } else if !cli_args.worker_exec && !cli_args.fork_restore && cli_args.guest_pid.is_none() {
+            // Root worker (not a migrated worker / fork-restore worker, and no
+            // explicit --guest-pid). Reserve the root init's guest pid in the
+            // broker so subsequent broker allocations don't collide with it.
+            // The first allocation returns pid 1 by construction (broker's
+            // process_registry starts its monotonic counter at 1), which
+            // matches the platform's default init_task().pid.
+            //
+            // The returned pid is stored process-globally so `task_params_with_overrides`
+            // can apply it as an override below.
+            if let Some(provider) = litebox_shim_linux::syscalls::broker_guest_pid_provider() {
+                match provider.register_process() {
+                    Ok(root_pid) => {
+                        ROOT_INIT_BROKER_PID.store(root_pid, std::sync::atomic::Ordering::SeqCst);
+                        tracing::debug!(root_pid, "reserved root init guest pid via broker");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            "broker register_process for root init pid failed; falling back to platform default",
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1040,12 +1065,28 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     run_program(program, shutdown, net_worker, worker_result_fd, None);
 }
 
+/// Process-global override for the root init's guest pid, set by the
+/// broker-bootstrap path in `run()` when an `fd_token_broker` is
+/// available and this is the root worker. `task_params_with_overrides`
+/// reads this and overrides the platform default. `0` is the sentinel
+/// "not set" value (no valid Linux pid is 0).
+static ROOT_INIT_BROKER_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Build task params for the init process, applying --guest-uid/gid overrides.
 fn task_params_with_overrides(
     cli_args: &CliArgs,
     platform: &litebox_platform_multiplex::Platform,
 ) -> litebox_common_linux::TaskParams {
     let mut params = platform.init_task();
+    // If the runner reserved a root-init pid in the broker (multi-worker
+    // mode), use that instead of the platform default. This keeps the
+    // broker's monotonic counter and the root init's visible pid aligned
+    // — subsequent forks broker-allocate from the next slot, avoiding
+    // any collision with pid 1.
+    let broker_pid = ROOT_INIT_BROKER_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if broker_pid != 0 {
+        params.pid = broker_pid as i32;
+    }
     if let Some(uid) = cli_args.guest_uid {
         params.uid = uid;
     }
@@ -2980,10 +3021,22 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     let signalfd_provider: Arc<
         dyn litebox_common_linux::broker_signalfd_provider::BrokerSignalfdProvider,
     > = Arc::new(
-        crate::broker_signalfd_provider::RunnerBrokerSignalfdProvider::new(client, dispatcher),
+        crate::broker_signalfd_provider::RunnerBrokerSignalfdProvider::new(
+            Arc::clone(&client),
+            dispatcher,
+        ),
     );
     litebox_shim_linux::syscalls::set_broker_signalfd_provider(signalfd_provider)
         .map_err(|_| anyhow!("signalfd provider already set"))?;
+
+    // Install the guest-pid provider against the same fd-token client.
+    // The shim's `do_fork` consults it; if missing, do_fork falls back
+    // to per-shim allocation (single-worker scenarios).
+    let pid_provider = Arc::new(crate::guest_pid_provider::RunnerGuestPidProvider::new(
+        Arc::clone(&client),
+    ));
+    litebox_shim_linux::syscalls::set_broker_guest_pid_provider(pid_provider)
+        .map_err(|_| anyhow!("guest-pid provider already set"))?;
     Ok(())
 }
 
@@ -3241,9 +3294,14 @@ mod tests {
         let path = dir.path().join("fd-token.sock");
         let fd_registry = Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = Arc::new(BrokerStateRegistry::new());
-        let _listener =
-            spawn_control_listener(&path, Arc::clone(&fd_registry), Arc::clone(&state_registry))
-                .expect("spawn listener");
+        let process_registry = Arc::new(BrokerStateRegistry::new());
+        let _listener = spawn_control_listener(
+            &path,
+            Arc::clone(&fd_registry),
+            Arc::clone(&state_registry),
+            Arc::clone(&process_registry),
+        )
+        .expect("spawn listener");
 
         for _ in 0..100 {
             if path.exists() {

@@ -2,14 +2,81 @@
 // Licensed under the MIT license.
 
 //! Semantic coordinator topology for VS Code Server shape canaries.
+//!
+//! Hosts the `VS.shape.*` family (full VS Code Server process-tree topology)
+//! and the `CSM.*` family (CLI Startup Mimic — VS Code CLI link-mode startup
+//! shape).
 
 use serde::{Deserialize, Serialize};
 
 use super::TestOutcome;
-use super::agents::{AgentBinary, AgentName, AgentSpec, IsolationKind};
+use super::agents::{AgentBinary, AgentName, AgentSpec, IsolationKind, SpawnKind};
 use super::registry::Registry;
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::register_handler;
+
+// ═══════════════════════════════════════════════════════════════════
+// CSM: CLI Startup Mimic — VS Code CLI link-mode startup shape
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CliStartupMimicArgs {}
+
+const CLI_STARTUP_MIMIC: HandlerToken<CliStartupMimicArgs, super::common::DetailOut> =
+    HandlerToken::new("platform_fixes.cli_startup_mimic");
+
+async fn handle_cli_startup_mimic(
+    _args: CliStartupMimicArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<super::common::DetailOut, HandlerError> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| HandlerError::from(format!("bind cli startup mimic listener: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| HandlerError::from(format!("listener addr: {e}")))?;
+    Ok(super::common::DetailOut {
+        detail: format!("CLI_STARTUP_MIMIC_OK {addr}"),
+    })
+}
+
+const CSM_DELIVERIES: &[&str] = &["tokio_pipe", "bash_heredoc_pipe"];
+
+pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
+    register_handler!(CLI_STARTUP_MIMIC, handle_cli_startup_mimic);
+
+    for &delivery in CSM_DELIVERIES {
+        for &bt in crate::BinaryType::ALL {
+            for &agent in super::common::CANARY_AGENTS {
+                let agent_s = agent.to_string();
+                let bt_label = bt.label();
+                let test_id = format!("CSM.{delivery}.{bt_label}.{agent}");
+                reg.test("fork", "cli_startup_mimic", test_id)
+                    .timeout(60)
+                    .build(move |cx| {
+                        let leaf = cx.declare_ephemeral(
+                            agent,
+                            format!("CliStartupMimic_{delivery}_{bt_label}_{agent}"),
+                            SpawnKind::Fork {
+                                binary: super::common::fork_binary_label(bt),
+                                inherit_listen_ports: vec![],
+                            },
+                        );
+                        Box::new(move |run| {
+                            let a = agent_s.clone();
+                            Box::pin(async move {
+                                let result = run
+                                    .run_leaf(&leaf, &CLI_STARTUP_MIMIC, CliStartupMimicArgs {})
+                                    .await;
+                                let pass = matches!(&result, Ok(out) if out.detail.contains("CLI_STARTUP_MIMIC_OK"));
+                                TestOutcome::new(&a, pass, format!("{result:?}"))
+                            })
+                        })
+                    });
+            }
+        }
+    }
+}
 
 /// Semantic agents in the VS Code Server process-tree shape.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

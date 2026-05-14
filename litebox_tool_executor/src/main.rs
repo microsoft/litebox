@@ -14,7 +14,6 @@
 //! provides the actual sandbox execution environment.
 
 use clap::Parser as _;
-use std::io::Read as _;
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "litebox-tool-executor")]
@@ -52,8 +51,26 @@ struct Cli {
     /// Run VS Code Server inside the sandbox with stdio transport.
     /// The server protocol runs over stdin/stdout so VS Code's Remote
     /// extension can connect via the same pipe mechanism as docker exec.
+    ///
+    /// This is a preset for `--ssh` with VS-Code-friendly defaults and
+    /// banner text. See `--ssh` for the general form.
     #[arg(long)]
     vscode_server: bool,
+
+    /// Run an SSH server (dropbear) inside the sandbox so external clients
+    /// can connect with a real TTY. The sandbox forwards `--ssh-port` on
+    /// the host to port 22 in the guest. dropbear must exist in the rootfs
+    /// (currently provided by the `litebox-vscode` and `litebox-agent-cli`
+    /// Dockerfile targets).
+    #[arg(long, conflicts_with_all = ["interactive", "vscode_server"])]
+    ssh: bool,
+
+    /// Optional command for incoming SSH sessions. When set, every SSH
+    /// session runs this command instead of a login shell. Useful for
+    /// running a single agent CLI under the sandbox (e.g.
+    /// `--ssh --ssh-command copilot`).
+    #[arg(long = "ssh-command", value_name = "CMD")]
+    ssh_command: Option<String>,
 
     /// SSH port for --vscode-server mode (default: 2222).
     /// Use a fixed port so the SSH config entry is stable across restarts.
@@ -139,9 +156,11 @@ fn main() -> anyhow::Result<()> {
     print_build_info(audit_log_file.as_deref());
 
     if cli.vscode_server {
-        vscode_server(&cli, audit_log_file.as_deref())
+        ssh_mode(&cli, audit_log_file.as_deref(), SshPreset::VsCode)
+    } else if cli.ssh {
+        ssh_mode(&cli, audit_log_file.as_deref(), SshPreset::Plain)
     } else if cli.interactive {
-        interactive(&cli, audit_log_file.as_deref())
+        ssh_mode(&cli, audit_log_file.as_deref(), SshPreset::Interactive)
     } else {
         direct(&cli, audit_log_file.as_deref())
     }
@@ -632,69 +651,6 @@ fn runner_command(
     Ok(cmd)
 }
 
-/// Interactive shell mode. Launches a persistent bash session inside a single
-/// sandbox. Shell state (cd, environment variables, etc.) persists across
-/// commands.
-///
-/// Stdin is piped through a bridge thread so the runner's stdin is NOT a TTY.
-/// This prevents bash from enabling job control (which breaks pipelines in
-/// the sandbox because setpgid fails for the session-leader init process).
-fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let broker = spawn_broker(cli, audit_log_file, &[])?;
-
-    let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
-
-    // Launch bash in non-editing script mode:
-    // --norc --noprofile: skip startup files
-    // --noediting: disable readline
-    // -s: read commands from stdin
-    cmd.args([&cli.shell, "--norc", "--noprofile", "--noediting", "-s"]);
-
-    // Pipe stdin so the runner sees a pipe, not a TTY. This makes bash
-    // enter non-interactive mode and skip job control entirely.
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}"))?;
-
-    // Bridge host stdin to the child's piped stdin in a background thread.
-    let mut child_stdin = child.stdin.take().unwrap();
-    let stdin_thread = std::thread::spawn(move || {
-        let mut host_stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 4096];
-        loop {
-            match host_stdin.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    if std::io::Write::write_all(&mut child_stdin, &buf[..n]).is_err() {
-                        break; // child closed stdin
-                    }
-                }
-                #[allow(clippy::match_same_arms)] // Distinct cases for documentation.
-                Err(_) => break,
-            }
-        }
-    });
-
-    let status = child
-        .wait()
-        .map_err(|e| anyhow::anyhow!("Failed to wait for litebox_runner_linux_userland: {e}"))?;
-
-    // stdin thread will exit when the child closes its end or host stdin hits EOF.
-    let _ = stdin_thread.join();
-
-    // Clean up the broker process.
-    drop(broker);
-
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
-}
-
 /// Direct mode: run a single command.
 fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
     let forward_ports = parse_forward_ports(&cli.forward_port);
@@ -776,12 +732,43 @@ fn run_sandbox(
 ///   docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode \
 ///     /`opt/litebox/litebox_tool_executor` --rootfs / --vscode-server
 ///   # then in VS Code: Remote-SSH → litebox (port 2222)
-fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
+/// Which preset variant of SSH mode we're in. Affects only banner text,
+/// argv to dropbear, and a couple of operational defaults — the actual
+/// sandbox + dropbear plumbing is identical.
+#[derive(Copy, Clone, Debug)]
+enum SshPreset {
+    /// User-driven `--ssh` invocation. No VS-Code-specific banner; honour
+    /// `--ssh-command` so callers can pin a single command for every
+    /// incoming session.
+    Plain,
+    /// `--vscode-server` preset. Banner explains the VS Code Remote setup;
+    /// dropbear runs a login shell (VS Code's Remote extension issues its
+    /// own command per session).
+    VsCode,
+    /// `--interactive` preset. Spawns dropbear with `--ssh-command
+    /// <cli.shell>` so each SSH session lands directly in a shell. Banner
+    /// nudges the user toward the `ssh` client invocation.
+    Interactive,
+}
+
+/// SSH-server-in-sandbox mode: run dropbear inside the sandbox, forward
+/// `--ssh-port` on the host to guest port 22, and let external clients
+/// connect with a real TTY.
+///
+/// This consolidates what used to be the VS-Code-specific dropbear setup
+/// into a general mechanism. `--vscode-server` is a preset of this with
+/// VS-Code-friendly banner text; `--interactive` is a preset that pins
+/// the configured shell (`--shell`) as the session command.
+fn ssh_mode(
+    cli: &Cli,
+    audit_log_file: Option<&std::path::Path>,
+    preset: SshPreset,
+) -> anyhow::Result<()> {
     if !cli.rootfs.is_dir() {
         anyhow::bail!(
-            "--vscode-server requires a directory rootfs (not a tar).\n\
+            "--ssh / --vscode-server / --interactive require a directory rootfs (not a tar).\n\
              Use Docker: docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .\n\
-             Then: docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server"
+             Then: docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --ssh"
         );
     }
 
@@ -806,25 +793,132 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         "0.0.0.0"
     };
 
+    print_ssh_banner(preset, cli, audit_log_file, host_ip, ssh_port);
+
+    // Resolve the effective ssh-command for each preset.
+    let ssh_command_owned: Option<String> = match preset {
+        SshPreset::Plain | SshPreset::VsCode => cli.ssh_command.clone(),
+        // `--interactive` always forces the configured shell so the
+        // first incoming SSH session lands at a shell prompt without
+        // the client having to specify a command.
+        SshPreset::Interactive => Some(cli.shell.clone()),
+    };
+
+    let dropbear_argv = build_dropbear_argv(preset, ssh_command_owned.as_deref());
+
+    let guest_command: Vec<&str> = dropbear_argv.iter().map(String::as_str).collect();
+
+    run_sandbox(
+        cli,
+        audit_log_file,
+        &forward_ports,
+        &guest_command,
+        std::process::Stdio::null(),
+    )
+}
+
+/// Build the dropbear argv for a given preset.
+///
+/// Plain `--ssh` mode honours `--ssh-command` by setting `-c <cmd>`, which
+/// makes dropbear ignore the client's requested command and force the
+/// configured one (useful for pinning a single agent CLI per session).
+/// VS-Code preset never sets `-c` — VS Code's Remote extension issues its
+/// own commands and would be broken by `-c`.
+fn build_dropbear_argv(preset: SshPreset, ssh_command: Option<&str>) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "/usr/sbin/dropbear".into(),
+        "-F".into(), // foreground
+        "-E".into(), // stderr logging
+        "-B".into(), // allow blank-password root login
+        "-R".into(), // create hostkeys on demand
+        "-p".into(),
+        "22".into(),
+    ];
+    // Plain `--ssh` honours --ssh-command directly. Interactive preset
+    // always forces the shell. VsCode never sets -c (the Remote
+    // extension issues its own commands).
+    let forced_cmd = match preset {
+        SshPreset::Plain => ssh_command,
+        SshPreset::Interactive => ssh_command, // already injected by caller
+        SshPreset::VsCode => None,
+    };
+    if let Some(cmd) = forced_cmd {
+        // Dropbear `-c <cmd>` forces every incoming session to run this
+        // command instead of an interactive shell or the client's
+        // requested command.
+        argv.push("-c".into());
+        argv.push(cmd.into());
+    }
+    argv
+}
+
+/// Print the connection banner. The Plain preset gets a generic banner;
+/// VsCode preset reproduces the historical VS-Code-specific output.
+fn print_ssh_banner(
+    preset: SshPreset,
+    cli: &Cli,
+    audit_log_file: Option<&std::path::Path>,
+    host_ip: &str,
+    ssh_port: u16,
+) {
     eprintln!();
     eprintln!("==============================================");
-    eprintln!("  LiteBox VS Code Server (dropbear SSH)");
-    if cli.record_baseline {
-        eprintln!("  *** RECORDING BASELINE (AllowAll policy) ***");
+    match preset {
+        SshPreset::VsCode => {
+            eprintln!("  LiteBox VS Code Server (dropbear SSH)");
+            if cli.record_baseline {
+                eprintln!("  *** RECORDING BASELINE (AllowAll policy) ***");
+            }
+            eprintln!("  dropbear inside sandbox on port 22");
+            eprintln!("  Forwarding host:{ssh_port} → sandbox:22");
+            eprintln!();
+            eprintln!("  Add to ~/.ssh/config:");
+            eprintln!("    Host litebox");
+            eprintln!("        HostName {host_ip}");
+            eprintln!("        Port {ssh_port}");
+            eprintln!("        User root");
+            eprintln!("        StrictHostKeyChecking no");
+            eprintln!("        UserKnownHostsFile /dev/null");
+            eprintln!();
+            eprintln!("  Then in VS Code:");
+            eprintln!("    Remote-SSH → Connect to Host → litebox");
+        }
+        SshPreset::Plain => {
+            eprintln!("  LiteBox SSH server (dropbear)");
+            if cli.record_baseline {
+                eprintln!("  *** RECORDING BASELINE (AllowAll policy) ***");
+            }
+            eprintln!("  dropbear inside sandbox on port 22");
+            eprintln!("  Forwarding host:{ssh_port} → sandbox:22");
+            if let Some(cmd) = cli.ssh_command.as_deref() {
+                eprintln!("  Forced session command: {cmd}");
+            }
+            eprintln!();
+            eprintln!("  Connect with:");
+            eprintln!(
+                "    ssh -t -p {ssh_port} -o StrictHostKeyChecking=no \\\n        -o UserKnownHostsFile=/dev/null root@{host_ip}"
+            );
+        }
+        SshPreset::Interactive => {
+            eprintln!("  LiteBox interactive shell (dropbear SSH)");
+            if cli.record_baseline {
+                eprintln!("  *** RECORDING BASELINE (AllowAll policy) ***");
+            }
+            eprintln!("  dropbear inside sandbox on port 22");
+            eprintln!("  Forwarding host:{ssh_port} → sandbox:22");
+            eprintln!("  Forced session command: {}", cli.shell);
+            eprintln!();
+            eprintln!("  Connect from another terminal with:");
+            eprintln!(
+                "    ssh -t -p {ssh_port} -o StrictHostKeyChecking=no \\\n        -o UserKnownHostsFile=/dev/null root@{host_ip}"
+            );
+            eprintln!();
+            eprintln!("  NOTE: --interactive now requires a separate ssh client. The");
+            eprintln!("  previous in-process pipe-to-bash mode has been replaced with");
+            eprintln!("  a proper TTY session over SSH. Run the ssh command above in a");
+            eprintln!("  second terminal; this one logs sandbox activity.");
+        }
     }
-    eprintln!("  dropbear inside sandbox on port 22");
-    eprintln!("  Forwarding host:{ssh_port} → sandbox:22");
-    eprintln!();
-    eprintln!("  Add to ~/.ssh/config:");
-    eprintln!("    Host litebox");
-    eprintln!("        HostName {host_ip}");
-    eprintln!("        Port {ssh_port}");
-    eprintln!("        User root");
-    eprintln!("        StrictHostKeyChecking no");
-    eprintln!("        UserKnownHostsFile /dev/null");
-    eprintln!();
-    eprintln!("  Then in VS Code:");
-    eprintln!("    Remote-SSH → Connect to Host → litebox");
     eprintln!();
     eprintln!("  Logs:");
     if let Some(audit) = audit_log_file {
@@ -838,14 +932,66 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     }
     eprintln!("==============================================");
     eprintln!();
+}
 
-    let guest_command = ["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    run_sandbox(
-        cli,
-        audit_log_file,
-        &forward_ports,
-        &guest_command,
-        std::process::Stdio::null(),
-    )
+    #[test]
+    fn dropbear_argv_vscode_never_forces_command() {
+        // The VS Code Remote extension issues its own per-session commands
+        // over SSH. If we ever pass `-c <cmd>` for the VsCode preset,
+        // the remote extension breaks: every session would run our forced
+        // command instead. Guard the invariant.
+        let argv = build_dropbear_argv(SshPreset::VsCode, Some("copilot"));
+        assert!(
+            !argv.iter().any(|a| a == "-c"),
+            "VsCode preset must never set -c, got argv = {argv:?}"
+        );
+    }
+
+    #[test]
+    fn dropbear_argv_plain_forwards_ssh_command() {
+        let argv = build_dropbear_argv(SshPreset::Plain, Some("copilot"));
+        let idx = argv
+            .iter()
+            .position(|a| a == "-c")
+            .expect("Plain preset with --ssh-command must include -c");
+        assert_eq!(argv.get(idx + 1).map(String::as_str), Some("copilot"));
+    }
+
+    #[test]
+    fn dropbear_argv_plain_omits_c_when_no_ssh_command() {
+        let argv = build_dropbear_argv(SshPreset::Plain, None);
+        assert!(
+            !argv.iter().any(|a| a == "-c"),
+            "Plain preset without --ssh-command must not pass -c, got {argv:?}"
+        );
+    }
+
+    #[test]
+    fn dropbear_argv_interactive_forwards_explicit_shell() {
+        // The Interactive preset's ssh_command is resolved from `--shell`
+        // by `ssh_mode` *before* this helper is called, so all this
+        // function sees is "we have a command, pass it through."
+        let argv = build_dropbear_argv(SshPreset::Interactive, Some("/usr/bin/zsh"));
+        let idx = argv
+            .iter()
+            .position(|a| a == "-c")
+            .expect("Interactive preset must include -c");
+        assert_eq!(argv.get(idx + 1).map(String::as_str), Some("/usr/bin/zsh"));
+    }
+
+    #[test]
+    fn dropbear_argv_always_starts_with_dropbear_and_port_22() {
+        let argv = build_dropbear_argv(SshPreset::Plain, None);
+        assert_eq!(argv[0], "/usr/sbin/dropbear");
+        let idx = argv.iter().position(|a| a == "-p").expect("port flag");
+        assert_eq!(
+            argv.get(idx + 1).map(String::as_str),
+            Some("22"),
+            "guest dropbear must always bind 22; port forwarding is on the host"
+        );
+    }
 }

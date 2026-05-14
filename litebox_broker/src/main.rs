@@ -237,10 +237,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::sync::Arc::new(litebox_broker::fd_tokens::BrokerFdTokenRegistry::new());
             let state_registry =
                 std::sync::Arc::new(litebox_broker::state_registry::BrokerStateRegistry::new());
+            // Process registry: dedicated BrokerStateRegistry instance for
+            // ProcessState entries. Disjoint id space from state_registry
+            // keeps allocated guest pids sequential u32s (suitable for
+            // /proc/<pid> and audit logs) while reusing the same
+            // refcount + tag-checked machinery.
+            let process_registry =
+                std::sync::Arc::new(litebox_broker::state_registry::BrokerStateRegistry::new());
             match litebox_broker::fd_token_socket::spawn_control_listener(
                 path,
                 fd_registry,
                 state_registry,
+                process_registry,
             ) {
                 Ok(handle) => {
                     info!(path = %path.display(), "fd-token broker listener started");
