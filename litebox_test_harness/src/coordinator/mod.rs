@@ -106,7 +106,7 @@ pub struct Test {
     pub(crate) suite: &'static str,
     pub(crate) group: &'static str,
     pub id: String,
-    pub(crate) timeout_secs: u64,
+    pub timeout_secs: u64,
     /// Agents this test will contact, expressed as an explicit set
     /// declared at registration time via `RegistrationContext::require`
     /// (and the parents of `declare_ephemeral` calls). `spawn_tree`
