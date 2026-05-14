@@ -182,7 +182,7 @@ impl Task {
             if let Some(state_entry) = map.get_mut(&state)
                 && let Some(cipher) = state_entry.get_mut_cipher()
             {
-                dst_slice.copy_from_slice(src_slice);
+                dst_slice[..src_slice.len()].copy_from_slice(src_slice);
                 match cipher {
                     Cipher::Aes128Ctr(aes128ctr) => {
                         aes128ctr.apply_keystream(&mut dst_slice[..src_slice.len()]);
@@ -318,6 +318,7 @@ impl Task {
 
 fn create_cipher(algo: TeeAlgorithm, key: &[u8], iv: &[u8]) -> Option<Cipher> {
     match algo {
+        TeeAlgorithm::AesCtr if iv.len() != 16 => None,
         TeeAlgorithm::AesCtr => match key.len() {
             16 => Some(Cipher::Aes128Ctr(Ctr128BE::<Aes128>::new(
                 GenericArray::from_slice(key),

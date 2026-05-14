@@ -75,13 +75,13 @@ impl Task {
         &self,
         prop_set: TeePropSet,
         index: u32,
-        name_buf: Option<&mut [u8]>,
+        name_buf: Option<UserMutPtr<u8>>,
         name_len: Option<UserMutPtr<u32>>,
         prop_buf: &mut [u8],
         prop_len: UserMutPtr<u32>,
         prop_type: UserMutPtr<u32>,
     ) -> Result<(), TeeResult> {
-        if name_buf.is_some() && name_len.is_some() {
+        if name_buf.is_some() || name_len.is_some() {
             #[cfg(debug_assertions)]
             todo!("return the name of a given property index");
             #[cfg(not(debug_assertions))]
@@ -96,7 +96,8 @@ impl Task {
                     return Err(TeeResult::ShortBuffer);
                 }
                 let identity = self.client_identity;
-                prop_buf.copy_from_slice(identity.as_bytes());
+                prop_buf[..core::mem::size_of::<TeeIdentity>()]
+                    .copy_from_slice(identity.as_bytes());
                 prop_len
                     .write_at_offset(0, core::mem::size_of::<TeeIdentity>().truncate())
                     .ok_or(TeeResult::AccessDenied)?;
@@ -113,7 +114,7 @@ impl Task {
                     return Err(TeeResult::ShortBuffer);
                 }
                 let ta_uuid = self.ta_app_id;
-                prop_buf.copy_from_slice(ta_uuid.as_bytes());
+                prop_buf[..core::mem::size_of::<TeeUuid>()].copy_from_slice(ta_uuid.as_bytes());
                 prop_len
                     .write_at_offset(0, core::mem::size_of::<TeeUuid>().truncate())
                     .ok_or(TeeResult::AccessDenied)?;
