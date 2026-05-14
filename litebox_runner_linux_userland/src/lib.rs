@@ -1043,9 +1043,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         let kind = match parts[1] {
             "eventfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Eventfd,
             "pidfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Pidfd,
-            "signalfd" => {
-                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Signalfd
-            }
+            "signalfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Signalfd,
             other => anyhow::bail!("broker-eventfd-bridge: bad kind {other:?}"),
         };
         let handle_id: u64 = parts[2]

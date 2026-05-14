@@ -241,12 +241,8 @@ fn test_clone_for_fork_preserves_per_fd_slot_metadata() {
     let parent_fd = parent_rds
         .fd_from_raw_integer::<MockSubsystem>(raw_fd)
         .expect("parent fd should still exist");
-    let parent_marker = descriptors
-        .with_metadata(&parent_fd, |_m: &CloexecMarker| ());
-    assert!(
-        parent_marker.is_ok(),
-        "parent must have CloexecMarker set"
-    );
+    let parent_marker = descriptors.with_metadata(&parent_fd, |_m: &CloexecMarker| ());
+    assert!(parent_marker.is_ok(), "parent must have CloexecMarker set");
 
     // Fork → child fd table.
     let child_rds = parent_rds.clone_for_fork(&mut descriptors);
@@ -259,8 +255,7 @@ fn test_clone_for_fork_preserves_per_fd_slot_metadata() {
     let child_fd = child_rds
         .fd_from_raw_integer::<MockSubsystem>(raw_fd)
         .expect("child fd should be cloned");
-    let child_marker = descriptors
-        .with_metadata(&child_fd, |_m: &CloexecMarker| ());
+    let child_marker = descriptors.with_metadata(&child_fd, |_m: &CloexecMarker| ());
     assert!(
         child_marker.is_ok(),
         "CloexecMarker must propagate through clone_for_fork's per-slot \

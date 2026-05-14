@@ -334,10 +334,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         eventfd_provider: Option<&Arc<dyn BrokerEventfdProvider>>,
         pidfd_provider: Option<&Arc<dyn BrokerPidfdProvider>>,
     ) -> Result<Option<(super::fork_snapshot::BrokerHandleKind, u64)>, BrokerOpError> {
+        use super::fork_snapshot::BrokerHandleKind;
         use litebox_common_linux::cwfd::notification_frame::{
             NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
         };
-        use super::fork_snapshot::BrokerHandleKind;
         let mut guard = self.inner.lock();
         match &*guard {
             EventFileInner::BrokerBacked { common, .. } => {
@@ -1529,11 +1529,7 @@ mod tests {
             }
         }
         impl BrokerEventfdProvider for RealProviderForTest {
-            fn create_eventfd(
-                &self,
-                initial: u64,
-                semaphore: bool,
-            ) -> Result<u64, BrokerOpError> {
+            fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
                 self.client
                     .lock()
                     .unwrap()
@@ -1547,11 +1543,7 @@ mod tests {
                     .read_eventfd(handle)
                     .map_err(|_| BrokerOpError::Io)
             }
-            fn write_eventfd(
-                &self,
-                handle: u64,
-                value: u64,
-            ) -> Result<(), BrokerOpError> {
+            fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError> {
                 self.client
                     .lock()
                     .unwrap()
@@ -1582,10 +1574,8 @@ mod tests {
         });
 
         // Start with a local Eventfd at counter=42.
-        let ef = super::EventFile::<litebox_platform_multiplex::Platform>::new(
-            42,
-            EfdFlags::NONBLOCK,
-        );
+        let ef =
+            super::EventFile::<litebox_platform_multiplex::Platform>::new(42, EfdFlags::NONBLOCK);
 
         let result = ef.ensure_broker_backed_for_fork(Some(&provider), None);
         let (kind, handle_id) = result
