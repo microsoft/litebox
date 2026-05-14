@@ -57,6 +57,7 @@ impl<FS: ShimFS> Drop for ElfFile<'_, FS> {
         // Fork/exec fd-bridge restore can repurpose the temporary loader fd slot
         // before this guard drops; the descriptor table entry has still been
         // transferred to its intended guest fd, so EBADF is benign here.
+        // (Phase E.2 independently rediscovered this via cross-worker PTY exec.)
         if let Err(err) = self.task.sys_close(self.fd)
             && err != Errno::EBADF
         {
