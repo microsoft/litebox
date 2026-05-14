@@ -54,7 +54,14 @@ impl<'a, FS: ShimFS> ElfFile<'a, FS> {
 
 impl<FS: ShimFS> Drop for ElfFile<'_, FS> {
     fn drop(&mut self) {
-        self.task.sys_close(self.fd).expect("failed to close fd");
+        // Fork/exec fd-bridge restore can repurpose the temporary loader fd slot
+        // before this guard drops; the descriptor table entry has still been
+        // transferred to its intended guest fd, so EBADF is benign here.
+        if let Err(err) = self.task.sys_close(self.fd)
+            && err != Errno::EBADF
+        {
+            panic!("failed to close fd: {err:?}");
+        }
     }
 }
 

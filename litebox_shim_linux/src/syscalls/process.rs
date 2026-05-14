@@ -1784,51 +1784,6 @@ impl<FS: ShimFS> Task<FS> {
             .get(&guest_pid)
             .copied()
             .unwrap_or(ProcessId(pid));
-        if let Err(err) = self.reject_remote_running_process_control(process_id, "pidfd_open") {
-            // Target lives on a different host worker. Only here do we
-            // route through the broker — for local-running targets we
-            // must keep the local pidfd path so tokio's child-process
-            // tracking (which pidfd_opens local children) doesn't get
-            // its wake semantics changed under it.
-            if let Some(provider) = crate::syscalls::eventfd::broker_pidfd_provider()
-                && let Some(host_pid) = self
-                    .global
-                    .fork_child_host_pids
-                    .read()
-                    .get(&process_id.0)
-                    .copied()
-            {
-                let host_pid = u32::try_from(host_pid).map_err(|_| Errno::ESRCH)?;
-                let handle = provider
-                    .create_pidfd(host_pid)
-                    .map_err(super::broker_backed::broker_err_to_errno)?;
-                let pidfd = crate::syscalls::eventfd::EventFile::new_pidfd_broker_backed(
-                    provider,
-                    handle,
-                    flags & PIDFD_NONBLOCK != 0,
-                );
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let typed = dt.insert::<crate::syscalls::eventfd::EventfdSubsystem>(pidfd);
-                let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
-                assert!(old.is_none());
-                drop(dt);
-
-                let raw_fd = self
-                    .files
-                    .borrow()
-                    .insert_raw_fd(typed)
-                    .map_err(|_| Errno::EMFILE)?;
-                return Ok(raw_fd);
-            }
-            return Err(err);
-        }
-
-        let state = self
-            .global
-            .litebox
-            .process_registry()
-            .exit_state(process_id)
-            .ok_or(Errno::ESRCH)?;
         let host_pid_opt: Option<u32> = self
             .global
             .fork_child_host_pids
@@ -1836,12 +1791,31 @@ impl<FS: ShimFS> Task<FS> {
             .get(&process_id.0)
             .copied()
             .and_then(|p| u32::try_from(p).ok());
-        let pidfd = crate::syscalls::eventfd::EventFile::new_pidfd(
-            state.exited,
-            state.subject,
-            flags & PIDFD_NONBLOCK != 0,
-            host_pid_opt,
-        );
+        let subscription =
+            crate::syscalls::guest_pid::try_subscribe_broker_process_exit(process_id)
+                .ok_or(Errno::ESRCH)?;
+        let state = self
+            .global
+            .litebox
+            .process_registry()
+            .exit_state(process_id);
+        let pidfd = if let Some(state) = state {
+            crate::syscalls::eventfd::EventFile::new_pidfd(
+                process_id,
+                state.exited,
+                state.subject,
+                flags & PIDFD_NONBLOCK != 0,
+                host_pid_opt,
+                Some(subscription),
+            )
+        } else {
+            crate::syscalls::eventfd::EventFile::new_broker_process_pidfd(
+                process_id,
+                subscription,
+                flags & PIDFD_NONBLOCK != 0,
+                host_pid_opt,
+            )
+        };
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<crate::syscalls::eventfd::EventfdSubsystem>(pidfd);
         let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
@@ -7235,7 +7209,9 @@ impl<FS: ShimFS> Task<FS> {
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
                             };
-                            if let Some(releaser) = releaser_opt {
+                            if kind == BrokerHandleKind::Pidfd {
+                                Some(BrokerHandleSnapshot { kind, handle_id })
+                            } else if let Some(releaser) = releaser_opt {
                                 match releaser.dup_handle(handle_id) {
                                     Ok(()) => {
                                         broker_transit.push(ForkSnapshotBrokerTransit {
@@ -9084,7 +9060,10 @@ impl<FS: ShimFS> Task<FS> {
                             .as_ref()
                             .map(|p| alloc::sync::Arc::clone(p) as _),
                     };
-                    if let Some(releaser) = releaser
+                    if kind == BrokerHandleKind::Pidfd {
+                        broker_eventfd_specs
+                            .push(alloc::format!("{raw_fd}:{kind_str}:{handle_id}"));
+                    } else if let Some(releaser) = releaser
                         && releaser.dup_handle(handle_id).is_ok()
                     {
                         broker_eventfd_specs
