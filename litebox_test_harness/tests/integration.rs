@@ -25,9 +25,66 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libtest_mimic::{Arguments, Failed, Trial};
+
+// ── Per-test timing telemetry ────────────────────────────────────────
+//
+// Each test produces JSONL lines in `target/test-logs/per-test-timing.jsonl`:
+//   * One synchronous line emitted from run_one_test once the JSON
+//     result is observed: includes t_acquire_ms / t_docker_start_ms /
+//     t_useful_ms / verdict. Always present, even if drain gets cut.
+//   * One optional drain line emitted from spawn_drain when the
+//     container actually exits: `{test, pass, t_drain_ms}`. Joined
+//     to the main line by (test, pass) in the analyzer. May be missing
+//     if cargo-test exits before the drain thread completes.
+//
+// Used to verify that subsequent perf optimizations (cgroup limits,
+// docker overhead trims, timeout budgets) actually help. See plan in
+// `~/.copilot/session-state/.../plan.md`.
+
+fn timing_file() -> &'static Mutex<std::fs::File> {
+    static FILE: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = log_dir().join("per-test-timing.jsonl");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+        Mutex::new(f)
+    })
+}
+
+fn emit_timing_main(
+    test: &str,
+    pass: &str,
+    t_acquire_ms: u128,
+    t_docker_start_ms: u128,
+    t_useful_ms: u128,
+    verdict: &str,
+    jobs: usize,
+) {
+    use std::io::Write as _;
+    let line = format!(
+        "{{\"test\":\"{test}\",\"pass\":\"{pass}\",\
+         \"t_acquire_ms\":{t_acquire_ms},\"t_docker_start_ms\":{t_docker_start_ms},\
+         \"t_useful_ms\":{t_useful_ms},\"verdict\":\"{verdict}\",\"jobs\":{jobs}}}\n",
+    );
+    if let Ok(mut f) = timing_file().lock() {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn emit_timing_drain(test: &str, pass: &str, t_drain_ms: u128) {
+    use std::io::Write as _;
+    let line = format!("{{\"test\":\"{test}\",\"pass\":\"{pass}\",\"t_drain_ms\":{t_drain_ms}}}\n");
+    if let Ok(mut f) = timing_file().lock() {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
 
 // ── Per-test docker run model ────────────────────────────────────────
 //
@@ -54,19 +111,33 @@ use libtest_mimic::{Arguments, Failed, Trial};
 // PIE-only tests) that this model is competitive with the old
 // single-docker-per-pass cache.
 
-/// Cached test IDs from `collect_all_tests` (direct library call, no subprocess).
-static TEST_IDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+/// Cached test (id, timeout_secs) tuples from `collect_all_tests`
+/// (direct library call, no subprocess).
+static TEST_METADATA: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
 
-fn get_test_ids() -> &'static Vec<String> {
-    TEST_IDS.get_or_init(|| {
+fn get_test_metadata() -> &'static Vec<(String, u64)> {
+    TEST_METADATA.get_or_init(|| {
         let tests = litebox_test_harness::coordinator::collect_all_tests();
-        let ids: Vec<String> = tests.into_iter().map(|t| t.id).collect();
-        eprintln!(
-            "[integration] {} test IDs from collect_all_tests",
-            ids.len()
-        );
-        ids
+        let meta: Vec<(String, u64)> =
+            tests.into_iter().map(|t| (t.id, t.timeout_secs)).collect();
+        eprintln!("[integration] {} test IDs from collect_all_tests", meta.len());
+        meta
     })
+}
+
+fn get_test_ids() -> Vec<String> {
+    get_test_metadata().iter().map(|(id, _)| id.clone()).collect()
+}
+
+/// Lookup the harness-declared per-test timeout (the `.timeout(N)` value
+/// the coordinator enforces). Returns 60s as a defensive fallback if
+/// the test ID isn't in the registry (shouldn't happen).
+fn test_timeout_secs(test_id: &str) -> u64 {
+    get_test_metadata()
+        .iter()
+        .find(|(id, _)| id == test_id)
+        .map(|(_, t)| *t)
+        .unwrap_or(60)
 }
 
 /// Whether to keep docker containers after exit (for debugging).
@@ -74,14 +145,48 @@ fn keep_containers() -> bool {
     std::env::var("LITEBOX_KEEP_CONTAINER").is_ok()
 }
 
-/// `--rm` unless `LITEBOX_KEEP_CONTAINER` is set. We pass `--name` so
-/// the container is identifiable in `docker ps` for debugging.
-fn docker_run_base_args() -> Vec<&'static str> {
-    if keep_containers() {
-        vec!["run", "--cap-add", "SYS_PTRACE"]
-    } else {
-        vec!["run", "--rm", "--cap-add", "SYS_PTRACE"]
+/// `--rm` unless `LITEBOX_KEEP_CONTAINER` is set, plus per-container
+/// cgroup-v2 safety bounds so a runaway test (memory leak, fork bomb)
+/// can't take down the host. Defaults are deliberately non-binding
+/// for normal tests; tighten them via env vars if you're stress-
+/// testing or running on a smaller machine:
+///   * `LITEBOX_TEST_CPUS`   — `--cpus` value (default unset: no CPU cap)
+///   * `LITEBOX_TEST_MEMORY` — `--memory` and `--memory-swap` value (default "8g")
+///   * `LITEBOX_TEST_PIDS`   — `--pids-limit` value (default "8192")
+///
+/// `--memory-swap` is set equal to `--memory` so an exploding test
+/// gets OOM-killed instead of thrashing host swap. CPU cap is OFF by
+/// default because matrix-heavy tests (e.g., `PB.sp.*`) fork many
+/// child processes whose throughput craters under a low `--cpus`
+/// value; opt in with `LITEBOX_TEST_CPUS=N` if you're stress-testing
+/// concurrency on a host where containers actually compete for CPU.
+///
+/// The 8 GB / 8192-pid defaults are far above what any test in the
+/// current suite needs (typical: ~500 MB, <100 procs); they're a
+/// safety net, not a tuning knob. The cgroup-setup overhead they add
+/// per `docker run` is small (<5% wall at the default 10-job
+/// concurrency on a 16-core host).
+fn docker_run_base_args() -> Vec<String> {
+    let memory = std::env::var("LITEBOX_TEST_MEMORY").unwrap_or_else(|_| "8g".to_string());
+    let pids = std::env::var("LITEBOX_TEST_PIDS").unwrap_or_else(|_| "8192".to_string());
+    let mut v: Vec<String> = vec!["run".to_string()];
+    if !keep_containers() {
+        v.push("--rm".to_string());
     }
+    v.extend([
+        "--cap-add".to_string(),
+        "SYS_PTRACE".to_string(),
+        "--memory".to_string(),
+        memory.clone(),
+        "--memory-swap".to_string(),
+        memory,
+        "--pids-limit".to_string(),
+        pids,
+    ]);
+    if let Ok(cpus) = std::env::var("LITEBOX_TEST_CPUS") {
+        v.extend(["--cpus".to_string(), cpus]);
+    }
+    v
 }
 
 // ── Bounded semaphore (std-only) ─────────────────────────────────────
@@ -124,12 +229,31 @@ impl Drop for SemaphoreGuard {
 static ACTIVE_JOBS: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
 static DRAIN_BACKLOG: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
 
-fn active_jobs() -> &'static Semaphore {
-    ACTIVE_JOBS.get_or_init(|| {
-        let n = std::env::var("LITEBOX_TEST_JOBS")
+static JOBS_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn default_jobs() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    // Roughly num_cpus / 1.5, clamped to a reasonable range. Past
+    // jobs=10 dockerd serializes container creation badly enough that
+    // further parallelism gives diminishing returns (verified by
+    // phase-2 measurement: jobs=5→10 cut wall by ~9% on PB.* family).
+    ((cpus as f32 / 1.5) as usize).clamp(2, 10)
+}
+
+fn current_jobs_cap() -> usize {
+    *JOBS_CAP.get_or_init(|| {
+        std::env::var("LITEBOX_TEST_JOBS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
+            .unwrap_or_else(default_jobs)
+    })
+}
+
+fn active_jobs() -> &'static Semaphore {
+    ACTIVE_JOBS.get_or_init(|| {
+        let n = current_jobs_cap();
         eprintln!("[integration] LITEBOX_TEST_JOBS={n}");
         Semaphore::new(n)
     })
@@ -140,7 +264,11 @@ fn drain_backlog() -> &'static Semaphore {
         let n = std::env::var("LITEBOX_DRAIN_BACKLOG")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(20);
+            // Scale with active_jobs: containers finishing their
+            // useful phase queue up in the drain backlog while still
+            // owning their docker pid/cgroup. ~4× jobs gives enough
+            // headroom that we never back-pressure the test loop.
+            .unwrap_or_else(|| current_jobs_cap() * 4);
         Semaphore::new(n)
     })
 }
@@ -217,7 +345,14 @@ fn build_docker_cmd(
                 .arg(&filter);
         }
         "litebox" => {
-            cmd.args(["timeout", "--signal=KILL", "120"])
+            // Outer timeout = per-test harness budget + 15 s grace
+            // for teardown_tree (5 s cap) and container shutdown.
+            // Replaces the previous blanket 120 s, which made
+            // failing fast-tests cost 120 s each.
+            let outer = test_timeout_secs(test_id).saturating_add(15);
+            let outer_str = outer.to_string();
+            cmd.args(["timeout", "--signal=KILL"])
+                .arg(&outer_str)
                 .args([
                     "/opt/litebox/litebox_tool_executor",
                     "--rootfs",
@@ -273,7 +408,10 @@ fn log_path_for(pass: &str, test_id: &str, kind: &str) -> PathBuf {
 /// the moment we return — no need for a drain-side join hook.
 fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> {
     use std::io::Write as _;
+    let t_start = Instant::now();
     let permit = active_jobs().acquire();
+    let t_acquired = Instant::now();
+    let t_acquire_ms = t_acquired.duration_since(t_start).as_millis();
     let (_, bins) = setup();
     let container_name = format!(
         "litebox-{}-{}{}-{}-{}",
@@ -298,6 +436,7 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     ));
 
     let label = format!("{pass}[{test_id}]");
+    let t_spawn = Instant::now();
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("docker spawn failed for {label}: {e}"));
@@ -310,8 +449,12 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     let mut stdout_log_file = std::fs::File::create(&stdout_log)
         .unwrap_or_else(|e| panic!("create {}: {e}", stdout_log.display()));
     let mut found: Option<serde_json::Value> = None;
+    let mut t_first_byte: Option<Instant> = None;
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
+        if t_first_byte.is_none() {
+            t_first_byte = Some(Instant::now());
+        }
         let _ = writeln!(stdout_log_file, "{line}");
         if found.is_none()
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
@@ -326,12 +469,50 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
             break;
         }
     }
+    let t_json = Instant::now();
+
+    let t_first_byte = t_first_byte.unwrap_or(t_json);
+    let t_docker_start_ms = t_first_byte.duration_since(t_spawn).as_millis();
+    let t_useful_ms = t_json.duration_since(t_first_byte).as_millis();
+    let verdict: &'static str = match &found {
+        Some(v) => match v.get("result").and_then(|r| r.as_str()) {
+            Some("pass") => "pass",
+            Some("FAIL") => "FAIL",
+            _ => "other",
+        },
+        None => "no_result",
+    };
+    let pass_static: &'static str = match pass {
+        "native" => "native",
+        "litebox" => "litebox",
+        _ => "unknown",
+    };
+    let jobs = current_jobs_cap();
+
+    // Emit the main timing line synchronously (drain may get cut off
+    // if cargo-test exits early).
+    emit_timing_main(
+        test_id,
+        pass_static,
+        t_acquire_ms,
+        t_docker_start_ms,
+        t_useful_ms,
+        verdict,
+        jobs,
+    );
 
     // Hand off the still-running child to a drain worker. It just
     // waits for clean exit so we bound zombies / per-host docker
     // population. Logs are already on disk (stderr via Stdio::from,
-    // stdout via the tee above).
-    spawn_drain(child, container_name.clone());
+    // stdout via the tee above). The drain thread emits its own
+    // t_drain_ms line when wait() returns.
+    spawn_drain(
+        child,
+        container_name.clone(),
+        test_id.to_string(),
+        pass_static,
+        t_json,
+    );
     drop(permit);
 
     found.ok_or_else(|| {
@@ -381,7 +562,13 @@ fn drain_timeout_secs() -> u64 {
 ///     of internal state.
 ///   * `kill(docker_run_pid, SIGTERM)` — unblocks our `wait()` even
 ///     if dockerd isn't responsive.
-fn spawn_drain(mut child: std::process::Child, container_name: String) {
+fn spawn_drain(
+    mut child: std::process::Child,
+    container_name: String,
+    test_id: String,
+    pass: &'static str,
+    t_drain_start: Instant,
+) {
     let backlog_permit = drain_backlog().acquire();
     std::thread::spawn(move || {
         let _hold_backlog = backlog_permit;
@@ -391,12 +578,8 @@ fn spawn_drain(mut child: std::process::Child, container_name: String) {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let watchdog = std::thread::spawn(move || {
             if rx.recv_timeout(timeout).is_ok() {
-                // Child exited cleanly — nothing to do.
                 return;
             }
-            // Defensive force-down. Both calls are best-effort:
-            // if the container/process has already exited they
-            // simply error out (ESRCH / "no such container").
             eprintln!(
                 "[drain] timeout after {} s; forcing teardown of {cname}",
                 timeout.as_secs()
@@ -416,6 +599,8 @@ fn spawn_drain(mut child: std::process::Child, container_name: String) {
         let _ = child.wait();
         let _ = tx.send(());
         let _ = watchdog.join();
+        let t_drain_ms = t_drain_start.elapsed().as_millis();
+        emit_timing_drain(&test_id, pass, t_drain_ms);
     });
 }
 

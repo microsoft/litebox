@@ -141,7 +141,7 @@ cargo test -p litebox_test_harness --test integration
 # Single test (one trial per pass):
 cargo test -p litebox_test_harness --test integration -- 'litebox::PN.B.eof' --exact
 
-# Tune concurrency (default 5):
+# Tune concurrency (default: clamp(num_cpus / 1.5, 2, 10) — e.g., 10 on a 16-core host):
 LITEBOX_TEST_JOBS=8 cargo test -p litebox_test_harness --test integration
 
 # Only native or only litebox:
@@ -149,14 +149,66 @@ cargo test -p litebox_test_harness --test integration -- 'native::'
 cargo test -p litebox_test_harness --test integration -- 'litebox::'
 ```
 
-Each Trial spawns its own `docker run` (`litebox-test` image),
-gets a fresh `litebox_tool_executor` + broker + runner + agent
-matrix, and writes per-Trial logs to
+Each Trial spawns its own `docker run` (`litebox-test` image), gets a
+fresh `litebox_tool_executor` + broker + runner + agent matrix, and
+writes per-Trial logs to
 `target/test-logs/<pass>-<sanitized_id>.{stdout,stderr}.log`.
-Use `cargo test`, not `cargo nextest` (the cross-process build
-lock is not yet implemented). Don't run multiple cargo test
-invocations against the same target dir simultaneously — the
-build cache will thrash.
+
+#### Why `cargo test` and not `cargo nextest`
+
+The repo otherwise uses `cargo nextest` (see `.config/nextest.toml`
+and the CI workflow). This integration test is the deliberate
+exception:
+
+- nextest spawns a **fresh test-binary process per test** (its
+  isolation model).
+- Our `setup()` in `tests/integration.rs` (build the 5 binary
+  variants + ensure the docker image) is amortized via `OnceLock`
+  to once per cargo-test invocation.
+- With nextest's process-per-test, every one of ~5500 tests would
+  re-enter `setup()` and re-invoke `cargo build`. Even a no-op
+  cargo build costs ~1 s; that's ~90 minutes of pure overhead.
+- There's a workable migration (nextest's `[scripts.setup-X]`
+  with a flock to serialize the build), but that's significant
+  infrastructure for a marginal benefit — what we'd gain from
+  nextest (per-test JUnit timing, per-test timeout overrides,
+  test-group concurrency, retries) we already do in-tree via
+  the per-test timing JSONL (below), the `LITEBOX_TEST_JOBS`
+  semaphore, and harness-side `.timeout(N)`.
+
+Don't run multiple `cargo test` invocations against the same target
+dir simultaneously — the build cache will thrash.
+
+#### Tuning knobs
+
+| Env var                   | Default                       | Effect                                                          |
+|---------------------------|-------------------------------|-----------------------------------------------------------------|
+| `LITEBOX_TEST_JOBS`       | `clamp(num_cpus / 1.5, 2, 10)`| Max concurrent `docker run` invocations (the real test parallelism cap). |
+| `LITEBOX_DRAIN_BACKLOG`   | `4 * LITEBOX_TEST_JOBS`       | Max in-flight post-result drain threads.                        |
+| `LITEBOX_TEST_MEMORY`     | `8g`                          | Per-container `--memory` and `--memory-swap` (safety bound — OOM-kill on excess; no swap thrash). |
+| `LITEBOX_TEST_PIDS`       | `8192`                        | Per-container `--pids-limit` (safety bound).                    |
+| `LITEBOX_TEST_CPUS`       | (unset → no CPU cap)          | Per-container `--cpus` (opt-in only — capping CPU often regresses fork-heavy tests). |
+| `LITEBOX_DRAIN_TIMEOUT_SECS` | `30`                       | Watchdog timeout on the post-result drain phase.                |
+| `LITEBOX_KEEP_CONTAINER`  | (unset)                       | If set, omit `--rm` so containers persist for `docker ps` inspection. |
+
+The litebox-pass outer timeout (`timeout --signal=KILL <N>`) is
+per-test, derived from the harness's `.timeout(N)` setting + 15 s
+grace, so failing fast-tests fail in (their budget) + 15 s rather
+than the previous blanket 120 s.
+
+#### Per-test timing telemetry
+
+Each run produces `target/test-logs/per-test-timing.jsonl` with one
+or two JSONL lines per test:
+
+```json
+{"test":"PB.c2p.pie-glibc.dpg1","pass":"native","t_acquire_ms":12,
+ "t_docker_start_ms":810,"t_useful_ms":340,"verdict":"pass","jobs":10}
+{"test":"PB.c2p.pie-glibc.dpg1","pass":"native","t_drain_ms":4500}
+```
+
+`litebox_test_harness/scripts/analyze-test-timing.py` summarizes a
+single run or diffs two runs (e.g., before/after a perf change).
 
 To run a docker invocation by hand for debugging:
 
