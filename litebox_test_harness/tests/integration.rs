@@ -131,14 +131,44 @@ fn keep_containers() -> bool {
     std::env::var("LITEBOX_KEEP_CONTAINER").is_ok()
 }
 
-/// `--rm` unless `LITEBOX_KEEP_CONTAINER` is set. We pass `--name` so
-/// the container is identifiable in `docker ps` for debugging.
-fn docker_run_base_args() -> Vec<&'static str> {
-    if keep_containers() {
-        vec!["run", "--cap-add", "SYS_PTRACE"]
-    } else {
-        vec!["run", "--rm", "--cap-add", "SYS_PTRACE"]
+/// `--rm` unless `LITEBOX_KEEP_CONTAINER` is set, plus per-container
+/// cgroup-v2 limits so we can safely run more concurrent containers
+/// without thrashing the host. Limits are env-overridable:
+///   * `LITEBOX_TEST_CPUS`   — `--cpus` value (default unset: no CPU cap)
+///   * `LITEBOX_TEST_MEMORY` — `--memory` and `--memory-swap` value (default "2g")
+///   * `LITEBOX_TEST_PIDS`   — `--pids-limit` value (default "2048")
+///
+/// `--memory-swap` is set equal to `--memory` so an exploding test
+/// gets OOM-killed instead of thrashing host swap. CPU cap is OFF by
+/// default because matrix-heavy tests (e.g., `PB.sp.*`) fork many
+/// child processes whose throughput craters under a low `--cpus`
+/// value; opt in with `LITEBOX_TEST_CPUS=N` if you're stress-testing
+/// concurrency on a host where containers actually compete for CPU.
+///
+/// At the current default concurrency (5 jobs on 16 cores) these
+/// limits are essentially invisible — they exist so we can bump
+/// `LITEBOX_TEST_JOBS` materially higher without thrashing.
+fn docker_run_base_args() -> Vec<String> {
+    let memory = std::env::var("LITEBOX_TEST_MEMORY").unwrap_or_else(|_| "2g".to_string());
+    let pids = std::env::var("LITEBOX_TEST_PIDS").unwrap_or_else(|_| "2048".to_string());
+    let mut v: Vec<String> = vec!["run".to_string()];
+    if !keep_containers() {
+        v.push("--rm".to_string());
     }
+    v.extend([
+        "--cap-add".to_string(),
+        "SYS_PTRACE".to_string(),
+        "--memory".to_string(),
+        memory.clone(),
+        "--memory-swap".to_string(),
+        memory,
+        "--pids-limit".to_string(),
+        pids,
+    ]);
+    if let Ok(cpus) = std::env::var("LITEBOX_TEST_CPUS") {
+        v.extend(["--cpus".to_string(), cpus]);
+    }
+    v
 }
 
 // ── Bounded semaphore (std-only) ─────────────────────────────────────
