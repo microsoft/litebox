@@ -279,6 +279,7 @@ pub enum BrokerHandleKind {
     Eventfd = 2,
     Signalfd = 3,
     Pty = 4,
+    Pipe = 5,
 }
 
 impl BrokerHandleKind {
@@ -295,6 +296,7 @@ impl BrokerHandleKind {
             2 => Self::Eventfd,
             3 => Self::Signalfd,
             4 => Self::Pty,
+            5 => Self::Pipe,
             _ => return None,
         })
     }

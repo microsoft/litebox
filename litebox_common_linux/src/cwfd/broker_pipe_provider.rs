@@ -29,5 +29,6 @@ pub trait BrokerPipeProvider: BrokerSubscribable {
     fn create_pipe(&self, capacity: u64, atomic_write_size: u64) -> Result<u64, BrokerOpError>;
     fn read_pipe(&self, handle: u64, max_len: u64) -> Result<alloc::vec::Vec<u8>, BrokerOpError>;
     fn write_pipe(&self, handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError>;
+    fn incref_pipe_end(&self, handle: u64, end: BrokerPipeEnd) -> Result<(), BrokerOpError>;
     fn close_pipe_end(&self, handle: u64, end: BrokerPipeEnd);
 }

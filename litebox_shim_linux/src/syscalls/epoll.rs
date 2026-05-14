@@ -56,6 +56,7 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
     HostPipe(Arc<TypedFd<super::host_pipe::HostPipeSubsystem>>),
+    BrokerPipe(Arc<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
@@ -73,6 +74,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             Epoll(Arc<TypedFd<EpollSubsystem<FS>>>),
             Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
             HostPipe(Arc<TypedFd<super::host_pipe::HostPipeSubsystem>>),
+            BrokerPipe(Arc<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
         }
 
         let resolved = {
@@ -103,6 +105,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
             {
                 ResolvedFd::HostPipe(fd)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+            {
+                ResolvedFd::BrokerPipe(fd)
             } else {
                 return Err(Errno::EBADF);
             }
@@ -124,6 +130,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             }
             ResolvedFd::Unix(fd) => EpollDescriptor::Unix(fd),
             ResolvedFd::HostPipe(fd) => EpollDescriptor::HostPipe(fd),
+            ResolvedFd::BrokerPipe(fd) => EpollDescriptor::BrokerPipe(fd),
         })
     }
 }
@@ -137,6 +144,7 @@ enum DescriptorRef<FS: ShimFS> {
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
     Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
     HostPipe(Weak<TypedFd<super::host_pipe::HostPipeSubsystem>>),
+    BrokerPipe(Weak<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
 }
 
 impl<FS: ShimFS> DescriptorRef<FS> {
@@ -150,6 +158,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
             EpollDescriptor::Unix(unix) => Self::Unix(Arc::downgrade(unix)),
             EpollDescriptor::HostPipe(hp) => Self::HostPipe(Arc::downgrade(hp)),
+            EpollDescriptor::BrokerPipe(bp) => Self::BrokerPipe(Arc::downgrade(bp)),
         }
     }
 
@@ -163,6 +172,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::Pipe(pipe) => pipe.upgrade().map(EpollDescriptor::Pipe),
             DescriptorRef::Unix(unix) => unix.upgrade().map(EpollDescriptor::Unix),
             DescriptorRef::HostPipe(hp) => hp.upgrade().map(EpollDescriptor::HostPipe),
+            DescriptorRef::BrokerPipe(bp) => bp.upgrade().map(EpollDescriptor::BrokerPipe),
         }
     }
 
@@ -176,6 +186,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::Pipe(_) => "Pipe",
             DescriptorRef::Unix(_) => "Unix",
             DescriptorRef::HostPipe(_) => "HostPipe",
+            DescriptorRef::BrokerPipe(_) => "BrokerPipe",
         }
     }
 }
@@ -241,6 +252,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
+            EpollDescriptor::BrokerPipe(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
         }
     }
 
@@ -263,6 +278,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 .get_io_pollable(file)
                 .is_some_and(|p| p.needs_host_poll()),
             EpollDescriptor::HostPipe(_) => true,
+            EpollDescriptor::BrokerPipe(_) => false,
             _ => false,
         }
     }
@@ -754,6 +770,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                 EpollDescriptor::Pipe(_) => "Pipe",
                 EpollDescriptor::Unix(_) => "Unix",
                 EpollDescriptor::HostPipe(_) => "HostPipe",
+                EpollDescriptor::BrokerPipe(_) => "BrokerPipe",
             };
             let msg = alloc::format!(
                 "[epoll-diag] ADD fd={fd} type={fd_type} mask={mask:?} events={events:?} host_poll={is_host_poll} ready={}\n",
@@ -842,6 +859,7 @@ impl EpollEntryKey {
             EpollDescriptor::Pipe(pipe_fd) => pipe_fd.object_id(),
             EpollDescriptor::Unix(unix) => unix.object_id(),
             EpollDescriptor::HostPipe(hp) => hp.object_id(),
+            EpollDescriptor::BrokerPipe(bp) => bp.object_id(),
         };
         Self(fd, object_id)
     }

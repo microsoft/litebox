@@ -255,7 +255,9 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 let provider = syscalls::eventfd::broker_pidfd_provider().ok_or(())?;
                 syscalls::eventfd::EventFile::new_pidfd_broker_backed(provider, handle_id, false)
             }
-            BrokerHandleKind::Signalfd | BrokerHandleKind::Pty => return Err(()),
+            BrokerHandleKind::Signalfd | BrokerHandleKind::Pty | BrokerHandleKind::Pipe => {
+                return Err(());
+            }
         };
         let typed_fd: litebox::fd::TypedFd<syscalls::eventfd::EventfdSubsystem> = self
             .task
@@ -1291,7 +1293,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
                                 )
                             })
                         }
-                        BrokerHandleKind::Signalfd | BrokerHandleKind::Pty => None,
+                        BrokerHandleKind::Signalfd
+                        | BrokerHandleKind::Pty
+                        | BrokerHandleKind::Pipe => None,
                     };
                 let Some(event_file) = event_file else {
                     continue;
@@ -1900,6 +1904,14 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         &self,
         fd: usize,
     ) -> Option<alloc::sync::Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>> {
+        let rds = self.raw_descriptor_store.read();
+        rds.fd_from_raw_integer(fd).ok()
+    }
+
+    pub(crate) fn try_broker_pipe_fd(
+        &self,
+        fd: usize,
+    ) -> Option<alloc::sync::Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>> {
         let rds = self.raw_descriptor_store.read();
         rds.fd_from_raw_integer(fd).ok()
     }
