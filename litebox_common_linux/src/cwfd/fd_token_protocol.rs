@@ -77,7 +77,7 @@ pub const CTRL_HEADER_LEN: usize = 16;
 
 /// Maximum body length the codec will encode or accept. Defensive
 /// upper bound — far larger than any legitimate v1 body.
-pub const BODY_MAX: u32 = 4096;
+pub const BODY_MAX: u32 = 65536;
 
 /// Opcodes carried in the `opcode` byte of the control frame.
 ///
@@ -119,6 +119,11 @@ pub enum Opcode {
     SubscribeEventfd = 0x13,
     CreateSignalfd = 0x40,
     ReadSiginfo = 0x41,
+    CreatePipe = 0x50,
+    ReadPipe = 0x51,
+    WritePipe = 0x52,
+    SubscribePipe = 0x53,
+    ClosePipeEnd = 0x54,
     Unsubscribe = 0x14,
     DupHandle = 0x15,
     CreatePidfd = 0x20,
@@ -139,6 +144,11 @@ pub enum Opcode {
     SubscribeEventfdResponse = 0x93,
     CreateSignalfdResponse = 0xC0,
     ReadSiginfoResponse = 0xC1,
+    CreatePipeResponse = 0xD0,
+    ReadPipeResponse = 0xD1,
+    WritePipeResponse = 0xD2,
+    SubscribePipeResponse = 0xD3,
+    ClosePipeEndResponse = 0xD4,
     UnsubscribeResponse = 0x94,
     DupHandleResponse = 0x95,
     CreatePidfdResponse = 0xA0,
@@ -164,6 +174,10 @@ pub mod opcode_ranges {
     pub const SIGNALFD_BASE: u8 = 0x40;
     pub const SIGNALFD_RESPONSE_BASE: u8 = 0xC0;
 
+    /// Pipe state (Phase C): create / read / write / subscribe / close-end.
+    pub const PIPE_BASE: u8 = 0x50;
+    pub const PIPE_RESPONSE_BASE: u8 = 0xD0;
+
     /// Process state (Phase 1 of process-registry rework): registration.
     pub const PROCESS_BASE: u8 = 0x70;
     pub const PROCESS_RESPONSE_BASE: u8 = 0xF0;
@@ -184,6 +198,11 @@ impl Opcode {
             Opcode::SubscribeEventfd => Some(Opcode::SubscribeEventfdResponse),
             Opcode::CreateSignalfd => Some(Opcode::CreateSignalfdResponse),
             Opcode::ReadSiginfo => Some(Opcode::ReadSiginfoResponse),
+            Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
+            Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
+            Opcode::WritePipe => Some(Opcode::WritePipeResponse),
+            Opcode::SubscribePipe => Some(Opcode::SubscribePipeResponse),
+            Opcode::ClosePipeEnd => Some(Opcode::ClosePipeEndResponse),
             Opcode::Unsubscribe => Some(Opcode::UnsubscribeResponse),
             Opcode::DupHandle => Some(Opcode::DupHandleResponse),
             Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
@@ -207,6 +226,11 @@ impl Opcode {
                 | Opcode::SubscribeEventfd
                 | Opcode::CreateSignalfd
                 | Opcode::ReadSiginfo
+                | Opcode::CreatePipe
+                | Opcode::ReadPipe
+                | Opcode::WritePipe
+                | Opcode::SubscribePipe
+                | Opcode::ClosePipeEnd
                 | Opcode::Unsubscribe
                 | Opcode::DupHandle
                 | Opcode::CreatePidfd
@@ -245,6 +269,11 @@ impl TryFrom<u8> for Opcode {
             0x13 => Ok(Opcode::SubscribeEventfd),
             0x40 => Ok(Opcode::CreateSignalfd),
             0x41 => Ok(Opcode::ReadSiginfo),
+            0x50 => Ok(Opcode::CreatePipe),
+            0x51 => Ok(Opcode::ReadPipe),
+            0x52 => Ok(Opcode::WritePipe),
+            0x53 => Ok(Opcode::SubscribePipe),
+            0x54 => Ok(Opcode::ClosePipeEnd),
             0x14 => Ok(Opcode::Unsubscribe),
             0x15 => Ok(Opcode::DupHandle),
             0x20 => Ok(Opcode::CreatePidfd),
@@ -260,6 +289,11 @@ impl TryFrom<u8> for Opcode {
             0x93 => Ok(Opcode::SubscribeEventfdResponse),
             0xC0 => Ok(Opcode::CreateSignalfdResponse),
             0xC1 => Ok(Opcode::ReadSiginfoResponse),
+            0xD0 => Ok(Opcode::CreatePipeResponse),
+            0xD1 => Ok(Opcode::ReadPipeResponse),
+            0xD2 => Ok(Opcode::WritePipeResponse),
+            0xD3 => Ok(Opcode::SubscribePipeResponse),
+            0xD4 => Ok(Opcode::ClosePipeEndResponse),
             0x94 => Ok(Opcode::UnsubscribeResponse),
             0x95 => Ok(Opcode::DupHandleResponse),
             0xA0 => Ok(Opcode::CreatePidfdResponse),
@@ -902,6 +936,235 @@ pub fn parse_read_siginfo_response_body(body: &[u8]) -> Result<Vec<u8>, Protocol
         });
     }
     Ok(body[8..].to_vec())
+}
+
+/// Body for [`Opcode::CreatePipe`]: (capacity: u64, atomic_write_size: u64).
+pub fn build_create_pipe_request(capacity: u64, atomic_write_size: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&capacity.to_le_bytes());
+    body.extend_from_slice(&atomic_write_size.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::CreatePipe,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_create_pipe_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreatePipe,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let capacity = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let atomic = u64::from_le_bytes(body[8..16].try_into().unwrap());
+    Ok((capacity, atomic))
+}
+
+pub fn build_create_pipe_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreatePipeResponse,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::ReadPipe`]: (handle: u64, max_len: u64).
+pub fn build_read_pipe_request(handle_id: u64, max_len: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::ReadPipe,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_read_pipe_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadPipe,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+    ))
+}
+
+/// Body for [`Opcode::ReadPipeResponse`]: (len: u32, pad: u32, bytes...).
+pub fn build_read_pipe_response_ok(bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + bytes.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::ReadPipeResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_read_pipe_response_body(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadPipeResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadPipeResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
+}
+
+/// Body for [`Opcode::WritePipe`]: (handle: u64, len: u32, pad: u32, bytes...).
+pub fn build_write_pipe_request(handle_id: u64, bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + bytes.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::WritePipe,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_write_pipe_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::WritePipe,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let len = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 16 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::WritePipe,
+            got: body.len(),
+            want: 16 + len,
+        });
+    }
+    Ok((handle, body[16..].to_vec()))
+}
+
+pub fn build_write_pipe_response_ok(written: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::WritePipeResponse,
+        status: StatusCode::Ok,
+        body: written.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_write_pipe_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::WritePipeResponse)
+}
+
+/// Body for [`Opcode::SubscribePipe`]: (handle: u64, sub_id: u64, events: u32, end: u8, pad: 3).
+pub fn build_subscribe_pipe_request(
+    handle_id: u64,
+    subscription_id: u64,
+    events_mask: u32,
+    end: u8,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&subscription_id.to_le_bytes());
+    body.extend_from_slice(&events_mask.to_le_bytes());
+    body.push(end);
+    body.extend_from_slice(&[0u8; 3]);
+    OwnedFrame {
+        opcode: Opcode::SubscribePipe,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_subscribe_pipe_body(body: &[u8]) -> Result<(u64, u64, u32, u8), ProtocolError> {
+    if body.len() != 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SubscribePipe,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    if body[21..24].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+        u32::from_le_bytes(body[16..20].try_into().unwrap()),
+        body[20],
+    ))
+}
+
+pub fn build_subscribe_pipe_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SubscribePipeResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::ClosePipeEnd`]: (handle: u64, end: u8, pad: 7).
+pub fn build_close_pipe_end_request(handle_id: u64, end: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.push(end);
+    body.extend_from_slice(&[0u8; 7]);
+    OwnedFrame {
+        opcode: Opcode::ClosePipeEnd,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_close_pipe_end_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ClosePipeEnd,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    if body[9..16].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((u64::from_le_bytes(body[0..8].try_into().unwrap()), body[8]))
+}
+
+pub fn build_close_pipe_end_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::ClosePipeEndResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
 }
 
 /// Body for [`Opcode::Unsubscribe`]: (handle: u64, sub_id: u64).

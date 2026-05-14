@@ -128,6 +128,8 @@ pub enum SubsystemTag {
     /// shim boundary). The payload is empty in the initial phase;
     /// later phases attach parent/children/exit state.
     Process,
+    /// Broker-hosted anonymous pipe. Wire value `9`. Phase C.
+    Pipe,
     /// Tag that this receiver doesn't recognise. Carries the raw u8
     /// value so the receiver can log diagnostics; callers should reject
     /// the specific fd while continuing to deliver the rest of the
@@ -147,6 +149,7 @@ impl SubsystemTag {
             SubsystemTag::Timerfd => 6,
             SubsystemTag::Inotify => 7,
             SubsystemTag::Process => 8,
+            SubsystemTag::Pipe => 9,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -164,6 +167,7 @@ impl SubsystemTag {
             6 => SubsystemTag::Timerfd,
             7 => SubsystemTag::Inotify,
             8 => SubsystemTag::Process,
+            9 => SubsystemTag::Pipe,
             other => SubsystemTag::Unknown(other),
         }
     }
