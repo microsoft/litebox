@@ -84,6 +84,28 @@ pub const BODY_MAX: u32 = 4096;
 /// Naming convention: request opcodes have arbitrary values; response
 /// opcodes are `request | 0x80`. The handler dispatcher can derive
 /// the response opcode from the request without a lookup table.
+///
+/// # Opcode range allocation
+///
+/// To let the broker-managed-fd kinds grow independently, each kind
+/// owns a 16-byte opcode range. New kinds append within their range;
+/// the response opcode is the request opcode with bit 7 set.
+///
+/// | Range            | Owner                       |
+/// |------------------|-----------------------------|
+/// | `0x00`–`0x0F`    | Token registry + transport  |
+/// | `0x10`–`0x1F`    | Eventfd state (P2.0)        |
+/// | `0x20`–`0x2F`    | Pidfd state (P2.B)          |
+/// | `0x30`–`0x3F`    | UnixSocket state (P2.A)     |
+/// | `0x40`–`0x4F`    | Signalfd state (P2.C)       |
+/// | `0x50`–`0x5F`    | Timerfd state (future)      |
+/// | `0x60`–`0x6F`    | Inotify state (future)      |
+/// | `0x70`–`0x7F`    | reserved for future kinds   |
+///
+/// Within a kind's range, follow the eventfd template:
+/// `0xN0` = create, `0xN1` = read-like primary op, `0xN2` = write-like
+/// primary op, `0xN3` = subscribe, etc. Unsubscribe / DupHandle live
+/// in the shared `0x14` / `0x15` slots — they're kind-agnostic.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Opcode {
@@ -95,13 +117,17 @@ pub enum Opcode {
     ReadEventfd = 0x11,
     WriteEventfd = 0x12,
     SubscribeEventfd = 0x13,
+    CreateSignalfd = 0x40,
+    ReadSiginfo = 0x41,
     Unsubscribe = 0x14,
     DupHandle = 0x15,
+    CreatePidfd = 0x20,
+    PidfdExited = 0x21,
     /// Broker-hosted process registration. Allocates a globally-
     /// unique guest pid in the broker's `process_registry`. The
     /// response carries the new pid as a `StateHandle` id (low 32
     /// bits are the Linux pid). Phase 1: empty request body.
-    RegisterProcess = 0x20,
+    RegisterProcess = 0x70,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -111,9 +137,36 @@ pub enum Opcode {
     ReadEventfdResponse = 0x91,
     WriteEventfdResponse = 0x92,
     SubscribeEventfdResponse = 0x93,
+    CreateSignalfdResponse = 0xC0,
+    ReadSiginfoResponse = 0xC1,
     UnsubscribeResponse = 0x94,
     DupHandleResponse = 0x95,
-    RegisterProcessResponse = 0xa0,
+    CreatePidfdResponse = 0xA0,
+    PidfdExitedResponse = 0xA1,
+    RegisterProcessResponse = 0xF0,
+}
+
+/// Reserved opcode ranges per kind. P2.B/A/C subagents append their
+/// opcodes within these ranges, then add `from_u8` arms + a
+/// `response_for` mapping. The reservation here documents the
+/// allocation contract; the actual `Opcode::CreateXxx` variants
+/// land in their respective subphase commits.
+pub mod opcode_ranges {
+    /// Pidfd state (P2.B): create / exit-query / subscribe.
+    pub const PIDFD_BASE: u8 = 0x20;
+    pub const PIDFD_RESPONSE_BASE: u8 = 0xA0;
+
+    /// UnixSocket state (P2.A): create / sendmsg / recvmsg / shutdown / subscribe.
+    pub const UNIX_SOCKET_BASE: u8 = 0x30;
+    pub const UNIX_SOCKET_RESPONSE_BASE: u8 = 0xB0;
+
+    /// Signalfd state (P2.C): create / read-siginfo / subscribe.
+    pub const SIGNALFD_BASE: u8 = 0x40;
+    pub const SIGNALFD_RESPONSE_BASE: u8 = 0xC0;
+
+    /// Process state (Phase 1 of process-registry rework): registration.
+    pub const PROCESS_BASE: u8 = 0x70;
+    pub const PROCESS_RESPONSE_BASE: u8 = 0xF0;
 }
 
 impl Opcode {
@@ -129,8 +182,12 @@ impl Opcode {
             Opcode::ReadEventfd => Some(Opcode::ReadEventfdResponse),
             Opcode::WriteEventfd => Some(Opcode::WriteEventfdResponse),
             Opcode::SubscribeEventfd => Some(Opcode::SubscribeEventfdResponse),
+            Opcode::CreateSignalfd => Some(Opcode::CreateSignalfdResponse),
+            Opcode::ReadSiginfo => Some(Opcode::ReadSiginfoResponse),
             Opcode::Unsubscribe => Some(Opcode::UnsubscribeResponse),
             Opcode::DupHandle => Some(Opcode::DupHandleResponse),
+            Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
+            Opcode::PidfdExited => Some(Opcode::PidfdExitedResponse),
             Opcode::RegisterProcess => Some(Opcode::RegisterProcessResponse),
             _ => None,
         }
@@ -148,8 +205,12 @@ impl Opcode {
                 | Opcode::ReadEventfd
                 | Opcode::WriteEventfd
                 | Opcode::SubscribeEventfd
+                | Opcode::CreateSignalfd
+                | Opcode::ReadSiginfo
                 | Opcode::Unsubscribe
                 | Opcode::DupHandle
+                | Opcode::CreatePidfd
+                | Opcode::PidfdExited
                 | Opcode::RegisterProcess
         )
     }
@@ -182,9 +243,13 @@ impl TryFrom<u8> for Opcode {
             0x11 => Ok(Opcode::ReadEventfd),
             0x12 => Ok(Opcode::WriteEventfd),
             0x13 => Ok(Opcode::SubscribeEventfd),
+            0x40 => Ok(Opcode::CreateSignalfd),
+            0x41 => Ok(Opcode::ReadSiginfo),
             0x14 => Ok(Opcode::Unsubscribe),
             0x15 => Ok(Opcode::DupHandle),
-            0x20 => Ok(Opcode::RegisterProcess),
+            0x20 => Ok(Opcode::CreatePidfd),
+            0x21 => Ok(Opcode::PidfdExited),
+            0x70 => Ok(Opcode::RegisterProcess),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -193,9 +258,13 @@ impl TryFrom<u8> for Opcode {
             0x91 => Ok(Opcode::ReadEventfdResponse),
             0x92 => Ok(Opcode::WriteEventfdResponse),
             0x93 => Ok(Opcode::SubscribeEventfdResponse),
+            0xC0 => Ok(Opcode::CreateSignalfdResponse),
+            0xC1 => Ok(Opcode::ReadSiginfoResponse),
             0x94 => Ok(Opcode::UnsubscribeResponse),
             0x95 => Ok(Opcode::DupHandleResponse),
-            0xa0 => Ok(Opcode::RegisterProcessResponse),
+            0xA0 => Ok(Opcode::CreatePidfdResponse),
+            0xA1 => Ok(Opcode::PidfdExitedResponse),
+            0xF0 => Ok(Opcode::RegisterProcessResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -571,6 +640,78 @@ pub fn build_create_eventfd_response_ok(handle_id: u64) -> OwnedFrame {
     }
 }
 
+/// Body for [`Opcode::CreatePidfd`]: target host pid (u32 LE).
+pub fn build_create_pidfd_request(target_host_pid: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreatePidfd,
+        status: StatusCode::Ok,
+        body: target_host_pid.to_le_bytes().to_vec(),
+    }
+}
+
+/// Decodes the body of a CreatePidfd request frame.
+pub fn parse_create_pidfd_body(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreatePidfd,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+}
+
+/// Body for [`Opcode::CreatePidfdResponse`]: handle id.
+pub fn build_create_pidfd_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreatePidfdResponse,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Decodes the body of a CreatePidfdResponse success frame.
+pub fn parse_create_pidfd_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::CreatePidfdResponse)
+}
+
+/// Body for [`Opcode::PidfdExited`]: handle id.
+pub fn build_pidfd_exited_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::PidfdExited,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Decodes the body of a PidfdExited request frame.
+pub fn parse_pidfd_exited_request(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::PidfdExited)
+}
+
+/// Body for [`Opcode::PidfdExitedResponse`]: exited flag (u8).
+pub fn build_pidfd_exited_response_ok(exited: bool) -> OwnedFrame {
+    let mut body = Vec::with_capacity(1);
+    body.push(u8::from(exited));
+    OwnedFrame {
+        opcode: Opcode::PidfdExitedResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes the body of a PidfdExitedResponse success frame.
+pub fn parse_pidfd_exited_response_ok(body: &[u8]) -> Result<bool, ProtocolError> {
+    if body.len() != 1 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PidfdExitedResponse,
+            got: body.len(),
+            want: 1,
+        });
+    }
+    Ok(body[0] != 0)
+}
+
 /// Body for [`Opcode::ReadEventfd`]: handle id.
 pub fn build_read_eventfd_request(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
@@ -677,6 +818,92 @@ pub fn build_subscribe_eventfd_response_ok() -> OwnedFrame {
     }
 }
 
+/// Body for [`Opcode::CreateSignalfd`]: (sigmask_lo: u64, sigmask_hi: u64).
+pub fn build_create_signalfd_request(sigmask_lo: u64, sigmask_hi: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&sigmask_lo.to_le_bytes());
+    body.extend_from_slice(&sigmask_hi.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::CreateSignalfd,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes the body of a CreateSignalfd request.
+pub fn parse_create_signalfd_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreateSignalfd,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let lo = u64::from_le_bytes([
+        body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+    ]);
+    let hi = u64::from_le_bytes([
+        body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
+    ]);
+    Ok((lo, hi))
+}
+
+/// Body for [`Opcode::CreateSignalfdResponse`]: handle id.
+pub fn build_create_signalfd_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreateSignalfdResponse,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::ReadSiginfo`]: handle id.
+pub fn build_read_siginfo_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::ReadSiginfo,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::ReadSiginfoResponse`]: (payload_len: u32, pad: u32, payload bytes).
+pub fn build_read_siginfo_response_ok(payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + payload.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(payload);
+    OwnedFrame {
+        opcode: Opcode::ReadSiginfoResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes a ReadSiginfo response body.
+pub fn parse_read_siginfo_response_body(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadSiginfoResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let reserved = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadSiginfoResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
+}
+
 /// Body for [`Opcode::Unsubscribe`]: (handle: u64, sub_id: u64).
 pub fn build_unsubscribe_request(handle_id: u64, subscription_id: u64) -> OwnedFrame {
     let mut body = Vec::with_capacity(16);
@@ -781,6 +1008,8 @@ mod tests {
             Opcode::WriteEventfd,
             Opcode::SubscribeEventfd,
             Opcode::Unsubscribe,
+            Opcode::CreatePidfd,
+            Opcode::PidfdExited,
             Opcode::RegisterResponse,
             Opcode::MaterializeResponse,
             Opcode::ReleaseResponse,
@@ -790,6 +1019,8 @@ mod tests {
             Opcode::WriteEventfdResponse,
             Opcode::SubscribeEventfdResponse,
             Opcode::UnsubscribeResponse,
+            Opcode::CreatePidfdResponse,
+            Opcode::PidfdExitedResponse,
         ] {
             assert_eq!(Opcode::try_from(op as u8).unwrap(), op);
         }
@@ -809,6 +1040,14 @@ mod tests {
             Opcode::Unsubscribe.response_for(),
             Some(Opcode::UnsubscribeResponse)
         );
+        assert_eq!(
+            Opcode::CreatePidfd.response_for(),
+            Some(Opcode::CreatePidfdResponse)
+        );
+        assert_eq!(
+            Opcode::PidfdExited.response_for(),
+            Some(Opcode::PidfdExitedResponse)
+        );
         assert_eq!(Opcode::ReadEventfdResponse.response_for(), None);
     }
 
@@ -825,9 +1064,13 @@ mod tests {
             Opcode::WriteEventfd,
             Opcode::SubscribeEventfd,
             Opcode::Unsubscribe,
+            Opcode::CreatePidfd,
+            Opcode::PidfdExited,
             Opcode::RegisterResponse,
             Opcode::CreateEventfdResponse,
             Opcode::ReadEventfdResponse,
+            Opcode::CreatePidfdResponse,
+            Opcode::PidfdExitedResponse,
         ] {
             assert_eq!(op.expected_fd_count(), 0, "{op:?}");
         }
@@ -874,6 +1117,33 @@ mod tests {
         let g = decode(&bytes).unwrap();
         assert_eq!(g.opcode, Opcode::CreateEventfdResponse);
         assert_eq!(parse_handle_body(g.body, g.opcode).unwrap(), 7);
+    }
+
+    #[test]
+    fn round_trip_pidfd_messages() {
+        let create = build_create_pidfd_request(1234);
+        let bytes = create.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::CreatePidfd);
+        assert_eq!(parse_create_pidfd_body(decoded.body).unwrap(), 1234);
+
+        let create_resp = build_create_pidfd_response_ok(0xabc);
+        let bytes = create_resp.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::CreatePidfdResponse);
+        assert_eq!(parse_create_pidfd_response_ok(decoded.body).unwrap(), 0xabc);
+
+        let exited = build_pidfd_exited_request(0xdef);
+        let bytes = exited.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::PidfdExited);
+        assert_eq!(parse_pidfd_exited_request(decoded.body).unwrap(), 0xdef);
+
+        let exited_resp = build_pidfd_exited_response_ok(true);
+        let bytes = exited_resp.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::PidfdExitedResponse);
+        assert!(parse_pidfd_exited_response_ok(decoded.body).unwrap());
     }
 
     #[test]

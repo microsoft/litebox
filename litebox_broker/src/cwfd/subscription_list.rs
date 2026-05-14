@@ -33,6 +33,7 @@
 //! `EventfdState`.
 
 use std::sync::{Arc, Mutex};
+use std::vec::Vec;
 
 use litebox_common_linux::notification_frame::{NOTIFY_EVENT_MASK_ALL, NotificationFrame};
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -158,19 +159,36 @@ impl SubscriptionList {
             if matched == 0 {
                 continue;
             }
-            let frame = NotificationFrame {
-                subscription_id: sub.id,
-                events: matched,
-            };
+            let frame = NotificationFrame::fixed(sub.id, matched);
             // Lock the sender briefly to write one frame. Hold time
             // bounded by the size of the notification frame plus
             // futex syscall — microseconds in the steady state.
             let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
-            if let Err(err) = sender.send(frame) {
+            if let Err(err) = sender.send(&frame) {
                 tracing::warn!(
                     subscription_id = sub.id,
                     error = %err,
                     "notification send failed; leaving subscription in list",
+                );
+            }
+        }
+    }
+
+    /// Notifies subscribers with an opaque payload frame.
+    pub fn notify_payload(&self, events: u32, payload: Vec<u8>) {
+        let entries = self.entries.lock().expect("SubscriptionList poisoned");
+        for sub in entries.iter() {
+            let matched = events & sub.events_mask;
+            if matched == 0 {
+                continue;
+            }
+            let frame = NotificationFrame::payload(sub.id, matched, payload.clone());
+            let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
+            if let Err(err) = sender.send(&frame) {
+                tracing::warn!(
+                    subscription_id = sub.id,
+                    error = %err,
+                    "payload notification send failed; leaving subscription in list",
                 );
             }
         }
@@ -226,8 +244,8 @@ mod tests {
         list.add(1, NOTIFY_EVENT_IN, Arc::clone(&sender)).unwrap();
         list.notify(NOTIFY_EVENT_IN);
         let frame = receiver.recv().expect("recv");
-        assert_eq!(frame.subscription_id, 1);
-        assert_eq!(frame.events, NOTIFY_EVENT_IN);
+        assert_eq!(frame.subscription_id(), 1);
+        assert_eq!(frame.events(), NOTIFY_EVENT_IN);
     }
 
     #[test]
@@ -240,14 +258,14 @@ mod tests {
 
         list.notify(NOTIFY_EVENT_IN);
         let frame = receiver_in.recv().unwrap();
-        assert_eq!(frame.subscription_id, 1);
+        assert_eq!(frame.subscription_id(), 1);
         // receiver_out has nothing yet — recv would block. Test by
         // sending a sentinel through OUT and confirming it arrives
         // BEFORE any IN-only notification.
         list.notify(NOTIFY_EVENT_OUT);
         let frame_out = receiver_out.recv().unwrap();
-        assert_eq!(frame_out.subscription_id, 2);
-        assert_eq!(frame_out.events, NOTIFY_EVENT_OUT);
+        assert_eq!(frame_out.subscription_id(), 2);
+        assert_eq!(frame_out.events(), NOTIFY_EVENT_OUT);
     }
 
     #[test]
@@ -258,9 +276,9 @@ mod tests {
         // Notify with IN|OUT — subscription only wants IN.
         list.notify(NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT);
         let frame = receiver.recv().unwrap();
-        assert_eq!(frame.subscription_id, 1);
+        assert_eq!(frame.subscription_id(), 1);
         // Only the IN bit, not OUT.
-        assert_eq!(frame.events, NOTIFY_EVENT_IN);
+        assert_eq!(frame.events(), NOTIFY_EVENT_IN);
     }
 
     #[test]
@@ -328,11 +346,11 @@ mod tests {
         let f1 = receiver1.recv().unwrap();
         let f2 = receiver2.recv().unwrap();
         let f3 = receiver3.recv().unwrap();
-        assert_eq!(f1.subscription_id, 10);
-        assert_eq!(f2.subscription_id, 20);
-        assert_eq!(f3.subscription_id, 30);
+        assert_eq!(f1.subscription_id(), 10);
+        assert_eq!(f2.subscription_id(), 20);
+        assert_eq!(f3.subscription_id(), 30);
         for f in [f1, f2, f3] {
-            assert_eq!(f.events, NOTIFY_EVENT_IN);
+            assert_eq!(f.events(), NOTIFY_EVENT_IN);
         }
     }
 
@@ -357,7 +375,7 @@ mod tests {
         let (_keep, mut receiver2) = (sender2, _r2);
         list.notify(NOTIFY_EVENT_IN);
         let f = receiver2.recv().unwrap();
-        assert_eq!(f.subscription_id, 2);
+        assert_eq!(f.subscription_id(), 2);
     }
 
     #[test]

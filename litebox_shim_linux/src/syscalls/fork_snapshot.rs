@@ -235,6 +235,95 @@ pub struct FdMetadataSnapshot {
     pub anon_ino: Option<u64>,
     /// Directory stream continuation offset for `getdents64`.
     pub diroff: Option<u64>,
+    /// Broker-managed-fd handle reference, when this fd's authoritative
+    /// state lives in the broker and survives cross-worker fork+exec.
+    /// `None` for ordinary local fds (the existing semantics path).
+    ///
+    /// This is the **Phase 2.F** extension that closes the
+    /// delayed-fork-bridge gap pinned by `PIDF.exit_inherit.<bt>` non-PIE
+    /// and `EV.fork_inherit*.<bt>` non-PIE litebox failures. At snapshot
+    /// time, the parent records the broker handle id + kind here; at
+    /// restore time the child dispatches on `kind` to call the matching
+    /// broker provider's `dup_handle` and construct the right
+    /// broker-backed shim variant.
+    pub broker_handle: Option<BrokerHandleSnapshot>,
+}
+
+/// Broker handle reference carried through `FdMetadataSnapshot` so a
+/// fork-snapshot can convey "this fd's authoritative state lives at
+/// broker handle id `handle_id` of kind `kind`". The child-side restore
+/// looks up the corresponding worker-side broker provider for `kind`
+/// and calls `dup_handle(handle_id)` to acquire its own reference,
+/// then constructs the appropriate `Subsystem::Entry` variant.
+///
+/// Phase 2.F-aware kinds (the only ones with broker plumbing today):
+/// `Pidfd`, `Eventfd`, `Signalfd`. Future broker-managed kinds (Unix
+/// socket, timerfd, inotify) extend the enum without further wire-
+/// format changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrokerHandleSnapshot {
+    pub kind: BrokerHandleKind,
+    pub handle_id: u64,
+}
+
+/// Kind tag for [`BrokerHandleSnapshot`]. Mirrors a subset of
+/// `litebox_broker::cwfd::fd_tokens::FdKind` — the kinds for which the
+/// shim has a broker-backed file variant. Defined locally in the
+/// snapshot module to avoid pulling in a `litebox_broker` dependency
+/// on the no_std shim crate; the boundary code translates between the
+/// two enums when entering/leaving the broker layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BrokerHandleKind {
+    Pidfd = 1,
+    Eventfd = 2,
+    Signalfd = 3,
+}
+
+impl BrokerHandleKind {
+    #[inline]
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            1 => Self::Pidfd,
+            2 => Self::Eventfd,
+            3 => Self::Signalfd,
+            _ => return None,
+        })
+    }
+}
+
+/// Phase 2.F: rollback ledger entry for a broker handle dup'd into a
+/// fork snapshot. Held in `ForkContext.fork_snapshot_broker_transit`
+/// from snapshot capture until `commit_delayed_fork` completes.
+///
+/// On rollback (snapshot consumption failed): caller drains the list
+/// and invokes `release` to undo the `dup_handle` so the broker
+/// refcount returns to baseline.
+///
+/// Stored as `Arc<dyn BrokerSubscribable>` to be kind-agnostic — all
+/// broker provider traits extend `BrokerSubscribable` which exposes
+/// `release(handle)`.
+pub struct ForkSnapshotBrokerTransit {
+    pub releaser: alloc::sync::Arc<
+        dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+    >,
+    pub handle_id: u64,
+    pub kind: BrokerHandleKind,
+}
+
+impl core::fmt::Debug for ForkSnapshotBrokerTransit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ForkSnapshotBrokerTransit")
+            .field("kind", &self.kind)
+            .field("handle_id", &self.handle_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Classification of a file descriptor for export/import decisions.
@@ -1010,17 +1099,51 @@ impl FdMetadataSnapshot {
         w.write_option_u64(self.sandbox_pty_index.map(u64::from));
         w.write_option_u64(self.anon_ino);
         w.write_option_u64(self.diroff);
+        match &self.broker_handle {
+            Some(bh) => {
+                w.write_u8(1);
+                w.write_u8(bh.kind.as_u8());
+                w.write_u64(bh.handle_id);
+            }
+            None => {
+                w.write_u8(0);
+            }
+        }
     }
 
     fn read(r: &mut SnapshotReader<'_>) -> Result<Self, SnapshotDeserializeError> {
+        let host_stdio_source_fd = r.read_option_i32()?;
+        let is_host_tty_alias = r.read_bool()?;
+        let is_host_pty_device = r.read_bool()?;
+        let is_sandbox_pty_slave = r.read_bool()?;
+        let sandbox_pty_index = r.read_option_u64()?.map(|v| v as u32);
+        let anon_ino = r.read_option_u64()?;
+        let diroff = r.read_option_u64()?;
+        let broker_handle = match r.read_u8()? {
+            0 => None,
+            1 => {
+                let kind_byte = r.read_u8()?;
+                let kind = BrokerHandleKind::from_u8(kind_byte)
+                    .ok_or(SnapshotDeserializeError::InvalidEnum("BrokerHandleKind", kind_byte))?;
+                let handle_id = r.read_u64()?;
+                Some(BrokerHandleSnapshot { kind, handle_id })
+            }
+            other => {
+                return Err(SnapshotDeserializeError::InvalidEnum(
+                    "FdMetadataSnapshot::broker_handle option tag",
+                    other,
+                ));
+            }
+        };
         Ok(Self {
-            host_stdio_source_fd: r.read_option_i32()?,
-            is_host_tty_alias: r.read_bool()?,
-            is_host_pty_device: r.read_bool()?,
-            is_sandbox_pty_slave: r.read_bool()?,
-            sandbox_pty_index: r.read_option_u64()?.map(|v| v as u32),
-            anon_ino: r.read_option_u64()?,
-            diroff: r.read_option_u64()?,
+            host_stdio_source_fd,
+            is_host_tty_alias,
+            is_host_pty_device,
+            is_sandbox_pty_slave,
+            sandbox_pty_index,
+            anon_ino,
+            diroff,
+            broker_handle,
         })
     }
 }
@@ -1351,6 +1474,7 @@ mod tests {
                             sandbox_pty_index: None,
                             anon_ino: None,
                             diroff: None,
+                            broker_handle: None,
                         },
                     },
                     FdEntrySnapshot {
@@ -1367,6 +1491,7 @@ mod tests {
                             sandbox_pty_index: None,
                             anon_ino: None,
                             diroff: None,
+                            broker_handle: None,
                         },
                     },
                     FdEntrySnapshot {
@@ -1383,6 +1508,7 @@ mod tests {
                             sandbox_pty_index: None,
                             anon_ino: Some(12345),
                             diroff: Some(42),
+                            broker_handle: None,
                         },
                     },
                     // fd 4 is a dup of fd 3 — shares the same object_id (OFD aliasing).
@@ -1400,6 +1526,7 @@ mod tests {
                             sandbox_pty_index: None,
                             anon_ino: None,
                             diroff: None,
+                            broker_handle: None,
                         },
                     },
                 ],
@@ -1843,5 +1970,58 @@ mod tests {
         // Other fields still intact.
         assert_eq!(restored.identity.pid, 42);
         assert_eq!(restored.thread.tls_base, Some(0x7f00_dead_beef));
+    }
+
+    /// Phase 2.F.1 wire format extension: `FdMetadataSnapshot.broker_handle`
+    /// round-trips through serialize+deserialize for both None (default
+    /// for legacy callers) and Some(BrokerHandleSnapshot) cases.
+    #[test]
+    fn fd_metadata_snapshot_broker_handle_round_trip_none() {
+        let meta = FdMetadataSnapshot::default();
+        assert!(meta.broker_handle.is_none());
+        let mut w = SnapshotWriter::new();
+        meta.write(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = SnapshotReader::new(&bytes);
+        let restored = FdMetadataSnapshot::read(&mut r).expect("read");
+        assert!(restored.broker_handle.is_none());
+    }
+
+    #[test]
+    fn fd_metadata_snapshot_broker_handle_round_trip_some_pidfd() {
+        let mut meta = FdMetadataSnapshot::default();
+        meta.broker_handle = Some(BrokerHandleSnapshot {
+            kind: BrokerHandleKind::Pidfd,
+            handle_id: 0x1234_5678_9ABC_DEF0,
+        });
+        let mut w = SnapshotWriter::new();
+        meta.write(&mut w);
+        let bytes = w.into_bytes();
+        let mut r = SnapshotReader::new(&bytes);
+        let restored = FdMetadataSnapshot::read(&mut r).expect("read");
+        let bh = restored.broker_handle.expect("broker_handle preserved");
+        assert_eq!(bh.kind, BrokerHandleKind::Pidfd);
+        assert_eq!(bh.handle_id, 0x1234_5678_9ABC_DEF0);
+    }
+
+    #[test]
+    fn fd_metadata_snapshot_broker_handle_round_trip_all_kinds() {
+        for kind in [
+            BrokerHandleKind::Pidfd,
+            BrokerHandleKind::Eventfd,
+            BrokerHandleKind::Signalfd,
+        ] {
+            let mut meta = FdMetadataSnapshot::default();
+            meta.broker_handle = Some(BrokerHandleSnapshot {
+                kind,
+                handle_id: 42,
+            });
+            let mut w = SnapshotWriter::new();
+            meta.write(&mut w);
+            let bytes = w.into_bytes();
+            let mut r = SnapshotReader::new(&bytes);
+            let restored = FdMetadataSnapshot::read(&mut r).expect("read");
+            assert_eq!(restored.broker_handle.unwrap().kind, kind);
+        }
     }
 }

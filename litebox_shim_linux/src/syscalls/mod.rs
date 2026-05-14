@@ -3,6 +3,7 @@
 
 //! Syscalls Handlers
 
+pub(crate) mod broker_backed;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub(crate) mod guest_pid;
@@ -12,11 +13,15 @@ pub(crate) mod guest_pid;
 /// available; the shim consults the registered provider from
 /// `sys_eventfd2`.
 pub use eventfd::broker_eventfd_provider;
+pub use eventfd::broker_pidfd_provider;
 pub use eventfd::set_broker_eventfd_provider;
+pub use eventfd::set_broker_pidfd_provider;
 pub use guest_pid::{
     broker_guest_pid_provider, set_broker_guest_pid_provider, try_register_broker_guest_pid,
     try_release_broker_guest_pid,
 };
+pub use signalfd::broker_signalfd_provider;
+pub use signalfd::set_broker_signalfd_provider;
 
 pub mod file;
 pub mod fork_snapshot;
@@ -26,6 +31,7 @@ pub(crate) mod mm;
 pub(crate) mod net;
 pub(crate) mod netlink;
 pub mod process;
+pub(crate) mod signalfd;
 pub(crate) mod unix;
 
 pub(crate) mod signal;

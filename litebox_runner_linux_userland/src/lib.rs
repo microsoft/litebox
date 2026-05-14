@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
+pub mod broker_pidfd_provider;
+pub mod broker_signalfd_provider;
 pub mod guest_pid_provider;
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -211,6 +213,16 @@ pub struct CliArgs {
     /// is 'r' (read) or 'w' (write).
     #[arg(long = "pipe-bridge", hide = true)]
     pub pipe_bridge: Vec<String>,
+
+    /// Internal: broker-backed eventfd bridge specs for worker-exec.
+    /// Each value has the format `guest_fd:kind:handle_id` where kind is
+    /// `eventfd`, `pidfd`, or `signalfd`. Used by Phase 2.F follow-up
+    /// to seed broker-backed EventFile entries at the right fd slots
+    /// before the worker binary runs, so cross-binary-type exec
+    /// inherits eventfd/pidfd state through the broker rather than
+    /// dropping it.
+    #[arg(long = "broker-eventfd-bridge", hide = true)]
+    pub broker_eventfd_bridge: Vec<String>,
 
     /// Internal: inherited socketpair fd for the stream multiplexer.
     #[arg(long = "mux-fd", hide = true, requires = "fork_restore")]
@@ -903,6 +915,38 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             }
         }
 
+        // Phase 2.F follow-up: install broker-backed EventFile entries for
+        // fds inherited across the cross-binary-type exec boundary.
+        for spec in &cli_args.broker_eventfd_bridge {
+            let parts: Vec<&str> = spec.split(':').collect();
+            if parts.len() != 3 {
+                anyhow::bail!("broker-eventfd-bridge: bad spec {spec:?}");
+            }
+            let guest_fd: usize = parts[0]
+                .parse()
+                .map_err(|e| anyhow!("broker-eventfd-bridge: bad fd {:?}: {e}", parts[0]))?;
+            let kind = match parts[1] {
+                "eventfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Eventfd,
+                "pidfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Pidfd,
+                "signalfd" => {
+                    litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Signalfd
+                }
+                other => anyhow::bail!("broker-eventfd-bridge: bad kind {other:?}"),
+            };
+            let handle_id: u64 = parts[2]
+                .parse()
+                .map_err(|e| anyhow!("broker-eventfd-bridge: bad handle {:?}: {e}", parts[2]))?;
+            program
+                .entrypoints
+                .install_broker_eventfd_fd(guest_fd, kind, handle_id)
+                .map_err(|()| {
+                    anyhow!(
+                        "broker-eventfd-bridge: no provider for kind {:?} (spec {spec:?})",
+                        parts[1]
+                    )
+                })?;
+        }
+
         run_program(program, shutdown, net_worker, worker_result_fd, None);
     }
 
@@ -984,6 +1028,38 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         program
             .entrypoints
             .install_host_pipe_fd(bridge.guest_fd, bridge.host_fd, direction);
+    }
+
+    // Phase 2.F follow-up: install broker-backed EventFile entries for
+    // fds inherited across the cross-binary-type exec boundary.
+    for spec in &cli_args.broker_eventfd_bridge {
+        let parts: Vec<&str> = spec.split(':').collect();
+        if parts.len() != 3 {
+            anyhow::bail!("broker-eventfd-bridge: bad spec {spec:?}");
+        }
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-eventfd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let kind = match parts[1] {
+            "eventfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Eventfd,
+            "pidfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Pidfd,
+            "signalfd" => {
+                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Signalfd
+            }
+            other => anyhow::bail!("broker-eventfd-bridge: bad kind {other:?}"),
+        };
+        let handle_id: u64 = parts[2]
+            .parse()
+            .map_err(|e| anyhow!("broker-eventfd-bridge: bad handle {:?}: {e}", parts[2]))?;
+        program
+            .entrypoints
+            .install_broker_eventfd_fd(guest_fd, kind, handle_id)
+            .map_err(|()| {
+                anyhow!(
+                    "broker-eventfd-bridge: no provider for kind {:?} (spec {spec:?})",
+                    parts[1]
+                )
+            })?;
     }
 
     run_program(program, shutdown, net_worker, worker_result_fd, None);
@@ -2248,6 +2324,39 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
                 .install_host_pipe_fd(bridge.guest_fd, bridge.host_fd, direction);
         }
 
+        // Phase 2.F follow-up: install broker-backed EventFile entries for
+        // fds inherited across the cross-binary-type exec boundary. Specs
+        // are encoded as `guest_fd:kind:handle_id` on `--broker-eventfd-bridge`.
+        for spec in &cli_args.broker_eventfd_bridge {
+            let parts: Vec<&str> = spec.split(':').collect();
+            if parts.len() != 3 {
+                anyhow::bail!("broker-eventfd-bridge: bad spec {spec:?}");
+            }
+            let guest_fd: usize = parts[0]
+                .parse()
+                .map_err(|e| anyhow!("broker-eventfd-bridge: bad fd {:?}: {e}", parts[0]))?;
+            let kind = match parts[1] {
+                "eventfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Eventfd,
+                "pidfd" => litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Pidfd,
+                "signalfd" => {
+                    litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Signalfd
+                }
+                other => anyhow::bail!("broker-eventfd-bridge: bad kind {other:?}"),
+            };
+            let handle_id: u64 = parts[2]
+                .parse()
+                .map_err(|e| anyhow!("broker-eventfd-bridge: bad handle {:?}: {e}", parts[2]))?;
+            program
+                .entrypoints
+                .install_broker_eventfd_fd(guest_fd, kind, handle_id)
+                .map_err(|()| {
+                    anyhow!(
+                        "broker-eventfd-bridge: no provider for kind {:?} (spec {spec:?})",
+                        parts[1]
+                    )
+                })?;
+        }
+
         run_program(
             program,
             shutdown,
@@ -2891,14 +3000,34 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     let _join = litebox_platform_linux_userland::spawn_host_thread(move || {
         NotificationDispatcher::run_reader_loop(&mut receiver, &callbacks);
     });
-    let provider = Arc::new(
+    let eventfd_provider = Arc::new(
         crate::broker_eventfd_provider::RunnerBrokerEventfdProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_eventfd_provider(eventfd_provider)
+        .map_err(|_| anyhow!("eventfd provider already set"))?;
+
+    let pidfd_provider = Arc::new(
+        crate::broker_pidfd_provider::RunnerBrokerPidfdProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_pidfd_provider(pidfd_provider)
+        .map_err(|_| anyhow!("pidfd provider already set"))?;
+
+    let signalfd_provider: Arc<
+        dyn litebox_common_linux::broker_signalfd_provider::BrokerSignalfdProvider,
+    > = Arc::new(
+        crate::broker_signalfd_provider::RunnerBrokerSignalfdProvider::new(
             Arc::clone(&client),
             dispatcher,
         ),
     );
-    litebox_shim_linux::syscalls::set_broker_eventfd_provider(provider)
-        .map_err(|_| anyhow!("provider already set"))?;
+    litebox_shim_linux::syscalls::set_broker_signalfd_provider(signalfd_provider)
+        .map_err(|_| anyhow!("signalfd provider already set"))?;
 
     // Install the guest-pid provider against the same fd-token client.
     // The shim's `do_fork` consults it; if missing, do_fork falls back

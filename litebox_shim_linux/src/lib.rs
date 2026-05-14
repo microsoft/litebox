@@ -223,6 +223,76 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         let ok = rds.fd_into_specific_raw_integer(pipe_fd, guest_fd);
         debug_assert!(ok, "install_mux_pipe_fd: slot {guest_fd} still occupied");
     }
+
+    /// Phase 2.F follow-up: install a broker-backed EventFile at the
+    /// given guest fd slot. Called by the runner during worker-exec
+    /// startup to reattach to a broker handle that the parent dup'd
+    /// before spawning the worker, so the worker sees the same
+    /// shared eventfd / pidfd state as the parent across the
+    /// cross-binary-type exec boundary.
+    ///
+    /// Returns `Err(())` if no broker provider is installed for the
+    /// requested kind (the worker will then have no fd at the slot
+    /// and the binary's read on it will fail with EBADF — a clean
+    /// failure mode for misconfigured workers).
+    pub fn install_broker_eventfd_fd(
+        &self,
+        guest_fd: usize,
+        kind: syscalls::fork_snapshot::BrokerHandleKind,
+        handle_id: u64,
+    ) -> Result<(), ()> {
+        use syscalls::fork_snapshot::BrokerHandleKind;
+        let event_file: syscalls::eventfd::EventFile<Platform> = match kind {
+            BrokerHandleKind::Eventfd => {
+                let provider = syscalls::eventfd::broker_eventfd_provider().ok_or(())?;
+                syscalls::eventfd::EventFile::new_broker_backed(
+                    provider,
+                    handle_id,
+                    litebox_common_linux::EfdFlags::empty(),
+                )
+            }
+            BrokerHandleKind::Pidfd => {
+                let provider = syscalls::eventfd::broker_pidfd_provider().ok_or(())?;
+                syscalls::eventfd::EventFile::new_pidfd_broker_backed(
+                    provider,
+                    handle_id,
+                    false,
+                )
+            }
+            BrokerHandleKind::Signalfd => return Err(()),
+        };
+        let typed_fd: litebox::fd::TypedFd<syscalls::eventfd::EventfdSubsystem> = self
+            .task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert(event_file);
+
+        // Pre-subscribe so the child binary's blocking read() on the
+        // inherited eventfd can be woken by the parent's broker write.
+        // Without this, the broker subscription is only set up by
+        // epoll's register_observer path, and direct read() hangs.
+        self.task
+            .global
+            .litebox
+            .descriptor_table()
+            .with_entry(&typed_fd, |ef: &syscalls::eventfd::EventFile<Platform>| {
+                ef.pre_subscribe_for_broker_blocking_read();
+            });
+
+        let files = self.task.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+
+        // Remove any existing entry at the slot (stdio placeholder etc.).
+        let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+
+        let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
+        debug_assert!(
+            ok,
+            "install_broker_eventfd_fd: slot {guest_fd} still occupied"
+        );
+        Ok(())
+    }
 }
 
 impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
@@ -1186,6 +1256,67 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     let success = rds.fd_into_specific_raw_integer(file, entry.fd);
                     debug_assert!(success, "unix fd slot {} occupied during restore", entry.fd);
                 }
+            }
+        }
+
+        // Phase 2.F.3: Recreate EventFd entries that carry a broker_handle
+        // reference. Re-attach to the same broker handle via the local
+        // provider's `dup_handle` semantics — the parent already dup'd
+        // the handle at snapshot capture, so adopting the existing ref
+        // requires no additional refcount changes.
+        //
+        // Entries without `broker_handle` (e.g. Eventfd with no provider
+        // available at snapshot time, or Timerfd) fall through to a
+        // fresh local fd at the next branch.
+        {
+            use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::EventFd {
+                    continue;
+                }
+                let Some(broker_handle) = entry.metadata.broker_handle else {
+                    continue;
+                };
+                let event_file: Option<syscalls::eventfd::EventFile<Platform>> = match broker_handle
+                    .kind
+                {
+                    BrokerHandleKind::Eventfd => syscalls::eventfd::broker_eventfd_provider()
+                        .map(|provider| {
+                            syscalls::eventfd::EventFile::new_broker_backed(
+                                provider,
+                                broker_handle.handle_id,
+                                litebox_common_linux::EfdFlags::empty(),
+                            )
+                        }),
+                    BrokerHandleKind::Pidfd => {
+                        syscalls::eventfd::broker_pidfd_provider().map(|provider| {
+                            syscalls::eventfd::EventFile::new_pidfd_broker_backed(
+                                provider,
+                                broker_handle.handle_id,
+                                false,
+                            )
+                        })
+                    }
+                    BrokerHandleKind::Signalfd => None,
+                };
+                let Some(event_file) = event_file else {
+                    continue;
+                };
+                let file = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<syscalls::eventfd::EventfdSubsystem>(event_file);
+                let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
+                let success = rds.fd_into_specific_raw_integer(file, entry.fd);
+                debug_assert!(
+                    success,
+                    "eventfd fd slot {} occupied during restore",
+                    entry.fd
+                );
             }
         }
 
@@ -3268,6 +3399,14 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
+            SyscallRequest::Signalfd4 {
+                fd,
+                mask,
+                sizemask,
+                flags,
+            } => {
+                syscall!(sys_signalfd4(fd, mask, sizemask, flags))
+            }
             SyscallRequest::MemfdCreate { name, flags } => {
                 name.to_cstring().map_or(Err(Errno::EFAULT), |name| {
                     syscall!(sys_memfd_create(name, flags))
@@ -3905,6 +4044,15 @@ struct ForkContext {
     /// When true, `commit_delayed_fork` must not replace the parent's
     /// pipe fds because the parent shares the grandparent's fd table.
     parent_is_delayed_fork: bool,
+    /// Phase 2.F: rollback list of broker handles dup'd during
+    /// fork-snapshot capture. Each entry represents a transit ref
+    /// held in the snapshot for the child to consume. On success
+    /// path the child's restore-side BrokerBacked adopts that ref
+    /// (entries dropped on `commit_delayed_fork` success). On
+    /// failure path we drain this list and call `release` on each
+    /// to undo the dup so the broker refcount returns to baseline.
+    fork_snapshot_broker_transit:
+        Vec<crate::syscalls::fork_snapshot::ForkSnapshotBrokerTransit>,
 }
 
 const SHELL_WRITE_SCAN_LEN: usize = 1024;

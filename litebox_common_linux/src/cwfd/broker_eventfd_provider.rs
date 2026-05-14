@@ -11,43 +11,31 @@
 //! wraps `BrokerEventfd` + `NotificationDispatcher`.
 //!
 //! The trait is intentionally minimal — just the ops a shim
-//! `EventFile::BrokerBacked` variant needs.
+//! `EventFile::BrokerBacked` variant needs. Lifecycle and
+//! subscription operations (subscribe / unsubscribe / release /
+//! dup_handle) live on the base [`BrokerSubscribable`] supertrait so
+//! they can be shared across every broker-managed fd kind.
 //!
 //! # Object safety
 //!
 //! All methods are object-safe. The shim stores
-//! `Arc<dyn BrokerEventfdProvider>` per backed eventfd.
+//! `Arc<dyn BrokerEventfdProvider>` per backed eventfd. It can also
+//! be coerced to `Arc<dyn BrokerSubscribable>` for the cross-kind
+//! poll-wake-up scaffolding.
 
-use alloc::sync::Arc;
+use crate::cwfd::broker_subscribable::BrokerSubscribable;
 
-/// Errors a broker eventfd op may return to the shim. Maps to a
-/// `Errno` at the shim's syscall boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BrokerOpError {
-    /// Linux eventfd would block (counter is 0 on read, or saturated
-    /// on write). Maps to `Errno::EAGAIN` in non-blocking mode.
-    WouldBlock,
-    /// `write(u64::MAX)` — invalid sentinel. Maps to `Errno::EINVAL`.
-    InvalidValue,
-    /// The handle id was unknown to the broker. Maps to `Errno::EBADF`.
-    UnknownHandle,
-    /// Generic communications or broker-side failure. Maps to
-    /// `Errno::EIO`.
-    Io,
-}
-
-/// A callback invoked from the broker's notification path when
-/// subscribed events occur. Implementations typically wake a local
-/// `Pollee` so `epoll_wait` / `poll` callers in the shim return.
-pub trait BrokerEventCallback: Send + Sync {
-    fn on_events(&self, events: u32);
-}
+#[doc(inline)]
+pub use crate::cwfd::broker_subscribable::{BrokerEventCallback, BrokerOpError};
 
 /// Trait abstraction over broker-hosted eventfd state.
 ///
+/// Extends [`BrokerSubscribable`] (lifecycle + subscription) with
+/// the eventfd-specific RPCs `create` / `read` / `write`.
+///
 /// The shim sees this trait; the runner provides a concrete impl
 /// (wrapping `BrokerEventfd` and `NotificationDispatcher`).
-pub trait BrokerEventfdProvider: Send + Sync {
+pub trait BrokerEventfdProvider: BrokerSubscribable {
     /// Creates a broker-hosted eventfd with `initial` counter and
     /// optional semaphore mode. Returns the broker handle id, or an
     /// error.
@@ -59,27 +47,33 @@ pub trait BrokerEventfdProvider: Send + Sync {
     /// Writes (adds) to the counter (Linux eventfd `write(2)` semantics).
     fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError>;
 
-    /// Releases the broker handle (decrement refcount). Invoked from
-    /// shim cleanup; failures are logged and dropped — there's no
-    /// useful action a shim can take on a release failure.
-    fn release_eventfd(&self, handle: u64);
+    // ---------------------------------------------------------------
+    // Compatibility shims for pre-P2.0 call sites.
+    //
+    // The eventfd-flavoured names predate the BrokerSubscribable
+    // factoring; these defaults forward to the generic methods so
+    // shim code that still says `provider.release_eventfd(h)` keeps
+    // working without an immediate sweep. New code should call the
+    // BrokerSubscribable methods directly.
+    // ---------------------------------------------------------------
 
-    /// Subscribes to events on the handle. The provider invokes
-    /// `callback.on_events(events)` whenever matching events fire.
-    /// Returns a subscription id for later `unsubscribe_eventfd`.
+    /// Compatibility alias for [`BrokerSubscribable::release`].
+    fn release_eventfd(&self, handle: u64) {
+        self.release(handle);
+    }
+
+    /// Compatibility alias for [`BrokerSubscribable::subscribe`].
     fn subscribe_eventfd(
         &self,
         handle: u64,
         events_mask: u32,
-        callback: Arc<dyn BrokerEventCallback>,
-    ) -> Result<u64, BrokerOpError>;
+        callback: alloc::sync::Arc<dyn BrokerEventCallback>,
+    ) -> Result<u64, BrokerOpError> {
+        self.subscribe(handle, events_mask, callback)
+    }
 
-    /// Removes a subscription.
-    fn unsubscribe_eventfd(&self, handle: u64, subscription_id: u64);
-
-    /// Asks the broker to increment the refcount of an existing
-    /// handle. Used when the worker is about to ship the handle to a
-    /// peer (e.g. cross-worker SCM_RIGHTS) — the peer's eventual
-    /// release balances this dup.
-    fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError>;
+    /// Compatibility alias for [`BrokerSubscribable::unsubscribe`].
+    fn unsubscribe_eventfd(&self, handle: u64, subscription_id: u64) {
+        self.unsubscribe(handle, subscription_id);
+    }
 }

@@ -49,6 +49,7 @@ const MAX_NESTED_EPOLL_DEPTH: usize = 5;
 
 pub(crate) enum EpollDescriptor<FS: ShimFS> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
+    Signalfd(Arc<TypedFd<super::signalfd::SignalfdSubsystem>>),
     Epoll(EntryHandle<Platform, super::epoll::EpollSubsystem<FS>>),
     File(Arc<crate::FileFd<FS>>),
     Socket(Arc<super::net::SocketFd>),
@@ -68,6 +69,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             Socket(Arc<super::net::SocketFd>),
             Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
             Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
+            Signalfd(Arc<TypedFd<super::signalfd::SignalfdSubsystem>>),
             Epoll(Arc<TypedFd<EpollSubsystem<FS>>>),
             Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
             HostPipe(Arc<TypedFd<super::host_pipe::HostPipeSubsystem>>),
@@ -87,6 +89,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
             {
                 ResolvedFd::Eventfd(fd)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
+            {
+                ResolvedFd::Signalfd(fd)
             } else if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<FS>>(raw_fd) {
                 ResolvedFd::Epoll(fd)
             } else if let Ok(fd) =
@@ -107,6 +113,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             ResolvedFd::Socket(fd) => EpollDescriptor::Socket(fd),
             ResolvedFd::Pipe(fd) => EpollDescriptor::Pipe(fd),
             ResolvedFd::Eventfd(fd) => EpollDescriptor::Eventfd(fd),
+            ResolvedFd::Signalfd(fd) => EpollDescriptor::Signalfd(fd),
             ResolvedFd::Epoll(fd) => {
                 let handle = global
                     .litebox
@@ -123,6 +130,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
 
 enum DescriptorRef<FS: ShimFS> {
     Eventfd(Weak<TypedFd<super::eventfd::EventfdSubsystem>>),
+    Signalfd(Weak<TypedFd<super::signalfd::SignalfdSubsystem>>),
     Epoll(WeakEntryHandle<Platform, super::epoll::EpollSubsystem<FS>>),
     File(Weak<crate::FileFd<FS>>),
     Socket(Weak<super::net::SocketFd>),
@@ -135,6 +143,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
     fn from(value: &EpollDescriptor<FS>) -> Self {
         match value {
             EpollDescriptor::Eventfd(file) => Self::Eventfd(Arc::downgrade(file)),
+            EpollDescriptor::Signalfd(file) => Self::Signalfd(Arc::downgrade(file)),
             EpollDescriptor::Epoll(file) => Self::Epoll(file.downgrade()),
             EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
@@ -147,6 +156,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
     fn upgrade(&self) -> Option<EpollDescriptor<FS>> {
         match self {
             DescriptorRef::Eventfd(eventfd) => eventfd.upgrade().map(EpollDescriptor::Eventfd),
+            DescriptorRef::Signalfd(signalfd) => signalfd.upgrade().map(EpollDescriptor::Signalfd),
             DescriptorRef::Epoll(epoll) => epoll.upgrade().map(EpollDescriptor::Epoll),
             DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
@@ -159,6 +169,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
     fn type_name(&self) -> &'static str {
         match self {
             DescriptorRef::Eventfd(_) => "Eventfd",
+            DescriptorRef::Signalfd(_) => "Signalfd",
             DescriptorRef::Epoll(_) => "Epoll",
             DescriptorRef::File(_) => "File",
             DescriptorRef::Socket(_) => "Socket",
@@ -187,6 +198,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
         };
         match self {
             EpollDescriptor::Eventfd(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
+            EpollDescriptor::Signalfd(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
@@ -233,6 +248,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
     /// rather than observer-based notifications.
     fn needs_host_poll(&self, global: &GlobalState<FS>, fs: &FS) -> bool {
         match self {
+            EpollDescriptor::Signalfd(_) => false,
             EpollDescriptor::Eventfd(fd) => global
                 .litebox
                 .descriptor_table()
@@ -731,6 +747,7 @@ impl<FS: ShimFS> EpollFile<FS> {
             use litebox::platform::DebugLogProvider as _;
             let fd_type = match file {
                 EpollDescriptor::Eventfd(_) => "Eventfd",
+                EpollDescriptor::Signalfd(_) => "Signalfd",
                 EpollDescriptor::Epoll(_) => "Epoll",
                 EpollDescriptor::File(_) => "File",
                 EpollDescriptor::Socket(_) => "Socket",
@@ -818,6 +835,7 @@ impl EpollEntryKey {
     fn new<FS: ShimFS>(fd: u32, desc: &EpollDescriptor<FS>) -> Self {
         let object_id = match desc {
             EpollDescriptor::Eventfd(file) => file.object_id(),
+            EpollDescriptor::Signalfd(file) => file.object_id(),
             EpollDescriptor::Epoll(file) => file.object_id(),
             EpollDescriptor::File(file) => file.object_id(),
             EpollDescriptor::Socket(socket_fd) => socket_fd.object_id(),

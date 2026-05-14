@@ -199,3 +199,72 @@ fn test_clone_for_fork_preserves_descriptor_object_id() {
     assert_eq!(parent_fd.object_id(), object_id);
     assert_eq!(child_fd.object_id(), object_id);
 }
+
+/// Regression test for fork-propagation of per-fd-slot metadata.
+///
+/// Linux fork copies the FD_CLOEXEC bit per-fd-slot from parent to child.
+/// `RawDescriptorStorage::clone_for_fork` does this via `duplicate_raw_fd`
+/// which clones the per-slot `metadata` AnyMap. This test asserts that
+/// metadata set on the parent's slot survives into the child's slot.
+///
+/// Discovered as the root cause of the exec_on_remote_host stderr-pipe
+/// hang on `EV.fork_inherit.<nonpie-bt>`: `pipe2(O_CLOEXEC)` correctly
+/// marks both fds CLOEXEC in the parent, but probe in the post-fork
+/// child showed the fds WITHOUT FD_CLOEXEC. `close_on_exec()` in the
+/// placeholder then skipped them, leaving the stderr write end open
+/// across the cross-binary-type exec boundary.
+///
+/// We use a custom marker type rather than the linux-specific
+/// `FileDescriptorFlags` to keep this test no_std-clean.
+#[test]
+fn test_clone_for_fork_preserves_per_fd_slot_metadata() {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CloexecMarker;
+
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+    let mut parent_rds = super::RawDescriptorStorage::new();
+
+    let entry = MockEntry {
+        data: "fd-cloexec".to_string(),
+    };
+    let typed_fd: TypedFd<MockSubsystem> = descriptors.insert(entry);
+
+    // Set the per-slot marker on the parent's slot — mirrors
+    // sys_pipe2 setting FileDescriptorFlags::FD_CLOEXEC on pipe ends.
+    let prev = descriptors.set_fd_metadata(&typed_fd, CloexecMarker);
+    assert!(prev.is_none(), "no prior CloexecMarker metadata expected");
+
+    let raw_fd = parent_rds.fd_into_raw_integer(typed_fd);
+
+    // Sanity: parent reads marker back.
+    let parent_fd = parent_rds
+        .fd_from_raw_integer::<MockSubsystem>(raw_fd)
+        .expect("parent fd should still exist");
+    let parent_marker = descriptors
+        .with_metadata(&parent_fd, |_m: &CloexecMarker| ());
+    assert!(
+        parent_marker.is_ok(),
+        "parent must have CloexecMarker set"
+    );
+
+    // Fork → child fd table.
+    let child_rds = parent_rds.clone_for_fork(&mut descriptors);
+
+    // Child must also have the marker. If this assertion fires, the
+    // fork-bridge's per-slot metadata clone in `duplicate_raw_fd` is
+    // broken — exec_on_remote_host's close_on_exec will then leak CLOEXEC
+    // fds (e.g. pipe ends from pipe2(O_CLOEXEC)) into the placeholder's
+    // post-fork view, hanging the parent on reads that should EOF.
+    let child_fd = child_rds
+        .fd_from_raw_integer::<MockSubsystem>(raw_fd)
+        .expect("child fd should be cloned");
+    let child_marker = descriptors
+        .with_metadata(&child_fd, |_m: &CloexecMarker| ());
+    assert!(
+        child_marker.is_ok(),
+        "CloexecMarker must propagate through clone_for_fork's per-slot \
+         metadata clone (this is the root cause of EV.fork_inherit.<nonpie-bt> \
+         hang documented in checkpoint 010)"
+    );
+}

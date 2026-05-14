@@ -30,11 +30,13 @@
 //!   pointing at sibling `ProcessGroupState` / `SessionState` entries.
 
 use core::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
+use litebox_common_linux::notification_ring::NotificationSender;
 
 use crate::state_registry::StateObject;
+use crate::subscription_list::{SubscribeError, UnsubscribeError};
 
 /// Broker-hosted state for one guest process. Phase 1: opaque pid
 /// holder; payload extends in subsequent phases (see module doc).
@@ -63,6 +65,21 @@ impl StateObject for ProcessState {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn subscribe(
+        &self,
+        _subscription_id: u64,
+        _events_mask: u32,
+        _sender: Arc<Mutex<NotificationSender>>,
+    ) -> Result<(), SubscribeError> {
+        // Phase 1: no subscriptions. Later phases (parent/child exit
+        // fanout) will attach a SubscriptionList here.
+        Ok(())
+    }
+
+    fn unsubscribe(&self, _subscription_id: u64) -> Result<(), UnsubscribeError> {
+        Ok(())
     }
 }
 

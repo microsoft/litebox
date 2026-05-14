@@ -55,32 +55,10 @@ impl RunnerBrokerEventfdProvider {
     }
 }
 
-impl BrokerEventfdProvider for RunnerBrokerEventfdProvider {
-    fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
-        self.client
-            .create_eventfd(initial, semaphore)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn read_eventfd(&self, handle: u64) -> Result<u64, BrokerOpError> {
-        self.client
-            .read_eventfd(handle)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError> {
-        self.client
-            .write_eventfd(handle, value)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn release_eventfd(&self, handle: u64) {
-        if let Err(e) = self.client.release(handle) {
-            tracing::warn!(handle, error = %e, "release_eventfd failed; broker handle may leak");
-        }
-    }
-
-    fn subscribe_eventfd(
+impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable
+    for RunnerBrokerEventfdProvider
+{
+    fn subscribe(
         &self,
         handle: u64,
         events_mask: u32,
@@ -105,16 +83,42 @@ impl BrokerEventfdProvider for RunnerBrokerEventfdProvider {
         }
     }
 
-    fn unsubscribe_eventfd(&self, handle: u64, subscription_id: u64) {
+    fn unsubscribe(&self, handle: u64, subscription_id: u64) {
         self.dispatcher.unregister_callback(subscription_id);
         if let Err(e) = self.client.unsubscribe(handle, subscription_id) {
-            tracing::warn!(handle, subscription_id, error = %e, "unsubscribe_eventfd failed");
+            tracing::warn!(handle, subscription_id, error = %e, "unsubscribe failed");
+        }
+    }
+
+    fn release(&self, handle: u64) {
+        if let Err(e) = self.client.release(handle) {
+            tracing::warn!(handle, error = %e, "release failed; broker handle may leak");
         }
     }
 
     fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
         self.client
             .dup_handle(handle)
+            .map_err(client_err_to_broker_err)
+    }
+}
+
+impl BrokerEventfdProvider for RunnerBrokerEventfdProvider {
+    fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
+        self.client
+            .create_eventfd(initial, semaphore)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn read_eventfd(&self, handle: u64) -> Result<u64, BrokerOpError> {
+        self.client
+            .read_eventfd(handle)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError> {
+        self.client
+            .write_eventfd(handle, value)
             .map_err(client_err_to_broker_err)
     }
 }

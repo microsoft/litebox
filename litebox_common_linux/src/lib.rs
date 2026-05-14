@@ -30,8 +30,8 @@ pub mod vmap;
 // `litebox_common_linux::broker_eventfd_provider::*` etc. import
 // paths working.
 pub use cwfd::{
-    broker_eventfd_provider, fd_token_protocol, fd_transfer_frame, guest_pid_provider,
-    notification_frame,
+    broker_eventfd_provider, broker_pidfd_provider, broker_signalfd_provider, fd_token_protocol,
+    fd_transfer_frame, guest_pid_provider, notification_frame,
 };
 
 #[cfg(feature = "std")]
@@ -664,6 +664,15 @@ bitflags::bitflags! {
         const NOEXEC_SEAL = 0x8;
         const EXEC = 0x10;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct SfdFlags: core::ffi::c_uint {
+        const CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();
+        const NONBLOCK = litebox::fs::OFlags::NONBLOCK.bits();
         const _ = !0;
     }
 }
@@ -2606,6 +2615,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         initval: u32,
         flags: EfdFlags,
     },
+    Signalfd4 {
+        fd: i32,
+        mask: Platform::RawConstPointer<crate::signal::SigSet>,
+        sizemask: usize,
+        flags: SfdFlags,
+    },
     MemfdCreate {
         name: Platform::RawConstPointer<i8>,
         flags: MemfdFlags,
@@ -3538,6 +3553,18 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            Sysno::signalfd => SyscallRequest::Signalfd4 {
+                fd: ctx.sys_req_arg(0),
+                mask: ctx.sys_req_ptr(1),
+                sizemask: ctx.sys_req_arg(2),
+                flags: SfdFlags::empty(),
+            },
+            Sysno::signalfd4 => SyscallRequest::Signalfd4 {
+                fd: ctx.sys_req_arg(0),
+                mask: ctx.sys_req_ptr(1),
+                sizemask: ctx.sys_req_arg(2),
+                flags: SfdFlags::from_bits_truncate(ctx.sys_req_arg(3)),
+            },
             Sysno::memfd_create => SyscallRequest::MemfdCreate {
                 name: ctx.sys_req_ptr(0),
                 flags: MemfdFlags::from_bits_truncate(ctx.sys_req_arg(1)),

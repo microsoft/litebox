@@ -1534,6 +1534,20 @@ impl<FS: ShimFS> Task<FS> {
 
         let files = self.files.borrow();
 
+        if let Ok(sfd) = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
+        {
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&sfd)
+                .ok_or(Errno::EBADF)?;
+            return handle.with_entry(|file| file.read(buf));
+        }
+
         if let Some(instance) = files.inotify_instances.lock().get(&raw_fd).cloned() {
             let (n, eventfd) = {
                 let mut state = instance.lock();
@@ -2440,6 +2454,16 @@ impl<FS: ShimFS> Task<FS> {
             drop(entry);
             return Ok(());
         }
+        if let Ok(fd) = rds.fd_consume_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd) {
+            drop(rds);
+            self.global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&fd)
+                .unwrap();
+            return Ok(());
+        }
+
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd) {
             #[cfg(feature = "trace_syscalls")]
             if raw_fd <= 20 {

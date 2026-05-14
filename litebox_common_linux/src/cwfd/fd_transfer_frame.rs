@@ -110,7 +110,19 @@ pub enum SubsystemTag {
     /// `SOCK_STREAM` AF_INET / AF_INET6 sockets. Listening sockets are
     /// distinguished only after materialisation via `SO_ACCEPTCONN`.)
     TcpSocket,
-    /// Broker-hosted process identity. Wire value `3`. The
+    /// Linux pidfd (`pidfd_open(2)`-created). Wire value `3`. P2.B.
+    Pidfd,
+    /// Linux AF_UNIX socket. Wire value `4`. P2.A. Distinguishes
+    /// `SOCK_STREAM` / `SOCK_SEQPACKET` / `SOCK_DGRAM` and
+    /// listening-vs-connected only via post-materialise inspection.
+    UnixSocket,
+    /// Linux `signalfd(2)`-created fd. Wire value `5`. P2.C.
+    Signalfd,
+    /// Linux `timerfd_create(2)`-created fd. Wire value `6` (future).
+    Timerfd,
+    /// Linux `inotify_init1(2)`-created fd. Wire value `7` (future).
+    Inotify,
+    /// Broker-hosted process identity. Wire value `8`. The
     /// [`StateHandle.id`] of a `Process`-tagged entry is the
     /// globally-unique Linux guest pid (truncated to `u32` at the
     /// shim boundary). The payload is empty in the initial phase;
@@ -129,7 +141,12 @@ impl SubsystemTag {
         match self {
             SubsystemTag::Eventfd => 1,
             SubsystemTag::TcpSocket => 2,
-            SubsystemTag::Process => 3,
+            SubsystemTag::Pidfd => 3,
+            SubsystemTag::UnixSocket => 4,
+            SubsystemTag::Signalfd => 5,
+            SubsystemTag::Timerfd => 6,
+            SubsystemTag::Inotify => 7,
+            SubsystemTag::Process => 8,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -141,7 +158,12 @@ impl SubsystemTag {
         match raw {
             1 => SubsystemTag::Eventfd,
             2 => SubsystemTag::TcpSocket,
-            3 => SubsystemTag::Process,
+            3 => SubsystemTag::Pidfd,
+            4 => SubsystemTag::UnixSocket,
+            5 => SubsystemTag::Signalfd,
+            6 => SubsystemTag::Timerfd,
+            7 => SubsystemTag::Inotify,
+            8 => SubsystemTag::Process,
             other => SubsystemTag::Unknown(other),
         }
     }
@@ -797,7 +819,9 @@ mod tests {
 
     #[test]
     fn subsystem_tag_unknown_round_trips_through_u8() {
-        for raw in [0u8, 3, 0x55, 0x7f, 0x80, 0xff] {
+        // Skip known values; pick a few unrecognised bytes (incl.
+        // mid-range and 0x7f / 0x80 / 0xff boundary cases).
+        for raw in [0u8, 0x55, 0x7e, 0x7f, 0x80, 0xfe, 0xff] {
             let tag = SubsystemTag::from_u8(raw);
             assert_eq!(tag.as_u8(), raw);
             assert!(!tag.is_known(), "raw {raw:#x} should be Unknown");
@@ -812,10 +836,23 @@ mod tests {
     fn subsystem_tag_known_values() {
         assert_eq!(SubsystemTag::Eventfd.as_u8(), 1);
         assert_eq!(SubsystemTag::TcpSocket.as_u8(), 2);
-        assert!(SubsystemTag::Eventfd.is_known());
-        assert!(SubsystemTag::TcpSocket.is_known());
-        assert_eq!(SubsystemTag::from_u8(1), SubsystemTag::Eventfd);
-        assert_eq!(SubsystemTag::from_u8(2), SubsystemTag::TcpSocket);
+        assert_eq!(SubsystemTag::Pidfd.as_u8(), 3);
+        assert_eq!(SubsystemTag::UnixSocket.as_u8(), 4);
+        assert_eq!(SubsystemTag::Signalfd.as_u8(), 5);
+        assert_eq!(SubsystemTag::Timerfd.as_u8(), 6);
+        assert_eq!(SubsystemTag::Inotify.as_u8(), 7);
+        for tag in [
+            SubsystemTag::Eventfd,
+            SubsystemTag::TcpSocket,
+            SubsystemTag::Pidfd,
+            SubsystemTag::UnixSocket,
+            SubsystemTag::Signalfd,
+            SubsystemTag::Timerfd,
+            SubsystemTag::Inotify,
+        ] {
+            assert!(tag.is_known(), "{tag:?} should be known");
+            assert_eq!(SubsystemTag::from_u8(tag.as_u8()), tag);
+        }
     }
 
     #[test]
