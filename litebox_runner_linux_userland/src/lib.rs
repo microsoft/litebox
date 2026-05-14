@@ -13,6 +13,7 @@ extern crate alloc;
 
 pub mod broker_eventfd_provider;
 pub mod broker_pidfd_provider;
+pub mod broker_pipe_provider;
 pub mod broker_pty_provider;
 pub mod broker_signalfd_provider;
 pub mod guest_pid_provider;
@@ -3016,6 +3017,13 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_pidfd_provider(pidfd_provider)
         .map_err(|_| anyhow!("pidfd provider already set"))?;
+
+    let pipe_provider = Arc::new(crate::broker_pipe_provider::RunnerBrokerPipeProvider::new(
+        Arc::clone(&client),
+        Arc::clone(&dispatcher),
+    ));
+    litebox_shim_linux::syscalls::set_broker_pipe_provider(pipe_provider)
+        .map_err(|_| anyhow!("pipe provider already set"))?;
 
     let pty_provider = Arc::new(crate::broker_pty_provider::RunnerBrokerPtyProvider::new(
         Arc::clone(&client),

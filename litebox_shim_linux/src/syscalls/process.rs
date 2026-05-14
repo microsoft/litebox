@@ -7208,6 +7208,9 @@ impl<FS: ShimFS> Task<FS> {
                                 BrokerHandleKind::Pty => super::eventfd::broker_pty_provider()
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
+                                BrokerHandleKind::Pipe => super::broker_pipe::broker_pipe_provider()
+                                    .as_ref()
+                                    .map(|p| alloc::sync::Arc::clone(p) as _),
                             };
                             if kind == BrokerHandleKind::Pidfd {
                                 Some(BrokerHandleSnapshot { kind, handle_id })
@@ -9043,6 +9046,7 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Pidfd => "pidfd",
                         BrokerHandleKind::Signalfd => "signalfd",
                         BrokerHandleKind::Pty => "pty",
+                        BrokerHandleKind::Pipe => "pipe",
                     };
                     let releaser: Option<
                         alloc::sync::Arc<
@@ -9057,6 +9061,9 @@ impl<FS: ShimFS> Task<FS> {
                             .map(|p| alloc::sync::Arc::clone(p) as _),
                         BrokerHandleKind::Signalfd => None,
                         BrokerHandleKind::Pty => super::eventfd::broker_pty_provider()
+                            .as_ref()
+                            .map(|p| alloc::sync::Arc::clone(p) as _),
+                        BrokerHandleKind::Pipe => super::broker_pipe::broker_pipe_provider()
                             .as_ref()
                             .map(|p| alloc::sync::Arc::clone(p) as _),
                     };

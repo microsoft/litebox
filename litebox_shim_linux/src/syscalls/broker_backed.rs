@@ -21,7 +21,7 @@
 //! cross-worker wake-up plumbing.
 
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use litebox::event::{Events, polling::Pollee};
 use litebox::platform::TimeProvider;
@@ -29,7 +29,9 @@ use litebox::sync::RawSyncPrimitivesProvider;
 use litebox_common_linux::cwfd::broker_subscribable::{
     BrokerEventCallback, BrokerOpError, BrokerSubscribable,
 };
-use litebox_common_linux::cwfd::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
+use litebox_common_linux::cwfd::notification_frame::{
+    NOTIFY_EVENT_ERR, NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
+};
 use litebox_common_linux::errno::Errno;
 
 /// Active broker subscription bookkeeping. Held inside a `Mutex`
@@ -55,6 +57,7 @@ struct BrokerSubscription {
 struct BrokerSubscriptionWaker<P: RawSyncPrimitivesProvider + TimeProvider> {
     pollee: Weak<Pollee<P>>,
     local_readable: Weak<AtomicBool>,
+    local_events: Weak<AtomicU32>,
 }
 
 impl<P> BrokerEventCallback for BrokerSubscriptionWaker<P>
@@ -74,6 +77,15 @@ where
         }
         if events & NOTIFY_EVENT_OUT != 0 {
             shim_events |= Events::OUT;
+        }
+        if events & NOTIFY_EVENT_HUP != 0 {
+            shim_events |= Events::HUP;
+        }
+        if events & NOTIFY_EVENT_ERR != 0 {
+            shim_events |= Events::ERR;
+        }
+        if let Some(bits) = self.local_events.upgrade() {
+            bits.fetch_or(shim_events.bits(), Ordering::SeqCst);
         }
         if !shim_events.is_empty() {
             pollee.notify_observers(shim_events);
@@ -97,6 +109,7 @@ pub(crate) struct BrokerBackedCommon<P: RawSyncPrimitivesProvider + TimeProvider
     provider: Arc<dyn BrokerSubscribable>,
     handle: u64,
     local_readable: Arc<AtomicBool>,
+    local_events: Arc<AtomicU32>,
     sub: litebox::sync::Mutex<P, Option<BrokerSubscription>>,
     events_mask: u32,
 }
@@ -120,6 +133,7 @@ where
             provider,
             handle,
             local_readable: Arc::new(AtomicBool::new(false)),
+            local_events: Arc::new(AtomicU32::new(0)),
             sub: litebox::sync::Mutex::new(None),
             events_mask,
         }
@@ -143,6 +157,13 @@ where
     #[inline]
     pub(crate) fn set_readable(&self, value: bool) {
         self.local_readable.store(value, Ordering::SeqCst);
+        if value {
+            self.local_events
+                .fetch_or(Events::IN.bits(), Ordering::SeqCst);
+        } else {
+            self.local_events
+                .fetch_and(!Events::IN.bits(), Ordering::SeqCst);
+        }
     }
 
     /// Reads the cached "readable" flag.
@@ -158,7 +179,7 @@ where
     /// should be ORed in by the embedding variant.
     #[inline]
     pub(crate) fn check_io_events(&self) -> Events {
-        let mut events = Events::empty();
+        let mut events = Events::from_bits_truncate(self.local_events.load(Ordering::SeqCst));
         if self.is_readable() {
             events |= Events::IN;
         }
@@ -188,6 +209,7 @@ where
         let waker: Arc<BrokerSubscriptionWaker<P>> = Arc::new(BrokerSubscriptionWaker {
             pollee: Arc::downgrade(pollee),
             local_readable: Arc::downgrade(&self.local_readable),
+            local_events: Arc::downgrade(&self.local_events),
         });
         let callback: Arc<dyn BrokerEventCallback> = waker;
         match self

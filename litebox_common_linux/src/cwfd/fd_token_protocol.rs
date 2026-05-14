@@ -130,6 +130,7 @@ pub enum Opcode {
     WritePipe = 0x52,
     SubscribePipe = 0x53,
     ClosePipeEnd = 0x54,
+    IncrefPipeEnd = 0x55,
     CreatePty = 0x60,
     PtyRead = 0x61,
     PtyWrite = 0x62,
@@ -164,6 +165,7 @@ pub enum Opcode {
     WritePipeResponse = 0xD2,
     SubscribePipeResponse = 0xD3,
     ClosePipeEndResponse = 0xD4,
+    IncrefPipeEndResponse = 0xD5,
     CreatePtyResponse = 0xE0,
     PtyReadResponse = 0xE1,
     PtyWriteResponse = 0xE2,
@@ -281,6 +283,7 @@ impl Opcode {
             Opcode::WritePipe => Some(Opcode::WritePipeResponse),
             Opcode::SubscribePipe => Some(Opcode::SubscribePipeResponse),
             Opcode::ClosePipeEnd => Some(Opcode::ClosePipeEndResponse),
+            Opcode::IncrefPipeEnd => Some(Opcode::IncrefPipeEndResponse),
             Opcode::CreatePty => Some(Opcode::CreatePtyResponse),
             Opcode::PtyRead => Some(Opcode::PtyReadResponse),
             Opcode::PtyWrite => Some(Opcode::PtyWriteResponse),
@@ -316,6 +319,7 @@ impl Opcode {
                 | Opcode::WritePipe
                 | Opcode::SubscribePipe
                 | Opcode::ClosePipeEnd
+                | Opcode::IncrefPipeEnd
                 | Opcode::CreatePty
                 | Opcode::PtyRead
                 | Opcode::PtyWrite
@@ -366,6 +370,7 @@ impl TryFrom<u8> for Opcode {
             0x52 => Ok(Opcode::WritePipe),
             0x53 => Ok(Opcode::SubscribePipe),
             0x54 => Ok(Opcode::ClosePipeEnd),
+            0x55 => Ok(Opcode::IncrefPipeEnd),
             0x60 => Ok(Opcode::CreatePty),
             0x61 => Ok(Opcode::PtyRead),
             0x62 => Ok(Opcode::PtyWrite),
@@ -393,6 +398,7 @@ impl TryFrom<u8> for Opcode {
             0xD2 => Ok(Opcode::WritePipeResponse),
             0xD3 => Ok(Opcode::SubscribePipeResponse),
             0xD4 => Ok(Opcode::ClosePipeEndResponse),
+            0xD5 => Ok(Opcode::IncrefPipeEndResponse),
             0xE0 => Ok(Opcode::CreatePtyResponse),
             0xE1 => Ok(Opcode::PtyReadResponse),
             0xE2 => Ok(Opcode::PtyWriteResponse),
@@ -1341,6 +1347,31 @@ pub fn build_subscribe_pipe_response_ok() -> OwnedFrame {
     }
 }
 
+/// Body for [`Opcode::IncrefPipeEnd`]: (handle: u64, end: u8, pad: 7).
+pub fn build_incref_pipe_end_request(handle_id: u64, end: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.push(end);
+    body.extend_from_slice(&[0; 7]);
+    OwnedFrame {
+        opcode: Opcode::IncrefPipeEnd,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_incref_pipe_end_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
+    parse_close_pipe_end_body_for_opcode(body, Opcode::IncrefPipeEnd)
+}
+
+pub fn build_incref_pipe_end_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::IncrefPipeEndResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
 /// Body for [`Opcode::ClosePipeEnd`]: (handle: u64, end: u8, pad: 7).
 pub fn build_close_pipe_end_request(handle_id: u64, end: u8) -> OwnedFrame {
     let mut body = Vec::with_capacity(16);
@@ -1355,9 +1386,16 @@ pub fn build_close_pipe_end_request(handle_id: u64, end: u8) -> OwnedFrame {
 }
 
 pub fn parse_close_pipe_end_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
+    parse_close_pipe_end_body_for_opcode(body, Opcode::ClosePipeEnd)
+}
+
+fn parse_close_pipe_end_body_for_opcode(
+    body: &[u8],
+    opcode: Opcode,
+) -> Result<(u64, u8), ProtocolError> {
     if body.len() != 16 {
         return Err(ProtocolError::WrongBodyLen {
-            opcode: Opcode::ClosePipeEnd,
+            opcode,
             got: body.len(),
             want: 16,
         });

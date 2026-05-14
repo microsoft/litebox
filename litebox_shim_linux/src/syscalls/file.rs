@@ -1574,6 +1574,16 @@ impl<FS: ShimFS> Task<FS> {
             });
         }
 
+        if let Some(bp_fd) = files.try_broker_pipe_fd(raw_fd) {
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&bp_fd)
+                .ok_or(Errno::EBADF)?;
+            return handle.with_entry(|entry| entry.read(&self.wait_cx(), buf));
+        }
+
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
@@ -1755,6 +1765,23 @@ impl<FS: ShimFS> Task<FS> {
             let res = handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
                 super::host_pipe::write_host_pipe(self.global.platform, entry, buf)
             });
+            if let Err(Errno::EPIPE) = res {
+                self.send_signal(
+                    litebox_common_linux::signal::Signal::SIGPIPE,
+                    siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+                );
+            }
+            return res;
+        }
+
+        if let Some(bp_fd) = files.try_broker_pipe_fd(raw_fd) {
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&bp_fd)
+                .ok_or(Errno::EBADF)?;
+            let res = handle.with_entry(|entry| entry.write(&self.wait_cx(), buf));
             if let Err(Errno::EPIPE) = res {
                 self.send_signal(
                     litebox_common_linux::signal::Signal::SIGPIPE,
@@ -2529,6 +2556,14 @@ impl<FS: ShimFS> Task<FS> {
             }
             return Ok(());
         }
+        if let Ok(fd) =
+            rds.fd_consume_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+        {
+            drop(rds);
+            let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
+            drop(entry);
+            return Ok(());
+        }
         // All the above cases should cover all the known subsystems, and we've already
         // early-handled the "raw FD not found" case.
         unreachable!()
@@ -2850,6 +2885,15 @@ fn fcntl_status_flags<FS: ShimFS>(
             .ok_or(Errno::EBADF)?;
         return handle
             .with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| Ok(file.get_status()));
+    }
+    if let Some(bp_fd) = files.try_broker_pipe_fd(desc) {
+        let handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&bp_fd)
+            .ok_or(Errno::EBADF)?;
+        return handle.with_entry(|file| Ok(file.get_status()));
     }
 
     files
@@ -4233,6 +4277,22 @@ impl<FS: ShimFS> Task<FS> {
                                 file.raw_fd(),
                                 flags.intersects(OFlags::NONBLOCK),
                             )?;
+                        }
+                        file.set_status(flags);
+                        Ok(0)
+                    });
+                }
+                if let Some(bp_fd) = files.try_broker_pipe_fd(desc) {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(&bp_fd)
+                        .ok_or(Errno::EBADF)?;
+                    return handle.with_entry(|file| {
+                        let diff = (file.get_status() & setfl_mask) ^ flags;
+                        if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                            log_unsupported!("unsupported flags");
                         }
                         file.set_status(flags);
                         Ok(0)
