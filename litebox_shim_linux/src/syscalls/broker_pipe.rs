@@ -14,6 +14,7 @@ use litebox::{
 };
 use litebox_common_linux::{
     broker_pipe_provider::{BrokerOpError, BrokerPipeEnd, BrokerPipeProvider},
+    cwfd::broker_subscribable::BrokerEventCallback,
     cwfd::notification_frame::{
         NOTIFY_EVENT_ERR, NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
     },
@@ -50,6 +51,40 @@ pub(crate) struct BrokerPipeFd<P: RawSyncPrimitivesProvider + litebox::platform:
     pollee: Arc<Pollee<P>>,
 }
 
+/// Adapter that presents a [`BrokerPipeProvider`] as a [`BrokerSubscribable`]
+/// pre-tagged with a specific pipe end. The generic
+/// `BrokerSubscribable::subscribe` impl on `BrokerPipeProvider` cannot carry
+/// per-end direction; this wrapper routes through `subscribe_pipe_end` so
+/// read-end and write-end subscriptions reach the broker correctly tagged.
+struct PipeEndSubscribable {
+    inner: Arc<dyn BrokerPipeProvider>,
+    end: BrokerPipeEnd,
+}
+
+impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable for PipeEndSubscribable {
+    fn subscribe(
+        &self,
+        handle: u64,
+        events_mask: u32,
+        callback: Arc<dyn BrokerEventCallback>,
+    ) -> Result<u64, BrokerOpError> {
+        self.inner
+            .subscribe_pipe_end(handle, self.end, events_mask, callback)
+    }
+
+    fn unsubscribe(&self, handle: u64, subscription_id: u64) {
+        self.inner.unsubscribe(handle, subscription_id)
+    }
+
+    fn release(&self, handle: u64) {
+        self.inner.release(handle)
+    }
+
+    fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
+        self.inner.dup_handle(handle)
+    }
+}
+
 impl<P> BrokerPipeFd<P>
 where
     P: RawSyncPrimitivesProvider + litebox::platform::TimeProvider,
@@ -64,14 +99,22 @@ where
             BrokerPipeEnd::Read => OFlags::RDONLY,
             BrokerPipeEnd::Write => OFlags::WRONLY,
         };
+        // Wrap the provider in a per-end subscribable so the broker
+        // sees the correct end tag on subscribe.
         let subscribable: Arc<
             dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-        > = Arc::clone(&provider) as _;
-        let common = BrokerBackedCommon::new(
-            subscribable,
-            handle,
-            NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR,
-        );
+        > = Arc::new(PipeEndSubscribable {
+            inner: Arc::clone(&provider),
+            end: direction,
+        });
+        // Event mask per end: readers care about IN/HUP/ERR; writers
+        // care about OUT/ERR (a closed reader manifests as ERR/EPIPE
+        // here, not HUP).
+        let events_mask = match direction {
+            BrokerPipeEnd::Read => NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR,
+            BrokerPipeEnd::Write => NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR,
+        };
+        let common = BrokerBackedCommon::new(subscribable, handle, events_mask);
         Self {
             provider,
             common,

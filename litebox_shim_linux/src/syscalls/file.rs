@@ -4534,6 +4534,87 @@ impl<FS: ShimFS> Task<FS> {
             (f, flags.contains(OFlags::CLOEXEC))
         };
 
+        // Eager-broker model: when a broker pipe provider is available,
+        // every `pipe2` allocates a broker-hosted `PipeState`. Both ends
+        // are broker-handles from creation, so a child process that
+        // migrates to a different worker continues to see the same
+        // canonical pipe state — EOF, refcount, readiness all flow
+        // through the broker.
+        //
+        // Falls back to the legacy in-shim `Pipes<Platform>` path only
+        // when no provider is set (i.e. unit tests without a broker).
+        if let Some(provider) = super::broker_pipe::broker_pipe_provider() {
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "[C3] sys_pipe2 entered eager-broker path pid={} flags={:?}\n",
+                    self.pid,
+                    flags,
+                ));
+            }
+            let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
+            let handle = provider
+                .create_pipe(
+                    DEFAULT_PIPE_BUF_SIZE as u64,
+                    // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
+                    4096,
+                )
+                .map_err(|e| {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "[C3] create_pipe FAILED pid={} err={:?}\n",
+                        self.pid,
+                        e,
+                    ));
+                    Errno::ENODEV
+                })?;
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "[C3] create_pipe ok handle={} pid={}\n",
+                    handle,
+                    self.pid,
+                ));
+            }
+
+            let writer_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
+                alloc::sync::Arc::clone(&provider),
+                handle,
+                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
+                entry_flags,
+            );
+            let reader_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
+                provider,
+                handle,
+                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
+                entry_flags,
+            );
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            let writer = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(writer_entry);
+            let reader = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(reader_entry);
+            if cloexec {
+                let _ = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC);
+                let _ = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC);
+            }
+            drop(dt);
+
+            let files = self.files.borrow();
+            let wr_raw_fd = files.insert_raw_fd(writer).map_err(|writer| {
+                let _ = self.global.litebox.descriptor_table_mut().remove(&writer);
+                Errno::EMFILE
+            })?;
+            let rd_raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
+                let _ = self.do_close(wr_raw_fd);
+                let _ = self.global.litebox.descriptor_table_mut().remove(&reader);
+                Errno::EMFILE
+            })?;
+            return Ok((
+                rd_raw_fd.try_into().map_err(|_| Errno::EMFILE)?,
+                wr_raw_fd.try_into().map_err(|_| Errno::EMFILE)?,
+            ));
+        }
+
+        // Legacy fallback: in-shim local pipe (no broker provider).
         let (writer, reader) = self.global.pipes.create_pipe(
             DEFAULT_PIPE_BUF_SIZE,
             pipe_flags,

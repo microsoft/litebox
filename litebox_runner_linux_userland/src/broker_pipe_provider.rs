@@ -23,27 +23,19 @@ impl RunnerBrokerPipeProvider {
 }
 
 impl BrokerSubscribable for RunnerBrokerPipeProvider {
+    /// Generic subscribe — required by `BrokerSubscribable`. This routes
+    /// to the broker as a Read-end subscription, which is **only correct
+    /// for read-end fds**. The shim's `BrokerPipeFd` MUST go through
+    /// `BrokerPipeProvider::subscribe_pipe_end` (which carries the
+    /// direction) instead. Kept here to satisfy the trait for callers
+    /// that don't need per-end direction.
     fn subscribe(
         &self,
         handle: u64,
         events_mask: u32,
         callback: Arc<dyn BrokerEventCallback>,
     ) -> Result<u64, BrokerOpError> {
-        let subscription_id = self.dispatcher.alloc_subscription_id();
-        let bridge: Arc<dyn NotificationCallback> = Arc::new(CallbackBridge { inner: callback });
-        self.dispatcher.register_callback(subscription_id, bridge);
-        match self.client.subscribe_pipe(
-            handle,
-            subscription_id,
-            events_mask,
-            BrokerPipeEnd::Read.as_u8(),
-        ) {
-            Ok(()) => Ok(subscription_id),
-            Err(e) => {
-                self.dispatcher.unregister_callback(subscription_id);
-                Err(client_err_to_broker_err(e))
-            }
-        }
+        self.subscribe_pipe_end(handle, BrokerPipeEnd::Read, events_mask, callback)
     }
 
     fn unsubscribe(&self, handle: u64, subscription_id: u64) {
@@ -94,6 +86,28 @@ impl BrokerPipeProvider for RunnerBrokerPipeProvider {
     fn close_pipe_end(&self, handle: u64, end: BrokerPipeEnd) {
         if let Err(e) = self.client.close_pipe_end(handle, end.as_u8()) {
             tracing::warn!(handle, ?end, error = %e, "pipe close-end failed");
+        }
+    }
+
+    fn subscribe_pipe_end(
+        &self,
+        handle: u64,
+        end: BrokerPipeEnd,
+        events_mask: u32,
+        callback: Arc<dyn BrokerEventCallback>,
+    ) -> Result<u64, BrokerOpError> {
+        let subscription_id = self.dispatcher.alloc_subscription_id();
+        let bridge: Arc<dyn NotificationCallback> = Arc::new(CallbackBridge { inner: callback });
+        self.dispatcher.register_callback(subscription_id, bridge);
+        match self
+            .client
+            .subscribe_pipe(handle, subscription_id, events_mask, end.as_u8())
+        {
+            Ok(()) => Ok(subscription_id),
+            Err(e) => {
+                self.dispatcher.unregister_callback(subscription_id);
+                Err(client_err_to_broker_err(e))
+            }
         }
     }
 }
