@@ -185,8 +185,8 @@ dir simultaneously — the build cache will thrash.
 |---------------------------|-------------------------------|-----------------------------------------------------------------|
 | `LITEBOX_TEST_JOBS`       | `clamp(num_cpus / 1.5, 2, 10)`| Max concurrent `docker run` invocations (the real test parallelism cap). |
 | `LITEBOX_DRAIN_BACKLOG`   | `4 * LITEBOX_TEST_JOBS`       | Max in-flight post-result drain threads.                        |
-| `LITEBOX_TEST_MEMORY`     | `2g`                          | Per-container `--memory` and `--memory-swap` (OOM-kill on excess; no swap thrash). |
-| `LITEBOX_TEST_PIDS`       | `2048`                        | Per-container `--pids-limit`.                                   |
+| `LITEBOX_TEST_MEMORY`     | `8g`                          | Per-container `--memory` and `--memory-swap` (safety bound — OOM-kill on excess; no swap thrash). |
+| `LITEBOX_TEST_PIDS`       | `8192`                        | Per-container `--pids-limit` (safety bound).                    |
 | `LITEBOX_TEST_CPUS`       | (unset → no CPU cap)          | Per-container `--cpus` (opt-in only — capping CPU often regresses fork-heavy tests). |
 | `LITEBOX_DRAIN_TIMEOUT_SECS` | `30`                       | Watchdog timeout on the post-result drain phase.                |
 | `LITEBOX_KEEP_CONTAINER`  | (unset)                       | If set, omit `--rm` so containers persist for `docker ps` inspection. |

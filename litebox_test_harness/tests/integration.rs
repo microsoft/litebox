@@ -146,11 +146,13 @@ fn keep_containers() -> bool {
 }
 
 /// `--rm` unless `LITEBOX_KEEP_CONTAINER` is set, plus per-container
-/// cgroup-v2 limits so we can safely run more concurrent containers
-/// without thrashing the host. Limits are env-overridable:
+/// cgroup-v2 safety bounds so a runaway test (memory leak, fork bomb)
+/// can't take down the host. Defaults are deliberately non-binding
+/// for normal tests; tighten them via env vars if you're stress-
+/// testing or running on a smaller machine:
 ///   * `LITEBOX_TEST_CPUS`   — `--cpus` value (default unset: no CPU cap)
-///   * `LITEBOX_TEST_MEMORY` — `--memory` and `--memory-swap` value (default "2g")
-///   * `LITEBOX_TEST_PIDS`   — `--pids-limit` value (default "2048")
+///   * `LITEBOX_TEST_MEMORY` — `--memory` and `--memory-swap` value (default "8g")
+///   * `LITEBOX_TEST_PIDS`   — `--pids-limit` value (default "8192")
 ///
 /// `--memory-swap` is set equal to `--memory` so an exploding test
 /// gets OOM-killed instead of thrashing host swap. CPU cap is OFF by
@@ -159,12 +161,14 @@ fn keep_containers() -> bool {
 /// value; opt in with `LITEBOX_TEST_CPUS=N` if you're stress-testing
 /// concurrency on a host where containers actually compete for CPU.
 ///
-/// At the current default concurrency (5 jobs on 16 cores) these
-/// limits are essentially invisible — they exist so we can bump
-/// `LITEBOX_TEST_JOBS` materially higher without thrashing.
+/// The 8 GB / 8192-pid defaults are far above what any test in the
+/// current suite needs (typical: ~500 MB, <100 procs); they're a
+/// safety net, not a tuning knob. The cgroup-setup overhead they add
+/// per `docker run` is small (<5% wall at the default 10-job
+/// concurrency on a 16-core host).
 fn docker_run_base_args() -> Vec<String> {
-    let memory = std::env::var("LITEBOX_TEST_MEMORY").unwrap_or_else(|_| "2g".to_string());
-    let pids = std::env::var("LITEBOX_TEST_PIDS").unwrap_or_else(|_| "2048".to_string());
+    let memory = std::env::var("LITEBOX_TEST_MEMORY").unwrap_or_else(|_| "8g".to_string());
+    let pids = std::env::var("LITEBOX_TEST_PIDS").unwrap_or_else(|_| "8192".to_string());
     let mut v: Vec<String> = vec!["run".to_string()];
     if !keep_containers() {
         v.push("--rm".to_string());
