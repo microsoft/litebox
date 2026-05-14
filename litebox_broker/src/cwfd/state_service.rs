@@ -28,12 +28,15 @@ use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use litebox_common_linux::fd_token_protocol::{
     Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
     build_create_pidfd_response_ok, build_create_signalfd_response_ok, build_error_response,
-    build_pidfd_exited_response_ok, build_read_eventfd_response_ok, build_read_siginfo_response_ok,
+    build_mark_process_exited_response_ok, build_pidfd_exited_response_ok,
+    build_read_eventfd_response_ok, build_read_siginfo_response_ok,
     build_register_notification_ring_response_ok, build_register_process_response_ok,
-    build_release_response_ok, build_subscribe_eventfd_response_ok, build_unsubscribe_response_ok,
+    build_release_response_ok, build_subscribe_eventfd_response_ok,
+    build_subscribe_process_exit_response_ok, build_unsubscribe_response_ok,
     build_write_eventfd_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
-    parse_create_signalfd_body, parse_handle_body, parse_pidfd_exited_request,
-    parse_subscribe_eventfd_body, parse_unsubscribe_body, parse_write_eventfd_body,
+    parse_create_signalfd_body, parse_handle_body, parse_mark_process_exited_body,
+    parse_pidfd_exited_request, parse_subscribe_eventfd_body, parse_subscribe_process_exit_body,
+    parse_unsubscribe_body, parse_write_eventfd_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -86,6 +89,10 @@ pub fn handle_request(
         Opcode::Release => handle_release_state(registry, request, in_fds),
         Opcode::DupHandle => handle_dup_handle(registry, request, in_fds),
         Opcode::RegisterProcess => handle_register_process(registry, request, in_fds),
+        Opcode::SubscribeProcessExit => {
+            handle_subscribe_process_exit(registry, conn, request, in_fds)
+        }
+        Opcode::MarkProcessExited => handle_mark_process_exited(registry, request, in_fds),
         other => HandlerResult {
             frame: build_error_response(
                 other.response_for().unwrap_or(Opcode::ReleaseResponse),
@@ -225,6 +232,97 @@ fn handle_register_process(
     let handle = registry.register(ProcessState::arc());
     HandlerResult {
         frame: build_register_process_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn handle_subscribe_process_exit(
+    registry: &BrokerStateRegistry,
+    conn: &ConnState,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SubscribeProcessExitResponse);
+    }
+    let (pid, subscription_id, events_mask) = match parse_subscribe_process_exit_body(request.body)
+    {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::SubscribeProcessExitResponse),
+    };
+    let Some(sender) = conn.notification_sender.as_ref().cloned() else {
+        return status_err(
+            Opcode::SubscribeProcessExitResponse,
+            StatusCode::NoNotificationRing,
+        );
+    };
+    let state = match registry.resolve(StateHandle::from_id(pid), SubsystemTag::Process) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return status_err(
+                Opcode::SubscribeProcessExitResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            return status_err(
+                Opcode::SubscribeProcessExitResponse,
+                StatusCode::SubsystemMismatch,
+            );
+        }
+        Err(_) => return status_err(Opcode::SubscribeProcessExitResponse, StatusCode::Internal),
+    };
+    let process = state
+        .as_any()
+        .downcast_ref::<ProcessState>()
+        .expect("subsystem_tag check guarantees ProcessState");
+    match process.subscribe(subscription_id, events_mask, sender) {
+        Ok(snapshot) => HandlerResult {
+            frame: build_subscribe_process_exit_response_ok(snapshot.map(|s| s.exit_code)),
+            out_fd: None,
+        },
+        Err(SubscribeError::DuplicateId(_)) => status_err(
+            Opcode::SubscribeProcessExitResponse,
+            StatusCode::DuplicateSubscription,
+        ),
+        Err(SubscribeError::UnknownEventBits { .. }) => {
+            protocol_err(Opcode::SubscribeProcessExitResponse)
+        }
+    }
+}
+
+fn handle_mark_process_exited(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::MarkProcessExitedResponse);
+    }
+    let (pid, exit_code) = match parse_mark_process_exited_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::MarkProcessExitedResponse),
+    };
+    let state = match registry.resolve(StateHandle::from_id(pid), SubsystemTag::Process) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return status_err(Opcode::MarkProcessExitedResponse, StatusCode::UnknownHandle);
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            return status_err(
+                Opcode::MarkProcessExitedResponse,
+                StatusCode::SubsystemMismatch,
+            );
+        }
+        Err(_) => return status_err(Opcode::MarkProcessExitedResponse, StatusCode::Internal),
+    };
+    let process = state
+        .as_any()
+        .downcast_ref::<ProcessState>()
+        .expect("subsystem_tag check guarantees ProcessState");
+    process.mark_exited(exit_code);
+    HandlerResult {
+        frame: build_mark_process_exited_response_ok(),
         out_fd: None,
     }
 }
@@ -523,10 +621,15 @@ fn status_err(response_opcode: Opcode, status: StatusCode) -> HandlerResult {
 mod tests {
     use super::*;
     use litebox_common_linux::fd_token_protocol::{
-        build_create_eventfd_request, build_read_eventfd_request, build_subscribe_eventfd_request,
+        build_create_eventfd_request, build_mark_process_exited_request,
+        build_read_eventfd_request, build_register_process_request,
+        build_subscribe_eventfd_request, build_subscribe_process_exit_request,
         build_unsubscribe_request, build_write_eventfd_request, decode,
+        parse_subscribe_process_exit_response_ok,
     };
-    use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
+    use litebox_common_linux::notification_frame::{
+        NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
+    };
     use litebox_common_linux::notification_ring::NotificationReceiver;
 
     fn make_ring_for_conn(conn: &mut ConnState) -> NotificationReceiver {
@@ -723,6 +826,74 @@ mod tests {
             &build_unsubscribe_request(handle_id, 1),
         );
         assert_eq!(unsub2.frame.status, StatusCode::UnknownSubscription);
+    }
+
+    #[test]
+    fn process_subscribe_then_mark_delivers_notification() {
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let mut receiver = make_ring_for_conn(&mut conn);
+
+        let register = run(&registry, &mut conn, &build_register_process_request());
+        assert_eq!(register.frame.status, StatusCode::Ok);
+        let pid = u64::from_le_bytes(register.frame.body[..8].try_into().unwrap());
+
+        let sub = run(
+            &registry,
+            &mut conn,
+            &build_subscribe_process_exit_request(
+                u32::try_from(pid).unwrap(),
+                77,
+                NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP,
+            ),
+        );
+        assert_eq!(sub.frame.status, StatusCode::Ok);
+        assert_eq!(
+            parse_subscribe_process_exit_response_ok(&sub.frame.body).unwrap(),
+            None
+        );
+
+        let mark = run(
+            &registry,
+            &mut conn,
+            &build_mark_process_exited_request(u32::try_from(pid).unwrap(), 33),
+        );
+        assert_eq!(mark.frame.status, StatusCode::Ok);
+        let frame = receiver.recv().unwrap();
+        assert_eq!(frame.subscription_id(), 77);
+        assert_eq!(frame.events(), NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP);
+        assert_eq!(frame.payload_bytes(), Some(&33i32.to_le_bytes()[..]));
+    }
+
+    #[test]
+    fn process_late_subscribe_returns_exit_snapshot() {
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let mut receiver = make_ring_for_conn(&mut conn);
+
+        let register = run(&registry, &mut conn, &build_register_process_request());
+        let pid = u64::from_le_bytes(register.frame.body[..8].try_into().unwrap());
+        let pid = u32::try_from(pid).unwrap();
+        let mark = run(
+            &registry,
+            &mut conn,
+            &build_mark_process_exited_request(pid, 44),
+        );
+        assert_eq!(mark.frame.status, StatusCode::Ok);
+
+        let sub = run(
+            &registry,
+            &mut conn,
+            &build_subscribe_process_exit_request(pid, 78, NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP),
+        );
+        assert_eq!(sub.frame.status, StatusCode::Ok);
+        assert_eq!(
+            parse_subscribe_process_exit_response_ok(&sub.frame.body).unwrap(),
+            Some(44)
+        );
+        let frame = receiver.recv().unwrap();
+        assert_eq!(frame.subscription_id(), 78);
+        assert_eq!(frame.payload_bytes(), Some(&44i32.to_le_bytes()[..]));
     }
 
     #[test]

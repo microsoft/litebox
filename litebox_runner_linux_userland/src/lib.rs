@@ -3021,7 +3021,7 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     > = Arc::new(
         crate::broker_signalfd_provider::RunnerBrokerSignalfdProvider::new(
             Arc::clone(&client),
-            dispatcher,
+            Arc::clone(&dispatcher),
         ),
     );
     litebox_shim_linux::syscalls::set_broker_signalfd_provider(signalfd_provider)
@@ -3032,6 +3032,7 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     // to per-shim allocation (single-worker scenarios).
     let pid_provider = Arc::new(crate::guest_pid_provider::RunnerGuestPidProvider::new(
         Arc::clone(&client),
+        dispatcher,
     ));
     litebox_shim_linux::syscalls::set_broker_guest_pid_provider(pid_provider)
         .map_err(|_| anyhow!("guest-pid provider already set"))?;

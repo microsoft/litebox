@@ -10,8 +10,16 @@
 //! and fall back to per-shim allocation when the provider is unset.
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use litebox_common_linux::guest_pid_provider::{GuestPidProvider, GuestPidProviderError};
+use litebox::event::{Events, observer::Subject};
+use litebox::process::ProcessId;
+use litebox_common_linux::cwfd::broker_subscribable::BrokerEventCallback;
+use litebox_common_linux::cwfd::notification_frame::{NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN};
+use litebox_common_linux::guest_pid_provider::{
+    GuestPidProvider, GuestPidProviderError, ProcessExitSubscription,
+};
+use litebox_platform_multiplex::Platform;
 
 /// Process-global broker guest-pid provider. Set once at runner
 /// bootstrap (in `litebox_runner_linux_userland`). `do_fork`
@@ -39,6 +47,49 @@ pub fn broker_guest_pid_provider() -> Option<Arc<dyn GuestPidProvider>> {
     BROKER_GUEST_PID_PROVIDER.get().cloned()
 }
 
+/// Shim-side wake source for a broker process-exit subscription.
+pub struct BrokerProcessExitWake {
+    pid: u32,
+    subscription_id: u64,
+    provider: Arc<dyn GuestPidProvider>,
+    exited: Arc<AtomicBool>,
+    /// Subject that downstream pidfd/wait code can observe exactly like
+    /// the local process-registry exit subject.
+    pub subject: Arc<Subject<Events, Events, Platform>>,
+    /// Broker-cached exit code if the target had already exited when
+    /// the subscription was installed.
+    pub already_exited: Option<i32>,
+}
+
+impl BrokerProcessExitWake {
+    /// Returns whether the broker has reported process exit to this wake source.
+    pub fn is_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for BrokerProcessExitWake {
+    fn drop(&mut self) {
+        self.provider
+            .unsubscribe_process_exit(self.pid, self.subscription_id);
+    }
+}
+
+struct ProcessExitWaker {
+    exited: Arc<AtomicBool>,
+    subject: Arc<Subject<Events, Events, Platform>>,
+}
+
+impl BrokerEventCallback for ProcessExitWaker {
+    fn on_events(&self, events: u32) {
+        if events & (NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP) == 0 {
+            return;
+        }
+        self.exited.store(true, Ordering::Release);
+        self.subject.notify_observers(Events::IN | Events::HUP);
+    }
+}
+
 /// Convenience: allocate a fresh globally-unique guest pid from the
 /// broker if a provider is installed. Returns `None` if there's no
 /// provider (caller falls back to the per-shim counter) or if the
@@ -57,4 +108,54 @@ pub fn try_release_broker_guest_pid(pid: u32) {
     if let Some(provider) = broker_guest_pid_provider() {
         provider.release_process(pid);
     }
+}
+
+/// Convenience: mark `pid` exited in the broker-owned process state.
+/// Exit teardown must proceed even if this best-effort RPC fails.
+pub fn try_mark_broker_process_exited(pid: u32, exit_code: i32) {
+    if let Some(provider) = broker_guest_pid_provider()
+        && let Err(err) = provider.mark_process_exited(pid, exit_code)
+    {
+        log_unsupported!(
+            "broker MarkProcessExited failed for pid {pid} status {exit_code}: {err:?}"
+        );
+    }
+}
+
+/// Subscribe to broker-owned process exit for a guest [`ProcessId`].
+///
+/// Phase B.2 can use the returned [`BrokerProcessExitWake::subject`] as
+/// the pidfd/wait wake source and [`BrokerProcessExitWake::is_exited`]
+/// (plus `already_exited`) for immediate readiness.
+pub fn try_subscribe_broker_process_exit(process_id: ProcessId) -> Option<BrokerProcessExitWake> {
+    let provider = broker_guest_pid_provider()?;
+    let pid = process_id.0;
+    let exited = Arc::new(AtomicBool::new(false));
+    let subject = Arc::new(Subject::new());
+    let callback: Arc<dyn BrokerEventCallback> = Arc::new(ProcessExitWaker {
+        exited: Arc::clone(&exited),
+        subject: Arc::clone(&subject),
+    });
+    let ProcessExitSubscription {
+        subscription_id,
+        already_exited,
+    } = match provider.subscribe_process_exit(pid, NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP, callback) {
+        Ok(sub) => sub,
+        Err(err) => {
+            log_unsupported!("broker SubscribeProcessExit failed for pid {pid}: {err:?}");
+            return None;
+        }
+    };
+    if already_exited.is_some() {
+        exited.store(true, Ordering::Release);
+        subject.notify_observers(Events::IN | Events::HUP);
+    }
+    Some(BrokerProcessExitWake {
+        pid,
+        subscription_id,
+        provider,
+        exited,
+        subject,
+        already_exited,
+    })
 }

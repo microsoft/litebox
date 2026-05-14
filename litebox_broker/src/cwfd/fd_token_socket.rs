@@ -335,6 +335,30 @@ pub fn handle_control_connection(
                             }
                         }
                     }
+                    Opcode::Unsubscribe => {
+                        // Unsubscribe is kind-agnostic: try fd-state first, then process-state.
+                        let state_result =
+                            state_handle_request(&state_registry, &mut conn_state, &frame, in_fds);
+                        if state_result.frame.status
+                            == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
+                        {
+                            let proc_result = state_handle_request(
+                                &process_registry,
+                                &mut conn_state,
+                                &frame,
+                                Vec::new(),
+                            );
+                            SocketHandlerResult {
+                                frame: proc_result.frame,
+                                out_fd: proc_result.out_fd,
+                            }
+                        } else {
+                            SocketHandlerResult {
+                                frame: state_result.frame,
+                                out_fd: state_result.out_fd,
+                            }
+                        }
+                    }
                     Opcode::RegisterNotificationRing
                     | Opcode::CreateEventfd
                     | Opcode::ReadEventfd
@@ -342,7 +366,6 @@ pub fn handle_control_connection(
                     | Opcode::CreateSignalfd
                     | Opcode::ReadSiginfo
                     | Opcode::SubscribeEventfd
-                    | Opcode::Unsubscribe
                     | Opcode::DupHandle => {
                         // State-object opcodes: route to state_service on the fd-state registry.
                         let state_result =
@@ -352,11 +375,12 @@ pub fn handle_control_connection(
                             out_fd: state_result.out_fd,
                         }
                     }
-                    Opcode::RegisterProcess => {
-                        // Process registration: route to state_service on the *process*
-                        // registry. state_service dispatches RegisterProcess via the same
-                        // tag-checked Insert + handle-id-return path it uses for eventfd
-                        // create.
+                    Opcode::RegisterProcess
+                    | Opcode::SubscribeProcessExit
+                    | Opcode::MarkProcessExited => {
+                        // Process operations: route to state_service on the *process*
+                        // registry. RegisterProcess allocates the process handle; Phase G
+                        // exit-state RPCs resolve that same handle id (guest pid).
                         let proc_result = state_handle_request(
                             &process_registry,
                             &mut conn_state,
