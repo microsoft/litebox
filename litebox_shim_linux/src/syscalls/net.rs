@@ -2679,7 +2679,7 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                     }
-                    SubsystemTag::TcpSocket | SubsystemTag::Unknown(_) => {
+                    SubsystemTag::TcpSocket | SubsystemTag::Process | SubsystemTag::Unknown(_) => {
                         // Unsupported token kind on this worker; drop.
                     }
                 }

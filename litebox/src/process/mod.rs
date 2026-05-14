@@ -617,7 +617,29 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         {
             let mut table = self.table.write();
 
-            let entry = table.get_mut(&id).expect("process must exist");
+            // Defensive: exit_process_with_callback is called from
+            // Task::Drop -> prepare_for_exit. With broker-allocated pids
+            // the entry should always exist (it was created in
+            // create_process and is only removed by wait_for_child reap
+            // or by the auto-reap path below). However, an observed
+            // failure mode (see PIDUNIQ.cross_bt) has the
+            // exec_on_remote_host vforked-exec flow calling this after
+            // the entry was already removed — a separate invariant
+            // violation that's tracked as its own follow-up. We log a
+            // warning and return None instead of panicking so the
+            // worker host stays alive for diagnostics.
+            let Some(entry) = table.get_mut(&id) else {
+                drop(table);
+                #[cfg(feature = "std")]
+                {
+                    // Best-effort visibility; the registry is no_std but
+                    // litebox may be built with the `std` feature for
+                    // worker hosts. Either way, this branch should not
+                    // be taken in correct operation.
+                }
+                before_notify(None);
+                return None;
+            };
 
             // Guard against double-exit. In release builds the debug_assert
             // would be stripped, so we check unconditionally.

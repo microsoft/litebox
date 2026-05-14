@@ -97,6 +97,11 @@ pub enum Opcode {
     SubscribeEventfd = 0x13,
     Unsubscribe = 0x14,
     DupHandle = 0x15,
+    /// Broker-hosted process registration. Allocates a globally-
+    /// unique guest pid in the broker's `process_registry`. The
+    /// response carries the new pid as a `StateHandle` id (low 32
+    /// bits are the Linux pid). Phase 1: empty request body.
+    RegisterProcess = 0x20,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -108,6 +113,7 @@ pub enum Opcode {
     SubscribeEventfdResponse = 0x93,
     UnsubscribeResponse = 0x94,
     DupHandleResponse = 0x95,
+    RegisterProcessResponse = 0xa0,
 }
 
 impl Opcode {
@@ -125,6 +131,7 @@ impl Opcode {
             Opcode::SubscribeEventfd => Some(Opcode::SubscribeEventfdResponse),
             Opcode::Unsubscribe => Some(Opcode::UnsubscribeResponse),
             Opcode::DupHandle => Some(Opcode::DupHandleResponse),
+            Opcode::RegisterProcess => Some(Opcode::RegisterProcessResponse),
             _ => None,
         }
     }
@@ -143,6 +150,7 @@ impl Opcode {
                 | Opcode::SubscribeEventfd
                 | Opcode::Unsubscribe
                 | Opcode::DupHandle
+                | Opcode::RegisterProcess
         )
     }
 
@@ -176,6 +184,7 @@ impl TryFrom<u8> for Opcode {
             0x13 => Ok(Opcode::SubscribeEventfd),
             0x14 => Ok(Opcode::Unsubscribe),
             0x15 => Ok(Opcode::DupHandle),
+            0x20 => Ok(Opcode::RegisterProcess),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -186,6 +195,7 @@ impl TryFrom<u8> for Opcode {
             0x93 => Ok(Opcode::SubscribeEventfdResponse),
             0x94 => Ok(Opcode::UnsubscribeResponse),
             0x95 => Ok(Opcode::DupHandleResponse),
+            0xa0 => Ok(Opcode::RegisterProcessResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -480,6 +490,24 @@ pub fn build_release_response_ok() -> OwnedFrame {
         opcode: Opcode::ReleaseResponse,
         status: StatusCode::Ok,
         body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::RegisterProcess`]: empty (allocates a fresh pid).
+pub fn build_register_process_request() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::RegisterProcess,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::RegisterProcessResponse`]: handle id (= pid as u64).
+pub fn build_register_process_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::RegisterProcessResponse,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
     }
 }
 

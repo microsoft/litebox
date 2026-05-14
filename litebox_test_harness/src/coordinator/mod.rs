@@ -17,6 +17,7 @@ pub(crate) mod inotify;
 pub(crate) mod iouring_discovery;
 pub mod leaf_subcommand;
 pub(crate) mod matrix;
+pub(crate) mod pid_uniqueness;
 pub(crate) mod pidfd_tests;
 pub(crate) mod pipe_bridge;
 pub(crate) mod port_router;
@@ -975,6 +976,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     file_tcp::register_file_tcp(&mut registry::Registry::new(&mut tests));
     port_router::register_port_router(&mut registry::Registry::new(&mut tests));
     pty::register_pty_tests(&mut registry::Registry::new(&mut tests));
+    pid_uniqueness::register_pid_uniqueness_tests(&mut registry::Registry::new(&mut tests));
     special_cases::register_contamination_sequence(&mut registry::Registry::new(&mut tests));
     tests
 }
