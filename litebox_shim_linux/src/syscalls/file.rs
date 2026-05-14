@@ -4542,7 +4542,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // TODO(Phase C.3): replace with env-var check or proper enablement once diagnosed.
+        let eager_broker = false; // TODO(Phase C.4): re-enable after Phase K routes forks through broker.RegisterProcess so sys_pidfd_open works for locally-forked children.
         if eager_broker
             && let Some(provider) = super::broker_pipe::broker_pipe_provider()
         {
@@ -6388,7 +6388,9 @@ impl<FS: ShimFS> Task<FS> {
                 )
             },
         );
-        // Fallback: try HostPipeSubsystem (pipe bridges from delayed fork).
+        // Fallback: try HostPipeSubsystem (pipe bridges from delayed fork)
+        // and BrokerPipeSubsystem (Phase C.3 eager-broker pipes). These
+        // subsystems aren't reached by `run_on_raw_fd`'s fixed arm set.
         let new_fd = match new_fd {
             Ok(Ok(fd)) => fd,
             Err(Errno::EBADF) => {
@@ -6397,6 +6399,17 @@ impl<FS: ShimFS> Task<FS> {
                         &self.global,
                         &files,
                         &hp_fd,
+                        self.pid,
+                        file,
+                        close_on_exec,
+                        target,
+                        min_fd,
+                    )?
+                } else if let Some(bp_fd) = files.try_broker_pipe_fd(file) {
+                    dup(
+                        &self.global,
+                        &files,
+                        &bp_fd,
                         self.pid,
                         file,
                         close_on_exec,

@@ -227,10 +227,7 @@ pub struct CliArgs {
     /// shim fd entries at the right fd slots before the worker binary
     /// runs, so cross-binary-type exec inherits broker-managed state
     /// rather than dropping it.
-    ///
-    /// (Pre-Phase-C.3 this flag was `--broker-eventfd-bridge`; that alias
-    /// is preserved for compatibility.)
-    #[arg(long = "broker-fd-bridge", alias = "broker-eventfd-bridge", hide = true)]
+    #[arg(long = "broker-fd-bridge", hide = true)]
     pub broker_fd_bridge: Vec<String>,
 
     /// Internal: inherited socketpair fd for the stream multiplexer.
