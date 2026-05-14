@@ -982,6 +982,7 @@ impl<FS: ShimFS> Task<FS> {
                     ExitStatus::Signal(sig) => sig.as_i32() + 128,
                 }
             };
+            super::guest_pid::try_mark_broker_process_exited(self.process_id.0, exit_status);
             let removed_owner = self
                 .global
                 .control_plane

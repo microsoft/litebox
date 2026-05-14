@@ -58,6 +58,12 @@
 //!   ring (the one previously sent via `RegisterNotificationRing`).
 //! - [`Opcode::Unsubscribe`] / response — remove a subscription.
 //!
+//! Process state-object ops (Phase G):
+//! - [`Opcode::RegisterProcess`] / response — broker allocates a guest pid.
+//! - [`Opcode::SubscribeProcessExit`] / response — subscribe to exit readiness
+//!   and receive a cached exit-code snapshot if already exited.
+//! - [`Opcode::MarkProcessExited`] / response — worker records final exit state.
+//!
 //! # Bounds
 //!
 //! [`BODY_MAX`] caps the body size. The largest defined body in v1
@@ -98,9 +104,9 @@ pub const BODY_MAX: u32 = 4096;
 /// | `0x20`–`0x2F`    | Pidfd state (P2.B)          |
 /// | `0x30`–`0x3F`    | UnixSocket state (P2.A)     |
 /// | `0x40`–`0x4F`    | Signalfd state (P2.C)       |
-/// | `0x50`–`0x5F`    | Timerfd state (future)      |
-/// | `0x60`–`0x6F`    | Inotify state (future)      |
-/// | `0x70`–`0x7F`    | reserved for future kinds   |
+/// | `0x50`–`0x5F`    | Pipe state (Phase C)        |
+/// | `0x60`–`0x6F`    | Pty state (Phase E)         |
+/// | `0x70`–`0x7F`    | Process state (Phase G)     |
 ///
 /// Within a kind's range, follow the eventfd template:
 /// `0xN0` = create, `0xN1` = read-like primary op, `0xN2` = write-like
@@ -128,6 +134,10 @@ pub enum Opcode {
     /// response carries the new pid as a `StateHandle` id (low 32
     /// bits are the Linux pid). Phase 1: empty request body.
     RegisterProcess = 0x70,
+    /// Subscribe this worker's notification ring to broker-owned process exit.
+    SubscribeProcessExit = 0x71,
+    /// Mark a broker-owned process as exited and wake exit subscribers.
+    MarkProcessExited = 0x72,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -144,6 +154,8 @@ pub enum Opcode {
     CreatePidfdResponse = 0xA0,
     PidfdExitedResponse = 0xA1,
     RegisterProcessResponse = 0xF0,
+    SubscribeProcessExitResponse = 0xF1,
+    MarkProcessExitedResponse = 0xF2,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -164,7 +176,8 @@ pub mod opcode_ranges {
     pub const SIGNALFD_BASE: u8 = 0x40;
     pub const SIGNALFD_RESPONSE_BASE: u8 = 0xC0;
 
-    /// Process state (Phase 1 of process-registry rework): registration.
+    /// Process state (Phase G): 0x70 RegisterProcess, 0x71 SubscribeProcessExit,
+    /// 0x72 MarkProcessExited.
     pub const PROCESS_BASE: u8 = 0x70;
     pub const PROCESS_RESPONSE_BASE: u8 = 0xF0;
 }
@@ -189,6 +202,8 @@ impl Opcode {
             Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
             Opcode::PidfdExited => Some(Opcode::PidfdExitedResponse),
             Opcode::RegisterProcess => Some(Opcode::RegisterProcessResponse),
+            Opcode::SubscribeProcessExit => Some(Opcode::SubscribeProcessExitResponse),
+            Opcode::MarkProcessExited => Some(Opcode::MarkProcessExitedResponse),
             _ => None,
         }
     }
@@ -212,6 +227,8 @@ impl Opcode {
                 | Opcode::CreatePidfd
                 | Opcode::PidfdExited
                 | Opcode::RegisterProcess
+                | Opcode::SubscribeProcessExit
+                | Opcode::MarkProcessExited
         )
     }
 
@@ -250,6 +267,8 @@ impl TryFrom<u8> for Opcode {
             0x20 => Ok(Opcode::CreatePidfd),
             0x21 => Ok(Opcode::PidfdExited),
             0x70 => Ok(Opcode::RegisterProcess),
+            0x71 => Ok(Opcode::SubscribeProcessExit),
+            0x72 => Ok(Opcode::MarkProcessExited),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -265,6 +284,8 @@ impl TryFrom<u8> for Opcode {
             0xA0 => Ok(Opcode::CreatePidfdResponse),
             0xA1 => Ok(Opcode::PidfdExitedResponse),
             0xF0 => Ok(Opcode::RegisterProcessResponse),
+            0xF1 => Ok(Opcode::SubscribeProcessExitResponse),
+            0xF2 => Ok(Opcode::MarkProcessExitedResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -580,6 +601,105 @@ pub fn build_register_process_response_ok(handle_id: u64) -> OwnedFrame {
     }
 }
 
+/// Body for [`Opcode::SubscribeProcessExit`]: (pid handle: u64, sub_id: u64, events: u32, pad: 4).
+pub fn build_subscribe_process_exit_request(
+    pid: u32,
+    subscription_id: u64,
+    events_mask: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&u64::from(pid).to_le_bytes());
+    body.extend_from_slice(&subscription_id.to_le_bytes());
+    body.extend_from_slice(&events_mask.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::SubscribeProcessExit,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes the body of a SubscribeProcessExit request.
+pub fn parse_subscribe_process_exit_body(body: &[u8]) -> Result<(u64, u64, u32), ProtocolError> {
+    parse_subscribe_body(body, Opcode::SubscribeProcessExit)
+}
+
+/// Body for SubscribeProcessExitResponse: (exited: u8, pad: 3, exit_code: i32).
+pub fn build_subscribe_process_exit_response_ok(exit_code: Option<i32>) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.push(u8::from(exit_code.is_some()));
+    body.extend_from_slice(&[0u8; 3]);
+    body.extend_from_slice(&exit_code.unwrap_or(0).to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::SubscribeProcessExitResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes a SubscribeProcessExitResponse success body.
+pub fn parse_subscribe_process_exit_response_ok(body: &[u8]) -> Result<Option<i32>, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SubscribeProcessExitResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[1..4].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    let code = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    match body[0] {
+        0 => Ok(None),
+        1 => Ok(Some(code)),
+        _ => Err(ProtocolError::NonZeroReserved {
+            reserved: u32::from(body[0]),
+        }),
+    }
+}
+
+/// Body for [`Opcode::MarkProcessExited`]: (pid handle: u64, exit_code: i32, pad: 4).
+pub fn build_mark_process_exited_request(pid: u32, exit_code: i32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&u64::from(pid).to_le_bytes());
+    body.extend_from_slice(&exit_code.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::MarkProcessExited,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes the body of a MarkProcessExited request.
+pub fn parse_mark_process_exited_body(body: &[u8]) -> Result<(u64, i32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::MarkProcessExited,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes([
+        body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+    ]);
+    let exit_code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+    if body[12..16].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((handle, exit_code))
+}
+
+/// Body for [`Opcode::MarkProcessExitedResponse`]: empty.
+pub fn build_mark_process_exited_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::MarkProcessExitedResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
 /// Body for [`Opcode::RegisterNotificationRing`]: empty (ring fd via SCM_RIGHTS).
 pub fn build_register_notification_ring_request() -> OwnedFrame {
     OwnedFrame {
@@ -789,9 +909,13 @@ pub fn build_subscribe_eventfd_request(
 
 /// Decodes the body of a SubscribeEventfd request.
 pub fn parse_subscribe_eventfd_body(body: &[u8]) -> Result<(u64, u64, u32), ProtocolError> {
+    parse_subscribe_body(body, Opcode::SubscribeEventfd)
+}
+
+fn parse_subscribe_body(body: &[u8], opcode: Opcode) -> Result<(u64, u64, u32), ProtocolError> {
     if body.len() != 24 {
         return Err(ProtocolError::WrongBodyLen {
-            opcode: Opcode::SubscribeEventfd,
+            opcode,
             got: body.len(),
             want: 24,
         });
@@ -1010,6 +1134,8 @@ mod tests {
             Opcode::Unsubscribe,
             Opcode::CreatePidfd,
             Opcode::PidfdExited,
+            Opcode::SubscribeProcessExit,
+            Opcode::MarkProcessExited,
             Opcode::RegisterResponse,
             Opcode::MaterializeResponse,
             Opcode::ReleaseResponse,
@@ -1021,6 +1147,10 @@ mod tests {
             Opcode::UnsubscribeResponse,
             Opcode::CreatePidfdResponse,
             Opcode::PidfdExitedResponse,
+            Opcode::SubscribeProcessExit,
+            Opcode::MarkProcessExited,
+            Opcode::SubscribeProcessExitResponse,
+            Opcode::MarkProcessExitedResponse,
         ] {
             assert_eq!(Opcode::try_from(op as u8).unwrap(), op);
         }
@@ -1048,6 +1178,14 @@ mod tests {
             Opcode::PidfdExited.response_for(),
             Some(Opcode::PidfdExitedResponse)
         );
+        assert_eq!(
+            Opcode::SubscribeProcessExit.response_for(),
+            Some(Opcode::SubscribeProcessExitResponse)
+        );
+        assert_eq!(
+            Opcode::MarkProcessExited.response_for(),
+            Some(Opcode::MarkProcessExitedResponse)
+        );
         assert_eq!(Opcode::ReadEventfdResponse.response_for(), None);
     }
 
@@ -1066,11 +1204,15 @@ mod tests {
             Opcode::Unsubscribe,
             Opcode::CreatePidfd,
             Opcode::PidfdExited,
+            Opcode::SubscribeProcessExit,
+            Opcode::MarkProcessExited,
             Opcode::RegisterResponse,
             Opcode::CreateEventfdResponse,
             Opcode::ReadEventfdResponse,
             Opcode::CreatePidfdResponse,
             Opcode::PidfdExitedResponse,
+            Opcode::SubscribeProcessExitResponse,
+            Opcode::MarkProcessExitedResponse,
         ] {
             assert_eq!(op.expected_fd_count(), 0, "{op:?}");
         }
@@ -1144,6 +1286,42 @@ mod tests {
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.opcode, Opcode::PidfdExitedResponse);
         assert!(parse_pidfd_exited_response_ok(decoded.body).unwrap());
+    }
+
+    #[test]
+    fn round_trip_process_exit_messages() {
+        let sub = build_subscribe_process_exit_request(123, 456, 0x0001);
+        let bytes = sub.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::SubscribeProcessExit);
+        assert_eq!(
+            parse_subscribe_process_exit_body(decoded.body).unwrap(),
+            (123, 456, 0x0001)
+        );
+
+        let sub_resp = build_subscribe_process_exit_response_ok(Some(17));
+        let bytes = sub_resp.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::SubscribeProcessExitResponse);
+        assert_eq!(
+            parse_subscribe_process_exit_response_ok(decoded.body).unwrap(),
+            Some(17)
+        );
+
+        let mark = build_mark_process_exited_request(123, 9);
+        let bytes = mark.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::MarkProcessExited);
+        assert_eq!(
+            parse_mark_process_exited_body(decoded.body).unwrap(),
+            (123, 9)
+        );
+
+        let mark_resp = build_mark_process_exited_response_ok();
+        let bytes = mark_resp.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::MarkProcessExitedResponse);
+        assert!(decoded.body.is_empty());
     }
 
     #[test]
