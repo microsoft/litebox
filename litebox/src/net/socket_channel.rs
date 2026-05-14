@@ -785,6 +785,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     ///
     /// Copies the datagram payload into `buf` and optionally returns the source address.
     /// If the datagram is larger than `buf`, behavior depends on `flags`.
+    /// Returns the original message size (which may exceed `buf.len()`).
     pub fn try_read(
         &self,
         buf: &mut [u8],
@@ -798,21 +799,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
             if let Some(source_addr) = source_addr {
                 *source_addr = addr;
             }
-            let n = if flags.contains(ReceiveFlags::DISCARD) {
-                data.len()
-            } else {
+            if !flags.contains(ReceiveFlags::DISCARD) {
                 let to_copy = core::cmp::min(buf.len(), data.len());
                 buf[..to_copy].copy_from_slice(&data[..to_copy]);
-                if flags.contains(ReceiveFlags::TRUNC) {
-                    // return the real size of the packet or datagram,
-                    // even when it was longer than the passed buffer.
-                    data.len()
-                } else {
-                    to_copy
-                }
-            };
+            }
             self.inner.rx_count.fetch_sub(1, Ordering::Release);
-            Ok(n)
+            Ok(data.len())
         } else {
             Ok(0)
         }

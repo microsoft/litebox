@@ -114,6 +114,13 @@ impl LocalPortAllocator {
             }
         }
     }
+
+    /// Deallocate a port number tracked by this allocator.
+    pub(crate) fn deallocate_port(&mut self, port: u16) {
+        if let Some(port) = NonZeroU16::new(port) {
+            self.deallocate(LocalPort { port });
+        }
+    }
 }
 
 /// A token expressing ownership over a specific local port.

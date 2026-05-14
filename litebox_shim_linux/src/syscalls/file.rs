@@ -304,7 +304,7 @@ impl<FS: ShimFS> Task<FS> {
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
-        files
+        let n = files
             .run_on_raw_fd(
                 fd as usize,
                 |fd| {
@@ -367,7 +367,11 @@ impl<FS: ShimFS> Task<FS> {
                     })
                 },
             )
-            .flatten()
+            .flatten()?;
+        // For datagrams, the returned size represents the actual size of the message,
+        // which may be larger than the buffer size.
+        let capped_size = n.min(buf.borrow().len());
+        Ok(capped_size)
     }
 
     /// Handle syscall `write`

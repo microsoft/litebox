@@ -85,16 +85,22 @@ static void test_trunc_flag(void) {
     }
 
     char rbuf[10];
+    char control[64];
     struct iovec iov = { .iov_base = rbuf, .iov_len = sizeof(rbuf) };
     struct msghdr msg = {0};
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
 
     ssize_t n = recvmsg(sv[1], &msg, 0);
-    printf("  recvmsg returned %zd, msg_flags = 0x%x\n", n, msg.msg_flags);
+    printf("  recvmsg returned %zd, msg_flags = 0x%x, msg_controllen=%zu\n",
+           n, msg.msg_flags, msg.msg_controllen);
     check(n == (ssize_t)sizeof(rbuf), "returned copied byte count (10)");
     check((msg.msg_flags & MSG_TRUNC) != 0,
           "MSG_TRUNC set in msg_flags (datagram > iovec capacity)");
+    check(msg.msg_controllen == 0,
+          "msg_controllen zeroed when no control messages delivered");
 
     close(sv[0]);
     close(sv[1]);
@@ -113,22 +119,27 @@ static void test_zero_iovlen(void) {
     send_one(tx, rx, SEND_LEN);
 
     struct sockaddr_un name;
+    char control[64];
     memset(&name, 0xAB, sizeof(name));
     struct msghdr msg = {0};
     msg.msg_name = &name;
     msg.msg_namelen = sizeof(name);
     msg.msg_iov = NULL;
     msg.msg_iovlen = 0;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
 
     errno = 0;
     ssize_t n = recvmsg(rx, &msg, 0);
     printf("  recvmsg returned %zd (errno=%d %s), msg_flags=0x%x, "
-           "msg_namelen=%u\n",
+           "msg_namelen=%u, msg_controllen=%zu\n",
            n, errno, n < 0 ? strerror(errno) : "-", msg.msg_flags,
-           (unsigned)msg.msg_namelen);
+           (unsigned)msg.msg_namelen, msg.msg_controllen);
     check(n == 0, "returned 0 (not -1/EINVAL)");
     check((msg.msg_flags & MSG_TRUNC) != 0,
           "MSG_TRUNC set (whole datagram discarded)");
+    check(msg.msg_controllen == 0,
+          "msg_controllen zeroed when no control messages delivered");
 
     // Datagram should have been consumed: a non-blocking peek must now
     // report no data.
@@ -153,18 +164,25 @@ static void test_zero_capacity_iov(void) {
     if (tx < 0) { perror("socket"); exit(2); }
     send_one(tx, rx, SEND_LEN);
 
+    char control[64];
     struct iovec iov = { .iov_base = NULL, .iov_len = 0 };
     struct msghdr msg = {0};
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
 
     errno = 0;
     ssize_t n = recvmsg(rx, &msg, 0);
-    printf("  recvmsg returned %zd (errno=%d %s), msg_flags=0x%x\n",
-           n, errno, n < 0 ? strerror(errno) : "-", msg.msg_flags);
+    printf("  recvmsg returned %zd (errno=%d %s), msg_flags=0x%x, "
+           "msg_controllen=%zu\n",
+           n, errno, n < 0 ? strerror(errno) : "-", msg.msg_flags,
+           msg.msg_controllen);
     check(n == 0, "returned 0");
     check((msg.msg_flags & MSG_TRUNC) != 0,
           "MSG_TRUNC set (whole datagram discarded)");
+    check(msg.msg_controllen == 0,
+          "msg_controllen zeroed when no control messages delivered");
 
     char tmp[1];
     ssize_t m = recv(rx, tmp, sizeof(tmp), MSG_DONTWAIT);

@@ -923,6 +923,8 @@ where
                 else {
                     unreachable!()
                 };
+                self.local_port_allocator
+                    .deallocate_port(socket.endpoint().port);
                 socket.close();
             }
             Protocol::Tcp => {
@@ -1190,13 +1192,13 @@ where
                     port: lp.port(),
                 };
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
-                socket.bind(local_endpoint).map_err(|e| {
+                if let Err(e) = socket.bind(local_endpoint) {
                     self.local_port_allocator.deallocate(lp);
-                    match e {
+                    return Err(match e {
                         udp::BindError::InvalidState => BindError::AlreadyBound,
                         udp::BindError::Unaddressable => unreachable!(),
-                    }
-                })?;
+                    });
+                }
             }
             Protocol::Icmp => unimplemented!(),
             Protocol::Raw { protocol: _ } => unimplemented!(),
@@ -1426,14 +1428,15 @@ where
                 };
                 let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
                 if !udp_socket.is_open() {
-                    let Ok(()) = udp_socket.bind(smoltcp::wire::IpListenEndpoint {
-                        addr: None,
-                        port: self
-                            .local_port_allocator
-                            .ephemeral_port()
-                            .map_err(SendError::PortAllocationFailure)?
-                            .port(),
-                    }) else {
+                    let local_port = self
+                        .local_port_allocator
+                        .ephemeral_port()
+                        .map_err(SendError::PortAllocationFailure)?;
+                    let port = local_port.port();
+                    let Ok(()) =
+                        udp_socket.bind(smoltcp::wire::IpListenEndpoint { addr: None, port })
+                    else {
+                        self.local_port_allocator.deallocate(local_port);
                         unreachable!("binding to a free port cannot fail")
                     };
                 }

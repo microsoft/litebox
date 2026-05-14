@@ -1658,7 +1658,7 @@ pub struct SigSetPack {
 #[repr(C, packed)]
 pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
     /// ptr to socket address structure
-    pub msg_name: Platform::RawConstPointer<u8>,
+    pub msg_name: Platform::RawMutPointer<u8>,
     /// size of socket address structure
     pub msg_namelen: u32,
     /// Explicit padding to match the 4-byte gap that Linux's naturally-aligned

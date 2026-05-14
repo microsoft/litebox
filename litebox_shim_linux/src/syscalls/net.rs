@@ -1383,14 +1383,15 @@ impl<FS: ShimFS> Task<FS> {
         let msg_name = msg.msg_name;
         let sock_addr = if msg_name.as_usize() != 0 {
             Some(read_sockaddr_from_user(
-                msg.msg_name,
+                ConstPtr::from_usize(msg_name.as_usize()),
                 msg.msg_namelen as usize,
             )?)
         } else {
             None
         };
         if msg.msg_controllen != 0 {
-            unimplemented!("ancillary data is not supported");
+            log_unsupported!("ancillary data is not supported");
+            return Err(Errno::EINVAL);
         }
         if msg.msg_iovlen == 0 || msg.msg_iovlen > 1024 {
             return Err(Errno::EINVAL);
@@ -1554,6 +1555,13 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(sockfd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
+
+        let supported_flags = ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC;
+        if flags.intersects(supported_flags.complement()) {
+            log_unsupported!("Unsupported recvmsg flags: {:?}", flags);
+            return Err(Errno::EINVAL);
+        }
+
         let msg = msg_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
 
         // Copy fields out of the packed struct to avoid unaligned references.
@@ -1597,9 +1605,8 @@ impl<FS: ShimFS> Task<FS> {
             },
         )?;
 
-        // Set MSG_TRUNC if the received message was larger than the total buffer.
         if size > total_iov_capacity {
-            ret_flags |= ReceiveFlags::TRUNC;
+            ret_flags.insert(ReceiveFlags::TRUNC);
         }
 
         // Scatter the received data across iovecs sequentially.
@@ -1637,19 +1644,26 @@ impl<FS: ShimFS> Task<FS> {
                     ),
             );
             if let Some(src_addr) = source_addr {
-                let addr_ptr = MutPtr::<u8>::from_usize(msg_name.as_usize());
-                write_sockaddr_to_user(src_addr, addr_ptr, addrlen_ptr)?;
+                write_sockaddr_to_user(src_addr, msg_name, addrlen_ptr)?;
             } else {
                 // No source address (e.g. connected stream socket) — zero out msg_namelen.
-                let _ = addrlen_ptr.write_at_offset(0, 0u32);
+                addrlen_ptr.write_at_offset(0, 0u32).ok_or(Errno::EFAULT)?;
             }
         }
+
+        // Ancillary data is not supported, so report that no control bytes were delivered.
+        let controllen_offset =
+            core::mem::offset_of!(litebox_common_linux::UserMsgHdr<Platform>, msg_controllen);
+        let controllen_ptr = MutPtr::<usize>::from_usize(msg_ptr.as_usize() + controllen_offset);
+        controllen_ptr.write_at_offset(0, 0).ok_or(Errno::EFAULT)?;
 
         // Write back msg_flags with any status flags (e.g. MSG_TRUNC).
         let flags_offset =
             core::mem::offset_of!(litebox_common_linux::UserMsgHdr<Platform>, msg_flags);
         let flags_ptr = MutPtr::<ReceiveFlags>::from_usize(msg_ptr.as_usize() + flags_offset);
-        let _ = flags_ptr.write_at_offset(0, ret_flags);
+        flags_ptr
+            .write_at_offset(0, ret_flags)
+            .ok_or(Errno::EFAULT)?;
 
         Ok(total_received)
     }
@@ -1808,7 +1822,13 @@ mod tests {
     use zerocopy::FromZeros as _;
 
     use super::SocketAddress;
-    use crate::{ConstPtr, MutPtr, syscalls::tests::init_platform};
+    use crate::{
+        ConstPtr, MutPtr,
+        syscalls::{
+            net::{CSockInetAddr, read_sockaddr_from_user},
+            tests::init_platform,
+        },
+    };
 
     extern crate alloc;
     extern crate std;
@@ -2221,9 +2241,13 @@ mod tests {
         assert_eq!(stdout, buf);
     }
 
-    fn blocking_udp_server_socket(test_trunc: bool, is_nonblocking: bool) {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
-
+    fn blocking_udp_server_socket(
+        task: &crate::Task<crate::DefaultFS>,
+        test_trunc: bool,
+        set_trunc_flag: bool,
+        is_nonblocking: bool,
+        op: &str,
+    ) {
         // Server socket and bind
         let server_fd = task
             .do_socket(
@@ -2253,7 +2277,7 @@ mod tests {
             .sys_epoll_create(litebox_common_linux::EpollCreateFlags::empty())
             .expect("failed to create epoll");
         let epfd = i32::try_from(epfd).unwrap();
-        epoll_add(&task, epfd, server_fd, litebox::event::Events::IN);
+        epoll_add(task, epfd, server_fd, litebox::event::Events::IN);
 
         let msg = "Hello from client";
         let mut child = std::process::Command::new("nc")
@@ -2282,14 +2306,13 @@ mod tests {
 
         // Server receives and inspects sender addr
         let mut recv_buf = [0u8; 48];
-        let mut sender_addr = None;
         let mut recv_flags = ReceiveFlags::empty();
-        if test_trunc {
+        if test_trunc && set_trunc_flag {
             recv_flags.insert(ReceiveFlags::TRUNC);
         }
         if is_nonblocking {
             let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
-            let n = epoll_wait(&task, epfd, &mut events);
+            let n = epoll_wait(task, epfd, &mut events);
             assert_eq!(n, 1);
             for ev in &events[..n] {
                 assert!(ev.events & litebox::event::Events::IN.bits() != 0);
@@ -2302,18 +2325,56 @@ mod tests {
         } else {
             recv_buf.len()
         };
-        let n = task
-            .do_recvfrom(
-                server_fd,
-                &mut recv_buf[..recv_len],
-                recv_flags,
-                Some(&mut sender_addr),
-            )
-            .expect("recvfrom failed");
-        if test_trunc {
+        let source_addr = [0u8; core::mem::size_of::<CSockInetAddr>()];
+        let n = match op {
+            "recvfrom" => {
+                let mut addrlen = core::mem::size_of::<CSockInetAddr>();
+                task.sys_recvfrom(
+                    i32::try_from(server_fd).unwrap(),
+                    MutPtr::from_usize(recv_buf.as_mut_ptr() as usize),
+                    recv_len,
+                    recv_flags,
+                    Some(MutPtr::from_usize(source_addr.as_ptr() as usize)),
+                    MutPtr::from_usize(&raw mut addrlen as usize),
+                )
+                .expect("recvfrom failed")
+            }
+            "recvmsg" => {
+                let iovec = [litebox_common_linux::IoVec {
+                    iov_base: MutPtr::from_usize(recv_buf.as_mut_ptr() as usize),
+                    iov_len: recv_len,
+                }];
+                let mut msg_hdr = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+                msg_hdr.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+                msg_hdr.msg_iovlen = iovec.len();
+                msg_hdr.msg_name = MutPtr::from_usize(source_addr.as_ptr() as usize);
+                msg_hdr.msg_namelen = source_addr.len().truncate();
+                let msg_ptr = MutPtr::from_usize(&raw mut msg_hdr as usize);
+                let n = task
+                    .sys_recvmsg(i32::try_from(server_fd).unwrap(), msg_ptr, recv_flags)
+                    .expect("recvmsg failed");
+                if test_trunc {
+                    let flags = msg_hdr.msg_flags;
+                    assert!(flags.contains(ReceiveFlags::TRUNC));
+                }
+                n
+            }
+            _ => panic!("Unknown operation"),
+        };
+        let sender_addr = read_sockaddr_from_user(
+            ConstPtr::from_usize(source_addr.as_ptr() as usize),
+            source_addr.len(),
+        )
+        .ok();
+        if test_trunc && set_trunc_flag {
             assert_eq!(n, msg.len()); // return the actual length of the datagram rather than the received length
             assert_eq!(recv_buf[..8], msg.as_bytes()[..8]); // only part of the message is received
-        } else {
+        }
+        if test_trunc && !set_trunc_flag {
+            assert_eq!(n, 8); // returns the size of the copied data, not the actual message length
+            assert_eq!(recv_buf[..n], msg.as_bytes()[..n]);
+        }
+        if !test_trunc {
             assert_eq!(n, msg.len());
             assert_eq!(recv_buf[..n], msg.as_bytes()[..n]);
         }
@@ -2322,24 +2383,31 @@ mod tests {
         };
         assert_eq!(sender_addr.port(), CLIENT_PORT);
 
-        close_socket(&task, server_fd);
+        close_socket(task, server_fd);
 
         child.wait().expect("Failed to wait for client");
     }
 
     #[test]
     fn test_tun_blocking_udp_server_socket() {
-        blocking_udp_server_socket(false, false);
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+        blocking_udp_server_socket(&task, false, false, false, "recvfrom");
+        blocking_udp_server_socket(&task, false, false, false, "recvmsg");
     }
 
     #[test]
     fn test_tun_nonblocking_udp_server_socket() {
-        blocking_udp_server_socket(false, true);
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+        blocking_udp_server_socket(&task, false, false, true, "recvfrom");
+        blocking_udp_server_socket(&task, false, false, true, "recvmsg");
     }
 
     #[test]
     fn test_tun_blocking_udp_server_socket_with_truncation() {
-        blocking_udp_server_socket(true, false);
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+        blocking_udp_server_socket(&task, true, true, false, "recvfrom");
+        blocking_udp_server_socket(&task, true, true, false, "recvmsg");
+        blocking_udp_server_socket(&task, true, false, false, "recvmsg");
     }
 
     #[test]
