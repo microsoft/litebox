@@ -4542,7 +4542,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // Phase C: EPIPE.{basic_io,fork_io,exec_no_capture} pass under eager_broker=true. EPIPE.exec_captured fails with EBADF on parent's read of captured-stdout broker pipe after child exec — narrow remaining bug.
+        let eager_broker = false; // Phase C: EPIPE.exec_captured now PASSES with the FIONBIO fix (commit pending). PB.c2p still fails with IO Safety violation — separate stdio-stream-routing bug. Gating off until that's resolved.
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider
@@ -4552,6 +4552,23 @@ impl<FS: ShimFS> Task<FS> {
                     4096,
                 )
                 .map_err(|_| Errno::ENODEV)?;
+
+            // `BrokerPipeFd` embeds a `BrokerBackedCommon` whose `Drop`
+            // calls `provider.release(handle)`. `create_pipe` only gave us
+            // ONE registry refcount, so allocating TWO BrokerPipeFds (rd,
+            // wr) without a matching dup would have one too few. Bump the
+            // handle refcount once here so each of the two entries owns its
+            // own ref. Without this, the registry refcount underflows during
+            // fork+exec cleanup and subsequent ops on either end return
+            // UnknownHandle → EBADF — observed as `EPIPE.exec_captured`
+            // failing with EBADF on the parent's read after child exec.
+            let releaser: alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            > = alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle).is_err() {
+                provider.release(handle);
+                return Err(Errno::ENODEV);
+            }
 
             let writer_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
                 alloc::sync::Arc::clone(&provider),
@@ -5499,6 +5516,27 @@ impl<FS: ShimFS> Task<FS> {
                         file.set_status(flags);
                         Ok::<(), Errno>(())
                     })?;
+                    return Ok(0);
+                }
+                // BrokerPipeFd: O_NONBLOCK is tracked entirely in the
+                // shim-side `status` AtomicU32 — the broker pipe path
+                // checks `get_status().contains(NONBLOCK)` on each read/
+                // write. Without this arm, `FIONBIO` on a broker pipe
+                // fell through to `run_on_raw_fd`, which doesn't know
+                // about BrokerPipeSubsystem and returned EBADF — the
+                // EPIPE.exec_captured failure mode.
+                if let Some(bp_fd) = files.try_broker_pipe_fd(desc) {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(&bp_fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file| {
+                        let mut flags = file.get_status();
+                        flags.set(OFlags::NONBLOCK, val != 0);
+                        file.set_status(flags);
+                    });
                     return Ok(0);
                 }
                 files
