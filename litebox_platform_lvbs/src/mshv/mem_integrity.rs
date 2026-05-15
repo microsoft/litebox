@@ -66,21 +66,31 @@ pub fn validate_kernel_module_against_elf(
 
     for target_section_name in sections_to_validate() {
         // section loaded in memory (with VTL0's relocations and patches applied)
-        let section_memory_container = module_memory
-            .find_section_by_name(target_section_name)
-            .expect("Section not found in module memory");
-        if section_memory_container.is_empty() {
-            continue;
-        }
+        let Some(section_memory_container) =
+            module_memory.find_section_by_name(target_section_name)
+        else {
+            return Err(KernelElfError::SectionNotFound);
+        };
 
-        let Some(target_shdr) = shdrs.iter().find(|s| {
+        let header = shdrs.iter().find(|s| {
             s.sh_flags & u64::from(SHF_ALLOC) != 0
                 && s.sh_size > 0
                 && shdr_strtab
                     .get(s.sh_name as usize)
                     .is_ok_and(|n| n == target_section_name)
-        }) else {
-            return Err(KernelElfError::SectionNotFound);
+        });
+        let target_shdr = match (header, section_memory_container.is_empty()) {
+            // ELF has no matching section and memory section is also empty -> nothing to validate
+            (None, true) => continue,
+            // ELF has no matching section but memory section has bytes -> suspicious
+            (None, false) => return Err(KernelElfError::SectionNotFound),
+            // ELF has content but memory section is empty -> mismatch
+            (Some(_), true) => {
+                result = false;
+                continue;
+            }
+            // ELF has content and memory section has bytes -> do validation
+            (Some(shdr), false) => shdr,
         };
 
         let elf_params = ElfParams {
@@ -284,7 +294,7 @@ fn identify_indirect_relocations(
                         Err(elf::ParseError::IntegerOverflow)
                     }
                 })
-                .is_ok()
+                .is_ok_and(|belongs_to_target| belongs_to_target)
             {
                 let reloc_size: usize = match rela.r_type {
                     R_X86_64_64 => 8,
