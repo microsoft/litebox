@@ -1350,20 +1350,22 @@ impl<FS: ShimFS> Task<FS> {
         mut argv: alloc::vec::Vec<alloc::ffi::CString>,
     ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
         for _ in 0..SHEBANG_MAX_RECURSION {
-            let fd = self.sys_open(
-                path.as_str(),
+            let full_path = self.resolve_path(&path)?;
+            let file = self.do_open(
+                full_path,
                 litebox::fs::OFlags::RDONLY,
                 litebox::fs::Mode::empty(),
             )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
-            let n = match self.do_read(fd, &mut header, Some(0)) {
+            let files = self.files.borrow();
+            let n = match files.fs.read(&file, &mut header, Some(0)) {
                 Ok(n) => n,
                 Err(e) => {
-                    let _ = self.do_close(fd as usize);
-                    return Err(e);
+                    let _ = files.fs.close(&file);
+                    return Err(Errno::from(e));
                 }
             };
-            let _ = self.do_close(fd as usize);
+            let _ = files.fs.close(&file);
 
             match parse_shebang(&header[..n]) {
                 Some((interp, opt_arg)) => {

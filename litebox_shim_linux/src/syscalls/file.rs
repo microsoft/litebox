@@ -167,7 +167,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Resolve a path against the current working directory.
-    fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
+    pub(crate) fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
         let path_str = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
         if path_str.is_empty() {
             return Err(Errno::ENOENT);
@@ -197,7 +197,7 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    fn do_open(
+    pub(crate) fn do_open(
         &self,
         path: impl path::Arg,
         flags: OFlags,
@@ -667,12 +667,13 @@ impl<FS: ShimFS> Task<FS> {
         }
         drop(rds);
 
-        if let Ok(fd) = i32::try_from(raw_fd) {
-            self.finalize_elf_patch(fd);
-        }
-
         match consumed {
-            ConsumedFd::Fs(fd) => files.fs.close(&fd).map_err(Errno::from),
+            ConsumedFd::Fs(fd) => {
+                if let Ok(raw_fd) = i32::try_from(raw_fd) {
+                    self.finalize_elf_patch(raw_fd);
+                }
+                files.fs.close(&fd).map_err(Errno::from)
+            }
             ConsumedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             ConsumedFd::Pipes(fd) => self.global.pipes.close(&fd).map_err(Errno::from),
             ConsumedFd::Eventfd(fd) => {
