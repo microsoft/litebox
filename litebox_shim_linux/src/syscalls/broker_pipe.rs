@@ -14,7 +14,6 @@ use litebox::{
 };
 use litebox_common_linux::{
     broker_pipe_provider::{BrokerOpError, BrokerPipeEnd, BrokerPipeProvider},
-    cwfd::broker_subscribable::BrokerEventCallback,
     cwfd::notification_frame::{
         NOTIFY_EVENT_ERR, NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
     },

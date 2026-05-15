@@ -244,7 +244,6 @@ impl BrokerStateRegistry {
             .get_mut(&handle.0)
             .ok_or(StateRegistryError::UnknownHandle(handle))?;
         entry.refcount -= 1;
-        let new_rc = entry.refcount;
         if entry.refcount == 0 {
             s.table.remove(&handle.0);
         }

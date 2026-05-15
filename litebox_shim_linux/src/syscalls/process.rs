@@ -9163,7 +9163,6 @@ impl<FS: ShimFS> Task<FS> {
                 );
                 drop(dt_local);
                 if let (Some(provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
-                    let _ = &provider; // kept for trait coherence; not used now
                     let releaser: alloc::sync::Arc<
                         dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
                     > = alloc::sync::Arc::clone(&provider) as _;
