@@ -1075,10 +1075,18 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
             .collect();
         runner.spawn_tree(&declared_union).await;
         for test in new_filtered {
+            crate::pause_points::pause_if_match("harness:test-start", &test.id);
             let timeout_dur = Duration::from_secs(test.timeout_secs);
             if let Ok(outcome) = tokio::time::timeout(timeout_dur, (test.run)(&mut runner)).await {
+                let tag = if outcome.pass {
+                    "harness:test-end-pass"
+                } else {
+                    "harness:test-end-fail"
+                };
+                crate::pause_points::pause_if_match(tag, &test.id);
                 runner.record(&test.id, &outcome.agent, outcome.pass, &outcome.detail);
             } else {
+                crate::pause_points::pause_if_match("harness:test-end-fail", &test.id);
                 runner.record(
                     &test.id,
                     "?",

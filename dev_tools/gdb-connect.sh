@@ -56,13 +56,15 @@ find_symbols_dir() {
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local workspace_root
     workspace_root="$(cd "$script_dir/.." && pwd)"
-    local target_dir="${CARGO_TARGET_DIR:-$workspace_root/target}/debug"
 
-    # Prefer the workspace target directory (ext4 default per AGENTS.md).
-    # Fall back to ~/litebox-out/debug for legacy NTFS-resident workspaces
-    # that built with --target-dir ~/litebox-out for Docker mmap compatibility.
+    # Prefer the workspace target directory (ext4 default per
+    # AGENTS.md). Try debug first (faster builds), then release.
+    # Fall back to ~/litebox-out/debug for legacy NTFS-resident
+    # workspaces that built with --target-dir ~/litebox-out for
+    # Docker mmap compatibility.
     local candidates=(
-        "$target_dir"
+        "$workspace_root/target/debug"
+        "$workspace_root/target/release"
         "$HOME/litebox-out/debug"
     )
 
@@ -112,20 +114,31 @@ echo "    break process.rs:LINE      — breakpoint by file:line (handles monomo
 echo "    break do_clone             — guest fork/clone" >&2
 echo "    break exit_group           — guest process exit" >&2
 echo "    thread apply all bt        — all thread backtraces" >&2
+echo "" >&2
+echo "  Fork-follow defaults to PARENT (shim-side debugging)." >&2
+echo "  For guest-side debugging, override with:" >&2
+echo "    -ex 'set follow-fork-mode child' (pass after -- on the command line)" >&2
 echo "===================" >&2
 echo "" >&2
 
 # Configure GDB to:
 # - Pass SIGSYS/SIGSEGV to the program (seccomp/guest faults)
 # - Track ALL child processes (broker + runner + workers)
+# - Default to following the parent on fork (shim-side bugs are the
+#   ~95% case; guest-side debugging overrides via EXTRA_ARGS).
+# - Pre-set print options agents are unlikely to know about.
 # - Load symbols for all litebox binaries
 exec "$GDB" \
     -ex "set pagination off" \
     -ex "set print pretty on" \
+    -ex "set print frame-arguments all" \
+    -ex "set print object on" \
+    -ex "set print elements 0" \
+    -ex "set max-completions 0" \
     -ex "handle SIGSYS nostop noprint pass" \
     -ex "handle SIGSEGV nostop noprint pass" \
     -ex "set detach-on-fork off" \
-    -ex "set follow-fork-mode child" \
+    -ex "set follow-fork-mode parent" \
     -ex "set schedule-multiple on" \
     -ex "target remote localhost:$PORT" \
     -ex "add-symbol-file $RUNNER" \

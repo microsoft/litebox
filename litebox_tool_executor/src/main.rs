@@ -129,6 +129,8 @@ fn main() -> anyhow::Result<()> {
             self_exe.display()
         );
         eprintln!("  Or use: bash dev_tools/gdb-connect.sh --port {port}");
+        eprintln!("  Or non-interactive (transcript only, good for coding agents):");
+        eprintln!("    bash dev_tools/gdb-connect-batch.sh --port {port} --commands probe.gdb");
         eprintln!("======================");
         eprintln!();
         let err = std::process::Command::new("gdbserver")
