@@ -4542,7 +4542,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // Phase K Step 1 in; still gated off — subscribe_process_exit(forked pid) returns Io, needs Phase K Step 2 (init via broker too).
+        let eager_broker = false; // Phase K Steps 1+2+3 in. eager_broker=true now correctly takes the broker pipe path (the test's litebox_tool_executor DOES start a broker), but reveals issues beyond Phase K: SubscribeProcessExit RPC fails for forked pids (Io) and the broker pipe path causes a Rust IO-safety double-close. These are Phase C activation issues, not "local pid" issues.
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider
