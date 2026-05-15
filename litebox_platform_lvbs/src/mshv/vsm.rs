@@ -888,25 +888,21 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
     let heki_patch_pa_0 = PhysAddr::new(heki_patch.pa[0]);
     let heki_patch_pa_1 = PhysAddr::new(heki_patch.pa[1]);
 
-    let patch_target_page_offset: usize =
-        (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).trunc();
-    let bytes_in_first_page = PAGE_SIZE - patch_target_page_offset;
+    let patch = &heki_patch.code[..usize::from(heki_patch.size)];
+    if patch.is_empty() {
+        return Ok(());
+    }
 
     if heki_patch_pa_1.is_null()
         || (heki_patch_pa_0.align_up(Size4KiB::SIZE) == heki_patch_pa_1.align_down(Size4KiB::SIZE))
     {
-        let patch = &heki_patch.code[..usize::from(heki_patch.size)];
-        if !patch.is_empty() {
-            let mut ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                heki_patch_pa_0.as_u64().trunc(),
-                patch.len(),
-            )
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
-            unsafe { ptr.write_slice_at_offset(0, patch) }.map_err(|_| VsmError::Vtl0CopyFailed)?;
-        }
+        let mut ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+            heki_patch_pa_0.as_u64().trunc(),
+            patch.len(),
+        )
+        .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        unsafe { ptr.write_slice_at_offset(0, patch) }.map_err(|_| VsmError::Vtl0CopyFailed)?;
     } else {
-        let (patch_first, patch_second) =
-            heki_patch.code[..usize::from(heki_patch.size)].split_at(bytes_in_first_page);
         let pages = [
             PhysPageAddr::<PAGE_SIZE>::new(
                 heki_patch_pa_0
@@ -923,15 +919,7 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
             (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
         )
         .map_err(|_| VsmError::Vtl0CopyFailed)?;
-
-        if !patch_first.is_empty() {
-            unsafe { ptr.write_slice_at_offset(0, patch_first) }
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        }
-        if !patch_second.is_empty() {
-            unsafe { ptr.write_slice_at_offset(patch_first.len(), patch_second) }
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        }
+        unsafe { ptr.write_slice_at_offset(0, patch) }.map_err(|_| VsmError::Vtl0CopyFailed)?;
     }
     Ok(())
 }
@@ -970,7 +958,7 @@ fn mshv_vsm_set_platform_root_key(key_pa: u64) -> Result<i64, VsmError> {
 
     let mut keybuf = Zeroizing::new([0u8; PRK_LEN]);
     let mut key_ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-        key_pa.as_u64().truncate(),
+        key_pa.as_u64().trunc(),
         PRK_LEN,
     )
     .map_err(|_| VsmError::Vtl0CopyFailed)?;
