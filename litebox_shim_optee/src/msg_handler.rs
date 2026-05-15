@@ -388,7 +388,6 @@ pub struct TaRequestInfo<const ALIGN: usize> {
 /// It copies the entire parameter data from the normal world shared memory into the secure world's
 /// memory to create `UteeParamOwned` structures to avoid potential data corruption during TA
 /// execution.
-///
 pub fn decode_ta_request(
     msg_args: &OpteeMsgArgs,
 ) -> Result<TaRequestInfo<PAGE_SIZE>, OpteeSmcReturnCode> {

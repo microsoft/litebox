@@ -13,6 +13,35 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
+/// Calls `sys_munmap(addr, len)` when dropped, unless `disarm()` has been called first.
+///
+/// Used to ensure a mapping created by `sys_mmap` is released on every error
+/// path of `sys_map_zi` / `sys_map_bin`. After the syscall has fully succeeded
+/// and ownership of the mapping has been transferred to the caller, call
+/// `disarm()` to suppress the unmap.
+#[must_use = "MmapGuard unmaps on drop unless disarm() is called; bind it"]
+struct MmapGuard<'a> {
+    task: &'a Task,
+    addr: UserMutPtr<u8>,
+    len: usize,
+}
+
+impl<'a> MmapGuard<'a> {
+    fn new(task: &'a Task, addr: UserMutPtr<u8>, len: usize) -> Self {
+        Self { task, addr, len }
+    }
+
+    fn disarm(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for MmapGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.task.sys_munmap(self.addr, self.len);
+    }
+}
+
 impl Task {
     #[inline]
     fn checked_map_size(
@@ -84,13 +113,12 @@ impl Task {
         let addr = self
             .sys_mmap(addr, total_size, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
             .map_err(|_| TeeResult::OutOfMemory)?;
+        let guard = MmapGuard::new(self, addr, total_size);
+
         let padded_start = addr
             .as_usize()
             .checked_add(pad_begin)
-            .ok_or(TeeResult::BadParameters)
-            .inspect_err(|_| {
-                self.sys_munmap(addr, total_size).ok();
-            })?;
+            .ok_or(TeeResult::BadParameters)?;
 
         // Unmap the padding regions to free physical memory.
         // Using munmap instead of mprotect(PROT_NONE) actually deallocates the frames.
@@ -100,17 +128,11 @@ impl Task {
             let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
         // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
-        let pad_end_start =
-            Self::checked_pad_end_start(padded_start, num_bytes).inspect_err(|_| {
-                self.sys_munmap(addr, total_size).ok();
-            })?;
+        let pad_end_start = Self::checked_pad_end_start(padded_start, num_bytes)?;
         let region_end = addr
             .as_usize()
             .checked_add(total_size)
-            .ok_or(TeeResult::BadParameters)
-            .inspect_err(|_| {
-                self.sys_munmap(addr, total_size).ok();
-            })?;
+            .ok_or(TeeResult::BadParameters)?;
         if pad_end_start < region_end {
             let _ = self.sys_munmap(
                 UserMutPtr::from_usize(pad_end_start),
@@ -119,6 +141,7 @@ impl Task {
         }
 
         let _ = va.write_at_offset(0, padded_start);
+        guard.disarm();
         Ok(())
     }
 
@@ -253,15 +276,13 @@ impl Task {
                 0,
             )
             .map_err(|_| TeeResult::OutOfMemory)?;
+        let guard = MmapGuard::new(self, addr, total_size);
+
         let padded_start = addr
             .as_usize()
             .checked_add(pad_begin)
-            .ok_or(TeeResult::BadParameters)
-            .inspect_err(|_| {
-                self.sys_munmap(addr, total_size).ok();
-            })?;
+            .ok_or(TeeResult::BadParameters)?;
         if padded_start == 0 {
-            let _ = self.sys_munmap(addr, total_size).ok();
             return Err(TeeResult::BadFormat);
         }
 
@@ -274,7 +295,6 @@ impl Task {
             )
             .is_none()
         {
-            self.sys_munmap(addr, total_size).ok();
             return Err(TeeResult::ShortBuffer);
         }
 
@@ -290,15 +310,11 @@ impl Task {
             .checked_sub(prot_start)
             .and_then(|offset| offset.checked_add(num_bytes))
             .and_then(|len| len.checked_next_multiple_of(PAGE_SIZE))
-            .ok_or(TeeResult::BadParameters)
-            .inspect_err(|_| {
-                self.sys_munmap(addr, total_size).ok();
-            })?;
+            .ok_or(TeeResult::BadParameters)?;
         if self
             .sys_mprotect(UserMutPtr::from_usize(prot_start), prot_len, prot)
             .is_err()
         {
-            let _ = self.sys_munmap(addr, total_size).ok();
             return Err(TeeResult::AccessDenied);
         }
 
@@ -310,17 +326,11 @@ impl Task {
             let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
         // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
-        let pad_end_start =
-            Self::checked_pad_end_start(padded_start, num_bytes).inspect_err(|_| {
-                self.sys_munmap(addr, total_size).ok();
-            })?;
+        let pad_end_start = Self::checked_pad_end_start(padded_start, num_bytes)?;
         let region_end = addr
             .as_usize()
             .checked_add(total_size)
-            .ok_or(TeeResult::BadParameters)
-            .inspect_err(|_| {
-                self.sys_munmap(addr, total_size).ok();
-            })?;
+            .ok_or(TeeResult::BadParameters)?;
         if pad_end_start < region_end {
             let _ = self.sys_munmap(
                 UserMutPtr::from_usize(pad_end_start),
@@ -329,6 +339,7 @@ impl Task {
         }
 
         let _ = va.write_at_offset(0, padded_start);
+        guard.disarm();
 
         Ok(())
     }
