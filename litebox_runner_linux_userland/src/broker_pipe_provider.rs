@@ -89,6 +89,16 @@ impl BrokerPipeProvider for RunnerBrokerPipeProvider {
         }
     }
 
+    fn unsubscribe_pipe_end(&self, handle: u64, end: BrokerPipeEnd, subscription_id: u64) {
+        self.dispatcher.unregister_callback(subscription_id);
+        if let Err(e) = self
+            .client
+            .unsubscribe_pipe_end(handle, end.as_u8(), subscription_id)
+        {
+            tracing::warn!(handle, ?end, subscription_id, error = %e, "pipe unsubscribe failed");
+        }
+    }
+
     fn subscribe_pipe_end(
         &self,
         handle: u64,

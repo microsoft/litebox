@@ -73,7 +73,14 @@ impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable for Pip
     }
 
     fn unsubscribe(&self, handle: u64, subscription_id: u64) {
-        self.inner.unsubscribe(handle, subscription_id)
+        // Direction-aware: pipes have separate read/write subjects but
+        // share a sub_id space. The broker's kind-agnostic unsubscribe
+        // checks `read_subject` first and would silently strip the
+        // wrong subject (e.g., a peer worker's read subscription that
+        // happens to share this id). Route through the direction-aware
+        // RPC instead.
+        self.inner
+            .unsubscribe_pipe_end(handle, self.end, subscription_id)
     }
 
     fn release(&self, handle: u64) {
@@ -196,6 +203,13 @@ impl BrokerPipeFd<Platform> {
         if buf.is_empty() {
             return Ok(0);
         }
+        // Phase C.5b: ensure broker-side subscription exists so the
+        // write pollee wakes when the reader drains the pipe (OUT)
+        // or closes (ERR). Without this, writes that block on full
+        // capacity never wake. Direction-aware unsubscribe (added in
+        // the same change) prevents this from accidentally stripping
+        // a peer worker's read subscription on Drop.
+        self.common.ensure_subscribed(&self.pollee);
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::OUT, || {

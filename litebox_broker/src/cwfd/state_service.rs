@@ -38,13 +38,14 @@ use litebox_common_linux::fd_token_protocol::{
     build_register_process_response_ok, build_release_response_ok,
     build_subscribe_eventfd_response_ok, build_subscribe_pipe_response_ok,
     build_subscribe_process_exit_response_ok, build_subscribe_pty_response_ok,
-    build_unsubscribe_response_ok, build_write_eventfd_response_ok, build_write_pipe_response_ok,
-    parse_close_pipe_end_body, parse_create_eventfd_body, parse_create_pidfd_body,
-    parse_create_pipe_body, parse_create_signalfd_body, parse_handle_body,
-    parse_incref_pipe_end_body, parse_mark_process_exited_body, parse_pidfd_exited_request,
-    parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_read_pipe_body,
-    parse_subscribe_eventfd_body, parse_subscribe_pipe_body, parse_subscribe_process_exit_body,
-    parse_subscribe_pty_body, parse_unsubscribe_body, parse_write_eventfd_body,
+    build_unsubscribe_pipe_end_response_ok, build_unsubscribe_response_ok,
+    build_write_eventfd_response_ok, build_write_pipe_response_ok, parse_close_pipe_end_body,
+    parse_create_eventfd_body, parse_create_pidfd_body, parse_create_pipe_body,
+    parse_create_signalfd_body, parse_handle_body, parse_incref_pipe_end_body,
+    parse_mark_process_exited_body, parse_pidfd_exited_request, parse_pty_ioctl_body,
+    parse_pty_read_body, parse_pty_write_body, parse_read_pipe_body, parse_subscribe_eventfd_body,
+    parse_subscribe_pipe_body, parse_subscribe_process_exit_body, parse_subscribe_pty_body,
+    parse_unsubscribe_body, parse_unsubscribe_pipe_end_body, parse_write_eventfd_body,
     parse_write_pipe_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
@@ -98,6 +99,7 @@ pub fn handle_request(
         Opcode::SubscribePipe => handle_subscribe_pipe(registry, conn, request, in_fds),
         Opcode::ClosePipeEnd => handle_close_pipe_end(registry, request, in_fds),
         Opcode::IncrefPipeEnd => handle_incref_pipe_end(registry, request, in_fds),
+        Opcode::UnsubscribePipeEnd => handle_unsubscribe_pipe_end(registry, request, in_fds),
         Opcode::ReadSiginfo => handle_read_siginfo(registry, request, in_fds),
         Opcode::CreatePty => handle_create_pty(registry, request, in_fds),
         Opcode::PtyRead => handle_pty_read(registry, request, in_fds),
@@ -641,6 +643,41 @@ fn handle_close_pipe_end(
     HandlerResult {
         frame: build_close_pipe_end_response_ok(),
         out_fd: None,
+    }
+}
+
+fn handle_unsubscribe_pipe_end(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnsubscribePipeEndResponse);
+    }
+    let (handle_id, subscription_id, end) = match parse_unsubscribe_pipe_end_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::UnsubscribePipeEndResponse),
+    };
+    let Some(end) = PipeEndKind::from_u8(end) else {
+        return protocol_err(Opcode::UnsubscribePipeEndResponse);
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::UnsubscribePipeEndResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match pipe.unsubscribe_end_specific(end, subscription_id) {
+        Ok(()) => HandlerResult {
+            frame: build_unsubscribe_pipe_end_response_ok(),
+            out_fd: None,
+        },
+        Err(UnsubscribeError::UnknownId(_)) => status_err(
+            Opcode::UnsubscribePipeEndResponse,
+            StatusCode::UnknownSubscription,
+        ),
     }
 }
 

@@ -768,6 +768,44 @@ impl FdTokenClient {
         }
     }
 
+    /// Direction-aware unsubscribe for broker pipes. The kind-agnostic
+    /// `unsubscribe` above asks the broker to remove a subscription by
+    /// id, but for pipes the same id can exist on both `read_subject`
+    /// and `write_subject` (subscription ids are worker-local and the
+    /// broker's `PipeState` shares the id space across both ends). The
+    /// broker would then strip the wrong subject (`read_subject` is
+    /// checked first by `PipeState::unsubscribe_end`), silently
+    /// stealing a peer worker's read subscription. The direction-aware
+    /// path tells the broker which subject to remove from.
+    pub fn unsubscribe_pipe_end(
+        &self,
+        handle_id: u64,
+        end: u8,
+        subscription_id: u64,
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &crate::fd_token_protocol::build_unsubscribe_pipe_end_request(
+                handle_id,
+                subscription_id,
+                end,
+            ),
+            None,
+        )?;
+        let (resp_bytes, _) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::UnsubscribePipeEndResponse)?;
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::UnknownSubscription => {
+                Err(ClientError::UnknownSubscription(subscription_id))
+            }
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
     /// Asks the broker to increment the refcount of an existing
     /// handle (typically before shipping it to a peer worker via
     /// SCM_RIGHTS). Returns Ok when the broker confirms the dup;

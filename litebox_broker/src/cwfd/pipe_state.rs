@@ -196,6 +196,22 @@ impl PipeState {
         }
         self.write_subject.remove(subscription_id)
     }
+
+    /// Direction-aware unsubscribe. Use this from the broker pipe
+    /// service for `UnsubscribePipeEnd`. The kind-agnostic
+    /// `unsubscribe_end` above checks `read_subject` first and would
+    /// silently strip the wrong subject if a peer worker's
+    /// subscription on the *other* end happens to share this id.
+    pub fn unsubscribe_end_specific(
+        &self,
+        end: PipeEndKind,
+        subscription_id: u64,
+    ) -> Result<(), UnsubscribeError> {
+        match end {
+            PipeEndKind::Read => self.read_subject.remove(subscription_id),
+            PipeEndKind::Write => self.write_subject.remove(subscription_id),
+        }
+    }
 }
 
 struct ReadyEvents {

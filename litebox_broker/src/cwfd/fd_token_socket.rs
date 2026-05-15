@@ -371,6 +371,7 @@ pub fn handle_control_connection(
                     | Opcode::SubscribePipe
                     | Opcode::ClosePipeEnd
                     | Opcode::IncrefPipeEnd
+                    | Opcode::UnsubscribePipeEnd
                     | Opcode::CreatePty
                     | Opcode::PtyRead
                     | Opcode::PtyWrite

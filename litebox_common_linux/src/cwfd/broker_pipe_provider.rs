@@ -32,6 +32,13 @@ pub trait BrokerPipeProvider: BrokerSubscribable {
     fn incref_pipe_end(&self, handle: u64, end: BrokerPipeEnd) -> Result<(), BrokerOpError>;
     fn close_pipe_end(&self, handle: u64, end: BrokerPipeEnd);
 
+    /// Direction-aware unsubscribe. Required for pipes because their
+    /// subscription ids span both `read_subject` and `write_subject`,
+    /// and the kind-agnostic [`BrokerSubscribable::unsubscribe`] would
+    /// silently strip the wrong subject (the broker checks
+    /// `read_subject` first).
+    fn unsubscribe_pipe_end(&self, handle: u64, end: BrokerPipeEnd, subscription_id: u64);
+
     /// Subscribe to broker pipe events for a specific end of the pipe.
     ///
     /// The generic `BrokerSubscribable::subscribe` impl cannot carry
