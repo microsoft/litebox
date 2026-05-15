@@ -112,21 +112,38 @@ echo "    break process.rs:LINE      — breakpoint by file:line (handles monomo
 echo "    break do_clone             — guest fork/clone" >&2
 echo "    break exit_group           — guest process exit" >&2
 echo "    thread apply all bt        — all thread backtraces" >&2
+echo "    ll                         — short alias for info locals + info args" >&2
+echo "" >&2
+echo "  Fork-follow defaults to PARENT (shim-side debugging)." >&2
+echo "  For guest-side debugging, override with:" >&2
+echo "    -ex 'set follow-fork-mode child' (pass after -- on the command line)" >&2
 echo "===================" >&2
 echo "" >&2
 
 # Configure GDB to:
 # - Pass SIGSYS/SIGSEGV to the program (seccomp/guest faults)
 # - Track ALL child processes (broker + runner + workers)
+# - Default to following the parent on fork (shim-side bugs are the
+#   ~95% case; guest-side debugging overrides via EXTRA_ARGS).
+# - Pre-set print options agents are unlikely to know about.
+# - Provide an `ll` alias for "info locals + info args".
 # - Load symbols for all litebox binaries
 exec "$GDB" \
     -ex "set pagination off" \
     -ex "set print pretty on" \
+    -ex "set print frame-arguments all" \
+    -ex "set print object on" \
+    -ex "set print elements 0" \
+    -ex "set max-completions 0" \
     -ex "handle SIGSYS nostop noprint pass" \
     -ex "handle SIGSEGV nostop noprint pass" \
     -ex "set detach-on-fork off" \
-    -ex "set follow-fork-mode child" \
+    -ex "set follow-fork-mode parent" \
     -ex "set schedule-multiple on" \
+    -ex "define ll
+info locals
+info args
+end" \
     -ex "target remote localhost:$PORT" \
     -ex "add-symbol-file $RUNNER" \
     -ex "add-symbol-file $BROKER" \
