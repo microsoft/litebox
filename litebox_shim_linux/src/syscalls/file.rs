@@ -4551,7 +4551,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // Phase C: F_GETFD fix landed; PB.c2p PASS + PB 65 pass + EPIPE 4/4 + PIDF 11/11. Still 48 PB.* failures + 4 PN.* — separate roots. Gating off until those are triaged.
+        let eager_broker = false; // Phase C: 3 fixes landed (IncrefPipeEnd routing ca90c39a, FIONBIO 05495616, F_GETFD 1994febc). With eager_broker=true: PIE-glibc and static-PIE-glibc/musl PB.* all PASS. Remaining 45 PB.* failures are exclusively nonpie-glibc / non-pie-static-musl legs — single shared root in worker_exec broker-pipe handoff (next session).
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider
