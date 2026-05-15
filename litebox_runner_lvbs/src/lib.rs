@@ -678,21 +678,33 @@ fn open_session_single_instance(
         Some(ta_req_info),
     );
 
-    if write_result.is_err()
-        && !ta_flags.is_keep_alive()
-        && session_manager()
-            .sessions()
-            .count_sessions_for_instance(&instance_arc)
-            == 0
-    {
-        let _ = session_manager().remove_single_instance_if_same(&ta_uuid, &instance_arc);
-        instance.closed = true;
+    // Write-back failure: OpenSession succeeded inside the TA, but we cannot
+    // deliver the session id to the normal world, so it will never issue a
+    // matching CloseSession. For a non-keep-alive instance with no siblings
+    // we tear the whole instance down, reclaiming the TA-side state, and the
+    // session id can be recycled normally. For keep-alive or shared
+    // instances the TA still holds session-local state tagged with this id,
+    // so we forget the id (disarm the guard) to prevent a future OpenSession
+    // from reusing it and colliding with the orphaned TA-side bookkeeping.
+    if let Err(e) = write_result {
+        if !ta_flags.is_keep_alive()
+            && session_manager()
+                .sessions()
+                .count_sessions_for_instance(&instance_arc)
+                == 0
+        {
+            let _ = session_manager().remove_single_instance_if_same(&ta_uuid, &instance_arc);
+            instance.closed = true;
 
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
-        unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
+            unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
+        } else {
+            let _ = session_id_guard.disarm();
+        }
+        drop(instance);
+        return Err(e);
     }
-    write_result?;
 
     // Success: register session and disarm the guard (ownership transfers to session map)
     session_manager().register_session(runner_session_id, instance_arc.clone(), ta_uuid, ta_flags);

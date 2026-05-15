@@ -244,11 +244,6 @@ impl SingleInstanceCache {
         self.inner.lock().insert(uuid, instance);
     }
 
-    /// Remove a cached single-instance TA by UUID.
-    pub fn remove(&self, uuid: &TeeUuid) -> Option<Arc<SpinMutex<TaInstance>>> {
-        self.inner.lock().remove(uuid)
-    }
-
     /// Remove a cached single-instance TA only if it is the expected instance.
     fn remove_if_same(&self, uuid: &TeeUuid, expected: &Arc<SpinMutex<TaInstance>>) -> bool {
         let mut guard = self.inner.lock();
