@@ -969,12 +969,15 @@ fn mshv_vsm_set_platform_root_key(key_pa: u64) -> Result<i64, VsmError> {
     let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
 
     let mut keybuf = Zeroizing::new([0u8; PRK_LEN]);
-    if unsafe { crate::platform_low().copy_slice_from_vtl0_phys(key_pa, &mut *keybuf) } {
-        set_platform_root_key(&*keybuf);
-        Ok(0)
-    } else {
-        Err(VsmError::Vtl0CopyFailed)
-    }
+    let mut key_ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+        key_pa.as_u64().truncate(),
+        PRK_LEN,
+    )
+    .map_err(|_| VsmError::Vtl0CopyFailed)?;
+    unsafe { key_ptr.read_slice_at_offset(0, &mut *keybuf) }
+        .map_err(|_| VsmError::Vtl0CopyFailed)?;
+    set_platform_root_key(&*keybuf);
+    Ok(0)
 }
 
 /// VSM function dispatcher
