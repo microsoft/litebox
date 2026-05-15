@@ -4640,10 +4640,14 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // C.5b protocol fix landed; reverting to gated default.
+        let eager_broker = false; // C.5d WIP — split has PIDF.exit_self regression
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
-            let handle = provider
+            // create_pipe returns two distinct broker state-registry
+            // handles — one for each end. Each handle's registry
+            // refcount = 1 initially; the two BrokerPipeFds we
+            // create below each own one ref and will release on Drop.
+            let (read_handle, write_handle) = provider
                 .create_pipe(
                     DEFAULT_PIPE_BUF_SIZE as u64,
                     // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
@@ -4651,32 +4655,15 @@ impl<FS: ShimFS> Task<FS> {
                 )
                 .map_err(|_| Errno::ENODEV)?;
 
-            // `BrokerPipeFd` embeds a `BrokerBackedCommon` whose `Drop`
-            // calls `provider.release(handle)`. `create_pipe` only gave us
-            // ONE registry refcount, so allocating TWO BrokerPipeFds (rd,
-            // wr) without a matching dup would have one too few. Bump the
-            // handle refcount once here so each of the two entries owns its
-            // own ref. Without this, the registry refcount underflows during
-            // fork+exec cleanup and subsequent ops on either end return
-            // UnknownHandle → EBADF — observed as `EPIPE.exec_captured`
-            // failing with EBADF on the parent's read after child exec.
-            let releaser: alloc::sync::Arc<
-                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-            > = alloc::sync::Arc::clone(&provider) as _;
-            if releaser.dup_handle(handle).is_err() {
-                provider.release(handle);
-                return Err(Errno::ENODEV);
-            }
-
             let writer_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
                 alloc::sync::Arc::clone(&provider),
-                handle,
+                write_handle,
                 litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
                 entry_flags,
             );
             let reader_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
                 provider,
-                handle,
+                read_handle,
                 litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
                 entry_flags,
             );

@@ -9163,40 +9163,24 @@ impl<FS: ShimFS> Task<FS> {
                 );
                 drop(dt_local);
                 if let (Some(provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
+                    let _ = &provider; // kept for trait coherence; not used now
                     let releaser: alloc::sync::Arc<
                         dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
                     > = alloc::sync::Arc::clone(&provider) as _;
-                    // Phase C.5: emit-side per-end refcount bump.
-                    //
-                    // After we spawn the new worker, the child task in this
-                    // parent worker is torn down, which drops the child's
-                    // fd table; each BrokerPipeFd's `on_close` calls
-                    // `close_pipe_end(handle, direction)`, decrementing the
-                    // broker pipe's per-end refcount. If the per-end count
-                    // hits zero mid-migration, the broker marks the end
-                    // closed and the new worker's read/write of the same
-                    // pipe gets EPIPE / EOF — what was symptomatic on
-                    // `PB.*.nonpie-glibc.dpg1` and other cross-binary-type
-                    // legs.
-                    //
-                    // Balance the drop with an `incref_pipe_end` here.
-                    // `dup_handle` covers the registry refcount for the
-                    // transit ref; `incref_pipe_end` covers the per-end
-                    // refcount so write_open / read_open stay true while
-                    // the migration is in flight. The install side does
-                    // NOT incref (its on_close is balanced by the eventual
-                    // close in the new worker, which is one end-refcount
-                    // we're handing off via this incref).
+                    // Phase C.5d (post-split): each pipe end is its own
+                    // broker StateObject with its own registry refcount.
+                    // Emit-side dup_handle bumps the registry refcount;
+                    // worker B's install creates a new BrokerPipeFd that
+                    // claims that ref; on Drop it releases. The parent
+                    // worker drops the child task's BrokerPipeFd ⇒
+                    // release. Net rc change across the migration: 0
+                    // (one ref shipped over).
                     let dup_ok = releaser.dup_handle(handle_id).is_ok();
-                    let incref_ok =
-                        dup_ok && provider.incref_pipe_end(handle_id, direction).is_ok();
-                    if !incref_ok && dup_ok {
-                        releaser.release(handle_id);
-                    }
-                    if incref_ok {
-                        // Phase C.3 spec format: `fd:pipe:handle_id:r|w`.
-                        // Direction is critical for the receiver to pick
-                        // the right end when constructing the BrokerPipeFd.
+                    if dup_ok {
+                        // Spec format `fd:pipe:handle:r|w`. Direction is
+                        // shim-side capability gating (a read-end fd
+                        // returns EBADF on write), not a broker hint —
+                        // the broker disambiguates by handle alone.
                         let dir_char = match direction {
                             litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
                             litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',

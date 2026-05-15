@@ -79,6 +79,14 @@ where
             BrokerPipeEnd::Write => NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR,
         };
         let common = BrokerBackedCommon::new(subscribable, handle, events_mask);
+        // Per-slot refcount model: each fd-table slot that references
+        // this BrokerPipeFd contributes one registry refcount on the
+        // broker. `on_dup` bumps via `dup_handle`; `on_close` (called
+        // per slot removal by `descriptor_table::remove`) balances via
+        // `release`. Suppress `BrokerBackedCommon::Drop`'s own release
+        // to avoid double-release — the per-slot `on_close` already
+        // released for every slot that ever existed.
+        common.disable_release_on_drop();
         Self {
             provider,
             common,
@@ -154,16 +162,6 @@ impl BrokerPipeFd<Platform> {
     }
 
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, Errno> {
-        {
-            use litebox::platform::DebugLogProvider as _;
-            let msg = alloc::format!(
-                "[SPLIT-DIAG] BrokerPipeFd::write handle={} dir={:?} len={}\n",
-                self.handle(),
-                self.direction,
-                buf.len()
-            );
-            litebox_platform_multiplex::platform().debug_log_print(&msg);
-        }
         if self.direction != BrokerPipeEnd::Write {
             return Err(Errno::EBADF);
         }
@@ -221,19 +219,18 @@ impl IOPollable for BrokerPipeFd<Platform> {
 
 impl FdEnabledSubsystemEntry for BrokerPipeFd<Platform> {
     fn on_dup(&self) {
-        // Each pipe end is its own broker state-object with its own
-        // registry refcount; bumping the registry refcount tracks the
-        // new shim BrokerPipeFd. No per-end direction needed — the
-        // handle uniquely identifies the end.
+        // Per-slot registry refcount: each new fd-table slot pointing
+        // to this BrokerPipeFd contributes +1 to the broker
+        // registry refcount. Balanced by `on_close` on slot removal.
         let _ = self.provider.dup_handle(self.handle());
     }
 
     fn on_close(&self) {
-        // Releasing the registry refcount decrements toward zero;
-        // when it hits zero, the broker drops the StateObject, whose
-        // Drop notifies the *other* end's subscribers (HUP for reader
-        // when writer ends close, ERR for writer when reader ends
-        // close). Generic Release, no direction byte needed.
+        // Per-slot release: every removal of an fd-table slot
+        // referencing this BrokerPipeFd decrements the broker
+        // registry refcount. When the last slot is removed, the
+        // broker StateObject Drops and notifies the OTHER end's
+        // subscribers (HUP → reader EOF, ERR → writer EPIPE).
         self.provider.release(self.handle());
     }
 }

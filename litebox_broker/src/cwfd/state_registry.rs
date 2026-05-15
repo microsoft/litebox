@@ -219,11 +219,6 @@ impl BrokerStateRegistry {
         StateHandle(id)
     }
 
-    /// Increments the refcount of an existing handle, returning the
-    /// same handle on success. Used when a worker passes the handle
-    /// cross-worker (broker holds an additional reference for the
-    /// receiver) or when the broker itself needs to retain a
-    /// reference beyond a worker's lifetime.
     pub fn dup(&self, handle: StateHandle) -> Result<StateHandle, StateRegistryError> {
         let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
         let entry = s
@@ -249,6 +244,7 @@ impl BrokerStateRegistry {
             .get_mut(&handle.0)
             .ok_or(StateRegistryError::UnknownHandle(handle))?;
         entry.refcount -= 1;
+        let new_rc = entry.refcount;
         if entry.refcount == 0 {
             s.table.remove(&handle.0);
         }

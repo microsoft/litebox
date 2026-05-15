@@ -526,9 +526,6 @@ fn handle_write_pipe(
     let state = match resolve_pipe_write(registry, handle_id) {
         Ok(s) => s,
         Err(status) => {
-            eprintln!(
-                "[SPLIT-BROKER-DIAG] handle_write_pipe(handle={handle_id}) resolve failed: {status:?}"
-            );
             return status_err(Opcode::WritePipeResponse, status);
         }
     };
@@ -536,13 +533,7 @@ fn handle_write_pipe(
         .as_any()
         .downcast_ref::<PipeWriteEnd>()
         .expect("resolve_pipe_write checked");
-    let result = write_end.write(&bytes);
-    eprintln!(
-        "[SPLIT-BROKER-DIAG] handle_write_pipe(handle={handle_id}, len={}) result={:?}",
-        bytes.len(),
-        result.as_ref().map(|n| *n).map_err(|e| format!("{e:?}"))
-    );
-    match result {
+    match write_end.write(&bytes) {
         Ok(n) => HandlerResult {
             frame: build_write_pipe_response_ok(n as u64),
             out_fd: None,

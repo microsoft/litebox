@@ -174,7 +174,10 @@ impl PipeInner {
 /// be registered into the [`BrokerStateRegistry`] independently — the
 /// registry refcount of each end represents the number of worker
 /// `BrokerPipeFd` instances referring to it.
-pub fn new_pipe(capacity: usize, atomic_write_size: usize) -> (Arc<PipeReadEnd>, Arc<PipeWriteEnd>) {
+pub fn new_pipe(
+    capacity: usize,
+    atomic_write_size: usize,
+) -> (Arc<PipeReadEnd>, Arc<PipeWriteEnd>) {
     let inner = Arc::new(PipeInner::new(capacity, atomic_write_size));
     let read_end = Arc::new(PipeReadEnd {
         inner: Arc::clone(&inner),

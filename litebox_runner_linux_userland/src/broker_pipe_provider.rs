@@ -36,10 +36,7 @@ impl BrokerSubscribable for RunnerBrokerPipeProvider {
         let subscription_id = self.dispatcher.alloc_subscription_id();
         let bridge: Arc<dyn NotificationCallback> = Arc::new(CallbackBridge { inner: callback });
         self.dispatcher.register_callback(subscription_id, bridge);
-        match self
-            .client
-            .subscribe(handle, subscription_id, events_mask)
-        {
+        match self.client.subscribe(handle, subscription_id, events_mask) {
             Ok(()) => Ok(subscription_id),
             Err(e) => {
                 self.dispatcher.unregister_callback(subscription_id);
