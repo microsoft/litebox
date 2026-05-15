@@ -722,22 +722,36 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-fn write_to_iovec<F>(iovs: &[IoWriteVec<ConstPtr<u8>>], write_fn: F) -> Result<usize, Errno>
+pub(super) fn write_to_iovec<P, I, F>(iovs: I, write_fn: F) -> Result<usize, Errno>
 where
+    P: RawConstPointer<u8>,
+    I: IntoIterator<Item = (P, usize)>,
     F: Fn(&[u8]) -> Result<usize, Errno>,
 {
     let mut total_written = 0;
-    for iov in iovs {
-        if iov.iov_len == 0 {
+    for (iov_base, iov_len) in iovs {
+        if iov_len == 0 {
             continue;
         }
-        let slice = iov
-            .iov_base
-            .to_owned_slice(iov.iov_len)
-            .ok_or(Errno::EFAULT)?;
-        let size = write_fn(&slice)?;
+        let Some(slice) = iov_base.to_owned_slice(iov_len) else {
+            return if total_written > 0 {
+                Ok(total_written)
+            } else {
+                Err(Errno::EFAULT)
+            };
+        };
+        let size = match write_fn(&slice) {
+            Ok(size) => size,
+            Err(err) => {
+                return if total_written > 0 {
+                    Ok(total_written)
+                } else {
+                    Err(err)
+                };
+            }
+        };
         total_written += size;
-        if size < iov.iov_len {
+        if size < iov_len {
             // Okay to transfer fewer bytes than requested
             break;
         }
@@ -766,12 +780,12 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
-                    write_to_iovec(iovs, |buf: &[u8]| {
+                    write_to_iovec(iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)), |buf| {
                         files.fs.write(fd, buf, None).map_err(Errno::from)
                     })
                 },
                 |fd| {
-                    write_to_iovec(iovs, |buf| {
+                    write_to_iovec(iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)), |buf| {
                         self.global.sendto(
                             &self.wait_cx(),
                             fd,
@@ -2256,9 +2270,42 @@ impl<FS: ShimFS> Task<FS> {
 mod tests {
     use super::*;
     use alloc::string::String;
+    use core::cell::Cell;
     use litebox::fs::Mode;
 
     extern crate std;
+
+    #[test]
+    fn write_to_iovec_returns_partial_after_later_error() {
+        let first = b"first";
+        let second = b"second";
+        let iovs = [
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(first.as_ptr().expose_provenance()),
+                iov_len: first.len(),
+            },
+            IoWriteVec {
+                iov_base: ConstPtr::from_usize(second.as_ptr().expose_provenance()),
+                iov_len: second.len(),
+            },
+        ];
+        let calls = Cell::new(0);
+
+        let result = write_to_iovec(iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)), |buf| {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 {
+                assert_eq!(buf, first);
+                Ok(buf.len())
+            } else {
+                assert_eq!(buf, second);
+                Err(Errno::EPIPE)
+            }
+        });
+
+        assert_eq!(result, Ok(first.len()));
+        assert_eq!(calls.get(), 2);
+    }
 
     #[test]
     fn fspath_new() {

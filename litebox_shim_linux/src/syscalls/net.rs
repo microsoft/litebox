@@ -1410,38 +1410,23 @@ impl<FS: ShimFS> Task<FS> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                let mut total_sent = 0;
-                for iov in &iovs {
-                    if iov.iov_len == 0 {
-                        continue;
-                    }
-                    let buf = iov
-                        .iov_base
-                        .to_owned_slice(iov.iov_len)
-                        .ok_or(Errno::EFAULT)?;
-                    total_sent +=
+                super::file::write_to_iovec(
+                    iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
+                    |buf| {
                         self.global
-                            .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)?;
-                }
-                Ok(total_sent)
+                            .sendto(&self.wait_cx(), fd, buf, flags, sock_addr)
+                    },
+                )
             },
             |file| {
                 let unix_addr = sock_addr
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                let mut total_sent = 0;
-                for iov in &iovs {
-                    if iov.iov_len == 0 {
-                        continue;
-                    }
-                    let buf = iov
-                        .iov_base
-                        .to_owned_slice(iov.iov_len)
-                        .ok_or(Errno::EFAULT)?;
-                    total_sent += file.sendto(self, &buf, flags, unix_addr.clone())?;
-                }
-                Ok(total_sent)
+                super::file::write_to_iovec(
+                    iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
+                    |buf| file.sendto(self, buf, flags, unix_addr.clone()),
+                )
             },
         );
         if let Err(Errno::EPIPE) = res
