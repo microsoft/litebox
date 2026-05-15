@@ -2042,7 +2042,15 @@ impl<FS: ShimFS> Task<FS> {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
-        let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        // TID allocation: Linux TIDs and PIDs share the same numeric
+        // space and are globally unique. If a broker guest-pid provider
+        // is installed, route the new thread's TID through it so two
+        // shims that clone() concurrently can never collide. Falls back
+        // to the per-shim `next_thread_id` counter when there's no
+        // broker (single-shim test scenarios).
+        let child_tid = crate::syscalls::guest_pid::try_register_broker_guest_pid()
+            .map(|raw| i32::try_from(raw).expect("broker pid must fit in Linux tid"))
+            .unwrap_or_else(|| self.global.next_thread_id.fetch_add(1, Ordering::Relaxed));
         if let Some(parent_tid_ptr) = set_parent_tid {
             let _ = self.prepare_guest_write(parent_tid_ptr, 1);
             let _ = parent_tid_ptr.write_at_offset(0, child_tid);
