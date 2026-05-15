@@ -275,6 +275,13 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             BrokerHandleKind::Pipe => {
                 let provider = syscalls::broker_pipe::broker_pipe_provider().ok_or(())?;
                 let direction = pipe_direction.ok_or(())?;
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let msg = alloc::format!(
+                        "[SPLIT-DIAG] install_broker_bridge_fd(pipe): fd={guest_fd} handle={handle_id} dir={direction:?}\n"
+                    );
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                }
                 let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
                     provider,
                     handle_id,
@@ -288,8 +295,17 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .descriptor_table_mut()
                     .insert(bp_fd);
                 let mut rds = files.raw_descriptor_store.write();
-                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+                let consumed = rds.fd_consume_raw_integer::<FS>(guest_fd);
                 let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let msg = alloc::format!(
+                        "[SPLIT-DIAG] install_broker_bridge_fd(pipe) DONE: fd={guest_fd} consumed_ok={} install_ok={}\n",
+                        consumed.is_ok(),
+                        ok
+                    );
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                }
                 debug_assert!(
                     ok,
                     "install_broker_bridge_fd(pipe): slot {guest_fd} still occupied"

@@ -577,7 +577,11 @@ impl FdTokenClient {
 
     /// Asks the broker to create a pipe state. The returned handle starts
     /// with one read-end ref and one write-end ref.
-    pub fn create_pipe(&self, capacity: u64, atomic_write_size: u64) -> Result<u64, ClientError> {
+    pub fn create_pipe(
+        &self,
+        capacity: u64,
+        atomic_write_size: u64,
+    ) -> Result<(u64, u64), ClientError> {
         let stream = self.lock();
         send_frame(
             &stream,
@@ -593,9 +597,8 @@ impl FdTokenClient {
             });
         }
         match resp.status {
-            StatusCode::Ok => {
-                parse_handle_body(resp.body, resp.opcode).map_err(ClientError::Protocol)
-            }
+            StatusCode::Ok => crate::fd_token_protocol::parse_create_pipe_response_body(resp.body)
+                .map_err(ClientError::Protocol),
             s => Err(map_status_no_handle(resp.opcode, s)),
         }
     }
@@ -721,6 +724,19 @@ impl FdTokenClient {
     /// `subscription_id` and the matched events bits whenever state
     /// changes match.
     pub fn subscribe_eventfd(
+        &self,
+        handle_id: u64,
+        subscription_id: u64,
+        events_mask: u32,
+    ) -> Result<(), ClientError> {
+        self.subscribe(handle_id, subscription_id, events_mask)
+    }
+
+    /// Generic subscribe. Reuses the `SubscribeEventfd` opcode (which
+    /// the broker handles via the kind-agnostic `StateObject::subscribe`
+    /// trait method), so it works for any broker state-object kind:
+    /// eventfd, pidfd, pipe read/write end, pty.
+    pub fn subscribe(
         &self,
         handle_id: u64,
         subscription_id: u64,

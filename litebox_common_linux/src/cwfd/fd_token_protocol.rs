@@ -1184,12 +1184,29 @@ pub fn parse_create_pipe_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> 
     Ok((capacity, atomic))
 }
 
-pub fn build_create_pipe_response_ok(handle_id: u64) -> OwnedFrame {
+pub fn build_create_pipe_response_ok(read_handle_id: u64, write_handle_id: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&read_handle_id.to_le_bytes());
+    body.extend_from_slice(&write_handle_id.to_le_bytes());
     OwnedFrame {
         opcode: Opcode::CreatePipeResponse,
         status: StatusCode::Ok,
-        body: handle_id.to_le_bytes().to_vec(),
+        body,
     }
+}
+
+pub fn parse_create_pipe_response_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreatePipeResponse,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+    ))
 }
 
 /// Body for [`Opcode::ReadPipe`]: (handle: u64, max_len: u64).

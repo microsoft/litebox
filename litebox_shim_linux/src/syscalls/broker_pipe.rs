@@ -51,47 +51,6 @@ pub(crate) struct BrokerPipeFd<P: RawSyncPrimitivesProvider + litebox::platform:
     pollee: Arc<Pollee<P>>,
 }
 
-/// Adapter that presents a [`BrokerPipeProvider`] as a [`BrokerSubscribable`]
-/// pre-tagged with a specific pipe end. The generic
-/// `BrokerSubscribable::subscribe` impl on `BrokerPipeProvider` cannot carry
-/// per-end direction; this wrapper routes through `subscribe_pipe_end` so
-/// read-end and write-end subscriptions reach the broker correctly tagged.
-struct PipeEndSubscribable {
-    inner: Arc<dyn BrokerPipeProvider>,
-    end: BrokerPipeEnd,
-}
-
-impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable for PipeEndSubscribable {
-    fn subscribe(
-        &self,
-        handle: u64,
-        events_mask: u32,
-        callback: Arc<dyn BrokerEventCallback>,
-    ) -> Result<u64, BrokerOpError> {
-        self.inner
-            .subscribe_pipe_end(handle, self.end, events_mask, callback)
-    }
-
-    fn unsubscribe(&self, handle: u64, subscription_id: u64) {
-        // Direction-aware: pipes have separate read/write subjects but
-        // share a sub_id space. The broker's kind-agnostic unsubscribe
-        // checks `read_subject` first and would silently strip the
-        // wrong subject (e.g., a peer worker's read subscription that
-        // happens to share this id). Route through the direction-aware
-        // RPC instead.
-        self.inner
-            .unsubscribe_pipe_end(handle, self.end, subscription_id)
-    }
-
-    fn release(&self, handle: u64) {
-        self.inner.release(handle)
-    }
-
-    fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
-        self.inner.dup_handle(handle)
-    }
-}
-
 impl<P> BrokerPipeFd<P>
 where
     P: RawSyncPrimitivesProvider + litebox::platform::TimeProvider,
@@ -106,14 +65,12 @@ where
             BrokerPipeEnd::Read => OFlags::RDONLY,
             BrokerPipeEnd::Write => OFlags::WRONLY,
         };
-        // Wrap the provider in a per-end subscribable so the broker
-        // sees the correct end tag on subscribe.
+        // Each pipe end has its own broker state-registry handle, so
+        // subscribe/unsubscribe/release/dup_handle on this handle
+        // unambiguously address THIS end. No direction wrapper needed.
         let subscribable: Arc<
             dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-        > = Arc::new(PipeEndSubscribable {
-            inner: Arc::clone(&provider),
-            end: direction,
-        });
+        > = Arc::clone(&provider) as _;
         // Event mask per end: readers care about IN/HUP/ERR; writers
         // care about OUT/ERR (a closed reader manifests as ERR/EPIPE
         // here, not HUP).
@@ -197,6 +154,16 @@ impl BrokerPipeFd<Platform> {
     }
 
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, Errno> {
+        {
+            use litebox::platform::DebugLogProvider as _;
+            let msg = alloc::format!(
+                "[SPLIT-DIAG] BrokerPipeFd::write handle={} dir={:?} len={}\n",
+                self.handle(),
+                self.direction,
+                buf.len()
+            );
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
+        }
         if self.direction != BrokerPipeEnd::Write {
             return Err(Errno::EBADF);
         }
@@ -254,11 +221,19 @@ impl IOPollable for BrokerPipeFd<Platform> {
 
 impl FdEnabledSubsystemEntry for BrokerPipeFd<Platform> {
     fn on_dup(&self) {
+        // Each pipe end is its own broker state-object with its own
+        // registry refcount; bumping the registry refcount tracks the
+        // new shim BrokerPipeFd. No per-end direction needed — the
+        // handle uniquely identifies the end.
         let _ = self.provider.dup_handle(self.handle());
-        let _ = self.provider.incref_pipe_end(self.handle(), self.direction);
     }
 
     fn on_close(&self) {
-        self.provider.close_pipe_end(self.handle(), self.direction);
+        // Releasing the registry refcount decrements toward zero;
+        // when it hits zero, the broker drops the StateObject, whose
+        // Drop notifies the *other* end's subscribers (HUP for reader
+        // when writer ends close, ERR for writer when reader ends
+        // close). Generic Release, no direction byte needed.
+        self.provider.release(self.handle());
     }
 }

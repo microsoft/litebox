@@ -5,7 +5,7 @@
 
 use litebox_common_linux::broker_eventfd::{NotificationCallback, NotificationDispatcher};
 use litebox_common_linux::broker_pipe_provider::{
-    BrokerEventCallback, BrokerOpError, BrokerPipeEnd, BrokerPipeProvider,
+    BrokerEventCallback, BrokerOpError, BrokerPipeProvider,
 };
 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
 use litebox_common_linux::fd_token_client::{ClientError, FdTokenClient};
@@ -23,19 +23,29 @@ impl RunnerBrokerPipeProvider {
 }
 
 impl BrokerSubscribable for RunnerBrokerPipeProvider {
-    /// Generic subscribe — required by `BrokerSubscribable`. This routes
-    /// to the broker as a Read-end subscription, which is **only correct
-    /// for read-end fds**. The shim's `BrokerPipeFd` MUST go through
-    /// `BrokerPipeProvider::subscribe_pipe_end` (which carries the
-    /// direction) instead. Kept here to satisfy the trait for callers
-    /// that don't need per-end direction.
+    /// Subscribes to broker events for the pipe end identified by
+    /// `handle`. Each end of a pipe has its own broker state-registry
+    /// entry, so the handle uniquely identifies the end; no direction
+    /// byte is needed.
     fn subscribe(
         &self,
         handle: u64,
         events_mask: u32,
         callback: Arc<dyn BrokerEventCallback>,
     ) -> Result<u64, BrokerOpError> {
-        self.subscribe_pipe_end(handle, BrokerPipeEnd::Read, events_mask, callback)
+        let subscription_id = self.dispatcher.alloc_subscription_id();
+        let bridge: Arc<dyn NotificationCallback> = Arc::new(CallbackBridge { inner: callback });
+        self.dispatcher.register_callback(subscription_id, bridge);
+        match self
+            .client
+            .subscribe(handle, subscription_id, events_mask)
+        {
+            Ok(()) => Ok(subscription_id),
+            Err(e) => {
+                self.dispatcher.unregister_callback(subscription_id);
+                Err(client_err_to_broker_err(e))
+            }
+        }
     }
 
     fn unsubscribe(&self, handle: u64, subscription_id: u64) {
@@ -59,7 +69,11 @@ impl BrokerSubscribable for RunnerBrokerPipeProvider {
 }
 
 impl BrokerPipeProvider for RunnerBrokerPipeProvider {
-    fn create_pipe(&self, capacity: u64, atomic_write_size: u64) -> Result<u64, BrokerOpError> {
+    fn create_pipe(
+        &self,
+        capacity: u64,
+        atomic_write_size: u64,
+    ) -> Result<(u64, u64), BrokerOpError> {
         self.client
             .create_pipe(capacity, atomic_write_size)
             .map_err(client_err_to_broker_err)
@@ -76,50 +90,6 @@ impl BrokerPipeProvider for RunnerBrokerPipeProvider {
             .write_pipe(handle, bytes)
             .map_err(client_err_to_broker_err)
     }
-
-    fn incref_pipe_end(&self, handle: u64, end: BrokerPipeEnd) -> Result<(), BrokerOpError> {
-        self.client
-            .incref_pipe_end(handle, end.as_u8())
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn close_pipe_end(&self, handle: u64, end: BrokerPipeEnd) {
-        if let Err(e) = self.client.close_pipe_end(handle, end.as_u8()) {
-            tracing::warn!(handle, ?end, error = %e, "pipe close-end failed");
-        }
-    }
-
-    fn unsubscribe_pipe_end(&self, handle: u64, end: BrokerPipeEnd, subscription_id: u64) {
-        self.dispatcher.unregister_callback(subscription_id);
-        if let Err(e) = self
-            .client
-            .unsubscribe_pipe_end(handle, end.as_u8(), subscription_id)
-        {
-            tracing::warn!(handle, ?end, subscription_id, error = %e, "pipe unsubscribe failed");
-        }
-    }
-
-    fn subscribe_pipe_end(
-        &self,
-        handle: u64,
-        end: BrokerPipeEnd,
-        events_mask: u32,
-        callback: Arc<dyn BrokerEventCallback>,
-    ) -> Result<u64, BrokerOpError> {
-        let subscription_id = self.dispatcher.alloc_subscription_id();
-        let bridge: Arc<dyn NotificationCallback> = Arc::new(CallbackBridge { inner: callback });
-        self.dispatcher.register_callback(subscription_id, bridge);
-        match self
-            .client
-            .subscribe_pipe(handle, subscription_id, events_mask, end.as_u8())
-        {
-            Ok(()) => Ok(subscription_id),
-            Err(e) => {
-                self.dispatcher.unregister_callback(subscription_id);
-                Err(client_err_to_broker_err(e))
-            }
-        }
-    }
 }
 
 struct CallbackBridge {
@@ -132,11 +102,11 @@ impl NotificationCallback for CallbackBridge {
     }
 }
 
-fn client_err_to_broker_err(err: ClientError) -> BrokerOpError {
-    match err {
-        ClientError::WouldBlock => BrokerOpError::WouldBlock,
-        ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
+fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
+    match e {
         ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
+        ClientError::WouldBlock => BrokerOpError::WouldBlock,
+        ClientError::Protocol(_) => BrokerOpError::InvalidValue,
         _ => BrokerOpError::Io,
     }
 }
