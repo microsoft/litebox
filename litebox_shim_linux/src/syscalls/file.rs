@@ -2090,6 +2090,20 @@ impl<FS: ShimFS> Task<FS> {
             close_on_exec: bool,
             target: DupFdRequest,
         ) -> Result<usize, DupFdError> {
+            let max_fd = task
+                .process()
+                .limits
+                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
+            match target {
+                DupFdRequest::Exact(target) if target >= max_fd => {
+                    return Err(DupFdError::TargetFdExceedsLimit);
+                }
+                DupFdRequest::LowestAtOrAbove(min_fd) if min_fd >= max_fd => {
+                    return Err(DupFdError::TargetFdExceedsLimit);
+                }
+                _ => {}
+            }
+
             let mut dt = task.global.litebox.descriptor_table_mut();
             let fd: TypedFd<_> = dt.duplicate(fd).ok_or(DupFdError::BadFd)?;
             if close_on_exec {
@@ -2097,14 +2111,15 @@ impl<FS: ShimFS> Task<FS> {
                 assert!(old.is_none());
             }
             drop(dt);
-            match target {
+
+            let new_fd = match target {
                 DupFdRequest::Exact(target) => {
                     let _ = task.do_close_and_replace(target, Some(fd));
-                    Ok(target)
+                    target
                 }
                 DupFdRequest::LowestAvailable => {
                     let rds = &mut *files.raw_descriptor_store.write();
-                    Ok(rds.fd_into_raw_integer(fd))
+                    rds.fd_into_raw_integer(fd)
                 }
                 DupFdRequest::LowestAtOrAbove(min_fd) => {
                     let rds = &mut *files.raw_descriptor_store.write();
@@ -2117,26 +2132,19 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
                     assert!(success);
-                    Ok(raw_fd)
+                    raw_fd
                 }
+            };
+            if new_fd >= max_fd {
+                let _ = task.do_close(new_fd);
+                return Err(DupFdError::TooManyFiles);
             }
+            Ok(new_fd)
         }
-        let max_fd = self
-            .process()
-            .limits
-            .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
-        match target {
-            DupFdRequest::Exact(fd) if fd >= max_fd => {
-                return Err(DupFdError::TargetFdExceedsLimit);
-            }
-            DupFdRequest::LowestAtOrAbove(min_fd) if min_fd >= max_fd => {
-                return Err(DupFdError::TargetFdExceedsLimit);
-            }
-            _ => {}
-        }
+
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
-        let new_fd = files
+        files
             .run_on_raw_fd(
                 file,
                 |fd| dup(self, &files, fd, close_on_exec, target),
@@ -2146,12 +2154,7 @@ impl<FS: ShimFS> Task<FS> {
                 |fd| dup(self, &files, fd, close_on_exec, target),
                 |fd| dup(self, &files, fd, close_on_exec, target),
             )
-            .map_err(|_| DupFdError::BadFd)??;
-        if new_fd >= max_fd {
-            let _ = self.do_close(new_fd);
-            return Err(DupFdError::TooManyFiles);
-        }
-        Ok(new_fd)
+            .map_err(|_| DupFdError::BadFd)?
     }
 
     /// Handle syscall `dup/dup2/dup3`
