@@ -642,10 +642,7 @@ fn test_rwlock_readers_not_starved_after_writer_handoff() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
-        match handle.join() {
-            Ok(value) => value,
-            Err(_) => panic!("{thread_name} panicked"),
-        }
+        handle.join().expect("{thread_name} panicked")
     }
 
     // Initialize the platform (reuses the global Once-based init).
