@@ -101,13 +101,18 @@ find_symbols_dir() {
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local workspace_root
     workspace_root="$(cd "$script_dir/.." && pwd)"
-    local target_dir="$workspace_root/target/debug"
-    if [[ -f "$target_dir/litebox_tool_executor" ]]; then
-        echo "$target_dir"
-        return
-    fi
-    echo "ERROR: Cannot find litebox binaries with debug symbols." >&2
-    echo "  Looked in: $target_dir" >&2
+    # Prefer debug (faster builds, full symbols), fall back to release
+    # (still has symbols unless explicitly stripped).
+    for candidate in "$workspace_root/target/debug" "$workspace_root/target/release"; do
+        if [[ -f "$candidate/litebox_tool_executor" ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    echo "ERROR: Cannot find litebox binaries with symbols." >&2
+    echo "  Looked in:" >&2
+    echo "    $workspace_root/target/debug" >&2
+    echo "    $workspace_root/target/release" >&2
     echo "  Set LITEBOX_SYMBOLS_DIR, or build with:" >&2
     echo "    cargo build -p litebox_tool_executor -p litebox_runner_linux_userland -p litebox_broker" >&2
     exit 1
@@ -155,10 +160,6 @@ exec timeout --signal=KILL "$TIMEOUT" \
     -ex "set detach-on-fork off" \
     -ex "set follow-fork-mode parent" \
     -ex "set schedule-multiple on" \
-    -ex "define ll
-info locals
-info args
-end" \
     -ex "target remote localhost:$PORT" \
     -ex "add-symbol-file $RUNNER" \
     -ex "add-symbol-file $BROKER" \

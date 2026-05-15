@@ -6,8 +6,12 @@
 //! Set the env var `LITEBOX_HARNESS_PAUSE` to one or more pause-point
 //! specs (comma-separated). At each matching site the current process
 //! prints `[litebox-pause] tag=... filter=... pid=N waiting for SIGCONT`
-//! on stderr and `raise(SIGSTOP)`s itself. Resume with
-//! `kill -CONT <pid>`.
+//! on stderr and waits for SIGCONT. Resume with `kill -CONT <pid>`.
+//!
+//! Implementation note: we install a no-op SIGCONT handler and call
+//! `pause(2)`. We do **not** use `raise(SIGSTOP)` because the harness
+//! is typically pid 1 inside its docker container, and Linux silently
+//! ignores SIGSTOP on pid 1 (kernel init protection).
 //!
 //! Spec syntax: `tag[=filter]`, where `tag` is one of the well-known
 //! pause-point names (e.g., `harness:test-start`, `harness:test-end-fail`)
@@ -98,7 +102,13 @@ pub fn should_pause(tag: &str, filter: &str) -> bool {
 }
 
 /// If any active spec matches, print a `[litebox-pause]` marker on
-/// stderr and `raise(SIGSTOP)` self. Returns once SIGCONT is delivered.
+/// stderr and wait for SIGCONT.
+///
+/// We install a no-op SIGCONT handler and then `pause()`. We do
+/// **not** use `raise(SIGSTOP)` because the harness is typically
+/// pid 1 inside its docker container, and Linux silently ignores
+/// SIGSTOP on pid 1 (kernel init protection). The pause/signal-handler
+/// pattern works regardless of pid.
 ///
 /// Call this at well-known sites (test start, end-pass, end-fail,
 /// etc.). When the env var is unset this is a fast no-op (single
@@ -114,9 +124,32 @@ pub fn pause_if_match(tag: &str, filter: &str) {
         "[litebox-pause] tag={tag} filter={filter} pid={pid} waiting for SIGCONT \
          (resume with: kill -CONT {pid})"
     );
-    // SAFETY: SIGSTOP is a valid signal; raise(2) is async-signal-safe
-    // and only stops the current thread group.
-    let _ = unsafe { libc::raise(libc::SIGSTOP) };
+    install_sigcont_handler();
+    // SAFETY: pause(2) blocks until any non-ignored signal is
+    // delivered; with our SIGCONT handler installed this returns
+    // when the user resumes. No memory or thread invariants involved.
+    let _ = unsafe { libc::pause() };
+}
+
+/// Install a no-op SIGCONT handler on first call so that subsequent
+/// `pause()` calls wake up when SIGCONT arrives instead of dying or
+/// being ignored. Idempotent.
+fn install_sigcont_handler() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        extern "C" fn noop_handler(_signum: libc::c_int) {}
+        // SAFETY: sigaction with a SIG_DFL-shaped no-op handler is
+        // well-defined. We zero-init the struct to set sa_flags=0,
+        // empty mask, and sa_sigaction=handler. We accept the loss
+        // of any prior SIGCONT handler (the only realistic prior
+        // is SIG_DFL, since pid-1 init implicitly inherits IGN for
+        // SIGCONT but we want a real handler).
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = noop_handler as *const () as usize;
+            let _ = libc::sigaction(libc::SIGCONT, &sa, std::ptr::null_mut());
+        }
+    });
 }
 
 #[cfg(test)]
