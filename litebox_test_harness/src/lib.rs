@@ -9,6 +9,7 @@
 pub mod coordinator;
 pub mod handlers;
 pub mod os;
+pub mod pause_points;
 pub mod protocol;
 pub mod test_registry;
 
