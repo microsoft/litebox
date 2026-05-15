@@ -4542,7 +4542,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // Phase C: EPIPE.exec_captured now PASSES with the FIONBIO fix (commit pending). PB.c2p still fails with IO Safety violation — separate stdio-stream-routing bug. Gating off until that's resolved.
+        let eager_broker = false; // Phase C: FIONBIO fix unlocked EPIPE.{basic_io,fork_io,exec_no_capture,exec_captured} and PIDF.* under eager_broker=true. PB.c2p still fails with IO Safety violation in libc::abort — looks like fd-inherit-non-stdio across worker_exec is missing handling for broker pipes. Separate bug from FIONBIO.
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider
