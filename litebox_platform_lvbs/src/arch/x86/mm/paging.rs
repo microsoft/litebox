@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::vec::Vec;
 use core::ops::Range;
 use litebox::mm::linux::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
 use litebox::platform::page_mgmt;
@@ -173,12 +174,19 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         // with the Linux kernel's mmu_gather approach.
         // Note this implementation is slow as each page requires a full page table walk.
         // If we have N pages, it will be N times slower.
+        let page_count: usize =
+            ((end.start_address() - start.start_address()) / Size4KiB::SIZE).truncate();
+        let mut unmapped_frames = if dealloc_frames {
+            Vec::with_capacity(page_count)
+        } else {
+            Vec::new()
+        };
         let mut inner = self.inner.lock();
         for page in Page::range(start, end) {
             match inner.unmap(page) {
                 Ok((frame, _)) => {
                     if dealloc_frames {
-                        unsafe { allocator.deallocate_frame(frame) };
+                        unmapped_frames.push(frame);
                     }
                 }
                 Err(X64UnmapError::PageNotMapped) => {}
@@ -192,9 +200,15 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         }
 
         if flush_tlb {
-            let page_count = (end.start_address() - start.start_address()) / Size4KiB::SIZE;
             // Present → not-present: other cores may hold stale entries.
-            flush_tlb_range(start, page_count.truncate());
+            flush_tlb_range(start, page_count);
+        }
+
+        // Must run after flush_tlb_range: freeing frames before the shootdown would
+        // let the allocator hand them back out while remote cores still hold valid
+        // TLB entries pointing at them.
+        for frame in unmapped_frames {
+            unsafe { allocator.deallocate_frame(frame) };
         }
 
         if clean_up_page_tables {
