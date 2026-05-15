@@ -4640,7 +4640,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // C.5d WIP — split has PIDF.exit_self regression
+        let eager_broker = false; // C.5d landed; eager off for committed state
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             // create_pipe returns two distinct broker state-registry
