@@ -210,6 +210,25 @@ or two JSONL lines per test:
 `litebox_test_harness/scripts/analyze-test-timing.py` summarizes a
 single run or diffs two runs (e.g., before/after a perf change).
 
+#### Debugging a specific failing test
+
+The harness supports `LITEBOX_HARNESS_PAUSE` "soft breakpoints" — at
+the matching site the process `raise(SIGSTOP)`s itself and waits for
+`SIGCONT`. This is more reliable than gdb breakpoints under litebox's
+multi-process protocol (which can deadlock when one inferior stops).
+Pair with `litebox_tool_executor --debug PORT` (gdbserver) and
+`dev_tools/gdb-connect-batch.sh` for a non-interactive, transcript-
+based debugging round-trip. See
+`litebox_test_harness/FIX_AGENT_PLAYBOOK.md` "gdbserver via `--debug`"
+and `dev_tools/gdb-example-session.md` for the full pattern.
+
+```bash
+# Pause the harness before a single failing test runs:
+LITEBOX_HARNESS_PAUSE='harness:test-start=PB.c2p.nonpie-glibc.dpg2' \
+  cargo test -p litebox_test_harness --test integration \
+  -- 'litebox::PB.c2p.nonpie-glibc.dpg2' --exact
+```
+
 To run a docker invocation by hand for debugging:
 
 ```bash
