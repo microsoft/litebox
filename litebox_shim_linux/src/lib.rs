@@ -1977,18 +1977,23 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     /// paths; several syscalls forgot the broker-pipe fast path,
     /// silently returning EBADF on broker-pipe fds. The 8-arm shape
     /// makes that class of bug a compile error.
+    ///
+    /// **Closure receives `&Arc<TypedFd<X>>`**, not `&TypedFd<X>`, so
+    /// arms that need an owned `Arc<TypedFd<X>>` (e.g., to embed in
+    /// a binding type that outlives the closure) can clone it. Most
+    /// call sites use it as `&TypedFd<X>` and rely on `Arc::deref`.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn run_on_raw_fd<R>(
         &self,
         fd: usize,
-        fs: impl FnOnce(&TypedFd<FS>) -> R,
-        net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
-        pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
-        eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem>) -> R,
-        epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<FS>>) -> R,
-        unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>) -> R,
-        host_pipe: impl FnOnce(&TypedFd<syscalls::host_pipe::HostPipeSubsystem>) -> R,
-        broker_pipe: impl FnOnce(&TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>) -> R,
+        fs: impl FnOnce(&Arc<TypedFd<FS>>) -> R,
+        net: impl FnOnce(&Arc<TypedFd<Network<Platform>>>) -> R,
+        pipes: impl FnOnce(&Arc<TypedFd<Pipes<Platform>>>) -> R,
+        eventfd: impl FnOnce(&Arc<TypedFd<syscalls::eventfd::EventfdSubsystem>>) -> R,
+        epoll: impl FnOnce(&Arc<TypedFd<syscalls::epoll::EpollSubsystem<FS>>>) -> R,
+        unix: impl FnOnce(&Arc<TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>>) -> R,
+        host_pipe: impl FnOnce(&Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>) -> R,
+        broker_pipe: impl FnOnce(&Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -2024,33 +2029,6 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             return Ok(broker_pipe(&fd));
         }
         Err(Errno::EBADF)
-    }
-
-    /// Check if the given raw FD is a host-pipe FD.
-    ///
-    /// Returns a typed handle if it is, `None` otherwise.
-    ///
-    /// **Deprecated**: prefer using `run_on_raw_fd`'s `host_pipe`
-    /// closure arm directly. This helper persists for sites that
-    /// genuinely need an owned `Arc<TypedFd>` to outlive a borrow
-    /// (e.g., the `entry_handle` lookup pattern in `sys_read`).
-    pub(crate) fn try_host_pipe_fd(
-        &self,
-        fd: usize,
-    ) -> Option<alloc::sync::Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>> {
-        let rds = self.raw_descriptor_store.read();
-        rds.fd_from_raw_integer(fd).ok()
-    }
-
-    /// Check if the given raw FD is a broker-pipe FD.
-    ///
-    /// **Deprecated**: see [`Self::try_host_pipe_fd`].
-    pub(crate) fn try_broker_pipe_fd(
-        &self,
-        fd: usize,
-    ) -> Option<alloc::sync::Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>> {
-        let rds = self.raw_descriptor_store.read();
-        rds.fd_from_raw_integer(fd).ok()
     }
 }
 

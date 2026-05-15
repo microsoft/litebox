@@ -1868,17 +1868,6 @@ impl<FS: ShimFS> Task<FS> {
                 },
             )
             .flatten();
-        // Diagnostic: log subsystem dispatch for write(fd=3) → EINVAL.
-        if raw_fd == 3 && matches!(res, Err(Errno::EINVAL)) {
-            let has_hp = files.try_host_pipe_fd(3).is_some();
-            litebox::log_println!(
-                self.global.platform,
-                "[WRITE-EINVAL] pid={} fd=3 len={} hp={} subsystem reached EINVAL path",
-                self.pid,
-                buf.len(),
-                has_hp,
-            );
-        }
         if let Err(Errno::EPIPE) = res {
             self.send_signal(
                 litebox_common_linux::signal::Signal::SIGPIPE,
@@ -3599,35 +3588,6 @@ fn synthetic_symlink_stat(target_len: usize) -> FileStat {
 fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileStat, Errno> {
     let uid = task.credentials.euid.truncate();
     let gid = task.credentials.egid.truncate();
-
-    // Fast path: host-pipe FDs return a synthetic pipe-like stat.
-    if let Some(hp_fd) = task.files.borrow().try_host_pipe_fd(raw_fd) {
-        let dt = task.global.litebox.descriptor_table();
-        let dir = dt
-            .with_entry(&hp_fd, |e: &super::host_pipe::HostPipeFd| e.direction)
-            .ok_or(Errno::EBADF)?;
-        let read_write_mode = match dir {
-            super::host_pipe::HostPipeDirection::Read => Mode::RUSR,
-            super::host_pipe::HostPipeDirection::Write => Mode::WUSR,
-            super::host_pipe::HostPipeDirection::ReadWrite => {
-                Mode::from_bits_truncate(Mode::RUSR.bits() | Mode::WUSR.bits())
-            }
-        };
-        return Ok(FileStat {
-            st_dev: PIPEFS_DEV.truncate(),
-            st_ino: raw_fd as u64,
-            st_nlink: 1,
-            st_mode: (read_write_mode.bits() | litebox_common_linux::InodeType::NamedPipe as u32)
-                .truncate(),
-            st_uid: uid,
-            st_gid: gid,
-            st_rdev: 0,
-            st_size: 0,
-            st_blksize: 4096,
-            st_blocks: 0,
-            ..Default::default()
-        });
-    }
 
     let mut fstat = task
         .files
