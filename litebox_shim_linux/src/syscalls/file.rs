@@ -4542,7 +4542,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // Phase K Steps 1+2+3+4 in. Activation now reveals concrete Phase C product blockers — see `target/test-logs/.../DBG-SUBSCRIBE` lines and rst-diag in keep-container runs: (1) SubscribeProcessExit(forked_pid) RPC fails with "Broken pipe" because the broker control socket closes (root cause not yet diagnosed — possibly broker dies, or coord's std runtime closes its broker fd as part of an IO-safety abort); (2) Rust std IO Safety violation aborts coord during dpg1 spawn, which the broken-pipe error feeds into. Both need product-level Phase C investigation.
+        let eager_broker = false; // Phase K Steps 1+2+3+4 in. Activation hits Phase C product blockers — see `/tmp/rst-diag.log` DBG-SUBSCRIBE for the "Broken pipe" RPC error and the Rust std "IO Safety violation: owned file descriptor already closed" abort during `Command::spawn`. RUST_BACKTRACE=full doesn't help (the abort path doesn't print backtraces). Needs deeper investigation than this session.
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider
