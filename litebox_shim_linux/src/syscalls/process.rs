@@ -463,7 +463,7 @@ impl<FS: ShimFS> Task<FS> {
         // Cancel blocking stdin reads so threads in host syscalls can exit.
         // Only do this for the init process; child processes should not cancel
         // stdin for the entire sandbox.
-        let is_init = self.process_id == litebox::process::ProcessId::INIT;
+        let is_init = Some(self.process_id) == self.global.litebox.process_registry().root_pid();
         if is_init {
             self.global.platform.cancel_stdin();
         }
@@ -500,7 +500,7 @@ impl<FS: ShimFS> Task<FS> {
             // Cancel blocking stdin reads so threads in host syscalls can exit.
             // Only do this for the init process; child processes should not cancel
             // stdin for the entire sandbox.
-            if self.process_id == litebox::process::ProcessId::INIT {
+            if Some(self.process_id) == self.global.litebox.process_registry().root_pid() {
                 self.global.platform.cancel_stdin();
             }
             for (&tid, thread) in &inner.threads {
@@ -1514,21 +1514,10 @@ impl<FS: ShimFS> Task<FS> {
 
         let target = match pid {
             p if p > 0 => {
-                // Translate the guest-visible pid to the shim-local
-                // ProcessId via the pid_to_process_id map. With broker-
-                // allocated pids the pid value is independent of
-                // ProcessId.0, so we MUST do the lookup instead of
-                // assuming `ProcessId(pid as u32)`. Fall back to the
-                // pid-as-ProcessId interpretation for backwards
-                // compatibility when the broker provider isn't installed
-                // (pre-Phase-1 behaviour where pid == ProcessId.0).
-                let process_id = self
-                    .global
-                    .pid_to_process_id
-                    .read()
-                    .get(&p)
-                    .copied()
-                    .unwrap_or(ProcessId(p.try_into().map_err(|_| Errno::EINVAL)?));
+                // After Phase K Step 3, ProcessId == guest pid by
+                // construction, so the historical pid_to_process_id
+                // forward lookup is just `ProcessId(p as u32)`.
+                let process_id = ProcessId(p.try_into().map_err(|_| Errno::EINVAL)?);
                 WaitTarget::Pid(process_id)
             }
             -1 => WaitTarget::AnyChild,
@@ -1582,20 +1571,11 @@ impl<FS: ShimFS> Task<FS> {
                     self.prepare_guest_write(ptr, 1)?;
                     let _ = ptr.write_at_offset(0, encoded);
                 }
-                // wait_for_child returns the matched child's ProcessId
-                // (shim-local handle), but Linux wait4 must return the
-                // guest-visible pid. Reverse-look the pid via
-                // pid_to_process_id; fall back to ProcessId.0 only if
-                // the reverse lookup misses (pre-Phase-1 invariant
-                // where pid == ProcessId.0).
-                let guest_pid = self
-                    .global
-                    .pid_to_process_id
-                    .read()
-                    .iter()
-                    .find_map(|(&gp, &pid)| (pid == wr.pid).then_some(gp))
-                    .map(|p| p as usize)
-                    .unwrap_or(wr.pid.0 as usize);
+                // wait_for_child returns the matched child's ProcessId.
+                // After Phase K Step 3 it equals the guest-visible pid
+                // by construction, so the historical reverse lookup
+                // through pid_to_process_id is just `wr.pid.0 as i32`.
+                let guest_pid = wr.pid.0 as usize;
                 Ok(guest_pid)
             }
             Err(litebox::process::WaitError::WouldBlock) => Ok(0),
@@ -1776,14 +1756,7 @@ impl<FS: ShimFS> Task<FS> {
         if flags & !PIDFD_NONBLOCK != 0 {
             return Err(Errno::EINVAL);
         }
-        let guest_pid = pid.cast_signed();
-        let process_id = self
-            .global
-            .pid_to_process_id
-            .read()
-            .get(&guest_pid)
-            .copied()
-            .unwrap_or(ProcessId(pid));
+        let process_id = ProcessId(pid);
         let host_pid_opt: Option<u32> = self
             .global
             .fork_child_host_pids
@@ -2887,11 +2860,14 @@ impl<FS: ShimFS> Task<FS> {
             .register_running_process_local(child_process_id)
             .expect("newly forked process must be registered to the local host");
 
-        // Register guest PID → ProcessId mapping for signal delivery.
-        self.global
-            .pid_to_process_id
-            .write()
-            .insert(child_pid, child_process_id);
+        // After Phase K Step 3, child_pid == child_process_id.0 by
+        // construction (broker pid drives both fields). The historical
+        // pid_to_process_id map is gone.
+        debug_assert_eq!(
+            u32::try_from(child_pid).ok(),
+            Some(child_process_id.0),
+            "child_pid and child_process_id must be the same value"
+        );
         let child_cmdline = self.global.proc_cmdline(self.pid).unwrap_or_else(|| {
             let exe = self.fs.borrow().exe_path.read().clone();
             proc_cmdline_from_argv(&[], &exe)
@@ -8530,13 +8506,7 @@ impl<FS: ShimFS> Task<FS> {
         if pid == 0 {
             return Ok(self.pid.cast_unsigned());
         }
-        let target = self
-            .global
-            .pid_to_process_id
-            .read()
-            .get(&pid)
-            .copied()
-            .unwrap_or(ProcessId(pid.cast_unsigned()));
+        let target = ProcessId(pid.cast_unsigned());
         self.global
             .litebox
             .process_registry()
@@ -8563,12 +8533,7 @@ impl<FS: ShimFS> Task<FS> {
         let target = if pid == 0 {
             caller
         } else {
-            self.global
-                .pid_to_process_id
-                .read()
-                .get(&pid)
-                .copied()
-                .unwrap_or(ProcessId(pid.cast_unsigned()))
+            ProcessId(pid.cast_unsigned())
         };
         let target_pgid = if pgid == 0 {
             ProcessGroupId::from(target)
@@ -8596,12 +8561,7 @@ impl<FS: ShimFS> Task<FS> {
         let target = if pid == 0 {
             self.process_id
         } else {
-            self.global
-                .pid_to_process_id
-                .read()
-                .get(&pid)
-                .copied()
-                .unwrap_or(ProcessId(pid.cast_unsigned()))
+            ProcessId(pid.cast_unsigned())
         };
         self.global
             .litebox

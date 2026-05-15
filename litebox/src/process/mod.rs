@@ -473,6 +473,15 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for WakerRegistration<Platform> {
 pub struct ProcessRegistry<Platform: RawSyncPrimitivesProvider> {
     table: RwLock<Platform, hashbrown::HashMap<ProcessId, ProcessEntry<Platform>>>,
     next_pid: AtomicU32,
+    /// The `ProcessId` of the root (init) process, set the first time a
+    /// process is registered with `parent = None`. `0` is the sentinel
+    /// "not yet set" value (no valid `ProcessId` is `0`).
+    ///
+    /// Used by reparenting and "am I init?" queries instead of the
+    /// historical `ProcessId::INIT` (= `ProcessId(1)`) hard-coding —
+    /// with broker-allocated pids, a non-root shim's init is at the
+    /// broker's next free pid (e.g. `2`, `5`, …), not `1`.
+    root: AtomicU32,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Default for ProcessRegistry<Platform> {
@@ -487,7 +496,15 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         Self {
             table: RwLock::new(hashbrown::HashMap::new()),
             next_pid: AtomicU32::new(1),
+            root: AtomicU32::new(0),
         }
+    }
+
+    /// The `ProcessId` of the root (init) process, or `None` if no
+    /// root has been registered yet.
+    pub fn root_pid(&self) -> Option<ProcessId> {
+        let raw = self.root.load(Ordering::Acquire);
+        if raw == 0 { None } else { Some(ProcessId(raw)) }
     }
 
     /// Create a new process and return its [`ProcessId`].
@@ -573,6 +590,11 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
 
         let prev = table.insert(pid, entry);
         debug_assert!(prev.is_none(), "PID collision: {}", pid.0);
+
+        // Record root pid the first time a parent-less process is added.
+        if parent.is_none() {
+            self.root.store(pid.0, Ordering::Release);
+        }
 
         // Keep next_pid ahead of any externally-allocated pid so subsequent
         // counter-allocated `create_process` calls don't collide.
@@ -694,8 +716,11 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
 
             // In Linux, init (PID 1) exiting is a kernel panic. In LiteBox,
             // we allow it (sandbox teardown) but skip reparenting since there
-            // is no ancestor to reparent to.
-            if id != ProcessId::INIT {
+            // is no ancestor to reparent to. With broker-allocated pids the
+            // root may not be `ProcessId::INIT`; consult the runtime-tracked
+            // root pid instead.
+            let root_pid = self.root_pid();
+            if Some(id) != root_pid {
                 let orphaned_children: Vec<ProcessId> = entry.children.drain(..).collect();
                 if !orphaned_children.is_empty() {
                     // Separate zombie orphans (auto-reap) from running orphans (reparent).
@@ -712,14 +737,16 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                         }
                     }
 
-                    // Reparent running children to PID 1.
-                    for &child_pid in &to_reparent {
-                        if let Some(child_entry) = table.get_mut(&child_pid) {
-                            child_entry.context.parent = Some(ProcessId::INIT);
+                    // Reparent running children to the registry's root.
+                    if let Some(root) = root_pid {
+                        for &child_pid in &to_reparent {
+                            if let Some(child_entry) = table.get_mut(&child_pid) {
+                                child_entry.context.parent = Some(root);
+                            }
                         }
-                    }
-                    if let Some(init_entry) = table.get_mut(&ProcessId::INIT) {
-                        init_entry.children.extend(to_reparent);
+                        if let Some(init_entry) = table.get_mut(&root) {
+                            init_entry.children.extend(to_reparent);
+                        }
                     }
 
                     // Auto-reap zombie orphans.

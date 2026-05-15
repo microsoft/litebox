@@ -650,12 +650,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    // Allocate the init process at ProcessId::INIT. The shim's init Task
-    // also hardcodes ProcessId::INIT as its process_id; the externally-
-    // visible guest pid (broker-allocated for the root, --guest-pid for
-    // worker-host paths) lives in TaskParams.pid and is mapped to
-    // ProcessId::INIT via the global pid_to_process_id table.
-    shim_builder.init_with_pid(litebox::process::ProcessId::INIT);
+    // Allocate the init process in the registry at a ProcessId equal to
+    // its externally-visible guest pid. With a broker provider, the
+    // root init's pid is the broker-allocated value reserved during
+    // `setup_broker_eventfd_provider`; without a broker we fall back to
+    // the host gettid() (`platform.init_task().pid`). In either case
+    // ProcessId == guest pid by construction, so the shim no longer
+    // needs to translate between them.
+    {
+        let task = task_params_with_overrides(&cli_args, platform);
+        let pid = u32::try_from(task.pid).expect("init task pid must be non-negative");
+        shim_builder.init_with_pid(litebox::process::ProcessId(pid));
+    }
     let litebox = shim_builder.litebox();
     let (in_mem, tar_ro) = build_initial_fs(
         litebox,
@@ -1350,9 +1356,13 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    // Worker-host paths: the shim's init Task uses ProcessId::INIT
-    // regardless of the guest pid carried by --guest-pid.
-    shim_builder.init_with_pid(litebox::process::ProcessId::INIT);
+    // Worker-host (fork-restore): the registry's init pid equals the
+    // worker's guest pid (carried in --guest-pid, defaulting to 1).
+    {
+        let task = worker_task_params(&cli_args);
+        let pid = u32::try_from(task.pid).expect("worker task pid must be non-negative");
+        shim_builder.init_with_pid(litebox::process::ProcessId(pid));
+    }
     let litebox = shim_builder.litebox();
 
     // Load tar data if --initial-files was forwarded.
@@ -2228,9 +2238,12 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
     register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    // Worker-exec: the shim's init Task uses ProcessId::INIT regardless
-    // of the guest pid carried by --guest-pid.
-    shim_builder.init_with_pid(litebox::process::ProcessId::INIT);
+    // Worker-exec: registry's init pid equals --guest-pid.
+    {
+        let task = worker_task_params(&cli_args);
+        let pid = u32::try_from(task.pid).expect("worker task pid must be non-negative");
+        shim_builder.init_with_pid(litebox::process::ProcessId(pid));
+    }
     let litebox = shim_builder.litebox();
     let transferred_exec_image = if let Some(fd) = cli_args.worker_exec_fd {
         Some(read_worker_exec_image(fd)?)

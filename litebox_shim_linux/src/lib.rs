@@ -554,8 +554,13 @@ impl LinuxShimBuilder {
             }),
         });
         let control_plane = multihost::ControlPlane::new_root_local();
+        let init_process_id = self
+            .litebox
+            .process_registry()
+            .root_pid()
+            .expect("init process must have been allocated before build()");
         control_plane
-            .register_running_process_local(litebox::process::ProcessId::INIT)
+            .register_running_process_local(init_process_id)
             .expect("init process must be registered to the root host");
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -570,7 +575,7 @@ impl LinuxShimBuilder {
             cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
             process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             host_tty_foreground_pgrp: litebox::sync::Mutex::new(
-                litebox::process::ProcessGroupId::from(litebox::process::ProcessId::INIT),
+                litebox::process::ProcessGroupId::from(init_process_id),
             ),
             host_tty_shadow_termios: litebox::sync::Mutex::new(None),
             local_control_plane_pump_active: core::sync::atomic::AtomicBool::new(false),
@@ -578,7 +583,6 @@ impl LinuxShimBuilder {
             epoll_graph_lock: litebox::sync::Mutex::new(()),
             control_plane,
             fork_child_host_pids: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
-            pid_to_process_id: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             proc_cmdlines: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             inotify_instances: litebox::sync::Mutex::new(Vec::new()),
         });
@@ -643,14 +647,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // future clone() allocations above that main thread ID.
         self.global.reserve_thread_id(pid);
 
-        // Register guest PID → ProcessId mapping for the init process.
-        // For the init task, `pid` comes from the host thread ID and may
-        // differ from ProcessId::INIT (1). This mapping allows sys_kill to
-        // find the correct ProcessId when given a guest PID.
-        self.global
-            .pid_to_process_id
-            .write()
-            .insert(pid, litebox::process::ProcessId::INIT);
+        // The init task's `ProcessId` matches its externally-visible guest
+        // pid by construction (the runner allocated init in the registry
+        // using `ProcessId(pid as u32)`). Phase K Step 3 retired the
+        // historical `pid_to_process_id` mapping; pid and ProcessId are
+        // now identical everywhere.
+        let process_id = litebox::process::ProcessId(
+            u32::try_from(pid).expect("init task pid must be non-negative"),
+        );
 
         let files = syscalls::file::FilesState::new(fs);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
@@ -664,7 +668,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 process_state: self.process_state.clone().into(),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.global.platform),
-                process_id: litebox::process::ProcessId::INIT,
+                process_id,
                 pid,
                 ppid,
                 tid: pid,
@@ -1464,7 +1468,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 process_state: child_process_state.into(),
                 thread: child_thread,
                 wait_state: wait::WaitState::new(self.global.platform),
-                process_id: litebox::process::ProcessId::INIT,
+                process_id: litebox::process::ProcessId(
+                    u32::try_from(id.pid).expect("fork-restore child pid must be non-negative"),
+                ),
                 pid: id.pid,
                 ppid: id.ppid,
                 tid: id.tid,
@@ -3793,13 +3799,6 @@ struct GlobalState<FS: ShimFS> {
     /// Mapping from guest ProcessId.0 → remote worker host OS PID.
     /// Used to forward signals to fork-restore and remote-exec workers.
     fork_child_host_pids: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, i32>>,
-    /// Mapping from guest PID (the value returned by getpid()) to ProcessId.
-    /// For forked children these are equal, but the init process may have a
-    /// host-derived PID (e.g. 8) while its ProcessId is always 1.
-    pid_to_process_id: litebox::sync::RwLock<
-        Platform,
-        alloc::collections::BTreeMap<i32, litebox::process::ProcessId>,
-    >,
     /// Synthetic `/proc/<pid>/cmdline` contents for locally-known guest PIDs.
     proc_cmdlines: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<i32, Vec<u8>>>,
     /// Open inotify instances visible to all tasks on this shim host.

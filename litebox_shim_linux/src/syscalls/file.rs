@@ -5066,9 +5066,9 @@ impl<FS: ShimFS> Task<FS> {
                 // silently-accepted TCSETS. Return the shadow if present
                 // so TCGETS reflects what the caller set.
                 let shadow = self.global.host_tty_shadow_termios.lock().clone();
-                let attrs = if self.process_id != litebox::process::ProcessId::INIT
-                    && let Some(ref shadow_attrs) = shadow
-                {
+                let is_init =
+                    Some(self.process_id) == self.global.litebox.process_registry().root_pid();
+                let attrs = if !is_init && let Some(ref shadow_attrs) = shadow {
                     shadow_attrs.clone()
                 } else {
                     self.global
