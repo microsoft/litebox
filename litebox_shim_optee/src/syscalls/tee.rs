@@ -260,7 +260,9 @@ impl Task {
             )
             .ok_or(TeeResult::AccessConflict)?
         };
-        start
+        // Reject ranges where `start + aligned_len` would wrap, so downstream
+        // permission lookups don't operate on a truncated address range.
+        let _ = start
             .as_usize()
             .checked_add(aligned_len.as_usize())
             .ok_or(TeeResult::AccessConflict)?;

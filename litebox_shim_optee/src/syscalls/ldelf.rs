@@ -87,7 +87,10 @@ impl Task {
         let padded_start = addr
             .as_usize()
             .checked_add(pad_begin)
-            .ok_or(TeeResult::BadParameters)?;
+            .ok_or(TeeResult::BadParameters)
+            .inspect_err(|_| {
+                self.sys_munmap(addr, total_size).ok();
+            })?;
 
         // Unmap the padding regions to free physical memory.
         // Using munmap instead of mprotect(PROT_NONE) actually deallocates the frames.
@@ -97,11 +100,17 @@ impl Task {
             let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
         // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
-        let pad_end_start = Self::checked_pad_end_start(padded_start, num_bytes)?;
+        let pad_end_start =
+            Self::checked_pad_end_start(padded_start, num_bytes).inspect_err(|_| {
+                self.sys_munmap(addr, total_size).ok();
+            })?;
         let region_end = addr
             .as_usize()
             .checked_add(total_size)
-            .ok_or(TeeResult::BadParameters)?;
+            .ok_or(TeeResult::BadParameters)
+            .inspect_err(|_| {
+                self.sys_munmap(addr, total_size).ok();
+            })?;
         if pad_end_start < region_end {
             let _ = self.sys_munmap(
                 UserMutPtr::from_usize(pad_end_start),
@@ -247,7 +256,10 @@ impl Task {
         let padded_start = addr
             .as_usize()
             .checked_add(pad_begin)
-            .ok_or(TeeResult::BadParameters)?;
+            .ok_or(TeeResult::BadParameters)
+            .inspect_err(|_| {
+                self.sys_munmap(addr, total_size).ok();
+            })?;
         if padded_start == 0 {
             let _ = self.sys_munmap(addr, total_size).ok();
             return Err(TeeResult::BadFormat);
@@ -262,6 +274,7 @@ impl Task {
             )
             .is_none()
         {
+            self.sys_munmap(addr, total_size).ok();
             return Err(TeeResult::ShortBuffer);
         }
 
@@ -277,7 +290,10 @@ impl Task {
             .checked_sub(prot_start)
             .and_then(|offset| offset.checked_add(num_bytes))
             .and_then(|len| len.checked_next_multiple_of(PAGE_SIZE))
-            .ok_or(TeeResult::BadParameters)?;
+            .ok_or(TeeResult::BadParameters)
+            .inspect_err(|_| {
+                self.sys_munmap(addr, total_size).ok();
+            })?;
         if self
             .sys_mprotect(UserMutPtr::from_usize(prot_start), prot_len, prot)
             .is_err()
@@ -294,11 +310,17 @@ impl Task {
             let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
         // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
-        let pad_end_start = Self::checked_pad_end_start(padded_start, num_bytes)?;
+        let pad_end_start =
+            Self::checked_pad_end_start(padded_start, num_bytes).inspect_err(|_| {
+                self.sys_munmap(addr, total_size).ok();
+            })?;
         let region_end = addr
             .as_usize()
             .checked_add(total_size)
-            .ok_or(TeeResult::BadParameters)?;
+            .ok_or(TeeResult::BadParameters)
+            .inspect_err(|_| {
+                self.sys_munmap(addr, total_size).ok();
+            })?;
         if pad_end_start < region_end {
             let _ = self.sys_munmap(
                 UserMutPtr::from_usize(pad_end_start),

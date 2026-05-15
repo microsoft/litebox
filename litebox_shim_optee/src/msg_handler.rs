@@ -442,10 +442,10 @@ pub fn decode_ta_request(
     };
 
     let num_params = msg_args.num_params as usize;
-    let client_params = num_params
+    if num_params
         .checked_sub(skip)
-        .ok_or(OpteeSmcReturnCode::EBadCmd)?;
-    if client_params > UteeParamOwned::TEE_NUM_PARAMS {
+        .is_none_or(|n| n > UteeParamOwned::TEE_NUM_PARAMS)
+    {
         return Err(OpteeSmcReturnCode::EBadCmd);
     }
     for (i, param) in msg_args
