@@ -240,7 +240,7 @@ impl Drop for NinePHandle {
 
 #[test]
 fn test_nine_p_create_and_read_file() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -276,7 +276,7 @@ fn test_nine_p_create_and_read_file() {
 
 #[test]
 fn test_nine_p_mkdir_and_readdir() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -346,7 +346,7 @@ fn test_nine_p_mkdir_and_readdir() {
 
 #[test]
 fn test_nine_p_unlink_and_rmdir() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -380,7 +380,7 @@ fn test_nine_p_unlink_and_rmdir() {
 
 #[test]
 fn test_nine_p_file_status() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -420,7 +420,7 @@ fn test_nine_p_file_status() {
 
 #[test]
 fn test_nine_p_seek_and_partial_read() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -453,7 +453,7 @@ fn test_nine_p_seek_and_partial_read() {
 
 #[test]
 fn test_nine_p_truncate() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -476,7 +476,7 @@ fn test_nine_p_truncate() {
 
 #[test]
 fn test_nine_p_host_files_visible() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
 
     // Pre-populate some files on the host side
@@ -647,7 +647,7 @@ impl Drop for BrokenNinePHandle {
 /// breaks after the filesystem has been attached.
 #[test]
 fn test_nine_p_broken_open() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     // 2 writes: version + attach. The next write (open's walk) will fail.
     let handle = BrokenNinePHandle::new(&litebox, &server, 2);
@@ -660,7 +660,7 @@ fn test_nine_p_broken_open() {
 /// Creating a file should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_create() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = BrokenNinePHandle::new(&litebox, &server, 2);
     let fs = handle.fs();
@@ -672,7 +672,7 @@ fn test_nine_p_broken_create() {
 /// Reading from an fd obtained before the break should fail.
 #[test]
 fn test_nine_p_broken_read() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
 
     // Pre-create a file via normal connection
@@ -701,7 +701,7 @@ fn test_nine_p_broken_read() {
 /// Writing to an fd obtained before the break should fail.
 #[test]
 fn test_nine_p_broken_write() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
 
     // 4 writes: version + attach + walk + lopen. Then write will fail.
@@ -718,7 +718,7 @@ fn test_nine_p_broken_write() {
 /// mkdir should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_mkdir() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = BrokenNinePHandle::new(&litebox, &server, 2);
     let fs = handle.fs();
@@ -730,7 +730,7 @@ fn test_nine_p_broken_mkdir() {
 /// readdir should fail when the connection breaks during the directory read.
 #[test]
 fn test_nine_p_broken_readdir() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
 
     // 4 writes: version + attach + walk + lopen for the directory.
@@ -747,7 +747,7 @@ fn test_nine_p_broken_readdir() {
 /// unlink should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_unlink() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
 
     // Pre-create a file
@@ -769,7 +769,7 @@ fn test_nine_p_broken_unlink() {
 /// rmdir should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_rmdir() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
 
     // Pre-create a directory
@@ -788,7 +788,7 @@ fn test_nine_p_broken_rmdir() {
 /// file_status should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_file_status() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = BrokenNinePHandle::new(&litebox, &server, 2);
     let fs = handle.fs();
@@ -800,7 +800,7 @@ fn test_nine_p_broken_file_status() {
 /// truncate should fail when the connection breaks after open.
 #[test]
 fn test_nine_p_broken_truncate() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
 
     // Pre-create a file
@@ -828,7 +828,7 @@ fn test_nine_p_broken_truncate() {
 /// seek (RelativeToEnd, which requires a getattr) should fail when broken.
 #[test]
 fn test_nine_p_broken_seek() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
 
     // Pre-create a file
@@ -857,7 +857,7 @@ fn test_nine_p_broken_seek() {
 fn test_nine_p_deep_path_walk() {
     use core::fmt::Write as _;
 
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -898,7 +898,7 @@ fn test_nine_p_deep_path_walk() {
 
 #[test]
 fn test_nine_p_chmod() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -940,7 +940,7 @@ fn test_nine_p_chmod() {
 
 #[test]
 fn test_nine_p_chown() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -978,7 +978,7 @@ fn test_nine_p_chown() {
 
 #[test]
 fn test_nine_p_fd_file_status() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -1030,7 +1030,7 @@ fn layered_readlink_respects_upper_shadow_over_lower_symlink() {
         return;
     }
 
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     std::os::unix::fs::symlink(
         "/target-from-lower",
@@ -1090,7 +1090,7 @@ fn layered_tombstoned_lower_dir_hides_late_lower_children() {
         return;
     }
 
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     std::fs::create_dir(server.export_path().join("masked-dir")).expect("create lower directory");
 
@@ -1153,7 +1153,7 @@ fn layered_tombstoned_lower_dir_hides_late_lower_children() {
 
 #[test]
 fn test_nine_p_large_read_write() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();
@@ -1205,7 +1205,7 @@ fn test_nine_p_large_read_write() {
 
 #[test]
 fn test_nine_p_explicit_offset_read_write() {
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let litebox = crate::LiteBox::new_for_test(MockPlatform::new());
     let server = DiodServer::start();
     let handle = NinePHandle::new(&litebox, &server);
     let fs = handle.fs();

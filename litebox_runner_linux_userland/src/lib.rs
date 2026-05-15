@@ -307,10 +307,15 @@ fn parse_broker_fd_bridge_spec(
             anyhow::bail!("broker-fd-bridge: pipe direction must be 'r' or 'w', got {other:?}")
         }
         (BrokerHandleKind::Pipe, None) => {
-            anyhow::bail!("broker-fd-bridge: pipe kind requires :r or :w direction suffix (spec {spec:?})")
+            anyhow::bail!(
+                "broker-fd-bridge: pipe kind requires :r or :w direction suffix (spec {spec:?})"
+            )
         }
         (_, Some(extra)) => {
-            anyhow::bail!("broker-fd-bridge: unexpected direction {extra:?} for kind {:?}", parts[1])
+            anyhow::bail!(
+                "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
+                parts[1]
+            )
         }
         (_, None) => None,
     };
@@ -645,6 +650,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    // Allocate the init process at ProcessId::INIT. The shim's init Task
+    // also hardcodes ProcessId::INIT as its process_id; the externally-
+    // visible guest pid (broker-allocated for the root, --guest-pid for
+    // worker-host paths) lives in TaskParams.pid and is mapped to
+    // ProcessId::INIT via the global pid_to_process_id table.
+    shim_builder.init_with_pid(litebox::process::ProcessId::INIT);
     let litebox = shim_builder.litebox();
     let (in_mem, tar_ro) = build_initial_fs(
         litebox,
@@ -974,14 +985,11 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         // the cross-binary-type exec boundary (Phase 2.F follow-up,
         // extended in Phase C.3 to handle pipe).
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction) =
-                parse_broker_fd_bridge_spec(spec)?;
+            let (guest_fd, kind, handle_id, pipe_direction) = parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
                 .install_broker_bridge_fd(guest_fd, kind, handle_id, pipe_direction)
-                .map_err(|()| {
-                    anyhow!("broker-fd-bridge: no provider for spec {spec:?}")
-                })?;
+                .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
         }
 
         run_program(program, shutdown, net_worker, worker_result_fd, None);
@@ -1342,6 +1350,9 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    // Worker-host paths: the shim's init Task uses ProcessId::INIT
+    // regardless of the guest pid carried by --guest-pid.
+    shim_builder.init_with_pid(litebox::process::ProcessId::INIT);
     let litebox = shim_builder.litebox();
 
     // Load tar data if --initial-files was forwarded.
@@ -2217,6 +2228,9 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
     register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    // Worker-exec: the shim's init Task uses ProcessId::INIT regardless
+    // of the guest pid carried by --guest-pid.
+    shim_builder.init_with_pid(litebox::process::ProcessId::INIT);
     let litebox = shim_builder.litebox();
     let transferred_exec_image = if let Some(fd) = cli_args.worker_exec_fd {
         Some(read_worker_exec_image(fd)?)
@@ -2344,8 +2358,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         // the cross-binary-type exec boundary (Phase 2.F follow-up,
         // extended in Phase C.3 to handle pipe).
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction) =
-                parse_broker_fd_bridge_spec(spec)?;
+            let (guest_fd, kind, handle_id, pipe_direction) = parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
                 .install_broker_bridge_fd(guest_fd, kind, handle_id, pipe_direction)

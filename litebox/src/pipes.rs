@@ -984,7 +984,7 @@ mod tests {
     #[test]
     fn test_blocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
-        let litebox = &crate::LiteBox::new(platform);
+        let litebox = &crate::LiteBox::new_for_test(platform);
         let pipes = &super::Pipes::new(litebox);
 
         let (prod, cons) = pipes.create_pipe(2, super::Flags::empty(), None);
@@ -1022,7 +1022,7 @@ mod tests {
     #[test]
     fn test_nonblocking_channel() {
         let platform = crate::platform::mock::MockPlatform::new();
-        let litebox = &crate::LiteBox::new(platform);
+        let litebox = &crate::LiteBox::new_for_test(platform);
         let pipes = &super::Pipes::new(litebox);
 
         let (prod, cons) = pipes.create_pipe(2, super::Flags::NON_BLOCKING, None);

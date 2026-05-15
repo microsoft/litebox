@@ -9176,8 +9176,8 @@ impl<FS: ShimFS> Task<FS> {
                     if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
                         continue;
                     }
-                    if let Ok(typed) = rds
-                        .fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
                     {
                         out.push((raw_fd, typed));
                     }
@@ -9206,9 +9206,8 @@ impl<FS: ShimFS> Task<FS> {
                             litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
                             litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
                         };
-                        broker_eventfd_specs.push(alloc::format!(
-                            "{raw_fd}:pipe:{handle_id}:{dir_char}"
-                        ));
+                        broker_eventfd_specs
+                            .push(alloc::format!("{raw_fd}:pipe:{handle_id}:{dir_char}"));
                         broker_eventfd_transit_release.push((releaser, handle_id));
                     }
                 }

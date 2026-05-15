@@ -5833,7 +5833,7 @@ mod tests {
         .unwrap()
         .as_usize();
 
-        let litebox = litebox::LiteBox::new(platform);
+        let litebox = litebox::LiteBox::new_for_test(platform);
         let page_manager = PageManager::<WindowsUserland, 4096>::new(
             &litebox,
             <WindowsUserland as PageManagementProvider<4096>>::TASK_ADDR_MIN

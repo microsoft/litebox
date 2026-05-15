@@ -25,7 +25,7 @@ impl TestLauncher {
     ) -> Self {
         let platform = Platform::new(tun_device_name);
         litebox_platform_multiplex::set_platform(platform);
-        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new_for_test();
         let litebox = shim_builder.litebox();
 
         let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);

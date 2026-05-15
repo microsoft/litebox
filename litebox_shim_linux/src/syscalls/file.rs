@@ -4543,9 +4543,7 @@ impl<FS: ShimFS> Task<FS> {
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
         let eager_broker = false; // Phase K Step 1 in; still gated off — subscribe_process_exit(forked pid) returns Io, needs Phase K Step 2 (init via broker too).
-        if eager_broker
-            && let Some(provider) = super::broker_pipe::broker_pipe_provider()
-        {
+        if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider
                 .create_pipe(

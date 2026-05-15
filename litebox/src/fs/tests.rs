@@ -12,7 +12,7 @@ mod in_mem {
 
     #[test]
     fn root_file_creation_and_deletion() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             // Test file creation
@@ -34,7 +34,7 @@ mod in_mem {
 
     #[test]
     fn root_file_read_write() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             // Create and write to a file
@@ -62,7 +62,7 @@ mod in_mem {
 
     #[test]
     fn root_directory_creation_and_removal() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             // Test directory creation
@@ -81,7 +81,7 @@ mod in_mem {
 
     #[test]
     fn file_creation_and_deletion() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
         fs.with_root_privileges(|fs| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
@@ -107,7 +107,7 @@ mod in_mem {
 
     #[test]
     fn file_read_write() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
         fs.with_root_privileges(|fs| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
@@ -145,7 +145,7 @@ mod in_mem {
 
     #[test]
     fn directory_creation_and_removal() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
         fs.with_root_privileges(|fs| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
@@ -168,7 +168,7 @@ mod in_mem {
 
     #[test]
     fn read_dir_empty() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             let fd = fs
@@ -191,7 +191,7 @@ mod in_mem {
 
     #[test]
     fn read_dir_with_files_and_dirs() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             // Create a directory structure
@@ -251,7 +251,7 @@ mod in_mem {
 
     #[test]
     fn read_dir_file_not_directory() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             // Create a file
@@ -276,7 +276,7 @@ mod in_mem {
 
     #[test]
     fn chown_test() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
 
         // Create a test file as root
@@ -336,7 +336,7 @@ mod in_mem {
 
     #[test]
     fn o_directory_flag_tests() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
 
         fs.with_root_privileges(|fs| {
@@ -412,7 +412,7 @@ mod in_mem {
 
     #[test]
     fn o_excl_flag_tests() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
 
         fs.with_root_privileges(|fs| {
@@ -478,7 +478,7 @@ mod in_mem {
 
     #[test]
     fn open_with_trunc() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
 
         fs.with_root_privileges(|fs| {
@@ -571,7 +571,7 @@ mod in_mem {
     fn write_position_after_seek() {
         use crate::fs::SeekWhence;
 
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
         fs.with_root_privileges(|fs| {
             // Allow regular user to create in root for this focused test
@@ -626,7 +626,7 @@ mod in_mem {
 
     #[test]
     fn o_append_flag_basic() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
 
         fs.with_root_privileges(|fs| {
@@ -670,7 +670,7 @@ mod in_mem {
     fn o_append_flag_seek_ignored_for_write() {
         use crate::fs::SeekWhence;
 
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
 
         fs.with_root_privileges(|fs| {
@@ -718,7 +718,7 @@ mod in_mem {
     fn o_append_flag_with_rdwr() {
         use crate::fs::SeekWhence;
 
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
 
         fs.with_root_privileges(|fs| {
@@ -770,7 +770,7 @@ mod in_mem {
 
     #[test]
     fn o_append_pwrite_ignores_append_mode() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
 
         fs.with_root_privileges(|fs| {
@@ -811,7 +811,7 @@ mod in_mem {
 
     #[test]
     fn o_append_with_trunc() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
 
         fs.with_root_privileges(|fs| {
@@ -871,7 +871,7 @@ mod tar_ro {
 
     #[test]
     fn file_read() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
         let fd = fs
             .open("foo", OFlags::RDONLY, Mode::RWXU)
@@ -895,7 +895,7 @@ mod tar_ro {
 
     #[test]
     fn dir_and_nonexist_checks() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
         assert!(matches!(
             fs.open("bar/ba", OFlags::RDONLY, Mode::empty()),
@@ -911,7 +911,7 @@ mod tar_ro {
 
     #[test]
     fn o_directory_flag_tests() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
 
         // Test O_DIRECTORY on a directory (should succeed)
@@ -951,7 +951,7 @@ mod tar_ro {
 
     #[test]
     fn read_dir_subdirectory() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
 
         // Read root directory
@@ -995,7 +995,7 @@ mod tar_ro {
 
     #[test]
     fn read_dir_file_not_directory() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let fs = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
 
         let fd = fs
@@ -1024,7 +1024,7 @@ mod layered {
 
     #[test]
     fn file_read_from_lower() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
@@ -1064,7 +1064,7 @@ mod layered {
 
     #[test]
     fn dir_and_nonexist_checks() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
@@ -1087,7 +1087,7 @@ mod layered {
     fn read_link_falls_back_when_upper_reports_missing_component() {
         use crate::fs::errors::ReadLinkError;
 
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut lower = in_mem::FileSystem::new(&litebox);
         lower.with_root_privileges(|fs| {
             fs.mkdir("/workspace", Mode::from_bits(0o755).unwrap())
@@ -1117,7 +1117,7 @@ mod layered {
     /// over, such that the expected semantics of being able to see the updated file are held.
     #[test]
     fn file_read_write_sync_up() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
         in_mem_fs.with_root_privileges(|fs| {
@@ -1168,7 +1168,7 @@ mod layered {
     /// maintained.
     #[test]
     fn file_read_write_seek_sync() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
         in_mem_fs.with_root_privileges(|fs| {
@@ -1215,7 +1215,7 @@ mod layered {
 
     #[test]
     fn file_deletion() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let fs = layered::FileSystem::new(
             &litebox,
@@ -1256,7 +1256,7 @@ mod layered {
 
     #[test]
     fn o_directory_flag_tests() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
 
         in_mem_fs.with_root_privileges(|fs| {
@@ -1342,7 +1342,7 @@ mod layered {
     // Regression test for #250: a file that already exists in the lower layer should not be
     // shadowed by an attempt to create a file.
     fn file_create_exist_in_lower() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
         in_mem_fs.with_root_privileges(|fs| {
@@ -1369,7 +1369,7 @@ mod layered {
 
     #[test]
     fn read_dir_from_lower_layer() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
@@ -1396,7 +1396,7 @@ mod layered {
 
     #[test]
     fn read_dir_from_upper_layer() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
         in_mem_fs.with_root_privileges(|fs| {
@@ -1464,7 +1464,7 @@ mod layered {
 
     #[test]
     fn o_excl_layered_tests() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
         in_mem_fs.with_root_privileges(|fs| {
@@ -1578,7 +1578,7 @@ mod layered {
 
     #[test]
     fn dir_creation_inside_lower_existing_dir() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let mut upper = in_mem::FileSystem::new(&litebox);
         upper.with_root_privileges(|fs| {
@@ -1622,7 +1622,7 @@ mod layered {
 
     #[test]
     fn file_creation_with_ancestor_dir_migration() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let mut upper = in_mem::FileSystem::new(&litebox);
         upper.with_root_privileges(|fs| {
@@ -1670,7 +1670,7 @@ mod layered {
 
     #[test]
     fn file_modification_with_ancestor_dir_migration() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let mut upper = in_mem::FileSystem::new(&litebox);
         upper.with_root_privileges(|fs| {
@@ -1719,7 +1719,7 @@ mod layered {
 
     #[test]
     fn open_with_trunc() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
         let mut upper = in_mem::FileSystem::new(&litebox);
@@ -1769,7 +1769,7 @@ mod layered {
     fn rmdir_upper_only_directory() {
         use crate::fs::errors::{PathError, RmdirError};
 
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         // Prepare upper with permissive root
         let mut upper = in_mem::FileSystem::new(&litebox);
@@ -1813,7 +1813,7 @@ mod layered {
     fn rmdir_upper_directory_not_empty_then_empty() {
         use crate::fs::errors::{PathError, RmdirError};
 
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let mut upper = in_mem::FileSystem::new(&litebox);
         upper.with_root_privileges(|fs| {
@@ -1863,7 +1863,7 @@ mod layered {
     fn rmdir_lower_directory_non_empty() {
         use crate::fs::errors::RmdirError;
 
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let upper = in_mem::FileSystem::new(&litebox); // empty
         let lower = tar_ro::FileSystem::new(&litebox, TEST_TAR_FILE.into());
         let fs = layered::FileSystem::new(
@@ -1881,7 +1881,7 @@ mod layered {
     fn rmdir_not_a_directory() {
         use crate::fs::errors::RmdirError;
 
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         let mut upper = in_mem::FileSystem::new(&litebox);
         upper.with_root_privileges(|fs| {
@@ -1920,7 +1920,7 @@ mod layered {
         use crate::fs::layered::LayeringSemantics;
 
         let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut lower = in_mem::FileSystem::new(&litebox);
         lower.with_root_privileges(|fs| {
             fs.chmod("/", all_rw).expect("chmod /");
@@ -1989,7 +1989,7 @@ mod layered {
         use crate::fs::layered::LayeringSemantics;
 
         let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut lower = in_mem::FileSystem::new(&litebox);
         lower.with_root_privileges(|fs| {
             fs.chmod("/", all_rw).expect("chmod /");
@@ -2050,7 +2050,7 @@ mod layered {
         use crate::fs::layered::LayeringSemantics;
 
         let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut lower = in_mem::FileSystem::new(&litebox);
         lower.with_root_privileges(|fs| {
             fs.chmod("/", all_rw).expect("chmod /");
@@ -2099,7 +2099,7 @@ mod layered {
         use crate::fs::layered::LayeringSemantics;
 
         let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut lower = in_mem::FileSystem::new(&litebox);
         lower.with_root_privileges(|fs| {
             fs.chmod("/", all_rw).expect("chmod /");
@@ -2153,7 +2153,7 @@ mod layered {
         use crate::fs::layered::LayeringSemantics;
 
         let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut lower = in_mem::FileSystem::new(&litebox);
         lower.with_root_privileges(|fs| {
             fs.chmod("/", all_rw).expect("chmod /");
@@ -2204,7 +2204,7 @@ mod stdio {
     #[test]
     fn stdio_open_read_write() {
         let platform = MockPlatform::new();
-        let litebox = LiteBox::new(platform);
+        let litebox = LiteBox::new_for_test(platform);
         let fs = crate::fs::devices::FileSystem::new(&litebox);
 
         // Test opening and writing to /dev/stdout
@@ -2249,7 +2249,7 @@ mod stdio {
 
     #[test]
     fn non_dev_path_fails() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let fs = crate::fs::devices::FileSystem::new(&litebox);
 
         // Attempt to open a non-/dev/* path
@@ -2276,7 +2276,7 @@ mod layered_stdio {
     #[test]
     fn layered_stdio_open_read_write() {
         let platform = MockPlatform::new();
-        let litebox = LiteBox::new(platform);
+        let litebox = LiteBox::new_for_test(platform);
         let layered_fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
@@ -2333,7 +2333,7 @@ mod layered_stdio {
 
     #[test]
     fn layered_write_to_non_dev() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let in_mem = {
             let mut in_mem = in_mem::FileSystem::new(&litebox);
             in_mem.with_root_privileges(|fs| {
@@ -2366,7 +2366,7 @@ mod layered_stdio {
 
     #[test]
     fn layered_ptmx_opens_are_distinct() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let layered_fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
@@ -2403,7 +2403,7 @@ mod layered_stdio {
 
     #[test]
     fn layered_tty_status_flags_sync_to_device_reads() {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let layered_fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
@@ -2431,7 +2431,7 @@ mod layered_stdio {
     #[test]
     fn layered_stderr_open_ignores_create_mode_bits() {
         let platform = MockPlatform::new();
-        let litebox = LiteBox::new(platform);
+        let litebox = LiteBox::new_for_test(platform);
         let layered_fs = layered::FileSystem::new(
             &litebox,
             in_mem::FileSystem::new(&litebox),
@@ -2467,7 +2467,7 @@ mod layered_stdio {
         use crate::fs::layered::LayeringSemantics;
 
         let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
 
         // Pre-populate the lower layer with a directory containing files.
         let mut lower = in_mem::FileSystem::new(&litebox);
@@ -2517,7 +2517,7 @@ mod in_mem_at {
 
     /// Helper: set up a filesystem with /dir/ containing a file.
     fn setup_with_dir_and_file() -> in_mem::FileSystem<MockPlatform> {
-        let litebox = LiteBox::new(MockPlatform::new());
+        let litebox = LiteBox::new_for_test(MockPlatform::new());
         let mut fs = in_mem::FileSystem::new(&litebox);
         fs.with_root_privileges(|fs| {
             fs.mkdir("/dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)

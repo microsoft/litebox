@@ -118,15 +118,20 @@ static TEST_METADATA: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceL
 fn get_test_metadata() -> &'static Vec<(String, u64)> {
     TEST_METADATA.get_or_init(|| {
         let tests = litebox_test_harness::coordinator::collect_all_tests();
-        let meta: Vec<(String, u64)> =
-            tests.into_iter().map(|t| (t.id, t.timeout_secs)).collect();
-        eprintln!("[integration] {} test IDs from collect_all_tests", meta.len());
+        let meta: Vec<(String, u64)> = tests.into_iter().map(|t| (t.id, t.timeout_secs)).collect();
+        eprintln!(
+            "[integration] {} test IDs from collect_all_tests",
+            meta.len()
+        );
         meta
     })
 }
 
 fn get_test_ids() -> Vec<String> {
-    get_test_metadata().iter().map(|(id, _)| id.clone()).collect()
+    get_test_metadata()
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// Lookup the harness-declared per-test timeout (the `.timeout(N)` value

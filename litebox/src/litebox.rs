@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 
 use crate::{
     fd::Descriptors,
-    process::ProcessRegistry,
+    process::{ProcessId, ProcessRegistry},
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -25,6 +25,19 @@ pub struct LiteBox<Platform: RawSyncPrimitivesProvider> {
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Create a new (empty) [`LiteBox`] instance for the given `platform`.
+    ///
+    /// The returned instance has an **empty** process registry — no init
+    /// process is allocated. Callers must explicitly create the init
+    /// process via [`process_registry`](Self::process_registry)'s
+    /// `create_process_with_id` once they know the externally-allocated
+    /// pid (e.g. handed out by the broker). In test code, prefer the
+    /// convenience constructor [`new_for_test`](Self::new_for_test) which
+    /// creates init at [`ProcessId::INIT`].
+    ///
+    /// Rationale: in multi-shim deployments, every guest pid must be
+    /// broker-allocated so two shims that fork concurrently never
+    /// collide. Auto-creating init inside `LiteBox::new` predates this
+    /// constraint and assumed the init pid was always `1`.
     ///
     /// # Panics
     ///
@@ -69,19 +82,26 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             x: Arc::new(LiteBoxX {
                 platform,
                 descriptors: RwLock::new(Descriptors::new_from_litebox_creation()),
-                process_registry: {
-                    let registry = ProcessRegistry::new();
-                    // Create the init process (PID 1) as the root of the process
-                    // tree. This mirrors Linux kernel behaviour where PID 1 is
-                    // created during boot before any user code runs.
-                    // exit_signal is 0 because init has no parent to signal.
-                    registry
-                        .create_process(None, 0)
-                        .expect("init process creation must succeed");
-                    registry
-                },
+                process_registry: ProcessRegistry::new(),
             }),
         }
+    }
+
+    /// Convenience constructor for tests and single-shim configurations
+    /// that don't need broker-allocated pids: builds a [`LiteBox`] and
+    /// creates the init process at [`ProcessId::INIT`] (pid 1) in a
+    /// single call.
+    ///
+    /// Production code that wires a broker-hosted pid allocator must
+    /// instead use [`new`](Self::new) and explicitly create init via
+    /// `process_registry().create_process_with_id(ProcessId(broker_pid),
+    /// None, 0)` once the broker pid is known.
+    pub fn new_for_test(platform: &'static Platform) -> Self {
+        let lb = Self::new(platform);
+        lb.x.process_registry
+            .create_process_with_id(ProcessId::INIT, None, 0)
+            .expect("init process creation must succeed");
+        lb
     }
 }
 

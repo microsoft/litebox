@@ -155,6 +155,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
     litebox_platform_multiplex::set_platform(platform);
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    shim_builder.init_with_pid(litebox::process::ProcessId::INIT);
     let litebox = shim_builder.litebox();
 
     // The program path is a Unix-style path inside the tar archive.

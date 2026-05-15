@@ -243,9 +243,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         guest_fd: usize,
         kind: syscalls::fork_snapshot::BrokerHandleKind,
         handle_id: u64,
-        pipe_direction: Option<
-            litebox_common_linux::broker_pipe_provider::BrokerPipeEnd,
-        >,
+        pipe_direction: Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
     ) -> Result<(), ()> {
         use syscalls::fork_snapshot::BrokerHandleKind;
         let files = self.task.files.borrow();
@@ -454,7 +452,13 @@ impl Default for LinuxShimBuilder {
 }
 
 impl LinuxShimBuilder {
-    /// Returns a new shim builder.
+    /// Returns a new shim builder with an **empty** process registry.
+    ///
+    /// The init process is not yet allocated; callers must call
+    /// [`init_with_pid`](Self::init_with_pid) once they know the
+    /// externally-allocated init pid (e.g. handed out by the broker).
+    /// In test code, prefer [`new_for_test`](Self::new_for_test) which
+    /// creates init at [`litebox::process::ProcessId::INIT`].
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
         Self {
@@ -462,6 +466,34 @@ impl LinuxShimBuilder {
             litebox: LiteBox::new(platform),
             load_filter: None,
         }
+    }
+
+    /// Convenience constructor for tests: returns a builder whose init
+    /// process is already allocated at [`litebox::process::ProcessId::INIT`].
+    pub fn new_for_test() -> Self {
+        let platform = litebox_platform_multiplex::platform();
+        Self {
+            platform,
+            litebox: LiteBox::new_for_test(platform),
+            load_filter: None,
+        }
+    }
+
+    /// Allocate the init process at the given externally-allocated pid.
+    ///
+    /// Production runners call this after the broker has assigned a pid
+    /// for the root init (see `runner_linux_userland::run`'s
+    /// `RegisterProcess` reservation).
+    ///
+    /// # Panics
+    ///
+    /// Panics if init has already been allocated (e.g. the builder came
+    /// from [`new_for_test`](Self::new_for_test)).
+    pub fn init_with_pid(&self, pid: litebox::process::ProcessId) {
+        self.litebox
+            .process_registry()
+            .create_process_with_id(pid, None, 0)
+            .expect("init process creation must succeed");
     }
 
     /// Returns the litebox object for the shim.
@@ -4363,7 +4395,7 @@ mod tests {
     fn reserve_thread_id_advances_allocator_past_bootstrap_tid() {
         let _ = crate::syscalls::tests::init_platform(None);
 
-        let shim = LinuxShimBuilder::new().build::<DefaultFS>();
+        let shim = LinuxShimBuilder::new_for_test().build::<DefaultFS>();
 
         shim.global.reserve_thread_id(8);
 

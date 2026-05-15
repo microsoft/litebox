@@ -35,7 +35,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
         set_platform(platform);
     });
 
-    let shim_builder = crate::LinuxShimBuilder::new();
+    let shim_builder = crate::LinuxShimBuilder::new_for_test();
     let litebox = shim_builder.litebox();
     let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
     in_mem_fs.with_root_privileges(|fs| {

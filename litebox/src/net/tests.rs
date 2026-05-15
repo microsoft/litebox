@@ -157,14 +157,14 @@ fn wildcard_bound_udp_comms(
 
 #[test]
 fn test_bidirectional_tcp_communication_default() {
-    let litebox = LiteBox::new(MockPlatform::new());
+    let litebox = LiteBox::new_for_test(MockPlatform::new());
     let network = Network::new(&litebox);
     bidi_tcp_comms(network, |_| {});
 }
 
 #[test]
 fn test_bidirectional_tcp_communication_manual() {
-    let litebox = LiteBox::new(MockPlatform::new());
+    let litebox = LiteBox::new_for_test(MockPlatform::new());
     let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Manual);
     bidi_tcp_comms(network, |nw| {
@@ -174,7 +174,7 @@ fn test_bidirectional_tcp_communication_manual() {
 
 #[test]
 fn test_bidirectional_tcp_communication_automatic() {
-    let litebox = LiteBox::new(MockPlatform::new());
+    let litebox = LiteBox::new_for_test(MockPlatform::new());
     let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Automatic);
     bidi_tcp_comms(network, |_| {});
@@ -182,7 +182,7 @@ fn test_bidirectional_tcp_communication_automatic() {
 
 #[test]
 fn test_wildcard_bound_udp_communication_manual() {
-    let litebox = LiteBox::new(MockPlatform::new());
+    let litebox = LiteBox::new_for_test(MockPlatform::new());
     let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Manual);
     wildcard_bound_udp_comms(network, |nw| {
@@ -192,7 +192,7 @@ fn test_wildcard_bound_udp_communication_manual() {
 
 #[test]
 fn test_udp_bound_port_is_released_on_close() {
-    let litebox = LiteBox::new(MockPlatform::new());
+    let litebox = LiteBox::new_for_test(MockPlatform::new());
     let mut network = Network::new(&litebox);
 
     let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
