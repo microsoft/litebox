@@ -97,6 +97,10 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
 /// Slow path used when `rb_pa` or `size` is not page-aligned/page-multiple.
 /// Wraparound issues two map/unmap cycles; the returned offset advances by
 /// bytes actually written so a mid-sequence failure does not strand stale data.
+/// Failure return values:
+/// - First slice fails: nothing written, cursor unchanged (`write_offset`).
+/// - Second slice fails after first succeeded: `space_remaining` bytes were
+///   written, so the cursor advances to `(write_offset + space_remaining) % size = 0`.
 fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> usize {
     let write_slice = |pa: PhysAddr, slice: &[u8]| -> bool {
         Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(pa.as_u64().trunc(), slice.len())
@@ -121,6 +125,7 @@ fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
             return write_offset;
         }
         if !write_slice(rb_pa, wraparound_slice) {
+            // `space_remaining` bytes written; cursor wraps to 0.
             return 0;
         }
         wraparound_slice.len()
