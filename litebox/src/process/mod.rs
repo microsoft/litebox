@@ -336,6 +336,8 @@ pub enum CreateProcessError {
     NoSuchParent,
     /// A root (init) process already exists; only one is allowed.
     InitAlreadyExists,
+    /// `create_process_with_id` was called with a pid already in the registry.
+    PidAlreadyExists,
 }
 
 /// Errors from [`ProcessRegistry::set_pgid`].
@@ -471,6 +473,15 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for WakerRegistration<Platform> {
 pub struct ProcessRegistry<Platform: RawSyncPrimitivesProvider> {
     table: RwLock<Platform, hashbrown::HashMap<ProcessId, ProcessEntry<Platform>>>,
     next_pid: AtomicU32,
+    /// The `ProcessId` of the root (init) process, set the first time a
+    /// process is registered with `parent = None`. `0` is the sentinel
+    /// "not yet set" value (no valid `ProcessId` is `0`).
+    ///
+    /// Used by reparenting and "am I init?" queries instead of the
+    /// historical `ProcessId::INIT` (= `ProcessId(1)`) hard-coding —
+    /// with broker-allocated pids, a non-root shim's init is at the
+    /// broker's next free pid (e.g. `2`, `5`, …), not `1`.
+    root: AtomicU32,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Default for ProcessRegistry<Platform> {
@@ -485,7 +496,15 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         Self {
             table: RwLock::new(hashbrown::HashMap::new()),
             next_pid: AtomicU32::new(1),
+            root: AtomicU32::new(0),
         }
+    }
+
+    /// The `ProcessId` of the root (init) process, or `None` if no
+    /// root has been registered yet.
+    pub fn root_pid(&self) -> Option<ProcessId> {
+        let raw = self.root.load(Ordering::Acquire);
+        if raw == 0 { None } else { Some(ProcessId(raw)) }
     }
 
     /// Create a new process and return its [`ProcessId`].
@@ -509,26 +528,54 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         exit_signal: i32,
     ) -> Result<ProcessId, CreateProcessError> {
         let raw = self.next_pid.fetch_add(1, Ordering::Relaxed);
-        let new_pid = ProcessId(raw);
+        self.create_process_with_id(ProcessId(raw), parent, exit_signal)
+    }
 
+    /// Like [`create_process`], but uses an explicit, externally-allocated
+    /// `pid` rather than the per-registry monotonic counter.
+    ///
+    /// Used by the shim's fork path when a broker-hosted pid allocator
+    /// (`broker.RegisterProcess`) is available — every guest pid then
+    /// comes from the broker, so two shims that fork concurrently never
+    /// collide. Also keeps `next_pid` ahead of `pid` so future
+    /// counter-allocated pids don't clash with broker-allocated ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CreateProcessError::NoSuchParent`] if `parent` is `Some` but
+    /// the parent PID is not in the registry,
+    /// [`CreateProcessError::InitAlreadyExists`] if `parent` is `None` and a
+    /// root process already exists, or
+    /// [`CreateProcessError::PidAlreadyExists`] if `pid` is already in the
+    /// registry (e.g., a same-shim sibling has it).
+    pub fn create_process_with_id(
+        &self,
+        pid: ProcessId,
+        parent: Option<ProcessId>,
+        exit_signal: i32,
+    ) -> Result<ProcessId, CreateProcessError> {
         let mut table = self.table.write();
+
+        if table.contains_key(&pid) {
+            return Err(CreateProcessError::PidAlreadyExists);
+        }
 
         let (pgid, sid) = if let Some(parent_pid) = parent {
             let parent_entry = table
                 .get_mut(&parent_pid)
                 .ok_or(CreateProcessError::NoSuchParent)?;
-            parent_entry.children.push(new_pid);
+            parent_entry.children.push(pid);
             (parent_entry.context.pgid, parent_entry.context.sid)
         } else {
             if table.values().any(|e| e.context.parent.is_none()) {
                 return Err(CreateProcessError::InitAlreadyExists);
             }
-            (ProcessGroupId::from(new_pid), SessionId::from(new_pid))
+            (ProcessGroupId::from(pid), SessionId::from(pid))
         };
 
         let entry = ProcessEntry {
             context: ProcessContext {
-                id: new_pid,
+                id: pid,
                 parent,
                 pgid,
                 sid,
@@ -541,10 +588,24 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             exit_subject: Arc::new(Subject::new()),
         };
 
-        let prev = table.insert(new_pid, entry);
-        debug_assert!(prev.is_none(), "PID collision: {}", new_pid.0);
+        let prev = table.insert(pid, entry);
+        debug_assert!(prev.is_none(), "PID collision: {}", pid.0);
 
-        Ok(new_pid)
+        // Record root pid the first time a parent-less process is added.
+        if parent.is_none() {
+            self.root.store(pid.0, Ordering::Release);
+        }
+
+        // Keep next_pid ahead of any externally-allocated pid so subsequent
+        // counter-allocated `create_process` calls don't collide.
+        let next = pid.0.saturating_add(1);
+        let _ = self
+            .next_pid
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if cur < next { Some(next) } else { None }
+            });
+
+        Ok(pid)
     }
 
     /// Remove a process that was never started (e.g., fork setup failed).
@@ -655,8 +716,11 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
 
             // In Linux, init (PID 1) exiting is a kernel panic. In LiteBox,
             // we allow it (sandbox teardown) but skip reparenting since there
-            // is no ancestor to reparent to.
-            if id != ProcessId::INIT {
+            // is no ancestor to reparent to. With broker-allocated pids the
+            // root may not be `ProcessId::INIT`; consult the runtime-tracked
+            // root pid instead.
+            let root_pid = self.root_pid();
+            if Some(id) != root_pid {
                 let orphaned_children: Vec<ProcessId> = entry.children.drain(..).collect();
                 if !orphaned_children.is_empty() {
                     // Separate zombie orphans (auto-reap) from running orphans (reparent).
@@ -673,14 +737,16 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                         }
                     }
 
-                    // Reparent running children to PID 1.
-                    for &child_pid in &to_reparent {
-                        if let Some(child_entry) = table.get_mut(&child_pid) {
-                            child_entry.context.parent = Some(ProcessId::INIT);
+                    // Reparent running children to the registry's root.
+                    if let Some(root) = root_pid {
+                        for &child_pid in &to_reparent {
+                            if let Some(child_entry) = table.get_mut(&child_pid) {
+                                child_entry.context.parent = Some(root);
+                            }
                         }
-                    }
-                    if let Some(init_entry) = table.get_mut(&ProcessId::INIT) {
-                        init_entry.children.extend(to_reparent);
+                        if let Some(init_entry) = table.get_mut(&root) {
+                            init_entry.children.extend(to_reparent);
+                        }
                     }
 
                     // Auto-reap zombie orphans.

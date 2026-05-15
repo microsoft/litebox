@@ -178,6 +178,9 @@ fn docker_run_base_args() -> Vec<String> {
     if !keep_containers() {
         v.push("--rm".to_string());
     }
+    // Capture detailed Rust panic backtraces for diagnostics; harmless
+    // when nothing panics.
+    v.extend(["-e".to_string(), "RUST_BACKTRACE=full".to_string()]);
     v.extend([
         "--cap-add".to_string(),
         "SYS_PTRACE".to_string(),

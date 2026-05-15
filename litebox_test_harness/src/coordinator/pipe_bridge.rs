@@ -1392,6 +1392,10 @@ async fn handle_pipe_pair_id(
 
 pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
     register_handler!(PIPE_PAIR_ID, handle_pipe_pair_id);
+    register_handler!(BPIPE_BASIC_IO, handle_bpipe_basic_io);
+    register_handler!(BPIPE_FORK_IO, handle_bpipe_fork_io);
+    register_handler!(BPIPE_EXEC_NO_CAPTURE, handle_bpipe_exec_no_capture);
+    register_handler!(BPIPE_EXEC_CAPTURED, handle_bpipe_exec_captured);
     for &agent in AGENTS {
         let agent_s = agent.to_string();
         reg.test("matrix", "pipe_pair_id", format!("PID.{agent}"))
@@ -1410,11 +1414,305 @@ pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
                 })
             });
     }
+    // BPIPE.basic_io: minimal capability test for the broker-pipe
+    // activation path. A single agent (Dpg1) creates a pipe via
+    // libc::pipe2, writes 8 bytes to the writer end, reads them back
+    // from the reader end, closes both. Native should always pass.
+    // With `eager_broker=true` in sys_pipe2, this exercises the broker
+    // pipe data plane (create_pipe RPC, read/write subscriptions, close).
+    // If this fails under litebox while PB.c2p also fails, the broker-pipe
+    // bug is in basic I/O, not fork+exec stdio handoff.
+    reg.test("matrix", "broker_pipe_basic", "EPIPE.basic_io")
+        .timeout(30)
+        .build(|cx| {
+            let handle = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let result = run
+                        .send_named_typed(&handle, &BPIPE_BASIC_IO, BpipeBasicIoArgs {})
+                        .await;
+                    let pass = matches!(&result, Ok(out) if out.detail == "ok");
+                    super::TestOutcome::new("EPIPE.basic_io", pass, format!("{result:?}"))
+                })
+            })
+        });
+    // EPIPE.fork_io: one level above EPIPE.basic_io — pipe2 + fork +
+    // child writes / parent reads + waitpid. No exec. Isolates broker-
+    // pipe cross-process inheritance from spawn-time stdio handoff.
+    reg.test("matrix", "broker_pipe_basic", "EPIPE.fork_io")
+        .timeout(30)
+        .build(|cx| {
+            let handle = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let result = run
+                        .send_named_typed(&handle, &BPIPE_FORK_IO, BpipeForkIoArgs {})
+                        .await;
+                    let pass = matches!(&result, Ok(out) if out.detail == "ok");
+                    super::TestOutcome::new("EPIPE.fork_io", pass, format!("{result:?}"))
+                })
+            })
+        });
+    // EPIPE.exec_no_capture: fork+exec without stdio piping. Uses
+    // std::process::Command::status() which inherits parent stdio
+    // rather than allocating new pipes. Tests the spawn path in the
+    // presence of broker-backed eventfd (Tokio's I/O waker) without
+    // exercising broker-backed pipe2() for stdio capture. If this
+    // passes but EPIPE.exec_captured fails, the bug is specifically
+    // in the stdio-capture pipe path.
+    reg.test("matrix", "broker_pipe_basic", "EPIPE.exec_no_capture")
+        .timeout(30)
+        .build(|cx| {
+            let handle = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let result = run
+                        .send_named_typed(&handle, &BPIPE_EXEC_NO_CAPTURE, BpipeExecArgs {})
+                        .await;
+                    let pass = matches!(&result, Ok(out) if out.detail == "ok");
+                    super::TestOutcome::new("EPIPE.exec_no_capture", pass, format!("{result:?}"))
+                })
+            })
+        });
+    // EPIPE.exec_captured: fork+exec WITH stdio captured via pipes.
+    // Uses std::process::Command::output() which creates pipes for
+    // child's stdout/stderr. With eager_broker=true those pipes are
+    // broker-backed. This is the PB.c2p shape but stripped to one
+    // capability.
+    reg.test("matrix", "broker_pipe_basic", "EPIPE.exec_captured")
+        .timeout(30)
+        .build(|cx| {
+            let handle = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let result = run
+                        .send_named_typed(&handle, &BPIPE_EXEC_CAPTURED, BpipeExecArgs {})
+                        .await;
+                    let pass = matches!(&result, Ok(out) if out.detail == "ok");
+                    super::TestOutcome::new("EPIPE.exec_captured", pass, format!("{result:?}"))
+                })
+            })
+        });
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// PN: Pipe Non-blocking
-// ═══════════════════════════════════════════════════════════════════
+// ─── BPIPE.basic_io: minimal broker-pipe activation test ───────────
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BpipeBasicIoArgs {}
+
+const BPIPE_BASIC_IO: HandlerToken<BpipeBasicIoArgs, PipeBridgeOut> =
+    HandlerToken::new("platform_fixes.bpipe_basic_io");
+
+async fn handle_bpipe_basic_io(
+    _args: BpipeBasicIoArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: pipe2 writes two fresh fds into pipe_fds on success.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), 0) } != 0 {
+        return Err(HandlerError(format!(
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let [rd, wr] = pipe_fds;
+    let msg = b"hello-bp";
+    // SAFETY: wr is a live fd; we own it for the duration of this fn.
+    let n = unsafe { libc::write(wr, msg.as_ptr() as *const _, msg.len()) };
+    if n != msg.len() as isize {
+        // SAFETY: closing fds we own.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return Err(HandlerError(format!(
+            "write: rc={n} err={}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut buf = [0u8; 8];
+    // SAFETY: rd is a live fd; buf is writable.
+    let m = unsafe { libc::read(rd, buf.as_mut_ptr() as *mut _, buf.len()) };
+    if m != msg.len() as isize {
+        // SAFETY: closing fds we own.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return Err(HandlerError(format!(
+            "read: rc={m} err={}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if &buf[..m as usize] != msg {
+        // SAFETY: closing fds we own.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return Err(HandlerError(format!(
+            "data mismatch: wrote {msg:?} read {:?}",
+            &buf[..m as usize]
+        )));
+    }
+    // SAFETY: closing fds we own.
+    unsafe {
+        libc::close(rd);
+        libc::close(wr);
+    }
+    Ok(PipeBridgeOut {
+        detail: "ok".to_string(),
+    })
+}
+
+// ─── EPIPE.fork_io: pipe2 + fork + IPC, no exec ────────────────────
+//
+// Parent calls pipe2; forks; child writes to write end; parent reads
+// from read end; parent reaps child. No exec. With `eager_broker=true`
+// in sys_pipe2 this exercises the broker pipe's cross-process
+// inheritance + refcount via on_dup on fork's fd table clone, without
+// any of the spawn-time stdio handoff complexity that PB.c2p hits.
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BpipeForkIoArgs {}
+
+const BPIPE_FORK_IO: HandlerToken<BpipeForkIoArgs, PipeBridgeOut> =
+    HandlerToken::new("platform_fixes.bpipe_fork_io");
+
+async fn handle_bpipe_fork_io(
+    _args: BpipeForkIoArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: pipe2 writes two fresh fds.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), 0) } != 0 {
+        return Err(HandlerError(format!(
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let [rd, wr] = pipe_fds;
+    let msg = b"hello-fk";
+    // SAFETY: fork().
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        // SAFETY: closing fds we own.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return Err(HandlerError(format!(
+            "fork: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if pid == 0 {
+        // Child: close read end, write msg, exit.
+        // SAFETY: closing child copy of rd.
+        unsafe {
+            libc::close(rd);
+        }
+        // SAFETY: wr is a live fd in child copy of fd table.
+        let n = unsafe { libc::write(wr, msg.as_ptr() as *const _, msg.len()) };
+        let exit_code = if n == msg.len() as isize { 0 } else { 1 };
+        // SAFETY: closing wr; then _exit avoids destructors.
+        unsafe {
+            libc::close(wr);
+            libc::_exit(exit_code);
+        }
+    }
+    // Parent: close write end, read msg, reap child.
+    // SAFETY: closing parent's wr.
+    unsafe {
+        libc::close(wr);
+    }
+    let mut buf = [0u8; 8];
+    // SAFETY: rd live, buf writable.
+    let m = unsafe { libc::read(rd, buf.as_mut_ptr() as *mut _, buf.len()) };
+    // SAFETY: closing rd.
+    unsafe {
+        libc::close(rd);
+    }
+    let mut status: libc::c_int = 0;
+    // SAFETY: waitpid on a child we forked.
+    let w = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    if w != pid {
+        return Err(HandlerError(format!(
+            "waitpid: rc={w} err={}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if m != msg.len() as isize {
+        return Err(HandlerError(format!(
+            "read: rc={m} err={}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if &buf[..m as usize] != msg {
+        return Err(HandlerError(format!(
+            "data mismatch: wrote {msg:?} read {:?}",
+            &buf[..m as usize]
+        )));
+    }
+    // WIFEXITED / WEXITSTATUS are pure macros over the status int.
+    let exited_normally = libc::WIFEXITED(status);
+    let exit_code = libc::WEXITSTATUS(status);
+    if !exited_normally || exit_code != 0 {
+        return Err(HandlerError(format!(
+            "child exit: WIFEXITED={exited_normally} WEXITSTATUS={exit_code}"
+        )));
+    }
+    Ok(PipeBridgeOut {
+        detail: "ok".to_string(),
+    })
+}
+
+// ─── EPIPE.exec_no_capture: spawn child with inherited stdio ───────
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BpipeExecArgs {}
+
+const BPIPE_EXEC_NO_CAPTURE: HandlerToken<BpipeExecArgs, PipeBridgeOut> =
+    HandlerToken::new("platform_fixes.bpipe_exec_no_capture");
+
+const BPIPE_EXEC_CAPTURED: HandlerToken<BpipeExecArgs, PipeBridgeOut> =
+    HandlerToken::new("platform_fixes.bpipe_exec_captured");
+
+async fn handle_bpipe_exec_no_capture(
+    _args: BpipeExecArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    // Spawn /bin/true with inherited stdio (no pipes for capture).
+    // This exercises the spawn path without allocating broker pipes
+    // for stdout/stderr.
+    let status = std::process::Command::new("/bin/true")
+        .status()
+        .map_err(|e| HandlerError(format!("spawn /bin/true: {e}")))?;
+    if !status.success() {
+        return Err(HandlerError(format!("/bin/true: {status:?}")));
+    }
+    Ok(PipeBridgeOut {
+        detail: "ok".to_string(),
+    })
+}
+
+async fn handle_bpipe_exec_captured(
+    _args: BpipeExecArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    // Spawn /bin/true with stdio captured. std::process::Command::output()
+    // creates pipes for child's stdout/stderr; with eager_broker=true
+    // those are broker-backed pipes.
+    let out = std::process::Command::new("/bin/true")
+        .output()
+        .map_err(|e| HandlerError(format!("spawn /bin/true: {e}")))?;
+    if !out.status.success() {
+        return Err(HandlerError(format!("/bin/true: {:?}", out.status)));
+    }
+    Ok(PipeBridgeOut {
+        detail: "ok".to_string(),
+    })
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct PipeNonblockArgs {}

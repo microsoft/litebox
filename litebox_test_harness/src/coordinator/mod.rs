@@ -22,6 +22,7 @@ pub(crate) mod pidfd_inherit;
 pub(crate) mod pidfd_tests;
 pub(crate) mod pipe_bridge;
 pub(crate) mod port_router;
+pub(crate) mod process_exit;
 pub(crate) mod pty;
 pub(crate) mod pxeof;
 pub(crate) mod registry;
@@ -961,6 +962,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
     pidfd_inherit::register_pidfd_inherit_tests(&mut registry::Registry::new(&mut tests));
     pidfd_tests::register_pidfd_tests(&mut registry::Registry::new(&mut tests));
+    process_exit::register_process_exit_tests(&mut registry::Registry::new(&mut tests));
     signalfd_tests::register_signalfd_tests(&mut registry::Registry::new(&mut tests));
     clone3_matrix::register_clone3_matrix(&mut registry::Registry::new(&mut tests));
     scm_rights::register_scm_rights_tests(&mut registry::Registry::new(&mut tests));

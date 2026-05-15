@@ -224,39 +224,100 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         debug_assert!(ok, "install_mux_pipe_fd: slot {guest_fd} still occupied");
     }
 
-    /// Phase 2.F follow-up: install a broker-backed EventFile at the
-    /// given guest fd slot. Called by the runner during worker-exec
-    /// startup to reattach to a broker handle that the parent dup'd
-    /// before spawning the worker, so the worker sees the same
-    /// shared eventfd / pidfd state as the parent across the
-    /// cross-binary-type exec boundary.
+    /// Install a broker-backed shim fd entry at `guest_fd`, materializing
+    /// it from a broker handle that the parent dup'd before spawn. Called
+    /// by the runner during worker-exec startup for every `--broker-fd-bridge`
+    /// spec, so the worker sees the same shared broker state as the parent
+    /// across the cross-binary-type exec boundary.
     ///
     /// Returns `Err(())` if no broker provider is installed for the
     /// requested kind (the worker will then have no fd at the slot
     /// and the binary's read on it will fail with EBADF — a clean
     /// failure mode for misconfigured workers).
+    ///
+    /// `pipe_direction` MUST be `Some(_)` when `kind == Pipe` and SHOULD be
+    /// `None` otherwise. The parser supplies it from the optional `r`/`w`
+    /// suffix on the bridge spec (`fd:pipe:handle_id:r|w`).
+    pub fn install_broker_bridge_fd(
+        &self,
+        guest_fd: usize,
+        kind: syscalls::fork_snapshot::BrokerHandleKind,
+        handle_id: u64,
+        pipe_direction: Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
+    ) -> Result<(), ()> {
+        use syscalls::fork_snapshot::BrokerHandleKind;
+        let files = self.task.files.borrow();
+        match kind {
+            BrokerHandleKind::Eventfd => {
+                let provider = syscalls::eventfd::broker_eventfd_provider().ok_or(())?;
+                let event_file = syscalls::eventfd::EventFile::new_broker_backed(
+                    provider,
+                    handle_id,
+                    litebox_common_linux::EfdFlags::empty(),
+                );
+                self.install_eventfd_at_slot(event_file, guest_fd, &files);
+                Ok(())
+            }
+            BrokerHandleKind::Pidfd => {
+                let target_pid =
+                    litebox::process::ProcessId(u32::try_from(handle_id).map_err(|_| ())?);
+                let subscription =
+                    syscalls::guest_pid::try_subscribe_broker_process_exit(target_pid).ok_or(())?;
+                let event_file = syscalls::eventfd::EventFile::new_broker_process_pidfd(
+                    target_pid,
+                    subscription,
+                    false,
+                    None,
+                );
+                self.install_eventfd_at_slot(event_file, guest_fd, &files);
+                Ok(())
+            }
+            BrokerHandleKind::Pipe => {
+                let provider = syscalls::broker_pipe::broker_pipe_provider().ok_or(())?;
+                let direction = pipe_direction.ok_or(())?;
+                let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
+                    provider,
+                    handle_id,
+                    direction,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem> = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(bp_fd);
+                let mut rds = files.raw_descriptor_store.write();
+                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+                debug_assert!(
+                    ok,
+                    "install_broker_bridge_fd(pipe): slot {guest_fd} still occupied"
+                );
+                Ok(())
+            }
+            BrokerHandleKind::Signalfd | BrokerHandleKind::Pty => Err(()),
+        }
+    }
+
+    /// Backwards-compatible alias retained until all runner callers move to
+    /// the new name. `pipe_direction` is unsupported in this entry point;
+    /// callers that need it must use `install_broker_bridge_fd` directly.
     pub fn install_broker_eventfd_fd(
         &self,
         guest_fd: usize,
         kind: syscalls::fork_snapshot::BrokerHandleKind,
         handle_id: u64,
     ) -> Result<(), ()> {
-        use syscalls::fork_snapshot::BrokerHandleKind;
-        let event_file: syscalls::eventfd::EventFile<Platform> = match kind {
-            BrokerHandleKind::Eventfd => {
-                let provider = syscalls::eventfd::broker_eventfd_provider().ok_or(())?;
-                syscalls::eventfd::EventFile::new_broker_backed(
-                    provider,
-                    handle_id,
-                    litebox_common_linux::EfdFlags::empty(),
-                )
-            }
-            BrokerHandleKind::Pidfd => {
-                let provider = syscalls::eventfd::broker_pidfd_provider().ok_or(())?;
-                syscalls::eventfd::EventFile::new_pidfd_broker_backed(provider, handle_id, false)
-            }
-            BrokerHandleKind::Signalfd => return Err(()),
-        };
+        self.install_broker_bridge_fd(guest_fd, kind, handle_id, None)
+    }
+
+    fn install_eventfd_at_slot(
+        &self,
+        event_file: syscalls::eventfd::EventFile<Platform>,
+        guest_fd: usize,
+        files: &syscalls::file::FilesState<FS>,
+    ) {
         let typed_fd: litebox::fd::TypedFd<syscalls::eventfd::EventfdSubsystem> = self
             .task
             .global
@@ -275,7 +336,6 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             },
         );
 
-        let files = self.task.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
 
         // Remove any existing entry at the slot (stdio placeholder etc.).
@@ -284,9 +344,8 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
         debug_assert!(
             ok,
-            "install_broker_eventfd_fd: slot {guest_fd} still occupied"
+            "install_broker_bridge_fd(eventfd): slot {guest_fd} still occupied"
         );
-        Ok(())
     }
 }
 
@@ -393,7 +452,13 @@ impl Default for LinuxShimBuilder {
 }
 
 impl LinuxShimBuilder {
-    /// Returns a new shim builder.
+    /// Returns a new shim builder with an **empty** process registry.
+    ///
+    /// The init process is not yet allocated; callers must call
+    /// [`init_with_pid`](Self::init_with_pid) once they know the
+    /// externally-allocated init pid (e.g. handed out by the broker).
+    /// In test code, prefer [`new_for_test`](Self::new_for_test) which
+    /// creates init at [`litebox::process::ProcessId::INIT`].
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
         Self {
@@ -401,6 +466,34 @@ impl LinuxShimBuilder {
             litebox: LiteBox::new(platform),
             load_filter: None,
         }
+    }
+
+    /// Convenience constructor for tests: returns a builder whose init
+    /// process is already allocated at [`litebox::process::ProcessId::INIT`].
+    pub fn new_for_test() -> Self {
+        let platform = litebox_platform_multiplex::platform();
+        Self {
+            platform,
+            litebox: LiteBox::new_for_test(platform),
+            load_filter: None,
+        }
+    }
+
+    /// Allocate the init process at the given externally-allocated pid.
+    ///
+    /// Production runners call this after the broker has assigned a pid
+    /// for the root init (see `runner_linux_userland::run`'s
+    /// `RegisterProcess` reservation).
+    ///
+    /// # Panics
+    ///
+    /// Panics if init has already been allocated (e.g. the builder came
+    /// from [`new_for_test`](Self::new_for_test)).
+    pub fn init_with_pid(&self, pid: litebox::process::ProcessId) {
+        self.litebox
+            .process_registry()
+            .create_process_with_id(pid, None, 0)
+            .expect("init process creation must succeed");
     }
 
     /// Returns the litebox object for the shim.
@@ -461,8 +554,13 @@ impl LinuxShimBuilder {
             }),
         });
         let control_plane = multihost::ControlPlane::new_root_local();
+        let init_process_id = self
+            .litebox
+            .process_registry()
+            .root_pid()
+            .expect("init process must have been allocated before build()");
         control_plane
-            .register_running_process_local(litebox::process::ProcessId::INIT)
+            .register_running_process_local(init_process_id)
             .expect("init process must be registered to the root host");
         let global = Arc::new(GlobalState {
             platform: self.platform,
@@ -477,7 +575,7 @@ impl LinuxShimBuilder {
             cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
             process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             host_tty_foreground_pgrp: litebox::sync::Mutex::new(
-                litebox::process::ProcessGroupId::from(litebox::process::ProcessId::INIT),
+                litebox::process::ProcessGroupId::from(init_process_id),
             ),
             host_tty_shadow_termios: litebox::sync::Mutex::new(None),
             local_control_plane_pump_active: core::sync::atomic::AtomicBool::new(false),
@@ -485,7 +583,6 @@ impl LinuxShimBuilder {
             epoll_graph_lock: litebox::sync::Mutex::new(()),
             control_plane,
             fork_child_host_pids: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
-            pid_to_process_id: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             proc_cmdlines: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             inotify_instances: litebox::sync::Mutex::new(Vec::new()),
         });
@@ -550,14 +647,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // future clone() allocations above that main thread ID.
         self.global.reserve_thread_id(pid);
 
-        // Register guest PID → ProcessId mapping for the init process.
-        // For the init task, `pid` comes from the host thread ID and may
-        // differ from ProcessId::INIT (1). This mapping allows sys_kill to
-        // find the correct ProcessId when given a guest PID.
-        self.global
-            .pid_to_process_id
-            .write()
-            .insert(pid, litebox::process::ProcessId::INIT);
+        // The init task's `ProcessId` matches its externally-visible guest
+        // pid by construction (the runner allocated init in the registry
+        // using `ProcessId(pid as u32)`). Phase K Step 3 retired the
+        // historical `pid_to_process_id` mapping; pid and ProcessId are
+        // now identical everywhere.
+        let process_id = litebox::process::ProcessId(
+            u32::try_from(pid).expect("init task pid must be non-negative"),
+        );
 
         let files = syscalls::file::FilesState::new(fs);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
@@ -571,7 +668,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 process_state: self.process_state.clone().into(),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.global.platform),
-                process_id: litebox::process::ProcessId::INIT,
+                process_id,
                 pid,
                 ppid,
                 tid: pid,
@@ -1283,15 +1380,22 @@ impl<FS: ShimFS> LinuxShim<FS> {
                                 )
                             }),
                         BrokerHandleKind::Pidfd => {
-                            syscalls::eventfd::broker_pidfd_provider().map(|provider| {
-                                syscalls::eventfd::EventFile::new_pidfd_broker_backed(
-                                    provider,
-                                    broker_handle.handle_id,
-                                    false,
-                                )
+                            u32::try_from(broker_handle.handle_id).ok().and_then(|pid| {
+                                let target_pid = litebox::process::ProcessId(pid);
+                                syscalls::guest_pid::try_subscribe_broker_process_exit(target_pid)
+                                    .map(|subscription| {
+                                        syscalls::eventfd::EventFile::new_broker_process_pidfd(
+                                            target_pid,
+                                            subscription,
+                                            false,
+                                            None,
+                                        )
+                                    })
                             })
                         }
-                        BrokerHandleKind::Signalfd => None,
+                        BrokerHandleKind::Signalfd
+                        | BrokerHandleKind::Pty
+                        | BrokerHandleKind::Pipe => None,
                     };
                 let Some(event_file) = event_file else {
                     continue;
@@ -1364,7 +1468,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 process_state: child_process_state.into(),
                 thread: child_thread,
                 wait_state: wait::WaitState::new(self.global.platform),
-                process_id: litebox::process::ProcessId::INIT,
+                process_id: litebox::process::ProcessId(
+                    u32::try_from(id.pid).expect("fork-restore child pid must be non-negative"),
+                ),
                 pid: id.pid,
                 ppid: id.ppid,
                 tid: id.tid,
@@ -1852,16 +1958,42 @@ impl<FS: ShimFS> Task<FS> {
 /// A strongly-typed FD.
 ///
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
+    /// Exhaustive fd-kind dispatcher.
+    ///
+    /// Looks up `fd` in the shim's per-process descriptor store and
+    /// invokes the matching closure for whichever subsystem owns the
+    /// entry. Returns [`Errno::EBADF`] only when `fd` is genuinely
+    /// not present in any subsystem table.
+    ///
+    /// **Exhaustiveness invariant**: every fd-shaped subsystem the
+    /// shim supports must have a closure arm here. Adding a new
+    /// subsystem (e.g., a future `PtySubsystem`, `SignalfdSubsystem`,
+    /// `BrokerSocketpairSubsystem`) adds a new closure parameter,
+    /// which is a compile-time forcing function for every call site
+    /// to make an explicit decision about the new kind. Historically
+    /// this dispatcher was 6-arm and `HostPipeSubsystem` /
+    /// `BrokerPipeSubsystem` were handled via per-syscall
+    /// `try_host_pipe_fd` / `try_broker_pipe_fd` early-return fast
+    /// paths; several syscalls forgot the broker-pipe fast path,
+    /// silently returning EBADF on broker-pipe fds. The 8-arm shape
+    /// makes that class of bug a compile error.
+    ///
+    /// **Closure receives `&Arc<TypedFd<X>>`**, not `&TypedFd<X>`, so
+    /// arms that need an owned `Arc<TypedFd<X>>` (e.g., to embed in
+    /// a binding type that outlives the closure) can clone it. Most
+    /// call sites use it as `&TypedFd<X>` and rely on `Arc::deref`.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn run_on_raw_fd<R>(
         &self,
         fd: usize,
-        fs: impl FnOnce(&TypedFd<FS>) -> R,
-        net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
-        pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
-        eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem>) -> R,
-        epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<FS>>) -> R,
-        unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>) -> R,
+        fs: impl FnOnce(&Arc<TypedFd<FS>>) -> R,
+        net: impl FnOnce(&Arc<TypedFd<Network<Platform>>>) -> R,
+        pipes: impl FnOnce(&Arc<TypedFd<Pipes<Platform>>>) -> R,
+        eventfd: impl FnOnce(&Arc<TypedFd<syscalls::eventfd::EventfdSubsystem>>) -> R,
+        epoll: impl FnOnce(&Arc<TypedFd<syscalls::epoll::EpollSubsystem<FS>>>) -> R,
+        unix: impl FnOnce(&Arc<TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>>) -> R,
+        host_pipe: impl FnOnce(&Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>) -> R,
+        broker_pipe: impl FnOnce(&Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -1888,20 +2020,15 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             drop(rds);
             return Ok(unix(&fd));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(host_pipe(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(broker_pipe(&fd));
+        }
         Err(Errno::EBADF)
-    }
-
-    /// Check if the given raw FD is a host-pipe FD.
-    ///
-    /// Returns a typed handle if it is, `None` otherwise.  Used by `sys_read`,
-    /// `sys_write`, and `sys_close` to fast-path host-pipe I/O without
-    /// modifying every `run_on_raw_fd` call site.
-    pub(crate) fn try_host_pipe_fd(
-        &self,
-        fd: usize,
-    ) -> Option<alloc::sync::Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>> {
-        let rds = self.raw_descriptor_store.read();
-        rds.fd_from_raw_integer(fd).ok()
     }
 }
 
@@ -2141,6 +2268,8 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| alloc::format!("raw={raw_fd} eventfd"),
                 |_fd| alloc::format!("raw={raw_fd} epoll"),
                 |_fd| alloc::format!("raw={raw_fd} unix"),
+                |_fd| alloc::format!("raw={raw_fd} host_pipe"),
+                |_fd| alloc::format!("raw={raw_fd} broker_pipe"),
             )
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))
     }
@@ -3685,13 +3814,6 @@ struct GlobalState<FS: ShimFS> {
     /// Mapping from guest ProcessId.0 → remote worker host OS PID.
     /// Used to forward signals to fork-restore and remote-exec workers.
     fork_child_host_pids: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, i32>>,
-    /// Mapping from guest PID (the value returned by getpid()) to ProcessId.
-    /// For forked children these are equal, but the init process may have a
-    /// host-derived PID (e.g. 8) while its ProcessId is always 1.
-    pid_to_process_id: litebox::sync::RwLock<
-        Platform,
-        alloc::collections::BTreeMap<i32, litebox::process::ProcessId>,
-    >,
     /// Synthetic `/proc/<pid>/cmdline` contents for locally-known guest PIDs.
     proc_cmdlines: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<i32, Vec<u8>>>,
     /// Open inotify instances visible to all tasks on this shim host.
@@ -4287,7 +4409,7 @@ mod tests {
     fn reserve_thread_id_advances_allocator_past_bootstrap_tid() {
         let _ = crate::syscalls::tests::init_platform(None);
 
-        let shim = LinuxShimBuilder::new().build::<DefaultFS>();
+        let shim = LinuxShimBuilder::new_for_test().build::<DefaultFS>();
 
         shim.global.reserve_thread_id(8);
 

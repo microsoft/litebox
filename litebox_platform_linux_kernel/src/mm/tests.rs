@@ -217,7 +217,7 @@ fn test_vmm_page_fault() {
     let start_addr: usize = 0x1_0000;
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let platform = MockKernel::new(p4.start_address());
-    let litebox = LiteBox::new(platform);
+    let litebox = LiteBox::new_for_test(platform);
     let vmm = PageManager::<_, PAGE_SIZE>::new(
         &litebox,
         <MockKernel as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN

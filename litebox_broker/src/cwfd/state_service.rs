@@ -21,19 +21,32 @@
 
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
 use crate::eventfd_state::{EventfdError, EventfdState};
+use crate::pipe_state::{PipeEndKind, PipeError, PipeState};
 use crate::process_state::ProcessState;
+use crate::pty_state::{PtyError, PtyState};
 use crate::signalfd_state::SignalfdState;
-use crate::state_registry::{BrokerStateRegistry, StateHandle, StateRegistryError};
+use crate::state_registry::{BrokerStateRegistry, StateHandle, StateObject, StateRegistryError};
 use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use litebox_common_linux::fd_token_protocol::{
-    Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
-    build_create_pidfd_response_ok, build_create_signalfd_response_ok, build_error_response,
-    build_pidfd_exited_response_ok, build_read_eventfd_response_ok, build_read_siginfo_response_ok,
-    build_register_notification_ring_response_ok, build_register_process_response_ok,
-    build_release_response_ok, build_subscribe_eventfd_response_ok, build_unsubscribe_response_ok,
-    build_write_eventfd_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
-    parse_create_signalfd_body, parse_handle_body, parse_pidfd_exited_request,
-    parse_subscribe_eventfd_body, parse_unsubscribe_body, parse_write_eventfd_body,
+    Frame, Opcode, OwnedFrame, StatusCode, build_close_pipe_end_response_ok,
+    build_create_eventfd_response_ok, build_create_pidfd_response_ok,
+    build_create_pipe_response_ok, build_create_pty_response_ok, build_create_signalfd_response_ok,
+    build_error_response, build_incref_pipe_end_response_ok, build_mark_process_exited_response_ok,
+    build_pidfd_exited_response_ok, build_pty_ioctl_response_ok, build_pty_read_response_ok,
+    build_pty_write_response_ok, build_read_eventfd_response_ok, build_read_pipe_response_ok,
+    build_read_siginfo_response_ok, build_register_notification_ring_response_ok,
+    build_register_process_response_ok, build_release_response_ok,
+    build_subscribe_eventfd_response_ok, build_subscribe_pipe_response_ok,
+    build_subscribe_process_exit_response_ok, build_subscribe_pty_response_ok,
+    build_unsubscribe_pipe_end_response_ok, build_unsubscribe_response_ok,
+    build_write_eventfd_response_ok, build_write_pipe_response_ok, parse_close_pipe_end_body,
+    parse_create_eventfd_body, parse_create_pidfd_body, parse_create_pipe_body,
+    parse_create_signalfd_body, parse_handle_body, parse_incref_pipe_end_body,
+    parse_mark_process_exited_body, parse_pidfd_exited_request, parse_pty_ioctl_body,
+    parse_pty_read_body, parse_pty_write_body, parse_read_pipe_body, parse_subscribe_eventfd_body,
+    parse_subscribe_pipe_body, parse_subscribe_process_exit_body, parse_subscribe_pty_body,
+    parse_unsubscribe_body, parse_unsubscribe_pipe_end_body, parse_write_eventfd_body,
+    parse_write_pipe_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -80,12 +93,28 @@ pub fn handle_request(
         Opcode::ReadEventfd => handle_read_eventfd(registry, request, in_fds),
         Opcode::WriteEventfd => handle_write_eventfd(registry, request, in_fds),
         Opcode::CreateSignalfd => handle_create_signalfd(registry, request, in_fds),
+        Opcode::CreatePipe => handle_create_pipe(registry, request, in_fds),
+        Opcode::ReadPipe => handle_read_pipe(registry, request, in_fds),
+        Opcode::WritePipe => handle_write_pipe(registry, request, in_fds),
+        Opcode::SubscribePipe => handle_subscribe_pipe(registry, conn, request, in_fds),
+        Opcode::ClosePipeEnd => handle_close_pipe_end(registry, request, in_fds),
+        Opcode::IncrefPipeEnd => handle_incref_pipe_end(registry, request, in_fds),
+        Opcode::UnsubscribePipeEnd => handle_unsubscribe_pipe_end(registry, request, in_fds),
         Opcode::ReadSiginfo => handle_read_siginfo(registry, request, in_fds),
+        Opcode::CreatePty => handle_create_pty(registry, request, in_fds),
+        Opcode::PtyRead => handle_pty_read(registry, request, in_fds),
+        Opcode::PtyWrite => handle_pty_write(registry, request, in_fds),
+        Opcode::SubscribePty => handle_subscribe_pty(registry, conn, request, in_fds),
+        Opcode::PtyIoctl => handle_pty_ioctl(registry, request, in_fds),
         Opcode::SubscribeEventfd => handle_subscribe_eventfd(registry, conn, request, in_fds),
         Opcode::Unsubscribe => handle_unsubscribe(registry, request, in_fds),
         Opcode::Release => handle_release_state(registry, request, in_fds),
         Opcode::DupHandle => handle_dup_handle(registry, request, in_fds),
         Opcode::RegisterProcess => handle_register_process(registry, request, in_fds),
+        Opcode::SubscribeProcessExit => {
+            handle_subscribe_process_exit(registry, conn, request, in_fds)
+        }
+        Opcode::MarkProcessExited => handle_mark_process_exited(registry, request, in_fds),
         other => HandlerResult {
             frame: build_error_response(
                 other.response_for().unwrap_or(Opcode::ReleaseResponse),
@@ -229,6 +258,97 @@ fn handle_register_process(
     }
 }
 
+fn handle_subscribe_process_exit(
+    registry: &BrokerStateRegistry,
+    conn: &ConnState,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SubscribeProcessExitResponse);
+    }
+    let (pid, subscription_id, events_mask) = match parse_subscribe_process_exit_body(request.body)
+    {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::SubscribeProcessExitResponse),
+    };
+    let Some(sender) = conn.notification_sender.as_ref().cloned() else {
+        return status_err(
+            Opcode::SubscribeProcessExitResponse,
+            StatusCode::NoNotificationRing,
+        );
+    };
+    let state = match registry.resolve(StateHandle::from_id(pid), SubsystemTag::Process) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return status_err(
+                Opcode::SubscribeProcessExitResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            return status_err(
+                Opcode::SubscribeProcessExitResponse,
+                StatusCode::SubsystemMismatch,
+            );
+        }
+        Err(_) => return status_err(Opcode::SubscribeProcessExitResponse, StatusCode::Internal),
+    };
+    let process = state
+        .as_any()
+        .downcast_ref::<ProcessState>()
+        .expect("subsystem_tag check guarantees ProcessState");
+    match process.subscribe(subscription_id, events_mask, sender) {
+        Ok(snapshot) => HandlerResult {
+            frame: build_subscribe_process_exit_response_ok(snapshot.map(|s| s.exit_code)),
+            out_fd: None,
+        },
+        Err(SubscribeError::DuplicateId(_)) => status_err(
+            Opcode::SubscribeProcessExitResponse,
+            StatusCode::DuplicateSubscription,
+        ),
+        Err(SubscribeError::UnknownEventBits { .. }) => {
+            protocol_err(Opcode::SubscribeProcessExitResponse)
+        }
+    }
+}
+
+fn handle_mark_process_exited(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::MarkProcessExitedResponse);
+    }
+    let (pid, exit_code) = match parse_mark_process_exited_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::MarkProcessExitedResponse),
+    };
+    let state = match registry.resolve(StateHandle::from_id(pid), SubsystemTag::Process) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return status_err(Opcode::MarkProcessExitedResponse, StatusCode::UnknownHandle);
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            return status_err(
+                Opcode::MarkProcessExitedResponse,
+                StatusCode::SubsystemMismatch,
+            );
+        }
+        Err(_) => return status_err(Opcode::MarkProcessExitedResponse, StatusCode::Internal),
+    };
+    let process = state
+        .as_any()
+        .downcast_ref::<ProcessState>()
+        .expect("subsystem_tag check guarantees ProcessState");
+    process.mark_exited(exit_code);
+    HandlerResult {
+        frame: build_mark_process_exited_response_ok(),
+        out_fd: None,
+    }
+}
+
 fn handle_read_eventfd(
     registry: &BrokerStateRegistry,
     request: &Frame<'_>,
@@ -312,6 +432,255 @@ fn handle_write_eventfd(
     }
 }
 
+fn handle_create_pipe(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::CreatePipeResponse);
+    }
+    let (capacity, atomic) = match parse_create_pipe_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::CreatePipeResponse),
+    };
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return protocol_err(Opcode::CreatePipeResponse);
+    };
+    let Ok(atomic) = usize::try_from(atomic) else {
+        return protocol_err(Opcode::CreatePipeResponse);
+    };
+    let state = PipeState::new(capacity, atomic);
+    let handle = registry.register(state);
+    HandlerResult {
+        frame: build_create_pipe_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn resolve_pipe(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+) -> Result<Arc<dyn crate::state_registry::StateObject>, StatusCode> {
+    match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Pipe) {
+        Ok(s) => Ok(s),
+        Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
+        Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
+        Err(_) => Err(StatusCode::Internal),
+    }
+}
+
+fn handle_read_pipe(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::ReadPipeResponse);
+    }
+    let (handle_id, max_len) = match parse_read_pipe_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::ReadPipeResponse),
+    };
+    let Ok(max_len) = usize::try_from(max_len) else {
+        return protocol_err(Opcode::ReadPipeResponse);
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::ReadPipeResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match pipe.read(max_len) {
+        Ok(bytes) => HandlerResult {
+            frame: build_read_pipe_response_ok(&bytes),
+            out_fd: None,
+        },
+        Err(PipeError::WouldBlock) => status_err(Opcode::ReadPipeResponse, StatusCode::WouldBlock),
+        Err(_) => status_err(Opcode::ReadPipeResponse, StatusCode::InvalidValue),
+    }
+}
+
+fn handle_write_pipe(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::WritePipeResponse);
+    }
+    let (handle_id, bytes) = match parse_write_pipe_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::WritePipeResponse),
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::WritePipeResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match pipe.write(&bytes) {
+        Ok(n) => HandlerResult {
+            frame: build_write_pipe_response_ok(n as u64),
+            out_fd: None,
+        },
+        Err(PipeError::WouldBlock) => status_err(Opcode::WritePipeResponse, StatusCode::WouldBlock),
+        Err(PipeError::PeerClosed) => {
+            status_err(Opcode::WritePipeResponse, StatusCode::InvalidValue)
+        }
+        Err(_) => status_err(Opcode::WritePipeResponse, StatusCode::Internal),
+    }
+}
+
+fn handle_subscribe_pipe(
+    registry: &BrokerStateRegistry,
+    conn: &ConnState,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SubscribePipeResponse);
+    }
+    let (handle_id, subscription_id, events_mask, end) =
+        match parse_subscribe_pipe_body(request.body) {
+            Ok(t) => t,
+            Err(_) => return protocol_err(Opcode::SubscribePipeResponse),
+        };
+    let Some(end) = PipeEndKind::from_u8(end) else {
+        return protocol_err(Opcode::SubscribePipeResponse);
+    };
+    let Some(sender) = conn.notification_sender.as_ref().cloned() else {
+        return status_err(
+            Opcode::SubscribePipeResponse,
+            StatusCode::NoNotificationRing,
+        );
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::SubscribePipeResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match pipe.subscribe_end(end, subscription_id, events_mask, sender) {
+        Ok(()) => HandlerResult {
+            frame: build_subscribe_pipe_response_ok(),
+            out_fd: None,
+        },
+        Err(SubscribeError::DuplicateId(_)) => status_err(
+            Opcode::SubscribePipeResponse,
+            StatusCode::DuplicateSubscription,
+        ),
+        Err(SubscribeError::UnknownEventBits { .. }) => protocol_err(Opcode::SubscribePipeResponse),
+    }
+}
+
+fn handle_incref_pipe_end(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::IncrefPipeEndResponse);
+    }
+    let (handle_id, end) = match parse_incref_pipe_end_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::IncrefPipeEndResponse),
+    };
+    let Some(end) = PipeEndKind::from_u8(end) else {
+        return protocol_err(Opcode::IncrefPipeEndResponse);
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::IncrefPipeEndResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match end {
+        PipeEndKind::Read => pipe.incref_read_end(),
+        PipeEndKind::Write => pipe.incref_write_end(),
+    }
+    HandlerResult {
+        frame: build_incref_pipe_end_response_ok(),
+        out_fd: None,
+    }
+}
+
+fn handle_close_pipe_end(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::ClosePipeEndResponse);
+    }
+    let (handle_id, end) = match parse_close_pipe_end_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::ClosePipeEndResponse),
+    };
+    let Some(end) = PipeEndKind::from_u8(end) else {
+        return protocol_err(Opcode::ClosePipeEndResponse);
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::ClosePipeEndResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match end {
+        PipeEndKind::Read => pipe.decref_read_end(),
+        PipeEndKind::Write => pipe.decref_write_end(),
+    }
+    HandlerResult {
+        frame: build_close_pipe_end_response_ok(),
+        out_fd: None,
+    }
+}
+
+fn handle_unsubscribe_pipe_end(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnsubscribePipeEndResponse);
+    }
+    let (handle_id, subscription_id, end) = match parse_unsubscribe_pipe_end_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::UnsubscribePipeEndResponse),
+    };
+    let Some(end) = PipeEndKind::from_u8(end) else {
+        return protocol_err(Opcode::UnsubscribePipeEndResponse);
+    };
+    let state = match resolve_pipe(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::UnsubscribePipeEndResponse, status),
+    };
+    let pipe = state
+        .as_any()
+        .downcast_ref::<PipeState>()
+        .expect("tag checked");
+    match pipe.unsubscribe_end_specific(end, subscription_id) {
+        Ok(()) => HandlerResult {
+            frame: build_unsubscribe_pipe_end_response_ok(),
+            out_fd: None,
+        },
+        Err(UnsubscribeError::UnknownId(_)) => status_err(
+            Opcode::UnsubscribePipeEndResponse,
+            StatusCode::UnknownSubscription,
+        ),
+    }
+}
+
 fn handle_create_signalfd(
     registry: &BrokerStateRegistry,
     request: &Frame<'_>,
@@ -374,6 +743,174 @@ fn handle_read_siginfo(
             tracing::warn!(error = %err, "ReadSiginfo failed");
             status_err(Opcode::ReadSiginfoResponse, StatusCode::Internal)
         }
+    }
+}
+
+fn handle_create_pty(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() || !request.body.is_empty() {
+        return protocol_err(Opcode::CreatePtyResponse);
+    }
+    let pty_id = u32::try_from(registry.live_handle_count() / 2).unwrap_or(u32::MAX);
+    let pair = PtyState::new_pair(pty_id);
+    let master = registry.register(pair.master);
+    let slave = registry.register(pair.slave);
+    HandlerResult {
+        frame: build_create_pty_response_ok(master.id(), slave.id(), pair.pty_id),
+        out_fd: None,
+    }
+}
+
+fn resolve_pty(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+    response: Opcode,
+) -> Result<std::sync::Arc<dyn StateObject + Send + Sync>, HandlerResult> {
+    match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Pty) {
+        Ok(s) => Ok(s),
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            Err(status_err(response, StatusCode::UnknownHandle))
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            Err(status_err(response, StatusCode::SubsystemMismatch))
+        }
+        Err(_) => Err(status_err(response, StatusCode::Internal)),
+    }
+}
+
+fn handle_pty_read(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::PtyReadResponse);
+    }
+    let (handle_id, max_len) = match parse_pty_read_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::PtyReadResponse),
+    };
+    let state = match resolve_pty(registry, handle_id, Opcode::PtyReadResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let pty = state
+        .as_any()
+        .downcast_ref::<PtyState>()
+        .expect("Pty tag guarantees PtyState");
+    match pty.read(max_len as usize) {
+        Ok(data) => HandlerResult {
+            frame: build_pty_read_response_ok(&data),
+            out_fd: None,
+        },
+        Err(PtyError::WouldBlock) => status_err(Opcode::PtyReadResponse, StatusCode::WouldBlock),
+        Err(PtyError::Invalid) => status_err(Opcode::PtyReadResponse, StatusCode::InvalidValue),
+        Err(PtyError::Closed) => HandlerResult {
+            frame: build_pty_read_response_ok(&[]),
+            out_fd: None,
+        },
+    }
+}
+
+fn handle_pty_write(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::PtyWriteResponse);
+    }
+    let (handle_id, data) = match parse_pty_write_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::PtyWriteResponse),
+    };
+    let state = match resolve_pty(registry, handle_id, Opcode::PtyWriteResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let pty = state
+        .as_any()
+        .downcast_ref::<PtyState>()
+        .expect("Pty tag guarantees PtyState");
+    match pty.write(&data) {
+        Ok(n) => HandlerResult {
+            frame: build_pty_write_response_ok(n as u32),
+            out_fd: None,
+        },
+        Err(PtyError::WouldBlock) => status_err(Opcode::PtyWriteResponse, StatusCode::WouldBlock),
+        Err(PtyError::Invalid) | Err(PtyError::Closed) => {
+            status_err(Opcode::PtyWriteResponse, StatusCode::InvalidValue)
+        }
+    }
+}
+
+fn handle_pty_ioctl(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::PtyIoctlResponse);
+    }
+    let (handle_id, op, payload) = match parse_pty_ioctl_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::PtyIoctlResponse),
+    };
+    let state = match resolve_pty(registry, handle_id, Opcode::PtyIoctlResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let pty = state
+        .as_any()
+        .downcast_ref::<PtyState>()
+        .expect("Pty tag guarantees PtyState");
+    // Caller ids are supplied as best-effort payload-independent defaults until
+    // Phase G's broker process/session model can validate job control globally.
+    match pty.ioctl(op, &payload, 1, 1, 1) {
+        Ok(result) => HandlerResult {
+            frame: build_pty_ioctl_response_ok(&result.payload),
+            out_fd: None,
+        },
+        Err(PtyError::WouldBlock) => status_err(Opcode::PtyIoctlResponse, StatusCode::WouldBlock),
+        Err(PtyError::Invalid) | Err(PtyError::Closed) => {
+            status_err(Opcode::PtyIoctlResponse, StatusCode::InvalidValue)
+        }
+    }
+}
+
+fn handle_subscribe_pty(
+    registry: &BrokerStateRegistry,
+    conn: &ConnState,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SubscribePtyResponse);
+    }
+    let (handle_id, subscription_id, events_mask) = match parse_subscribe_pty_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::SubscribePtyResponse),
+    };
+    let Some(sender) = conn.notification_sender.as_ref().cloned() else {
+        return status_err(Opcode::SubscribePtyResponse, StatusCode::NoNotificationRing);
+    };
+    let state = match resolve_pty(registry, handle_id, Opcode::SubscribePtyResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.subscribe(subscription_id, events_mask, sender) {
+        Ok(()) => HandlerResult {
+            frame: build_subscribe_pty_response_ok(),
+            out_fd: None,
+        },
+        Err(SubscribeError::DuplicateId(_)) => status_err(
+            Opcode::SubscribePtyResponse,
+            StatusCode::DuplicateSubscription,
+        ),
+        Err(SubscribeError::UnknownEventBits { .. }) => protocol_err(Opcode::SubscribePtyResponse),
     }
 }
 
@@ -523,10 +1060,15 @@ fn status_err(response_opcode: Opcode, status: StatusCode) -> HandlerResult {
 mod tests {
     use super::*;
     use litebox_common_linux::fd_token_protocol::{
-        build_create_eventfd_request, build_read_eventfd_request, build_subscribe_eventfd_request,
+        build_create_eventfd_request, build_mark_process_exited_request,
+        build_read_eventfd_request, build_register_process_request,
+        build_subscribe_eventfd_request, build_subscribe_process_exit_request,
         build_unsubscribe_request, build_write_eventfd_request, decode,
+        parse_subscribe_process_exit_response_ok,
     };
-    use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
+    use litebox_common_linux::notification_frame::{
+        NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
+    };
     use litebox_common_linux::notification_ring::NotificationReceiver;
 
     fn make_ring_for_conn(conn: &mut ConnState) -> NotificationReceiver {
@@ -723,6 +1265,74 @@ mod tests {
             &build_unsubscribe_request(handle_id, 1),
         );
         assert_eq!(unsub2.frame.status, StatusCode::UnknownSubscription);
+    }
+
+    #[test]
+    fn process_subscribe_then_mark_delivers_notification() {
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let mut receiver = make_ring_for_conn(&mut conn);
+
+        let register = run(&registry, &mut conn, &build_register_process_request());
+        assert_eq!(register.frame.status, StatusCode::Ok);
+        let pid = u64::from_le_bytes(register.frame.body[..8].try_into().unwrap());
+
+        let sub = run(
+            &registry,
+            &mut conn,
+            &build_subscribe_process_exit_request(
+                u32::try_from(pid).unwrap(),
+                77,
+                NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP,
+            ),
+        );
+        assert_eq!(sub.frame.status, StatusCode::Ok);
+        assert_eq!(
+            parse_subscribe_process_exit_response_ok(&sub.frame.body).unwrap(),
+            None
+        );
+
+        let mark = run(
+            &registry,
+            &mut conn,
+            &build_mark_process_exited_request(u32::try_from(pid).unwrap(), 33),
+        );
+        assert_eq!(mark.frame.status, StatusCode::Ok);
+        let frame = receiver.recv().unwrap();
+        assert_eq!(frame.subscription_id(), 77);
+        assert_eq!(frame.events(), NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP);
+        assert_eq!(frame.payload_bytes(), Some(&33i32.to_le_bytes()[..]));
+    }
+
+    #[test]
+    fn process_late_subscribe_returns_exit_snapshot() {
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let mut receiver = make_ring_for_conn(&mut conn);
+
+        let register = run(&registry, &mut conn, &build_register_process_request());
+        let pid = u64::from_le_bytes(register.frame.body[..8].try_into().unwrap());
+        let pid = u32::try_from(pid).unwrap();
+        let mark = run(
+            &registry,
+            &mut conn,
+            &build_mark_process_exited_request(pid, 44),
+        );
+        assert_eq!(mark.frame.status, StatusCode::Ok);
+
+        let sub = run(
+            &registry,
+            &mut conn,
+            &build_subscribe_process_exit_request(pid, 78, NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP),
+        );
+        assert_eq!(sub.frame.status, StatusCode::Ok);
+        assert_eq!(
+            parse_subscribe_process_exit_response_ok(&sub.frame.body).unwrap(),
+            Some(44)
+        );
+        let frame = receiver.recv().unwrap();
+        assert_eq!(frame.subscription_id(), 78);
+        assert_eq!(frame.payload_bytes(), Some(&44i32.to_le_bytes()[..]));
     }
 
     #[test]

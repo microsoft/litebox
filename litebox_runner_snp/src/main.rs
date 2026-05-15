@@ -146,6 +146,7 @@ pub extern "C" fn sandbox_process_init(
 
     litebox_platform_multiplex::set_platform(platform);
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    shim_builder.init_with_pid(litebox::process::ProcessId::INIT);
     let shim = shim_builder.build();
     unsafe { SHIM = Some(shim) };
 

@@ -685,6 +685,8 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| None,
                 |_fd| None,
                 |_fd| None,
+                |_fd| None,
+                |_fd| None,
             )
             .ok()
             .flatten()
@@ -1257,6 +1259,8 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                 )?;
                 let file = file?;
                 {
@@ -1333,6 +1337,8 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -1421,6 +1427,8 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                 )?
             }
         }
@@ -1483,6 +1491,8 @@ impl<FS: ShimFS> Task<FS> {
                             };
                             CString::new(abs).map_err(|_| Errno::EINVAL)
                         },
+                        |_| Err(Errno::ENOTDIR),
+                        |_| Err(Errno::ENOTDIR),
                         |_| Err(Errno::ENOTDIR),
                         |_| Err(Errno::ENOTDIR),
                         |_| Err(Errno::ENOTDIR),
@@ -1559,19 +1569,6 @@ impl<FS: ShimFS> Task<FS> {
             };
             let _ = eventfd.with_entry(|file| file.read(&self.wait_cx()));
             return Ok(n);
-        }
-
-        // Fast path: host-pipe FDs bypass the multi-subsystem dispatch.
-        if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
-            let handle = self
-                .global
-                .litebox
-                .descriptor_table()
-                .entry_handle(&hp_fd)
-                .ok_or(Errno::EBADF)?;
-            return handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
-                super::host_pipe::read_host_pipe(self.global.platform, entry, buf)
-            });
         }
 
         // We need to do this cell dance because otherwise Rust can't recognize that the two
@@ -1720,6 +1717,30 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
+                        super::host_pipe::read_host_pipe(
+                            self.global.platform,
+                            entry,
+                            &mut buf.borrow_mut(),
+                        )
+                    })
+                },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut buf.borrow_mut()))
+                },
             )
             .flatten()
     }
@@ -1733,36 +1754,6 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
-
-        // Fast path: host-pipe FDs bypass the multi-subsystem dispatch.
-        if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
-            #[cfg(feature = "trace_syscalls")]
-            if raw_fd <= 2 {
-                litebox::log_println!(
-                    self.global.platform,
-                    "[WRITE-HOSTPIPE] pid={} fd={} len={}",
-                    self.pid,
-                    raw_fd,
-                    buf.len(),
-                );
-            }
-            let handle = self
-                .global
-                .litebox
-                .descriptor_table()
-                .entry_handle(&hp_fd)
-                .ok_or(Errno::EBADF)?;
-            let res = handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
-                super::host_pipe::write_host_pipe(self.global.platform, entry, buf)
-            });
-            if let Err(Errno::EPIPE) = res {
-                self.send_signal(
-                    litebox_common_linux::signal::Signal::SIGPIPE,
-                    siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
-                );
-            }
-            return res;
-        }
 
         let res = files
             .run_on_raw_fd(
@@ -1845,19 +1836,38 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 },
+                |fd| {
+                    #[cfg(feature = "trace_syscalls")]
+                    if raw_fd <= 2 {
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[WRITE-HOSTPIPE] pid={} fd={} len={}",
+                            self.pid,
+                            raw_fd,
+                            buf.len(),
+                        );
+                    }
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
+                        super::host_pipe::write_host_pipe(self.global.platform, entry, buf)
+                    })
+                },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
+                },
             )
             .flatten();
-        // Diagnostic: log subsystem dispatch for write(fd=3) → EINVAL.
-        if raw_fd == 3 && matches!(res, Err(Errno::EINVAL)) {
-            let has_hp = files.try_host_pipe_fd(3).is_some();
-            litebox::log_println!(
-                self.global.platform,
-                "[WRITE-EINVAL] pid={} fd=3 len={} hp={} subsystem reached EINVAL path",
-                self.pid,
-                buf.len(),
-                has_hp,
-            );
-        }
         if let Err(Errno::EPIPE) = res {
             self.send_signal(
                 litebox_common_linux::signal::Signal::SIGPIPE,
@@ -2151,6 +2161,8 @@ impl<FS: ShimFS> Task<FS> {
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
             )
             .flatten()
     }
@@ -2202,6 +2214,8 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                 )?
             }
         }
@@ -2213,7 +2227,17 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
-        files.run_on_raw_fd(raw_fd, |_| (), |_| (), |_| (), |_| (), |_| (), |_| ())?;
+        files.run_on_raw_fd(
+            raw_fd,
+            |_| (),
+            |_| (),
+            |_| (),
+            |_| (),
+            |_| (),
+            |_| (),
+            |_| (),
+            |_| (),
+        )?;
         Ok(())
     }
 
@@ -2283,6 +2307,8 @@ impl<FS: ShimFS> Task<FS> {
                     alloc::format!("{dir_path}/{rel}")
                 })
             },
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
             |_| Err(Errno::ENOTDIR),
             |_| Err(Errno::ENOTDIR),
             |_| Err(Errno::ENOTDIR),
@@ -2529,6 +2555,14 @@ impl<FS: ShimFS> Task<FS> {
             }
             return Ok(());
         }
+        if let Ok(fd) =
+            rds.fd_consume_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+        {
+            drop(rds);
+            let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
+            drop(entry);
+            return Ok(());
+        }
         // All the above cases should cover all the known subsystems, and we've already
         // early-handled the "raw FD not found" case.
         unreachable!()
@@ -2555,6 +2589,20 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         files.run_on_raw_fd(
             raw_fd,
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
             |fd| {
                 let _old = self
                     .global
@@ -2772,6 +2820,38 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
+                        read_once_to_iovecs(
+                            iovs,
+                            || self.park_if_deferred(),
+                            |buf| {
+                                super::host_pipe::read_host_pipe(self.global.platform, entry, buf)
+                            },
+                        )
+                    })
+                },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry| {
+                        read_once_to_iovecs(
+                            iovs,
+                            || self.park_if_deferred(),
+                            |buf| entry.read(&self.wait_cx(), buf),
+                        )
+                    })
+                },
             )
             .flatten()
     }
@@ -2841,23 +2921,14 @@ fn fcntl_status_flags<FS: ShimFS>(
             handle.with_entry(|file| Ok(file.get_status()))
         }};
     }
-    if let Some(hp_fd) = files.try_host_pipe_fd(desc) {
-        let handle = task
-            .global
-            .litebox
-            .descriptor_table()
-            .entry_handle(&hp_fd)
-            .ok_or(Errno::EBADF)?;
-        return handle
-            .with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| Ok(file.get_status()));
-    }
-
     files
         .run_on_raw_fd(
             desc,
             |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
             |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
             |fd| getfl_from_metadata!(fd, crate::PipeStatusFlags),
+            |fd| getfl_from_handle!(fd),
+            |fd| getfl_from_handle!(fd),
             |fd| getfl_from_handle!(fd),
             |fd| getfl_from_handle!(fd),
             |fd| getfl_from_handle!(fd),
@@ -3103,6 +3174,30 @@ impl<FS: ShimFS> Task<FS> {
                         })
                     })
                 },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
+                        write_once_from_iovecs(iovs, |buf| {
+                            super::host_pipe::write_host_pipe(self.global.platform, entry, buf)
+                        })
+                    })
+                },
+                |fd| {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry| {
+                        write_once_from_iovecs(iovs, |buf| entry.write(&self.wait_cx(), buf))
+                    })
+                },
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
@@ -3175,6 +3270,8 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Ok(()),
                     |_| Ok(()),
                     |_| Ok(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
                 )?;
             }
             FsPath::FdRelative { fd, path } => {
@@ -3189,6 +3286,8 @@ impl<FS: ShimFS> Task<FS> {
                             .map_err(Errno::from)?;
                         Self::check_access_mode(&s, mode)
                     },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
@@ -3420,7 +3519,17 @@ impl<FS: ShimFS> Task<FS> {
             FsPath::Fd(fd) => {
                 let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
                 let files = self.files.borrow();
-                files.run_on_raw_fd(raw_fd, |_| (), |_| (), |_| (), |_| (), |_| (), |_| ())?;
+                files.run_on_raw_fd(
+                    raw_fd,
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                )?;
                 Err(Errno::ENOENT)
             }
             FsPath::FdRelative { fd, path } => {
@@ -3441,6 +3550,8 @@ impl<FS: ShimFS> Task<FS> {
                             _ => Errno::EIO,
                         })
                     },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
@@ -3477,35 +3588,6 @@ fn synthetic_symlink_stat(target_len: usize) -> FileStat {
 fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileStat, Errno> {
     let uid = task.credentials.euid.truncate();
     let gid = task.credentials.egid.truncate();
-
-    // Fast path: host-pipe FDs return a synthetic pipe-like stat.
-    if let Some(hp_fd) = task.files.borrow().try_host_pipe_fd(raw_fd) {
-        let dt = task.global.litebox.descriptor_table();
-        let dir = dt
-            .with_entry(&hp_fd, |e: &super::host_pipe::HostPipeFd| e.direction)
-            .ok_or(Errno::EBADF)?;
-        let read_write_mode = match dir {
-            super::host_pipe::HostPipeDirection::Read => Mode::RUSR,
-            super::host_pipe::HostPipeDirection::Write => Mode::WUSR,
-            super::host_pipe::HostPipeDirection::ReadWrite => {
-                Mode::from_bits_truncate(Mode::RUSR.bits() | Mode::WUSR.bits())
-            }
-        };
-        return Ok(FileStat {
-            st_dev: PIPEFS_DEV.truncate(),
-            st_ino: raw_fd as u64,
-            st_nlink: 1,
-            st_mode: (read_write_mode.bits() | litebox_common_linux::InodeType::NamedPipe as u32)
-                .truncate(),
-            st_uid: uid,
-            st_gid: gid,
-            st_rdev: 0,
-            st_size: 0,
-            st_blksize: 4096,
-            st_blocks: 0,
-            ..Default::default()
-        });
-    }
 
     let mut fstat = task
         .files
@@ -3611,6 +3693,68 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     ..Default::default()
                 })
             },
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
+                let dir = task
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .with_entry(fd, |e: &super::host_pipe::HostPipeFd| e.direction)
+                    .ok_or(Errno::EBADF)?;
+                let read_write_mode = match dir {
+                    super::host_pipe::HostPipeDirection::Read => Mode::RUSR,
+                    super::host_pipe::HostPipeDirection::Write => Mode::WUSR,
+                    super::host_pipe::HostPipeDirection::ReadWrite => {
+                        Mode::from_bits_truncate(Mode::RUSR.bits() | Mode::WUSR.bits())
+                    }
+                };
+                Ok(FileStat {
+                    st_dev: PIPEFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
+                    st_nlink: 1,
+                    st_mode: (read_write_mode.bits()
+                        | litebox_common_linux::InodeType::NamedPipe as u32)
+                        .truncate(),
+                    st_uid: uid,
+                    st_gid: gid,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            },
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
+                let dir = task
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .with_entry(
+                        fd,
+                        |e: &super::broker_pipe::BrokerPipeFd<crate::Platform>| e.direction(),
+                    )
+                    .ok_or(Errno::EBADF)?;
+                let read_write_mode = match dir {
+                    litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => Mode::RUSR,
+                    litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => Mode::WUSR,
+                };
+                Ok(FileStat {
+                    st_dev: PIPEFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
+                    st_nlink: 1,
+                    st_mode: (read_write_mode.bits()
+                        | litebox_common_linux::InodeType::NamedPipe as u32)
+                        .truncate(),
+                    st_uid: uid,
+                    st_gid: gid,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            },
         )
         .flatten()?;
 
@@ -3656,6 +3800,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     .with_metadata(fd, |_: &crate::HostTtyAlias| ())
                     .is_ok()
             },
+            |_| false,
+            |_| false,
             |_| false,
             |_| false,
             |_| false,
@@ -3717,13 +3863,10 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
             .unwrap_or(FileDescriptorFlags::empty())
     }
 
-    // Fast path: host-pipe FDs bypass run_on_raw_fd.
-    if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
-        return Ok(get_flags(global, &hp_fd));
-    }
-
     files.run_on_raw_fd(
         raw_fd,
+        |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
@@ -3750,14 +3893,10 @@ fn set_file_descriptor_flags<FS: ShimFS>(
             .set_fd_metadata(fd, flags);
     }
 
-    // Fast path: host-pipe FDs bypass run_on_raw_fd.
-    if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
-        set_flags(global, &hp_fd, flags);
-        return Ok(());
-    }
-
     files.run_on_raw_fd(
         raw_fd,
+        |fd| set_flags(global, fd, flags),
+        |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
@@ -4017,6 +4156,8 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                 )??
             }
         };
@@ -4216,29 +4357,6 @@ impl<FS: ShimFS> Task<FS> {
                             })
                     };
                 }
-                if let Some(hp_fd) = files.try_host_pipe_fd(desc) {
-                    let handle = self
-                        .global
-                        .litebox
-                        .descriptor_table()
-                        .entry_handle(&hp_fd)
-                        .ok_or(Errno::EBADF)?;
-                    return handle.with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| {
-                        let diff = (file.get_status() & setfl_mask) ^ flags;
-                        if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
-                            log_unsupported!("unsupported flags");
-                        }
-                        if diff.intersects(OFlags::NONBLOCK) {
-                            self.global.platform.set_host_fd_nonblocking(
-                                file.raw_fd(),
-                                flags.intersects(OFlags::NONBLOCK),
-                            )?;
-                        }
-                        file.set_status(flags);
-                        Ok(0)
-                    });
-                }
-
                 files.run_on_raw_fd(
                     desc,
                     |fd| {
@@ -4330,6 +4448,44 @@ impl<FS: ShimFS> Task<FS> {
                     |fd| {
                         toggle_flags!(fd);
                         Ok(())
+                    },
+                    |fd| {
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| {
+                            let diff = (file.get_status() & setfl_mask) ^ flags;
+                            if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                                log_unsupported!("unsupported flags");
+                            }
+                            if diff.intersects(OFlags::NONBLOCK) {
+                                self.global.platform.set_host_fd_nonblocking(
+                                    file.raw_fd(),
+                                    flags.intersects(OFlags::NONBLOCK),
+                                )?;
+                            }
+                            file.set_status(flags);
+                            Ok(())
+                        })
+                    },
+                    |fd| {
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| {
+                            let diff = (file.get_status() & setfl_mask) ^ flags;
+                            if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                                log_unsupported!("unsupported flags");
+                            }
+                            file.set_status(flags);
+                            Ok(())
+                        })
                     },
                 )??;
                 Ok(0)
@@ -4443,6 +4599,8 @@ impl<FS: ShimFS> Task<FS> {
             |_| Err(Errno::ENOTDIR),
             |_| Err(Errno::ENOTDIR),
             |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
         )??;
 
         let mut new_cwd = dir_path;
@@ -4474,6 +4632,98 @@ impl<FS: ShimFS> Task<FS> {
             (f, flags.contains(OFlags::CLOEXEC))
         };
 
+        // Phase C.3 (WIP): eager-broker `sys_pipe2`. Disabled by default
+        // because activation regresses PB.* tests — pid 2 in coord's
+        // shim exits status 127 BEFORE `sys_execve` is even entered.
+        // Root cause not yet diagnosed; keep the codepath buildable by
+        // gating on an env var (`LITEBOX_EAGER_BROKER_PIPE`) so the
+        // structural scaffolding (provider, install path, bridge specs,
+        // subscribe direction fix) can land while the activation work
+        // is iterated on separately.
+        let eager_broker = false; // C.5b protocol fix landed; reverting to gated default.
+        if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
+            let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
+            let handle = provider
+                .create_pipe(
+                    DEFAULT_PIPE_BUF_SIZE as u64,
+                    // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
+                    4096,
+                )
+                .map_err(|_| Errno::ENODEV)?;
+
+            // `BrokerPipeFd` embeds a `BrokerBackedCommon` whose `Drop`
+            // calls `provider.release(handle)`. `create_pipe` only gave us
+            // ONE registry refcount, so allocating TWO BrokerPipeFds (rd,
+            // wr) without a matching dup would have one too few. Bump the
+            // handle refcount once here so each of the two entries owns its
+            // own ref. Without this, the registry refcount underflows during
+            // fork+exec cleanup and subsequent ops on either end return
+            // UnknownHandle → EBADF — observed as `EPIPE.exec_captured`
+            // failing with EBADF on the parent's read after child exec.
+            let releaser: alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            > = alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle).is_err() {
+                provider.release(handle);
+                return Err(Errno::ENODEV);
+            }
+
+            let writer_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
+                alloc::sync::Arc::clone(&provider),
+                handle,
+                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
+                entry_flags,
+            );
+            let reader_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
+                provider,
+                handle,
+                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
+                entry_flags,
+            );
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            let writer = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(writer_entry);
+            let reader = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(reader_entry);
+            // Mirror the legacy `Pipes`-backed path's metadata. Code
+            // elsewhere in the shim queries `PipeStatusFlags` for
+            // status-flag updates (`fcntl(F_SETFL)`) and uses
+            // `GuestCreatedPipe` as a marker for fds the guest created
+            // (so the host doesn't try to close them as host fds).
+            {
+                let initial_status = OFlags::from(pipe_flags);
+                let _ = dt.set_entry_metadata(
+                    &writer,
+                    crate::PipeStatusFlags(initial_status | OFlags::WRONLY),
+                );
+                let _ = dt.set_entry_metadata(
+                    &reader,
+                    crate::PipeStatusFlags(initial_status | OFlags::RDONLY),
+                );
+                let _ = dt.set_entry_metadata(&writer, crate::GuestCreatedPipe);
+                let _ = dt.set_entry_metadata(&reader, crate::GuestCreatedPipe);
+            }
+            if cloexec {
+                let _ = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC);
+                let _ = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC);
+            }
+            drop(dt);
+
+            let files = self.files.borrow();
+            let wr_raw_fd = files.insert_raw_fd(writer).map_err(|writer| {
+                let _ = self.global.litebox.descriptor_table_mut().remove(&writer);
+                Errno::EMFILE
+            })?;
+            let rd_raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
+                let _ = self.do_close(wr_raw_fd);
+                let _ = self.global.litebox.descriptor_table_mut().remove(&reader);
+                Errno::EMFILE
+            })?;
+            return Ok((
+                rd_raw_fd.try_into().map_err(|_| Errno::EMFILE)?,
+                wr_raw_fd.try_into().map_err(|_| Errno::EMFILE)?,
+            ));
+        }
+
+        // Legacy fallback: in-shim local pipe (no broker provider).
         let (writer, reader) = self.global.pipes.create_pipe(
             DEFAULT_PIPE_BUF_SIZE,
             pipe_flags,
@@ -4949,9 +5199,9 @@ impl<FS: ShimFS> Task<FS> {
                 // silently-accepted TCSETS. Return the shadow if present
                 // so TCGETS reflects what the caller set.
                 let shadow = self.global.host_tty_shadow_termios.lock().clone();
-                let attrs = if self.process_id != litebox::process::ProcessId::INIT
-                    && let Some(ref shadow_attrs) = shadow
-                {
+                let is_init =
+                    Some(self.process_id) == self.global.litebox.process_registry().root_pid();
+                let attrs = if !is_init && let Some(ref shadow_attrs) = shadow {
                     shadow_attrs.clone()
                 } else {
                     self.global
@@ -5342,30 +5592,14 @@ impl<FS: ShimFS> Task<FS> {
                         |_fd| Err(Errno::ENOTTY),
                         |_fd| Err(Errno::ENOTTY),
                         |_fd| Err(Errno::ENOTTY),
+                        |_fd| Err(Errno::ENOTTY),
+                        |_fd| Err(Errno::ENOTTY),
                     )
                     .flatten()
             }
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 let files = self.files.borrow();
-                if let Some(hp_fd) = files.try_host_pipe_fd(desc) {
-                    let handle = self
-                        .global
-                        .litebox
-                        .descriptor_table()
-                        .entry_handle(&hp_fd)
-                        .ok_or(Errno::EBADF)?;
-                    handle.with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| {
-                        self.global
-                            .platform
-                            .set_host_fd_nonblocking(file.raw_fd(), val != 0)?;
-                        let mut flags = file.get_status();
-                        flags.set(OFlags::NONBLOCK, val != 0);
-                        file.set_status(flags);
-                        Ok::<(), Errno>(())
-                    })?;
-                    return Ok(0);
-                }
                 files
                     .run_on_raw_fd(
                         desc,
@@ -5452,12 +5686,63 @@ impl<FS: ShimFS> Task<FS> {
                             });
                             Ok(())
                         },
+                        |fd| {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| {
+                                self.global
+                                    .platform
+                                    .set_host_fd_nonblocking(file.raw_fd(), val != 0)?;
+                                let mut flags = file.get_status();
+                                flags.set(OFlags::NONBLOCK, val != 0);
+                                file.set_status(flags);
+                                Ok::<(), Errno>(())
+                            })
+                        },
+                        |fd| {
+                            // BrokerPipeFd: O_NONBLOCK lives in the shim-side
+                            // `status` AtomicU32; read/write paths consult
+                            // `get_status().contains(NONBLOCK)` before issuing
+                            // broker RPCs. No host fd to toggle.
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                let mut flags = file.get_status();
+                                flags.set(OFlags::NONBLOCK, val != 0);
+                                file.set_status(flags);
+                            });
+                            Ok(())
+                        },
                     )
                     .flatten()?;
                 Ok(0)
             }
             IoctlArg::FIOCLEX => files.run_on_raw_fd(
                 desc,
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
                 |fd| {
                     let _old = self
                         .global
@@ -5557,6 +5842,22 @@ impl<FS: ShimFS> Task<FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
                 },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
             )?,
             IoctlArg::TIOCGPTPEER(open_flags) => {
                 // TIOCGPTPEER: open the slave side of a PTY master, returning a new fd.
@@ -5573,6 +5874,8 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         Ok(rdev.get() & 0xFF)
                     },
+                    |_| Err(Errno::ENOTTY),
+                    |_| Err(Errno::ENOTTY),
                     |_| Err(Errno::ENOTTY),
                     |_| Err(Errno::ENOTTY),
                     |_| Err(Errno::ENOTTY),
@@ -5647,6 +5950,8 @@ impl<FS: ShimFS> Task<FS> {
                         _ => Err(Errno::ENOTTY),
                     }
                 },
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
@@ -6268,26 +6573,33 @@ impl<FS: ShimFS> Task<FS> {
                     min_fd,
                 )
             },
+            |fd| {
+                dup(
+                    &self.global,
+                    &files,
+                    fd,
+                    self.pid,
+                    file,
+                    close_on_exec,
+                    target,
+                    min_fd,
+                )
+            },
+            |fd| {
+                dup(
+                    &self.global,
+                    &files,
+                    fd,
+                    self.pid,
+                    file,
+                    close_on_exec,
+                    target,
+                    min_fd,
+                )
+            },
         );
-        // Fallback: try HostPipeSubsystem (pipe bridges from delayed fork).
         let new_fd = match new_fd {
             Ok(Ok(fd)) => fd,
-            Err(Errno::EBADF) => {
-                if let Some(hp_fd) = files.try_host_pipe_fd(file) {
-                    dup(
-                        &self.global,
-                        &files,
-                        &hp_fd,
-                        self.pid,
-                        file,
-                        close_on_exec,
-                        target,
-                        min_fd,
-                    )?
-                } else {
-                    return Err(Errno::EBADF);
-                }
-            }
             Ok(Err(e)) | Err(e) => return Err(e),
         };
         if target.is_none() {
@@ -6349,6 +6661,20 @@ impl<FS: ShimFS> Task<FS> {
                 files
                     .run_on_raw_fd(
                         oldfd_usize,
+                        |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        },
+                        |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        },
                         |fd| {
                             self.global
                                 .litebox
@@ -6518,6 +6844,8 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),

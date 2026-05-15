@@ -206,7 +206,7 @@ fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>
 }
 
 fn make_page_manager() -> super::PageManager<DummyVmemBackend, PAGE_SIZE> {
-    let litebox = crate::LiteBox::new(&DUMMY_VMEM_BACKEND);
+    let litebox = crate::LiteBox::new_for_test(&DUMMY_VMEM_BACKEND);
     super::PageManager::new(
         &litebox,
         DummyVmemBackend::TASK_ADDR_MIN..DummyVmemBackend::TASK_ADDR_MAX,
@@ -215,7 +215,7 @@ fn make_page_manager() -> super::PageManager<DummyVmemBackend, PAGE_SIZE> {
 
 #[cfg(target_arch = "x86_64")]
 fn make_retry_low_2g_page_manager() -> super::PageManager<RetryLow2gBackend, PAGE_SIZE> {
-    let litebox = crate::LiteBox::new(&RETRY_LOW_2G_BACKEND);
+    let litebox = crate::LiteBox::new_for_test(&RETRY_LOW_2G_BACKEND);
     super::PageManager::new(
         &litebox,
         RetryLow2gBackend::TASK_ADDR_MIN..RetryLow2gBackend::TASK_ADDR_MAX,

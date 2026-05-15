@@ -27,9 +27,12 @@ use litebox_common_linux::{
     ClockId, EfdFlags, ItimerSpec, TimerfdFlags, TimerfdTimerFlags,
     broker_eventfd_provider::{BrokerEventfdProvider, BrokerOpError},
     broker_pidfd_provider::BrokerPidfdProvider,
+    broker_pty_provider::BrokerPtyProvider,
     errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
+
+use super::guest_pid::BrokerProcessExitWake;
 
 pub(crate) struct EventfdSubsystem;
 impl FdEnabledSubsystem for EventfdSubsystem {
@@ -46,6 +49,8 @@ impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 static BROKER_EVENTFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerEventfdProvider>> =
     once_cell::race::OnceBox::new();
 static BROKER_PIDFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPidfdProvider>> =
+    once_cell::race::OnceBox::new();
+static BROKER_PTY_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPtyProvider>> =
     once_cell::race::OnceBox::new();
 
 /// Sets the process-global broker eventfd provider. Called by the
@@ -79,26 +84,37 @@ pub fn broker_pidfd_provider() -> Option<Arc<dyn BrokerPidfdProvider>> {
     BROKER_PIDFD_PROVIDER.get().cloned()
 }
 
+/// Sets the process-global broker PTY provider.
+#[allow(dead_code)]
+pub fn set_broker_pty_provider(
+    provider: Arc<dyn BrokerPtyProvider>,
+) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerPtyProvider>>> {
+    BROKER_PTY_PROVIDER.set(alloc::boxed::Box::new(provider))
+}
+
+/// Returns the broker PTY provider if one has been set.
+pub fn broker_pty_provider() -> Option<Arc<dyn BrokerPtyProvider>> {
+    BROKER_PTY_PROVIDER.get().cloned()
+}
+
 enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Eventfd {
         counter: u64,
         semaphore: bool,
     },
     Pidfd {
+        target_pid: litebox::process::ProcessId,
         exited: Arc<AtomicBool>,
         subject: Arc<Subject<Events, Events, Platform>>,
+        /// Broker process-exit subscription. Phase B.2 pidfds created by
+        /// pidfd_open carry this from birth, so fork-snapshot can export
+        /// the target ProcessId token instead of minting a host-pid-backed
+        /// pidfd handle. Drop unsubscribes from the broker.
+        broker_subscription: Option<BrokerProcessExitWake>,
         /// Host pid of the target process, if known. Captured at
-        /// `sys_pidfd_open` time from `fork_child_host_pids`. Used by
-        /// the fork-snapshot bridge (Phase 2.F) to mint a broker
-        /// pidfd handle so the child worker can observe exits
-        /// across the cross-binary-type fork boundary.
-        ///
-        /// `None` for pidfds whose target host pid isn't recorded
-        /// (e.g., pidfd_getfd inheritance chains, or virtual
-        /// process ids without a corresponding host process); in
-        /// that case the fork-bridge falls back to recording
-        /// `broker_handle = None` for this fd and the child will
-        /// recreate a local pidfd that may not observe exits.
+        /// `sys_pidfd_open` time from `fork_child_host_pids`. Kept for
+        /// process-control fallback paths; fork-snapshot no longer depends
+        /// on it because Phase B.2 exports the broker process token instead.
         host_pid: Option<u32>,
     },
     Timerfd(TimerFileState<Platform>),
@@ -254,17 +270,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     }
 
     pub(crate) fn new_pidfd(
+        target_pid: litebox::process::ProcessId,
         exited: Arc<AtomicBool>,
         subject: Arc<Subject<Events, Events, Platform>>,
         nonblock: bool,
         host_pid: Option<u32>,
+        broker_subscription: Option<BrokerProcessExitWake>,
     ) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, nonblock);
         Self {
             inner: litebox::sync::Mutex::new(EventFileInner::Pidfd {
+                target_pid,
                 exited,
                 subject,
+                broker_subscription,
                 host_pid,
             }),
             status: AtomicU32::new(status.bits()),
@@ -316,28 +336,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     /// - `BrokerBacked` / `PidfdBrokerBacked`: returns the existing handle.
     /// - `Eventfd`: promotes in place to `BrokerBacked` (migrates counter
     ///   value); fails closed if no eventfd provider is supplied.
-    /// - `Pidfd { host_pid: Some(_) }`: promotes in place to
-    ///   `PidfdBrokerBacked`; fails closed if no pidfd provider is supplied.
-    /// - `Pidfd { host_pid: None }`: returns `Ok(None)` — cannot mint
-    ///   a broker handle without a host pid. The child will get a
-    ///   fresh local pidfd that may not observe exits, which is
-    ///   the best-effort fallback.
+    /// - `Pidfd { broker_subscription: Some(_), .. }`: Phase B.2 pidfds are
+    ///   already broker-backed by process-exit subscription, so this is a
+    ///   no-op that exports the target ProcessId as the child restore token.
+    /// - legacy `Pidfd` without a broker subscription: returns `Ok(None)`.
     /// - `Timerfd`: returns `Ok(None)` — timerfd state is not
     ///   currently broker-backed; the child loses timer state
     ///   across fork (acceptable since timerfd-across-fork is rare).
     ///
-    /// On success the caller MUST `dup_handle` the returned handle
-    /// to keep the in-transit ref alive, and arrange to call
-    /// `release` on rollback (failed snapshot consumption).
+    /// For handle-backed kinds, the caller MUST `dup_handle` the returned
+    /// handle and arrange rollback `release`. For Phase B.2 pidfds, the
+    /// returned value is a broker process token and needs no fd-handle dup.
     pub(crate) fn ensure_broker_backed_for_fork(
         &self,
         eventfd_provider: Option<&Arc<dyn BrokerEventfdProvider>>,
-        pidfd_provider: Option<&Arc<dyn BrokerPidfdProvider>>,
+        _pidfd_provider: Option<&Arc<dyn BrokerPidfdProvider>>,
     ) -> Result<Option<(super::fork_snapshot::BrokerHandleKind, u64)>, BrokerOpError> {
         use super::fork_snapshot::BrokerHandleKind;
-        use litebox_common_linux::cwfd::notification_frame::{
-            NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
-        };
+        use litebox_common_linux::cwfd::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
         let mut guard = self.inner.lock();
         match &*guard {
             EventFileInner::BrokerBacked { common, .. } => {
@@ -377,27 +393,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 };
                 Ok(Some((BrokerHandleKind::Eventfd, handle)))
             }
-            EventFileInner::Pidfd { host_pid, .. } => {
-                let Some(host_pid_val) = *host_pid else {
-                    return Ok(None);
-                };
-                let Some(provider) = pidfd_provider else {
-                    return Ok(None);
-                };
-                let handle = provider.create_pidfd(host_pid_val)?;
-                let subscribable: Arc<
-                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-                > = Arc::clone(provider) as _;
-                let common = super::broker_backed::BrokerBackedCommon::new(
-                    subscribable,
-                    handle,
-                    NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP,
-                );
-                *guard = EventFileInner::PidfdBrokerBacked {
-                    provider: Arc::clone(provider),
-                    common,
-                };
-                Ok(Some((BrokerHandleKind::Pidfd, handle)))
+            EventFileInner::Pidfd {
+                target_pid,
+                broker_subscription,
+                ..
+            } => {
+                if broker_subscription.is_some() {
+                    Ok(Some((BrokerHandleKind::Pidfd, u64::from(target_pid.0))))
+                } else {
+                    Ok(None)
+                }
             }
         }
     }
@@ -655,8 +660,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                     events |= Events::IN;
                 }
             }
-            EventFileInner::Pidfd { exited, .. } => {
-                if exited.load(Ordering::Acquire) {
+            EventFileInner::Pidfd {
+                exited,
+                broker_subscription,
+                ..
+            } => {
+                if exited.load(Ordering::Acquire)
+                    || broker_subscription
+                        .as_ref()
+                        .is_some_and(BrokerProcessExitWake::is_exited)
+                {
                     events |= Events::IN | Events::HUP;
                 }
             }
@@ -687,8 +700,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
         let inner = self.inner.lock();
         match &*inner {
-            EventFileInner::Pidfd { subject, .. } => {
-                subject.register_observer(observer, mask | Events::ALWAYS_POLLED);
+            EventFileInner::Pidfd {
+                subject,
+                broker_subscription,
+                ..
+            } => {
+                let observer_mask = mask | Events::ALWAYS_POLLED;
+                subject.register_observer(alloc::sync::Weak::clone(&observer), observer_mask);
+                if let Some(subscription) = broker_subscription {
+                    subscription
+                        .subject
+                        .register_observer(observer, observer_mask);
+                }
             }
             EventFileInner::Eventfd { .. } | EventFileInner::Timerfd(_) => {
                 drop(inner);
@@ -735,6 +758,26 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
             }
             _ => {}
         }
+    }
+}
+
+impl EventFile<Platform> {
+    pub(crate) fn new_broker_process_pidfd(
+        target_pid: litebox::process::ProcessId,
+        subscription: BrokerProcessExitWake,
+        nonblock: bool,
+        host_pid: Option<u32>,
+    ) -> Self {
+        let exited = Arc::new(AtomicBool::new(subscription.is_exited()));
+        let subject = Arc::clone(&subscription.subject);
+        Self::new_pidfd(
+            target_pid,
+            exited,
+            subject,
+            nonblock,
+            host_pid,
+            Some(subscription),
+        )
     }
 }
 
@@ -1556,10 +1599,12 @@ mod tests {
         let path = dir.path().join("fd-token.sock");
         let fd_registry = std::sync::Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = std::sync::Arc::new(BrokerStateRegistry::new());
+        let process_registry = std::sync::Arc::new(BrokerStateRegistry::new());
         let _listener = spawn_control_listener(
             &path,
             std::sync::Arc::clone(&fd_registry),
             std::sync::Arc::clone(&state_registry),
+            std::sync::Arc::clone(&process_registry),
         )
         .expect("spawn listener");
         for _ in 0..100 {
@@ -1626,7 +1671,12 @@ mod tests {
             >,
         > = Arc::new(Subject::new());
         let pidfd = super::EventFile::<litebox_platform_multiplex::Platform>::new_pidfd(
-            exited, subject, false, None,
+            litebox::process::ProcessId(123),
+            exited,
+            subject,
+            false,
+            None,
+            None,
         );
 
         // No providers: should be Ok(None), not Err.

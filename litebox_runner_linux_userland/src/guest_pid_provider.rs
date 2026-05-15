@@ -3,24 +3,27 @@
 
 //! Runner-side implementation of [`GuestPidProvider`].
 //!
-//! Wraps [`FdTokenClient`] for the RegisterProcess / Release control-
-//! channel RPCs against the broker's process registry. The shim's
-//! `register_guest_pid` / `release_guest_pid` accessors call into
-//! this trait via a `OnceBox` set at runner bootstrap.
+//! Wraps [`FdTokenClient`] for RegisterProcess / Release and the
+//! Phase-G process-exit RPCs against the broker's process registry.
 
+use litebox_common_linux::broker_eventfd::NotificationDispatcher;
+use litebox_common_linux::cwfd::notification_frame::{NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN};
 use litebox_common_linux::fd_token_client::FdTokenClient;
-use litebox_common_linux::guest_pid_provider::{GuestPidProvider, GuestPidProviderError};
+use litebox_common_linux::guest_pid_provider::{
+    GuestPidProvider, GuestPidProviderError, ProcessExitSubscription,
+};
 use std::sync::Arc;
 
 /// Runner-side concrete impl of [`GuestPidProvider`]. Stores the
-/// shared broker control-channel client.
+/// shared broker control-channel client and notification dispatcher.
 pub struct RunnerGuestPidProvider {
     client: Arc<FdTokenClient>,
+    dispatcher: Arc<NotificationDispatcher>,
 }
 
 impl RunnerGuestPidProvider {
-    pub fn new(client: Arc<FdTokenClient>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<FdTokenClient>, dispatcher: Arc<NotificationDispatcher>) -> Self {
+        Self { client, dispatcher }
     }
 }
 
@@ -46,4 +49,86 @@ impl GuestPidProvider for RunnerGuestPidProvider {
             tracing::warn!(pid, error = %e, "release_process RPC failed; pid may leak in broker");
         }
     }
+
+    fn mark_process_exited(&self, pid: u32, exit_code: i32) -> Result<(), GuestPidProviderError> {
+        self.client
+            .mark_process_exited(pid, exit_code)
+            .map_err(|e| map_client_error(pid, e))
+    }
+
+    fn subscribe_process_exit(
+        &self,
+        pid: u32,
+        events_mask: u32,
+        callback: Arc<dyn litebox_common_linux::cwfd::broker_subscribable::BrokerEventCallback>,
+    ) -> Result<ProcessExitSubscription, GuestPidProviderError> {
+        let subscription_id = self.dispatcher.alloc_subscription_id();
+        let bridge: Arc<dyn litebox_common_linux::broker_eventfd::NotificationCallback> =
+            Arc::new(CallbackBridge { inner: callback });
+        self.dispatcher.register_callback(subscription_id, bridge);
+        match self
+            .client
+            .subscribe_process_exit(pid, subscription_id, events_mask)
+        {
+            Ok(already_exited) => Ok(ProcessExitSubscription {
+                subscription_id,
+                already_exited,
+            }),
+            Err(e) => {
+                self.dispatcher.unregister_callback(subscription_id);
+                Err(map_client_error(pid, e))
+            }
+        }
+    }
+
+    fn unsubscribe_process_exit(&self, pid: u32, subscription_id: u64) {
+        self.dispatcher.unregister_callback(subscription_id);
+        if let Err(e) = self.client.unsubscribe(u64::from(pid), subscription_id) {
+            tracing::warn!(pid, subscription_id, error = %e, "process-exit unsubscribe failed");
+        }
+    }
 }
+
+struct CallbackBridge {
+    inner: Arc<dyn litebox_common_linux::cwfd::broker_subscribable::BrokerEventCallback>,
+}
+
+impl litebox_common_linux::broker_eventfd::NotificationCallback for CallbackBridge {
+    fn on_events(&self, events: u32) {
+        self.inner.on_events(events);
+    }
+}
+
+fn map_client_error(
+    pid: u32,
+    err: litebox_common_linux::fd_token_client::ClientError,
+) -> GuestPidProviderError {
+    match err {
+        litebox_common_linux::fd_token_client::ClientError::UnknownHandle { .. } => {
+            tracing::warn!(pid, "process-exit RPC returned UnknownHandle");
+            GuestPidProviderError::UnknownHandle
+        }
+        other => {
+            tracing::warn!(pid, error = %other, "process-exit RPC failed (mapped to Io)");
+            // Mirror to /tmp/rst-diag.log so failures surface inside
+            // the test container (tracing output may not reach the
+            // log dir during fast failures).
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[DBG-SUBSCRIBE] pid={} RPC error mapped to Io: {}",
+                    pid, other
+                );
+            }
+            GuestPidProviderError::Io
+        }
+    }
+}
+
+#[allow(dead_code)]
+const PROCESS_EXIT_EVENTS: u32 = NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP;

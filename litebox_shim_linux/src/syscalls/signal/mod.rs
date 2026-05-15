@@ -893,10 +893,11 @@ impl<FS: ShimFS> Task<FS> {
                 .litebox
                 .process_registry()
                 .all_running_except(self.process_id);
+            let root_pid = self.global.litebox.process_registry().root_pid();
             let mut delivered = false;
             for target in all_pids {
-                if target == litebox::process::ProcessId::INIT {
-                    continue; // skip PID 1, matching Linux semantics
+                if Some(target) == root_pid {
+                    continue; // skip the init process, matching Linux semantics
                 }
                 let target_pid = i32::try_from(target.0).unwrap_or(-1);
                 if target_pid > 0
@@ -1079,14 +1080,8 @@ impl<FS: ShimFS> Task<FS> {
         tid: Option<i32>,
         signal: i32,
     ) -> Result<usize, Errno> {
-        // Resolve the guest PID to a ProcessId.
-        let target = self
-            .global
-            .pid_to_process_id
-            .read()
-            .get(&pid)
-            .copied()
-            .unwrap_or(ProcessId(pid.try_into().map_err(|_| Errno::ESRCH)?));
+        // After Phase K Step 3, ProcessId == guest pid by construction.
+        let target = ProcessId(pid.try_into().map_err(|_| Errno::ESRCH)?);
 
         // Check process existence. First try the local process registry,
         // then the control plane. For signal 0 (existence check), also

@@ -463,7 +463,7 @@ impl<FS: ShimFS> Task<FS> {
         // Cancel blocking stdin reads so threads in host syscalls can exit.
         // Only do this for the init process; child processes should not cancel
         // stdin for the entire sandbox.
-        let is_init = self.process_id == litebox::process::ProcessId::INIT;
+        let is_init = Some(self.process_id) == self.global.litebox.process_registry().root_pid();
         if is_init {
             self.global.platform.cancel_stdin();
         }
@@ -500,7 +500,7 @@ impl<FS: ShimFS> Task<FS> {
             // Cancel blocking stdin reads so threads in host syscalls can exit.
             // Only do this for the init process; child processes should not cancel
             // stdin for the entire sandbox.
-            if self.process_id == litebox::process::ProcessId::INIT {
+            if Some(self.process_id) == self.global.litebox.process_registry().root_pid() {
                 self.global.platform.cancel_stdin();
             }
             for (&tid, thread) in &inner.threads {
@@ -982,6 +982,7 @@ impl<FS: ShimFS> Task<FS> {
                     ExitStatus::Signal(sig) => sig.as_i32() + 128,
                 }
             };
+            super::guest_pid::try_mark_broker_process_exited(self.process_id.0, exit_status);
             let removed_owner = self
                 .global
                 .control_plane
@@ -1513,21 +1514,10 @@ impl<FS: ShimFS> Task<FS> {
 
         let target = match pid {
             p if p > 0 => {
-                // Translate the guest-visible pid to the shim-local
-                // ProcessId via the pid_to_process_id map. With broker-
-                // allocated pids the pid value is independent of
-                // ProcessId.0, so we MUST do the lookup instead of
-                // assuming `ProcessId(pid as u32)`. Fall back to the
-                // pid-as-ProcessId interpretation for backwards
-                // compatibility when the broker provider isn't installed
-                // (pre-Phase-1 behaviour where pid == ProcessId.0).
-                let process_id = self
-                    .global
-                    .pid_to_process_id
-                    .read()
-                    .get(&p)
-                    .copied()
-                    .unwrap_or(ProcessId(p.try_into().map_err(|_| Errno::EINVAL)?));
+                // After Phase K Step 3, ProcessId == guest pid by
+                // construction, so the historical pid_to_process_id
+                // forward lookup is just `ProcessId(p as u32)`.
+                let process_id = ProcessId(p.try_into().map_err(|_| Errno::EINVAL)?);
                 WaitTarget::Pid(process_id)
             }
             -1 => WaitTarget::AnyChild,
@@ -1581,20 +1571,11 @@ impl<FS: ShimFS> Task<FS> {
                     self.prepare_guest_write(ptr, 1)?;
                     let _ = ptr.write_at_offset(0, encoded);
                 }
-                // wait_for_child returns the matched child's ProcessId
-                // (shim-local handle), but Linux wait4 must return the
-                // guest-visible pid. Reverse-look the pid via
-                // pid_to_process_id; fall back to ProcessId.0 only if
-                // the reverse lookup misses (pre-Phase-1 invariant
-                // where pid == ProcessId.0).
-                let guest_pid = self
-                    .global
-                    .pid_to_process_id
-                    .read()
-                    .iter()
-                    .find_map(|(&gp, &pid)| (pid == wr.pid).then_some(gp))
-                    .map(|p| p as usize)
-                    .unwrap_or(wr.pid.0 as usize);
+                // wait_for_child returns the matched child's ProcessId.
+                // After Phase K Step 3 it equals the guest-visible pid
+                // by construction, so the historical reverse lookup
+                // through pid_to_process_id is just `wr.pid.0 as i32`.
+                let guest_pid = wr.pid.0 as usize;
                 Ok(guest_pid)
             }
             Err(litebox::process::WaitError::WouldBlock) => Ok(0),
@@ -1775,59 +1756,7 @@ impl<FS: ShimFS> Task<FS> {
         if flags & !PIDFD_NONBLOCK != 0 {
             return Err(Errno::EINVAL);
         }
-        let guest_pid = pid.cast_signed();
-        let process_id = self
-            .global
-            .pid_to_process_id
-            .read()
-            .get(&guest_pid)
-            .copied()
-            .unwrap_or(ProcessId(pid));
-        if let Err(err) = self.reject_remote_running_process_control(process_id, "pidfd_open") {
-            // Target lives on a different host worker. Only here do we
-            // route through the broker — for local-running targets we
-            // must keep the local pidfd path so tokio's child-process
-            // tracking (which pidfd_opens local children) doesn't get
-            // its wake semantics changed under it.
-            if let Some(provider) = crate::syscalls::eventfd::broker_pidfd_provider()
-                && let Some(host_pid) = self
-                    .global
-                    .fork_child_host_pids
-                    .read()
-                    .get(&process_id.0)
-                    .copied()
-            {
-                let host_pid = u32::try_from(host_pid).map_err(|_| Errno::ESRCH)?;
-                let handle = provider
-                    .create_pidfd(host_pid)
-                    .map_err(super::broker_backed::broker_err_to_errno)?;
-                let pidfd = crate::syscalls::eventfd::EventFile::new_pidfd_broker_backed(
-                    provider,
-                    handle,
-                    flags & PIDFD_NONBLOCK != 0,
-                );
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let typed = dt.insert::<crate::syscalls::eventfd::EventfdSubsystem>(pidfd);
-                let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
-                assert!(old.is_none());
-                drop(dt);
-
-                let raw_fd = self
-                    .files
-                    .borrow()
-                    .insert_raw_fd(typed)
-                    .map_err(|_| Errno::EMFILE)?;
-                return Ok(raw_fd);
-            }
-            return Err(err);
-        }
-
-        let state = self
-            .global
-            .litebox
-            .process_registry()
-            .exit_state(process_id)
-            .ok_or(Errno::ESRCH)?;
+        let process_id = ProcessId(pid);
         let host_pid_opt: Option<u32> = self
             .global
             .fork_child_host_pids
@@ -1835,12 +1764,31 @@ impl<FS: ShimFS> Task<FS> {
             .get(&process_id.0)
             .copied()
             .and_then(|p| u32::try_from(p).ok());
-        let pidfd = crate::syscalls::eventfd::EventFile::new_pidfd(
-            state.exited,
-            state.subject,
-            flags & PIDFD_NONBLOCK != 0,
-            host_pid_opt,
-        );
+        let subscription =
+            crate::syscalls::guest_pid::try_subscribe_broker_process_exit(process_id)
+                .ok_or(Errno::ESRCH)?;
+        let state = self
+            .global
+            .litebox
+            .process_registry()
+            .exit_state(process_id);
+        let pidfd = if let Some(state) = state {
+            crate::syscalls::eventfd::EventFile::new_pidfd(
+                process_id,
+                state.exited,
+                state.subject,
+                flags & PIDFD_NONBLOCK != 0,
+                host_pid_opt,
+                Some(subscription),
+            )
+        } else {
+            crate::syscalls::eventfd::EventFile::new_broker_process_pidfd(
+                process_id,
+                subscription,
+                flags & PIDFD_NONBLOCK != 0,
+                host_pid_opt,
+            )
+        };
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<crate::syscalls::eventfd::EventfdSubsystem>(pidfd);
         let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
@@ -2094,7 +2042,15 @@ impl<FS: ShimFS> Task<FS> {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
-        let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        // TID allocation: Linux TIDs and PIDs share the same numeric
+        // space and are globally unique. If a broker guest-pid provider
+        // is installed, route the new thread's TID through it so two
+        // shims that clone() concurrently can never collide. Falls back
+        // to the per-shim `next_thread_id` counter when there's no
+        // broker (single-shim test scenarios).
+        let child_tid = crate::syscalls::guest_pid::try_register_broker_guest_pid()
+            .map(|raw| i32::try_from(raw).expect("broker pid must fit in Linux tid"))
+            .unwrap_or_else(|| self.global.next_thread_id.fetch_add(1, Ordering::Relaxed));
         if let Some(parent_tid_ptr) = set_parent_tid {
             let _ = self.prepare_guest_write(parent_tid_ptr, 1);
             let _ = parent_tid_ptr.write_at_offset(0, child_tid);
@@ -2283,22 +2239,62 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        // 1. Register child process in the core ProcessRegistry.
+        // 1. Allocate the child's pid.
+        //
+        // Phase K: in production (broker-hosted GuestPidProvider
+        // installed), every guest pid comes from the broker so:
+        // - ProcessId is globally unique across all shim instances by
+        //   construction; coord's "pid 2" and dpg1's "pid 2" cannot
+        //   collide.
+        // - Phase B.2's broker-only `sys_pidfd_open` always finds the
+        //   pid in the broker's process registry.
+        // - cross-worker waitpid identity is unambiguous.
+        //
+        // Without a broker provider (single-worker test scenarios),
+        // fall back to the per-shim `next_pid` counter via the legacy
+        // `create_process`.
         let exit_signal = i32::try_from(args.exit_signal).map_err(|_| Errno::EINVAL)?;
-        let child_process_id = self
-            .global
-            .litebox
-            .process_registry()
-            .create_process(Some(self.process_id), exit_signal)
-            .map_err(|_| {
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[FORK] pid={}: create_process failed (ENOMEM)",
-                    self.pid,
-                );
-                Errno::ENOMEM
-            })?;
+        let broker_pid_opt = crate::syscalls::guest_pid::try_register_broker_guest_pid();
+        let child_process_id = match broker_pid_opt {
+            Some(broker_pid) => {
+                let pid = litebox::process::ProcessId(broker_pid);
+                self.global
+                    .litebox
+                    .process_registry()
+                    .create_process_with_id(pid, Some(self.process_id), exit_signal)
+                    .map_err(|err| {
+                        #[cfg(feature = "trace_syscalls")]
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[FORK] pid={}: create_process_with_id({}) failed: {:?}",
+                            self.pid,
+                            broker_pid,
+                            err,
+                        );
+                        let _ = err;
+                        // The broker handed us a pid we can't register
+                        // locally (e.g. PidAlreadyExists collision).
+                        // Release the broker pid so it isn't leaked.
+                        crate::syscalls::guest_pid::try_release_broker_guest_pid(broker_pid);
+                        Errno::ENOMEM
+                    })?;
+                pid
+            }
+            None => self
+                .global
+                .litebox
+                .process_registry()
+                .create_process(Some(self.process_id), exit_signal)
+                .map_err(|_| {
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FORK] pid={}: create_process failed (ENOMEM)",
+                        self.pid,
+                    );
+                    Errno::ENOMEM
+                })?,
+        };
 
         // 2. Fork address space: allocate a VA partition for the child.
         let parent_as_id = self.process_state.borrow().address_space_id;
@@ -2353,35 +2349,24 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(not(target_arch = "x86_64"))]
         let delayed_fork = false;
 
-        // 3. Allocate a TID for the child.
-        //
-        // PID allocation strategy: if a broker-hosted `GuestPidProvider`
-        // is installed (multi-worker mode with fd-token broker), allocate
-        // a globally-unique pid via the broker so cross-worker forks
-        // cannot collide with the migrated init's `--guest-pid` (the
-        // root cause of the PIDUNIQ.cross_bt_* failures). If no provider
-        // is available (single-worker scenarios), fall back to using the
-        // per-shim `ProcessId.0` as the pid — preserves existing
-        // behaviour where no migration occurs and collisions are
-        // impossible.
+        // 3. Derive the guest pid from the child's ProcessId. Phase K:
+        // `ProcessId.0` is the broker-allocated pid (when a provider is
+        // installed) or the per-shim counter pid (test scenarios) —
+        // either way, it's THE pid for this child. The legacy split
+        // between "internal ProcessId" and "external guest pid" went
+        // away with Phase K.
         //
         // The TID for the initial thread is set equal to the pid, matching
         // Linux's `tgid == pid` invariant for a process's leader thread.
-        let child_pid_u32 = match crate::syscalls::guest_pid::try_register_broker_guest_pid() {
-            Some(broker_pid) => broker_pid,
-            None => u32::try_from(child_process_id.0).map_err(|_| {
-                self.global
-                    .litebox
-                    .process_registry()
-                    .remove_process(child_process_id);
-                Errno::EAGAIN
-            })?,
-        };
+        let child_pid_u32 = child_process_id.0;
         let child_pid = i32::try_from(child_pid_u32).map_err(|_| {
             self.global
                 .litebox
                 .process_registry()
                 .remove_process(child_process_id);
+            if let Some(broker_pid) = broker_pid_opt {
+                crate::syscalls::guest_pid::try_release_broker_guest_pid(broker_pid);
+            }
             Errno::EAGAIN
         })?;
         let child_initial_tid = child_pid;
@@ -2883,11 +2868,14 @@ impl<FS: ShimFS> Task<FS> {
             .register_running_process_local(child_process_id)
             .expect("newly forked process must be registered to the local host");
 
-        // Register guest PID → ProcessId mapping for signal delivery.
-        self.global
-            .pid_to_process_id
-            .write()
-            .insert(child_pid, child_process_id);
+        // After Phase K Step 3, child_pid == child_process_id.0 by
+        // construction (broker pid drives both fields). The historical
+        // pid_to_process_id map is gone.
+        debug_assert_eq!(
+            u32::try_from(child_pid).ok(),
+            Some(child_process_id.0),
+            "child_pid and child_process_id must be the same value"
+        );
         let child_cmdline = self.global.proc_cmdline(self.pid).unwrap_or_else(|| {
             let exe = self.fs.borrow().exe_path.read().clone();
             proc_cmdline_from_argv(&[], &exe)
@@ -7084,6 +7072,13 @@ impl<FS: ShimFS> Task<FS> {
                     // Host-backed pipe (from a prior delayed-fork bridge).
                     (FdClass::Pipe, Some(fd.object_id()), None, None)
                 } else if let Ok(fd) =
+                    rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+                {
+                    // Phase C.3: eager-broker pipe. Classify as Pipe so the
+                    // broker-handle metadata is emitted below and the restored
+                    // worker can re-attach to the same broker `PipeState`.
+                    (FdClass::Pipe, Some(fd.object_id()), None, None)
+                } else if let Ok(fd) =
                     rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
                 {
                     (FdClass::EventFd, Some(fd.object_id()), None, None)
@@ -7230,8 +7225,16 @@ impl<FS: ShimFS> Task<FS> {
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
                                 BrokerHandleKind::Signalfd => None,
+                                BrokerHandleKind::Pty => super::eventfd::broker_pty_provider()
+                                    .as_ref()
+                                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                                BrokerHandleKind::Pipe => super::broker_pipe::broker_pipe_provider()
+                                    .as_ref()
+                                    .map(|p| alloc::sync::Arc::clone(p) as _),
                             };
-                            if let Some(releaser) = releaser_opt {
+                            if kind == BrokerHandleKind::Pidfd {
+                                Some(BrokerHandleSnapshot { kind, handle_id })
+                            } else if let Some(releaser) = releaser_opt {
                                 match releaser.dup_handle(handle_id) {
                                     Ok(()) => {
                                         broker_transit.push(ForkSnapshotBrokerTransit {
@@ -7248,6 +7251,51 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                         _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else if class == FdClass::Pipe {
+                // Phase C.3: emit a broker-Pipe handle snapshot when the fd
+                // is a `BrokerPipeSubsystem` entry. Local `Pipes<Platform>`
+                // and `HostPipeSubsystem` pipes don't have broker identity
+                // and fall through to `None`.
+                if let Ok(typed) =
+                    rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+                {
+                    let pipe_provider = super::broker_pipe::broker_pipe_provider();
+                    let entry_result = dt.with_entry(
+                        &typed,
+                        |bp_fd: &super::broker_pipe::BrokerPipeFd<crate::Platform>| {
+                            bp_fd.fork_snapshot_handle()
+                        },
+                    );
+                    match entry_result {
+                        Some((kind, handle_id)) => {
+                            let releaser_opt: Option<
+                                alloc::sync::Arc<
+                                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                                >,
+                            > = pipe_provider
+                                .as_ref()
+                                .map(|p| alloc::sync::Arc::clone(p) as _);
+                            if let Some(releaser) = releaser_opt {
+                                match releaser.dup_handle(handle_id) {
+                                    Ok(()) => {
+                                        broker_transit.push(ForkSnapshotBrokerTransit {
+                                            releaser,
+                                            handle_id,
+                                            kind,
+                                        });
+                                        Some(BrokerHandleSnapshot { kind, handle_id })
+                                    }
+                                    Err(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
                     }
                 } else {
                     None
@@ -8466,13 +8514,7 @@ impl<FS: ShimFS> Task<FS> {
         if pid == 0 {
             return Ok(self.pid.cast_unsigned());
         }
-        let target = self
-            .global
-            .pid_to_process_id
-            .read()
-            .get(&pid)
-            .copied()
-            .unwrap_or(ProcessId(pid.cast_unsigned()));
+        let target = ProcessId(pid.cast_unsigned());
         self.global
             .litebox
             .process_registry()
@@ -8499,12 +8541,7 @@ impl<FS: ShimFS> Task<FS> {
         let target = if pid == 0 {
             caller
         } else {
-            self.global
-                .pid_to_process_id
-                .read()
-                .get(&pid)
-                .copied()
-                .unwrap_or(ProcessId(pid.cast_unsigned()))
+            ProcessId(pid.cast_unsigned())
         };
         let target_pgid = if pgid == 0 {
             ProcessGroupId::from(target)
@@ -8532,12 +8569,7 @@ impl<FS: ShimFS> Task<FS> {
         let target = if pid == 0 {
             self.process_id
         } else {
-            self.global
-                .pid_to_process_id
-                .read()
-                .get(&pid)
-                .copied()
-                .unwrap_or(ProcessId(pid.cast_unsigned()))
+            ProcessId(pid.cast_unsigned())
         };
         self.global
             .litebox
@@ -9062,6 +9094,8 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Eventfd => "eventfd",
                         BrokerHandleKind::Pidfd => "pidfd",
                         BrokerHandleKind::Signalfd => "signalfd",
+                        BrokerHandleKind::Pty => "pty",
+                        BrokerHandleKind::Pipe => "pipe",
                     };
                     let releaser: Option<
                         alloc::sync::Arc<
@@ -9075,12 +9109,100 @@ impl<FS: ShimFS> Task<FS> {
                             .as_ref()
                             .map(|p| alloc::sync::Arc::clone(p) as _),
                         BrokerHandleKind::Signalfd => None,
+                        BrokerHandleKind::Pty => super::eventfd::broker_pty_provider()
+                            .as_ref()
+                            .map(|p| alloc::sync::Arc::clone(p) as _),
+                        BrokerHandleKind::Pipe => super::broker_pipe::broker_pipe_provider()
+                            .as_ref()
+                            .map(|p| alloc::sync::Arc::clone(p) as _),
                     };
-                    if let Some(releaser) = releaser
+                    if kind == BrokerHandleKind::Pidfd {
+                        broker_eventfd_specs
+                            .push(alloc::format!("{raw_fd}:{kind_str}:{handle_id}"));
+                    } else if let Some(releaser) = releaser
                         && releaser.dup_handle(handle_id).is_ok()
                     {
                         broker_eventfd_specs
                             .push(alloc::format!("{raw_fd}:{kind_str}:{handle_id}"));
+                        broker_eventfd_transit_release.push((releaser, handle_id));
+                    }
+                }
+            }
+
+            // Phase C.3: collect BrokerPipeSubsystem fds and emit bridge
+            // specs so the remote worker re-installs broker pipes at the
+            // matching slots. Eager-broker pipes are already broker-backed
+            // (no promote step needed); just dup the handle and ship it.
+            let broker_pipe_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::broker_pipe::BrokerPipeSubsystem>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in broker_pipe_fds {
+                let pipe_provider = super::broker_pipe::broker_pipe_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let pipe_info = dt_local.with_entry(
+                    &typed,
+                    |bp_fd: &super::broker_pipe::BrokerPipeFd<crate::Platform>| {
+                        (bp_fd.handle(), bp_fd.direction())
+                    },
+                );
+                drop(dt_local);
+                if let (Some(provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
+                    let releaser: alloc::sync::Arc<
+                        dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                    > = alloc::sync::Arc::clone(&provider) as _;
+                    // Phase C.5: emit-side per-end refcount bump.
+                    //
+                    // After we spawn the new worker, the child task in this
+                    // parent worker is torn down, which drops the child's
+                    // fd table; each BrokerPipeFd's `on_close` calls
+                    // `close_pipe_end(handle, direction)`, decrementing the
+                    // broker pipe's per-end refcount. If the per-end count
+                    // hits zero mid-migration, the broker marks the end
+                    // closed and the new worker's read/write of the same
+                    // pipe gets EPIPE / EOF — what was symptomatic on
+                    // `PB.*.nonpie-glibc.dpg1` and other cross-binary-type
+                    // legs.
+                    //
+                    // Balance the drop with an `incref_pipe_end` here.
+                    // `dup_handle` covers the registry refcount for the
+                    // transit ref; `incref_pipe_end` covers the per-end
+                    // refcount so write_open / read_open stay true while
+                    // the migration is in flight. The install side does
+                    // NOT incref (its on_close is balanced by the eventual
+                    // close in the new worker, which is one end-refcount
+                    // we're handing off via this incref).
+                    let dup_ok = releaser.dup_handle(handle_id).is_ok();
+                    let incref_ok =
+                        dup_ok && provider.incref_pipe_end(handle_id, direction).is_ok();
+                    if !incref_ok && dup_ok {
+                        releaser.release(handle_id);
+                    }
+                    if incref_ok {
+                        // Phase C.3 spec format: `fd:pipe:handle_id:r|w`.
+                        // Direction is critical for the receiver to pick
+                        // the right end when constructing the BrokerPipeFd.
+                        let dir_char = match direction {
+                            litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
+                            litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
+                        };
+                        broker_eventfd_specs
+                            .push(alloc::format!("{raw_fd}:pipe:{handle_id}:{dir_char}"));
                         broker_eventfd_transit_release.push((releaser, handle_id));
                     }
                 }
@@ -10100,193 +10222,190 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return false;
     }
-    let rds = files.raw_descriptor_store.read();
-    if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
-        drop(rds);
-        let nonblocking = global
-            .pipes
-            .get_flags(fd.as_ref())
-            .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
-            .unwrap_or(true);
-        return global.pipes.half_pipe_type(fd.as_ref()).map_or_else(
-            |_| {
-                log_worker_exec_stdio_unsupported(global, raw_fd, "closed pipe descriptor");
+    files
+        .run_on_raw_fd(
+            raw_fd,
+            |fd| {
+                let status = files.fs.fd_file_status(fd).ok();
+                let open_flags = global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(fd, |crate::StdioStatusFlags(flags)| *flags)
+                    .unwrap_or(OFlags::empty());
+                let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
+                if open_flags.contains(OFlags::PATH)
+                    || (raw_fd == 0 && access == OFlags::WRONLY)
+                    || (matches!(raw_fd, 1 | 2) && access == OFlags::empty())
+                {
+                    let source_fd = worker_exec_host_stdio_source_fd(raw_fd, global, files, fd);
+                    litebox::log_println!(
+                        global.platform,
+                        "[EXEC-REMOTE-STDIO] fd={} unsupported fs access: object_id={} flags={:?} source_fd={:?}",
+                        raw_fd,
+                        fd.object_id().as_u64(),
+                        open_flags,
+                        source_fd,
+                    );
+                    return true;
+                }
+                if let Some(source_fd) =
+                    worker_exec_host_stdio_source_fd(raw_fd, global, files, fd)
+                {
+                    let unsupported = !worker_exec_host_stdio_direction_compatible(
+                        raw_fd, source_fd,
+                    ) || (raw_fd == 0 && open_flags.contains(OFlags::NONBLOCK));
+                    if unsupported {
+                        let reason = if worker_exec_host_stdio_direction_compatible(
+                            raw_fd, source_fd,
+                        ) {
+                            "nonblocking host-backed stdin"
+                        } else {
+                            "host stdio alias points at the wrong direction"
+                        };
+                        log_worker_exec_stdio_unsupported(global, raw_fd, reason);
+                    }
+                    return unsupported;
+                }
+                let Some(status) = status else {
+                    log_worker_exec_stdio_unsupported(global, raw_fd, "missing file status");
+                    return true;
+                };
+                if status.file_type == litebox::fs::FileType::Directory {
+                    log_worker_exec_stdio_unsupported(global, raw_fd, "directory-backed stdio");
+                    return true;
+                }
+                // All other FS-backed fds — including terminal-like devices such as
+                // /dev/tty, /dev/stdin, /dev/stdout, /dev/stderr (rdev 0x500), and
+                // sandbox-created PTY masters/slaves (rdev 0x8800+N) — are bridgeable
+                // via the Fs path.  If the fd had a direct host alias
+                // (HostStdioSourceFd or HostTtyAlias), it was already handled above
+                // with a HostStdio binding.
+                false
+            },
+            |_net| {
+                log_worker_exec_stdio_unsupported(global, raw_fd, "network socket-backed stdio");
                 true
             },
-            |half| match (raw_fd, half) {
-                (0, HalfPipeType::ReceiverHalf) => {
+            |fd| {
+                let nonblocking = global
+                    .pipes
+                    .get_flags(fd)
+                    .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
+                    .unwrap_or(true);
+                global.pipes.half_pipe_type(fd).map_or_else(
+                    |_| {
+                        log_worker_exec_stdio_unsupported(global, raw_fd, "closed pipe descriptor");
+                        true
+                    },
+                    |half| match (raw_fd, half) {
+                        (0, HalfPipeType::ReceiverHalf) => {
+                            if nonblocking {
+                                log_worker_exec_stdio_unsupported(
+                                    global,
+                                    raw_fd,
+                                    "nonblocking pipe-backed stdin",
+                                );
+                            }
+                            nonblocking
+                        }
+                        (1 | 2, HalfPipeType::SenderHalf) => false,
+                        _ => {
+                            log_worker_exec_stdio_unsupported(
+                                global,
+                                raw_fd,
+                                "wrong pipe direction",
+                            );
+                            true
+                        }
+                    },
+                )
+            },
+            |fd| {
+                let nonblocking = global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .is_some_and(|handle| {
+                        handle.with_entry(|file| file.get_status().contains(OFlags::NONBLOCK))
+                    });
+                log_worker_exec_stdio_unsupported(
+                    global,
+                    raw_fd,
                     if nonblocking {
-                        log_worker_exec_stdio_unsupported(
-                            global,
-                            raw_fd,
-                            "nonblocking pipe-backed stdin",
-                        );
-                    }
-                    nonblocking
-                }
-                (1 | 2, HalfPipeType::SenderHalf) => false,
-                _ => {
-                    log_worker_exec_stdio_unsupported(global, raw_fd, "wrong pipe direction");
-                    true
-                }
+                        "eventfd-backed stdio (nonblocking)"
+                    } else {
+                        "eventfd-backed stdio (blocking)"
+                    },
+                );
+                true
             },
-        );
-    }
-    if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-        drop(rds);
-        let status = files.fs.fd_file_status(fd.as_ref()).ok();
-        let open_flags = global
-            .litebox
-            .descriptor_table()
-            .with_metadata(fd.as_ref(), |crate::StdioStatusFlags(flags)| *flags)
-            .unwrap_or(OFlags::empty());
-        let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
-        if open_flags.contains(OFlags::PATH)
-            || (raw_fd == 0 && access == OFlags::WRONLY)
-            || (matches!(raw_fd, 1 | 2) && access == OFlags::empty())
-        {
-            let source_fd = worker_exec_host_stdio_source_fd(raw_fd, global, files, fd.as_ref());
-            litebox::log_println!(
-                global.platform,
-                "[EXEC-REMOTE-STDIO] fd={} unsupported fs access: object_id={} flags={:?} source_fd={:?}",
-                raw_fd,
-                fd.as_ref().object_id().as_u64(),
-                open_flags,
-                source_fd,
-            );
-            return true;
-        }
-        if let Some(source_fd) =
-            worker_exec_host_stdio_source_fd(raw_fd, global, files, fd.as_ref())
-        {
-            let unsupported = !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd)
-                || (raw_fd == 0 && open_flags.contains(OFlags::NONBLOCK));
-            if unsupported {
-                let reason = if worker_exec_host_stdio_direction_compatible(raw_fd, source_fd) {
-                    "nonblocking host-backed stdin"
-                } else {
-                    "host stdio alias points at the wrong direction"
-                };
-                log_worker_exec_stdio_unsupported(global, raw_fd, reason);
-            }
-            return unsupported;
-        }
-        let Some(status) = status else {
-            log_worker_exec_stdio_unsupported(global, raw_fd, "missing file status");
-            return true;
-        };
-        if status.file_type == litebox::fs::FileType::Directory {
-            log_worker_exec_stdio_unsupported(global, raw_fd, "directory-backed stdio");
-            return true;
-        }
-        // All other FS-backed fds — including terminal-like devices such as
-        // /dev/tty, /dev/stdin, /dev/stdout, /dev/stderr (rdev 0x500), and
-        // sandbox-created PTY masters/slaves (rdev 0x8800+N) — are bridgeable
-        // via the Fs path.  If the fd had a direct host alias
-        // (HostStdioSourceFd or HostTtyAlias), it was already handled above
-        // with a HostStdio binding.
-        return false;
-    }
-    if rds
-        .fd_from_raw_integer::<crate::Network<Platform>>(raw_fd)
-        .is_ok()
-    {
-        drop(rds);
-        log_worker_exec_stdio_unsupported(global, raw_fd, "network socket-backed stdio");
-        return true;
-    }
-    if let Ok(fd) = rds.fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd) {
-        let nonblocking = global
-            .litebox
-            .descriptor_table()
-            .entry_handle(&fd)
-            .is_some_and(|handle| {
-                handle.with_entry(|file| file.get_status().contains(OFlags::NONBLOCK))
-            });
-        drop(rds);
-        log_worker_exec_stdio_unsupported(
-            global,
-            raw_fd,
-            if nonblocking {
-                "eventfd-backed stdio (nonblocking)"
-            } else {
-                "eventfd-backed stdio (blocking)"
+            |_epoll| {
+                log_worker_exec_stdio_unsupported(global, raw_fd, "epoll-backed stdio");
+                true
             },
-        );
-        return true;
-    }
-    if rds
-        .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<FS>>(raw_fd)
-        .is_ok()
-    {
-        drop(rds);
-        log_worker_exec_stdio_unsupported(global, raw_fd, "epoll-backed stdio");
-        return true;
-    }
-    if let Ok(fd) =
-        rds.fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
-    {
-        let (nonblocking, is_stream, is_connected, has_timeouts) = global
-            .litebox
-            .descriptor_table()
-            .entry_handle(&fd)
-            .map_or((false, false, false, false), |handle| {
-                handle.with_entry(|file| {
-                    (
-                        file.get_status().contains(OFlags::NONBLOCK),
-                        file.sock_type() == litebox_common_linux::SockType::Stream,
-                        file.is_connected(),
-                        file.has_timeouts(),
-                    )
-                })
-            });
-        drop(rds);
-        if nonblocking {
-            log_worker_exec_stdio_unsupported(
-                global,
-                raw_fd,
-                "unix-socket-backed stdio (nonblocking)",
-            );
-            return true;
-        }
-        if !is_stream {
-            log_worker_exec_stdio_unsupported(
-                global,
-                raw_fd,
-                "unix-socket-backed stdio (non-stream type)",
-            );
-            return true;
-        }
-        if !is_connected {
-            log_worker_exec_stdio_unsupported(
-                global,
-                raw_fd,
-                "unix-socket-backed stdio (not connected)",
-            );
-            return true;
-        }
-        if has_timeouts {
-            log_worker_exec_stdio_unsupported(
-                global,
-                raw_fd,
-                "unix-socket-backed stdio (has send/recv timeouts)",
-            );
-            return true;
-        }
-        // Blocking SOCK_STREAM unix sockets are supported via stream bridging.
-        return false;
-    }
-    drop(rds);
-
-    // HostPipeFd: these are pipe bridge fds from a prior delayed fork.
-    // They already wrap a host OS fd, so the worker can inherit them
-    // directly — they are always supported.
-    if files.try_host_pipe_fd(raw_fd).is_some() {
-        return false;
-    }
-
-    log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
-    true
+            |fd| {
+                let (nonblocking, is_stream, is_connected, has_timeouts) = global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .map_or((false, false, false, false), |handle| {
+                        handle.with_entry(|file| {
+                            (
+                                file.get_status().contains(OFlags::NONBLOCK),
+                                file.sock_type() == litebox_common_linux::SockType::Stream,
+                                file.is_connected(),
+                                file.has_timeouts(),
+                            )
+                        })
+                    });
+                if nonblocking {
+                    log_worker_exec_stdio_unsupported(
+                        global,
+                        raw_fd,
+                        "unix-socket-backed stdio (nonblocking)",
+                    );
+                    return true;
+                }
+                if !is_stream {
+                    log_worker_exec_stdio_unsupported(
+                        global,
+                        raw_fd,
+                        "unix-socket-backed stdio (non-stream type)",
+                    );
+                    return true;
+                }
+                if !is_connected {
+                    log_worker_exec_stdio_unsupported(
+                        global,
+                        raw_fd,
+                        "unix-socket-backed stdio (not connected)",
+                    );
+                    return true;
+                }
+                if has_timeouts {
+                    log_worker_exec_stdio_unsupported(
+                        global,
+                        raw_fd,
+                        "unix-socket-backed stdio (has send/recv timeouts)",
+                    );
+                    return true;
+                }
+                // Blocking SOCK_STREAM unix sockets are supported via stream bridging.
+                false
+            },
+            // HostPipeFd: pipe bridge fds from a prior delayed fork.  They
+            // already wrap a host OS fd, so the worker can inherit them
+            // directly via posix_spawn dup2 — always supported.
+            |_host_pipe| false,
+            // BrokerPipeSubsystem (Phase C.3): supported. The
+            // --broker-fd-bridge install path wires the broker-pipe fd in
+            // the worker after spawn; the spawn binding itself is Close.
+            |_broker_pipe| false,
+        )
+        .unwrap_or_else(|_| {
+            log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
+            true
+        })
 }
 
 fn worker_exec_tty_stdio_source_fd<FS: ShimFS>(
@@ -10348,73 +10467,77 @@ fn worker_exec_input_binding<FS: ShimFS>(
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return WorkerExecInputBinding::Close;
     }
-
-    // HostPipeFd: the worker needs this fd dup2'd onto its stdio slot.
-    // The pipe bridge mechanism (--pipe-bridge) only applies to fork-restore,
-    // not exec.  For exec, we use posix_spawn file actions to dup2 the host
-    // fd onto the target stdio slot.
-    if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
-        let dt = global.litebox.descriptor_table();
-        if let Some(host_fd) = dt.with_entry(&hp_fd, |e: &super::host_pipe::HostPipeFd| e.raw_fd())
-            && host_fd >= 0
-        {
-            return WorkerExecInputBinding::HostPipe { fd: host_fd };
-        }
-        return WorkerExecInputBinding::Close;
-    }
-
-    let rds = files.raw_descriptor_store.read();
-    if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
-        drop(rds);
-        return match global.pipes.half_pipe_type(fd.as_ref()) {
-            Ok(HalfPipeType::ReceiverHalf) => WorkerExecInputBinding::Pipe {
-                pipes: global.pipes.clone(),
-                fd,
+    files
+        .run_on_raw_fd(
+            raw_fd,
+            |fd| {
+                let open_flags = global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(fd, |crate::StdioStatusFlags(flags)| *flags)
+                    .unwrap_or(OFlags::empty());
+                let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
+                if open_flags.contains(OFlags::PATH) || access == OFlags::WRONLY {
+                    return WorkerExecInputBinding::Close;
+                }
+                let source_fd = worker_exec_host_stdio_source_fd(raw_fd, global, files, fd);
+                if let Some(source_fd) = source_fd {
+                    if !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd) {
+                        return WorkerExecInputBinding::Close;
+                    }
+                    return if usize::try_from(source_fd).ok() == Some(raw_fd) {
+                        WorkerExecInputBinding::Inherit
+                    } else {
+                        WorkerExecInputBinding::HostStdio { fd: source_fd }
+                    };
+                }
+                WorkerExecInputBinding::Fs {
+                    fs: files.fs.clone(),
+                    fd: fd.clone(),
+                }
             },
-            Ok(HalfPipeType::SenderHalf) | Err(_) => WorkerExecInputBinding::Close,
-        };
-    }
-    if let Ok(fd) =
-        rds.fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
-    {
-        drop(rds);
-        if let Some(handle) = global.litebox.descriptor_table().entry_handle(&fd) {
-            return WorkerExecInputBinding::Stream(Arc::new(UnixSocketStreamReader {
-                platform: global.platform,
-                handle,
-            }));
-        }
-        return WorkerExecInputBinding::Close;
-    }
-    if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-        drop(rds);
-        let open_flags = global
-            .litebox
-            .descriptor_table()
-            .with_metadata(fd.as_ref(), |crate::StdioStatusFlags(flags)| *flags)
-            .unwrap_or(OFlags::empty());
-        let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
-        if open_flags.contains(OFlags::PATH) || access == OFlags::WRONLY {
-            return WorkerExecInputBinding::Close;
-        }
-        let source_fd = worker_exec_host_stdio_source_fd(raw_fd, global, files, fd.as_ref());
-        if let Some(source_fd) = source_fd {
-            if !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd) {
-                return WorkerExecInputBinding::Close;
-            }
-            return if usize::try_from(source_fd).ok() == Some(raw_fd) {
-                WorkerExecInputBinding::Inherit
-            } else {
-                WorkerExecInputBinding::HostStdio { fd: source_fd }
-            };
-        }
-        WorkerExecInputBinding::Fs {
-            fs: files.fs.clone(),
-            fd,
-        }
-    } else {
-        WorkerExecInputBinding::Close
-    }
+            // Network sockets: not supported across worker exec.
+            |_net| WorkerExecInputBinding::Close,
+            |fd| match global.pipes.half_pipe_type(fd) {
+                Ok(HalfPipeType::ReceiverHalf) => WorkerExecInputBinding::Pipe {
+                    pipes: global.pipes.clone(),
+                    fd: fd.clone(),
+                },
+                Ok(HalfPipeType::SenderHalf) | Err(_) => WorkerExecInputBinding::Close,
+            },
+            // eventfd: not bridgeable as stdin.
+            |_eventfd| WorkerExecInputBinding::Close,
+            // epoll: not bridgeable as stdin.
+            |_epoll| WorkerExecInputBinding::Close,
+            |fd| {
+                if let Some(handle) = global.litebox.descriptor_table().entry_handle(fd) {
+                    return WorkerExecInputBinding::Stream(Arc::new(UnixSocketStreamReader {
+                        platform: global.platform,
+                        handle,
+                    }));
+                }
+                WorkerExecInputBinding::Close
+            },
+            // HostPipeFd: the worker needs this fd dup2'd onto its stdio slot.
+            // The pipe bridge mechanism (--pipe-bridge) only applies to
+            // fork-restore, not exec.  For exec, we use posix_spawn file actions
+            // to dup2 the host fd onto the target stdio slot.
+            |hp_fd| {
+                let dt = global.litebox.descriptor_table();
+                if let Some(host_fd) =
+                    dt.with_entry(hp_fd, |e: &super::host_pipe::HostPipeFd| e.raw_fd())
+                    && host_fd >= 0
+                {
+                    return WorkerExecInputBinding::HostPipe { fd: host_fd };
+                }
+                WorkerExecInputBinding::Close
+            },
+            // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
+            // before exec; the --broker-fd-bridge install path will install
+            // the broker pipe fd at the same slot during worker startup.
+            |_broker_pipe| WorkerExecInputBinding::Close,
+        )
+        .unwrap_or(WorkerExecInputBinding::Close)
 }
 
 /// Blocking reader for a connected unix-socket FD, used by worker-exec
@@ -10472,70 +10595,74 @@ fn worker_exec_output_binding<FS: ShimFS>(
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return WorkerExecOutputBinding::Close;
     }
-
-    // HostPipeFd: dup2 onto the target stdio slot via posix_spawn.
-    if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
-        let dt = global.litebox.descriptor_table();
-        if let Some(host_fd) = dt.with_entry(&hp_fd, |e: &super::host_pipe::HostPipeFd| e.raw_fd())
-            && host_fd >= 0
-        {
-            return WorkerExecOutputBinding::HostPipe { fd: host_fd };
-        }
-        return WorkerExecOutputBinding::Close;
-    }
-
-    let rds = files.raw_descriptor_store.read();
-    if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
-        drop(rds);
-        return match global.pipes.half_pipe_type(fd.as_ref()) {
-            Ok(HalfPipeType::SenderHalf) => WorkerExecOutputBinding::Pipe {
-                pipes: global.pipes.clone(),
-                fd,
+    files
+        .run_on_raw_fd(
+            raw_fd,
+            |fd| {
+                let open_flags = global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(fd, |crate::StdioStatusFlags(flags)| *flags)
+                    .unwrap_or(OFlags::empty());
+                let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
+                if open_flags.contains(OFlags::PATH) || access == OFlags::empty() {
+                    return WorkerExecOutputBinding::Close;
+                }
+                let source_fd = worker_exec_host_stdio_source_fd(raw_fd, global, files, fd);
+                if let Some(source_fd) = source_fd {
+                    if !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd) {
+                        return WorkerExecOutputBinding::Close;
+                    }
+                    return if usize::try_from(source_fd).ok() == Some(raw_fd) {
+                        WorkerExecOutputBinding::Inherit
+                    } else {
+                        WorkerExecOutputBinding::HostStdio { fd: source_fd }
+                    };
+                }
+                WorkerExecOutputBinding::Fs {
+                    fs: files.fs.clone(),
+                    fd: fd.clone(),
+                }
             },
-            Ok(HalfPipeType::ReceiverHalf) | Err(_) => WorkerExecOutputBinding::Close,
-        };
-    }
-    if let Ok(fd) =
-        rds.fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
-    {
-        drop(rds);
-        if let Some(handle) = global.litebox.descriptor_table().entry_handle(&fd) {
-            return WorkerExecOutputBinding::Stream(Arc::new(UnixSocketStreamWriter {
-                platform: global.platform,
-                handle,
-            }));
-        }
-        return WorkerExecOutputBinding::Close;
-    }
-    if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-        drop(rds);
-        let open_flags = global
-            .litebox
-            .descriptor_table()
-            .with_metadata(fd.as_ref(), |crate::StdioStatusFlags(flags)| *flags)
-            .unwrap_or(OFlags::empty());
-        let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
-        if open_flags.contains(OFlags::PATH) || access == OFlags::empty() {
-            return WorkerExecOutputBinding::Close;
-        }
-        let source_fd = worker_exec_host_stdio_source_fd(raw_fd, global, files, fd.as_ref());
-        if let Some(source_fd) = source_fd {
-            if !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd) {
-                return WorkerExecOutputBinding::Close;
-            }
-            return if usize::try_from(source_fd).ok() == Some(raw_fd) {
-                WorkerExecOutputBinding::Inherit
-            } else {
-                WorkerExecOutputBinding::HostStdio { fd: source_fd }
-            };
-        }
-        WorkerExecOutputBinding::Fs {
-            fs: files.fs.clone(),
-            fd,
-        }
-    } else {
-        WorkerExecOutputBinding::Close
-    }
+            // Network sockets: not supported as stdout/stderr across worker exec.
+            |_net| WorkerExecOutputBinding::Close,
+            |fd| match global.pipes.half_pipe_type(fd) {
+                Ok(HalfPipeType::SenderHalf) => WorkerExecOutputBinding::Pipe {
+                    pipes: global.pipes.clone(),
+                    fd: fd.clone(),
+                },
+                Ok(HalfPipeType::ReceiverHalf) | Err(_) => WorkerExecOutputBinding::Close,
+            },
+            // eventfd: not bridgeable as stdout/stderr.
+            |_eventfd| WorkerExecOutputBinding::Close,
+            // epoll: not bridgeable as stdout/stderr.
+            |_epoll| WorkerExecOutputBinding::Close,
+            |fd| {
+                if let Some(handle) = global.litebox.descriptor_table().entry_handle(fd) {
+                    return WorkerExecOutputBinding::Stream(Arc::new(UnixSocketStreamWriter {
+                        platform: global.platform,
+                        handle,
+                    }));
+                }
+                WorkerExecOutputBinding::Close
+            },
+            // HostPipeFd: dup2 onto the target stdio slot via posix_spawn.
+            |hp_fd| {
+                let dt = global.litebox.descriptor_table();
+                if let Some(host_fd) =
+                    dt.with_entry(hp_fd, |e: &super::host_pipe::HostPipeFd| e.raw_fd())
+                    && host_fd >= 0
+                {
+                    return WorkerExecOutputBinding::HostPipe { fd: host_fd };
+                }
+                WorkerExecOutputBinding::Close
+            },
+            // BrokerPipeSubsystem (Phase C.3): close the worker's output slot
+            // before exec; the --broker-fd-bridge install path will install
+            // the broker pipe fd at the same slot during worker startup.
+            |_broker_pipe| WorkerExecOutputBinding::Close,
+        )
+        .unwrap_or(WorkerExecOutputBinding::Close)
 }
 
 #[cfg(test)]

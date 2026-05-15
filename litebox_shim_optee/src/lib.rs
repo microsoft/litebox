@@ -124,13 +124,15 @@ impl Default for OpteeShimBuilder {
 }
 
 impl OpteeShimBuilder {
-    /// Returns a new shim builder.
+    /// Returns a new shim builder with init allocated at [`litebox::process::ProcessId::INIT`].
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
-        Self {
-            platform,
-            litebox: LiteBox::new(platform),
-        }
+        let litebox = LiteBox::new(platform);
+        litebox
+            .process_registry()
+            .create_process_with_id(litebox::process::ProcessId::INIT, None, 0)
+            .expect("init process creation must succeed");
+        Self { platform, litebox }
     }
 
     /// Returns the litebox object for the shim.

@@ -570,6 +570,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     let litebox = litebox::LiteBox::new(platform);
+    litebox
+        .process_registry()
+        .create_process_with_id(litebox::process::ProcessId::INIT, None, 0)
+        .expect("init process creation must succeed");
 
     // Create the smoltcp network stack if any network transport is configured.
     let net = if platform.has_network() {

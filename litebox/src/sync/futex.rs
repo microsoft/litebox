@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn test_futex_wait_wake_single_thread() {
         let platform = MockPlatform::new();
-        let _litebox = LiteBox::new(platform);
+        let _litebox = LiteBox::new_for_test(platform);
         let futex_manager = Arc::new(FutexManager::new());
 
         let futex_word = Arc::new(AtomicU32::new(0));
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn test_futex_wait_wake_single_thread_with_timeout() {
         let platform = MockPlatform::new();
-        let _litebox = LiteBox::new(platform);
+        let _litebox = LiteBox::new_for_test(platform);
         let futex_manager = Arc::new(FutexManager::new());
 
         let futex_word = Arc::new(AtomicU32::new(0));
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn test_futex_multiple_waiters_with_timeout() {
         let platform = MockPlatform::new();
-        let _litebox = LiteBox::new(platform);
+        let _litebox = LiteBox::new_for_test(platform);
         let futex_manager = Arc::new(FutexManager::new());
 
         let futex_word = Arc::new(AtomicU32::new(0));

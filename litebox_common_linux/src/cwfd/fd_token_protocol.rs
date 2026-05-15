@@ -58,6 +58,12 @@
 //!   ring (the one previously sent via `RegisterNotificationRing`).
 //! - [`Opcode::Unsubscribe`] / response — remove a subscription.
 //!
+//! Process state-object ops (Phase G):
+//! - [`Opcode::RegisterProcess`] / response — broker allocates a guest pid.
+//! - [`Opcode::SubscribeProcessExit`] / response — subscribe to exit readiness
+//!   and receive a cached exit-code snapshot if already exited.
+//! - [`Opcode::MarkProcessExited`] / response — worker records final exit state.
+//!
 //! # Bounds
 //!
 //! [`BODY_MAX`] caps the body size. The largest defined body in v1
@@ -77,7 +83,7 @@ pub const CTRL_HEADER_LEN: usize = 16;
 
 /// Maximum body length the codec will encode or accept. Defensive
 /// upper bound — far larger than any legitimate v1 body.
-pub const BODY_MAX: u32 = 4096;
+pub const BODY_MAX: u32 = 65536;
 
 /// Opcodes carried in the `opcode` byte of the control frame.
 ///
@@ -98,9 +104,9 @@ pub const BODY_MAX: u32 = 4096;
 /// | `0x20`–`0x2F`    | Pidfd state (P2.B)          |
 /// | `0x30`–`0x3F`    | UnixSocket state (P2.A)     |
 /// | `0x40`–`0x4F`    | Signalfd state (P2.C)       |
-/// | `0x50`–`0x5F`    | Timerfd state (future)      |
-/// | `0x60`–`0x6F`    | Inotify state (future)      |
-/// | `0x70`–`0x7F`    | reserved for future kinds   |
+/// | `0x50`–`0x5F`    | Pipe state (Phase C)        |
+/// | `0x60`–`0x6F`    | Pty state (Phase E)         |
+/// | `0x70`–`0x7F`    | Process state (Phase G)     |
 ///
 /// Within a kind's range, follow the eventfd template:
 /// `0xN0` = create, `0xN1` = read-like primary op, `0xN2` = write-like
@@ -119,6 +125,18 @@ pub enum Opcode {
     SubscribeEventfd = 0x13,
     CreateSignalfd = 0x40,
     ReadSiginfo = 0x41,
+    CreatePipe = 0x50,
+    ReadPipe = 0x51,
+    WritePipe = 0x52,
+    SubscribePipe = 0x53,
+    ClosePipeEnd = 0x54,
+    IncrefPipeEnd = 0x55,
+    UnsubscribePipeEnd = 0x56,
+    CreatePty = 0x60,
+    PtyRead = 0x61,
+    PtyWrite = 0x62,
+    SubscribePty = 0x63,
+    PtyIoctl = 0x64,
     Unsubscribe = 0x14,
     DupHandle = 0x15,
     CreatePidfd = 0x20,
@@ -128,6 +146,10 @@ pub enum Opcode {
     /// response carries the new pid as a `StateHandle` id (low 32
     /// bits are the Linux pid). Phase 1: empty request body.
     RegisterProcess = 0x70,
+    /// Subscribe this worker's notification ring to broker-owned process exit.
+    SubscribeProcessExit = 0x71,
+    /// Mark a broker-owned process as exited and wake exit subscribers.
+    MarkProcessExited = 0x72,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -139,11 +161,25 @@ pub enum Opcode {
     SubscribeEventfdResponse = 0x93,
     CreateSignalfdResponse = 0xC0,
     ReadSiginfoResponse = 0xC1,
+    CreatePipeResponse = 0xD0,
+    ReadPipeResponse = 0xD1,
+    WritePipeResponse = 0xD2,
+    SubscribePipeResponse = 0xD3,
+    ClosePipeEndResponse = 0xD4,
+    IncrefPipeEndResponse = 0xD5,
+    UnsubscribePipeEndResponse = 0xD6,
+    CreatePtyResponse = 0xE0,
+    PtyReadResponse = 0xE1,
+    PtyWriteResponse = 0xE2,
+    SubscribePtyResponse = 0xE3,
+    PtyIoctlResponse = 0xE4,
     UnsubscribeResponse = 0x94,
     DupHandleResponse = 0x95,
     CreatePidfdResponse = 0xA0,
     PidfdExitedResponse = 0xA1,
     RegisterProcessResponse = 0xF0,
+    SubscribeProcessExitResponse = 0xF1,
+    MarkProcessExitedResponse = 0xF2,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -164,9 +200,69 @@ pub mod opcode_ranges {
     pub const SIGNALFD_BASE: u8 = 0x40;
     pub const SIGNALFD_RESPONSE_BASE: u8 = 0xC0;
 
-    /// Process state (Phase 1 of process-registry rework): registration.
+    /// Pipe state (Phase C): create / read / write / subscribe / close-end.
+    pub const PIPE_BASE: u8 = 0x50;
+    pub const PIPE_RESPONSE_BASE: u8 = 0xD0;
+
+    /// Pty state (Phase E): create / read / write / subscribe / ioctl.
+    pub const PTY_BASE: u8 = 0x60;
+    pub const PTY_RESPONSE_BASE: u8 = 0xE0;
+
+    /// Process state (Phase G): 0x70 RegisterProcess, 0x71 SubscribeProcessExit,
+    /// 0x72 MarkProcessExited.
     pub const PROCESS_BASE: u8 = 0x70;
     pub const PROCESS_RESPONSE_BASE: u8 = 0xF0;
+}
+
+/// Endpoint side for a broker-hosted PTY handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyEndpoint {
+    Master = 0,
+    Slave = 1,
+}
+
+impl PtyEndpoint {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Master),
+            1 => Some(Self::Slave),
+            _ => None,
+        }
+    }
+}
+
+/// Pty ioctl multiplex sub-opcode carried by [`Opcode::PtyIoctl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum PtyIoctlOp {
+    Tcgets = 1,
+    Tcsets = 2,
+    Tiocgwinsz = 3,
+    Tiocswinsz = 4,
+    Tiocgpgrp = 5,
+    Tiocspgrp = 6,
+    Tiocsctty = 7,
+    Tiocgptn = 8,
+    Tiocsptlk = 9,
+    Tiocgsid = 10,
+}
+
+impl PtyIoctlOp {
+    pub fn from_u16(v: u16) -> Option<Self> {
+        match v {
+            1 => Some(Self::Tcgets),
+            2 => Some(Self::Tcsets),
+            3 => Some(Self::Tiocgwinsz),
+            4 => Some(Self::Tiocswinsz),
+            5 => Some(Self::Tiocgpgrp),
+            6 => Some(Self::Tiocspgrp),
+            7 => Some(Self::Tiocsctty),
+            8 => Some(Self::Tiocgptn),
+            9 => Some(Self::Tiocsptlk),
+            10 => Some(Self::Tiocgsid),
+            _ => None,
+        }
+    }
 }
 
 impl Opcode {
@@ -184,11 +280,25 @@ impl Opcode {
             Opcode::SubscribeEventfd => Some(Opcode::SubscribeEventfdResponse),
             Opcode::CreateSignalfd => Some(Opcode::CreateSignalfdResponse),
             Opcode::ReadSiginfo => Some(Opcode::ReadSiginfoResponse),
+            Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
+            Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
+            Opcode::WritePipe => Some(Opcode::WritePipeResponse),
+            Opcode::SubscribePipe => Some(Opcode::SubscribePipeResponse),
+            Opcode::ClosePipeEnd => Some(Opcode::ClosePipeEndResponse),
+            Opcode::IncrefPipeEnd => Some(Opcode::IncrefPipeEndResponse),
+            Opcode::UnsubscribePipeEnd => Some(Opcode::UnsubscribePipeEndResponse),
+            Opcode::CreatePty => Some(Opcode::CreatePtyResponse),
+            Opcode::PtyRead => Some(Opcode::PtyReadResponse),
+            Opcode::PtyWrite => Some(Opcode::PtyWriteResponse),
+            Opcode::SubscribePty => Some(Opcode::SubscribePtyResponse),
+            Opcode::PtyIoctl => Some(Opcode::PtyIoctlResponse),
             Opcode::Unsubscribe => Some(Opcode::UnsubscribeResponse),
             Opcode::DupHandle => Some(Opcode::DupHandleResponse),
             Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
             Opcode::PidfdExited => Some(Opcode::PidfdExitedResponse),
             Opcode::RegisterProcess => Some(Opcode::RegisterProcessResponse),
+            Opcode::SubscribeProcessExit => Some(Opcode::SubscribeProcessExitResponse),
+            Opcode::MarkProcessExited => Some(Opcode::MarkProcessExitedResponse),
             _ => None,
         }
     }
@@ -207,11 +317,25 @@ impl Opcode {
                 | Opcode::SubscribeEventfd
                 | Opcode::CreateSignalfd
                 | Opcode::ReadSiginfo
+                | Opcode::CreatePipe
+                | Opcode::ReadPipe
+                | Opcode::WritePipe
+                | Opcode::SubscribePipe
+                | Opcode::ClosePipeEnd
+                | Opcode::IncrefPipeEnd
+                | Opcode::UnsubscribePipeEnd
+                | Opcode::CreatePty
+                | Opcode::PtyRead
+                | Opcode::PtyWrite
+                | Opcode::SubscribePty
+                | Opcode::PtyIoctl
                 | Opcode::Unsubscribe
                 | Opcode::DupHandle
                 | Opcode::CreatePidfd
                 | Opcode::PidfdExited
                 | Opcode::RegisterProcess
+                | Opcode::SubscribeProcessExit
+                | Opcode::MarkProcessExited
         )
     }
 
@@ -245,11 +369,25 @@ impl TryFrom<u8> for Opcode {
             0x13 => Ok(Opcode::SubscribeEventfd),
             0x40 => Ok(Opcode::CreateSignalfd),
             0x41 => Ok(Opcode::ReadSiginfo),
+            0x50 => Ok(Opcode::CreatePipe),
+            0x51 => Ok(Opcode::ReadPipe),
+            0x52 => Ok(Opcode::WritePipe),
+            0x53 => Ok(Opcode::SubscribePipe),
+            0x54 => Ok(Opcode::ClosePipeEnd),
+            0x55 => Ok(Opcode::IncrefPipeEnd),
+            0x56 => Ok(Opcode::UnsubscribePipeEnd),
+            0x60 => Ok(Opcode::CreatePty),
+            0x61 => Ok(Opcode::PtyRead),
+            0x62 => Ok(Opcode::PtyWrite),
+            0x63 => Ok(Opcode::SubscribePty),
+            0x64 => Ok(Opcode::PtyIoctl),
             0x14 => Ok(Opcode::Unsubscribe),
             0x15 => Ok(Opcode::DupHandle),
             0x20 => Ok(Opcode::CreatePidfd),
             0x21 => Ok(Opcode::PidfdExited),
             0x70 => Ok(Opcode::RegisterProcess),
+            0x71 => Ok(Opcode::SubscribeProcessExit),
+            0x72 => Ok(Opcode::MarkProcessExited),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -260,11 +398,25 @@ impl TryFrom<u8> for Opcode {
             0x93 => Ok(Opcode::SubscribeEventfdResponse),
             0xC0 => Ok(Opcode::CreateSignalfdResponse),
             0xC1 => Ok(Opcode::ReadSiginfoResponse),
+            0xD0 => Ok(Opcode::CreatePipeResponse),
+            0xD1 => Ok(Opcode::ReadPipeResponse),
+            0xD2 => Ok(Opcode::WritePipeResponse),
+            0xD3 => Ok(Opcode::SubscribePipeResponse),
+            0xD4 => Ok(Opcode::ClosePipeEndResponse),
+            0xD5 => Ok(Opcode::IncrefPipeEndResponse),
+            0xD6 => Ok(Opcode::UnsubscribePipeEndResponse),
+            0xE0 => Ok(Opcode::CreatePtyResponse),
+            0xE1 => Ok(Opcode::PtyReadResponse),
+            0xE2 => Ok(Opcode::PtyWriteResponse),
+            0xE3 => Ok(Opcode::SubscribePtyResponse),
+            0xE4 => Ok(Opcode::PtyIoctlResponse),
             0x94 => Ok(Opcode::UnsubscribeResponse),
             0x95 => Ok(Opcode::DupHandleResponse),
             0xA0 => Ok(Opcode::CreatePidfdResponse),
             0xA1 => Ok(Opcode::PidfdExitedResponse),
             0xF0 => Ok(Opcode::RegisterProcessResponse),
+            0xF1 => Ok(Opcode::SubscribeProcessExitResponse),
+            0xF2 => Ok(Opcode::MarkProcessExitedResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -580,6 +732,105 @@ pub fn build_register_process_response_ok(handle_id: u64) -> OwnedFrame {
     }
 }
 
+/// Body for [`Opcode::SubscribeProcessExit`]: (pid handle: u64, sub_id: u64, events: u32, pad: 4).
+pub fn build_subscribe_process_exit_request(
+    pid: u32,
+    subscription_id: u64,
+    events_mask: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&u64::from(pid).to_le_bytes());
+    body.extend_from_slice(&subscription_id.to_le_bytes());
+    body.extend_from_slice(&events_mask.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::SubscribeProcessExit,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes the body of a SubscribeProcessExit request.
+pub fn parse_subscribe_process_exit_body(body: &[u8]) -> Result<(u64, u64, u32), ProtocolError> {
+    parse_subscribe_body(body, Opcode::SubscribeProcessExit)
+}
+
+/// Body for SubscribeProcessExitResponse: (exited: u8, pad: 3, exit_code: i32).
+pub fn build_subscribe_process_exit_response_ok(exit_code: Option<i32>) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.push(u8::from(exit_code.is_some()));
+    body.extend_from_slice(&[0u8; 3]);
+    body.extend_from_slice(&exit_code.unwrap_or(0).to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::SubscribeProcessExitResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes a SubscribeProcessExitResponse success body.
+pub fn parse_subscribe_process_exit_response_ok(body: &[u8]) -> Result<Option<i32>, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SubscribeProcessExitResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[1..4].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    let code = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    match body[0] {
+        0 => Ok(None),
+        1 => Ok(Some(code)),
+        _ => Err(ProtocolError::NonZeroReserved {
+            reserved: u32::from(body[0]),
+        }),
+    }
+}
+
+/// Body for [`Opcode::MarkProcessExited`]: (pid handle: u64, exit_code: i32, pad: 4).
+pub fn build_mark_process_exited_request(pid: u32, exit_code: i32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&u64::from(pid).to_le_bytes());
+    body.extend_from_slice(&exit_code.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::MarkProcessExited,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes the body of a MarkProcessExited request.
+pub fn parse_mark_process_exited_body(body: &[u8]) -> Result<(u64, i32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::MarkProcessExited,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes([
+        body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+    ]);
+    let exit_code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+    if body[12..16].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((handle, exit_code))
+}
+
+/// Body for [`Opcode::MarkProcessExitedResponse`]: empty.
+pub fn build_mark_process_exited_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::MarkProcessExitedResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
 /// Body for [`Opcode::RegisterNotificationRing`]: empty (ring fd via SCM_RIGHTS).
 pub fn build_register_notification_ring_request() -> OwnedFrame {
     OwnedFrame {
@@ -789,9 +1040,13 @@ pub fn build_subscribe_eventfd_request(
 
 /// Decodes the body of a SubscribeEventfd request.
 pub fn parse_subscribe_eventfd_body(body: &[u8]) -> Result<(u64, u64, u32), ProtocolError> {
+    parse_subscribe_body(body, Opcode::SubscribeEventfd)
+}
+
+fn parse_subscribe_body(body: &[u8], opcode: Opcode) -> Result<(u64, u64, u32), ProtocolError> {
     if body.len() != 24 {
         return Err(ProtocolError::WrongBodyLen {
-            opcode: Opcode::SubscribeEventfd,
+            opcode,
             got: body.len(),
             want: 24,
         });
@@ -897,6 +1152,555 @@ pub fn parse_read_siginfo_response_body(body: &[u8]) -> Result<Vec<u8>, Protocol
     if body.len() != 8 + len {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::ReadSiginfoResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
+}
+
+/// Body for [`Opcode::CreatePipe`]: (capacity: u64, atomic_write_size: u64).
+pub fn build_create_pipe_request(capacity: u64, atomic_write_size: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&capacity.to_le_bytes());
+    body.extend_from_slice(&atomic_write_size.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::CreatePipe,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_create_pipe_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreatePipe,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let capacity = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let atomic = u64::from_le_bytes(body[8..16].try_into().unwrap());
+    Ok((capacity, atomic))
+}
+
+pub fn build_create_pipe_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreatePipeResponse,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::ReadPipe`]: (handle: u64, max_len: u64).
+pub fn build_read_pipe_request(handle_id: u64, max_len: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::ReadPipe,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_read_pipe_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadPipe,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+    ))
+}
+
+/// Body for [`Opcode::ReadPipeResponse`]: (len: u32, pad: u32, bytes...).
+pub fn build_read_pipe_response_ok(bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + bytes.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::ReadPipeResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_read_pipe_response_body(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadPipeResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadPipeResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
+}
+
+/// Body for [`Opcode::WritePipe`]: (handle: u64, len: u32, pad: u32, bytes...).
+pub fn build_write_pipe_request(handle_id: u64, bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + bytes.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::WritePipe,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_write_pipe_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::WritePipe,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let len = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 16 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::WritePipe,
+            got: body.len(),
+            want: 16 + len,
+        });
+    }
+    Ok((handle, body[16..].to_vec()))
+}
+
+pub fn build_write_pipe_response_ok(written: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::WritePipeResponse,
+        status: StatusCode::Ok,
+        body: written.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_write_pipe_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::WritePipeResponse)
+}
+
+/// Body for [`Opcode::SubscribePipe`]: (handle: u64, sub_id: u64, events: u32, end: u8, pad: 3).
+pub fn build_subscribe_pipe_request(
+    handle_id: u64,
+    subscription_id: u64,
+    events_mask: u32,
+    end: u8,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&subscription_id.to_le_bytes());
+    body.extend_from_slice(&events_mask.to_le_bytes());
+    body.push(end);
+    body.extend_from_slice(&[0u8; 3]);
+    OwnedFrame {
+        opcode: Opcode::SubscribePipe,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_subscribe_pipe_body(body: &[u8]) -> Result<(u64, u64, u32, u8), ProtocolError> {
+    if body.len() != 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SubscribePipe,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    if body[21..24].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+        u32::from_le_bytes(body[16..20].try_into().unwrap()),
+        body[20],
+    ))
+}
+
+pub fn build_subscribe_pipe_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SubscribePipeResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::IncrefPipeEnd`]: (handle: u64, end: u8, pad: 7).
+pub fn build_incref_pipe_end_request(handle_id: u64, end: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.push(end);
+    body.extend_from_slice(&[0; 7]);
+    OwnedFrame {
+        opcode: Opcode::IncrefPipeEnd,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_incref_pipe_end_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
+    parse_close_pipe_end_body_for_opcode(body, Opcode::IncrefPipeEnd)
+}
+
+pub fn build_incref_pipe_end_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::IncrefPipeEndResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::UnsubscribePipeEnd`]: (handle: u64, sub_id: u64, end: u8, pad: 7).
+pub fn build_unsubscribe_pipe_end_request(
+    handle_id: u64,
+    subscription_id: u64,
+    end: u8,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&subscription_id.to_le_bytes());
+    body.push(end);
+    body.extend_from_slice(&[0u8; 7]);
+    OwnedFrame {
+        opcode: Opcode::UnsubscribePipeEnd,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_unsubscribe_pipe_end_body(body: &[u8]) -> Result<(u64, u64, u8), ProtocolError> {
+    if body.len() != 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnsubscribePipeEnd,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    if body[17..24].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+        body[16],
+    ))
+}
+
+pub fn build_unsubscribe_pipe_end_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::UnsubscribePipeEndResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::ClosePipeEnd`]: (handle: u64, end: u8, pad: 7).
+pub fn build_close_pipe_end_request(handle_id: u64, end: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.push(end);
+    body.extend_from_slice(&[0u8; 7]);
+    OwnedFrame {
+        opcode: Opcode::ClosePipeEnd,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_close_pipe_end_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
+    parse_close_pipe_end_body_for_opcode(body, Opcode::ClosePipeEnd)
+}
+
+fn parse_close_pipe_end_body_for_opcode(
+    body: &[u8],
+    opcode: Opcode,
+) -> Result<(u64, u8), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    if body[9..16].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((u64::from_le_bytes(body[0..8].try_into().unwrap()), body[8]))
+}
+
+pub fn build_close_pipe_end_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::ClosePipeEndResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::CreatePty`]: empty (allocates one master/slave pair).
+pub fn build_create_pty_request() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreatePty,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::CreatePtyResponse`]: master handle, slave handle, pty id, reserved.
+pub fn build_create_pty_response_ok(
+    master_handle: u64,
+    slave_handle: u64,
+    pty_id: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&master_handle.to_le_bytes());
+    body.extend_from_slice(&slave_handle.to_le_bytes());
+    body.extend_from_slice(&pty_id.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::CreatePtyResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_create_pty_response_ok(body: &[u8]) -> Result<(u64, u64, u32), ProtocolError> {
+    if body.len() != 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreatePtyResponse,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    let master = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let slave = u64::from_le_bytes(body[8..16].try_into().unwrap());
+    let pty_id = u32::from_le_bytes(body[16..20].try_into().unwrap());
+    if body[20..24].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((master, slave, pty_id))
+}
+
+/// Body for [`Opcode::PtyRead`]: handle id + max byte count.
+pub fn build_pty_read_request(handle_id: u64, max_len: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::PtyRead,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_pty_read_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PtyRead,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    if body[12..16].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
+}
+
+pub fn build_pty_read_response_ok(data: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + data.len());
+    body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(data);
+    OwnedFrame {
+        opcode: Opcode::PtyReadResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_pty_read_response_body(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    parse_len_prefixed_body(body, Opcode::PtyReadResponse)
+}
+
+/// Body for [`Opcode::PtyWrite`]: handle id + length-prefixed payload.
+pub fn build_pty_write_request(handle_id: u64, data: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + data.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(data);
+    OwnedFrame {
+        opcode: Opcode::PtyWrite,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_pty_write_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PtyWrite,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let len = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    if body[12..16].iter().any(|&b| b != 0) || body.len() != 16 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PtyWrite,
+            got: body.len(),
+            want: 16 + len,
+        });
+    }
+    Ok((handle, body[16..].to_vec()))
+}
+
+pub fn build_pty_write_response_ok(bytes_written: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::PtyWriteResponse,
+        status: StatusCode::Ok,
+        body: bytes_written.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_pty_write_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PtyWriteResponse,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes(body.try_into().unwrap()))
+}
+
+pub fn build_subscribe_pty_request(
+    handle_id: u64,
+    subscription_id: u64,
+    events_mask: u32,
+) -> OwnedFrame {
+    let mut frame = build_subscribe_eventfd_request(handle_id, subscription_id, events_mask);
+    frame.opcode = Opcode::SubscribePty;
+    frame
+}
+
+pub fn parse_subscribe_pty_body(body: &[u8]) -> Result<(u64, u64, u32), ProtocolError> {
+    parse_subscribe_eventfd_body(body)
+}
+
+pub fn build_subscribe_pty_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SubscribePtyResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_pty_ioctl_request(handle_id: u64, op: PtyIoctlOp, payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + payload.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&(op as u16).to_le_bytes());
+    body.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(payload);
+    OwnedFrame {
+        opcode: Opcode::PtyIoctl,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_pty_ioctl_body(body: &[u8]) -> Result<(u64, PtyIoctlOp, Vec<u8>), ProtocolError> {
+    if body.len() < 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PtyIoctl,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let op_raw = u16::from_le_bytes(body[8..10].try_into().unwrap());
+    let len = u16::from_le_bytes(body[10..12].try_into().unwrap()) as usize;
+    if body[12..16].iter().any(|&b| b != 0) || body.len() != 16 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PtyIoctl,
+            got: body.len(),
+            want: 16 + len,
+        });
+    }
+    let Some(op) = PtyIoctlOp::from_u16(op_raw) else {
+        return Err(ProtocolError::NonZeroReserved {
+            reserved: u32::from(op_raw),
+        });
+    };
+    Ok((handle, op, body[16..].to_vec()))
+}
+
+pub fn build_pty_ioctl_response_ok(payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + payload.len());
+    body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(payload);
+    OwnedFrame {
+        opcode: Opcode::PtyIoctlResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_pty_ioctl_response_body(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    parse_len_prefixed_body(body, Opcode::PtyIoctlResponse)
+}
+
+fn parse_len_prefixed_body(body: &[u8], opcode: Opcode) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
             got: body.len(),
             want: 8 + len,
         });
@@ -1010,6 +1814,8 @@ mod tests {
             Opcode::Unsubscribe,
             Opcode::CreatePidfd,
             Opcode::PidfdExited,
+            Opcode::SubscribeProcessExit,
+            Opcode::MarkProcessExited,
             Opcode::RegisterResponse,
             Opcode::MaterializeResponse,
             Opcode::ReleaseResponse,
@@ -1021,6 +1827,10 @@ mod tests {
             Opcode::UnsubscribeResponse,
             Opcode::CreatePidfdResponse,
             Opcode::PidfdExitedResponse,
+            Opcode::SubscribeProcessExit,
+            Opcode::MarkProcessExited,
+            Opcode::SubscribeProcessExitResponse,
+            Opcode::MarkProcessExitedResponse,
         ] {
             assert_eq!(Opcode::try_from(op as u8).unwrap(), op);
         }
@@ -1048,6 +1858,14 @@ mod tests {
             Opcode::PidfdExited.response_for(),
             Some(Opcode::PidfdExitedResponse)
         );
+        assert_eq!(
+            Opcode::SubscribeProcessExit.response_for(),
+            Some(Opcode::SubscribeProcessExitResponse)
+        );
+        assert_eq!(
+            Opcode::MarkProcessExited.response_for(),
+            Some(Opcode::MarkProcessExitedResponse)
+        );
         assert_eq!(Opcode::ReadEventfdResponse.response_for(), None);
     }
 
@@ -1066,11 +1884,15 @@ mod tests {
             Opcode::Unsubscribe,
             Opcode::CreatePidfd,
             Opcode::PidfdExited,
+            Opcode::SubscribeProcessExit,
+            Opcode::MarkProcessExited,
             Opcode::RegisterResponse,
             Opcode::CreateEventfdResponse,
             Opcode::ReadEventfdResponse,
             Opcode::CreatePidfdResponse,
             Opcode::PidfdExitedResponse,
+            Opcode::SubscribeProcessExitResponse,
+            Opcode::MarkProcessExitedResponse,
         ] {
             assert_eq!(op.expected_fd_count(), 0, "{op:?}");
         }
@@ -1144,6 +1966,42 @@ mod tests {
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.opcode, Opcode::PidfdExitedResponse);
         assert!(parse_pidfd_exited_response_ok(decoded.body).unwrap());
+    }
+
+    #[test]
+    fn round_trip_process_exit_messages() {
+        let sub = build_subscribe_process_exit_request(123, 456, 0x0001);
+        let bytes = sub.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::SubscribeProcessExit);
+        assert_eq!(
+            parse_subscribe_process_exit_body(decoded.body).unwrap(),
+            (123, 456, 0x0001)
+        );
+
+        let sub_resp = build_subscribe_process_exit_response_ok(Some(17));
+        let bytes = sub_resp.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::SubscribeProcessExitResponse);
+        assert_eq!(
+            parse_subscribe_process_exit_response_ok(decoded.body).unwrap(),
+            Some(17)
+        );
+
+        let mark = build_mark_process_exited_request(123, 9);
+        let bytes = mark.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::MarkProcessExited);
+        assert_eq!(
+            parse_mark_process_exited_body(decoded.body).unwrap(),
+            (123, 9)
+        );
+
+        let mark_resp = build_mark_process_exited_response_ok();
+        let bytes = mark_resp.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::MarkProcessExitedResponse);
+        assert!(decoded.body.is_empty());
     }
 
     #[test]

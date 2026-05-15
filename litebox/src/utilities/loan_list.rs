@@ -20,7 +20,7 @@
 //! # Example
 //!
 //! ```ignore
-//! let litebox = LiteBox::new(platform);
+//! let litebox = LiteBox::new_for_test(platform);
 //! let list = LoanList::new(&litebox);
 //!
 //! let mut entry = core::pin::pin!(LoanListEntry::new(platform, 42));
@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn test_loan_list_basic() {
         let platform = MockPlatform::new();
-        let _litebox = crate::LiteBox::new(platform);
+        let _litebox = crate::LiteBox::new_for_test(platform);
         let list = LoanList::<MockPlatform, _>::new();
 
         let mut entry1 = pin!(LoanListEntry::new(42));
@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn test_loan_list() {
         let platform = MockPlatform::new();
-        let _litebox = crate::LiteBox::new(platform);
+        let _litebox = crate::LiteBox::new_for_test(platform);
         let list = LoanList::<MockPlatform, _>::new();
         let inserted = AtomicUsize::new(0);
         let mut removed = 0;

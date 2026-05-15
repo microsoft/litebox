@@ -1455,12 +1455,13 @@ impl LinuxUserland {
             spawn_argv.push(CString::new(format!("{guest_fd}:b:{guest_fd}")).map_err(|_| -1_i32)?);
         }
 
-        // Phase 2.F follow-up: add --broker-eventfd-bridge for inherited
-        // broker-backed eventfd/pidfd entries. The parent has already
-        // promoted the local EventFile to broker-backed and dup'd the
-        // handle so the worker can reattach without racing on refcount.
+        // Phase C.3: add --broker-fd-bridge for inherited broker-backed
+        // shim fd entries (eventfd, pidfd, signalfd, pty, pipe). The
+        // parent has already promoted the relevant local entry to
+        // broker-backed and dup'd the handle so the worker can reattach
+        // without racing on refcount.
         for spec in broker_eventfd_specs {
-            spawn_argv.push(CString::new("--broker-eventfd-bridge").unwrap());
+            spawn_argv.push(CString::new("--broker-fd-bridge").unwrap());
             spawn_argv.push(CString::new(spec.as_bytes()).map_err(|_| -1_i32)?);
         }
 

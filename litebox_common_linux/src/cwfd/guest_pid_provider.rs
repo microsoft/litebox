@@ -35,6 +35,8 @@
 
 use alloc::sync::Arc;
 
+use crate::cwfd::broker_subscribable::BrokerEventCallback;
+
 /// Errors a guest-pid provider op may return to the shim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestPidProviderError {
@@ -45,7 +47,16 @@ pub enum GuestPidProviderError {
     Io,
 }
 
-/// Trait abstraction over the broker's guest-pid allocator.
+/// Result of subscribing to broker-owned process-exit notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessExitSubscription {
+    /// Worker-allocated subscription id registered with the broker.
+    pub subscription_id: u64,
+    /// Cached exit code returned by the broker for late subscribers.
+    pub already_exited: Option<i32>,
+}
+
+/// Trait abstraction over the broker's guest-pid allocator and process-exit state.
 ///
 /// The shim sees this trait; the runner provides a concrete impl
 /// that talks to the broker over the existing control plane.
@@ -58,6 +69,23 @@ pub trait GuestPidProvider: Send + Sync {
     /// Decrement the broker's refcount on `pid`. Logged-on-failure;
     /// there is no useful action a shim can take on release failure.
     fn release_process(&self, pid: u32);
+
+    /// Mark the process exited in the broker-owned process state and
+    /// wake any process-exit subscribers. Exit paths log failures but
+    /// must not fail process teardown.
+    fn mark_process_exited(&self, pid: u32, exit_code: i32) -> Result<(), GuestPidProviderError>;
+
+    /// Subscribe to process-exit readiness for `pid`, using the same
+    /// broker notification ring as other broker-backed wait sources.
+    fn subscribe_process_exit(
+        &self,
+        pid: u32,
+        events_mask: u32,
+        callback: Arc<dyn BrokerEventCallback>,
+    ) -> Result<ProcessExitSubscription, GuestPidProviderError>;
+
+    /// Remove a process-exit subscription. Best-effort during drop.
+    fn unsubscribe_process_exit(&self, pid: u32, subscription_id: u64);
 }
 
 /// Convenience: the `Arc<dyn GuestPidProvider>` shape the shim

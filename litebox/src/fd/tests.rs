@@ -30,7 +30,7 @@ struct MockEntry2 {
 impl FdEnabledSubsystemEntry for MockEntry2 {}
 
 fn litebox() -> LiteBox<MockPlatform> {
-    LiteBox::new(MockPlatform::new())
+    LiteBox::new_for_test(MockPlatform::new())
 }
 
 #[test]

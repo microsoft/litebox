@@ -4,6 +4,7 @@
 //! Syscalls Handlers
 
 pub(crate) mod broker_backed;
+pub(crate) mod broker_pipe;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub(crate) mod guest_pid;
@@ -12,13 +13,16 @@ pub(crate) mod guest_pid;
 /// calls this at bootstrap if a broker fd-token control socket is
 /// available; the shim consults the registered provider from
 /// `sys_eventfd2`.
+pub use broker_pipe::{broker_pipe_provider, set_broker_pipe_provider};
 pub use eventfd::broker_eventfd_provider;
 pub use eventfd::broker_pidfd_provider;
+pub use eventfd::broker_pty_provider;
 pub use eventfd::set_broker_eventfd_provider;
 pub use eventfd::set_broker_pidfd_provider;
+pub use eventfd::set_broker_pty_provider;
 pub use guest_pid::{
-    broker_guest_pid_provider, set_broker_guest_pid_provider, try_register_broker_guest_pid,
-    try_release_broker_guest_pid,
+    broker_guest_pid_provider, set_broker_guest_pid_provider, try_mark_broker_process_exited,
+    try_register_broker_guest_pid, try_release_broker_guest_pid, try_subscribe_broker_process_exit,
 };
 pub use signalfd::broker_signalfd_provider;
 pub use signalfd::set_broker_signalfd_provider;
