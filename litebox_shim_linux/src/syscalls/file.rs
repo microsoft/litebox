@@ -3765,6 +3765,10 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
     if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
         return Ok(get_flags(global, &hp_fd));
     }
+    // Broker-pipe FDs bypass run_on_raw_fd too (no arm for them there).
+    if let Some(bp_fd) = files.try_broker_pipe_fd(raw_fd) {
+        return Ok(get_flags(global, &bp_fd));
+    }
 
     files.run_on_raw_fd(
         raw_fd,
@@ -3797,6 +3801,11 @@ fn set_file_descriptor_flags<FS: ShimFS>(
     // Fast path: host-pipe FDs bypass run_on_raw_fd.
     if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
         set_flags(global, &hp_fd, flags);
+        return Ok(());
+    }
+    // Broker-pipe FDs bypass run_on_raw_fd too.
+    if let Some(bp_fd) = files.try_broker_pipe_fd(raw_fd) {
+        set_flags(global, &bp_fd, flags);
         return Ok(());
     }
 
@@ -4542,7 +4551,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // Phase C: FIONBIO fix unlocked EPIPE.{basic_io,fork_io,exec_no_capture,exec_captured} and PIDF.* under eager_broker=true. PB.c2p still fails with IO Safety violation in libc::abort — looks like fd-inherit-non-stdio across worker_exec is missing handling for broker pipes. Separate bug from FIONBIO.
+        let eager_broker = false; // Phase C: F_GETFD fix landed; PB.c2p PASS + PB 65 pass + EPIPE 4/4 + PIDF 11/11. Still 48 PB.* failures + 4 PN.* — separate roots. Gating off until those are triaged.
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider
