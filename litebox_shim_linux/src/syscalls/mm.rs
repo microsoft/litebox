@@ -245,6 +245,8 @@ impl<FS: ShimFS> Task<FS> {
             |_| Err(Errno::ENODEV),
             |_| Err(Errno::ENODEV),
             |_| Err(Errno::ENODEV),
+            |_| Err(Errno::ENODEV),
+            |_| Err(Errno::ENODEV),
         )?
     }
 
@@ -260,6 +262,8 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |typed_fd| files.fs.fd_path(typed_fd),
+                |_| None,
+                |_| None,
                 |_| None,
                 |_| None,
                 |_| None,
@@ -916,6 +920,8 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |typed_fd| files.fs.get_static_backing_data(typed_fd),
+                |_| None,
+                |_| None,
                 |_| None,
                 |_| None,
                 |_| None,

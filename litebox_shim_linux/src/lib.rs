@@ -1958,6 +1958,25 @@ impl<FS: ShimFS> Task<FS> {
 /// A strongly-typed FD.
 ///
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
+    /// Exhaustive fd-kind dispatcher.
+    ///
+    /// Looks up `fd` in the shim's per-process descriptor store and
+    /// invokes the matching closure for whichever subsystem owns the
+    /// entry. Returns [`Errno::EBADF`] only when `fd` is genuinely
+    /// not present in any subsystem table.
+    ///
+    /// **Exhaustiveness invariant**: every fd-shaped subsystem the
+    /// shim supports must have a closure arm here. Adding a new
+    /// subsystem (e.g., a future `PtySubsystem`, `SignalfdSubsystem`,
+    /// `BrokerSocketpairSubsystem`) adds a new closure parameter,
+    /// which is a compile-time forcing function for every call site
+    /// to make an explicit decision about the new kind. Historically
+    /// this dispatcher was 6-arm and `HostPipeSubsystem` /
+    /// `BrokerPipeSubsystem` were handled via per-syscall
+    /// `try_host_pipe_fd` / `try_broker_pipe_fd` early-return fast
+    /// paths; several syscalls forgot the broker-pipe fast path,
+    /// silently returning EBADF on broker-pipe fds. The 8-arm shape
+    /// makes that class of bug a compile error.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn run_on_raw_fd<R>(
         &self,
@@ -1968,6 +1987,8 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem>) -> R,
         epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<FS>>) -> R,
         unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>) -> R,
+        host_pipe: impl FnOnce(&TypedFd<syscalls::host_pipe::HostPipeSubsystem>) -> R,
+        broker_pipe: impl FnOnce(&TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -1994,14 +2015,25 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             drop(rds);
             return Ok(unix(&fd));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(host_pipe(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(broker_pipe(&fd));
+        }
         Err(Errno::EBADF)
     }
 
     /// Check if the given raw FD is a host-pipe FD.
     ///
-    /// Returns a typed handle if it is, `None` otherwise.  Used by `sys_read`,
-    /// `sys_write`, and `sys_close` to fast-path host-pipe I/O without
-    /// modifying every `run_on_raw_fd` call site.
+    /// Returns a typed handle if it is, `None` otherwise.
+    ///
+    /// **Deprecated**: prefer using `run_on_raw_fd`'s `host_pipe`
+    /// closure arm directly. This helper persists for sites that
+    /// genuinely need an owned `Arc<TypedFd>` to outlive a borrow
+    /// (e.g., the `entry_handle` lookup pattern in `sys_read`).
     pub(crate) fn try_host_pipe_fd(
         &self,
         fd: usize,
@@ -2010,6 +2042,9 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         rds.fd_from_raw_integer(fd).ok()
     }
 
+    /// Check if the given raw FD is a broker-pipe FD.
+    ///
+    /// **Deprecated**: see [`Self::try_host_pipe_fd`].
     pub(crate) fn try_broker_pipe_fd(
         &self,
         fd: usize,
@@ -2255,6 +2290,8 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| alloc::format!("raw={raw_fd} eventfd"),
                 |_fd| alloc::format!("raw={raw_fd} epoll"),
                 |_fd| alloc::format!("raw={raw_fd} unix"),
+                |_fd| alloc::format!("raw={raw_fd} host_pipe"),
+                |_fd| alloc::format!("raw={raw_fd} broker_pipe"),
             )
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))
     }

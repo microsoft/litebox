@@ -685,6 +685,8 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| None,
                 |_fd| None,
                 |_fd| None,
+                |_fd| None,
+                |_fd| None,
             )
             .ok()
             .flatten()
@@ -1257,6 +1259,8 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                 )?;
                 let file = file?;
                 {
@@ -1333,6 +1337,8 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
@@ -1421,6 +1427,8 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                 )?
             }
         }
@@ -1483,6 +1491,8 @@ impl<FS: ShimFS> Task<FS> {
                             };
                             CString::new(abs).map_err(|_| Errno::EINVAL)
                         },
+                        |_| Err(Errno::ENOTDIR),
+                        |_| Err(Errno::ENOTDIR),
                         |_| Err(Errno::ENOTDIR),
                         |_| Err(Errno::ENOTDIR),
                         |_| Err(Errno::ENOTDIR),
@@ -1730,6 +1740,8 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 },
+                |_| Err(Errno::EBADF),
+                |_| Err(Errno::EBADF),
             )
             .flatten()
     }
@@ -1872,6 +1884,8 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 },
+                |_| Err(Errno::EBADF),
+                |_| Err(Errno::EBADF),
             )
             .flatten();
         // Diagnostic: log subsystem dispatch for write(fd=3) → EINVAL.
@@ -2178,6 +2192,8 @@ impl<FS: ShimFS> Task<FS> {
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
+                |_| Err(Errno::ESPIPE),
             )
             .flatten()
     }
@@ -2229,6 +2245,8 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                 )?
             }
         }
@@ -2240,7 +2258,17 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
-        files.run_on_raw_fd(raw_fd, |_| (), |_| (), |_| (), |_| (), |_| (), |_| ())?;
+        files.run_on_raw_fd(
+            raw_fd,
+            |_| (),
+            |_| (),
+            |_| (),
+            |_| (),
+            |_| (),
+            |_| (),
+            |_| (),
+            |_| (),
+        )?;
         Ok(())
     }
 
@@ -2310,6 +2338,8 @@ impl<FS: ShimFS> Task<FS> {
                     alloc::format!("{dir_path}/{rel}")
                 })
             },
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
             |_| Err(Errno::ENOTDIR),
             |_| Err(Errno::ENOTDIR),
             |_| Err(Errno::ENOTDIR),
@@ -2632,6 +2662,20 @@ impl<FS: ShimFS> Task<FS> {
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
             },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
         )
     }
 
@@ -2807,6 +2851,8 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 },
+                |_| Err(Errno::EBADF),
+                |_| Err(Errno::EBADF),
             )
             .flatten()
     }
@@ -2902,6 +2948,8 @@ fn fcntl_status_flags<FS: ShimFS>(
             |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
             |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
             |fd| getfl_from_metadata!(fd, crate::PipeStatusFlags),
+            |fd| getfl_from_handle!(fd),
+            |fd| getfl_from_handle!(fd),
             |fd| getfl_from_handle!(fd),
             |fd| getfl_from_handle!(fd),
             |fd| getfl_from_handle!(fd),
@@ -3147,6 +3195,8 @@ impl<FS: ShimFS> Task<FS> {
                         })
                     })
                 },
+                |_| Err(Errno::EBADF),
+                |_| Err(Errno::EBADF),
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
@@ -3219,6 +3269,8 @@ impl<FS: ShimFS> Task<FS> {
                     |_| Ok(()),
                     |_| Ok(()),
                     |_| Ok(()),
+                    |_| Ok(()),
+                    |_| Ok(()),
                 )?;
             }
             FsPath::FdRelative { fd, path } => {
@@ -3233,6 +3285,8 @@ impl<FS: ShimFS> Task<FS> {
                             .map_err(Errno::from)?;
                         Self::check_access_mode(&s, mode)
                     },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
@@ -3464,7 +3518,17 @@ impl<FS: ShimFS> Task<FS> {
             FsPath::Fd(fd) => {
                 let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
                 let files = self.files.borrow();
-                files.run_on_raw_fd(raw_fd, |_| (), |_| (), |_| (), |_| (), |_| (), |_| ())?;
+                files.run_on_raw_fd(
+                    raw_fd,
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                    |_| (),
+                )?;
                 Err(Errno::ENOENT)
             }
             FsPath::FdRelative { fd, path } => {
@@ -3485,6 +3549,8 @@ impl<FS: ShimFS> Task<FS> {
                             _ => Errno::EIO,
                         })
                     },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
@@ -3655,6 +3721,42 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     ..Default::default()
                 })
             },
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
+                Ok(FileStat {
+                    st_dev: SOCKFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
+                    st_nlink: 1,
+                    st_mode: (litebox_common_linux::InodeType::Socket as u32
+                        | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+                    .truncate(),
+                    st_uid: uid,
+                    st_gid: gid,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            },
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
+                Ok(FileStat {
+                    st_dev: SOCKFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
+                    st_nlink: 1,
+                    st_mode: (litebox_common_linux::InodeType::Socket as u32
+                        | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+                    .truncate(),
+                    st_uid: uid,
+                    st_gid: gid,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            },
         )
         .flatten()?;
 
@@ -3700,6 +3802,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     .with_metadata(fd, |_: &crate::HostTtyAlias| ())
                     .is_ok()
             },
+            |_| false,
+            |_| false,
             |_| false,
             |_| false,
             |_| false,
@@ -3778,6 +3882,8 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
         |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
+        |fd| get_flags(global, fd),
     )
 }
 
@@ -3811,6 +3917,8 @@ fn set_file_descriptor_flags<FS: ShimFS>(
 
     files.run_on_raw_fd(
         raw_fd,
+        |fd| set_flags(global, fd, flags),
+        |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
         |fd| set_flags(global, fd, flags),
@@ -4065,6 +4173,8 @@ impl<FS: ShimFS> Task<FS> {
                             .map(FileStat::from)
                             .map_err(Errno::from)
                     },
+                    |_| Err(Errno::ENOTDIR),
+                    |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
                     |_| Err(Errno::ENOTDIR),
@@ -4400,6 +4510,8 @@ impl<FS: ShimFS> Task<FS> {
                         toggle_flags!(fd);
                         Ok(())
                     },
+                    |_| Err(Errno::EBADF),
+                    |_| Err(Errno::EBADF),
                 )??;
                 Ok(0)
             }
@@ -4512,6 +4624,8 @@ impl<FS: ShimFS> Task<FS> {
             |_| Err(Errno::ENOTDIR),
             |_| Err(Errno::ENOTDIR),
             |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
+            |_| Err(Errno::ENOTDIR),
         )??;
 
         let mut new_cwd = dir_path;
@@ -4551,7 +4665,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // Phase C: 3 fixes landed (IncrefPipeEnd routing ca90c39a, FIONBIO 05495616, F_GETFD 1994febc). With eager_broker=true: PIE-glibc and static-PIE-glibc/musl PB.* all PASS. Remaining 45 PB.* failures are exclusively nonpie-glibc / non-pie-static-musl legs — single shared root in worker_exec broker-pipe handoff (next session).
+        let eager_broker = false; // Phase C: 4 fixes landed (IncrefPipeEnd routing ca90c39a, FIONBIO 05495616, F_GETFD 1994febc, dispatcher widen C.6). EPIPE 4/4, PIDF 11/11, PB PIE-glibc + static-PIE all PASS with eager_broker=true. Remaining 45 PB.* failures are exclusively nonpie-glibc / non-pie-static-musl legs.
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider
@@ -5503,6 +5617,8 @@ impl<FS: ShimFS> Task<FS> {
                         |_fd| Err(Errno::ENOTTY),
                         |_fd| Err(Errno::ENOTTY),
                         |_fd| Err(Errno::ENOTTY),
+                        |_fd| Err(Errno::ENOTTY),
+                        |_fd| Err(Errno::ENOTTY),
                     )
                     .flatten()
             }
@@ -5634,12 +5750,30 @@ impl<FS: ShimFS> Task<FS> {
                             });
                             Ok(())
                         },
+                        |_| Err(Errno::EBADF),
+                        |_| Err(Errno::EBADF),
                     )
                     .flatten()?;
                 Ok(0)
             }
             IoctlArg::FIOCLEX => files.run_on_raw_fd(
                 desc,
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                },
                 |fd| {
                     let _old = self
                         .global
@@ -5739,6 +5873,22 @@ impl<FS: ShimFS> Task<FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
                 },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
+                |fd| {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                },
             )?,
             IoctlArg::TIOCGPTPEER(open_flags) => {
                 // TIOCGPTPEER: open the slave side of a PTY master, returning a new fd.
@@ -5755,6 +5905,8 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         Ok(rdev.get() & 0xFF)
                     },
+                    |_| Err(Errno::ENOTTY),
+                    |_| Err(Errno::ENOTTY),
                     |_| Err(Errno::ENOTTY),
                     |_| Err(Errno::ENOTTY),
                     |_| Err(Errno::ENOTTY),
@@ -5829,6 +5981,8 @@ impl<FS: ShimFS> Task<FS> {
                         _ => Err(Errno::ENOTTY),
                     }
                 },
+                |_fd| Err(Errno::ENOTTY),
+                |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
@@ -6450,6 +6604,30 @@ impl<FS: ShimFS> Task<FS> {
                     min_fd,
                 )
             },
+            |fd| {
+                dup(
+                    &self.global,
+                    &files,
+                    fd,
+                    self.pid,
+                    file,
+                    close_on_exec,
+                    target,
+                    min_fd,
+                )
+            },
+            |fd| {
+                dup(
+                    &self.global,
+                    &files,
+                    fd,
+                    self.pid,
+                    file,
+                    close_on_exec,
+                    target,
+                    min_fd,
+                )
+            },
         );
         // Fallback: try HostPipeSubsystem (pipe bridges from delayed fork)
         // and BrokerPipeSubsystem (Phase C.3 eager-broker pipes). These
@@ -6544,6 +6722,20 @@ impl<FS: ShimFS> Task<FS> {
                 files
                     .run_on_raw_fd(
                         oldfd_usize,
+                        |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        },
+                        |fd| {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        },
                         |fd| {
                             self.global
                                 .litebox
@@ -6713,6 +6905,8 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
             |_fd| Err(Errno::ENOTDIR),
