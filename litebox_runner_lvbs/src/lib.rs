@@ -917,9 +917,9 @@ fn open_session_new_instance(
         closed: false,
     }));
 
-    // Ownership of the session ID transfers to the session manager.
-    session_id_guard.disarm();
+    // Success: register session and disarm the guard (ownership transfers to session map)
     session_manager().register_session(runner_session_id, instance.clone(), ta_uuid, ta_flags);
+    session_id_guard.disarm();
 
     // Cache single-instance TAs only after the opening session owns the instance.
     if ta_flags.is_single_instance() {
