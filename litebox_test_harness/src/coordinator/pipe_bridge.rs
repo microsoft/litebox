@@ -1392,6 +1392,7 @@ async fn handle_pipe_pair_id(
 
 pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
     register_handler!(PIPE_PAIR_ID, handle_pipe_pair_id);
+    register_handler!(BPIPE_BASIC_IO, handle_bpipe_basic_io);
     for &agent in AGENTS {
         let agent_s = agent.to_string();
         reg.test("matrix", "pipe_pair_id", format!("PID.{agent}"))
@@ -1410,6 +1411,98 @@ pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
                 })
             });
     }
+    // BPIPE.basic_io: minimal capability test for the broker-pipe
+    // activation path. A single agent (Dpg1) creates a pipe via
+    // libc::pipe2, writes 8 bytes to the writer end, reads them back
+    // from the reader end, closes both. Native should always pass.
+    // With `eager_broker=true` in sys_pipe2, this exercises the broker
+    // pipe data plane (create_pipe RPC, read/write subscriptions, close).
+    // If this fails under litebox while PB.c2p also fails, the broker-pipe
+    // bug is in basic I/O, not fork+exec stdio handoff.
+    reg.test("matrix", "broker_pipe_basic", "EPIPE.basic_io")
+        .timeout(30)
+        .build(|cx| {
+            let handle = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let result = run
+                        .send_named_typed(&handle, &BPIPE_BASIC_IO, BpipeBasicIoArgs {})
+                        .await;
+                    let pass = matches!(&result, Ok(out) if out.detail == "ok");
+                    super::TestOutcome::new("EPIPE.basic_io", pass, format!("{result:?}"))
+                })
+            })
+        });
+}
+
+// ─── BPIPE.basic_io: minimal broker-pipe activation test ───────────
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BpipeBasicIoArgs {}
+
+const BPIPE_BASIC_IO: HandlerToken<BpipeBasicIoArgs, PipeBridgeOut> =
+    HandlerToken::new("platform_fixes.bpipe_basic_io");
+
+async fn handle_bpipe_basic_io(
+    _args: BpipeBasicIoArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: pipe2 writes two fresh fds into pipe_fds on success.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), 0) } != 0 {
+        return Err(HandlerError(format!(
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let [rd, wr] = pipe_fds;
+    let msg = b"hello-bp";
+    // SAFETY: wr is a live fd; we own it for the duration of this fn.
+    let n = unsafe { libc::write(wr, msg.as_ptr() as *const _, msg.len()) };
+    if n != msg.len() as isize {
+        // SAFETY: closing fds we own.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return Err(HandlerError(format!(
+            "write: rc={n} err={}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut buf = [0u8; 8];
+    // SAFETY: rd is a live fd; buf is writable.
+    let m = unsafe { libc::read(rd, buf.as_mut_ptr() as *mut _, buf.len()) };
+    if m != msg.len() as isize {
+        // SAFETY: closing fds we own.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return Err(HandlerError(format!(
+            "read: rc={m} err={}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if &buf[..m as usize] != msg {
+        // SAFETY: closing fds we own.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return Err(HandlerError(format!(
+            "data mismatch: wrote {msg:?} read {:?}",
+            &buf[..m as usize]
+        )));
+    }
+    // SAFETY: closing fds we own.
+    unsafe {
+        libc::close(rd);
+        libc::close(wr);
+    }
+    Ok(PipeBridgeOut {
+        detail: "ok".to_string(),
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════
