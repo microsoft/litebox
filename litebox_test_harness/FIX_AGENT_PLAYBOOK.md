@@ -192,20 +192,123 @@ docker run --rm -it --cap-add SYS_PTRACE \
 In another terminal:
 
 ```
+# Interactive (humans):
 bash dev_tools/gdb-connect.sh --port 9999
-# or:
-gdb -ex 'target remote localhost:9999' \
-    /home/wportnoy/src/litebox-platform-fixes/target/debug/litebox_tool_executor
+
+# Non-interactive transcript (coding agents):
+bash dev_tools/gdb-connect-batch.sh --port 9999 --commands probe.gdb \
+  [--timeout 120]
 ```
 
-GDB sets `detach-on-fork off` automatically (see `dev_tools/gdb-
-connect.sh`), so the broker and runner children are all
-followable. Useful breakpoint targets:
+### Multi-inferior model — read this first
 
-- `do_close`, `sys_socket`, `sys_connect` — syscall handlers.
-- `Dispatcher::handle` (or per-syscall dispatch) in
-  `litebox_runner_linux_userland`.
-- The 9P fcall handler in `litebox_broker::nine_p`.
+Litebox runs as ≥4 cooperating processes (executor, broker, runner,
+per-guest worker). Under gdbserver each is a separate GDB *inferior*.
+The connect scripts pre-configure `set detach-on-fork off`, so all
+of them remain attached. Use:
+
+  - `info inferiors` — list them.
+  - `inferior N` — switch.
+  - `thread apply all bt` — backtrace every thread in current inferior.
+
+**A breakpoint that stops one inferior will block the others.** The
+broker/runner protocol is synchronous over pipes; sitting at a
+breakpoint in one process makes the rest of the system deadlock as
+soon as protocol traffic backs up. Two practical implications:
+
+1. Prefer **short-lived breakpoints**: use
+   `commands ... silent ... <gather info> ... continue end`
+   so the inferior never sits paused.
+2. For "stop and look around" use cases, prefer **pause points**
+   (see next section) rather than gdb breakpoints — the pause
+   freezes only the matching process, and its siblings keep running.
+
+### Pause points (`LITEBOX_HARNESS_PAUSE`)
+
+For many debugging scenarios, gdb breakpoints inside litebox are
+fragile (multi-inferior deadlocks, fragile conditionals, attach
+races, monomorphized-symbol misses). The test harness supports
+**pause points** as a more reliable alternative.
+
+Set `LITEBOX_HARNESS_PAUSE=<tag>[=<filter>][,<tag>[=<filter>]]...`
+to make the harness `raise(SIGSTOP)` itself at a stable site, emit
+a `[litebox-pause] tag=... pid=N ...` marker on stderr, and wait for
+`SIGCONT`. Attach gdb at the paused point (data structures are
+quiescent), or run `gcore <pid>` / poke `/proc/<pid>/*` and resume
+with `kill -CONT <pid>`.
+
+Available harness tags (extend the framework with shim/broker tags
+as concrete debugging needs arise — see
+`litebox_test_harness::pause_points`):
+
+| Tag                       | Fires when…                                     | Typical filter |
+|---------------------------|-------------------------------------------------|----------------|
+| `harness:test-start`      | Just before running a test                      | test ID        |
+| `harness:test-end-pass`   | Test passed; before teardown                    | test ID        |
+| `harness:test-end-fail`   | Test failed or timed out; before teardown       | test ID        |
+
+Examples:
+
+```
+# Pause before a single failing test runs (gives time to attach gdb):
+LITEBOX_HARNESS_PAUSE='harness:test-start=PB.c2p.nonpie-glibc.dpg2' \
+  cargo test ... --test integration -- 'litebox::PB.c2p.nonpie-glibc.dpg2' --exact
+
+# Pause whenever any test fails:
+LITEBOX_HARNESS_PAUSE='harness:test-end-fail' cargo test ...
+
+# Multiple pause points in one run:
+LITEBOX_HARNESS_PAUSE='harness:test-start=PB.x,harness:test-end-fail' cargo test ...
+```
+
+The marker prefix `[litebox-pause]` is grep-able and is distinct
+from the harness's JSON protocol output.
+
+### Failure-shape → breakpoint cookbook
+
+For each failure shape, the suspect site to inspect (gdb breakpoint
+or pause point as noted). Symbols verified against current sources;
+adjust file paths if the runner refactors.
+
+| Failure shape                                       | Suspect site                                                       | gdb or pause?     |
+|-----------------------------------------------------|--------------------------------------------------------------------|-------------------|
+| Single TEST_ID I want to debug from the start       | (set `LITEBOX_HARNESS_PAUSE=harness:test-start=<id>`)              | pause             |
+| Any test fails — want post-mortem state             | (set `LITEBOX_HARNESS_PAUSE=harness:test-end-fail`)                | pause             |
+| Guest fork returns wrong PID / clone misbehavior    | `litebox_shim_linux::syscalls::process::do_clone`                  | gdb               |
+| Guest exec silently fails                           | `litebox_shim_linux::syscalls::process` (search `execve`)          | gdb               |
+| Fd inheritance across exec broken                   | `litebox_shim_linux::syscalls::fd::cloexec_filter` / `FdTable`     | gdb               |
+| Signal lost between guest threads                   | `litebox_shim_linux::syscalls::signal` (search `do_kill` / `queue`)| gdb               |
+| epoll wakes up with 0 events                        | `litebox_shim_linux::syscalls::epoll` (search `epoll_wait`)        | gdb               |
+| 9P op times out / returns wrong errno               | `litebox_broker::nine_p::fcall::handle`                            | gdb               |
+| TCP connect fails with surprising errno             | `litebox_broker::net_proxy::PortRouter`                            | gdb               |
+| Cross-worker fd transfer fails                      | `litebox_common_linux::cwfd` (state object trait impls)            | gdb               |
+| /proc/self/* read returns wrong content             | `litebox_shim_linux::syscalls::proc` (search `proc_self`)          | gdb               |
+| Stdio inheritance across worker-exec wrong          | `litebox_platform_linux_userland::posix_spawn` (PARENT_BRIDGE_FD)  | gdb               |
+| `posix_spawn` of a non-PIE binary fails             | `litebox_runner_linux_userland::worker_exec`                       | gdb               |
+| Pipe EAGAIN unexpected in non-blocking mode         | `litebox_shim_linux::syscalls::pipe`                               | gdb               |
+| io_uring probe fails                                | `litebox_shim_linux::syscalls::io_uring`                           | gdb               |
+| Signalfd / pidfd ops not routed cross-worker        | `litebox_broker::cwfd::*` (signalfd_state, pidfd_state)            | gdb               |
+| Audit log shows weird errno; want to step it        | `litebox_runner_linux_userland::audit` (Sysno-level)               | gdb               |
+
+When in doubt, run `litebox_audit_query schema` first — many bugs
+narrow to a `(syscall, errno)` pair that points at one of the
+above.
+
+### Example session
+
+`dev_tools/gdb-example-session.md` walks an end-to-end example
+using `LITEBOX_HARNESS_PAUSE` + `gdb-connect-batch.sh` to drive a
+single test from failure observation to root cause in a single
+shell round-trip. Imitate that template for new debugging sessions.
+
+### Coding-agent ergonomics
+
+Coding agents typically struggle with **interactive** gdb sessions:
+the multi-inferior protocol-deadlock model breaks single-process
+assumptions, and step-through inside async Rust tokio futures rarely
+produces useful state. The two tools above (`gdb-connect-batch.sh`
+and `LITEBOX_HARNESS_PAUSE`) are specifically designed for
+non-interactive use. Prefer them over driving a live `(gdb)` prompt.
 
 ---
 

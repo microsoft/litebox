@@ -191,19 +191,15 @@ registry.
 | `run_copilot.sh` | Launches Copilot inside the litebox sandbox |
 | `run_copilot_ipc.sh` | Launches Copilot inside the litebox sandbox over IPC |
 | `run_claude_ipc.sh` | Launches Claude Code inside the litebox sandbox over IPC |
-| `check-debug-env.sh` | Validates debugging prerequisites (GDB, rr, debug symbols) |
-| `debug-runner.sh` | GDB batch wrapper for crash diagnosis and deadlock inspection |
-| `rr-record.sh` | Records a litebox session under rr (requires real PMU hardware) |
-| `rr-replay.sh` | Replays an rr trace with scripted GDB commands |
-| `deadlock-inspect.sh` | Attaches to running runner process(es) and dumps all thread stacks |
-| `gdb-connect.sh` | Connects GDB to a litebox runner running under gdbserver in Docker |
+| `gdb-connect.sh` | Interactive GDB session to a litebox runner under gdbserver in Docker |
+| `gdb-connect-batch.sh` | Non-interactive (`-batch`) variant of `gdb-connect.sh` for coding agents — runs a caller-supplied GDB command file and returns a transcript |
 
 ## Debugging Litebox
 
 ### Architecture
 
 The litebox runner uses **seccomp/SIGSYS** (systrap backend) for syscall
-interception — not ptrace.  This means GDB and rr can debug the runner
+interception — not ptrace.  This means GDB can debug the runner
 without conflict: GDB ptraces the runner process while seccomp independently
 intercepts guest syscalls via SIGSYS signals.
 
@@ -221,87 +217,56 @@ litebox_tool_executor
        └── worker host (--fork-restore)    ← fork child restore
 ```
 
-### GDB batch mode (works everywhere, including WSL2)
+### GDB remote debugging (in-Docker)
 
-`debug-runner.sh` wraps any litebox entry point under `rust-gdb -batch`.
-On crash it captures a full backtrace; on deadlock you get all thread stacks.
-
-```bash
-# Debug the runner directly with a rootfs
-bash dev_tools/debug-runner.sh --target runner --rootfs /path/to/rootfs -- /program args...
-
-# Debug tool_executor (includes broker + runner)
-bash dev_tools/debug-runner.sh --target tool-executor -- --rootfs /path/to/rootfs --record-baseline -- /program
-
-# Debug the integration test
-bash dev_tools/debug-runner.sh --target integration
-
-# Debug the test harness inside the runner
-bash dev_tools/debug-runner.sh --target harness --rootfs /path/to/rootfs
-```
-
-### Deadlock inspection
-
-When a test hangs, attach to the running runner(s) without killing them:
+The tool executor's `--debug PORT` flag re-execs itself under
+`gdbserver :PORT` so the executor + broker + runner + worker
+processes are all debuggable from one GDB session. From the host:
 
 ```bash
-bash dev_tools/deadlock-inspect.sh           # find and inspect all runners
-bash dev_tools/deadlock-inspect.sh <PID>     # inspect a specific process
+# Interactive session (good for human debugging)
+bash dev_tools/gdb-connect.sh --port 9999
+
+# Non-interactive transcript (good for coding agents)
+bash dev_tools/gdb-connect-batch.sh --port 9999 --commands probe.gdb [--timeout 120]
 ```
 
-### rr record/replay (requires real PMU hardware — NOT available on WSL2)
+The scripts auto-discover the debug-symbol directory (cargo's
+default `target/debug` or override via `LITEBOX_SYMBOLS_DIR`),
+load symbols for runner + broker, and pre-configure GDB with
+`handle SIGSYS nostop noprint pass` (so seccomp-routed syscalls
+don't stop GDB), `set detach-on-fork off`, `set schedule-multiple on`,
+and a number of `set print *` defaults agents commonly need.
 
-rr provides deterministic record/replay with time-travel debugging.  It
-records the entire process tree (parent runner + all worker hosts) in a
-single trace.  However, **rr requires hardware performance counters (PMU)**
-that must be virtualized by the hypervisor.
-
-**WSL2 does not work with rr.**  Microsoft's Hyper-V lightweight utility VM
-does not virtualize the PMU.  The `perf_event_open` syscall returns ENOENT
-and `rr record` fails with:
-
-```
-[FATAL] Unable to open performance counter with 'perf_event_open'
-```
-
-This is a hypervisor-level limitation with no user-side workaround.  There is
-no `.wslconfig` setting to enable PMU passthrough.  The WSL2 kernel has
-`CONFIG_PERF_EVENTS=y` compiled in, but the hardware counters are simply not
-exposed by Hyper-V.
-
-rr works on:
-- Bare metal Linux
-- VMs with PMU virtualization enabled (KVM with `-cpu host`, VMware with
-  perf counter virtualization, Hyper-V with `Set-VMProcessor -Perfmon @("pmu")`)
-
-If you have a compatible environment, the scripts work as follows:
+The default `follow-fork-mode` is `parent` (shim-side debugging is
+the common case). To debug a forked guest binary, override:
 
 ```bash
-# Record a test run
-TRACE=$(bash dev_tools/rr-record.sh --target harness --rootfs /path/to/rootfs)
-
-# Replay with a breakpoint
-bash dev_tools/rr-replay.sh "$TRACE" --batch --break "litebox_shim_linux::syscalls::pipe::do_pipe2"
-
-# Interactive time-travel debugging
-bash dev_tools/rr-replay.sh "$TRACE" --interactive
+bash dev_tools/gdb-connect.sh --port 9999 -- -ex 'set follow-fork-mode child'
 ```
 
-### Verifying your environment
+### Pause points (LITEBOX_HARNESS_PAUSE)
 
-```bash
-bash dev_tools/check-debug-env.sh
-```
+For many debugging scenarios, GDB breakpoints inside litebox are
+fragile: stopping one process in a multi-process protocol can
+deadlock its siblings, conditional breakpoints are awkward, and
+attach races can lose the bug.
 
-This checks for GDB, rr + PMU availability, debug symbols, and required
-binaries.  GDB is required; rr is optional (and will show a warning on WSL2
-explaining why it cannot work).
+The harness and shim support **pause points** as a more reliable
+alternative. Set `LITEBOX_HARNESS_PAUSE=<tag>[=<filter>]` to make
+the matching process `raise(SIGSTOP)` itself at a stable source-code
+site, emit `[litebox-pause] tag=... filter=... pid=N ...` on stderr,
+and wait for `SIGCONT`. Attach gdb (or run `gcore`, poke `/proc`)
+at the paused point; resume with `kill -CONT <pid>`.
+
+See `FIX_AGENT_PLAYBOOK.md` "Pause points" section for the full
+list of tags and recommended use.
 
 ### GDB remote debugging (VS Code Server in Docker)
 
-For debugging the litebox runner during VS Code Remote-SSH testing, the
-tool executor supports a `--debug` flag that runs the runner under
-`gdbserver` inside the Docker container. The agent connects from WSL2.
+For debugging the litebox runner during VS Code Remote-SSH testing,
+the tool executor supports a `--debug` flag that runs the runner
+under `gdbserver` inside the Docker container.
 
 ```
 ┌─ Docker container ──────────────────────────┐
@@ -317,29 +282,25 @@ tool executor supports a `--debug` flag that runs the runner under
          │ target remote localhost:9999
 ┌─ WSL2 ─┴──────────────────────────────────┐
 │  gdb ./litebox_runner_linux_userland       │
-│  (debug symbols from ~/litebox-out/debug/) │
 └────────────────────────────────────────────┘
 ```
 
-**Start the container in debug mode** (VS Code task "LiteBox: Start VS Code
-Server (Debug)" or manually):
+**Start the container in debug mode** (VS Code task "LiteBox: Start
+VS Code Server (Debug)" or manually):
 
 ```bash
 docker run --rm --name litebox-vscode \
   -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE \
-  -v \\\\wsl$\\Ubuntu\\home\\$USER\\litebox-out\\debug:/opt/litebox:ro \
+  -v $PWD/target/debug:/opt/litebox:ro \
   litebox-vscode /opt/litebox/litebox_tool_executor \
     --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug
 ```
 
-**Connect GDB from WSL2:**
+**Connect GDB from the host:**
 
 ```bash
 bash dev_tools/gdb-connect.sh --port 9999
 ```
-
-The script finds the runner binary with debug symbols and configures GDB
-with `handle SIGSYS nostop noprint pass` for seccomp compatibility.
 
 **Useful breakpoints for process lifecycle:**
 
@@ -349,18 +310,5 @@ break sys_execve       — guest exec
 break exit_group       — guest process exit
 ```
 
-**Coding agent usage** (via async powershell + write_powershell):
-
-```python
-# Start GDB session
-powershell("wsl.exe -- bash dev_tools/gdb-connect.sh", mode="async", shellId="gdb")
-
-# Set breakpoints and continue
-write_powershell(shellId="gdb", input="break do_clone{enter}")
-write_powershell(shellId="gdb", input="continue{enter}")
-
-# When breakpoint fires, inspect
-write_powershell(shellId="gdb", input="bt{enter}")
-write_powershell(shellId="gdb", input="info locals{enter}")
-write_powershell(shellId="gdb", input="continue{enter}")
-```
+See `FIX_AGENT_PLAYBOOK.md` for a fuller failure-shape → breakpoint
+cookbook.
