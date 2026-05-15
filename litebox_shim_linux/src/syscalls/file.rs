@@ -4542,7 +4542,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // Phase C activation deferred — see EPIPE.basic_io test (added 2026-05-15) for the minimal harness reproducer. Activation requires docker for integration testing.
+        let eager_broker = false; // Phase C: EPIPE.basic_io now passes with broker fix (commit pending), but PB.c2p still fails on fork+exec stdio handoff with broker pipes — separate bug, gating off again.
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider

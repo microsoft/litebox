@@ -1599,10 +1599,12 @@ mod tests {
         let path = dir.path().join("fd-token.sock");
         let fd_registry = std::sync::Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = std::sync::Arc::new(BrokerStateRegistry::new());
+        let process_registry = std::sync::Arc::new(BrokerStateRegistry::new());
         let _listener = spawn_control_listener(
             &path,
             std::sync::Arc::clone(&fd_registry),
             std::sync::Arc::clone(&state_registry),
+            std::sync::Arc::clone(&process_registry),
         )
         .expect("spawn listener");
         for _ in 0..100 {
