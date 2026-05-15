@@ -109,7 +109,22 @@ fn map_client_error(
             GuestPidProviderError::UnknownHandle
         }
         other => {
-            tracing::warn!(pid, error = %other, "process-exit RPC failed");
+            tracing::warn!(pid, error = %other, "process-exit RPC failed (mapped to Io)");
+            // Mirror to /tmp/rst-diag.log so failures surface inside
+            // the test container (tracing output may not reach the
+            // log dir during fast failures).
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[DBG-SUBSCRIBE] pid={} RPC error mapped to Io: {}",
+                    pid, other
+                );
+            }
             GuestPidProviderError::Io
         }
     }

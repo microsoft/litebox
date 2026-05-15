@@ -4542,7 +4542,7 @@ impl<FS: ShimFS> Task<FS> {
         // structural scaffolding (provider, install path, bridge specs,
         // subscribe direction fix) can land while the activation work
         // is iterated on separately.
-        let eager_broker = false; // Phase K Steps 1+2+3 in. eager_broker=true now correctly takes the broker pipe path (the test's litebox_tool_executor DOES start a broker), but reveals issues beyond Phase K: SubscribeProcessExit RPC fails for forked pids (Io) and the broker pipe path causes a Rust IO-safety double-close. These are Phase C activation issues, not "local pid" issues.
+        let eager_broker = false; // Phase K Steps 1+2+3+4 in. Activation now reveals concrete Phase C product blockers — see `target/test-logs/.../DBG-SUBSCRIBE` lines and rst-diag in keep-container runs: (1) SubscribeProcessExit(forked_pid) RPC fails with "Broken pipe" because the broker control socket closes (root cause not yet diagnosed — possibly broker dies, or coord's std runtime closes its broker fd as part of an IO-safety abort); (2) Rust std IO Safety violation aborts coord during dpg1 spawn, which the broken-pipe error feeds into. Both need product-level Phase C investigation.
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             let handle = provider
@@ -4568,6 +4568,24 @@ impl<FS: ShimFS> Task<FS> {
             let mut dt = self.global.litebox.descriptor_table_mut();
             let writer = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(writer_entry);
             let reader = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(reader_entry);
+            // Mirror the legacy `Pipes`-backed path's metadata. Code
+            // elsewhere in the shim queries `PipeStatusFlags` for
+            // status-flag updates (`fcntl(F_SETFL)`) and uses
+            // `GuestCreatedPipe` as a marker for fds the guest created
+            // (so the host doesn't try to close them as host fds).
+            {
+                let initial_status = OFlags::from(pipe_flags);
+                let _ = dt.set_entry_metadata(
+                    &writer,
+                    crate::PipeStatusFlags(initial_status | OFlags::WRONLY),
+                );
+                let _ = dt.set_entry_metadata(
+                    &reader,
+                    crate::PipeStatusFlags(initial_status | OFlags::RDONLY),
+                );
+                let _ = dt.set_entry_metadata(&writer, crate::GuestCreatedPipe);
+                let _ = dt.set_entry_metadata(&reader, crate::GuestCreatedPipe);
+            }
             if cloexec {
                 let _ = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC);
                 let _ = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC);
