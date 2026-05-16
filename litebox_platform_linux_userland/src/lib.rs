@@ -3204,7 +3204,11 @@ fn bridge_worker_output_to_pipe(
                 let mut offset = 0;
                 while remaining > 0 {
                     match pipes.write(&cx, fd.as_ref(), &buf[offset..offset + remaining]) {
-                        Ok(0) => return,
+                        Ok(0) => {
+                            // Local reader gone — drop our sender ref.
+                            pipes.remove_fd(fd.as_ref());
+                            return;
+                        }
                         Ok(written) => {
                             offset += written;
                             remaining -= written;
@@ -3217,7 +3221,10 @@ fn bridge_worker_output_to_pipe(
                         ) => {
                             std::thread::sleep(Duration::from_millis(1));
                         }
-                        Err(_) => return,
+                        Err(_) => {
+                            pipes.remove_fd(fd.as_ref());
+                            return;
+                        }
                     }
                 }
             }
@@ -3225,6 +3232,21 @@ fn bridge_worker_output_to_pipe(
             Err(_) => break,
         }
     }
+    // C.5h: explicitly drop our sender ref so the peer reader observes
+    // EOF.  Just dropping the Arc<TypedFd> is not enough — the placeholder
+    // shim task in worker 10 ALSO holds a guest-fd-table reference to the
+    // same Pipe SenderHalf SharedEntry (cross-bt Stdio::piped() spawns
+    // dup'd the original parent fd into placeholder fd 1 before exec).
+    // Without explicit remove, the placeholder's reference keeps the
+    // sender refcount at 1 until the placeholder exits, which doesn't
+    // happen until after the parent has reaped the child — a deadlock
+    // for any test that waits for stdout EOF before waitpid.
+    //
+    // remove_fd calls descriptor_table.remove → on_close on the entry,
+    // which (for a pipe SenderHalf) signals shutdown to the receiver
+    // peer regardless of remaining Arc refs.  Safe: the placeholder is
+    // not running guest code that could use the dropped fd.
+    pipes.remove_fd(fd.as_ref());
 }
 
 fn bridge_worker_input_from_stream(

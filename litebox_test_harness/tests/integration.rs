@@ -764,21 +764,29 @@ fn ensure_binaries_built(ws_root: &Path) {
     let td_str = td.to_string_lossy();
 
     eprintln!("Building litebox binaries (PIE-glibc) to {td_str}...");
+    let mut build_args: Vec<&str> = vec![
+        "build",
+        "--target-dir",
+        &td_str,
+        "-p",
+        "litebox_tool_executor",
+        "-p",
+        "litebox_broker",
+        "-p",
+        "litebox_runner_linux_userland",
+        "-p",
+        "litebox_test_harness",
+    ];
+    let trace_feature_runner;
+    if std::env::var("LITEBOX_TRACE_SYSCALLS").is_ok() {
+        trace_feature_runner =
+            String::from("litebox_runner_linux_userland/trace_syscalls");
+        build_args.push("--features");
+        build_args.push(&trace_feature_runner);
+    }
     let status = Command::new("cargo")
         .current_dir(ws_root)
-        .args([
-            "build",
-            "--target-dir",
-            &td_str,
-            "-p",
-            "litebox_tool_executor",
-            "-p",
-            "litebox_broker",
-            "-p",
-            "litebox_runner_linux_userland",
-            "-p",
-            "litebox_test_harness",
-        ])
+        .args(&build_args)
         .status()
         .expect("cargo build");
     assert!(status.success(), "cargo build (PIE-glibc) failed");
