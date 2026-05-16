@@ -201,6 +201,14 @@ fn read_to_eof_or_timeout(
                 }
                 wait_pollin_or_hup(fd, remaining.min(Duration::from_millis(500)))?;
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // EINTR — a signal landed during the read syscall.
+                // Retry rather than treating as a hard error. Under
+                // litebox, signal-delivery during a guest's read of
+                // a broker pipe can surface as EINTR even when the
+                // read would otherwise succeed.
+                continue;
+            }
             Err(e) => {
                 set_nonblock(fd, false).ok();
                 return Err(format!("read error after {} bytes: {e}", buf.len()));
@@ -234,7 +242,9 @@ fn set_nonblock(fd: i32, on: bool) -> Result<(), String> {
 }
 
 /// `poll(fd, POLLIN | POLLHUP, timeout)` — block up to `timeout`
-/// waiting for the fd to become readable or hang up.
+/// waiting for the fd to become readable or hang up. Retries on
+/// EINTR so a signal landing during the poll doesn't surface as a
+/// hard error to the caller.
 fn wait_pollin_or_hup(fd: i32, timeout: Duration) -> Result<i16, String> {
     let mut pfd = libc::pollfd {
         fd,
@@ -242,11 +252,17 @@ fn wait_pollin_or_hup(fd: i32, timeout: Duration) -> Result<i16, String> {
         revents: 0,
     };
     let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    if rc < 0 {
-        return Err(format!("poll({fd}): {}", std::io::Error::last_os_error()));
+    loop {
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("poll({fd}): {err}"));
+        }
+        return Ok(pfd.revents);
     }
-    Ok(pfd.revents)
 }
 
 // ─── Scenario bodies ───────────────────────────────────────────────
