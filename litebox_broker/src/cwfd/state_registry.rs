@@ -229,6 +229,10 @@ impl BrokerStateRegistry {
             .refcount
             .checked_add(1)
             .ok_or(StateRegistryError::RefcountOverflow(handle))?;
+        let new_rc = entry.refcount;
+        let tag = entry.state.subsystem_tag();
+        drop(s);
+        tracing::info!(handle = handle.0, new_rc, ?tag, "REG-DUP");
         Ok(handle)
     }
 
@@ -244,9 +248,13 @@ impl BrokerStateRegistry {
             .get_mut(&handle.0)
             .ok_or(StateRegistryError::UnknownHandle(handle))?;
         entry.refcount -= 1;
-        if entry.refcount == 0 {
+        let new_rc = entry.refcount;
+        let tag = entry.state.subsystem_tag();
+        if new_rc == 0 {
             s.table.remove(&handle.0);
         }
+        drop(s);
+        tracing::info!(handle = handle.0, new_rc, ?tag, "REG-REL");
         Ok(())
     }
 

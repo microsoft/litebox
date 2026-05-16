@@ -1434,6 +1434,65 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }
         }
 
+        // C.5l: Phase C.3 follow-up — restore BrokerPipeFd entries for
+        // FdClass::Pipe slots whose snapshot carries a broker_handle.
+        // Previously these fell through to the local-pipe restore branch
+        // (line 1414 mapped `BrokerHandleKind::Pipe => None`), which
+        // meant fork-restore created no BrokerPipeFd in the child
+        // worker. The emit-side `dup_handle` in
+        // `syscalls/process.rs:7283` then leaked the broker refcount,
+        // and the writer-side pipe's `PipeWriteEnd::Drop` never fired
+        // when the original writer process exited — readers in other
+        // workers stalled forever waiting for EOF.
+        //
+        // Now: per FdClass::Pipe entry with broker_handle, create a
+        // fresh BrokerPipeFd that adopts the parent's emit-side
+        // `dup_handle` ref (no additional bump on this side).
+        // BrokerPipeFd's on_close in the child worker will release on
+        // drop; the broker per-connection cleanup handles SIGKILL'd
+        // workers.
+        {
+            use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::Pipe {
+                    continue;
+                }
+                let Some(broker_handle) = entry.metadata.broker_handle else {
+                    continue;
+                };
+                if broker_handle.kind != BrokerHandleKind::Pipe {
+                    continue;
+                }
+                let Some(direction) = broker_handle.pipe_direction else {
+                    continue;
+                };
+                let Some(provider) = syscalls::broker_pipe::broker_pipe_provider() else {
+                    continue;
+                };
+                let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
+                    provider,
+                    broker_handle.handle_id,
+                    direction,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<syscalls::broker_pipe::BrokerPipeSubsystem>(bp_fd);
+                let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
+                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                debug_assert!(
+                    success,
+                    "broker-pipe fd slot {} occupied during restore",
+                    entry.fd
+                );
+            }
+        }
+
         // --- 11. Build credentials. -----------------------------------------
         let child_credentials = Arc::new(syscalls::process::Credentials {
             uid: id.credentials.uid,

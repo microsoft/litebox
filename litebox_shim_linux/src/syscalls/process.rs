@@ -7233,7 +7233,11 @@ impl<FS: ShimFS> Task<FS> {
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
                             };
                             if kind == BrokerHandleKind::Pidfd {
-                                Some(BrokerHandleSnapshot { kind, handle_id })
+                                Some(BrokerHandleSnapshot {
+                                    kind,
+                                    handle_id,
+                                    pipe_direction: None,
+                                })
                             } else if let Some(releaser) = releaser_opt {
                                 match releaser.dup_handle(handle_id) {
                                     Ok(()) => {
@@ -7242,7 +7246,11 @@ impl<FS: ShimFS> Task<FS> {
                                             handle_id,
                                             kind,
                                         });
-                                        Some(BrokerHandleSnapshot { kind, handle_id })
+                                        Some(BrokerHandleSnapshot {
+                                            kind,
+                                            handle_id,
+                                            pipe_direction: None,
+                                        })
                                     }
                                     Err(_) => None,
                                 }
@@ -7271,7 +7279,7 @@ impl<FS: ShimFS> Task<FS> {
                         },
                     );
                     match entry_result {
-                        Some((kind, handle_id)) => {
+                        Some((kind, handle_id, direction)) => {
                             let releaser_opt: Option<
                                 alloc::sync::Arc<
                                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
@@ -7287,7 +7295,11 @@ impl<FS: ShimFS> Task<FS> {
                                             handle_id,
                                             kind,
                                         });
-                                        Some(BrokerHandleSnapshot { kind, handle_id })
+                                        Some(BrokerHandleSnapshot {
+                                            kind,
+                                            handle_id,
+                                            pipe_direction: Some(direction),
+                                        })
                                     }
                                     Err(_) => None,
                                 }

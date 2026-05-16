@@ -115,8 +115,14 @@ where
         );
     }
 
-    pub(crate) fn fork_snapshot_handle(&self) -> (BrokerHandleKind, u64) {
-        (BrokerHandleKind::Pipe, self.handle())
+    pub(crate) fn fork_snapshot_handle(
+        &self,
+    ) -> (
+        BrokerHandleKind,
+        u64,
+        litebox_common_linux::broker_pipe_provider::BrokerPipeEnd,
+    ) {
+        (BrokerHandleKind::Pipe, self.handle(), self.direction)
     }
 }
 

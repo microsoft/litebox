@@ -264,6 +264,11 @@ pub struct FdMetadataSnapshot {
 pub struct BrokerHandleSnapshot {
     pub kind: BrokerHandleKind,
     pub handle_id: u64,
+    /// For `BrokerHandleKind::Pipe`, the read/write direction. Required
+    /// so the fork-restore side can reconstruct the correct
+    /// `BrokerPipeEnd` capability. `None` for non-pipe kinds (which
+    /// don't carry a direction). C.5l.
+    pub pipe_direction: Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
 }
 
 /// Kind tag for [`BrokerHandleSnapshot`]. Mirrors a subset of
@@ -1107,6 +1112,13 @@ impl FdMetadataSnapshot {
                 w.write_u8(1);
                 w.write_u8(bh.kind.as_u8());
                 w.write_u64(bh.handle_id);
+                // C.5l: pipe direction. 0=None, 1=Read, 2=Write.
+                let dir_byte: u8 = match bh.pipe_direction {
+                    None => 0,
+                    Some(litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read) => 1,
+                    Some(litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write) => 2,
+                };
+                w.write_u8(dir_byte);
             }
             None => {
                 w.write_u8(0);
@@ -1130,7 +1142,23 @@ impl FdMetadataSnapshot {
                     SnapshotDeserializeError::InvalidEnum("BrokerHandleKind", kind_byte),
                 )?;
                 let handle_id = r.read_u64()?;
-                Some(BrokerHandleSnapshot { kind, handle_id })
+                let dir_byte = r.read_u8()?;
+                let pipe_direction = match dir_byte {
+                    0 => None,
+                    1 => Some(litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read),
+                    2 => Some(litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write),
+                    other => {
+                        return Err(SnapshotDeserializeError::InvalidEnum(
+                            "BrokerHandleSnapshot::pipe_direction",
+                            other,
+                        ));
+                    }
+                };
+                Some(BrokerHandleSnapshot {
+                    kind,
+                    handle_id,
+                    pipe_direction,
+                })
             }
             other => {
                 return Err(SnapshotDeserializeError::InvalidEnum(
