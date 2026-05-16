@@ -68,6 +68,24 @@ enum Scenario {
     /// propagation in the presence of an inner fork (rather than
     /// pidfd-specific code paths).
     InnerForkExit,
+    /// Same as `InnerForkExit` but the fork happens IN THE AGENT
+    /// PROCESS itself — no `std::process::Command::new(child_binary)`,
+    /// no cross-bt worker_exec, no `Stdio` capture machinery. Strips
+    /// the test down to: agent forks, child forks grandchild,
+    /// grandchild exits, child waitpids, child exits, agent reads
+    /// from the pipe expecting EOF. A failure here means the
+    /// broker-pipe EOF bug is pure inner-fork; a pass means the
+    /// bug specifically needs cross-bt to manifest.
+    InnerForkNoCommand,
+    /// Same shape as `InnerForkNoCommand` but the agent uses
+    /// `poll(POLLIN | POLLHUP, timeout)` instead of read. The test
+    /// passes if poll returns with `POLLHUP` (or any nonzero
+    /// revents) before the timeout. Isolates HUP-delivery (broker
+    /// → subscriber → pollee) from the read-after-HUP path. If
+    /// `inner_fork_no_command` hangs but `hup_only_poll` returns
+    /// POLLHUP, the read path has a bug. If both hang, the
+    /// subscription/HUP delivery is missing.
+    HupOnlyPoll,
 }
 
 impl Scenario {
@@ -85,6 +103,8 @@ impl Scenario {
             Self::DepthTwo => "depth_two",
             Self::SharedWriter => "shared_writer",
             Self::InnerForkExit => "inner_fork_exit",
+            Self::InnerForkNoCommand => "inner_fork_no_command",
+            Self::HupOnlyPoll => "hup_only_poll",
         }
     }
 }
@@ -102,6 +122,8 @@ const ALL_SCENARIOS: &[Scenario] = &[
     Scenario::DepthTwo,
     Scenario::SharedWriter,
     Scenario::InnerForkExit,
+    Scenario::InnerForkNoCommand,
+    Scenario::HupOnlyPoll,
 ];
 
 // ─── Handler protocol ──────────────────────────────────────────────
@@ -150,6 +172,8 @@ async fn handle_pxeof(
         Scenario::DepthTwo => run_depth_two(&args.child_bin, args.grandchild_bin.as_deref()),
         Scenario::SharedWriter => run_shared_writer(&args.child_bin),
         Scenario::InnerForkExit => run_inner_fork_exit(&args.child_bin),
+        Scenario::InnerForkNoCommand => run_inner_fork_no_command(),
+        Scenario::HupOnlyPoll => run_hup_only_poll(),
     };
     Ok(match r {
         Ok(detail) => PxeofOut {
@@ -614,6 +638,166 @@ fn run_inner_fork_exit(child_bin: &str) -> Result<String, String> {
         ));
     }
     Ok("inner-fork-exit: EOF observed, child exited cleanly".to_string())
+}
+
+/// In-process variant of `inner_fork_exit`. The agent itself
+/// creates a pipe, forks, the child forks a grandchild, grandchild
+/// exits, child waitpids, child exits. The agent reads from its
+/// kept read end and must observe EOF. No `std::process::Command`,
+/// no cross-bt worker_exec, no `Stdio` capture machinery — just
+/// `libc::pipe2` + `libc::fork` + `libc::waitpid` + the agent's
+/// own read loop.
+fn run_inner_fork_no_command() -> Result<String, String> {
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe2 initializes fds[] on success.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!("pipe2: {}", std::io::Error::last_os_error()));
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+
+    // SAFETY: this is the test agent doing a focused fork; no other
+    // threads are mutating state we care about.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err(format!("fork: {err}"));
+    }
+    if pid == 0 {
+        // CHILD: close read end (we only hold the writer).
+        unsafe { libc::close(read_fd) };
+        // Inner fork the grandchild.
+        let grandchild = unsafe { libc::fork() };
+        if grandchild < 0 {
+            unsafe { libc::close(write_fd) };
+            unsafe { libc::_exit(2) };
+        }
+        if grandchild == 0 {
+            // GRANDCHILD: exit immediately.
+            unsafe { libc::_exit(0) };
+        }
+        // CHILD waits for grandchild.
+        let _ = unsafe { libc::waitpid(grandchild, core::ptr::null_mut(), 0) };
+        // CHILD closes its writer and exits. Parent's read end is the
+        // last reference to the read side; once we close write_fd,
+        // parent should see EOF on read.
+        unsafe { libc::close(write_fd) };
+        unsafe { libc::_exit(0) };
+    }
+    // PARENT (agent process): close writer; read from read_fd expecting
+    // EOF after child exits.
+    unsafe { libc::close(write_fd) };
+    let mut received = Vec::new();
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let mut tmp = [0u8; 256];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            unsafe { libc::close(read_fd) };
+            return Err(format!("timeout after {} bytes, no EOF", received.len()));
+        }
+        let revents = wait_pollin_or_hup(read_fd, remaining.min(Duration::from_millis(500)))?;
+        if revents & (libc::POLLIN | libc::POLLHUP) as i16 == 0 {
+            continue;
+        }
+        // SAFETY: read_fd is owned by us; tmp is initialized.
+        let n = unsafe { libc::read(read_fd, tmp.as_mut_ptr().cast::<libc::c_void>(), tmp.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe { libc::close(read_fd) };
+            return Err(format!("read: {err}"));
+        }
+        if n == 0 {
+            // EOF.
+            break;
+        }
+        received.extend_from_slice(&tmp[..n as usize]);
+    }
+    unsafe { libc::close(read_fd) };
+    let mut status = 0i32;
+    let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if !received.is_empty() {
+        return Err(format!(
+            "expected empty stdout, got {} bytes",
+            received.len()
+        ));
+    }
+    Ok(format!(
+        "inner-fork-no-command: EOF observed (child status={status})"
+    ))
+}
+
+/// Like `inner_fork_no_command` but the agent uses ONLY
+/// `poll(POLLIN | POLLHUP, timeout)` — no read after the poll
+/// returns. Reports the observed revents. The test passes if
+/// poll returns with any of `POLLIN | POLLHUP` set before the
+/// timeout (HUP is the EOF signal; POLLIN with subsequent
+/// zero-byte read is the read-path EOF; this test specifically
+/// validates the broker → subscriber → pollee delivery path
+/// without the read syscall in the picture).
+fn run_hup_only_poll() -> Result<String, String> {
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe2 initializes fds[] on success.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!("pipe2: {}", std::io::Error::last_os_error()));
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+
+    // SAFETY: same constraints as run_inner_fork_no_command.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err(format!("fork: {err}"));
+    }
+    if pid == 0 {
+        unsafe { libc::close(read_fd) };
+        let grandchild = unsafe { libc::fork() };
+        if grandchild < 0 {
+            unsafe { libc::close(write_fd) };
+            unsafe { libc::_exit(2) };
+        }
+        if grandchild == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let _ = unsafe { libc::waitpid(grandchild, core::ptr::null_mut(), 0) };
+        unsafe { libc::close(write_fd) };
+        unsafe { libc::_exit(0) };
+    }
+    // PARENT.
+    unsafe { libc::close(write_fd) };
+    let revents = wait_pollin_or_hup(read_fd, READ_TIMEOUT)?;
+    unsafe { libc::close(read_fd) };
+    let mut status = 0i32;
+    let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if revents == 0 {
+        return Err("timeout waiting for POLLIN|POLLHUP (revents=0)".to_string());
+    }
+    let mut tags = Vec::new();
+    if revents & libc::POLLIN as i16 != 0 {
+        tags.push("POLLIN");
+    }
+    if revents & libc::POLLHUP as i16 != 0 {
+        tags.push("POLLHUP");
+    }
+    if revents & libc::POLLERR as i16 != 0 {
+        tags.push("POLLERR");
+    }
+    Ok(format!(
+        "hup-only-poll: revents={revents:#x} ({}) child_status={status}",
+        tags.join("|")
+    ))
 }
 
 // ─── Test registration ─────────────────────────────────────────────
