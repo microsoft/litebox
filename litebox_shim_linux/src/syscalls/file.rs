@@ -1558,6 +1558,25 @@ impl<FS: ShimFS> Task<FS> {
             return handle.with_entry(|file| file.read(buf));
         }
 
+        // Phase F: broker-backed socketpair early-dispatch.
+        // BrokerSocketPairSubsystem isn't routed through run_on_raw_fd
+        // (which would require adding a 9th closure to all 43 call
+        // sites). Handle it here before the generic dispatch.
+        if let Ok(spfd) =
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
+        {
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&spfd)
+                .ok_or(Errno::EBADF)?;
+            return handle.with_entry(|entry| entry.read(&self.wait_cx(), buf));
+        }
+
         if let Some(instance) = files.inotify_instances.lock().get(&raw_fd).cloned() {
             let (n, eventfd) = {
                 let mut state = instance.lock();
@@ -1754,6 +1773,22 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
+
+        // Phase F: broker-backed socketpair early-dispatch (mirror of sys_read).
+        if let Ok(spfd) =
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
+        {
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&spfd)
+                .ok_or(Errno::EBADF)?;
+            return handle.with_entry(|entry| entry.write(&self.wait_cx(), buf));
+        }
 
         let res = files
             .run_on_raw_fd(
@@ -2557,6 +2592,14 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) =
             rds.fd_consume_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+        {
+            drop(rds);
+            let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
+            drop(entry);
+            return Ok(());
+        }
+        if let Ok(fd) = rds
+            .fd_consume_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
         {
             drop(rds);
             let entry = self.global.litebox.descriptor_table_mut().remove(&fd);

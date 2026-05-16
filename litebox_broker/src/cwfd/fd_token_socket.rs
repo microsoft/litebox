@@ -156,6 +156,15 @@ fn update_tracker_from_response(
                 tracker.record_state(w);
             }
         }
+        Opcode::CreateSocketPair => {
+            // Phase F: response is (endpoint_a_id, endpoint_b_id) as 2 u64 LE.
+            if response.body.len() >= 16 {
+                let a = u64::from_le_bytes(response.body[..8].try_into().unwrap());
+                let b = u64::from_le_bytes(response.body[8..16].try_into().unwrap());
+                tracker.record_state(a);
+                tracker.record_state(b);
+            }
+        }
         Opcode::CreatePty => {
             if let Ok((master, slave, _flags)) = parse_create_pty_response_ok(&response.body) {
                 tracker.record_state(master);
@@ -568,6 +577,9 @@ fn handle_control_connection_inner(
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe
+                    | Opcode::CreateSocketPair
+                    | Opcode::ReadSocketPair
+                    | Opcode::WriteSocketPair
                     | Opcode::CreatePty
                     | Opcode::PtyRead
                     | Opcode::PtyWrite

@@ -187,8 +187,14 @@ fn docker_run_base_args() -> Vec<String> {
     //   - LITEBOX_EAGER_BROKER_PIPE=1: enable eager-broker sys_pipe2
     //     in the shim (gated to be off by default in the committed
     //     state; tests opt in per-invocation).
+    //   - LITEBOX_EAGER_BROKER_SOCKETPAIR=1: enable eager-broker
+    //     sys_socketpair for AF_UNIX SOCK_STREAM (Phase F; off by
+    //     default).
     // Add more LITEBOX_* gates here as they're introduced.
-    for var in ["LITEBOX_EAGER_BROKER_PIPE"] {
+    for var in [
+        "LITEBOX_EAGER_BROKER_PIPE",
+        "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+    ] {
         if let Ok(val) = std::env::var(var) {
             v.extend(["-e".to_string(), format!("{var}={val}")]);
         }
