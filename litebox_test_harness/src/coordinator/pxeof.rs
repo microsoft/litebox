@@ -86,6 +86,18 @@ enum Scenario {
     /// POLLHUP, the read path has a bug. If both hang, the
     /// subscription/HUP delivery is missing.
     HupOnlyPoll,
+    /// Cross-bt variant of `InnerForkExit` where the child binary
+    /// first WRITES a marker line to stdout, THEN does the inner
+    /// fork+waitpid+exit dance. The parent agent reads stdout and
+    /// expects to see the marker followed by EOF. Three possible
+    /// outcomes that pinpoint the bug:
+    /// - marker observed + EOF: works (passes).
+    /// - marker observed but timeout-no-EOF: cross-bt setup works,
+    ///   data flow works, but EOF doesn't propagate after inner
+    ///   fork (the C.5e shape — same as `InnerForkExit` failure
+    ///   mode but isolates that initial cross-bt write DOES flow).
+    /// - no marker: cross-bt initial setup is broken.
+    InnerForkWriteThenExit,
 }
 
 impl Scenario {
@@ -105,6 +117,7 @@ impl Scenario {
             Self::InnerForkExit => "inner_fork_exit",
             Self::InnerForkNoCommand => "inner_fork_no_command",
             Self::HupOnlyPoll => "hup_only_poll",
+            Self::InnerForkWriteThenExit => "inner_fork_write_then_exit",
         }
     }
 }
@@ -124,6 +137,7 @@ const ALL_SCENARIOS: &[Scenario] = &[
     Scenario::InnerForkExit,
     Scenario::InnerForkNoCommand,
     Scenario::HupOnlyPoll,
+    Scenario::InnerForkWriteThenExit,
 ];
 
 // ─── Handler protocol ──────────────────────────────────────────────
@@ -174,6 +188,7 @@ async fn handle_pxeof(
         Scenario::InnerForkExit => run_inner_fork_exit(&args.child_bin),
         Scenario::InnerForkNoCommand => run_inner_fork_no_command(),
         Scenario::HupOnlyPoll => run_hup_only_poll(),
+        Scenario::InnerForkWriteThenExit => run_inner_fork_write_then_exit(&args.child_bin),
     };
     Ok(match r {
         Ok(detail) => PxeofOut {
@@ -800,6 +815,50 @@ fn run_hup_only_poll() -> Result<String, String> {
     ))
 }
 
+/// Cross-bt narrowing: spawn child binary that WRITES a marker
+/// first, THEN does the inner-fork+waitpid+exit dance. The
+/// existing `InnerForkExit` test has the child write nothing, so
+/// failure conflates "data flow broken" with "EOF not propagated".
+/// This variant lets us see if data flows correctly before
+/// declaring an EOF bug.
+fn run_inner_fork_write_then_exit(child_bin: &str) -> Result<String, String> {
+    let mut cmd = Command::new(child_bin);
+    cmd.args(["pxeof-leaf", "ROLE=inner-fork-write-then-exit"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let mut out = child.stdout.take().ok_or("no stdout")?;
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&out);
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let received = read_to_eof_or_timeout(&mut out, fd, deadline);
+    drop(out);
+    let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+    let received = match received {
+        Ok(r) => r,
+        Err(e) => {
+            // Even on timeout, child may have exited normally — partial-read
+            // diagnostics tell us if data flow worked even though EOF didn't.
+            return Err(format!(
+                "read failed: {e}; child status={status:?}"
+            ));
+        }
+    };
+    if !status.success() {
+        return Err(format!("child exit non-zero: {status:?}"));
+    }
+    let text = String::from_utf8_lossy(&received);
+    if !text.contains("INNER_FORK_MARKER") {
+        return Err(format!(
+            "expected INNER_FORK_MARKER in stdout, got {} bytes: {text:?}",
+            received.len()
+        ));
+    }
+    Ok(format!(
+        "inner-fork-write-then-exit: marker observed + EOF; got {} bytes",
+        received.len()
+    ))
+}
+
 // ─── Test registration ─────────────────────────────────────────────
 
 /// Binary-type variants per scenario. `pie-glibc` is the same-bt
@@ -882,6 +941,7 @@ mod leaf_subcmd {
             "forward" => role_forward(args),
             "shared-writer-fork" => role_shared_writer_fork(),
             "inner-fork-exit" => role_inner_fork_exit(),
+            "inner-fork-write-then-exit" => role_inner_fork_write_then_exit(),
             other => {
                 eprintln!("pxeof-leaf: unknown ROLE={other}");
                 2
@@ -1106,6 +1166,41 @@ mod leaf_subcmd {
         }
         // Exit cleanly. We deliberately don't write to stdout — the
         // handler asserts on empty stdout + EOF.
+        0
+    }
+
+    /// Same as `role_inner_fork_exit` but writes a marker line to
+    /// stdout BEFORE forking. Lets the test handler distinguish
+    /// "cross-bt setup broken" (no marker) from "EOF not propagating
+    /// after inner fork" (marker observed but no EOF).
+    fn role_inner_fork_write_then_exit() -> i32 {
+        println!("INNER_FORK_MARKER");
+        // Flush stdout so the marker reaches the parent reader before
+        // any subsequent broker pipe state churn from the fork.
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        // SAFETY: fork() is async-signal-safe; child branch is
+        // _exit-only.
+        let grandchild = unsafe { libc::fork() };
+        if grandchild < 0 {
+            eprintln!(
+                "pxeof-leaf inner-fork-write-then-exit: fork failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if grandchild == 0 {
+            // SAFETY: _exit is async-signal-safe.
+            unsafe { libc::_exit(0) };
+        }
+        // SAFETY: waitpid on known pid.
+        let waited = unsafe { libc::waitpid(grandchild, core::ptr::null_mut(), 0) };
+        if waited != grandchild {
+            eprintln!(
+                "pxeof-leaf inner-fork-write-then-exit: waitpid returned {waited}"
+            );
+            return 1;
+        }
         0
     }
 
