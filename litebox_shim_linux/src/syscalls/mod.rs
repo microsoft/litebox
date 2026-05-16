@@ -13,7 +13,10 @@ pub(crate) mod guest_pid;
 /// calls this at bootstrap if a broker fd-token control socket is
 /// available; the shim consults the registered provider from
 /// `sys_eventfd2`.
-pub use broker_pipe::{broker_pipe_provider, set_broker_pipe_provider};
+pub use broker_pipe::{
+    broker_pipe_provider, eager_broker_pipe_enabled, set_broker_pipe_provider,
+    set_eager_broker_pipe_enabled,
+};
 pub use eventfd::broker_eventfd_provider;
 pub use eventfd::broker_pidfd_provider;
 pub use eventfd::broker_pty_provider;

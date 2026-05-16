@@ -4632,15 +4632,18 @@ impl<FS: ShimFS> Task<FS> {
             (f, flags.contains(OFlags::CLOEXEC))
         };
 
-        // Phase C.3 (WIP): eager-broker `sys_pipe2`. Disabled by default
-        // because activation regresses PB.* tests — pid 2 in coord's
-        // shim exits status 127 BEFORE `sys_execve` is even entered.
-        // Root cause not yet diagnosed; keep the codepath buildable by
-        // gating on an env var (`LITEBOX_EAGER_BROKER_PIPE`) so the
-        // structural scaffolding (provider, install path, bridge specs,
-        // subscribe direction fix) can land while the activation work
-        // is iterated on separately.
-        let eager_broker = false; // C.5d landed; eager off for committed state
+        // Phase C.3: eager-broker `sys_pipe2`. Gated on the runtime
+        // boolean `super::broker_pipe::eager_broker_pipe_enabled()`,
+        // which the runner sets from the env var
+        // `LITEBOX_EAGER_BROKER_PIPE=1` at startup. Default `false`
+        // keeps the committed state regression-clean while the
+        // legacy host-pipe-bridge code is phased out.
+        //
+        // When `true`, every guest `pipe2()` allocates a pair of
+        // broker-backed handles (one per end). The two
+        // `BrokerPipeFd`s each own one registry refcount and
+        // release on Drop.
+        let eager_broker = super::broker_pipe::eager_broker_pipe_enabled();
         if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
             let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
             // create_pipe returns two distinct broker state-registry

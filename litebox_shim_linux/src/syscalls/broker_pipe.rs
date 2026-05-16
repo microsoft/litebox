@@ -27,6 +27,35 @@ use super::fork_snapshot::BrokerHandleKind;
 static BROKER_PIPE_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPipeProvider>> =
     once_cell::race::OnceBox::new();
 
+/// C.5* follow-up: dynamic gate for the eager-broker `sys_pipe2`
+/// codepath, replacing the previous compile-time `let eager_broker
+/// = false` toggle. The runner sets this from the env var
+/// `LITEBOX_EAGER_BROKER_PIPE=1` at startup, before any guest
+/// `pipe2` can run. Default is `false` (legacy `Pipes<Platform>`
+/// fallback) to preserve regression-clean behavior in the
+/// committed state while eager-broker is iterated on.
+///
+/// Lives in `core::sync::atomic` because the shim is no_std and
+/// reads need to be lock-free from any guest syscall thread.
+static EAGER_BROKER_PIPE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Setter for [`EAGER_BROKER_PIPE_ENABLED`]. Called once at runner
+/// startup from `litebox_runner_linux_userland::run()` (and
+/// equivalents) after reading `LITEBOX_EAGER_BROKER_PIPE`. Idempotent;
+/// later calls overwrite the previous value (intended for tests
+/// that want to flip the gate mid-process).
+pub fn set_eager_broker_pipe_enabled(enabled: bool) {
+    EAGER_BROKER_PIPE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+/// Reader for [`EAGER_BROKER_PIPE_ENABLED`]. Hot path from
+/// `sys_pipe2`.
+#[inline]
+pub fn eager_broker_pipe_enabled() -> bool {
+    EAGER_BROKER_PIPE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub fn set_broker_pipe_provider(
     provider: Arc<dyn BrokerPipeProvider>,
 ) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerPipeProvider>>> {
