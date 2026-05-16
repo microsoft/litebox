@@ -3,15 +3,25 @@
 
 //! Broker-hosted pipe state.
 //!
-//! `PipeState` is the canonical readiness/refcount owner for a
-//! cross-worker pipe.  The data plane is broker-mediated for Phase C:
-//! workers issue read/write RPCs against the same state handle, and the
-//! broker wakes read-side subscribers with `IN|HUP` when data arrives or
-//! the last write end closes.
+//! A pipe is modeled as TWO state-registry entries that share an
+//! [`Arc<PipeInner>`]: a [`PipeReadEnd`] and a [`PipeWriteEnd`]. Each
+//! end is an independent [`StateObject`] with its own registry
+//! refcount and its own subscription list. The shim's `read fd` holds
+//! a handle to the read end; the `write fd` holds a handle to the
+//! write end. Read/write/subscribe/release operate on the specific
+//! end's handle — no direction parameter on the wire.
+//!
+//! This shape eliminates the per-end direction byte from
+//! `ClosePipeEnd` / `IncrefPipeEnd` / `SubscribePipe` /
+//! `UnsubscribePipeEnd` (deleted in the same change) and prevents
+//! cross-end subscription-id collisions: each end's subscription
+//! ids live in its own SubscriptionList namespace, so worker A's
+//! read sub id 1 and worker B's write sub id 1 don't share a
+//! `PipeState` to confuse the broker.
 
 use core::any::Any;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
@@ -23,23 +33,6 @@ use litebox_common_linux::notification_ring::NotificationSender;
 use crate::state_registry::StateObject;
 use crate::subscription_list::{SubscribeError, SubscriptionList, UnsubscribeError};
 
-/// Which end of a pipe an operation addresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipeEndKind {
-    Read,
-    Write,
-}
-
-impl PipeEndKind {
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::Read),
-            1 => Some(Self::Write),
-            _ => None,
-        }
-    }
-}
-
 /// Errors returned by pipe operations.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PipeError {
@@ -47,196 +40,200 @@ pub enum PipeError {
     WouldBlock,
     #[error("pipe peer is closed")]
     PeerClosed,
-    #[error("invalid pipe end")]
+    #[error("operation invalid for this pipe end")]
     InvalidEnd,
 }
 
 #[derive(Debug)]
-struct PipeInner {
+struct PipeBuffer {
     buf: VecDeque<u8>,
     capacity: usize,
-    read_open: bool,
-    write_open: bool,
 }
 
-/// Broker-hosted state for one unidirectional pipe.
+/// State shared between the two ends of one pipe.
+///
+/// Owned by both [`PipeReadEnd`] and [`PipeWriteEnd`] via `Arc`. Each
+/// end's [`Drop`] flips its corresponding `*_open` flag and notifies
+/// the *other* end's subscribers — that's how cross-worker EOF and
+/// EPIPE propagate when the last handle to one end is released by
+/// the state registry.
 #[derive(Debug)]
-pub struct PipeState {
-    inner: Mutex<PipeInner>,
+pub struct PipeInner {
+    buffer: Mutex<PipeBuffer>,
+    /// `false` once the read end's registry entry has been dropped
+    /// (the last worker released its read handle). Surfaces as
+    /// `NOTIFY_EVENT_ERR` on the write end's subject.
+    read_open: AtomicBool,
+    /// `false` once the write end's registry entry has been dropped.
+    /// Surfaces as `NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN` on the read
+    /// end's subject (the `IN` bit is the EOF wake-up — readers
+    /// blocked in `read` see a zero-byte read).
+    write_open: AtomicBool,
+    /// Linux `PIPE_BUF`. Writes whose `len <= atomic_write_size` are
+    /// atomic: they either fit entirely or return `WouldBlock`. Larger
+    /// writes may produce partial successes.
+    atomic_write_size: usize,
     read_subject: SubscriptionList,
     write_subject: SubscriptionList,
-    read_refcount: AtomicUsize,
-    write_refcount: AtomicUsize,
-    atomic_write_size: usize,
 }
 
-impl PipeState {
-    pub fn new(capacity: usize, atomic_write_size: usize) -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(PipeInner {
+impl PipeInner {
+    fn new(capacity: usize, atomic_write_size: usize) -> Self {
+        Self {
+            buffer: Mutex::new(PipeBuffer {
                 buf: VecDeque::with_capacity(capacity),
                 capacity,
-                read_open: true,
-                write_open: true,
             }),
+            read_open: AtomicBool::new(true),
+            write_open: AtomicBool::new(true),
+            atomic_write_size,
             read_subject: SubscriptionList::new(),
             write_subject: SubscriptionList::new(),
-            read_refcount: AtomicUsize::new(1),
-            write_refcount: AtomicUsize::new(1),
-            atomic_write_size,
-        })
-    }
-
-    pub fn incref_read_end(&self) {
-        self.read_refcount.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub fn incref_write_end(&self) {
-        self.write_refcount.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub fn decref_read_end(&self) {
-        if self.read_refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut inner = self.inner.lock().expect("PipeState poisoned");
-            inner.read_open = false;
-            drop(inner);
-            self.write_subject.notify(NOTIFY_EVENT_ERR);
         }
     }
 
-    pub fn decref_write_end(&self) {
-        if self.write_refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut inner = self.inner.lock().expect("PipeState poisoned");
-            inner.write_open = false;
-            drop(inner);
-            self.read_subject.notify(NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN);
-        }
+    fn read_open(&self) -> bool {
+        self.read_open.load(Ordering::Acquire)
     }
 
-    pub fn read(&self, max_len: usize) -> Result<Vec<u8>, PipeError> {
-        let mut inner = self.inner.lock().expect("PipeState poisoned");
+    fn write_open(&self) -> bool {
+        self.write_open.load(Ordering::Acquire)
+    }
+
+    fn read(&self, max_len: usize) -> Result<Vec<u8>, PipeError> {
         if max_len == 0 {
             return Ok(Vec::new());
         }
-        if inner.buf.is_empty() {
-            if !inner.write_open {
+        let mut buf = self.buffer.lock().expect("PipeInner poisoned");
+        if buf.buf.is_empty() {
+            if !self.write_open() {
                 return Ok(Vec::new());
             }
             return Err(PipeError::WouldBlock);
         }
-        let n = core::cmp::min(max_len, inner.buf.len());
+        let n = core::cmp::min(max_len, buf.buf.len());
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            out.push(inner.buf.pop_front().expect("length checked"));
+            out.push(buf.buf.pop_front().expect("length checked"));
         }
-        let events = current_events_unlocked(&inner);
-        drop(inner);
-        if events.write != 0 {
-            self.write_subject.notify(events.write);
+        let writable = buf.buf.len() < buf.capacity;
+        drop(buf);
+        if writable && self.write_open() {
+            self.write_subject.notify(NOTIFY_EVENT_OUT);
         }
         Ok(out)
     }
 
-    pub fn write(&self, bytes: &[u8]) -> Result<usize, PipeError> {
+    fn write(&self, bytes: &[u8]) -> Result<usize, PipeError> {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let mut inner = self.inner.lock().expect("PipeState poisoned");
-        if !inner.read_open {
+        if !self.read_open() {
             return Err(PipeError::PeerClosed);
         }
-        if !inner.write_open {
-            return Err(PipeError::InvalidEnd);
-        }
-        let vacant = inner.capacity.saturating_sub(inner.buf.len());
+        let mut buf = self.buffer.lock().expect("PipeInner poisoned");
+        let vacant = buf.capacity.saturating_sub(buf.buf.len());
         if vacant == 0 || (bytes.len() <= self.atomic_write_size && vacant < bytes.len()) {
             return Err(PipeError::WouldBlock);
         }
         let n = core::cmp::min(vacant, bytes.len());
-        inner.buf.extend(bytes[..n].iter().copied());
-        let events = current_events_unlocked(&inner);
-        drop(inner);
-        if events.read != 0 {
-            self.read_subject.notify(events.read);
+        buf.buf.extend(bytes[..n].iter().copied());
+        let has_data = !buf.buf.is_empty();
+        drop(buf);
+        if has_data {
+            self.read_subject.notify(NOTIFY_EVENT_IN);
         }
         Ok(n)
     }
 
-    pub fn current_events(&self, end: PipeEndKind) -> u32 {
-        let inner = self.inner.lock().expect("PipeState poisoned");
-        let events = current_events_unlocked(&inner);
-        match end {
-            PipeEndKind::Read => events.read,
-            PipeEndKind::Write => events.write,
+    fn current_read_end_events(&self) -> u32 {
+        let buf = self.buffer.lock().expect("PipeInner poisoned");
+        let mut events = 0;
+        if !buf.buf.is_empty() {
+            events |= NOTIFY_EVENT_IN;
         }
+        if !self.write_open() {
+            events |= NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN;
+        }
+        events
     }
 
-    pub fn subscribe_end(
-        &self,
-        end: PipeEndKind,
-        subscription_id: u64,
-        events_mask: u32,
-        sender: Arc<Mutex<NotificationSender>>,
-    ) -> Result<(), SubscribeError> {
-        let now = self.current_events(end);
-        let list = match end {
-            PipeEndKind::Read => &self.read_subject,
-            PipeEndKind::Write => &self.write_subject,
-        };
-        list.add(subscription_id, events_mask, sender)?;
-        if now & events_mask != 0 {
-            list.notify(now);
+    fn current_write_end_events(&self) -> u32 {
+        let buf = self.buffer.lock().expect("PipeInner poisoned");
+        let mut events = 0;
+        if !self.read_open() {
+            events |= NOTIFY_EVENT_ERR;
+        } else if buf.buf.len() < buf.capacity {
+            events |= NOTIFY_EVENT_OUT;
         }
-        Ok(())
-    }
-
-    pub fn unsubscribe_end(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
-        if self.read_subject.remove(subscription_id).is_ok() {
-            return Ok(());
-        }
-        self.write_subject.remove(subscription_id)
-    }
-
-    /// Direction-aware unsubscribe. Use this from the broker pipe
-    /// service for `UnsubscribePipeEnd`. The kind-agnostic
-    /// `unsubscribe_end` above checks `read_subject` first and would
-    /// silently strip the wrong subject if a peer worker's
-    /// subscription on the *other* end happens to share this id.
-    pub fn unsubscribe_end_specific(
-        &self,
-        end: PipeEndKind,
-        subscription_id: u64,
-    ) -> Result<(), UnsubscribeError> {
-        match end {
-            PipeEndKind::Read => self.read_subject.remove(subscription_id),
-            PipeEndKind::Write => self.write_subject.remove(subscription_id),
-        }
+        events
     }
 }
 
-struct ReadyEvents {
-    read: u32,
-    write: u32,
+/// Creates a new pipe and returns its two ends. Each end is meant to
+/// be registered into the [`BrokerStateRegistry`] independently — the
+/// registry refcount of each end represents the number of worker
+/// `BrokerPipeFd` instances referring to it.
+pub fn new_pipe(
+    capacity: usize,
+    atomic_write_size: usize,
+) -> (Arc<PipeReadEnd>, Arc<PipeWriteEnd>) {
+    let inner = Arc::new(PipeInner::new(capacity, atomic_write_size));
+    let read_end = Arc::new(PipeReadEnd {
+        inner: Arc::clone(&inner),
+    });
+    let write_end = Arc::new(PipeWriteEnd { inner });
+    (read_end, write_end)
 }
 
-fn current_events_unlocked(inner: &PipeInner) -> ReadyEvents {
-    let mut read = 0;
-    let mut write = 0;
-    if !inner.buf.is_empty() {
-        read |= NOTIFY_EVENT_IN;
-    }
-    if !inner.write_open {
-        read |= NOTIFY_EVENT_HUP;
-    }
-    if !inner.read_open {
-        write |= NOTIFY_EVENT_ERR;
-    } else if inner.write_open && inner.buf.len() < inner.capacity {
-        write |= NOTIFY_EVENT_OUT;
-    }
-    ReadyEvents { read, write }
+/// Broker-hosted read end of one pipe. Independent [`StateObject`]:
+/// the registry tracks its refcount, and when that refcount hits zero
+/// the underlying entry is dropped — [`PipeReadEnd::drop`] flips
+/// `read_open=false` on the shared [`PipeInner`] and wakes the write
+/// end's subscribers with `NOTIFY_EVENT_ERR` (EPIPE).
+#[derive(Debug)]
+pub struct PipeReadEnd {
+    pub(crate) inner: Arc<PipeInner>,
 }
 
-impl StateObject for PipeState {
+/// Broker-hosted write end. Symmetric to [`PipeReadEnd`]; drop fires
+/// `NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN` on the read end's subject
+/// (the `IN` bit is the EOF wake — readers blocked in `read` see a
+/// zero-byte read returned).
+#[derive(Debug)]
+pub struct PipeWriteEnd {
+    pub(crate) inner: Arc<PipeInner>,
+}
+
+impl PipeReadEnd {
+    pub fn read(&self, max_len: usize) -> Result<Vec<u8>, PipeError> {
+        self.inner.read(max_len)
+    }
+}
+
+impl PipeWriteEnd {
+    pub fn write(&self, bytes: &[u8]) -> Result<usize, PipeError> {
+        self.inner.write(bytes)
+    }
+}
+
+impl Drop for PipeReadEnd {
+    fn drop(&mut self) {
+        self.inner.read_open.store(false, Ordering::Release);
+        self.inner.write_subject.notify(NOTIFY_EVENT_ERR);
+    }
+}
+
+impl Drop for PipeWriteEnd {
+    fn drop(&mut self) {
+        self.inner.write_open.store(false, Ordering::Release);
+        self.inner
+            .read_subject
+            .notify(NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN);
+    }
+}
+
+impl StateObject for PipeReadEnd {
     fn subsystem_tag(&self) -> SubsystemTag {
         SubsystemTag::Pipe
     }
@@ -251,10 +248,47 @@ impl StateObject for PipeState {
         events_mask: u32,
         sender: Arc<Mutex<NotificationSender>>,
     ) -> Result<(), SubscribeError> {
-        self.subscribe_end(PipeEndKind::Read, subscription_id, events_mask, sender)
+        let now = self.inner.current_read_end_events();
+        self.inner
+            .read_subject
+            .add(subscription_id, events_mask, sender)?;
+        if now & events_mask != 0 {
+            self.inner.read_subject.notify(now);
+        }
+        Ok(())
     }
 
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
-        self.unsubscribe_end(subscription_id)
+        self.inner.read_subject.remove(subscription_id)
+    }
+}
+
+impl StateObject for PipeWriteEnd {
+    fn subsystem_tag(&self) -> SubsystemTag {
+        SubsystemTag::Pipe
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn subscribe(
+        &self,
+        subscription_id: u64,
+        events_mask: u32,
+        sender: Arc<Mutex<NotificationSender>>,
+    ) -> Result<(), SubscribeError> {
+        let now = self.inner.current_write_end_events();
+        self.inner
+            .write_subject
+            .add(subscription_id, events_mask, sender)?;
+        if now & events_mask != 0 {
+            self.inner.write_subject.notify(now);
+        }
+        Ok(())
+    }
+
+    fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
+        self.inner.write_subject.remove(subscription_id)
     }
 }

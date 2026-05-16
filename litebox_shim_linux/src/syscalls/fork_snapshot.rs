@@ -264,6 +264,11 @@ pub struct FdMetadataSnapshot {
 pub struct BrokerHandleSnapshot {
     pub kind: BrokerHandleKind,
     pub handle_id: u64,
+    /// For `BrokerHandleKind::Pipe`, the read/write direction. Required
+    /// so the fork-restore side can reconstruct the correct
+    /// `BrokerPipeEnd` capability. `None` for non-pipe kinds (which
+    /// don't carry a direction). C.5l.
+    pub pipe_direction: Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
 }
 
 /// Kind tag for [`BrokerHandleSnapshot`]. Mirrors a subset of
@@ -664,6 +669,22 @@ pub struct SnapshotReader<'a> {
 impl<'a> SnapshotReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
+    }
+
+    /// Returns `true` iff every byte of the underlying buffer has
+    /// been consumed. Useful in round-trip tests for catching
+    /// trailing-byte bugs (e.g., a writer emitting more bytes than
+    /// the reader consumes for the same logical message).
+    #[must_use]
+    pub fn is_at_end(&self) -> bool {
+        self.pos == self.data.len()
+    }
+
+    /// Returns the number of bytes remaining to be read. Used in
+    /// diagnostic messages alongside `is_at_end`.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], SnapshotDeserializeError> {
@@ -1107,6 +1128,13 @@ impl FdMetadataSnapshot {
                 w.write_u8(1);
                 w.write_u8(bh.kind.as_u8());
                 w.write_u64(bh.handle_id);
+                // C.5l: pipe direction. 0=None, 1=Read, 2=Write.
+                let dir_byte: u8 = match bh.pipe_direction {
+                    None => 0,
+                    Some(litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read) => 1,
+                    Some(litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write) => 2,
+                };
+                w.write_u8(dir_byte);
             }
             None => {
                 w.write_u8(0);
@@ -1130,7 +1158,23 @@ impl FdMetadataSnapshot {
                     SnapshotDeserializeError::InvalidEnum("BrokerHandleKind", kind_byte),
                 )?;
                 let handle_id = r.read_u64()?;
-                Some(BrokerHandleSnapshot { kind, handle_id })
+                let dir_byte = r.read_u8()?;
+                let pipe_direction = match dir_byte {
+                    0 => None,
+                    1 => Some(litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read),
+                    2 => Some(litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write),
+                    other => {
+                        return Err(SnapshotDeserializeError::InvalidEnum(
+                            "BrokerHandleSnapshot::pipe_direction",
+                            other,
+                        ));
+                    }
+                };
+                Some(BrokerHandleSnapshot {
+                    kind,
+                    handle_id,
+                    pipe_direction,
+                })
             }
             other => {
                 return Err(SnapshotDeserializeError::InvalidEnum(
@@ -1997,6 +2041,7 @@ mod tests {
         meta.broker_handle = Some(BrokerHandleSnapshot {
             kind: BrokerHandleKind::Pidfd,
             handle_id: 0x1234_5678_9ABC_DEF0,
+            pipe_direction: None,
         });
         let mut w = SnapshotWriter::new();
         meta.write(&mut w);
@@ -2006,6 +2051,105 @@ mod tests {
         let bh = restored.broker_handle.expect("broker_handle preserved");
         assert_eq!(bh.kind, BrokerHandleKind::Pidfd);
         assert_eq!(bh.handle_id, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(bh.pipe_direction, None);
+    }
+
+    /// C.5l follow-up: exhaustive enumerate-and-round-trip for the
+    /// `BrokerHandleSnapshot` wire format. Exercises every
+    /// `(BrokerHandleKind, pipe_direction)` combination plus a range
+    /// of `handle_id` boundary values. Any future addition to
+    /// `BrokerHandleKind` or `BrokerPipeEnd` (or any new field on
+    /// `BrokerHandleSnapshot`) will fail to compile here unless
+    /// every variant is exercised, catching the silent-fall-through
+    /// shape that caused C.5l.
+    #[test]
+    fn broker_handle_snapshot_round_trip_property() {
+        use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
+
+        // Cover every kind. Compile-time exhaustiveness check via match
+        // ensures any new variant fails-to-compile here.
+        let all_kinds: alloc::vec::Vec<BrokerHandleKind> = {
+            let kinds = alloc::vec![
+                BrokerHandleKind::Pidfd,
+                BrokerHandleKind::Eventfd,
+                BrokerHandleKind::Signalfd,
+                BrokerHandleKind::Pty,
+                BrokerHandleKind::Pipe,
+            ];
+            for k in &kinds {
+                // Force the match to be exhaustive — adding a new
+                // variant will fail to compile here.
+                match k {
+                    BrokerHandleKind::Pidfd
+                    | BrokerHandleKind::Eventfd
+                    | BrokerHandleKind::Signalfd
+                    | BrokerHandleKind::Pty
+                    | BrokerHandleKind::Pipe => {}
+                }
+            }
+            kinds
+        };
+        let all_pipe_directions: alloc::vec::Vec<Option<BrokerPipeEnd>> = {
+            let dirs = alloc::vec![None, Some(BrokerPipeEnd::Read), Some(BrokerPipeEnd::Write)];
+            for d in &dirs {
+                match d {
+                    None => {}
+                    Some(BrokerPipeEnd::Read) | Some(BrokerPipeEnd::Write) => {}
+                }
+            }
+            dirs
+        };
+        // Boundary handle_ids: smallest, largest, alternating-bit
+        // patterns to catch endianness or sign-extension bugs.
+        let handle_ids: &[u64] = &[
+            0,
+            1,
+            0xFF,
+            0xFFFF,
+            0x1234_5678_9ABC_DEF0,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+            u64::MAX,
+        ];
+
+        let mut total_cases = 0;
+        for kind in &all_kinds {
+            for dir in &all_pipe_directions {
+                for &id in handle_ids {
+                    let original = BrokerHandleSnapshot {
+                        kind: *kind,
+                        handle_id: id,
+                        pipe_direction: *dir,
+                    };
+                    // Wrap in FdMetadataSnapshot which owns the
+                    // serialization machinery.
+                    let mut meta = FdMetadataSnapshot::default();
+                    meta.broker_handle = Some(original);
+                    let mut w = SnapshotWriter::new();
+                    meta.write(&mut w);
+                    let bytes = w.into_bytes();
+                    let mut r = SnapshotReader::new(&bytes);
+                    let restored = FdMetadataSnapshot::read(&mut r)
+                        .expect("BrokerHandleSnapshot round-trip read failed");
+                    let restored_bh = restored
+                        .broker_handle
+                        .expect("broker_handle should be preserved through round-trip");
+                    assert_eq!(
+                        restored_bh, original,
+                        "BrokerHandleSnapshot round-trip mismatch for {original:?}"
+                    );
+                    // SnapshotReader should have consumed exactly the
+                    // bytes written — no extra padding.
+                    assert!(
+                        r.is_at_end(),
+                        "SnapshotReader has unread bytes after round-trip for {original:?}"
+                    );
+                    total_cases += 1;
+                }
+            }
+        }
+        // 5 kinds × 3 dir options × 8 ids = 120 cases.
+        assert_eq!(total_cases, 120, "expected to cover 120 combinations");
     }
 
     #[test]
@@ -2020,6 +2164,7 @@ mod tests {
             meta.broker_handle = Some(BrokerHandleSnapshot {
                 kind,
                 handle_id: 42,
+                pipe_direction: None,
             });
             let mut w = SnapshotWriter::new();
             meta.write(&mut w);

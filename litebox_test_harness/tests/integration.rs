@@ -181,6 +181,18 @@ fn docker_run_base_args() -> Vec<String> {
     // Capture detailed Rust panic backtraces for diagnostics; harmless
     // when nothing panics.
     v.extend(["-e".to_string(), "RUST_BACKTRACE=full".to_string()]);
+    // C.5* follow-up: forward selected LITEBOX_* env vars into the
+    // container so test invocations can flip runtime gates without a
+    // rebuild. Currently:
+    //   - LITEBOX_EAGER_BROKER_PIPE=1: enable eager-broker sys_pipe2
+    //     in the shim (gated to be off by default in the committed
+    //     state; tests opt in per-invocation).
+    // Add more LITEBOX_* gates here as they're introduced.
+    for var in ["LITEBOX_EAGER_BROKER_PIPE"] {
+        if let Ok(val) = std::env::var(var) {
+            v.extend(["-e".to_string(), format!("{var}={val}")]);
+        }
+    }
     v.extend([
         "--cap-add".to_string(),
         "SYS_PTRACE".to_string(),
@@ -764,21 +776,29 @@ fn ensure_binaries_built(ws_root: &Path) {
     let td_str = td.to_string_lossy();
 
     eprintln!("Building litebox binaries (PIE-glibc) to {td_str}...");
+    let mut build_args: Vec<&str> = vec![
+        "build",
+        "--target-dir",
+        &td_str,
+        "-p",
+        "litebox_tool_executor",
+        "-p",
+        "litebox_broker",
+        "-p",
+        "litebox_runner_linux_userland",
+        "-p",
+        "litebox_test_harness",
+    ];
+    let trace_feature_runner;
+    if std::env::var("LITEBOX_TRACE_SYSCALLS").is_ok() {
+        trace_feature_runner =
+            String::from("litebox_runner_linux_userland/trace_syscalls");
+        build_args.push("--features");
+        build_args.push(&trace_feature_runner);
+    }
     let status = Command::new("cargo")
         .current_dir(ws_root)
-        .args([
-            "build",
-            "--target-dir",
-            &td_str,
-            "-p",
-            "litebox_tool_executor",
-            "-p",
-            "litebox_broker",
-            "-p",
-            "litebox_runner_linux_userland",
-            "-p",
-            "litebox_test_harness",
-        ])
+        .args(&build_args)
         .status()
         .expect("cargo build");
     assert!(status.success(), "cargo build (PIE-glibc) failed");

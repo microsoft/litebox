@@ -7233,7 +7233,11 @@ impl<FS: ShimFS> Task<FS> {
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
                             };
                             if kind == BrokerHandleKind::Pidfd {
-                                Some(BrokerHandleSnapshot { kind, handle_id })
+                                Some(BrokerHandleSnapshot {
+                                    kind,
+                                    handle_id,
+                                    pipe_direction: None,
+                                })
                             } else if let Some(releaser) = releaser_opt {
                                 match releaser.dup_handle(handle_id) {
                                     Ok(()) => {
@@ -7242,7 +7246,11 @@ impl<FS: ShimFS> Task<FS> {
                                             handle_id,
                                             kind,
                                         });
-                                        Some(BrokerHandleSnapshot { kind, handle_id })
+                                        Some(BrokerHandleSnapshot {
+                                            kind,
+                                            handle_id,
+                                            pipe_direction: None,
+                                        })
                                     }
                                     Err(_) => None,
                                 }
@@ -7271,7 +7279,7 @@ impl<FS: ShimFS> Task<FS> {
                         },
                     );
                     match entry_result {
-                        Some((kind, handle_id)) => {
+                        Some((kind, handle_id, direction)) => {
                             let releaser_opt: Option<
                                 alloc::sync::Arc<
                                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
@@ -7287,7 +7295,11 @@ impl<FS: ShimFS> Task<FS> {
                                             handle_id,
                                             kind,
                                         });
-                                        Some(BrokerHandleSnapshot { kind, handle_id })
+                                        Some(BrokerHandleSnapshot {
+                                            kind,
+                                            handle_id,
+                                            pipe_direction: Some(direction),
+                                        })
                                     }
                                     Err(_) => None,
                                 }
@@ -9162,48 +9174,34 @@ impl<FS: ShimFS> Task<FS> {
                     },
                 );
                 drop(dt_local);
-                if let (Some(provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
-                    let releaser: alloc::sync::Arc<
-                        dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-                    > = alloc::sync::Arc::clone(&provider) as _;
-                    // Phase C.5: emit-side per-end refcount bump.
+                if let (Some(_provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
+                    // C.5j: emit-side dup_handle removed. Previously
+                    // `releaser.dup_handle(handle_id)` here bumped the
+                    // broker rc to "ship the ref over" to worker B;
+                    // worker B's install just attached without
+                    // bumping. That left the +1 untracked on any
+                    // connection, so SIGKILL of worker B leaked the
+                    // ref forever (PXEOF.signal_kill cross-bt
+                    // failures).
                     //
-                    // After we spawn the new worker, the child task in this
-                    // parent worker is torn down, which drops the child's
-                    // fd table; each BrokerPipeFd's `on_close` calls
-                    // `close_pipe_end(handle, direction)`, decrementing the
-                    // broker pipe's per-end refcount. If the per-end count
-                    // hits zero mid-migration, the broker marks the end
-                    // closed and the new worker's read/write of the same
-                    // pipe gets EPIPE / EOF — what was symptomatic on
-                    // `PB.*.nonpie-glibc.dpg1` and other cross-binary-type
-                    // legs.
+                    // Now worker B's `install_broker_bridge_fd` calls
+                    // `dup_handle` itself, so the +1 is tracked on
+                    // worker B's connection and the broker's per-
+                    // connection cleanup on disconnect can release
+                    // it. The emit side just enumerates the spec.
                     //
-                    // Balance the drop with an `incref_pipe_end` here.
-                    // `dup_handle` covers the registry refcount for the
-                    // transit ref; `incref_pipe_end` covers the per-end
-                    // refcount so write_open / read_open stay true while
-                    // the migration is in flight. The install side does
-                    // NOT incref (its on_close is balanced by the eventual
-                    // close in the new worker, which is one end-refcount
-                    // we're handing off via this incref).
-                    let dup_ok = releaser.dup_handle(handle_id).is_ok();
-                    let incref_ok =
-                        dup_ok && provider.incref_pipe_end(handle_id, direction).is_ok();
-                    if !incref_ok && dup_ok {
-                        releaser.release(handle_id);
-                    }
-                    if incref_ok {
-                        // Phase C.3 spec format: `fd:pipe:handle_id:r|w`.
-                        // Direction is critical for the receiver to pick
-                        // the right end when constructing the BrokerPipeFd.
+                    // Race note: the placeholder shim task in worker
+                    // A is blocked in `wait_worker_host` from
+                    // spawn-time until worker B exits, so its fd's
+                    // BrokerPipeFd keeps the rc alive in the gap
+                    // between worker B startup and its install call.
+                    {
                         let dir_char = match direction {
                             litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
                             litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
                         };
                         broker_eventfd_specs
                             .push(alloc::format!("{raw_fd}:pipe:{handle_id}:{dir_char}"));
-                        broker_eventfd_transit_release.push((releaser, handle_id));
                     }
                 }
             }

@@ -24,20 +24,19 @@
 
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
-    build_close_pipe_end_request, build_create_eventfd_request, build_create_pidfd_request,
-    build_create_pipe_request, build_create_pty_request, build_create_signalfd_request,
-    build_incref_pipe_end_request, build_mark_process_exited_request, build_materialize_request,
-    build_pidfd_exited_request, build_pty_ioctl_request, build_pty_read_request,
-    build_pty_write_request, build_read_eventfd_request, build_read_pipe_request,
-    build_read_siginfo_request, build_register_notification_ring_request,
+    build_create_eventfd_request, build_create_pidfd_request, build_create_pipe_request,
+    build_create_pty_request, build_create_signalfd_request, build_mark_process_exited_request,
+    build_materialize_request, build_pidfd_exited_request, build_pty_ioctl_request,
+    build_pty_read_request, build_pty_write_request, build_read_eventfd_request,
+    build_read_pipe_request, build_read_siginfo_request, build_register_notification_ring_request,
     build_register_process_request, build_register_request, build_release_request,
-    build_subscribe_eventfd_request, build_subscribe_pipe_request,
-    build_subscribe_process_exit_request, build_subscribe_pty_request, build_unsubscribe_request,
-    build_write_eventfd_request, build_write_pipe_request, decode, parse_create_pidfd_response_ok,
-    parse_create_pty_response_ok, parse_handle_body, parse_pidfd_exited_response_ok,
-    parse_pty_ioctl_response_body, parse_pty_read_response_body, parse_pty_write_response_ok,
-    parse_read_pipe_response_body, parse_read_siginfo_response_body,
-    parse_subscribe_process_exit_response_ok, parse_write_pipe_response_ok,
+    build_subscribe_eventfd_request, build_subscribe_process_exit_request,
+    build_subscribe_pty_request, build_unsubscribe_request, build_write_eventfd_request,
+    build_write_pipe_request, decode, parse_create_pidfd_response_ok, parse_create_pty_response_ok,
+    parse_handle_body, parse_pidfd_exited_response_ok, parse_pty_ioctl_response_body,
+    parse_pty_read_response_body, parse_pty_write_response_ok, parse_read_pipe_response_body,
+    parse_read_siginfo_response_body, parse_subscribe_process_exit_response_ok,
+    parse_write_pipe_response_ok,
 };
 use std::format;
 use std::io;
@@ -577,7 +576,11 @@ impl FdTokenClient {
 
     /// Asks the broker to create a pipe state. The returned handle starts
     /// with one read-end ref and one write-end ref.
-    pub fn create_pipe(&self, capacity: u64, atomic_write_size: u64) -> Result<u64, ClientError> {
+    pub fn create_pipe(
+        &self,
+        capacity: u64,
+        atomic_write_size: u64,
+    ) -> Result<(u64, u64), ClientError> {
         let stream = self.lock();
         send_frame(
             &stream,
@@ -593,9 +596,8 @@ impl FdTokenClient {
             });
         }
         match resp.status {
-            StatusCode::Ok => {
-                parse_handle_body(resp.body, resp.opcode).map_err(ClientError::Protocol)
-            }
+            StatusCode::Ok => crate::fd_token_protocol::parse_create_pipe_response_body(resp.body)
+                .map_err(ClientError::Protocol),
             s => Err(map_status_no_handle(resp.opcode, s)),
         }
     }
@@ -643,84 +645,24 @@ impl FdTokenClient {
         }
     }
 
-    pub fn subscribe_pipe(
-        &self,
-        handle_id: u64,
-        subscription_id: u64,
-        events_mask: u32,
-        end: u8,
-    ) -> Result<(), ClientError> {
-        let stream = self.lock();
-        send_frame(
-            &stream,
-            &build_subscribe_pipe_request(handle_id, subscription_id, events_mask, end),
-            None,
-        )?;
-        let (resp_bytes, attached) = recv_frame(&stream)?;
-        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
-        check_opcode(&resp, Opcode::SubscribePipeResponse)?;
-        if attached.is_some() {
-            return Err(ClientError::UnexpectedFdAttachment {
-                opcode: resp.opcode,
-            });
-        }
-        match resp.status {
-            StatusCode::Ok => Ok(()),
-            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
-            StatusCode::DuplicateSubscription => {
-                Err(ClientError::DuplicateSubscription(subscription_id))
-            }
-            StatusCode::NoNotificationRing => Err(ClientError::NoNotificationRing),
-            StatusCode::SubsystemMismatch => Err(ClientError::SubsystemMismatch),
-            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
-        }
-    }
-
-    pub fn incref_pipe_end(&self, handle_id: u64, end: u8) -> Result<(), ClientError> {
-        let stream = self.lock();
-        send_frame(
-            &stream,
-            &build_incref_pipe_end_request(handle_id, end),
-            None,
-        )?;
-        let (resp_bytes, attached) = recv_frame(&stream)?;
-        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
-        check_opcode(&resp, Opcode::IncrefPipeEndResponse)?;
-        if attached.is_some() {
-            return Err(ClientError::UnexpectedFdAttachment {
-                opcode: resp.opcode,
-            });
-        }
-        match resp.status {
-            StatusCode::Ok => Ok(()),
-            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
-            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
-        }
-    }
-
-    pub fn close_pipe_end(&self, handle_id: u64, end: u8) -> Result<(), ClientError> {
-        let stream = self.lock();
-        send_frame(&stream, &build_close_pipe_end_request(handle_id, end), None)?;
-        let (resp_bytes, attached) = recv_frame(&stream)?;
-        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
-        check_opcode(&resp, Opcode::ClosePipeEndResponse)?;
-        if attached.is_some() {
-            return Err(ClientError::UnexpectedFdAttachment {
-                opcode: resp.opcode,
-            });
-        }
-        match resp.status {
-            StatusCode::Ok => Ok(()),
-            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
-            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
-        }
-    }
-
     /// Registers a subscription on an eventfd handle, bound to this
     /// worker's notification ring. The broker will push frames with
     /// `subscription_id` and the matched events bits whenever state
     /// changes match.
     pub fn subscribe_eventfd(
+        &self,
+        handle_id: u64,
+        subscription_id: u64,
+        events_mask: u32,
+    ) -> Result<(), ClientError> {
+        self.subscribe(handle_id, subscription_id, events_mask)
+    }
+
+    /// Generic subscribe. Reuses the `SubscribeEventfd` opcode (which
+    /// the broker handles via the kind-agnostic `StateObject::subscribe`
+    /// trait method), so it works for any broker state-object kind:
+    /// eventfd, pidfd, pipe read/write end, pty.
+    pub fn subscribe(
         &self,
         handle_id: u64,
         subscription_id: u64,
@@ -758,44 +700,6 @@ impl FdTokenClient {
         let (resp_bytes, _) = recv_frame(&stream)?;
         let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
         check_opcode(&resp, Opcode::UnsubscribeResponse)?;
-        match resp.status {
-            StatusCode::Ok => Ok(()),
-            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
-            StatusCode::UnknownSubscription => {
-                Err(ClientError::UnknownSubscription(subscription_id))
-            }
-            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
-        }
-    }
-
-    /// Direction-aware unsubscribe for broker pipes. The kind-agnostic
-    /// `unsubscribe` above asks the broker to remove a subscription by
-    /// id, but for pipes the same id can exist on both `read_subject`
-    /// and `write_subject` (subscription ids are worker-local and the
-    /// broker's `PipeState` shares the id space across both ends). The
-    /// broker would then strip the wrong subject (`read_subject` is
-    /// checked first by `PipeState::unsubscribe_end`), silently
-    /// stealing a peer worker's read subscription. The direction-aware
-    /// path tells the broker which subject to remove from.
-    pub fn unsubscribe_pipe_end(
-        &self,
-        handle_id: u64,
-        end: u8,
-        subscription_id: u64,
-    ) -> Result<(), ClientError> {
-        let stream = self.lock();
-        send_frame(
-            &stream,
-            &crate::fd_token_protocol::build_unsubscribe_pipe_end_request(
-                handle_id,
-                subscription_id,
-                end,
-            ),
-            None,
-        )?;
-        let (resp_bytes, _) = recv_frame(&stream)?;
-        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
-        check_opcode(&resp, Opcode::UnsubscribePipeEndResponse)?;
         match resp.status {
             StatusCode::Ok => Ok(()),
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),

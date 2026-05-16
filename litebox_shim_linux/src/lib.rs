@@ -275,6 +275,22 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             BrokerHandleKind::Pipe => {
                 let provider = syscalls::broker_pipe::broker_pipe_provider().ok_or(())?;
                 let direction = pipe_direction.ok_or(())?;
+                // C.5j: explicitly dup_handle on THIS worker's broker
+                // connection so the per-connection ref tracker in
+                // `litebox_broker::fd_token_socket` records our
+                // ownership. Without this, the cross-bt fork-snapshot
+                // transfer leaks the inherited refcount when the
+                // worker is SIGKILL'd: the BrokerPipeFd's on_close
+                // (which calls `release`) never fires, and there's no
+                // per-connection record on the broker for the
+                // disconnect cleanup to find. Paired with removal of
+                // the emit-side transit dup_handle in
+                // exec_on_remote_host so net rc change across the
+                // migration stays at 0.
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(handle_id);
                 let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
                     provider,
                     handle_id,
@@ -296,7 +312,22 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 );
                 Ok(())
             }
-            BrokerHandleKind::Signalfd | BrokerHandleKind::Pty => Err(()),
+            // C.5l guardrail: Signalfd / Pty are accepted by the
+            // emit-side fork-snapshot code, but the install side
+            // here has no implementation. Returning `Err(())` was
+            // historically a silent skip (caller logs at the
+            // runner level but no early panic). Make it a hard
+            // failure so a snapshot carrying one of these kinds
+            // crashes loudly instead of leaking broker refs and
+            // stalling readers.
+            BrokerHandleKind::Signalfd => todo!(
+                "install_broker_bridge_fd for BrokerHandleKind::Signalfd \
+                 not implemented yet (guest_fd={guest_fd}, handle_id={handle_id})"
+            ),
+            BrokerHandleKind::Pty => todo!(
+                "install_broker_bridge_fd for BrokerHandleKind::Pty \
+                 not implemented yet (guest_fd={guest_fd}, handle_id={handle_id})"
+            ),
         }
     }
 
@@ -1393,9 +1424,22 @@ impl<FS: ShimFS> LinuxShim<FS> {
                                     })
                             })
                         }
-                        BrokerHandleKind::Signalfd
-                        | BrokerHandleKind::Pty
-                        | BrokerHandleKind::Pipe => None,
+                        // `Pipe` is handled by the FdClass::Pipe restore branch
+                        // below (C.5l). It's intentionally NOT an EventFile.
+                        BrokerHandleKind::Pipe => None,
+                        // `Signalfd` and `Pty` aren't yet wired into
+                        // fork-snapshot restore. If a snapshot carries one,
+                        // we have a real gap that should fail loud.
+                        BrokerHandleKind::Signalfd => todo!(
+                            "fork-snapshot restore for BrokerHandleKind::Signalfd \
+                             not implemented yet (handle_id={})",
+                            broker_handle.handle_id
+                        ),
+                        BrokerHandleKind::Pty => todo!(
+                            "fork-snapshot restore for BrokerHandleKind::Pty \
+                             not implemented yet (handle_id={})",
+                            broker_handle.handle_id
+                        ),
                     };
                 let Some(event_file) = event_file else {
                     continue;
@@ -1413,6 +1457,65 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 debug_assert!(
                     success,
                     "eventfd fd slot {} occupied during restore",
+                    entry.fd
+                );
+            }
+        }
+
+        // C.5l: Phase C.3 follow-up — restore BrokerPipeFd entries for
+        // FdClass::Pipe slots whose snapshot carries a broker_handle.
+        // Previously these fell through to the local-pipe restore branch
+        // (line 1414 mapped `BrokerHandleKind::Pipe => None`), which
+        // meant fork-restore created no BrokerPipeFd in the child
+        // worker. The emit-side `dup_handle` in
+        // `syscalls/process.rs:7283` then leaked the broker refcount,
+        // and the writer-side pipe's `PipeWriteEnd::Drop` never fired
+        // when the original writer process exited — readers in other
+        // workers stalled forever waiting for EOF.
+        //
+        // Now: per FdClass::Pipe entry with broker_handle, create a
+        // fresh BrokerPipeFd that adopts the parent's emit-side
+        // `dup_handle` ref (no additional bump on this side).
+        // BrokerPipeFd's on_close in the child worker will release on
+        // drop; the broker per-connection cleanup handles SIGKILL'd
+        // workers.
+        {
+            use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::Pipe {
+                    continue;
+                }
+                let Some(broker_handle) = entry.metadata.broker_handle else {
+                    continue;
+                };
+                if broker_handle.kind != BrokerHandleKind::Pipe {
+                    continue;
+                }
+                let Some(direction) = broker_handle.pipe_direction else {
+                    continue;
+                };
+                let Some(provider) = syscalls::broker_pipe::broker_pipe_provider() else {
+                    continue;
+                };
+                let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
+                    provider,
+                    broker_handle.handle_id,
+                    direction,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<syscalls::broker_pipe::BrokerPipeSubsystem>(bp_fd);
+                let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
+                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                debug_assert!(
+                    success,
+                    "broker-pipe fd slot {} occupied during restore",
                     entry.fd
                 );
             }

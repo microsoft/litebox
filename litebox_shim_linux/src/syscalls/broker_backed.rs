@@ -112,18 +112,17 @@ pub(crate) struct BrokerBackedCommon<P: RawSyncPrimitivesProvider + TimeProvider
     local_events: Arc<AtomicU32>,
     sub: litebox::sync::Mutex<P, Option<BrokerSubscription>>,
     events_mask: u32,
+    /// If `false`, `Drop` skips calling `provider.release(handle)`.
+    /// Used by subsystems that manage the registry refcount per
+    /// fd-table-slot (via `on_dup`/`on_close`), where Drop would
+    /// double-release. The unsubscribe step in Drop still runs.
+    release_on_drop: AtomicBool,
 }
 
 impl<P> BrokerBackedCommon<P>
 where
     P: RawSyncPrimitivesProvider + TimeProvider,
 {
-    /// Constructs a new scaffold for a freshly created broker handle.
-    ///
-    /// `events_mask` is the bitmask passed to `subscribe()` on first
-    /// observer registration — typically
-    /// `NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT` for kinds that want both
-    /// readability and writability wake-ups.
     pub(crate) fn new(
         provider: Arc<dyn BrokerSubscribable>,
         handle: u64,
@@ -136,7 +135,15 @@ where
             local_events: Arc::new(AtomicU32::new(0)),
             sub: litebox::sync::Mutex::new(None),
             events_mask,
+            release_on_drop: AtomicBool::new(true),
         }
+    }
+
+    /// Suppresses the automatic `release(handle)` in `Drop`. Used by
+    /// subsystems that manage the registry refcount per fd-table-slot
+    /// via `FdEnabledSubsystemEntry::{on_dup, on_close}`.
+    pub(crate) fn disable_release_on_drop(&self) {
+        self.release_on_drop.store(false, Ordering::Release);
     }
 
     /// Returns the canonical broker handle id.
@@ -243,8 +250,10 @@ where
         if let Some(sub) = self.sub.lock().take() {
             sub.provider.unsubscribe(sub.handle, sub.subscription_id);
         }
-        // Release balances the initial broker handle refcount.
-        self.provider.release(self.handle);
+        if self.release_on_drop.load(Ordering::Acquire) {
+            // Release balances the initial broker handle refcount.
+            self.provider.release(self.handle);
+        }
     }
 }
 

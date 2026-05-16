@@ -14,7 +14,6 @@ use litebox::{
 };
 use litebox_common_linux::{
     broker_pipe_provider::{BrokerOpError, BrokerPipeEnd, BrokerPipeProvider},
-    cwfd::broker_subscribable::BrokerEventCallback,
     cwfd::notification_frame::{
         NOTIFY_EVENT_ERR, NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
     },
@@ -27,6 +26,35 @@ use super::fork_snapshot::BrokerHandleKind;
 
 static BROKER_PIPE_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPipeProvider>> =
     once_cell::race::OnceBox::new();
+
+/// C.5* follow-up: dynamic gate for the eager-broker `sys_pipe2`
+/// codepath, replacing the previous compile-time `let eager_broker
+/// = false` toggle. The runner sets this from the env var
+/// `LITEBOX_EAGER_BROKER_PIPE=1` at startup, before any guest
+/// `pipe2` can run. Default is `false` (legacy `Pipes<Platform>`
+/// fallback) to preserve regression-clean behavior in the
+/// committed state while eager-broker is iterated on.
+///
+/// Lives in `core::sync::atomic` because the shim is no_std and
+/// reads need to be lock-free from any guest syscall thread.
+static EAGER_BROKER_PIPE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Setter for [`EAGER_BROKER_PIPE_ENABLED`]. Called once at runner
+/// startup from `litebox_runner_linux_userland::run()` (and
+/// equivalents) after reading `LITEBOX_EAGER_BROKER_PIPE`. Idempotent;
+/// later calls overwrite the previous value (intended for tests
+/// that want to flip the gate mid-process).
+pub fn set_eager_broker_pipe_enabled(enabled: bool) {
+    EAGER_BROKER_PIPE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+/// Reader for [`EAGER_BROKER_PIPE_ENABLED`]. Hot path from
+/// `sys_pipe2`.
+#[inline]
+pub fn eager_broker_pipe_enabled() -> bool {
+    EAGER_BROKER_PIPE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
 
 pub fn set_broker_pipe_provider(
     provider: Arc<dyn BrokerPipeProvider>,
@@ -51,47 +79,6 @@ pub(crate) struct BrokerPipeFd<P: RawSyncPrimitivesProvider + litebox::platform:
     pollee: Arc<Pollee<P>>,
 }
 
-/// Adapter that presents a [`BrokerPipeProvider`] as a [`BrokerSubscribable`]
-/// pre-tagged with a specific pipe end. The generic
-/// `BrokerSubscribable::subscribe` impl on `BrokerPipeProvider` cannot carry
-/// per-end direction; this wrapper routes through `subscribe_pipe_end` so
-/// read-end and write-end subscriptions reach the broker correctly tagged.
-struct PipeEndSubscribable {
-    inner: Arc<dyn BrokerPipeProvider>,
-    end: BrokerPipeEnd,
-}
-
-impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable for PipeEndSubscribable {
-    fn subscribe(
-        &self,
-        handle: u64,
-        events_mask: u32,
-        callback: Arc<dyn BrokerEventCallback>,
-    ) -> Result<u64, BrokerOpError> {
-        self.inner
-            .subscribe_pipe_end(handle, self.end, events_mask, callback)
-    }
-
-    fn unsubscribe(&self, handle: u64, subscription_id: u64) {
-        // Direction-aware: pipes have separate read/write subjects but
-        // share a sub_id space. The broker's kind-agnostic unsubscribe
-        // checks `read_subject` first and would silently strip the
-        // wrong subject (e.g., a peer worker's read subscription that
-        // happens to share this id). Route through the direction-aware
-        // RPC instead.
-        self.inner
-            .unsubscribe_pipe_end(handle, self.end, subscription_id)
-    }
-
-    fn release(&self, handle: u64) {
-        self.inner.release(handle)
-    }
-
-    fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
-        self.inner.dup_handle(handle)
-    }
-}
-
 impl<P> BrokerPipeFd<P>
 where
     P: RawSyncPrimitivesProvider + litebox::platform::TimeProvider,
@@ -106,14 +93,12 @@ where
             BrokerPipeEnd::Read => OFlags::RDONLY,
             BrokerPipeEnd::Write => OFlags::WRONLY,
         };
-        // Wrap the provider in a per-end subscribable so the broker
-        // sees the correct end tag on subscribe.
+        // Each pipe end has its own broker state-registry handle, so
+        // subscribe/unsubscribe/release/dup_handle on this handle
+        // unambiguously address THIS end. No direction wrapper needed.
         let subscribable: Arc<
             dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-        > = Arc::new(PipeEndSubscribable {
-            inner: Arc::clone(&provider),
-            end: direction,
-        });
+        > = Arc::clone(&provider) as _;
         // Event mask per end: readers care about IN/HUP/ERR; writers
         // care about OUT/ERR (a closed reader manifests as ERR/EPIPE
         // here, not HUP).
@@ -122,6 +107,14 @@ where
             BrokerPipeEnd::Write => NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR,
         };
         let common = BrokerBackedCommon::new(subscribable, handle, events_mask);
+        // Per-slot refcount model: each fd-table slot that references
+        // this BrokerPipeFd contributes one registry refcount on the
+        // broker. `on_dup` bumps via `dup_handle`; `on_close` (called
+        // per slot removal by `descriptor_table::remove`) balances via
+        // `release`. Suppress `BrokerBackedCommon::Drop`'s own release
+        // to avoid double-release — the per-slot `on_close` already
+        // released for every slot that ever existed.
+        common.disable_release_on_drop();
         Self {
             provider,
             common,
@@ -151,8 +144,14 @@ where
         );
     }
 
-    pub(crate) fn fork_snapshot_handle(&self) -> (BrokerHandleKind, u64) {
-        (BrokerHandleKind::Pipe, self.handle())
+    pub(crate) fn fork_snapshot_handle(
+        &self,
+    ) -> (
+        BrokerHandleKind,
+        u64,
+        litebox_common_linux::broker_pipe_provider::BrokerPipeEnd,
+    ) {
+        (BrokerHandleKind::Pipe, self.handle(), self.direction)
     }
 }
 
@@ -169,10 +168,18 @@ impl BrokerPipeFd<Platform> {
             return Ok(0);
         }
         self.common.ensure_subscribed(&self.pollee);
+        // Phase C.5c: cap the requested read length to fit within
+        // the wire codec's BODY_MAX. The response body is
+        // `ReadPipeResponse { bytes_len: u32, bytes: [u8] }`, so
+        // payload must be <= BODY_MAX - 4. Use a 60 KB chunk to
+        // mirror the write path. The guest's read loop will iterate
+        // for larger transfers.
+        const READ_PIPE_CHUNK: usize = 60 * 1024;
+        let capped_len = core::cmp::min(buf.len(), READ_PIPE_CHUNK);
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::IN, || {
-                match self.provider.read_pipe(self.handle(), buf.len() as u64) {
+                match self.provider.read_pipe(self.handle(), capped_len as u64) {
                     Ok(bytes) => {
                         let n = bytes.len().min(buf.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
@@ -182,6 +189,15 @@ impl BrokerPipeFd<Platform> {
                         Ok(n)
                     }
                     Err(BrokerOpError::WouldBlock) => {
+                        // C.5k: clear the pollee's readable flag so a
+                        // subsequent ppoll without a fresh broker IN
+                        // notification doesn't immediately return
+                        // ready (livelock observed under eager_broker=true
+                        // for PIDF.exit_self.{pie-glibc, ...} — broker
+                        // pipe wakes on write, reader drains, pollee
+                        // state stayed "readable" because only n==0
+                        // (EOF) cleared it).
+                        self.common.set_readable(false);
                         Err(litebox::event::polling::TryOpError::TryAgain)
                     }
                     Err(e) => Err(litebox::event::polling::TryOpError::Other(
@@ -210,10 +226,24 @@ impl BrokerPipeFd<Platform> {
         // the same change) prevents this from accidentally stripping
         // a peer worker's read subscription on Drop.
         self.common.ensure_subscribed(&self.pollee);
+        // Phase C.5c: cap each RPC at WRITE_PIPE_CHUNK bytes. The wire
+        // codec (`fd_token_protocol::BODY_MAX`) caps frame bodies at
+        // 64 KB and writes larger than that fail with `BodyTooLarge`
+        // (surfaced to the shim as `BrokerOpError::InvalidValue`,
+        // which we map to EPIPE — wrong but historically observed).
+        // The write_pipe request body is `handle_id (u64) + bytes`,
+        // so safe payload is `BODY_MAX - 8`. We round down to 60 KB
+        // for a comfortable margin and to match the MUX_MAX_PAYLOAD
+        // constant used elsewhere. Returning a partial byte count to
+        // the guest is normal Linux write(2) semantics for non-atomic
+        // writes (any write > PIPE_BUF/4096 is non-atomic).
+        const WRITE_PIPE_CHUNK: usize = 60 * 1024;
+        let to_write = core::cmp::min(buf.len(), WRITE_PIPE_CHUNK);
+        let chunk = &buf[..to_write];
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::OUT, || {
-                match self.provider.write_pipe(self.handle(), buf) {
+                match self.provider.write_pipe(self.handle(), chunk) {
                     Ok(n) => Ok(n),
                     Err(BrokerOpError::WouldBlock) => {
                         Err(litebox::event::polling::TryOpError::TryAgain)
@@ -254,11 +284,18 @@ impl IOPollable for BrokerPipeFd<Platform> {
 
 impl FdEnabledSubsystemEntry for BrokerPipeFd<Platform> {
     fn on_dup(&self) {
+        // Per-slot registry refcount: each new fd-table slot pointing
+        // to this BrokerPipeFd contributes +1 to the broker
+        // registry refcount. Balanced by `on_close` on slot removal.
         let _ = self.provider.dup_handle(self.handle());
-        let _ = self.provider.incref_pipe_end(self.handle(), self.direction);
     }
 
     fn on_close(&self) {
-        self.provider.close_pipe_end(self.handle(), self.direction);
+        // Per-slot release: every removal of an fd-table slot
+        // referencing this BrokerPipeFd decrements the broker
+        // registry refcount. When the last slot is removed, the
+        // broker StateObject Drops and notifies the OTHER end's
+        // subscribers (HUP → reader EOF, ERR → writer EPIPE).
+        self.provider.release(self.handle());
     }
 }

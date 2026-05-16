@@ -181,6 +181,18 @@ struct State {
     table: HashMap<u64, Entry>,
 }
 
+/// Snapshot of one live registry entry, for diagnostic dumps and
+/// leak detection. C.5l follow-up: returned by
+/// [`BrokerStateRegistry::diagnostic_snapshot`] so callers can
+/// report leaks by handle id, kind, and refcount without
+/// holding the registry lock.
+#[derive(Debug, Clone)]
+pub struct DiagnosticEntry {
+    pub handle_id: u64,
+    pub subsystem_tag: SubsystemTag,
+    pub refcount: u32,
+}
+
 /// Broker-global registry of [`StateObject`]s reachable by opaque
 /// [`StateHandle`]s.
 pub struct BrokerStateRegistry {
@@ -206,6 +218,40 @@ impl BrokerStateRegistry {
         }
     }
 
+    /// Returns the number of currently-registered handles.
+    ///
+    /// Intended for leak detection: this should drop to zero once all
+    /// clients have disconnected and all per-connection cleanup has run.
+    /// A non-zero value at "quiescence" indicates broker-rc bookkeeping
+    /// is off (e.g., a `dup_handle` not matched by a corresponding
+    /// `release`, often surfaced as a peer-stall in tests).
+    pub fn len(&self) -> usize {
+        self.state.lock().expect("BrokerStateRegistry poisoned").table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns a per-entry snapshot suitable for diagnostic logging.
+    /// Sorted by handle_id for deterministic dump output. Holds the
+    /// registry lock for the duration of the iteration; cheap because
+    /// the registry is small (single-digit-thousand entries at most).
+    pub fn diagnostic_snapshot(&self) -> Vec<DiagnosticEntry> {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        let mut out: Vec<DiagnosticEntry> = s
+            .table
+            .iter()
+            .map(|(&id, e)| DiagnosticEntry {
+                handle_id: id,
+                subsystem_tag: e.state.subsystem_tag(),
+                refcount: e.refcount,
+            })
+            .collect();
+        out.sort_by_key(|e| e.handle_id);
+        out
+    }
+
     /// Inserts a new state object with refcount = 1 and returns its
     /// handle.
     pub fn register(&self, state: Arc<dyn StateObject + Send + Sync>) -> StateHandle {
@@ -219,11 +265,6 @@ impl BrokerStateRegistry {
         StateHandle(id)
     }
 
-    /// Increments the refcount of an existing handle, returning the
-    /// same handle on success. Used when a worker passes the handle
-    /// cross-worker (broker holds an additional reference for the
-    /// receiver) or when the broker itself needs to retain a
-    /// reference beyond a worker's lifetime.
     pub fn dup(&self, handle: StateHandle) -> Result<StateHandle, StateRegistryError> {
         let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
         let entry = s
@@ -234,6 +275,10 @@ impl BrokerStateRegistry {
             .refcount
             .checked_add(1)
             .ok_or(StateRegistryError::RefcountOverflow(handle))?;
+        let new_rc = entry.refcount;
+        let tag = entry.state.subsystem_tag();
+        drop(s);
+        tracing::debug!(handle = handle.0, new_rc, ?tag, "REG-DUP");
         Ok(handle)
     }
 
@@ -249,9 +294,13 @@ impl BrokerStateRegistry {
             .get_mut(&handle.0)
             .ok_or(StateRegistryError::UnknownHandle(handle))?;
         entry.refcount -= 1;
-        if entry.refcount == 0 {
+        let new_rc = entry.refcount;
+        let tag = entry.state.subsystem_tag();
+        if new_rc == 0 {
             s.table.remove(&handle.0);
         }
+        drop(s);
+        tracing::debug!(handle = handle.0, new_rc, ?tag, "REG-REL");
         Ok(())
     }
 

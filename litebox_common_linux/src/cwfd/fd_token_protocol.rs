@@ -128,10 +128,6 @@ pub enum Opcode {
     CreatePipe = 0x50,
     ReadPipe = 0x51,
     WritePipe = 0x52,
-    SubscribePipe = 0x53,
-    ClosePipeEnd = 0x54,
-    IncrefPipeEnd = 0x55,
-    UnsubscribePipeEnd = 0x56,
     CreatePty = 0x60,
     PtyRead = 0x61,
     PtyWrite = 0x62,
@@ -164,10 +160,6 @@ pub enum Opcode {
     CreatePipeResponse = 0xD0,
     ReadPipeResponse = 0xD1,
     WritePipeResponse = 0xD2,
-    SubscribePipeResponse = 0xD3,
-    ClosePipeEndResponse = 0xD4,
-    IncrefPipeEndResponse = 0xD5,
-    UnsubscribePipeEndResponse = 0xD6,
     CreatePtyResponse = 0xE0,
     PtyReadResponse = 0xE1,
     PtyWriteResponse = 0xE2,
@@ -283,10 +275,6 @@ impl Opcode {
             Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
             Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
             Opcode::WritePipe => Some(Opcode::WritePipeResponse),
-            Opcode::SubscribePipe => Some(Opcode::SubscribePipeResponse),
-            Opcode::ClosePipeEnd => Some(Opcode::ClosePipeEndResponse),
-            Opcode::IncrefPipeEnd => Some(Opcode::IncrefPipeEndResponse),
-            Opcode::UnsubscribePipeEnd => Some(Opcode::UnsubscribePipeEndResponse),
             Opcode::CreatePty => Some(Opcode::CreatePtyResponse),
             Opcode::PtyRead => Some(Opcode::PtyReadResponse),
             Opcode::PtyWrite => Some(Opcode::PtyWriteResponse),
@@ -320,10 +308,6 @@ impl Opcode {
                 | Opcode::CreatePipe
                 | Opcode::ReadPipe
                 | Opcode::WritePipe
-                | Opcode::SubscribePipe
-                | Opcode::ClosePipeEnd
-                | Opcode::IncrefPipeEnd
-                | Opcode::UnsubscribePipeEnd
                 | Opcode::CreatePty
                 | Opcode::PtyRead
                 | Opcode::PtyWrite
@@ -372,10 +356,6 @@ impl TryFrom<u8> for Opcode {
             0x50 => Ok(Opcode::CreatePipe),
             0x51 => Ok(Opcode::ReadPipe),
             0x52 => Ok(Opcode::WritePipe),
-            0x53 => Ok(Opcode::SubscribePipe),
-            0x54 => Ok(Opcode::ClosePipeEnd),
-            0x55 => Ok(Opcode::IncrefPipeEnd),
-            0x56 => Ok(Opcode::UnsubscribePipeEnd),
             0x60 => Ok(Opcode::CreatePty),
             0x61 => Ok(Opcode::PtyRead),
             0x62 => Ok(Opcode::PtyWrite),
@@ -401,10 +381,6 @@ impl TryFrom<u8> for Opcode {
             0xD0 => Ok(Opcode::CreatePipeResponse),
             0xD1 => Ok(Opcode::ReadPipeResponse),
             0xD2 => Ok(Opcode::WritePipeResponse),
-            0xD3 => Ok(Opcode::SubscribePipeResponse),
-            0xD4 => Ok(Opcode::ClosePipeEndResponse),
-            0xD5 => Ok(Opcode::IncrefPipeEndResponse),
-            0xD6 => Ok(Opcode::UnsubscribePipeEndResponse),
             0xE0 => Ok(Opcode::CreatePtyResponse),
             0xE1 => Ok(Opcode::PtyReadResponse),
             0xE2 => Ok(Opcode::PtyWriteResponse),
@@ -1184,12 +1160,29 @@ pub fn parse_create_pipe_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> 
     Ok((capacity, atomic))
 }
 
-pub fn build_create_pipe_response_ok(handle_id: u64) -> OwnedFrame {
+pub fn build_create_pipe_response_ok(read_handle_id: u64, write_handle_id: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&read_handle_id.to_le_bytes());
+    body.extend_from_slice(&write_handle_id.to_le_bytes());
     OwnedFrame {
         opcode: Opcode::CreatePipeResponse,
         status: StatusCode::Ok,
-        body: handle_id.to_le_bytes().to_vec(),
+        body,
     }
+}
+
+pub fn parse_create_pipe_response_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreatePipeResponse,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+    ))
 }
 
 /// Body for [`Opcode::ReadPipe`]: (handle: u64, max_len: u64).
@@ -1304,164 +1297,6 @@ pub fn build_write_pipe_response_ok(written: u64) -> OwnedFrame {
 
 pub fn parse_write_pipe_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
     parse_handle_body(body, Opcode::WritePipeResponse)
-}
-
-/// Body for [`Opcode::SubscribePipe`]: (handle: u64, sub_id: u64, events: u32, end: u8, pad: 3).
-pub fn build_subscribe_pipe_request(
-    handle_id: u64,
-    subscription_id: u64,
-    events_mask: u32,
-    end: u8,
-) -> OwnedFrame {
-    let mut body = Vec::with_capacity(24);
-    body.extend_from_slice(&handle_id.to_le_bytes());
-    body.extend_from_slice(&subscription_id.to_le_bytes());
-    body.extend_from_slice(&events_mask.to_le_bytes());
-    body.push(end);
-    body.extend_from_slice(&[0u8; 3]);
-    OwnedFrame {
-        opcode: Opcode::SubscribePipe,
-        status: StatusCode::Ok,
-        body,
-    }
-}
-
-pub fn parse_subscribe_pipe_body(body: &[u8]) -> Result<(u64, u64, u32, u8), ProtocolError> {
-    if body.len() != 24 {
-        return Err(ProtocolError::WrongBodyLen {
-            opcode: Opcode::SubscribePipe,
-            got: body.len(),
-            want: 24,
-        });
-    }
-    if body[21..24].iter().any(|&b| b != 0) {
-        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
-    }
-    Ok((
-        u64::from_le_bytes(body[0..8].try_into().unwrap()),
-        u64::from_le_bytes(body[8..16].try_into().unwrap()),
-        u32::from_le_bytes(body[16..20].try_into().unwrap()),
-        body[20],
-    ))
-}
-
-pub fn build_subscribe_pipe_response_ok() -> OwnedFrame {
-    OwnedFrame {
-        opcode: Opcode::SubscribePipeResponse,
-        status: StatusCode::Ok,
-        body: Vec::new(),
-    }
-}
-
-/// Body for [`Opcode::IncrefPipeEnd`]: (handle: u64, end: u8, pad: 7).
-pub fn build_incref_pipe_end_request(handle_id: u64, end: u8) -> OwnedFrame {
-    let mut body = Vec::with_capacity(16);
-    body.extend_from_slice(&handle_id.to_le_bytes());
-    body.push(end);
-    body.extend_from_slice(&[0; 7]);
-    OwnedFrame {
-        opcode: Opcode::IncrefPipeEnd,
-        status: StatusCode::Ok,
-        body,
-    }
-}
-
-pub fn parse_incref_pipe_end_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
-    parse_close_pipe_end_body_for_opcode(body, Opcode::IncrefPipeEnd)
-}
-
-pub fn build_incref_pipe_end_response_ok() -> OwnedFrame {
-    OwnedFrame {
-        opcode: Opcode::IncrefPipeEndResponse,
-        status: StatusCode::Ok,
-        body: Vec::new(),
-    }
-}
-
-/// Body for [`Opcode::UnsubscribePipeEnd`]: (handle: u64, sub_id: u64, end: u8, pad: 7).
-pub fn build_unsubscribe_pipe_end_request(
-    handle_id: u64,
-    subscription_id: u64,
-    end: u8,
-) -> OwnedFrame {
-    let mut body = Vec::with_capacity(24);
-    body.extend_from_slice(&handle_id.to_le_bytes());
-    body.extend_from_slice(&subscription_id.to_le_bytes());
-    body.push(end);
-    body.extend_from_slice(&[0u8; 7]);
-    OwnedFrame {
-        opcode: Opcode::UnsubscribePipeEnd,
-        status: StatusCode::Ok,
-        body,
-    }
-}
-
-pub fn parse_unsubscribe_pipe_end_body(body: &[u8]) -> Result<(u64, u64, u8), ProtocolError> {
-    if body.len() != 24 {
-        return Err(ProtocolError::WrongBodyLen {
-            opcode: Opcode::UnsubscribePipeEnd,
-            got: body.len(),
-            want: 24,
-        });
-    }
-    if body[17..24].iter().any(|&b| b != 0) {
-        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
-    }
-    Ok((
-        u64::from_le_bytes(body[0..8].try_into().unwrap()),
-        u64::from_le_bytes(body[8..16].try_into().unwrap()),
-        body[16],
-    ))
-}
-
-pub fn build_unsubscribe_pipe_end_response_ok() -> OwnedFrame {
-    OwnedFrame {
-        opcode: Opcode::UnsubscribePipeEndResponse,
-        status: StatusCode::Ok,
-        body: Vec::new(),
-    }
-}
-
-/// Body for [`Opcode::ClosePipeEnd`]: (handle: u64, end: u8, pad: 7).
-pub fn build_close_pipe_end_request(handle_id: u64, end: u8) -> OwnedFrame {
-    let mut body = Vec::with_capacity(16);
-    body.extend_from_slice(&handle_id.to_le_bytes());
-    body.push(end);
-    body.extend_from_slice(&[0u8; 7]);
-    OwnedFrame {
-        opcode: Opcode::ClosePipeEnd,
-        status: StatusCode::Ok,
-        body,
-    }
-}
-
-pub fn parse_close_pipe_end_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
-    parse_close_pipe_end_body_for_opcode(body, Opcode::ClosePipeEnd)
-}
-
-fn parse_close_pipe_end_body_for_opcode(
-    body: &[u8],
-    opcode: Opcode,
-) -> Result<(u64, u8), ProtocolError> {
-    if body.len() != 16 {
-        return Err(ProtocolError::WrongBodyLen {
-            opcode,
-            got: body.len(),
-            want: 16,
-        });
-    }
-    if body[9..16].iter().any(|&b| b != 0) {
-        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
-    }
-    Ok((u64::from_le_bytes(body[0..8].try_into().unwrap()), body[8]))
-}
-
-pub fn build_close_pipe_end_response_ok() -> OwnedFrame {
-    OwnedFrame {
-        opcode: Opcode::ClosePipeEndResponse,
-        status: StatusCode::Ok,
-        body: Vec::new(),
-    }
 }
 
 /// Body for [`Opcode::CreatePty`]: empty (allocates one master/slave pair).
@@ -2165,5 +2000,114 @@ mod tests {
         let g = decode(&bytes).unwrap();
         assert_eq!(g.opcode, Opcode::MaterializeResponse);
         assert_eq!(g.status, StatusCode::UnknownHandle);
+    }
+
+    /// C.5c follow-up: property-style round-trip test for the
+    /// `WritePipe` wire format that exhaustively covers the
+    /// `BODY_MAX` boundary. The C.5c bug was the shim passing a
+    /// >64 KB write payload to `build_write_pipe_request` in one
+    /// shot, which encoded successfully but failed `decode()` with
+    /// `BodyTooLarge`. The fix chunks in the shim, but the
+    /// underlying invariant — "writes up to `BODY_MAX - header
+    /// overhead` round-trip; writes above fail at the encoder, not
+    /// silently corrupt" — needs explicit test coverage.
+    ///
+    /// `WritePipe` body shape: 8-byte handle_id + 4-byte len +
+    /// 4-byte reserved + len bytes of payload. So the maximum
+    /// safe payload is `BODY_MAX - 16`. Cases:
+    ///   - tiny (0, 1, 1 KB): trivial, should round-trip
+    ///   - exactly at the safe boundary: must round-trip
+    ///   - exactly one byte over: must fail at `encode()` with
+    ///     `BodyTooLarge`
+    ///   - well over: same failure
+    #[test]
+    fn write_pipe_round_trip_body_max_boundary() {
+        let max_payload = (BODY_MAX as usize) - 16; // header overhead
+        let cases: &[(usize, bool)] = &[
+            (0, true),
+            (1, true),
+            (1024, true),
+            (60 * 1024, true), // matches the shim's WRITE_PIPE_CHUNK constant
+            (max_payload, true),
+            (max_payload + 1, false),
+            (max_payload + 16, false),
+            (BODY_MAX as usize, false),
+        ];
+        for &(payload_len, expect_ok) in cases {
+            let bytes = alloc::vec![0xA5u8; payload_len];
+            let frame = build_write_pipe_request(0xDEAD_BEEF_CAFE_BABE, &bytes);
+            match (frame.encode(), expect_ok) {
+                (Ok(encoded), true) => {
+                    let decoded = decode(&encoded).expect("decode should succeed");
+                    assert_eq!(decoded.opcode, Opcode::WritePipe);
+                    let (handle, payload) = parse_write_pipe_body(decoded.body)
+                        .expect("body parse should succeed");
+                    assert_eq!(handle, 0xDEAD_BEEF_CAFE_BABE);
+                    assert_eq!(payload.len(), payload_len);
+                    assert!(
+                        payload.iter().all(|&b| b == 0xA5),
+                        "payload corrupted at len={payload_len}"
+                    );
+                }
+                (Err(ProtocolError::BodyTooLarge { .. }), false) => {
+                    // Expected failure path. C.5c confirmed encoder
+                    // rejects oversize bodies cleanly.
+                }
+                (Ok(_), false) => {
+                    panic!(
+                        "expected BodyTooLarge for payload_len={payload_len}, got Ok"
+                    )
+                }
+                (Err(e), true) => {
+                    panic!("expected Ok for payload_len={payload_len}, got Err({e:?})")
+                }
+                (Err(e), false) => {
+                    panic!(
+                        "expected BodyTooLarge for payload_len={payload_len}, got unexpected Err({e:?})"
+                    )
+                }
+            }
+        }
+    }
+
+    /// C.5c follow-up: same boundary check on the symmetric
+    /// `ReadPipeResponse` wire format. Response body shape:
+    /// 4-byte len + 4-byte reserved + len bytes of payload. Max safe
+    /// payload is `BODY_MAX - 8`.
+    #[test]
+    fn read_pipe_response_round_trip_body_max_boundary() {
+        let max_payload = (BODY_MAX as usize) - 8; // 4-byte len + 4-byte reserved
+        let cases: &[(usize, bool)] = &[
+            (0, true),
+            (1, true),
+            (60 * 1024, true), // shim's READ_PIPE_CHUNK
+            (max_payload, true),
+            (max_payload + 1, false),
+        ];
+        for &(payload_len, expect_ok) in cases {
+            let bytes = alloc::vec![0x5Au8; payload_len];
+            let frame = build_read_pipe_response_ok(&bytes);
+            match (frame.encode(), expect_ok) {
+                (Ok(encoded), true) => {
+                    let decoded = decode(&encoded).expect("decode should succeed");
+                    assert_eq!(decoded.opcode, Opcode::ReadPipeResponse);
+                    let payload = parse_read_pipe_response_body(decoded.body)
+                        .expect("body parse should succeed");
+                    assert_eq!(payload.len(), payload_len);
+                }
+                (Err(ProtocolError::BodyTooLarge { .. }), false) => {}
+                (Ok(_), false) => {
+                    panic!(
+                        "expected BodyTooLarge for response payload_len={payload_len}, got Ok"
+                    )
+                }
+                (Err(e), true) => panic!(
+                    "expected Ok for response payload_len={payload_len}, got Err({e:?})"
+                ),
+                (Err(e), false) => panic!(
+                    "expected BodyTooLarge for response payload_len={payload_len}, got unexpected Err({e:?})"
+                ),
+            }
+        }
     }
 }

@@ -59,6 +59,45 @@ enum Scenario {
     EpollRdhup,
     DepthTwo,
     SharedWriter,
+    /// Spawn child binary; child forks a grandchild that immediately
+    /// exits; child waits for grandchild via waitpid; child exits.
+    /// Parent agent captures the child's stdout (which is empty) and
+    /// must observe EOF — exercises the same pattern as
+    /// `PIDF.exit_self` minus the pidfd_open / poll(POLLIN) dance,
+    /// so a failure here isolates the bug to broker-pipe EOF
+    /// propagation in the presence of an inner fork (rather than
+    /// pidfd-specific code paths).
+    InnerForkExit,
+    /// Same as `InnerForkExit` but the fork happens IN THE AGENT
+    /// PROCESS itself — no `std::process::Command::new(child_binary)`,
+    /// no cross-bt worker_exec, no `Stdio` capture machinery. Strips
+    /// the test down to: agent forks, child forks grandchild,
+    /// grandchild exits, child waitpids, child exits, agent reads
+    /// from the pipe expecting EOF. A failure here means the
+    /// broker-pipe EOF bug is pure inner-fork; a pass means the
+    /// bug specifically needs cross-bt to manifest.
+    InnerForkNoCommand,
+    /// Same shape as `InnerForkNoCommand` but the agent uses
+    /// `poll(POLLIN | POLLHUP, timeout)` instead of read. The test
+    /// passes if poll returns with `POLLHUP` (or any nonzero
+    /// revents) before the timeout. Isolates HUP-delivery (broker
+    /// → subscriber → pollee) from the read-after-HUP path. If
+    /// `inner_fork_no_command` hangs but `hup_only_poll` returns
+    /// POLLHUP, the read path has a bug. If both hang, the
+    /// subscription/HUP delivery is missing.
+    HupOnlyPoll,
+    /// Cross-bt variant of `InnerForkExit` where the child binary
+    /// first WRITES a marker line to stdout, THEN does the inner
+    /// fork+waitpid+exit dance. The parent agent reads stdout and
+    /// expects to see the marker followed by EOF. Three possible
+    /// outcomes that pinpoint the bug:
+    /// - marker observed + EOF: works (passes).
+    /// - marker observed but timeout-no-EOF: cross-bt setup works,
+    ///   data flow works, but EOF doesn't propagate after inner
+    ///   fork (the C.5e shape — same as `InnerForkExit` failure
+    ///   mode but isolates that initial cross-bt write DOES flow).
+    /// - no marker: cross-bt initial setup is broken.
+    InnerForkWriteThenExit,
 }
 
 impl Scenario {
@@ -75,6 +114,10 @@ impl Scenario {
             Self::EpollRdhup => "epoll_rdhup",
             Self::DepthTwo => "depth_two",
             Self::SharedWriter => "shared_writer",
+            Self::InnerForkExit => "inner_fork_exit",
+            Self::InnerForkNoCommand => "inner_fork_no_command",
+            Self::HupOnlyPoll => "hup_only_poll",
+            Self::InnerForkWriteThenExit => "inner_fork_write_then_exit",
         }
     }
 }
@@ -91,6 +134,10 @@ const ALL_SCENARIOS: &[Scenario] = &[
     Scenario::EpollRdhup,
     Scenario::DepthTwo,
     Scenario::SharedWriter,
+    Scenario::InnerForkExit,
+    Scenario::InnerForkNoCommand,
+    Scenario::HupOnlyPoll,
+    Scenario::InnerForkWriteThenExit,
 ];
 
 // ─── Handler protocol ──────────────────────────────────────────────
@@ -138,6 +185,10 @@ async fn handle_pxeof(
         Scenario::EpollRdhup => run_epoll_rdhup(&args.child_bin),
         Scenario::DepthTwo => run_depth_two(&args.child_bin, args.grandchild_bin.as_deref()),
         Scenario::SharedWriter => run_shared_writer(&args.child_bin),
+        Scenario::InnerForkExit => run_inner_fork_exit(&args.child_bin),
+        Scenario::InnerForkNoCommand => run_inner_fork_no_command(),
+        Scenario::HupOnlyPoll => run_hup_only_poll(),
+        Scenario::InnerForkWriteThenExit => run_inner_fork_write_then_exit(&args.child_bin),
     };
     Ok(match r {
         Ok(detail) => PxeofOut {
@@ -189,6 +240,14 @@ fn read_to_eof_or_timeout(
                 }
                 wait_pollin_or_hup(fd, remaining.min(Duration::from_millis(500)))?;
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // EINTR — a signal landed during the read syscall.
+                // Retry rather than treating as a hard error. Under
+                // litebox, signal-delivery during a guest's read of
+                // a broker pipe can surface as EINTR even when the
+                // read would otherwise succeed.
+                continue;
+            }
             Err(e) => {
                 set_nonblock(fd, false).ok();
                 return Err(format!("read error after {} bytes: {e}", buf.len()));
@@ -222,7 +281,9 @@ fn set_nonblock(fd: i32, on: bool) -> Result<(), String> {
 }
 
 /// `poll(fd, POLLIN | POLLHUP, timeout)` — block up to `timeout`
-/// waiting for the fd to become readable or hang up.
+/// waiting for the fd to become readable or hang up. Retries on
+/// EINTR so a signal landing during the poll doesn't surface as a
+/// hard error to the caller.
 fn wait_pollin_or_hup(fd: i32, timeout: Duration) -> Result<i16, String> {
     let mut pfd = libc::pollfd {
         fd,
@@ -230,11 +291,17 @@ fn wait_pollin_or_hup(fd: i32, timeout: Duration) -> Result<i16, String> {
         revents: 0,
     };
     let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    if rc < 0 {
-        return Err(format!("poll({fd}): {}", std::io::Error::last_os_error()));
+    loop {
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("poll({fd}): {err}"));
+        }
+        return Ok(pfd.revents);
     }
-    Ok(pfd.revents)
 }
 
 // ─── Scenario bodies ───────────────────────────────────────────────
@@ -557,6 +624,244 @@ fn run_shared_writer(child_bin: &str) -> Result<String, String> {
     Ok(format!("shared-writer EOF OK: {}", text.trim()))
 }
 
+fn run_inner_fork_exit(child_bin: &str) -> Result<String, String> {
+    // Child binary does: fork → grandchild sleeps briefly + exits;
+    // child waits via waitpid; child exits. No pidfd, no inner poll.
+    // Parent captures stdout (empty — child writes nothing) and must
+    // observe EOF. Isolates the broker-pipe EOF-propagation behavior
+    // in the presence of an inner fork from the pidfd code paths
+    // exercised by `PIDF.exit_self`.
+    let mut cmd = Command::new(child_bin);
+    cmd.args(["pxeof-leaf", "ROLE=inner-fork-exit"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let mut out = child.stdout.take().ok_or("no stdout")?;
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&out);
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let received = read_to_eof_or_timeout(&mut out, fd, deadline)?;
+    drop(out);
+    let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+    if !status.success() {
+        return Err(format!("child exit non-zero: {status:?}"));
+    }
+    if !received.is_empty() {
+        return Err(format!(
+            "expected empty stdout, got {} bytes: {:?}",
+            received.len(),
+            String::from_utf8_lossy(&received)
+        ));
+    }
+    Ok("inner-fork-exit: EOF observed, child exited cleanly".to_string())
+}
+
+/// In-process variant of `inner_fork_exit`. The agent itself
+/// creates a pipe, forks, the child forks a grandchild, grandchild
+/// exits, child waitpids, child exits. The agent reads from its
+/// kept read end and must observe EOF. No `std::process::Command`,
+/// no cross-bt worker_exec, no `Stdio` capture machinery — just
+/// `libc::pipe2` + `libc::fork` + `libc::waitpid` + the agent's
+/// own read loop.
+fn run_inner_fork_no_command() -> Result<String, String> {
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe2 initializes fds[] on success.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!("pipe2: {}", std::io::Error::last_os_error()));
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+
+    // SAFETY: this is the test agent doing a focused fork; no other
+    // threads are mutating state we care about.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err(format!("fork: {err}"));
+    }
+    if pid == 0 {
+        // CHILD: close read end (we only hold the writer).
+        unsafe { libc::close(read_fd) };
+        // Inner fork the grandchild.
+        let grandchild = unsafe { libc::fork() };
+        if grandchild < 0 {
+            unsafe { libc::close(write_fd) };
+            unsafe { libc::_exit(2) };
+        }
+        if grandchild == 0 {
+            // GRANDCHILD: exit immediately.
+            unsafe { libc::_exit(0) };
+        }
+        // CHILD waits for grandchild.
+        let _ = unsafe { libc::waitpid(grandchild, core::ptr::null_mut(), 0) };
+        // CHILD closes its writer and exits. Parent's read end is the
+        // last reference to the read side; once we close write_fd,
+        // parent should see EOF on read.
+        unsafe { libc::close(write_fd) };
+        unsafe { libc::_exit(0) };
+    }
+    // PARENT (agent process): close writer; read from read_fd expecting
+    // EOF after child exits.
+    unsafe { libc::close(write_fd) };
+    let mut received = Vec::new();
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let mut tmp = [0u8; 256];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            unsafe { libc::close(read_fd) };
+            return Err(format!("timeout after {} bytes, no EOF", received.len()));
+        }
+        let revents = wait_pollin_or_hup(read_fd, remaining.min(Duration::from_millis(500)))?;
+        if revents & (libc::POLLIN | libc::POLLHUP) as i16 == 0 {
+            continue;
+        }
+        // SAFETY: read_fd is owned by us; tmp is initialized.
+        let n = unsafe { libc::read(read_fd, tmp.as_mut_ptr().cast::<libc::c_void>(), tmp.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe { libc::close(read_fd) };
+            return Err(format!("read: {err}"));
+        }
+        if n == 0 {
+            // EOF.
+            break;
+        }
+        received.extend_from_slice(&tmp[..n as usize]);
+    }
+    unsafe { libc::close(read_fd) };
+    let mut status = 0i32;
+    let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if !received.is_empty() {
+        return Err(format!(
+            "expected empty stdout, got {} bytes",
+            received.len()
+        ));
+    }
+    Ok(format!(
+        "inner-fork-no-command: EOF observed (child status={status})"
+    ))
+}
+
+/// Like `inner_fork_no_command` but the agent uses ONLY
+/// `poll(POLLIN | POLLHUP, timeout)` — no read after the poll
+/// returns. Reports the observed revents. The test passes if
+/// poll returns with any of `POLLIN | POLLHUP` set before the
+/// timeout (HUP is the EOF signal; POLLIN with subsequent
+/// zero-byte read is the read-path EOF; this test specifically
+/// validates the broker → subscriber → pollee delivery path
+/// without the read syscall in the picture).
+fn run_hup_only_poll() -> Result<String, String> {
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe2 initializes fds[] on success.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!("pipe2: {}", std::io::Error::last_os_error()));
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+
+    // SAFETY: same constraints as run_inner_fork_no_command.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err(format!("fork: {err}"));
+    }
+    if pid == 0 {
+        unsafe { libc::close(read_fd) };
+        let grandchild = unsafe { libc::fork() };
+        if grandchild < 0 {
+            unsafe { libc::close(write_fd) };
+            unsafe { libc::_exit(2) };
+        }
+        if grandchild == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let _ = unsafe { libc::waitpid(grandchild, core::ptr::null_mut(), 0) };
+        unsafe { libc::close(write_fd) };
+        unsafe { libc::_exit(0) };
+    }
+    // PARENT.
+    unsafe { libc::close(write_fd) };
+    let revents = wait_pollin_or_hup(read_fd, READ_TIMEOUT)?;
+    unsafe { libc::close(read_fd) };
+    let mut status = 0i32;
+    let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if revents == 0 {
+        return Err("timeout waiting for POLLIN|POLLHUP (revents=0)".to_string());
+    }
+    let mut tags = Vec::new();
+    if revents & libc::POLLIN as i16 != 0 {
+        tags.push("POLLIN");
+    }
+    if revents & libc::POLLHUP as i16 != 0 {
+        tags.push("POLLHUP");
+    }
+    if revents & libc::POLLERR as i16 != 0 {
+        tags.push("POLLERR");
+    }
+    Ok(format!(
+        "hup-only-poll: revents={revents:#x} ({}) child_status={status}",
+        tags.join("|")
+    ))
+}
+
+/// Cross-bt narrowing: spawn child binary that WRITES a marker
+/// first, THEN does the inner-fork+waitpid+exit dance. The
+/// existing `InnerForkExit` test has the child write nothing, so
+/// failure conflates "data flow broken" with "EOF not propagated".
+/// This variant lets us see if data flows correctly before
+/// declaring an EOF bug.
+fn run_inner_fork_write_then_exit(child_bin: &str) -> Result<String, String> {
+    let mut cmd = Command::new(child_bin);
+    cmd.args(["pxeof-leaf", "ROLE=inner-fork-write-then-exit"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let mut out = child.stdout.take().ok_or("no stdout")?;
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&out);
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let received = read_to_eof_or_timeout(&mut out, fd, deadline);
+    drop(out);
+    // On read-timeout the child may be stuck (e.g., in inner fork's
+    // unreaped grandchild path under a cross-bt bug). Kill it so we
+    // don't trip the trial-level outer timeout (which masks our
+    // partial-read diagnostic with a bare "timeout" string).
+    if received.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+    let received = match received {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(format!("read failed: {e}; child status={status:?}"));
+        }
+    };
+    if !status.success() {
+        return Err(format!("child exit non-zero: {status:?}"));
+    }
+    let text = String::from_utf8_lossy(&received);
+    if !text.contains("INNER_FORK_MARKER") {
+        return Err(format!(
+            "expected INNER_FORK_MARKER in stdout, got {} bytes: {text:?}",
+            received.len()
+        ));
+    }
+    Ok(format!(
+        "inner-fork-write-then-exit: marker observed + EOF; got {} bytes",
+        received.len()
+    ))
+}
+
 // ─── Test registration ─────────────────────────────────────────────
 
 /// Binary-type variants per scenario. `pie-glibc` is the same-bt
@@ -638,6 +943,8 @@ mod leaf_subcmd {
             "read-stdin" => role_read_stdin(),
             "forward" => role_forward(args),
             "shared-writer-fork" => role_shared_writer_fork(),
+            "inner-fork-exit" => role_inner_fork_exit(),
+            "inner-fork-write-then-exit" => role_inner_fork_write_then_exit(),
             other => {
                 eprintln!("pxeof-leaf: unknown ROLE={other}");
                 2
@@ -829,6 +1136,74 @@ mod leaf_subcmd {
         // pair above (that pair is internal to this leaf). Print the
         // marker line that the handler asserts on.
         println!("SHARED_WRITER_DONE");
+        0
+    }
+
+    /// Mirrors `PIDF.exit_self`'s child-binary shape but without
+    /// pidfd/poll. Forks a grandchild that exits immediately, waits
+    /// for it via waitpid, then exits cleanly. Parent observes
+    /// closed stdout (empty payload + EOF) since this leaf writes
+    /// nothing to stdout.
+    fn role_inner_fork_exit() -> i32 {
+        // SAFETY: fork() is async-signal-safe; the child branch only
+        // calls `_exit(0)` which is also async-signal-safe.
+        let grandchild = unsafe { libc::fork() };
+        if grandchild < 0 {
+            eprintln!(
+                "pxeof-leaf inner-fork-exit: fork failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if grandchild == 0 {
+            // SAFETY: _exit on a known status.
+            unsafe { libc::_exit(0) };
+        }
+        // SAFETY: waitpid on the known pid; null status pointer accepted.
+        let waited = unsafe { libc::waitpid(grandchild, core::ptr::null_mut(), 0) };
+        if waited != grandchild {
+            eprintln!(
+                "pxeof-leaf inner-fork-exit: waitpid returned {waited}, expected {grandchild}"
+            );
+            return 1;
+        }
+        // Exit cleanly. We deliberately don't write to stdout — the
+        // handler asserts on empty stdout + EOF.
+        0
+    }
+
+    /// Same as `role_inner_fork_exit` but writes a marker line to
+    /// stdout BEFORE forking. Lets the test handler distinguish
+    /// "cross-bt setup broken" (no marker) from "EOF not propagating
+    /// after inner fork" (marker observed but no EOF).
+    fn role_inner_fork_write_then_exit() -> i32 {
+        println!("INNER_FORK_MARKER");
+        // Flush stdout so the marker reaches the parent reader before
+        // any subsequent broker pipe state churn from the fork.
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        // SAFETY: fork() is async-signal-safe; child branch is
+        // _exit-only.
+        let grandchild = unsafe { libc::fork() };
+        if grandchild < 0 {
+            eprintln!(
+                "pxeof-leaf inner-fork-write-then-exit: fork failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if grandchild == 0 {
+            // SAFETY: _exit is async-signal-safe.
+            unsafe { libc::_exit(0) };
+        }
+        // SAFETY: waitpid on known pid.
+        let waited = unsafe { libc::waitpid(grandchild, core::ptr::null_mut(), 0) };
+        if waited != grandchild {
+            eprintln!(
+                "pxeof-leaf inner-fork-write-then-exit: waitpid returned {waited}"
+            );
+            return 1;
+        }
         0
     }
 
