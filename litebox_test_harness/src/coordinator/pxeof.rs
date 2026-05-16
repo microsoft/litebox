@@ -832,15 +832,18 @@ fn run_inner_fork_write_then_exit(child_bin: &str) -> Result<String, String> {
     let deadline = Instant::now() + READ_TIMEOUT;
     let received = read_to_eof_or_timeout(&mut out, fd, deadline);
     drop(out);
+    // On read-timeout the child may be stuck (e.g., in inner fork's
+    // unreaped grandchild path under a cross-bt bug). Kill it so we
+    // don't trip the trial-level outer timeout (which masks our
+    // partial-read diagnostic with a bare "timeout" string).
+    if received.is_err() {
+        let _ = child.kill();
+    }
     let status = child.wait().map_err(|e| format!("wait: {e}"))?;
     let received = match received {
         Ok(r) => r,
         Err(e) => {
-            // Even on timeout, child may have exited normally — partial-read
-            // diagnostics tell us if data flow worked even though EOF didn't.
-            return Err(format!(
-                "read failed: {e}; child status={status:?}"
-            ));
+            return Err(format!("read failed: {e}; child status={status:?}"));
         }
     };
     if !status.success() {
