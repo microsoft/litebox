@@ -232,7 +232,7 @@ impl BrokerStateRegistry {
         let new_rc = entry.refcount;
         let tag = entry.state.subsystem_tag();
         drop(s);
-        tracing::info!(handle = handle.0, new_rc, ?tag, "REG-DUP");
+        tracing::debug!(handle = handle.0, new_rc, ?tag, "REG-DUP");
         Ok(handle)
     }
 
@@ -254,7 +254,7 @@ impl BrokerStateRegistry {
             s.table.remove(&handle.0);
         }
         drop(s);
-        tracing::info!(handle = handle.0, new_rc, ?tag, "REG-REL");
+        tracing::debug!(handle = handle.0, new_rc, ?tag, "REG-REL");
         Ok(())
     }
 
