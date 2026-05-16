@@ -2001,4 +2001,113 @@ mod tests {
         assert_eq!(g.opcode, Opcode::MaterializeResponse);
         assert_eq!(g.status, StatusCode::UnknownHandle);
     }
+
+    /// C.5c follow-up: property-style round-trip test for the
+    /// `WritePipe` wire format that exhaustively covers the
+    /// `BODY_MAX` boundary. The C.5c bug was the shim passing a
+    /// >64 KB write payload to `build_write_pipe_request` in one
+    /// shot, which encoded successfully but failed `decode()` with
+    /// `BodyTooLarge`. The fix chunks in the shim, but the
+    /// underlying invariant — "writes up to `BODY_MAX - header
+    /// overhead` round-trip; writes above fail at the encoder, not
+    /// silently corrupt" — needs explicit test coverage.
+    ///
+    /// `WritePipe` body shape: 8-byte handle_id + 4-byte len +
+    /// 4-byte reserved + len bytes of payload. So the maximum
+    /// safe payload is `BODY_MAX - 16`. Cases:
+    ///   - tiny (0, 1, 1 KB): trivial, should round-trip
+    ///   - exactly at the safe boundary: must round-trip
+    ///   - exactly one byte over: must fail at `encode()` with
+    ///     `BodyTooLarge`
+    ///   - well over: same failure
+    #[test]
+    fn write_pipe_round_trip_body_max_boundary() {
+        let max_payload = (BODY_MAX as usize) - 16; // header overhead
+        let cases: &[(usize, bool)] = &[
+            (0, true),
+            (1, true),
+            (1024, true),
+            (60 * 1024, true), // matches the shim's WRITE_PIPE_CHUNK constant
+            (max_payload, true),
+            (max_payload + 1, false),
+            (max_payload + 16, false),
+            (BODY_MAX as usize, false),
+        ];
+        for &(payload_len, expect_ok) in cases {
+            let bytes = alloc::vec![0xA5u8; payload_len];
+            let frame = build_write_pipe_request(0xDEAD_BEEF_CAFE_BABE, &bytes);
+            match (frame.encode(), expect_ok) {
+                (Ok(encoded), true) => {
+                    let decoded = decode(&encoded).expect("decode should succeed");
+                    assert_eq!(decoded.opcode, Opcode::WritePipe);
+                    let (handle, payload) = parse_write_pipe_body(decoded.body)
+                        .expect("body parse should succeed");
+                    assert_eq!(handle, 0xDEAD_BEEF_CAFE_BABE);
+                    assert_eq!(payload.len(), payload_len);
+                    assert!(
+                        payload.iter().all(|&b| b == 0xA5),
+                        "payload corrupted at len={payload_len}"
+                    );
+                }
+                (Err(ProtocolError::BodyTooLarge { .. }), false) => {
+                    // Expected failure path. C.5c confirmed encoder
+                    // rejects oversize bodies cleanly.
+                }
+                (Ok(_), false) => {
+                    panic!(
+                        "expected BodyTooLarge for payload_len={payload_len}, got Ok"
+                    )
+                }
+                (Err(e), true) => {
+                    panic!("expected Ok for payload_len={payload_len}, got Err({e:?})")
+                }
+                (Err(e), false) => {
+                    panic!(
+                        "expected BodyTooLarge for payload_len={payload_len}, got unexpected Err({e:?})"
+                    )
+                }
+            }
+        }
+    }
+
+    /// C.5c follow-up: same boundary check on the symmetric
+    /// `ReadPipeResponse` wire format. Response body shape:
+    /// 4-byte len + 4-byte reserved + len bytes of payload. Max safe
+    /// payload is `BODY_MAX - 8`.
+    #[test]
+    fn read_pipe_response_round_trip_body_max_boundary() {
+        let max_payload = (BODY_MAX as usize) - 8; // 4-byte len + 4-byte reserved
+        let cases: &[(usize, bool)] = &[
+            (0, true),
+            (1, true),
+            (60 * 1024, true), // shim's READ_PIPE_CHUNK
+            (max_payload, true),
+            (max_payload + 1, false),
+        ];
+        for &(payload_len, expect_ok) in cases {
+            let bytes = alloc::vec![0x5Au8; payload_len];
+            let frame = build_read_pipe_response_ok(&bytes);
+            match (frame.encode(), expect_ok) {
+                (Ok(encoded), true) => {
+                    let decoded = decode(&encoded).expect("decode should succeed");
+                    assert_eq!(decoded.opcode, Opcode::ReadPipeResponse);
+                    let payload = parse_read_pipe_response_body(decoded.body)
+                        .expect("body parse should succeed");
+                    assert_eq!(payload.len(), payload_len);
+                }
+                (Err(ProtocolError::BodyTooLarge { .. }), false) => {}
+                (Ok(_), false) => {
+                    panic!(
+                        "expected BodyTooLarge for response payload_len={payload_len}, got Ok"
+                    )
+                }
+                (Err(e), true) => panic!(
+                    "expected Ok for response payload_len={payload_len}, got Err({e:?})"
+                ),
+                (Err(e), false) => panic!(
+                    "expected BodyTooLarge for response payload_len={payload_len}, got unexpected Err({e:?})"
+                ),
+            }
+        }
+    }
 }
