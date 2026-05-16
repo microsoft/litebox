@@ -2040,8 +2040,8 @@ mod tests {
                 (Ok(encoded), true) => {
                     let decoded = decode(&encoded).expect("decode should succeed");
                     assert_eq!(decoded.opcode, Opcode::WritePipe);
-                    let (handle, payload) = parse_write_pipe_body(decoded.body)
-                        .expect("body parse should succeed");
+                    let (handle, payload) =
+                        parse_write_pipe_body(decoded.body).expect("body parse should succeed");
                     assert_eq!(handle, 0xDEAD_BEEF_CAFE_BABE);
                     assert_eq!(payload.len(), payload_len);
                     assert!(
@@ -2054,9 +2054,7 @@ mod tests {
                     // rejects oversize bodies cleanly.
                 }
                 (Ok(_), false) => {
-                    panic!(
-                        "expected BodyTooLarge for payload_len={payload_len}, got Ok"
-                    )
+                    panic!("expected BodyTooLarge for payload_len={payload_len}, got Ok")
                 }
                 (Err(e), true) => {
                     panic!("expected Ok for payload_len={payload_len}, got Err({e:?})")
@@ -2097,13 +2095,11 @@ mod tests {
                 }
                 (Err(ProtocolError::BodyTooLarge { .. }), false) => {}
                 (Ok(_), false) => {
-                    panic!(
-                        "expected BodyTooLarge for response payload_len={payload_len}, got Ok"
-                    )
+                    panic!("expected BodyTooLarge for response payload_len={payload_len}, got Ok")
                 }
-                (Err(e), true) => panic!(
-                    "expected Ok for response payload_len={payload_len}, got Err({e:?})"
-                ),
+                (Err(e), true) => {
+                    panic!("expected Ok for response payload_len={payload_len}, got Err({e:?})")
+                }
                 (Err(e), false) => panic!(
                     "expected BodyTooLarge for response payload_len={payload_len}, got unexpected Err({e:?})"
                 ),

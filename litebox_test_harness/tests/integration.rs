@@ -791,8 +791,7 @@ fn ensure_binaries_built(ws_root: &Path) {
     ];
     let trace_feature_runner;
     if std::env::var("LITEBOX_TRACE_SYSCALLS").is_ok() {
-        trace_feature_runner =
-            String::from("litebox_runner_linux_userland/trace_syscalls");
+        trace_feature_runner = String::from("litebox_runner_linux_userland/trace_syscalls");
         build_args.push("--features");
         build_args.push(&trace_feature_runner);
     }

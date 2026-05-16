@@ -9174,7 +9174,8 @@ impl<FS: ShimFS> Task<FS> {
                     },
                 );
                 drop(dt_local);
-                if let (Some(_provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
+                if let (Some(_provider), Some((handle_id, direction))) = (pipe_provider, pipe_info)
+                {
                     // C.5j: emit-side dup_handle removed. Previously
                     // `releaser.dup_handle(handle_id)` here bumped the
                     // broker rc to "ship the ref over" to worker B;

@@ -142,9 +142,7 @@ fn update_tracker_from_response(
     }
     match request_opcode {
         // State-registry creators: response body is one or two handle ids.
-        Opcode::CreateEventfd
-        | Opcode::CreatePidfd
-        | Opcode::CreateSignalfd => {
+        Opcode::CreateEventfd | Opcode::CreatePidfd | Opcode::CreateSignalfd => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
                 tracker.record_state(id);
             }
@@ -474,8 +472,7 @@ fn handle_control_connection_inner(
                             return;
                         }
                         let in_fd = fds.pop();
-                        let host_result = match host_fd_handle_request(fd_registry, &frame, in_fd)
-                        {
+                        let host_result = match host_fd_handle_request(fd_registry, &frame, in_fd) {
                             Ok(r) => r,
                             Err(e) => {
                                 warn!(error = %e, "fd-token control: fatal handler error");
@@ -592,12 +589,8 @@ fn handle_control_connection_inner(
                         // Process operations: route to state_service on the *process*
                         // registry. RegisterProcess allocates the process handle; Phase G
                         // exit-state RPCs resolve that same handle id (guest pid).
-                        let proc_result = state_handle_request(
-                            process_registry,
-                            conn_state,
-                            &frame,
-                            in_fds,
-                        );
+                        let proc_result =
+                            state_handle_request(process_registry, conn_state, &frame, in_fds);
                         SocketHandlerResult {
                             frame: proc_result.frame,
                             out_fd: proc_result.out_fd,
@@ -608,12 +601,7 @@ fn handle_control_connection_inner(
                         return;
                     }
                 };
-                update_tracker_from_response(
-                    tracker,
-                    request_opcode,
-                    &request_body,
-                    &result.frame,
-                );
+                update_tracker_from_response(tracker, request_opcode, &request_body, &result.frame);
                 if let Err(e) = write_response(&stream, result.frame, result.out_fd) {
                     warn!(error = %e, "fd-token control: write error");
                     return;
