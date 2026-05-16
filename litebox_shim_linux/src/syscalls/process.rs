@@ -9162,31 +9162,34 @@ impl<FS: ShimFS> Task<FS> {
                     },
                 );
                 drop(dt_local);
-                if let (Some(provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
-                    let releaser: alloc::sync::Arc<
-                        dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-                    > = alloc::sync::Arc::clone(&provider) as _;
-                    // Phase C.5d (post-split): each pipe end is its own
-                    // broker StateObject with its own registry refcount.
-                    // Emit-side dup_handle bumps the registry refcount;
-                    // worker B's install creates a new BrokerPipeFd that
-                    // claims that ref; on Drop it releases. The parent
-                    // worker drops the child task's BrokerPipeFd ⇒
-                    // release. Net rc change across the migration: 0
-                    // (one ref shipped over).
-                    let dup_ok = releaser.dup_handle(handle_id).is_ok();
-                    if dup_ok {
-                        // Spec format `fd:pipe:handle:r|w`. Direction is
-                        // shim-side capability gating (a read-end fd
-                        // returns EBADF on write), not a broker hint —
-                        // the broker disambiguates by handle alone.
+                if let (Some(_provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
+                    // C.5j: emit-side dup_handle removed. Previously
+                    // `releaser.dup_handle(handle_id)` here bumped the
+                    // broker rc to "ship the ref over" to worker B;
+                    // worker B's install just attached without
+                    // bumping. That left the +1 untracked on any
+                    // connection, so SIGKILL of worker B leaked the
+                    // ref forever (PXEOF.signal_kill cross-bt
+                    // failures).
+                    //
+                    // Now worker B's `install_broker_bridge_fd` calls
+                    // `dup_handle` itself, so the +1 is tracked on
+                    // worker B's connection and the broker's per-
+                    // connection cleanup on disconnect can release
+                    // it. The emit side just enumerates the spec.
+                    //
+                    // Race note: the placeholder shim task in worker
+                    // A is blocked in `wait_worker_host` from
+                    // spawn-time until worker B exits, so its fd's
+                    // BrokerPipeFd keeps the rc alive in the gap
+                    // between worker B startup and its install call.
+                    {
                         let dir_char = match direction {
                             litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
                             litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
                         };
                         broker_eventfd_specs
                             .push(alloc::format!("{raw_fd}:pipe:{handle_id}:{dir_char}"));
-                        broker_eventfd_transit_release.push((releaser, handle_id));
                     }
                 }
             }
