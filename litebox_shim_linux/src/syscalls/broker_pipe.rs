@@ -154,6 +154,15 @@ impl BrokerPipeFd<Platform> {
                         Ok(n)
                     }
                     Err(BrokerOpError::WouldBlock) => {
+                        // C.5k: clear the pollee's readable flag so a
+                        // subsequent ppoll without a fresh broker IN
+                        // notification doesn't immediately return
+                        // ready (livelock observed under eager_broker=true
+                        // for PIDF.exit_self.{pie-glibc, ...} — broker
+                        // pipe wakes on write, reader drains, pollee
+                        // state stayed "readable" because only n==0
+                        // (EOF) cleared it).
+                        self.common.set_readable(false);
                         Err(litebox::event::polling::TryOpError::TryAgain)
                     }
                     Err(e) => Err(litebox::event::polling::TryOpError::Other(
