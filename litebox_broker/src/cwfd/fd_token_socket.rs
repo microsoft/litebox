@@ -97,6 +97,34 @@ impl ConnRefTracker {
                 "fd-token control: per-connection cleanup released leaked broker refs after disconnect"
             );
         }
+        // C.5l follow-up: leak-detection breadcrumb. After this
+        // connection's cleanup, report the post-cleanup registry
+        // sizes. In a healthy system these should drop to zero
+        // once all clients disconnect; a non-zero size here when
+        // no other connections are active is a leak signal.
+        //
+        // We log at info! so the line shows up in default broker
+        // logs (LITEBOX_KEEP_CONTAINER=1) without needing a
+        // dedicated env-filter, and so tests can grep
+        // `*.broker.log` for "registry post-cleanup state".
+        let state_remaining = state_registry.len();
+        let process_remaining = process_registry.len();
+        info!(
+            state_remaining,
+            process_remaining,
+            "fd-token control: registry post-cleanup state (non-zero after last connection = leak)"
+        );
+        if state_remaining > 0 {
+            let dump = state_registry.diagnostic_snapshot();
+            // Cap to first 16 entries to bound log volume.
+            let preview: Vec<_> = dump.iter().take(16).collect();
+            info!(
+                state_remaining,
+                truncated_to = preview.len(),
+                ?preview,
+                "fd-token control: state-registry leak preview"
+            );
+        }
     }
 }
 

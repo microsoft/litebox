@@ -312,7 +312,22 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 );
                 Ok(())
             }
-            BrokerHandleKind::Signalfd | BrokerHandleKind::Pty => Err(()),
+            // C.5l guardrail: Signalfd / Pty are accepted by the
+            // emit-side fork-snapshot code, but the install side
+            // here has no implementation. Returning `Err(())` was
+            // historically a silent skip (caller logs at the
+            // runner level but no early panic). Make it a hard
+            // failure so a snapshot carrying one of these kinds
+            // crashes loudly instead of leaking broker refs and
+            // stalling readers.
+            BrokerHandleKind::Signalfd => todo!(
+                "install_broker_bridge_fd for BrokerHandleKind::Signalfd \
+                 not implemented yet (guest_fd={guest_fd}, handle_id={handle_id})"
+            ),
+            BrokerHandleKind::Pty => todo!(
+                "install_broker_bridge_fd for BrokerHandleKind::Pty \
+                 not implemented yet (guest_fd={guest_fd}, handle_id={handle_id})"
+            ),
         }
     }
 
@@ -1409,9 +1424,22 @@ impl<FS: ShimFS> LinuxShim<FS> {
                                     })
                             })
                         }
-                        BrokerHandleKind::Signalfd
-                        | BrokerHandleKind::Pty
-                        | BrokerHandleKind::Pipe => None,
+                        // `Pipe` is handled by the FdClass::Pipe restore branch
+                        // below (C.5l). It's intentionally NOT an EventFile.
+                        BrokerHandleKind::Pipe => None,
+                        // `Signalfd` and `Pty` aren't yet wired into
+                        // fork-snapshot restore. If a snapshot carries one,
+                        // we have a real gap that should fail loud.
+                        BrokerHandleKind::Signalfd => todo!(
+                            "fork-snapshot restore for BrokerHandleKind::Signalfd \
+                             not implemented yet (handle_id={})",
+                            broker_handle.handle_id
+                        ),
+                        BrokerHandleKind::Pty => todo!(
+                            "fork-snapshot restore for BrokerHandleKind::Pty \
+                             not implemented yet (handle_id={})",
+                            broker_handle.handle_id
+                        ),
                     };
                 let Some(event_file) = event_file else {
                     continue;
