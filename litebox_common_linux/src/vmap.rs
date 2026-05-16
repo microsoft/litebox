@@ -79,6 +79,22 @@ pub trait VmapManager<const ALIGN: usize> {
     }
 }
 
+/// A type-level handle to a platform-global [`VmapManager`].
+///
+/// `PhysMutPtr` and `PhysConstPtr` carry their provider as a type parameter
+/// (`PhantomData<P>`), so they cannot hold a live `&VmapManager`. This trait
+/// is the minimum surface that lets such a `PhantomData`-only carrier reach
+/// the live manager: each platform implements this on a small unit struct
+/// (e.g., `Vmap`) and points `manager()` at its global
+/// platform singleton.
+pub trait GlobalVmapManager<const ALIGN: usize>: 'static {
+    /// The concrete `VmapManager` this marker resolves to.
+    type Manager: VmapManager<ALIGN> + 'static;
+
+    /// Return the global manager instance for this platform.
+    fn manager() -> &'static Self::Manager;
+}
+
 /// Data structure representing a physical address with page alignment.
 ///
 /// Currently, this is an alias to `crate::mm::linux::NonZeroAddress`. This might change if

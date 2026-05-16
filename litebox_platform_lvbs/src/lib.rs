@@ -23,14 +23,11 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
-use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
-use litebox_common_linux::{
-    physical_pointers::PhysMapProvider,
-    vmap::{
-        PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
-        VmapManager,
-    },
+use litebox_common_linux::vmap::{
+    GlobalVmapManager, PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions,
+    PhysPointerError, VmapManager,
 };
+use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use x86_64::{
     VirtAddr,
     structures::paging::{
@@ -448,29 +445,19 @@ type UserMutPtr<T> =
     litebox::platform::common_providers::userspace_pointers::UserMutPtr<LvbsValidateAccess, T>;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Vtl0PhysMapProvider;
+pub struct Vmap;
 
-impl<const ALIGN: usize> PhysMapProvider<ALIGN> for Vtl0PhysMapProvider {
-    fn validate_unowned(pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
-        VmapManager::validate_unowned(crate::platform_low(), pages)
-    }
-
-    unsafe fn vmap(
-        pages: &PhysPageAddrArray<ALIGN>,
-        perms: PhysPageMapPermissions,
-    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
-        unsafe { VmapManager::vmap(crate::platform_low(), pages, perms) }
-    }
-
-    unsafe fn vunmap(map_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
-        unsafe { VmapManager::vunmap(crate::platform_low(), map_info) }
+impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
+    type Manager = crate::host::LvbsLinuxKernel;
+    fn manager() -> &'static Self::Manager {
+        crate::platform_low()
     }
 }
 
 pub type Vtl0PhysConstPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, Vtl0PhysMapProvider>;
+    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, Vmap>;
 pub type Vtl0PhysMutPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, Vtl0PhysMapProvider>;
+    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, Vmap>;
 
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
@@ -1301,6 +1288,7 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
         Ok(())
     }
 
+    #[allow(dead_code, reason = "will be used soon")]
     unsafe fn protect(
         &self,
         pages: &PhysPageAddrArray<ALIGN>,

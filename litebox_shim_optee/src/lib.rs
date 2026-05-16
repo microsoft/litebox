@@ -21,12 +21,7 @@ use litebox::{
     shim::ContinueOperation,
     utils::{ReinterpretUnsignedExt, TruncateExt},
 };
-use litebox_common_linux::{
-    MapFlags, ProtFlags,
-    errno::Errno,
-    physical_pointers::PhysMapProvider,
-    vmap::{PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError},
-};
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, vmap::GlobalVmapManager};
 use litebox_common_optee::{
     LdelfArg, LdelfSyscallRequest, SyscallRequest, TaFlags, TeeAlgorithm, TeeAlgorithmClass,
     TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
@@ -1417,43 +1412,19 @@ impl SessionIdPool {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NormalWorldVmapProvider;
+pub struct Vmap;
 
-impl<const ALIGN: usize> PhysMapProvider<ALIGN> for NormalWorldVmapProvider {
-    fn validate_unowned(pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
-        litebox_common_linux::vmap::VmapManager::validate_unowned(
-            litebox_platform_multiplex::platform(),
-            pages,
-        )
-    }
-
-    unsafe fn vmap(
-        pages: &PhysPageAddrArray<ALIGN>,
-        perms: PhysPageMapPermissions,
-    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
-        unsafe {
-            litebox_common_linux::vmap::VmapManager::vmap(
-                litebox_platform_multiplex::platform(),
-                pages,
-                perms,
-            )
-        }
-    }
-
-    unsafe fn vunmap(map_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
-        unsafe {
-            litebox_common_linux::vmap::VmapManager::vunmap(
-                litebox_platform_multiplex::platform(),
-                map_info,
-            )
-        }
+impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
+    type Manager = litebox_platform_multiplex::Platform;
+    fn manager() -> &'static Self::Manager {
+        litebox_platform_multiplex::platform()
     }
 }
 
 pub type NormalWorldConstPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, NormalWorldVmapProvider>;
+    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, Vmap>;
 pub type NormalWorldMutPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, NormalWorldVmapProvider>;
+    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, Vmap>;
 
 #[cfg(test)]
 mod test_utils {
