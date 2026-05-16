@@ -59,34 +59,11 @@
 //! provide a wrong list by mistake or intentionally).
 
 use crate::vmap::{
-    PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
+    GlobalVmapManager, PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
+    VmapManager,
 };
 use core::marker::PhantomData;
 use zerocopy::FromBytes;
-
-/// Provider for physical page mapping operations used by physical pointers.
-pub trait PhysMapProvider<const ALIGN: usize> {
-    fn validate_unowned(_pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
-        Ok(())
-    }
-
-    /// # Safety
-    ///
-    /// Same as [`crate::vmap::VmapManager::vmap`].
-    unsafe fn vmap(
-        _pages: &PhysPageAddrArray<ALIGN>,
-        _perms: PhysPageMapPermissions,
-    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
-        Err(PhysPointerError::UnsupportedOperation)
-    }
-
-    /// # Safety
-    ///
-    /// Same as [`crate::vmap::VmapManager::vunmap`].
-    unsafe fn vunmap(_map_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
-        Err(PhysPointerError::UnsupportedOperation)
-    }
-}
 
 /// Allocate a zeroed `Box<T>` on the heap.
 ///
@@ -125,18 +102,18 @@ fn align_down(address: usize, align: usize) -> usize {
 ///   memory for an object of type `T`.
 #[derive(Clone)]
 #[repr(C)]
-pub struct PhysMutPtr<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> {
+pub struct PhysMutPtr<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
     pages: alloc::boxed::Box<[PhysPageAddr<ALIGN>]>,
     offset: usize,
     count: usize,
     map_info: Option<PhysPageMapInfo<ALIGN>>,
     _type: PhantomData<T>,
-    _provider: PhantomData<P>,
+    _vmap: PhantomData<V>,
 }
 
-impl<T: Clone, const ALIGN: usize, P> PhysMutPtr<T, ALIGN, P>
+impl<T: Clone, const ALIGN: usize, V> PhysMutPtr<T, ALIGN, V>
 where
-    P: PhysMapProvider<ALIGN>,
+    V: GlobalVmapManager<ALIGN>,
 {
     /// Create a new `PhysMutPtr` from the given physical page array and offset.
     ///
@@ -166,14 +143,14 @@ where
                 core::mem::size_of::<T>(),
             ));
         }
-        P::validate_unowned(pages)?;
+        V::manager().validate_unowned(pages)?;
         Ok(Self {
             pages: pages.into(),
             offset,
             count: size / core::mem::size_of::<T>(),
             map_info: None,
             _type: PhantomData,
-            _provider: PhantomData,
+            _vmap: PhantomData,
         })
     }
 
@@ -402,7 +379,7 @@ where
         count: usize,
         size: usize,
         perms: PhysPageMapPermissions,
-    ) -> Result<MappedGuard<'_, T, ALIGN, P>, PhysPointerError> {
+    ) -> Result<MappedGuard<'_, T, ALIGN, V>, PhysPointerError> {
         let skip = self
             .offset
             .checked_add(
@@ -454,7 +431,7 @@ where
         if self.map_info.is_none() {
             let sub_pages = &self.pages[start..end];
             unsafe {
-                self.map_info = Some(P::vmap(sub_pages, perms)?);
+                self.map_info = Some(V::manager().vmap(sub_pages, perms)?);
             }
             Ok(())
         } else {
@@ -473,7 +450,7 @@ where
     unsafe fn unmap(&mut self) -> Result<(), PhysPointerError> {
         if let Some(map_info) = self.map_info.take() {
             unsafe {
-                P::vunmap(map_info)?;
+                V::manager().vunmap(map_info)?;
             }
             Ok(())
         } else {
@@ -488,14 +465,14 @@ where
 ///
 /// Created by `map_and_get_ptr_guard`. Holds a mutable borrow on the parent
 /// `PhysMutPtr` and provides the mapped base pointer for the duration of the mapping.
-struct MappedGuard<'a, T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> {
-    owner: &'a mut PhysMutPtr<T, ALIGN, P>,
+struct MappedGuard<'a, T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
+    owner: &'a mut PhysMutPtr<T, ALIGN, V>,
     ptr: *mut T,
     size: usize,
 }
 
-impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> Drop
-    for MappedGuard<'_, T, ALIGN, P>
+impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop
+    for MappedGuard<'_, T, ALIGN, V>
 {
     fn drop(&mut self) {
         // SAFETY: The platform is expected to handle unmapping safely, including
@@ -508,7 +485,7 @@ impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> Drop
     }
 }
 
-impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> Drop for PhysMutPtr<T, ALIGN, P> {
+impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop for PhysMutPtr<T, ALIGN, V> {
     fn drop(&mut self) {
         // SAFETY: The platform is expected to handle unmapping safely, including
         // the case where pages were never mapped (returns Unmapped error, ignored).
@@ -520,8 +497,8 @@ impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> Drop for PhysMutPt
     }
 }
 
-impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> core::fmt::Debug
-    for PhysMutPtr<T, ALIGN, P>
+impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
+    for PhysMutPtr<T, ALIGN, V>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysMutPtr")
@@ -535,13 +512,13 @@ impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> core::fmt::Debug
 /// exposes only read access.
 #[derive(Clone)]
 #[repr(C)]
-pub struct PhysConstPtr<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> {
-    inner: PhysMutPtr<T, ALIGN, P>,
+pub struct PhysConstPtr<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
+    inner: PhysMutPtr<T, ALIGN, V>,
 }
 
-impl<T: Clone + FromBytes, const ALIGN: usize, P> PhysConstPtr<T, ALIGN, P>
+impl<T: Clone + FromBytes, const ALIGN: usize, V> PhysConstPtr<T, ALIGN, V>
 where
-    P: PhysMapProvider<ALIGN>,
+    V: GlobalVmapManager<ALIGN>,
 {
     /// Create a new `PhysConstPtr` from the given physical page array and offset.
     ///
@@ -614,8 +591,8 @@ where
     }
 }
 
-impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> core::fmt::Debug
-    for PhysConstPtr<T, ALIGN, P>
+impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
+    for PhysConstPtr<T, ALIGN, V>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysConstPtr")
