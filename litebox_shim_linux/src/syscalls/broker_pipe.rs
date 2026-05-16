@@ -133,10 +133,18 @@ impl BrokerPipeFd<Platform> {
             return Ok(0);
         }
         self.common.ensure_subscribed(&self.pollee);
+        // Phase C.5c: cap the requested read length to fit within
+        // the wire codec's BODY_MAX. The response body is
+        // `ReadPipeResponse { bytes_len: u32, bytes: [u8] }`, so
+        // payload must be <= BODY_MAX - 4. Use a 60 KB chunk to
+        // mirror the write path. The guest's read loop will iterate
+        // for larger transfers.
+        const READ_PIPE_CHUNK: usize = 60 * 1024;
+        let capped_len = core::cmp::min(buf.len(), READ_PIPE_CHUNK);
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::IN, || {
-                match self.provider.read_pipe(self.handle(), buf.len() as u64) {
+                match self.provider.read_pipe(self.handle(), capped_len as u64) {
                     Ok(bytes) => {
                         let n = bytes.len().min(buf.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
@@ -174,10 +182,24 @@ impl BrokerPipeFd<Platform> {
         // the same change) prevents this from accidentally stripping
         // a peer worker's read subscription on Drop.
         self.common.ensure_subscribed(&self.pollee);
+        // Phase C.5c: cap each RPC at WRITE_PIPE_CHUNK bytes. The wire
+        // codec (`fd_token_protocol::BODY_MAX`) caps frame bodies at
+        // 64 KB and writes larger than that fail with `BodyTooLarge`
+        // (surfaced to the shim as `BrokerOpError::InvalidValue`,
+        // which we map to EPIPE — wrong but historically observed).
+        // The write_pipe request body is `handle_id (u64) + bytes`,
+        // so safe payload is `BODY_MAX - 8`. We round down to 60 KB
+        // for a comfortable margin and to match the MUX_MAX_PAYLOAD
+        // constant used elsewhere. Returning a partial byte count to
+        // the guest is normal Linux write(2) semantics for non-atomic
+        // writes (any write > PIPE_BUF/4096 is non-atomic).
+        const WRITE_PIPE_CHUNK: usize = 60 * 1024;
+        let to_write = core::cmp::min(buf.len(), WRITE_PIPE_CHUNK);
+        let chunk = &buf[..to_write];
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::OUT, || {
-                match self.provider.write_pipe(self.handle(), buf) {
+                match self.provider.write_pipe(self.handle(), chunk) {
                     Ok(n) => Ok(n),
                     Err(BrokerOpError::WouldBlock) => {
                         Err(litebox::event::polling::TryOpError::TryAgain)
