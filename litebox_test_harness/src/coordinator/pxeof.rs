@@ -59,6 +59,15 @@ enum Scenario {
     EpollRdhup,
     DepthTwo,
     SharedWriter,
+    /// Spawn child binary; child forks a grandchild that immediately
+    /// exits; child waits for grandchild via waitpid; child exits.
+    /// Parent agent captures the child's stdout (which is empty) and
+    /// must observe EOF — exercises the same pattern as
+    /// `PIDF.exit_self` minus the pidfd_open / poll(POLLIN) dance,
+    /// so a failure here isolates the bug to broker-pipe EOF
+    /// propagation in the presence of an inner fork (rather than
+    /// pidfd-specific code paths).
+    InnerForkExit,
 }
 
 impl Scenario {
@@ -75,6 +84,7 @@ impl Scenario {
             Self::EpollRdhup => "epoll_rdhup",
             Self::DepthTwo => "depth_two",
             Self::SharedWriter => "shared_writer",
+            Self::InnerForkExit => "inner_fork_exit",
         }
     }
 }
@@ -91,6 +101,7 @@ const ALL_SCENARIOS: &[Scenario] = &[
     Scenario::EpollRdhup,
     Scenario::DepthTwo,
     Scenario::SharedWriter,
+    Scenario::InnerForkExit,
 ];
 
 // ─── Handler protocol ──────────────────────────────────────────────
@@ -138,6 +149,7 @@ async fn handle_pxeof(
         Scenario::EpollRdhup => run_epoll_rdhup(&args.child_bin),
         Scenario::DepthTwo => run_depth_two(&args.child_bin, args.grandchild_bin.as_deref()),
         Scenario::SharedWriter => run_shared_writer(&args.child_bin),
+        Scenario::InnerForkExit => run_inner_fork_exit(&args.child_bin),
     };
     Ok(match r {
         Ok(detail) => PxeofOut {
@@ -557,6 +569,37 @@ fn run_shared_writer(child_bin: &str) -> Result<String, String> {
     Ok(format!("shared-writer EOF OK: {}", text.trim()))
 }
 
+fn run_inner_fork_exit(child_bin: &str) -> Result<String, String> {
+    // Child binary does: fork → grandchild sleeps briefly + exits;
+    // child waits via waitpid; child exits. No pidfd, no inner poll.
+    // Parent captures stdout (empty — child writes nothing) and must
+    // observe EOF. Isolates the broker-pipe EOF-propagation behavior
+    // in the presence of an inner fork from the pidfd code paths
+    // exercised by `PIDF.exit_self`.
+    let mut cmd = Command::new(child_bin);
+    cmd.args(["pxeof-leaf", "ROLE=inner-fork-exit"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let mut out = child.stdout.take().ok_or("no stdout")?;
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&out);
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let received = read_to_eof_or_timeout(&mut out, fd, deadline)?;
+    drop(out);
+    let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+    if !status.success() {
+        return Err(format!("child exit non-zero: {status:?}"));
+    }
+    if !received.is_empty() {
+        return Err(format!(
+            "expected empty stdout, got {} bytes: {:?}",
+            received.len(),
+            String::from_utf8_lossy(&received)
+        ));
+    }
+    Ok("inner-fork-exit: EOF observed, child exited cleanly".to_string())
+}
+
 // ─── Test registration ─────────────────────────────────────────────
 
 /// Binary-type variants per scenario. `pie-glibc` is the same-bt
@@ -638,6 +681,7 @@ mod leaf_subcmd {
             "read-stdin" => role_read_stdin(),
             "forward" => role_forward(args),
             "shared-writer-fork" => role_shared_writer_fork(),
+            "inner-fork-exit" => role_inner_fork_exit(),
             other => {
                 eprintln!("pxeof-leaf: unknown ROLE={other}");
                 2
@@ -829,6 +873,39 @@ mod leaf_subcmd {
         // pair above (that pair is internal to this leaf). Print the
         // marker line that the handler asserts on.
         println!("SHARED_WRITER_DONE");
+        0
+    }
+
+    /// Mirrors `PIDF.exit_self`'s child-binary shape but without
+    /// pidfd/poll. Forks a grandchild that exits immediately, waits
+    /// for it via waitpid, then exits cleanly. Parent observes
+    /// closed stdout (empty payload + EOF) since this leaf writes
+    /// nothing to stdout.
+    fn role_inner_fork_exit() -> i32 {
+        // SAFETY: fork() is async-signal-safe; the child branch only
+        // calls `_exit(0)` which is also async-signal-safe.
+        let grandchild = unsafe { libc::fork() };
+        if grandchild < 0 {
+            eprintln!(
+                "pxeof-leaf inner-fork-exit: fork failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if grandchild == 0 {
+            // SAFETY: _exit on a known status.
+            unsafe { libc::_exit(0) };
+        }
+        // SAFETY: waitpid on the known pid; null status pointer accepted.
+        let waited = unsafe { libc::waitpid(grandchild, core::ptr::null_mut(), 0) };
+        if waited != grandchild {
+            eprintln!(
+                "pxeof-leaf inner-fork-exit: waitpid returned {waited}, expected {grandchild}"
+            );
+            return 1;
+        }
+        // Exit cleanly. We deliberately don't write to stdout — the
+        // handler asserts on empty stdout + EOF.
         0
     }
 
