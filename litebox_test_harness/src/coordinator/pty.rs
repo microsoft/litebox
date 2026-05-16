@@ -38,6 +38,16 @@ enum ScenarioKind {
     Tiocsctty,
     Resize,
     ExecShellSession,
+    /// PTYR.stdout_roundtrip — child writes a unique marker to fd 1
+    /// (PTY slave) via `printf` after exec; parent reads from master.
+    /// Headline regression test for the SSH-TUI failure: confirms
+    /// stdout bytes from a non-PIE binary reach the parent across
+    /// `exec_on_remote_host`'s worker handoff.
+    StdoutRoundtrip,
+    /// PTYR.isatty — child calls `isatty(0/1/2)` post-exec and prints
+    /// `isatty: 0=Y 1=Y 2=Y`. Confirms all three stdio fds are TTYs in
+    /// the new worker after a non-PIE execve.
+    Isatty,
 }
 
 struct ScenarioDef {
@@ -82,6 +92,24 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         kind: ScenarioKind::ExecShellSession,
         per_binary_type: false,
     },
+    // ─── PTYR.* family ────────────────────────────────────────────────
+    // Regression coverage for the SSH-TUI demo failure
+    // (FOLLOWUP-shim-pty-stdio-handoff-to-remote-worker). The existing
+    // PTY.* family exercises ioctls (TIOCGPGRP/TIOCSPGRP/TIOCSCTTY/
+    // TIOCSWINSZ) and the controlling-terminal hookup; what was missing
+    // is verifying that ordinary stdout I/O survives the non-PIE
+    // worker handoff in `exec_on_remote_host`. The two PTYR scenarios
+    // close that gap.
+    ScenarioDef {
+        name: "stdout_roundtrip",
+        kind: ScenarioKind::StdoutRoundtrip,
+        per_binary_type: true,
+    },
+    ScenarioDef {
+        name: "isatty",
+        kind: ScenarioKind::Isatty,
+        per_binary_type: true,
+    },
 ];
 
 #[derive(Serialize, Deserialize)]
@@ -102,6 +130,10 @@ const TIOCSPGRP: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.tiocs
 const TIOCSCTTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.tiocsctty");
 const RESIZE: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.resize");
 const EXEC_SHELL_SESSION: HandlerToken<(), PtyOut> = HandlerToken::new("pty.exec_shell_session");
+// PTYR.* tokens — regression coverage for non-PIE worker-handoff stdio.
+const PTYR_STDOUT_ROUNDTRIP: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.stdout_roundtrip");
+const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
 
 // ─── Handlers ────────────────────────────────────────────────────────
 
@@ -189,6 +221,44 @@ async fn handle_exec_shell_session(
     Ok(PtyOut { detail })
 }
 
+// ─── PTYR handlers ───────────────────────────────────────────────────
+// Regression coverage for the SSH-TUI worker-handoff bug
+// (FOLLOWUP-shim-pty-stdio-handoff-to-remote-worker). These tests
+// fork+exec the harness binary in a chosen BinaryType — when the
+// binary is non-PIE, the execve goes through `exec_on_remote_host`
+// in the shim, which spawns a fresh worker host. The child runs
+// under the new worker with the PTY slave as its stdin/stdout/stderr;
+// the parent reads from the master and asserts the bytes arrived.
+// If the worker handoff doesn't propagate the PTY slave correctly,
+// these assertions will fail (and they're the smallest possible
+// repro of the demo's TUI failure).
+
+async fn handle_ptyr_stdout_roundtrip(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-stdout-print".into()], true)?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    let detail = exact(&data, "PTYR_STDOUT_OK\r\n")?;
+    Ok(PtyOut { detail })
+}
+
+async fn handle_ptyr_isatty(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-isatty-check".into()], true)?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    let detail = exact(&data, "isatty: 0=Y 1=Y 2=Y\r\n")?;
+    Ok(PtyOut { detail })
+}
+
 // ─── Registration ────────────────────────────────────────────────────
 
 pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
@@ -198,11 +268,15 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(TIOCSCTTY, handle_tiocsctty);
     register_handler!(RESIZE, handle_resize);
     register_handler!(EXEC_SHELL_SESSION, handle_exec_shell_session);
+    register_handler!(PTYR_STDOUT_ROUNDTRIP, handle_ptyr_stdout_roundtrip);
+    register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
 
     crate::register_leaf_subcommand!("pty-tiocgpgrp", leaf_subcmd::subcmd_pty_tiocgpgrp);
     crate::register_leaf_subcommand!("pty-tiocspgrp", leaf_subcmd::subcmd_pty_tiocspgrp);
     crate::register_leaf_subcommand!("pty-tiocsctty", leaf_subcmd::subcmd_pty_tiocsctty);
     crate::register_leaf_subcommand!("pty-resize", leaf_subcmd::subcmd_pty_resize);
+    crate::register_leaf_subcommand!("pty-stdout-print", leaf_subcmd::subcmd_pty_stdout_print);
+    crate::register_leaf_subcommand!("pty-isatty-check", leaf_subcmd::subcmd_pty_isatty_check);
 
     for &agent in PTY_AGENTS {
         for def in PTY_SCENARIOS {
@@ -287,6 +361,11 @@ async fn drive_target(
         ScenarioKind::Tiocspgrp => run.send_named_typed(handle, &TIOCSPGRP, args).await?,
         ScenarioKind::Tiocsctty => run.send_named_typed(handle, &TIOCSCTTY, args).await?,
         ScenarioKind::Resize => run.send_named_typed(handle, &RESIZE, args).await?,
+        ScenarioKind::StdoutRoundtrip => {
+            run.send_named_typed(handle, &PTYR_STDOUT_ROUNDTRIP, args)
+                .await?
+        }
+        ScenarioKind::Isatty => run.send_named_typed(handle, &PTYR_ISATTY, args).await?,
         ScenarioKind::ExecEcho | ScenarioKind::ExecShellSession => {
             return Err("target binary unexpectedly requested for non-target scenario".into());
         }
@@ -436,6 +515,35 @@ mod leaf_subcmd {
             return 1;
         }
         println!("RESIZE rows={} cols={}", ws.ws_row, ws.ws_col);
+        0
+    }
+
+    /// PTYR.stdout_roundtrip: write a fixed marker to fd 1 (PTY slave)
+    /// and exit. Parent reads from the master and verifies the marker
+    /// arrived. Smallest possible test of "bytes from a non-PIE binary
+    /// reach the PTY master after `exec_on_remote_host` handoff."
+    pub(super) fn subcmd_pty_stdout_print(_args: &[String]) -> i32 {
+        println!("PTYR_STDOUT_OK");
+        let _ = std::io::stdout().flush();
+        0
+    }
+
+    /// PTYR.isatty: probe `isatty(0)/isatty(1)/isatty(2)` after exec
+    /// and report. Each should be a TTY when the child inherits the
+    /// PTY slave as stdio; the assertion catches stdio-handoff
+    /// regressions that downgrade an fd to a non-TTY across a
+    /// worker handoff.
+    pub(super) fn subcmd_pty_isatty_check(_args: &[String]) -> i32 {
+        let label = |fd: i32| -> &'static str {
+            // SAFETY: isatty reads kernel state for an fd; no preconditions.
+            if unsafe { libc::isatty(fd) } == 1 {
+                "Y"
+            } else {
+                "N"
+            }
+        };
+        println!("isatty: 0={} 1={} 2={}", label(0), label(1), label(2));
+        let _ = std::io::stdout().flush();
         0
     }
 }
