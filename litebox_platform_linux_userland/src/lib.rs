@@ -2298,6 +2298,7 @@ impl LinuxUserland {
     /// Panics if the internal worker-result-fd lock is poisoned.
     pub fn wait_worker_host(&self, host_pid: i32) -> i32 {
         let mut status: libc::c_int = 0;
+        let t0 = std::time::Instant::now();
         loop {
             let ret = unsafe { libc::waitpid(host_pid, core::ptr::addr_of_mut!(status), 0) };
             if ret == -1 {
@@ -2317,6 +2318,14 @@ impl LinuxUserland {
             }
             break;
         }
+        {
+            use litebox::platform::DebugLogProvider as _;
+            self.debug_log_print(&format!(
+                "[WAIT-WORKER] host_pid={} waitpid_returned_in_ms={}",
+                host_pid,
+                t0.elapsed().as_millis()
+            ));
+        }
         let fallback_status = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else if libc::WIFSIGNALED(status) {
@@ -2331,11 +2340,25 @@ impl LinuxUserland {
                 bridge_threads,
             } = worker;
             let wait_status = read_worker_result_fd(result_fd);
-            // Wait for all bridge threads to finish. The worker has exited,
-            // so the OS pipes will EOF and bridges will exit shortly. We
-            // must wait here because the caller (exec_on_remote_host) will
-            // call exit_group immediately after we return, which would close
-            // the virtual pipe senders before bridges finish writing data.
+            {
+                use litebox::platform::DebugLogProvider as _;
+                self.debug_log_print(&format!(
+                    "[WAIT-WORKER] host_pid={} joining {} bridges (t={}ms)",
+                    host_pid,
+                    bridge_threads.len(),
+                    t0.elapsed().as_millis()
+                ));
+            }
+            // Wait for OUTPUT bridge threads to finish (they read FROM
+            // worker stdio and write TO parent virtual pipes/fs/streams;
+            // we must wait so buffered data isn't lost when exit_group
+            // closes the parent senders).  INPUT bridge threads only
+            // write TO the now-dead worker — there's nothing to wait
+            // for — and historically they sometimes take 10+ seconds
+            // to exit because `pipes.read` on the source can block past
+            // the cancel signal.  Detach them so wait_worker_host
+            // returns quickly.
+            let mut detached = self.detached_worker_bridge_threads.lock().unwrap();
             for bridge in bridge_threads {
                 if let Some(input_control) = bridge.input_control.as_ref() {
                     input_control
@@ -2344,8 +2367,24 @@ impl LinuxUserland {
                     if let Some(thread_handle) = &input_control.thread_handle {
                         thread_handle.interrupt();
                     }
+                    // Input bridge: cancel signaled; let it finish in the
+                    // background.  Reaped later by
+                    // reap_finished_worker_bridge_threads.
+                    detached.push(bridge);
+                } else {
+                    // Output bridge: must finish synchronously.
+                    let _ = bridge.handle.join();
                 }
-                let _ = bridge.handle.join();
+            }
+            drop(detached);
+            self.reap_finished_worker_bridge_threads();
+            {
+                use litebox::platform::DebugLogProvider as _;
+                self.debug_log_print(&format!(
+                    "[WAIT-WORKER] host_pid={} all output bridges joined (t={}ms)",
+                    host_pid,
+                    t0.elapsed().as_millis()
+                ));
             }
             if let Some(wait_status) = wait_status {
                 return wait_status;
