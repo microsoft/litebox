@@ -16,6 +16,7 @@ pub mod broker_pidfd_provider;
 pub mod broker_pipe_provider;
 pub mod broker_pty_provider;
 pub mod broker_signalfd_provider;
+pub mod broker_socketpair_provider;
 pub mod guest_pid_provider;
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -279,8 +280,10 @@ fn parse_broker_fd_bridge_spec(
     litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind,
     u64,
     Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
+    Option<litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint>,
 )> {
     use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
+    use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
     use litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind;
     let parts: Vec<&str> = spec.split(':').collect();
     if !(parts.len() == 3 || parts.len() == 4) {
@@ -295,14 +298,15 @@ fn parse_broker_fd_bridge_spec(
         "signalfd" => BrokerHandleKind::Signalfd,
         "pty" => BrokerHandleKind::Pty,
         "pipe" => BrokerHandleKind::Pipe,
+        "unix_socket" => BrokerHandleKind::UnixSocket,
         other => anyhow::bail!("broker-fd-bridge: bad kind {other:?}"),
     };
     let handle_id: u64 = parts[2]
         .parse()
         .map_err(|e| anyhow!("broker-fd-bridge: bad handle {:?}: {e}", parts[2]))?;
-    let direction = match (kind, parts.get(3)) {
-        (BrokerHandleKind::Pipe, Some(&"r")) => Some(BrokerPipeEnd::Read),
-        (BrokerHandleKind::Pipe, Some(&"w")) => Some(BrokerPipeEnd::Write),
+    let (direction, endpoint) = match (kind, parts.get(3)) {
+        (BrokerHandleKind::Pipe, Some(&"r")) => (Some(BrokerPipeEnd::Read), None),
+        (BrokerHandleKind::Pipe, Some(&"w")) => (Some(BrokerPipeEnd::Write), None),
         (BrokerHandleKind::Pipe, Some(other)) => {
             anyhow::bail!("broker-fd-bridge: pipe direction must be 'r' or 'w', got {other:?}")
         }
@@ -311,15 +315,27 @@ fn parse_broker_fd_bridge_spec(
                 "broker-fd-bridge: pipe kind requires :r or :w direction suffix (spec {spec:?})"
             )
         }
+        (BrokerHandleKind::UnixSocket, Some(&"a")) => (None, Some(BrokerSocketPairEndpoint::A)),
+        (BrokerHandleKind::UnixSocket, Some(&"b")) => (None, Some(BrokerSocketPairEndpoint::B)),
+        (BrokerHandleKind::UnixSocket, Some(other)) => {
+            anyhow::bail!(
+                "broker-fd-bridge: unix_socket endpoint must be 'a' or 'b', got {other:?}"
+            )
+        }
+        (BrokerHandleKind::UnixSocket, None) => {
+            anyhow::bail!(
+                "broker-fd-bridge: unix_socket kind requires :a or :b endpoint suffix (spec {spec:?})"
+            )
+        }
         (_, Some(extra)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
                 parts[1]
             )
         }
-        (_, None) => None,
+        (_, None) => (None, None),
     };
-    Ok((guest_fd, kind, handle_id, direction))
+    Ok((guest_fd, kind, handle_id, direction, endpoint))
 }
 
 fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
@@ -488,6 +504,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
         litebox_shim_linux::syscalls::set_eager_broker_pipe_enabled(enabled);
+    }
+
+    // Phase F: equivalent runtime gate for eager broker-backed
+    // socketpair. `LITEBOX_EAGER_BROKER_SOCKETPAIR=1` (or 'true' /
+    // 'yes', case-insensitive) flips `sys_socketpair` to allocate
+    // broker-backed AF_UNIX SOCK_STREAM pairs instead of in-shim
+    // UnixSocket. Required for cross-worker fork+exec inheritance
+    // of socketpair fds. Default off; non-stream / non-AF_UNIX
+    // socketpairs ignore the gate.
+    {
+        let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETPAIR")
+            .ok()
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
     }
 
     // Phase B-Step8c: if --fd-token-broker is supplied, connect to
@@ -1003,10 +1034,17 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         // the cross-binary-type exec boundary (Phase 2.F follow-up,
         // extended in Phase C.3 to handle pipe).
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction) = parse_broker_fd_bridge_spec(spec)?;
+            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
+                parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
-                .install_broker_bridge_fd(guest_fd, kind, handle_id, pipe_direction)
+                .install_broker_bridge_fd(
+                    guest_fd,
+                    kind,
+                    handle_id,
+                    pipe_direction,
+                    socketpair_endpoint,
+                )
                 .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
         }
 
@@ -1097,10 +1135,17 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // the cross-binary-type exec boundary (Phase 2.F follow-up,
     // extended in Phase C.3 to handle pipe).
     for spec in &cli_args.broker_fd_bridge {
-        let (guest_fd, kind, handle_id, pipe_direction) = parse_broker_fd_bridge_spec(spec)?;
+        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
+            parse_broker_fd_bridge_spec(spec)?;
         program
             .entrypoints
-            .install_broker_bridge_fd(guest_fd, kind, handle_id, pipe_direction)
+            .install_broker_bridge_fd(
+                guest_fd,
+                kind,
+                handle_id,
+                pipe_direction,
+                socketpair_endpoint,
+            )
             .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
     }
 
@@ -2383,10 +2428,17 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         // the cross-binary-type exec boundary (Phase 2.F follow-up,
         // extended in Phase C.3 to handle pipe).
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction) = parse_broker_fd_bridge_spec(spec)?;
+            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
+                parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
-                .install_broker_bridge_fd(guest_fd, kind, handle_id, pipe_direction)
+                .install_broker_bridge_fd(
+                    guest_fd,
+                    kind,
+                    handle_id,
+                    pipe_direction,
+                    socketpair_endpoint,
+                )
                 .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
         }
 
@@ -3057,6 +3109,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     ));
     litebox_shim_linux::syscalls::set_broker_pipe_provider(pipe_provider)
         .map_err(|_| anyhow!("pipe provider already set"))?;
+
+    let socketpair_provider = Arc::new(
+        crate::broker_socketpair_provider::RunnerBrokerSocketPairProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_socketpair_provider(socketpair_provider)
+        .map_err(|_| anyhow!("socketpair provider already set"))?;
 
     let pty_provider = Arc::new(crate::broker_pty_provider::RunnerBrokerPtyProvider::new(
         Arc::clone(&client),

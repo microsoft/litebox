@@ -7231,12 +7231,18 @@ impl<FS: ShimFS> Task<FS> {
                                 BrokerHandleKind::Pipe => super::broker_pipe::broker_pipe_provider()
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
+                                BrokerHandleKind::UnixSocket => {
+                                    super::broker_socketpair::broker_socketpair_provider()
+                                        .as_ref()
+                                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                                }
                             };
                             if kind == BrokerHandleKind::Pidfd {
                                 Some(BrokerHandleSnapshot {
                                     kind,
                                     handle_id,
                                     pipe_direction: None,
+                                    socketpair_endpoint: None,
                                 })
                             } else if let Some(releaser) = releaser_opt {
                                 match releaser.dup_handle(handle_id) {
@@ -7250,6 +7256,7 @@ impl<FS: ShimFS> Task<FS> {
                                             kind,
                                             handle_id,
                                             pipe_direction: None,
+                                            socketpair_endpoint: None,
                                         })
                                     }
                                     Err(_) => None,
@@ -7299,6 +7306,7 @@ impl<FS: ShimFS> Task<FS> {
                                             kind,
                                             handle_id,
                                             pipe_direction: Some(direction),
+                                            socketpair_endpoint: None,
                                         })
                                     }
                                     Err(_) => None,
@@ -9108,6 +9116,7 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Signalfd => "signalfd",
                         BrokerHandleKind::Pty => "pty",
                         BrokerHandleKind::Pipe => "pipe",
+                        BrokerHandleKind::UnixSocket => "unix_socket",
                     };
                     let releaser: Option<
                         alloc::sync::Arc<
@@ -9127,6 +9136,11 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Pipe => super::broker_pipe::broker_pipe_provider()
                             .as_ref()
                             .map(|p| alloc::sync::Arc::clone(p) as _),
+                        BrokerHandleKind::UnixSocket => {
+                            super::broker_socketpair::broker_socketpair_provider()
+                                .as_ref()
+                                .map(|p| alloc::sync::Arc::clone(p) as _)
+                        }
                     };
                     if kind == BrokerHandleKind::Pidfd {
                         broker_eventfd_specs

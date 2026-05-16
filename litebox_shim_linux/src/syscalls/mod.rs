@@ -5,6 +5,7 @@
 
 pub(crate) mod broker_backed;
 pub(crate) mod broker_pipe;
+pub(crate) mod broker_socketpair;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub(crate) mod guest_pid;
@@ -16,6 +17,10 @@ pub(crate) mod guest_pid;
 pub use broker_pipe::{
     broker_pipe_provider, eager_broker_pipe_enabled, set_broker_pipe_provider,
     set_eager_broker_pipe_enabled,
+};
+pub use broker_socketpair::{
+    broker_socketpair_provider, eager_broker_socketpair_enabled, set_broker_socketpair_provider,
+    set_eager_broker_socketpair_enabled,
 };
 pub use eventfd::broker_eventfd_provider;
 pub use eventfd::broker_pidfd_provider;

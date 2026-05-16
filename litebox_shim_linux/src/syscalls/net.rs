@@ -1340,6 +1340,77 @@ impl<FS: ShimFS> Task<FS> {
         let (desc1, desc2) = match domain {
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
+
+                // Phase F: eager broker-backed AF_UNIX SOCK_STREAM
+                // socketpair. Gated by LITEBOX_EAGER_BROKER_SOCKETPAIR
+                // (off by default). Only SOCK_STREAM is supported by
+                // the broker StateObject — datagram / seqpacket /
+                // SCM_RIGHTS-bearing variants fall through to the
+                // in-shim UnixSocket path until those are modeled.
+                if ty == SockType::Stream
+                    && crate::syscalls::broker_socketpair::eager_broker_socketpair_enabled()
+                    && let Some(provider) =
+                        crate::syscalls::broker_socketpair::broker_socketpair_provider()
+                {
+                    use litebox::fs::OFlags;
+                    use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
+                    // Default capacity / atomic-write-size mirror the
+                    // pipe defaults (PIPE_BUF=4096, capacity=64KB).
+                    const SP_CAPACITY: u64 = 64 * 1024;
+                    const SP_ATOMIC: u64 = 4096;
+                    let (handle_a, handle_b) = provider
+                        .create_socketpair(SP_CAPACITY, SP_ATOMIC)
+                        .map_err(|_| Errno::EIO)?;
+                    let nonblock = if flags.contains(SockFlags::NONBLOCK) {
+                        OFlags::NONBLOCK
+                    } else {
+                        OFlags::empty()
+                    };
+                    let sp_a = crate::syscalls::broker_socketpair::BrokerSocketPairFd::<
+                        crate::Platform,
+                    >::new(
+                        alloc::sync::Arc::clone(&provider),
+                        handle_a,
+                        BrokerSocketPairEndpoint::A,
+                        nonblock,
+                    );
+                    let sp_b = crate::syscalls::broker_socketpair::BrokerSocketPairFd::<
+                        crate::Platform,
+                    >::new(
+                        provider, handle_b, BrokerSocketPairEndpoint::B, nonblock
+                    );
+                    let files = self.files.borrow();
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let typed1 = dt
+                        .insert::<crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+                            sp_a,
+                        );
+                    let typed2 = dt
+                        .insert::<crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+                            sp_b,
+                        );
+                    if flags.contains(SockFlags::CLOEXEC) {
+                        let old = dt.set_fd_metadata(&typed1, FileDescriptorFlags::FD_CLOEXEC);
+                        assert!(old.is_none());
+                        let old = dt.set_fd_metadata(&typed2, FileDescriptorFlags::FD_CLOEXEC);
+                        assert!(old.is_none());
+                    }
+                    drop(dt);
+                    let raw_fd1 = files.insert_raw_fd(typed1).map_err(|typed| {
+                        let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                        Errno::EMFILE
+                    })?;
+                    let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
+                        self.do_close(raw_fd1).unwrap();
+                        let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                        Errno::EMFILE
+                    })?;
+                    return Ok((
+                        u32::try_from(raw_fd1).unwrap(),
+                        u32::try_from(raw_fd2).unwrap(),
+                    ));
+                }
+
                 let (sock1, sock2) =
                     UnixSocket::new_connected_pair(ty, flags, self.current_ucred())
                         .ok_or(Errno::ESOCKTNOSUPPORT)?;
