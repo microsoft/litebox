@@ -6992,114 +6992,123 @@ impl<FS: ShimFS> Task<FS> {
             // the descriptor's object_id matches the original host stdio.
             // For filesystem fds, also probe terminal metadata markers so we
             // can accept terminal fds through the snapshot gate.
-            let (subsystem_class, object_id, terminal_meta, _socket_pair_id) =
-                if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-                    let oid = Some(fd.object_id());
-                    // Probe terminal metadata markers on this filesystem fd.
-                    // HostStdioSourceFd only counts as terminal when the
-                    // underlying host stream is actually a tty.
-                    let host_stdio_source = dt
-                        .with_metadata(&fd, |m: &crate::HostStdioSourceFd| m.0)
-                        .ok()
-                        .filter(|&source_fd| {
-                            let stream = match source_fd {
-                                0 => litebox::platform::StdioStream::Stdin,
-                                1 => litebox::platform::StdioStream::Stdout,
-                                _ => litebox::platform::StdioStream::Stderr,
-                            };
-                            self.global.platform.is_a_tty(stream)
-                        });
-                    let is_tty_alias = dt.with_metadata(&fd, |_: &crate::HostTtyAlias| ()).is_ok();
-                    let is_pty_device = dt
-                        .with_metadata(&fd, |_: &super::file::HostPtyDeviceFd| ())
-                        .is_ok();
+            let (subsystem_class, object_id, terminal_meta, _socket_pair_id) = if let Ok(fd) =
+                rds.fd_from_raw_integer::<FS>(raw_fd)
+            {
+                let oid = Some(fd.object_id());
+                // Probe terminal metadata markers on this filesystem fd.
+                // HostStdioSourceFd only counts as terminal when the
+                // underlying host stream is actually a tty.
+                let host_stdio_source = dt
+                    .with_metadata(&fd, |m: &crate::HostStdioSourceFd| m.0)
+                    .ok()
+                    .filter(|&source_fd| {
+                        let stream = match source_fd {
+                            0 => litebox::platform::StdioStream::Stdin,
+                            1 => litebox::platform::StdioStream::Stdout,
+                            _ => litebox::platform::StdioStream::Stderr,
+                        };
+                        self.global.platform.is_a_tty(stream)
+                    });
+                let is_tty_alias = dt.with_metadata(&fd, |_: &crate::HostTtyAlias| ()).is_ok();
+                let is_pty_device = dt
+                    .with_metadata(&fd, |_: &super::file::HostPtyDeviceFd| ())
+                    .is_ok();
 
-                    // Check if this is a sandbox PTY (userspace-emulated, major >= 136).
-                    // Extract PTY pair index from rdev: rdev = 0x8800 + index.
-                    // Only slaves (not masters) count — masters are the host
-                    // side and should not be bridged.
-                    let sandbox_pty_info: Option<u32> = files
-                        .fs
-                        .fd_file_status(&fd)
-                        .ok()
-                        .and_then(|s| s.node_info.rdev)
-                        .and_then(|rdev| {
-                            let major = rdev.get() >> 8;
-                            if major >= 136 {
-                                u32::try_from(rdev.get() - 0x8800).ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .filter(|_| {
-                            // Verify this is actually a slave, not a master.
-                            // get_pty_pair_erased returns (arc, index, is_master).
-                            // If is_master is true or the pair is gone, filter out.
-                            files
-                                .fs
-                                .get_pty_pair_erased(&fd)
-                                .is_some_and(|(_, _, is_master)| !is_master)
-                        });
+                // Check if this is a sandbox PTY (userspace-emulated, major >= 136).
+                // Extract PTY pair index from rdev: rdev = 0x8800 + index.
+                // Only slaves (not masters) count — masters are the host
+                // side and should not be bridged.
+                let sandbox_pty_info: Option<u32> = files
+                    .fs
+                    .fd_file_status(&fd)
+                    .ok()
+                    .and_then(|s| s.node_info.rdev)
+                    .and_then(|rdev| {
+                        let major = rdev.get() >> 8;
+                        if major >= 136 {
+                            u32::try_from(rdev.get() - 0x8800).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .filter(|_| {
+                        // Verify this is actually a slave, not a master.
+                        // get_pty_pair_erased returns (arc, index, is_master).
+                        // If is_master is true or the pair is gone, filter out.
+                        files
+                            .fs
+                            .get_pty_pair_erased(&fd)
+                            .is_some_and(|(_, _, is_master)| !is_master)
+                    });
 
-                    let meta = if host_stdio_source.is_some()
-                        || is_tty_alias
-                        || is_pty_device
-                        || sandbox_pty_info.is_some()
-                    {
-                        Some(FdMetadataSnapshot {
-                            host_stdio_source_fd: host_stdio_source,
-                            is_host_tty_alias: is_tty_alias,
-                            is_host_pty_device: is_pty_device,
-                            is_sandbox_pty_slave: sandbox_pty_info.is_some(),
-                            sandbox_pty_index: sandbox_pty_info,
-                            ..Default::default()
-                        })
-                    } else {
-                        None
-                    };
-                    (FdClass::FilesystemFd, oid, meta, None)
-                } else if let Ok(fd) =
-                    rds.fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
+                let meta = if host_stdio_source.is_some()
+                    || is_tty_alias
+                    || is_pty_device
+                    || sandbox_pty_info.is_some()
                 {
-                    (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
-                } else if let Ok(fd) =
-                    rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                {
-                    (FdClass::Pipe, Some(fd.object_id()), None, None)
-                } else if let Ok(fd) =
-                    rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
-                {
-                    // Host-backed pipe (from a prior delayed-fork bridge).
-                    (FdClass::Pipe, Some(fd.object_id()), None, None)
-                } else if let Ok(fd) =
-                    rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
-                {
-                    // Phase C.3: eager-broker pipe. Classify as Pipe so the
-                    // broker-handle metadata is emitted below and the restored
-                    // worker can re-attach to the same broker `PipeState`.
-                    (FdClass::Pipe, Some(fd.object_id()), None, None)
-                } else if let Ok(fd) =
-                    rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-                {
-                    (FdClass::EventFd, Some(fd.object_id()), None, None)
-                } else if let Ok(fd) =
-                    rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
-                {
-                    (FdClass::Epoll, Some(fd.object_id()), None, None)
-                } else if let Ok(fd) =
-                    rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
-                {
-                    let dt_inner = self.global.litebox.descriptor_table();
-                    let pair_id = dt_inner
-                        .with_entry(&fd, |sock: &super::unix::UnixSocket<FS>| {
-                            sock.socket_pair_id()
-                        })
-                        .flatten();
-                    drop(dt_inner);
-                    (FdClass::UnixSocket, Some(fd.object_id()), None, pair_id)
+                    Some(FdMetadataSnapshot {
+                        host_stdio_source_fd: host_stdio_source,
+                        is_host_tty_alias: is_tty_alias,
+                        is_host_pty_device: is_pty_device,
+                        is_sandbox_pty_slave: sandbox_pty_info.is_some(),
+                        sandbox_pty_index: sandbox_pty_info,
+                        ..Default::default()
+                    })
                 } else {
-                    (FdClass::Other, None, None, None)
+                    None
                 };
+                (FdClass::FilesystemFd, oid, meta, None)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
+            {
+                (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+            {
+                (FdClass::Pipe, Some(fd.object_id()), None, None)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
+            {
+                // Host-backed pipe (from a prior delayed-fork bridge).
+                (FdClass::Pipe, Some(fd.object_id()), None, None)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
+            {
+                // Phase C.3: eager-broker pipe. Classify as Pipe so the
+                // broker-handle metadata is emitted below and the restored
+                // worker can re-attach to the same broker `PipeState`.
+                (FdClass::Pipe, Some(fd.object_id()), None, None)
+            } else if let Ok(fd) = rds
+                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
+            {
+                // Phase F: eager-broker socketpair. Classify as
+                // UnixSocket so the broker-handle metadata is emitted
+                // below and the restored worker can re-attach to the
+                // same broker `SocketPairState` endpoint.
+                (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+            {
+                (FdClass::EventFd, Some(fd.object_id()), None, None)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
+            {
+                (FdClass::Epoll, Some(fd.object_id()), None, None)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+            {
+                let dt_inner = self.global.litebox.descriptor_table();
+                let pair_id = dt_inner
+                    .with_entry(&fd, |sock: &super::unix::UnixSocket<FS>| {
+                        sock.socket_pair_id()
+                    })
+                    .flatten();
+                drop(dt_inner);
+                (FdClass::UnixSocket, Some(fd.object_id()), None, pair_id)
+            } else {
+                (FdClass::Other, None, None, None)
+            };
 
             // Promote to StdioFd only if this fd sits at a stdio slot AND
             // its object_id matches ANY of the original host stdio descriptors.
@@ -7307,6 +7316,63 @@ impl<FS: ShimFS> Task<FS> {
                                             handle_id,
                                             pipe_direction: Some(direction),
                                             socketpair_endpoint: None,
+                                        })
+                                    }
+                                    Err(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                }
+            } else if class == FdClass::UnixSocket {
+                // Phase F: emit a broker-UnixSocket handle snapshot
+                // when the fd is a `BrokerSocketPairSubsystem` entry.
+                // Local `UnixSocketSubsystem` pairs don't have broker
+                // identity and fall through to `None` (the snapshot
+                // restore path creates a fresh local UnixSocket for
+                // them, which loses the cross-worker connection — that
+                // pre-existing limitation is the very thing eager
+                // broker socketpair fixes).
+                if let Ok(typed) = rds
+                    .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(
+                        raw_fd,
+                    )
+                {
+                    let socketpair_provider =
+                        super::broker_socketpair::broker_socketpair_provider();
+                    let entry_result = dt.with_entry(
+                        &typed,
+                        |sp_fd: &super::broker_socketpair::BrokerSocketPairFd<crate::Platform>| {
+                            sp_fd.fork_snapshot_handle()
+                        },
+                    );
+                    match entry_result {
+                        Some((kind, handle_id, endpoint)) => {
+                            let releaser_opt: Option<
+                                alloc::sync::Arc<
+                                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                                >,
+                            > = socketpair_provider
+                                .as_ref()
+                                .map(|p| alloc::sync::Arc::clone(p) as _);
+                            if let Some(releaser) = releaser_opt {
+                                match releaser.dup_handle(handle_id) {
+                                    Ok(()) => {
+                                        broker_transit.push(ForkSnapshotBrokerTransit {
+                                            releaser,
+                                            handle_id,
+                                            kind,
+                                        });
+                                        Some(BrokerHandleSnapshot {
+                                            kind,
+                                            handle_id,
+                                            pipe_direction: None,
+                                            socketpair_endpoint: Some(endpoint),
                                         })
                                     }
                                     Err(_) => None,
@@ -9218,6 +9284,54 @@ impl<FS: ShimFS> Task<FS> {
                         broker_eventfd_specs
                             .push(alloc::format!("{raw_fd}:pipe:{handle_id}:{dir_char}"));
                     }
+                }
+            }
+
+            // Phase F: collect BrokerSocketPairSubsystem fds and emit
+            // unix_socket bridge specs. Mirrors the BrokerPipe block
+            // above. Worker B's install_broker_bridge_fd calls
+            // dup_handle to record the +1 on its own connection.
+            let broker_socketpair_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<
+                    litebox::fd::TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>,
+                >,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) = rds
+                        .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(
+                            raw_fd,
+                        )
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in broker_socketpair_fds {
+                let sp_provider = super::broker_socketpair::broker_socketpair_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let sp_info = dt_local.with_entry(
+                    &typed,
+                    |sp_fd: &super::broker_socketpair::BrokerSocketPairFd<crate::Platform>| {
+                        (sp_fd.handle(), sp_fd.endpoint())
+                    },
+                );
+                drop(dt_local);
+                if let (Some(_provider), Some((handle_id, endpoint))) = (sp_provider, sp_info) {
+                    let endpoint_char = match endpoint {
+                        litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::A => 'a',
+                        litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::B => 'b',
+                    };
+                    broker_eventfd_specs.push(alloc::format!(
+                        "{raw_fd}:unix_socket:{handle_id}:{endpoint_char}"
+                    ));
                 }
             }
 
