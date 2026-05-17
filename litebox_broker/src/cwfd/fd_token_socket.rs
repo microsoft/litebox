@@ -1101,4 +1101,92 @@ mod tests {
         efd.close().expect("close");
         assert_eq!(state_registry.live_handle_count(), 0);
     }
+
+    #[test]
+    fn release_all_for_pid_drains_per_pid_bucket() {
+        // Phase F.5+ PE.1 Step D: when the shim sends caller_pid != 0
+        // on resource creation, the broker tracks per-(pid, id), and
+        // ReleaseAllForPid(pid) drains every entry for that pid
+        // without touching entries owned by other pids.
+        use litebox_common_linux::fd_token_client::set_caller_pid_scope;
+
+        let (_dir, path, _fdr, state_registry, _proc) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        // Pid 7 creates two eventfds.
+        let (h7a, h7b) = {
+            let _guard = set_caller_pid_scope(7);
+            let a = client.create_eventfd(0, false).expect("create eventfd a");
+            let b = client.create_eventfd(0, false).expect("create eventfd b");
+            (a, b)
+        };
+        // Pid 8 creates one eventfd.
+        let h8 = {
+            let _guard = set_caller_pid_scope(8);
+            client.create_eventfd(0, false).expect("create eventfd c")
+        };
+        assert_eq!(state_registry.live_handle_count(), 3);
+
+        // ReleaseAllForPid(7) drops both pid-7 handles, keeps pid-8.
+        let released = {
+            let _guard = set_caller_pid_scope(7);
+            client.release_all_for_pid(7).expect("release_all_for_pid")
+        };
+        assert_eq!(released, 2, "should release exactly the two pid-7 refs");
+        assert_eq!(
+            state_registry.live_handle_count(),
+            1,
+            "pid-8 eventfd must remain"
+        );
+
+        // ReleaseAllForPid(7) again — nothing left to release.
+        let released_again = {
+            let _guard = set_caller_pid_scope(7);
+            client
+                .release_all_for_pid(7)
+                .expect("release_all_for_pid 2")
+        };
+        assert_eq!(released_again, 0);
+
+        // ReleaseAllForPid(8) drains the remaining handle.
+        let released_8 = {
+            let _guard = set_caller_pid_scope(8);
+            client
+                .release_all_for_pid(8)
+                .expect("release_all_for_pid 8")
+        };
+        assert_eq!(released_8, 1);
+        assert_eq!(state_registry.live_handle_count(), 0);
+
+        let _ = (h7a, h7b, h8);
+    }
+
+    #[test]
+    fn caller_pid_zero_is_distinct_bucket() {
+        use litebox_common_linux::fd_token_client::set_caller_pid_scope;
+
+        let (_dir, path, _fdr, state_registry, _proc) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        // Default (caller_pid=0) creates one.
+        let _h0 = client.create_eventfd(0, false).expect("create");
+        // pid=5 creates one.
+        let _h5 = {
+            let _guard = set_caller_pid_scope(5);
+            client.create_eventfd(0, false).expect("create")
+        };
+        assert_eq!(state_registry.live_handle_count(), 2);
+
+        // ReleaseAllForPid(0) drains the legacy bucket only.
+        let n = client.release_all_for_pid(0).expect("release_all 0");
+        assert_eq!(n, 1);
+        assert_eq!(state_registry.live_handle_count(), 1);
+
+        let n = {
+            let _guard = set_caller_pid_scope(5);
+            client.release_all_for_pid(5).expect("release_all 5")
+        };
+        assert_eq!(n, 1);
+        assert_eq!(state_registry.live_handle_count(), 0);
+    }
 }
