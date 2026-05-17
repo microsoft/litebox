@@ -26,6 +26,7 @@ pub mod pipe_state;
 pub mod process_state;
 pub mod pty_state;
 pub mod signalfd_state;
+pub mod socketpair_state;
 pub mod state_registry;
 pub mod state_service;
 pub mod subscription_list;

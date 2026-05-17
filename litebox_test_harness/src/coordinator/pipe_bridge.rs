@@ -83,6 +83,13 @@ const EXTRA_PIPE_MULTI: HandlerToken<ExtraPipeMultiArgs, PipeBridgeOut> =
     HandlerToken::new("pipe_bridge.extra_pipe_multi");
 const EXTRA_SOCKETPAIR: HandlerToken<ExtraSocketpairArgs, PipeBridgeOut> =
     HandlerToken::new("pipe_bridge.extra_socketpair");
+/// Phase F bisection: socketpair + fork + parent↔child data, NO exec.
+/// Isolates "fork-snapshot restore of broker socketpair endpoint" from
+/// "exec_on_remote_host bridge-spec install of broker socketpair endpoint".
+/// If PB.sp fails but SP.fork_no_exec passes for the same bt, the bug is in
+/// the exec install path; if both fail, the bug is in restore_process.
+const FORK_NO_EXEC_SOCKETPAIR: HandlerToken<(), PipeBridgeOut> =
+    HandlerToken::new("pipe_bridge.fork_no_exec_socketpair");
 const EPOLL_PIPE_BRIDGE: HandlerToken<EpollPipeBridgeArgs, PipeBridgeOut> =
     HandlerToken::new("pipe_bridge.epoll_pipe_bridge");
 const EPOLL_SOCKETPAIR_BRIDGE: HandlerToken<EpollSocketpairBridgeArgs, PipeBridgeOut> =
@@ -206,6 +213,15 @@ async fn handle_extra_socketpair(
     let exe = current_exe_string()?;
     Ok(PipeBridgeOut {
         detail: test_extra_socketpair(&exe),
+    })
+}
+
+async fn handle_fork_no_exec_socketpair(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    Ok(PipeBridgeOut {
+        detail: test_fork_no_exec_socketpair(),
     })
 }
 
@@ -333,6 +349,89 @@ fn test_extra_socketpair(exe: &str) -> String {
     } else {
         format!("PB_SP_FAIL:exit={exit_code},data={text}")
     }
+}
+
+/// Phase F bisection: socketpair + fork + parent↔child data, **NO execve**.
+/// Returns "SP_FORK_NO_EXEC_OK" on success, else a structured failure
+/// string identifying which step broke (socketpair, fork, read, write,
+/// or echo-mismatch). Failure modes:
+///
+/// * `SP_FNE_SOCKETPAIR_FAIL:<errno>` — initial socketpair() failed.
+/// * `SP_FNE_FORK_FAIL:<errno>` — fork() failed.
+/// * `SP_FNE_PARENT_WRITE_FAIL:<errno>` — parent write returned -1 (EIO etc).
+/// * `SP_FNE_PARENT_WRITE_SHORT:<n>` — write returned partial count.
+/// * `SP_FNE_PARENT_READ_FAIL:<n_or_errno>` — parent read failed/timed out.
+/// * `SP_FNE_CHILD_EXIT:<code>` — child exited non-zero (its read/write failed).
+/// * `SP_FNE_MISMATCH:<actual>` — data round-trip data didn't match.
+fn test_fork_no_exec_socketpair() -> String {
+    let mut fds = [0i32; 2];
+    // Safety: fds points to two valid i32 slots for socketpair to fill.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+        return format!("SP_FNE_SOCKETPAIR_FAIL:{}", errno());
+    }
+
+    // Safety: this test process is single-threaded for this fork probe.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return format!("SP_FNE_FORK_FAIL:{}", errno());
+    }
+
+    if pid == 0 {
+        // Child: close parent's end, read PING, write PONG, exit.
+        // No execve — child re-enters the test_fork_no_exec_socketpair
+        // function context after fork, but since this is the child it
+        // hits this branch and exits cleanly.
+        // Safety: fds[0] is a valid fd returned by socketpair.
+        unsafe { libc::close(fds[0]) };
+        let mut buf = [0u8; 16];
+        // Safety: fds[1] is valid, buf is initialized.
+        let n = unsafe { libc::read(fds[1], buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n != 4 {
+            // Safety: process exit.
+            unsafe { libc::_exit(10) };
+        }
+        if &buf[..4] != b"PING" {
+            // Safety: process exit.
+            unsafe { libc::_exit(11) };
+        }
+        let msg = b"PONG";
+        // Safety: fds[1] valid, msg initialized.
+        let n = unsafe { libc::write(fds[1], msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
+        if n != 4 {
+            // Safety: process exit.
+            unsafe { libc::_exit(12) };
+        }
+        // Safety: process exit.
+        unsafe { libc::_exit(0) };
+    }
+
+    // Parent: close child's end, write PING, read PONG, wait child.
+    // Safety: fds[1] is a valid fd returned by socketpair.
+    unsafe { libc::close(fds[1]) };
+    let msg = b"PING";
+    // Safety: fds[0] valid, msg initialized.
+    let written = unsafe { libc::write(fds[0], msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
+    if written < 0 {
+        return format!("SP_FNE_PARENT_WRITE_FAIL:{}", errno());
+    }
+    if written != 4 {
+        return format!("SP_FNE_PARENT_WRITE_SHORT:{written}");
+    }
+    let (data, _eof) = read_with_poll_timeout(fds[0], 10);
+    // Safety: fds[0] is a valid fd returned by socketpair.
+    unsafe { libc::close(fds[0]) };
+    let exit_code = wait_child(pid);
+    if exit_code != 0 {
+        return format!("SP_FNE_CHILD_EXIT:{exit_code}");
+    }
+    if data.len() < 4 {
+        return format!("SP_FNE_PARENT_READ_FAIL:{}", data.len());
+    }
+    if &data[..4] != b"PONG" {
+        let text = String::from_utf8_lossy(&data[..data.len().min(16)]);
+        return format!("SP_FNE_MISMATCH:{text}");
+    }
+    "SP_FORK_NO_EXEC_OK".to_string()
 }
 
 fn test_epoll_pipe_bridge(exe: &str, delay_ms: u64) -> String {
@@ -645,6 +744,7 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
     register_handler!(BASH, handle_bash);
     register_handler!(EXTRA_PIPE_MULTI, handle_extra_pipe_multi);
     register_handler!(EXTRA_SOCKETPAIR, handle_extra_socketpair);
+    register_handler!(FORK_NO_EXEC_SOCKETPAIR, handle_fork_no_exec_socketpair);
     register_handler!(EPOLL_PIPE_BRIDGE, handle_epoll_pipe_bridge);
     register_handler!(EPOLL_SOCKETPAIR_BRIDGE, handle_epoll_socketpair_bridge);
     register_handler!(BIDIRECTIONAL, handle_bidirectional);

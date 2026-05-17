@@ -1199,9 +1199,7 @@ mod leaf_subcmd {
         // SAFETY: waitpid on known pid.
         let waited = unsafe { libc::waitpid(grandchild, core::ptr::null_mut(), 0) };
         if waited != grandchild {
-            eprintln!(
-                "pxeof-leaf inner-fork-write-then-exit: waitpid returned {waited}"
-            );
+            eprintln!("pxeof-leaf inner-fork-write-then-exit: waitpid returned {waited}");
             return 1;
         }
         0

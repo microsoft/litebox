@@ -226,7 +226,11 @@ impl BrokerStateRegistry {
     /// is off (e.g., a `dup_handle` not matched by a corresponding
     /// `release`, often surfaced as a peer-stall in tests).
     pub fn len(&self) -> usize {
-        self.state.lock().expect("BrokerStateRegistry poisoned").table.len()
+        self.state
+            .lock()
+            .expect("BrokerStateRegistry poisoned")
+            .table
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {

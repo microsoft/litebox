@@ -13,8 +13,8 @@ use crate::fd_tokens::BrokerFdTokenRegistry;
 use crate::state_registry::{BrokerStateRegistry, StateHandle};
 use crate::state_service::{ConnState, handle_request as state_handle_request};
 use litebox_common_linux::fd_token_protocol::{
-    BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, StatusCode, decode,
-    parse_create_pidfd_response_ok, parse_create_pty_response_ok, parse_handle_body,
+    BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, StatusCode, build_error_response,
+    decode, parse_create_pidfd_response_ok, parse_create_pty_response_ok, parse_handle_body,
 };
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
@@ -24,17 +24,41 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use tracing::{debug, info, warn};
 
-/// Per-connection record of how many refs this connection has
-/// contributed to each handle's registry refcount. On clean
-/// disconnect the worker should have released them all; on
-/// unclean disconnect (e.g., worker SIGKILL'd before its shim
-/// could run `on_close` on inherited fds), `cleanup_on_disconnect`
-/// force-releases each entry by its tracked count so the
-/// underlying `StateObject` Drop fires (e.g.,
-/// `PipeWriteEnd::drop` → reader sees EOF).
+/// Per-connection ledger of broker-held resources owned by the
+/// guest process(es) served by this connection.
 ///
-/// Without this, a SIGKILL'd worker leaks broker pipe/eventfd/etc.
-/// refcounts and the peer worker stalls forever waiting on EOF.
+/// # Ownership model
+///
+/// Each broker-held resource (eventfd state, pipe state, socketpair
+/// state, etc.) has a registry-side refcount. A "reference" to that
+/// resource is held by a guest process. The broker tracks references
+/// at the connection granularity — for now, a connection is a proxy
+/// for the guest process(es) it serves (in the simple case: one
+/// worker process = one connection = one or more guest pids).
+///
+/// **Protocol invariants** (these are STRICT — violations close the
+/// connection with a loud log):
+///
+/// * `Release(handle)` MUST be matched by a prior acquire
+///   (`Create*` response or `DupHandle`) on the SAME connection.
+///   A release from a connection that hasn't acquired the handle
+///   is a shim-side bug — typically a fork-inherited fd-table
+///   entry whose `on_close` is firing release on the parent's
+///   broker connection without the child having ever issued
+///   `DupHandle` for that handle.
+///
+/// * `Release` is NOT idempotent — calling it without a matching
+///   acquire is the same protocol error.
+///
+/// # Crash cleanup
+///
+/// On unclean disconnect (e.g., worker SIGKILL'd before its shim
+/// could run `on_close` on inherited fds), `cleanup_on_disconnect`
+/// force-releases each entry by its tracked count so the underlying
+/// `StateObject` Drop fires (e.g., `PipeWriteEnd::drop` → reader
+/// sees EOF). Without this, a SIGKILL'd worker leaks broker
+/// pipe/eventfd/etc. refcounts and the peer worker stalls forever
+/// waiting on EOF.
 #[derive(Default)]
 struct ConnRefTracker {
     state_refs: HashMap<u64, u32>,
@@ -52,6 +76,18 @@ impl ConnRefTracker {
 
     fn record_process(&mut self, id: u64) {
         *self.process_refs.entry(id).or_insert(0) += 1;
+    }
+
+    /// Returns true iff this connection has a positive reference
+    /// count for `id` in the state registry — i.e., this connection
+    /// owns at least one outstanding acquire (Create response or
+    /// DupHandle) for this handle.
+    fn owns_state(&self, id: u64) -> bool {
+        self.state_refs.get(&id).copied().unwrap_or(0) > 0
+    }
+
+    fn owns_process(&self, id: u64) -> bool {
+        self.process_refs.get(&id).copied().unwrap_or(0) > 0
     }
 
     /// Worker called Release on `id`. We don't know which registry
@@ -142,9 +178,7 @@ fn update_tracker_from_response(
     }
     match request_opcode {
         // State-registry creators: response body is one or two handle ids.
-        Opcode::CreateEventfd
-        | Opcode::CreatePidfd
-        | Opcode::CreateSignalfd => {
+        Opcode::CreateEventfd | Opcode::CreatePidfd | Opcode::CreateSignalfd => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
                 tracker.record_state(id);
             }
@@ -156,6 +190,15 @@ fn update_tracker_from_response(
                 let w = u64::from_le_bytes(response.body[8..16].try_into().unwrap());
                 tracker.record_state(r);
                 tracker.record_state(w);
+            }
+        }
+        Opcode::CreateSocketPair => {
+            // Phase F: response is (endpoint_a_id, endpoint_b_id) as 2 u64 LE.
+            if response.body.len() >= 16 {
+                let a = u64::from_le_bytes(response.body[..8].try_into().unwrap());
+                let b = u64::from_le_bytes(response.body[8..16].try_into().unwrap());
+                tracker.record_state(a);
+                tracker.record_state(b);
             }
         }
         Opcode::CreatePty => {
@@ -474,8 +517,7 @@ fn handle_control_connection_inner(
                             return;
                         }
                         let in_fd = fds.pop();
-                        let host_result = match host_fd_handle_request(fd_registry, &frame, in_fd)
-                        {
+                        let host_result = match host_fd_handle_request(fd_registry, &frame, in_fd) {
                             Ok(r) => r,
                             Err(e) => {
                                 warn!(error = %e, "fd-token control: fatal handler error");
@@ -491,11 +533,28 @@ fn handle_control_connection_inner(
                         // Release: cascade host-fd registry → state registry → process registry.
                         // All three registries use independent monotonic id spaces, so an id
                         // will never be in more than one. Easy disambiguation by UnknownHandle.
+                        //
+                        // Phase F follow-up: STRICT OWNERSHIP CHECK. A Release of a handle that
+                        // EXISTS but is not owned by this connection is a protocol violation
+                        // (typically a fork-inherited fd-table entry whose on_close fires
+                        // release on the parent's broker connection without a matching
+                        // DupHandle). We close the connection in that case so the bug
+                        // surfaces loudly. A Release of a handle that doesn't exist anywhere
+                        // is just an unknown-handle error (existing behavior).
                         let fds: Vec<OwnedFd> = in_fds;
                         if !fds.is_empty() {
                             warn!("fd-token control: Release with attached fds; closing");
                             return;
                         }
+                        let release_id = match parse_handle_body(frame.body, frame.opcode) {
+                            Ok(id) => id,
+                            Err(_) => {
+                                warn!("fd-token control: Release with malformed body; closing");
+                                return;
+                            }
+                        };
+                        // Host-fd registry: it has its own per-conn ownership inside
+                        // BrokerFdTokenRegistry. Let it speak for itself.
                         let host_result = match host_fd_handle_request(fd_registry, &frame, None) {
                             Ok(r) => r,
                             Err(e) => {
@@ -504,37 +563,68 @@ fn handle_control_connection_inner(
                             }
                         };
                         if host_result.frame.status
-                            == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
+                            != litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
                         {
+                            // Host-fd handled it (success or other status).
+                            SocketHandlerResult {
+                                frame: host_result.frame,
+                                out_fd: host_result.out_fd,
+                            }
+                        } else if tracker.owns_state(release_id) {
+                            // State-registry release. Owner-gated.
                             let state_result = state_handle_request(
                                 state_registry,
                                 conn_state,
                                 &frame,
                                 Vec::new(),
                             );
-                            if state_result.frame.status
-                                == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
-                            {
-                                let proc_result = state_handle_request(
-                                    process_registry,
-                                    conn_state,
-                                    &frame,
-                                    Vec::new(),
-                                );
-                                SocketHandlerResult {
-                                    frame: proc_result.frame,
-                                    out_fd: proc_result.out_fd,
-                                }
-                            } else {
-                                SocketHandlerResult {
-                                    frame: state_result.frame,
-                                    out_fd: state_result.out_fd,
-                                }
+                            SocketHandlerResult {
+                                frame: state_result.frame,
+                                out_fd: state_result.out_fd,
+                            }
+                        } else if tracker.owns_process(release_id) {
+                            // Process-registry release. Owner-gated.
+                            let proc_result = state_handle_request(
+                                process_registry,
+                                conn_state,
+                                &frame,
+                                Vec::new(),
+                            );
+                            SocketHandlerResult {
+                                frame: proc_result.frame,
+                                out_fd: proc_result.out_fd,
                             }
                         } else {
+                            // This conn doesn't own a state or process ref. Is the handle
+                            // even known to the broker, or is it just bogus?
+                            let state_exists = state_registry
+                                .resolve_untyped(StateHandle::from_id(release_id))
+                                .is_ok();
+                            let process_exists = process_registry
+                                .resolve_untyped(StateHandle::from_id(release_id))
+                                .is_ok();
+                            if state_exists || process_exists {
+                                // Handle exists but THIS conn isn't an owner. Loud bug.
+                                warn!(
+                                    handle_id = release_id,
+                                    state_exists,
+                                    process_exists,
+                                    "fd-token control: PROTOCOL VIOLATION: Release of \
+                                     broker-held resource not owned by this connection; \
+                                     closing. Likely a shim-side bug — a fork-inherited \
+                                     fd-table entry's on_close firing release without a \
+                                     matching DupHandle."
+                                );
+                                return;
+                            }
+                            // Handle is truly unknown to the broker — preserve existing
+                            // semantics by returning UnknownHandle to the client.
                             SocketHandlerResult {
-                                frame: host_result.frame,
-                                out_fd: host_result.out_fd,
+                                frame: build_error_response(
+                                    Opcode::ReleaseResponse,
+                                    litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle,
+                                ),
+                                out_fd: None,
                             }
                         }
                     }
@@ -571,6 +661,9 @@ fn handle_control_connection_inner(
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe
+                    | Opcode::CreateSocketPair
+                    | Opcode::ReadSocketPair
+                    | Opcode::WriteSocketPair
                     | Opcode::CreatePty
                     | Opcode::PtyRead
                     | Opcode::PtyWrite
@@ -592,12 +685,8 @@ fn handle_control_connection_inner(
                         // Process operations: route to state_service on the *process*
                         // registry. RegisterProcess allocates the process handle; Phase G
                         // exit-state RPCs resolve that same handle id (guest pid).
-                        let proc_result = state_handle_request(
-                            process_registry,
-                            conn_state,
-                            &frame,
-                            in_fds,
-                        );
+                        let proc_result =
+                            state_handle_request(process_registry, conn_state, &frame, in_fds);
                         SocketHandlerResult {
                             frame: proc_result.frame,
                             out_fd: proc_result.out_fd,
@@ -608,12 +697,7 @@ fn handle_control_connection_inner(
                         return;
                     }
                 };
-                update_tracker_from_response(
-                    tracker,
-                    request_opcode,
-                    &request_body,
-                    &result.frame,
-                );
+                update_tracker_from_response(tracker, request_opcode, &request_body, &result.frame);
                 if let Err(e) = write_response(&stream, result.frame, result.out_fd) {
                     warn!(error = %e, "fd-token control: write error");
                     return;

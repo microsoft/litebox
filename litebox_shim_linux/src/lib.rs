@@ -244,6 +244,9 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         kind: syscalls::fork_snapshot::BrokerHandleKind,
         handle_id: u64,
         pipe_direction: Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
+        socketpair_endpoint: Option<
+            litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint,
+        >,
     ) -> Result<(), ()> {
         use syscalls::fork_snapshot::BrokerHandleKind;
         let files = self.task.files.borrow();
@@ -312,6 +315,41 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 );
                 Ok(())
             }
+            BrokerHandleKind::UnixSocket => {
+                let provider =
+                    syscalls::broker_socketpair::broker_socketpair_provider().ok_or(())?;
+                let endpoint = socketpair_endpoint.ok_or(())?;
+                // Mirror C.5j's pipe pattern: explicit per-worker
+                // dup_handle so the broker's per-connection refcount
+                // tracker records our ownership and disconnect-cleanup
+                // can find the entry.
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(handle_id);
+                let sp_fd = syscalls::broker_socketpair::BrokerSocketPairFd::<Platform>::new(
+                    provider,
+                    handle_id,
+                    endpoint,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<
+                    syscalls::broker_socketpair::BrokerSocketPairSubsystem,
+                > = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(sp_fd);
+                let mut rds = files.raw_descriptor_store.write();
+                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+                debug_assert!(
+                    ok,
+                    "install_broker_bridge_fd(unix_socket): slot {guest_fd} still occupied"
+                );
+                Ok(())
+            }
             // C.5l guardrail: Signalfd / Pty are accepted by the
             // emit-side fork-snapshot code, but the install side
             // here has no implementation. Returning `Err(())` was
@@ -340,7 +378,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         kind: syscalls::fork_snapshot::BrokerHandleKind,
         handle_id: u64,
     ) -> Result<(), ()> {
-        self.install_broker_bridge_fd(guest_fd, kind, handle_id, None)
+        self.install_broker_bridge_fd(guest_fd, kind, handle_id, None, None)
     }
 
     fn install_eventfd_at_slot(
@@ -1357,11 +1395,53 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // table entry to replace with the cross-process host pipe.
         {
             use litebox_common_linux::{SockFlags, SockType};
-            use syscalls::fork_snapshot::FdClass;
+            use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
 
             for entry in &fd_table.entries {
                 if entry.class != FdClass::UnixSocket {
                     continue;
+                }
+
+                // Phase F: if the snapshot carries a broker UnixSocket
+                // handle for this slot, install a BrokerSocketPairFd
+                // that adopts the parent's emit-side `dup_handle` ref.
+                // (Mirrors the Pipe-side restore at line ~1520.)
+                if let Some(broker_handle) = entry.metadata.broker_handle {
+                    if broker_handle.kind == BrokerHandleKind::UnixSocket {
+                        let Some(provider) =
+                            syscalls::broker_socketpair::broker_socketpair_provider()
+                        else {
+                            continue;
+                        };
+                        let Some(endpoint) = broker_handle.socketpair_endpoint else {
+                            continue;
+                        };
+                        let sp_fd =
+                            syscalls::broker_socketpair::BrokerSocketPairFd::<Platform>::new(
+                                provider,
+                                broker_handle.handle_id,
+                                endpoint,
+                                litebox::fs::OFlags::empty(),
+                            );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+                            sp_fd,
+                        );
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "broker_socketpair fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                        continue;
+                    }
                 }
 
                 if let Some(socket) =
@@ -1427,6 +1507,11 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         // `Pipe` is handled by the FdClass::Pipe restore branch
                         // below (C.5l). It's intentionally NOT an EventFile.
                         BrokerHandleKind::Pipe => None,
+                        // Phase F: `UnixSocket` is handled by the
+                        // FdClass::UnixSocket restore branch below (or a
+                        // dedicated branch if FdClass::UnixSocket doesn't
+                        // exist yet — handled near the FdClass::Pipe block).
+                        BrokerHandleKind::UnixSocket => None,
                         // `Signalfd` and `Pty` aren't yet wired into
                         // fork-snapshot restore. If a snapshot carries one,
                         // we have a real gap that should fail loud.
@@ -2097,6 +2182,9 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         unix: impl FnOnce(&Arc<TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>>) -> R,
         host_pipe: impl FnOnce(&Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>) -> R,
         broker_pipe: impl FnOnce(&Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>) -> R,
+        broker_socketpair: impl FnOnce(
+            &Arc<TypedFd<syscalls::broker_socketpair::BrokerSocketPairSubsystem>>,
+        ) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -2130,6 +2218,10 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(broker_pipe(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(broker_socketpair(&fd));
         }
         Err(Errno::EBADF)
     }
@@ -2372,6 +2464,7 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| alloc::format!("raw={raw_fd} epoll"),
                 |_fd| alloc::format!("raw={raw_fd} unix"),
                 |_fd| alloc::format!("raw={raw_fd} host_pipe"),
+                |_fd| alloc::format!("raw={raw_fd} broker_pipe"),
                 |_fd| alloc::format!("raw={raw_fd} broker_pipe"),
             )
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))

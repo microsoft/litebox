@@ -25,24 +25,28 @@ use crate::pipe_state::{PipeError, PipeReadEnd, PipeWriteEnd};
 use crate::process_state::ProcessState;
 use crate::pty_state::{PtyError, PtyState};
 use crate::signalfd_state::SignalfdState;
+use crate::socketpair_state::{SocketPairEnd, SocketPairError};
 use crate::state_registry::{BrokerStateRegistry, StateHandle, StateObject, StateRegistryError};
 use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use litebox_common_linux::fd_token_protocol::{
     Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
     build_create_pidfd_response_ok, build_create_pipe_response_ok, build_create_pty_response_ok,
-    build_create_signalfd_response_ok, build_error_response, build_mark_process_exited_response_ok,
-    build_pidfd_exited_response_ok, build_pty_ioctl_response_ok, build_pty_read_response_ok,
-    build_pty_write_response_ok, build_read_eventfd_response_ok, build_read_pipe_response_ok,
-    build_read_siginfo_response_ok, build_register_notification_ring_response_ok,
+    build_create_signalfd_response_ok, build_create_socketpair_response_ok, build_error_response,
+    build_mark_process_exited_response_ok, build_pidfd_exited_response_ok,
+    build_pty_ioctl_response_ok, build_pty_read_response_ok, build_pty_write_response_ok,
+    build_read_eventfd_response_ok, build_read_pipe_response_ok, build_read_siginfo_response_ok,
+    build_read_socketpair_response_ok, build_register_notification_ring_response_ok,
     build_register_process_response_ok, build_release_response_ok,
     build_subscribe_eventfd_response_ok, build_subscribe_process_exit_response_ok,
     build_subscribe_pty_response_ok, build_unsubscribe_response_ok,
-    build_write_eventfd_response_ok, build_write_pipe_response_ok, parse_create_eventfd_body,
-    parse_create_pidfd_body, parse_create_pipe_body, parse_create_signalfd_body, parse_handle_body,
-    parse_mark_process_exited_body, parse_pidfd_exited_request, parse_pty_ioctl_body,
-    parse_pty_read_body, parse_pty_write_body, parse_read_pipe_body, parse_subscribe_eventfd_body,
-    parse_subscribe_process_exit_body, parse_subscribe_pty_body, parse_unsubscribe_body,
-    parse_write_eventfd_body, parse_write_pipe_body,
+    build_write_eventfd_response_ok, build_write_pipe_response_ok,
+    build_write_socketpair_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
+    parse_create_pipe_body, parse_create_signalfd_body, parse_create_socketpair_body,
+    parse_handle_body, parse_mark_process_exited_body, parse_pidfd_exited_request,
+    parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_read_pipe_body,
+    parse_read_socketpair_body, parse_subscribe_eventfd_body, parse_subscribe_process_exit_body,
+    parse_subscribe_pty_body, parse_unsubscribe_body, parse_write_eventfd_body,
+    parse_write_pipe_body, parse_write_socketpair_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -92,6 +96,9 @@ pub fn handle_request(
         Opcode::CreatePipe => handle_create_pipe(registry, request, in_fds),
         Opcode::ReadPipe => handle_read_pipe(registry, request, in_fds),
         Opcode::WritePipe => handle_write_pipe(registry, request, in_fds),
+        Opcode::CreateSocketPair => handle_create_socketpair(registry, request, in_fds),
+        Opcode::ReadSocketPair => handle_read_socketpair(registry, request, in_fds),
+        Opcode::WriteSocketPair => handle_write_socketpair(registry, request, in_fds),
         Opcode::ReadSiginfo => handle_read_siginfo(registry, request, in_fds),
         Opcode::CreatePty => handle_create_pty(registry, request, in_fds),
         Opcode::PtyRead => handle_pty_read(registry, request, in_fds),
@@ -542,6 +549,115 @@ fn handle_write_pipe(
             status_err(Opcode::WritePipeResponse, StatusCode::InvalidValue)
         }
         Err(_) => status_err(Opcode::WritePipeResponse, StatusCode::Internal),
+    }
+}
+
+fn handle_create_socketpair(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::CreateSocketPairResponse);
+    }
+    let (capacity, atomic) = match parse_create_socketpair_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::CreateSocketPairResponse),
+    };
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return protocol_err(Opcode::CreateSocketPairResponse);
+    };
+    let Ok(atomic) = usize::try_from(atomic) else {
+        return protocol_err(Opcode::CreateSocketPairResponse);
+    };
+    let (end_a, end_b) = crate::socketpair_state::new_socketpair(capacity, atomic);
+    let handle_a = registry.register(end_a);
+    let handle_b = registry.register(end_b);
+    HandlerResult {
+        frame: build_create_socketpair_response_ok(handle_a.id(), handle_b.id()),
+        out_fd: None,
+    }
+}
+
+fn resolve_socketpair_end(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+) -> Result<Arc<dyn crate::state_registry::StateObject>, StatusCode> {
+    match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::UnixSocket) {
+        Ok(s) if s.as_any().is::<SocketPairEnd>() => Ok(s),
+        Ok(_) => Err(StatusCode::SubsystemMismatch),
+        Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
+        Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
+        Err(_) => Err(StatusCode::Internal),
+    }
+}
+
+fn handle_read_socketpair(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::ReadSocketPairResponse);
+    }
+    let (handle_id, max_len) = match parse_read_socketpair_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::ReadSocketPairResponse),
+    };
+    let Ok(max_len) = usize::try_from(max_len) else {
+        return protocol_err(Opcode::ReadSocketPairResponse);
+    };
+    let state = match resolve_socketpair_end(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::ReadSocketPairResponse, status),
+    };
+    let end = state
+        .as_any()
+        .downcast_ref::<SocketPairEnd>()
+        .expect("resolve_socketpair_end checked");
+    match end.read(max_len) {
+        Ok(bytes) => HandlerResult {
+            frame: build_read_socketpair_response_ok(&bytes),
+            out_fd: None,
+        },
+        Err(SocketPairError::WouldBlock) => {
+            status_err(Opcode::ReadSocketPairResponse, StatusCode::WouldBlock)
+        }
+        Err(_) => status_err(Opcode::ReadSocketPairResponse, StatusCode::InvalidValue),
+    }
+}
+
+fn handle_write_socketpair(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::WriteSocketPairResponse);
+    }
+    let (handle_id, bytes) = match parse_write_socketpair_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::WriteSocketPairResponse),
+    };
+    let state = match resolve_socketpair_end(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::WriteSocketPairResponse, status),
+    };
+    let end = state
+        .as_any()
+        .downcast_ref::<SocketPairEnd>()
+        .expect("resolve_socketpair_end checked");
+    match end.write(&bytes) {
+        Ok(n) => HandlerResult {
+            frame: build_write_socketpair_response_ok(n as u64),
+            out_fd: None,
+        },
+        Err(SocketPairError::WouldBlock) => {
+            status_err(Opcode::WriteSocketPairResponse, StatusCode::WouldBlock)
+        }
+        Err(SocketPairError::PeerClosed) => {
+            status_err(Opcode::WriteSocketPairResponse, StatusCode::InvalidValue)
+        }
     }
 }
 

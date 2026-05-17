@@ -128,6 +128,9 @@ pub enum Opcode {
     CreatePipe = 0x50,
     ReadPipe = 0x51,
     WritePipe = 0x52,
+    CreateSocketPair = 0x30,
+    ReadSocketPair = 0x31,
+    WriteSocketPair = 0x32,
     CreatePty = 0x60,
     PtyRead = 0x61,
     PtyWrite = 0x62,
@@ -160,6 +163,9 @@ pub enum Opcode {
     CreatePipeResponse = 0xD0,
     ReadPipeResponse = 0xD1,
     WritePipeResponse = 0xD2,
+    CreateSocketPairResponse = 0xB0,
+    ReadSocketPairResponse = 0xB1,
+    WriteSocketPairResponse = 0xB2,
     CreatePtyResponse = 0xE0,
     PtyReadResponse = 0xE1,
     PtyWriteResponse = 0xE2,
@@ -275,6 +281,9 @@ impl Opcode {
             Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
             Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
             Opcode::WritePipe => Some(Opcode::WritePipeResponse),
+            Opcode::CreateSocketPair => Some(Opcode::CreateSocketPairResponse),
+            Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
+            Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
             Opcode::CreatePty => Some(Opcode::CreatePtyResponse),
             Opcode::PtyRead => Some(Opcode::PtyReadResponse),
             Opcode::PtyWrite => Some(Opcode::PtyWriteResponse),
@@ -308,6 +317,9 @@ impl Opcode {
                 | Opcode::CreatePipe
                 | Opcode::ReadPipe
                 | Opcode::WritePipe
+                | Opcode::CreateSocketPair
+                | Opcode::ReadSocketPair
+                | Opcode::WriteSocketPair
                 | Opcode::CreatePty
                 | Opcode::PtyRead
                 | Opcode::PtyWrite
@@ -356,6 +368,9 @@ impl TryFrom<u8> for Opcode {
             0x50 => Ok(Opcode::CreatePipe),
             0x51 => Ok(Opcode::ReadPipe),
             0x52 => Ok(Opcode::WritePipe),
+            0x30 => Ok(Opcode::CreateSocketPair),
+            0x31 => Ok(Opcode::ReadSocketPair),
+            0x32 => Ok(Opcode::WriteSocketPair),
             0x60 => Ok(Opcode::CreatePty),
             0x61 => Ok(Opcode::PtyRead),
             0x62 => Ok(Opcode::PtyWrite),
@@ -381,6 +396,9 @@ impl TryFrom<u8> for Opcode {
             0xD0 => Ok(Opcode::CreatePipeResponse),
             0xD1 => Ok(Opcode::ReadPipeResponse),
             0xD2 => Ok(Opcode::WritePipeResponse),
+            0xB0 => Ok(Opcode::CreateSocketPairResponse),
+            0xB1 => Ok(Opcode::ReadSocketPairResponse),
+            0xB2 => Ok(Opcode::WriteSocketPairResponse),
             0xE0 => Ok(Opcode::CreatePtyResponse),
             0xE1 => Ok(Opcode::PtyReadResponse),
             0xE2 => Ok(Opcode::PtyWriteResponse),
@@ -1299,6 +1317,184 @@ pub fn parse_write_pipe_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
     parse_handle_body(body, Opcode::WritePipeResponse)
 }
 
+// =====================================================================
+// SocketPair (AF_UNIX SOCK_STREAM) wire format. Phase F.
+//
+// Byte-for-byte mirror of the Pipe ops with new opcodes — same shape:
+// capacity/atomic on create, (handle, max_len) on read, (handle, bytes)
+// on write. The two response handle_ids correspond to endpoints A and B.
+// =====================================================================
+
+/// Body for [`Opcode::CreateSocketPair`]: (capacity: u64, atomic_write_size: u64).
+pub fn build_create_socketpair_request(capacity: u64, atomic_write_size: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&capacity.to_le_bytes());
+    body.extend_from_slice(&atomic_write_size.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::CreateSocketPair,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_create_socketpair_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreateSocketPair,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let capacity = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let atomic = u64::from_le_bytes(body[8..16].try_into().unwrap());
+    Ok((capacity, atomic))
+}
+
+/// Response carries (endpoint_a_handle_id: u64, endpoint_b_handle_id: u64).
+pub fn build_create_socketpair_response_ok(
+    endpoint_a_handle_id: u64,
+    endpoint_b_handle_id: u64,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&endpoint_a_handle_id.to_le_bytes());
+    body.extend_from_slice(&endpoint_b_handle_id.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::CreateSocketPairResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_create_socketpair_response_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreateSocketPairResponse,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+    ))
+}
+
+/// Body for [`Opcode::ReadSocketPair`]: (handle: u64, max_len: u64).
+pub fn build_read_socketpair_request(handle_id: u64, max_len: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::ReadSocketPair,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_read_socketpair_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadSocketPair,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+    ))
+}
+
+/// Body for [`Opcode::ReadSocketPairResponse`]: (len: u32, pad: u32, bytes...).
+/// Overhead = 8 bytes; safe payload `BODY_MAX - 8`.
+pub fn build_read_socketpair_response_ok(bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + bytes.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::ReadSocketPairResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_read_socketpair_response_body(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadSocketPairResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadSocketPairResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
+}
+
+/// Body for [`Opcode::WriteSocketPair`]: (handle: u64, len: u32, pad: u32, bytes...).
+/// Overhead = 16 bytes; safe payload `BODY_MAX - 16`.
+pub fn build_write_socketpair_request(handle_id: u64, bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + bytes.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::WriteSocketPair,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+pub fn parse_write_socketpair_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::WriteSocketPair,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let len = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 16 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::WriteSocketPair,
+            got: body.len(),
+            want: 16 + len,
+        });
+    }
+    Ok((handle, body[16..].to_vec()))
+}
+
+pub fn build_write_socketpair_response_ok(written: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::WriteSocketPairResponse,
+        status: StatusCode::Ok,
+        body: written.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_write_socketpair_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::WriteSocketPairResponse)
+}
+
 /// Body for [`Opcode::CreatePty`]: empty (allocates one master/slave pair).
 pub fn build_create_pty_request() -> OwnedFrame {
     OwnedFrame {
@@ -2040,8 +2236,8 @@ mod tests {
                 (Ok(encoded), true) => {
                     let decoded = decode(&encoded).expect("decode should succeed");
                     assert_eq!(decoded.opcode, Opcode::WritePipe);
-                    let (handle, payload) = parse_write_pipe_body(decoded.body)
-                        .expect("body parse should succeed");
+                    let (handle, payload) =
+                        parse_write_pipe_body(decoded.body).expect("body parse should succeed");
                     assert_eq!(handle, 0xDEAD_BEEF_CAFE_BABE);
                     assert_eq!(payload.len(), payload_len);
                     assert!(
@@ -2054,9 +2250,7 @@ mod tests {
                     // rejects oversize bodies cleanly.
                 }
                 (Ok(_), false) => {
-                    panic!(
-                        "expected BodyTooLarge for payload_len={payload_len}, got Ok"
-                    )
+                    panic!("expected BodyTooLarge for payload_len={payload_len}, got Ok")
                 }
                 (Err(e), true) => {
                     panic!("expected Ok for payload_len={payload_len}, got Err({e:?})")
@@ -2097,17 +2291,122 @@ mod tests {
                 }
                 (Err(ProtocolError::BodyTooLarge { .. }), false) => {}
                 (Ok(_), false) => {
-                    panic!(
-                        "expected BodyTooLarge for response payload_len={payload_len}, got Ok"
-                    )
+                    panic!("expected BodyTooLarge for response payload_len={payload_len}, got Ok")
                 }
-                (Err(e), true) => panic!(
-                    "expected Ok for response payload_len={payload_len}, got Err({e:?})"
-                ),
+                (Err(e), true) => {
+                    panic!("expected Ok for response payload_len={payload_len}, got Err({e:?})")
+                }
                 (Err(e), false) => panic!(
                     "expected BodyTooLarge for response payload_len={payload_len}, got unexpected Err({e:?})"
                 ),
             }
         }
+    }
+
+    /// Phase F: socketpair wire format mirrors the pipe ops. Verifies
+    /// `WriteSocketPair` round-trip at the BODY_MAX boundary
+    /// (overhead = 16 bytes).
+    #[test]
+    fn write_socketpair_round_trip_body_max_boundary() {
+        let max_payload = (BODY_MAX as usize) - 16;
+        let cases: &[(usize, bool)] = &[
+            (0, true),
+            (1, true),
+            (1024, true),
+            (60 * 1024, true),
+            (max_payload, true),
+            (max_payload + 1, false),
+            (max_payload + 16, false),
+            (BODY_MAX as usize, false),
+        ];
+        for &(payload_len, expect_ok) in cases {
+            let bytes = alloc::vec![0xC3u8; payload_len];
+            let frame = build_write_socketpair_request(0xFEED_FACE_DEAD_BEEF, &bytes);
+            match (frame.encode(), expect_ok) {
+                (Ok(encoded), true) => {
+                    let decoded = decode(&encoded).expect("decode should succeed");
+                    assert_eq!(decoded.opcode, Opcode::WriteSocketPair);
+                    let (handle, payload) = parse_write_socketpair_body(decoded.body)
+                        .expect("body parse should succeed");
+                    assert_eq!(handle, 0xFEED_FACE_DEAD_BEEF);
+                    assert_eq!(payload.len(), payload_len);
+                    assert!(
+                        payload.iter().all(|&b| b == 0xC3),
+                        "payload corrupted at len={payload_len}"
+                    );
+                }
+                (Err(ProtocolError::BodyTooLarge { .. }), false) => {}
+                (Ok(_), false) => {
+                    panic!("expected BodyTooLarge for payload_len={payload_len}, got Ok")
+                }
+                (Err(e), true) => {
+                    panic!("expected Ok for payload_len={payload_len}, got Err({e:?})")
+                }
+                (Err(e), false) => panic!(
+                    "expected BodyTooLarge for payload_len={payload_len}, got unexpected Err({e:?})"
+                ),
+            }
+        }
+    }
+
+    /// Phase F: `ReadSocketPairResponse` BODY_MAX boundary
+    /// (overhead = 8 bytes: 4-byte len + 4-byte reserved).
+    #[test]
+    fn read_socketpair_response_round_trip_body_max_boundary() {
+        let max_payload = (BODY_MAX as usize) - 8;
+        let cases: &[(usize, bool)] = &[
+            (0, true),
+            (1, true),
+            (60 * 1024, true),
+            (max_payload, true),
+            (max_payload + 1, false),
+        ];
+        for &(payload_len, expect_ok) in cases {
+            let bytes = alloc::vec![0x3Cu8; payload_len];
+            let frame = build_read_socketpair_response_ok(&bytes);
+            match (frame.encode(), expect_ok) {
+                (Ok(encoded), true) => {
+                    let decoded = decode(&encoded).expect("decode should succeed");
+                    assert_eq!(decoded.opcode, Opcode::ReadSocketPairResponse);
+                    let payload = parse_read_socketpair_response_body(decoded.body)
+                        .expect("body parse should succeed");
+                    assert_eq!(payload.len(), payload_len);
+                }
+                (Err(ProtocolError::BodyTooLarge { .. }), false) => {}
+                (Ok(_), false) => {
+                    panic!("expected BodyTooLarge for response payload_len={payload_len}, got Ok")
+                }
+                (Err(e), true) => {
+                    panic!("expected Ok for response payload_len={payload_len}, got Err({e:?})")
+                }
+                (Err(e), false) => panic!(
+                    "expected BodyTooLarge for response payload_len={payload_len}, got unexpected Err({e:?})"
+                ),
+            }
+        }
+    }
+
+    /// Phase F: CreateSocketPair / Read / Write request and response
+    /// body parsers reject malformed inputs (wrong length, non-zero
+    /// reserved). Mirrors the pipe-side test discipline.
+    #[test]
+    fn socketpair_parsers_reject_malformed() {
+        // CreateSocketPair: wrong length
+        assert!(parse_create_socketpair_body(&[0u8; 8]).is_err());
+        assert!(parse_create_socketpair_body(&[0u8; 17]).is_err());
+        // ReadSocketPair: wrong length
+        assert!(parse_read_socketpair_body(&[0u8; 8]).is_err());
+        // WriteSocketPair: non-zero reserved
+        let mut bad = alloc::vec![0u8; 16];
+        bad[12] = 1; // reserved byte 0
+        assert!(parse_write_socketpair_body(&bad).is_err());
+        // ReadSocketPair response: non-zero reserved
+        let mut bad = alloc::vec![0u8; 8];
+        bad[4] = 1;
+        assert!(parse_read_socketpair_response_body(&bad).is_err());
+        // ReadSocketPair response: claimed len doesn't match body len
+        let mut bad = alloc::vec![0u8; 8];
+        bad[0] = 4; // claims 4 bytes payload, but body has only 8 bytes (header) and 0 payload
+        assert!(parse_read_socketpair_response_body(&bad).is_err());
     }
 }
