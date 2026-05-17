@@ -79,6 +79,22 @@ pub struct PidfdState {
     _pidfd: OwnedFd,
 }
 
+impl Drop for PidfdState {
+    fn drop(&mut self) {
+        // PE.9 diagnostic: live subscriptions at Drop = subscriber
+        // disconnected before unsubscribe (typical SIGKILL path,
+        // cleaned via cleanup_on_disconnect). Logged for chasing
+        // notification-delivery issues, not a bug.
+        if !self.subscriptions.is_empty() {
+            tracing::debug!(
+                target_host_pid = self.target_host_pid,
+                count = self.subscriptions.len(),
+                "PidfdState dropped with live subscription(s)"
+            );
+        }
+    }
+}
+
 impl PidfdState {
     /// Creates a new broker-hosted pidfd watching `target_host_pid`.
     /// Performs `pidfd_open(target_host_pid)` and spawns a background

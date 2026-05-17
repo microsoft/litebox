@@ -45,6 +45,21 @@ pub struct ProcessState {
     subscription_list: SubscriptionList,
 }
 
+impl Drop for ProcessState {
+    fn drop(&mut self) {
+        // PE.9 diagnostic: live exit subscriptions at Drop =
+        // subscriber disconnected before unsubscribe (typical
+        // SIGKILL path, cleaned via cleanup_on_disconnect). Logged
+        // for chasing notification-delivery issues, not a bug.
+        if !self.subscription_list.is_empty() {
+            tracing::debug!(
+                count = self.subscription_list.len(),
+                "ProcessState dropped with live exit subscription(s)"
+            );
+        }
+    }
+}
+
 impl Default for ProcessState {
     fn default() -> Self {
         Self::new()

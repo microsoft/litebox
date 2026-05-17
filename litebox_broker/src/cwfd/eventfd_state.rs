@@ -86,6 +86,25 @@ pub struct EventfdState {
     subscriptions: SubscriptionList,
 }
 
+impl Drop for EventfdState {
+    fn drop(&mut self) {
+        // PE.9 diagnostic: live subscriptions at Drop indicate a
+        // subscriber that didn't explicitly Unsubscribe before
+        // releasing the state — typically a SIGKILL'd worker
+        // whose conn was cleaned up via cleanup_on_disconnect.
+        // Not a bug per se (cleanup_on_disconnect is the
+        // intended path), but a useful breadcrumb when chasing
+        // notification-delivery issues. Cheap; debug-only.
+        if !self.subscriptions.is_empty() {
+            tracing::debug!(
+                count = self.subscriptions.len(),
+                "EventfdState dropped with live subscription(s) — \
+                 expected when subscriber disconnected uncleanly"
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 struct EventfdInner {
     counter: u64,
