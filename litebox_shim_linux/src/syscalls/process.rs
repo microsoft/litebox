@@ -9276,14 +9276,27 @@ impl<FS: ShimFS> Task<FS> {
                     // spawn-time until worker B exits, so its fd's
                     // BrokerPipeFd keeps the rc alive in the gap
                     // between worker B startup and its install call.
-                    {
-                        let dir_char = match direction {
-                            litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
-                            litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
-                        };
-                        broker_eventfd_specs
-                            .push(alloc::format!("{raw_fd}:pipe:{handle_id}:{dir_char}"));
-                    }
+                    //
+                    // Phase F TODO: investigate whether pipe should adopt
+                    // the same emit-side dup_handle pattern that socketpair
+                    // uses (process.rs ~line 9335). Naively adding the dup
+                    // here caused PB.c2p.* non-PIE tests to TIMEOUT (writer
+                    // never seen EOF by reader) — likely the dup keeps a
+                    // BrokerPipeWriteEnd ref alive beyond when the writer
+                    // wants to close. socketpair doesn't see this because
+                    // sockets are bidi and don't have the same "writer
+                    // close → reader EOF" data-flow contract. Pipe needs
+                    // a different shape: maybe release the dup explicitly
+                    // when the migrating worker's close_all_fds runs, or
+                    // use a "transient transit" model that the migrating
+                    // worker's close DOES NOT release (only the spawned
+                    // worker's install/close releases).
+                    let dir_char = match direction {
+                        litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
+                        litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
+                    };
+                    broker_eventfd_specs
+                        .push(alloc::format!("{raw_fd}:pipe:{handle_id}:{dir_char}"));
                 }
             }
 
@@ -9324,7 +9337,32 @@ impl<FS: ShimFS> Task<FS> {
                     },
                 );
                 drop(dt_local);
-                if let (Some(_provider), Some((handle_id, endpoint))) = (sp_provider, sp_info) {
+                if let (Some(provider), Some((handle_id, endpoint))) = (sp_provider, sp_info) {
+                    // Phase F: emit-side dup_handle BEFORE the migrated
+                    // worker's close_all_fds runs. After fork, the broker
+                    // rc reflects parent+child refs (1 each via clone_for_fork's
+                    // on_dup, plus the original create_socketpair). When the
+                    // child task is marked `migrated_to_remote`, its
+                    // prepare_for_exit calls close_all_fds, which fires
+                    // on_close → release for each broker socketpair fd —
+                    // releasing the child's inherited ref. If we don't pre-
+                    // dup here, the timing race is:
+                    //   parent close fd + child close_all_fds → rc=0 → DROP
+                    // before the new worker's install_broker_bridge_fd can
+                    // call dup_handle. The dropped handle then makes the
+                    // new worker's read/write fail with UnknownHandle.
+                    //
+                    // The pre-dup is balanced: the per-conn tracker records
+                    // it on THIS connection (the migrating child's), and
+                    // when that connection eventually disconnects, cleanup
+                    // releases it. The new worker independently dup_handles
+                    // on its own connection in install_broker_bridge_fd.
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
                     let endpoint_char = match endpoint {
                         litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::A => 'a',
                         litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::B => 'b',
