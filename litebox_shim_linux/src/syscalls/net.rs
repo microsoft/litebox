@@ -2829,6 +2829,38 @@ impl<FS: ShimFS> Task<FS> {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
+
+        // F.8 prep: broker-backed AF_UNIX SOCK_STREAM socketpair fast
+        // path. with_socket's two-arm dispatch (INET / shim-UnixSocket)
+        // doesn't know about BrokerSocketPair, so without this branch
+        // any recv() on a broker-backed socketpair would fall through
+        // to ENOTSOCK. tokio's signal self-pipe is the prominent
+        // caller hitting this under eager-broker-socketpair.
+        //
+        // recv() on a connected stream socketpair degenerates to
+        // read() when caller doesn't ask for addr/fds — exactly
+        // tokio's use. Limit this fast path to that case; richer
+        // recvmsg semantics (SCM_RIGHTS, peer addr) are deferred
+        // until BrokerSocketPair is plumbed through with_socket
+        // properly.
+        if !want_source && received_fds.is_empty() && received_tokens.is_empty() {
+            let broker_sp = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
+                .ok();
+            if let Some(typed) = broker_sp {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(&typed)
+                    .ok_or(Errno::EBADF)?;
+                let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))?;
+                return Ok(size);
+            }
+        }
+
         let (size, addr) = {
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
             files.with_socket(
