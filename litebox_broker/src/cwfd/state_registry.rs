@@ -304,10 +304,6 @@ impl BrokerStateRegistry {
             .table
             .get_mut(&handle.0)
             .ok_or(StateRegistryError::UnknownHandle(handle))?;
-        // Invariant B1: refcount must be strictly positive before
-        // decrement. Reaching 0 means a stale entry that should have
-        // been removed when its rc dropped to 0 previously; reaching
-        // negative would underflow. Either is a broker-side bug.
         assert!(
             entry.refcount > 0,
             "BrokerStateRegistry::release: entry for handle={} has refcount=0 (stale/double-release)",
@@ -320,6 +316,21 @@ impl BrokerStateRegistry {
             s.table.remove(&handle.0);
         }
         drop(s);
+        // PE.10 diag: log every release with the new rc.
+        if matches!(tag, SubsystemTag::UnixSocket) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.10-diag] release UnixSocket handle={} new_rc={new_rc}",
+                    handle.0
+                );
+            }
+        }
         tracing::debug!(handle = handle.0, new_rc, ?tag, "REG-REL");
         Ok(())
     }

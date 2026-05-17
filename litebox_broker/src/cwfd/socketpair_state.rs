@@ -131,6 +131,22 @@ impl SocketPairInner {
         let mut buf = buf_mutex.lock().expect("SocketPairInner poisoned");
         if buf.buf.is_empty() {
             if !peer_open {
+                // PE.10 diag: log first time we report EOF to a reader
+                // — this is the case that surfaces tokio's "EOF on
+                // self-pipe" panic when broker socketpair rc accounting
+                // drops the peer-end early. Helps debug the residual
+                // F.8 flip blocker.
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/rst-diag.log")
+                {
+                    let _ = writeln!(
+                        f,
+                        "[PE.10-diag] BrokerSocketPair read EOF: endpoint={endpoint:?}"
+                    );
+                }
                 // Peer-end closed and no data → EOF (zero-length read).
                 return Ok(Vec::new());
             }
@@ -248,6 +264,22 @@ impl SocketPairEnd {
 
 impl Drop for SocketPairEnd {
     fn drop(&mut self) {
+        // PE.10 diag: log every Drop so we can correlate broker-side
+        // peer-close events with read-EOF observations.
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = writeln!(
+                f,
+                "[PE.10-diag] BrokerSocketPair Drop: endpoint={:?} a_open={} b_open={}",
+                self.endpoint,
+                self.inner.a_open.load(Ordering::Acquire),
+                self.inner.b_open.load(Ordering::Acquire)
+            );
+        }
         match self.endpoint {
             SocketPairEndpoint::A => {
                 // Invariant B6: Drop fires when registry rc=0.
