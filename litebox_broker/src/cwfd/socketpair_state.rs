@@ -250,6 +250,12 @@ impl Drop for SocketPairEnd {
     fn drop(&mut self) {
         match self.endpoint {
             SocketPairEndpoint::A => {
+                // Invariant B6: Drop fires when registry rc=0.
+                // a_open must be true (else double-Drop).
+                debug_assert!(
+                    self.inner.a_open.load(Ordering::Acquire),
+                    "SocketPairEnd::drop endpoint=A with a_open=false (double-Drop?)"
+                );
                 self.inner.a_open.store(false, Ordering::Release);
                 // Wake B: peer close = IN (read EOF) + HUP + ERR (write EPIPE).
                 self.inner
@@ -257,6 +263,10 @@ impl Drop for SocketPairEnd {
                     .notify(NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN | NOTIFY_EVENT_ERR);
             }
             SocketPairEndpoint::B => {
+                debug_assert!(
+                    self.inner.b_open.load(Ordering::Acquire),
+                    "SocketPairEnd::drop endpoint=B with b_open=false (double-Drop?)"
+                );
                 self.inner.b_open.store(false, Ordering::Release);
                 self.inner
                     .subject_a

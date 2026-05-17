@@ -2140,6 +2140,19 @@ impl<FS: ShimFS> Task<FS> {
         for raw_fd in alive_fds {
             let _ = self.do_close(raw_fd);
         }
+        // Invariant S4: after close_all_fds, no fd-table slot should
+        // remain alive. If any are left, it means do_close failed to
+        // dispatch for some subsystem (i.e., a new fd kind was added
+        // without wiring close support in sys_close).
+        debug_assert!(
+            files
+                .raw_descriptor_store
+                .read()
+                .iter_alive()
+                .next()
+                .is_none(),
+            "close_all_fds left alive fd-table entries — sys_close missing a subsystem arm"
+        );
     }
 }
 

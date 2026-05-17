@@ -275,6 +275,13 @@ impl BrokerStateRegistry {
             .table
             .get_mut(&handle.0)
             .ok_or(StateRegistryError::UnknownHandle(handle))?;
+        // Invariant B1 (mirror for dup): refcount must be > 0 before
+        // dup. If we found the entry it has rc >= 1; assert defensively.
+        debug_assert!(
+            entry.refcount > 0,
+            "BrokerStateRegistry::dup: entry for handle={} has refcount=0 (resurrection?)",
+            handle.0,
+        );
         entry.refcount = entry
             .refcount
             .checked_add(1)
@@ -297,6 +304,15 @@ impl BrokerStateRegistry {
             .table
             .get_mut(&handle.0)
             .ok_or(StateRegistryError::UnknownHandle(handle))?;
+        // Invariant B1: refcount must be strictly positive before
+        // decrement. Reaching 0 means a stale entry that should have
+        // been removed when its rc dropped to 0 previously; reaching
+        // negative would underflow. Either is a broker-side bug.
+        assert!(
+            entry.refcount > 0,
+            "BrokerStateRegistry::release: entry for handle={} has refcount=0 (stale/double-release)",
+            handle.0,
+        );
         entry.refcount -= 1;
         let new_rc = entry.refcount;
         let tag = entry.state.subsystem_tag();

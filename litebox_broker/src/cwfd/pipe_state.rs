@@ -219,6 +219,13 @@ impl PipeWriteEnd {
 
 impl Drop for PipeReadEnd {
     fn drop(&mut self) {
+        // Invariant B6: Drop fires exactly when registry rc=0, which
+        // means no peer endpoint has registered a re-open. read_open
+        // must have been true (or this is a double-Drop bug).
+        debug_assert!(
+            self.inner.read_open.load(Ordering::Acquire),
+            "PipeReadEnd::drop with read_open=false (double-Drop?)"
+        );
         self.inner.read_open.store(false, Ordering::Release);
         self.inner.write_subject.notify(NOTIFY_EVENT_ERR);
     }
@@ -226,6 +233,10 @@ impl Drop for PipeReadEnd {
 
 impl Drop for PipeWriteEnd {
     fn drop(&mut self) {
+        debug_assert!(
+            self.inner.write_open.load(Ordering::Acquire),
+            "PipeWriteEnd::drop with write_open=false (double-Drop?)"
+        );
         self.inner.write_open.store(false, Ordering::Release);
         self.inner
             .read_subject
