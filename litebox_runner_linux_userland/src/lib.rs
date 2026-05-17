@@ -511,8 +511,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // 'yes', case-insensitive) flips `sys_socketpair` to allocate
     // broker-backed AF_UNIX SOCK_STREAM pairs instead of in-shim
     // UnixSocket. Required for cross-worker fork+exec inheritance
-    // of socketpair fds. Default off; non-stream / non-AF_UNIX
-    // socketpairs ignore the gate.
+    // of socketpair fds.
+    //
+    // **F.8 flip attempted 2026-05-17, reverted same day.** With
+    // eager-socketpair as the default, PB.c2p drops 20/20 → 11/20
+    // at scale even though every test passes in isolation. The
+    // harness uses socketpair internally for coordinator↔agent
+    // communication; under load the broker-backed path exposes a
+    // contention / race that doesn't surface in single-test runs.
+    // Investigate before re-flipping. See plan.md F.8 entry.
     {
         let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETPAIR")
             .ok()
