@@ -194,6 +194,7 @@ fn docker_run_base_args() -> Vec<String> {
     for var in [
         "LITEBOX_EAGER_BROKER_PIPE",
         "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+        "LITEBOX_PER_PID_OWNERSHIP",
     ] {
         if let Ok(val) = std::env::var(var) {
             v.extend(["-e".to_string(), format!("{var}={val}")]);
