@@ -161,8 +161,13 @@ impl ConnRefTracker {
     fn record_release(&mut self, caller_pid: u32, id: u64) {
         if caller_pid == 0 {
             // Ambient release: pick any (pid, id) bucket with a
-            // positive count and decrement. Prefer state over process
-            // (matches the per-pid branch order below).
+            // positive count and decrement. With PE.10's gate on
+            // PE.5 fork-emit scope (only stamping child_pid when
+            // per_pid_ownership_enabled), at gate-off everything
+            // is in (0, id) and this falls back to the natural
+            // (0, id) match; at gate-on the shim consistently
+            // stamps non-zero caller_pid so this path is rare
+            // (only async-Drop / unscoped paths hit it).
             let state_key = self
                 .state_refs
                 .iter()

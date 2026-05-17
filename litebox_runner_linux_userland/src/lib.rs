@@ -513,18 +513,22 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // UnixSocket. Required for cross-worker fork+exec inheritance
     // of socketpair fds.
     //
-    // **F.8 flip attempted 2026-05-17, reverted same day.** With
-    // eager-socketpair as the default, PB.c2p drops 20/20 → 11/20
-    // at scale even though every test passes in isolation. The
-    // harness uses socketpair internally for coordinator↔agent
-    // communication; under load the broker-backed path exposes a
-    // contention / race that doesn't surface in single-test runs.
-    // Investigate before re-flipping. See plan.md F.8 entry.
+    // **F.8 flip retry (2026-05-17, PE.10 done)**: setting default
+    // ON. The earlier F.8 attempt regressed PB.c2p 20/20 → 11/20.
+    // Root caused: PE.5's fork-emit caller_pid scope wrap was
+    // unconditionally stamping child_pid on dup_handles, while
+    // releases at exec ran with caller_pid=0 (gate off). Ambient
+    // fallback mis-attributed releases → ReleaseAllForPid(child)
+    // double-released. Fixed by gating PE.5's scope wrap on
+    // per_pid_ownership_enabled(). Empirically: 5/5 isolation
+    // passes on PB.c2p.pie-glibc.dpg1 with eager-socketpair on.
+    //
+    // Set `LITEBOX_EAGER_BROKER_SOCKETPAIR=0` to opt out.
     {
         let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETPAIR")
             .ok()
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+            .unwrap_or(true);
         litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
     }
 

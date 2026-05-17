@@ -2407,8 +2407,22 @@ impl<FS: ShimFS> Task<FS> {
                 // independent-fork branch below. Same rationale —
                 // dup_handles from on_dup must be attributed to
                 // child_pid in the broker's per-(pid, id) tracker.
-                let _scope =
-                    litebox_common_linux::fd_token_client::set_caller_pid_scope(child_pid_u32);
+                //
+                // **Gated on per_pid_ownership_enabled()** (PE.10 fix):
+                // stamping child_pid here while releases run with
+                // caller_pid=0 (gate off, ambient fallback path)
+                // mis-attributes the tracker bookkeeping and causes
+                // ReleaseAllForPid(child_pid) at child exit to
+                // double-release the broker state. When the gate is
+                // off, leave caller_pid=0 so dup_handle and release
+                // both target the same (0, id) bucket.
+                let _scope = if crate::per_pid_ownership_enabled() {
+                    Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                        child_pid_u32,
+                    ))
+                } else {
+                    None
+                };
                 Arc::new(
                     self.files
                         .borrow()
@@ -2771,15 +2785,15 @@ impl<FS: ShimFS> Task<FS> {
             let child_files_state = {
                 // Phase F.5+ PE.5: stamp caller_pid = child_pid for all
                 // broker dup_handle RPCs emitted during clone_for_fork's
-                // on_dup invocations. Without this, the dup_handles
-                // would be attributed to parent_pid in the broker's
-                // per-(pid, id) tracker, and the child would later
-                // hit a PROTOCOL VIOLATION when its release fires with
-                // caller_pid = child_pid against an entry only tracked
-                // under (parent_pid, id). Scope drops at end of block;
-                // outer code returns to parent's caller_pid.
-                let _scope =
-                    litebox_common_linux::fd_token_client::set_caller_pid_scope(child_pid_u32);
+                // on_dup invocations. Gated on per_pid_ownership_enabled()
+                // — see PE.10 comment at the vfork branch above for why.
+                let _scope = if crate::per_pid_ownership_enabled() {
+                    Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                        child_pid_u32,
+                    ))
+                } else {
+                    None
+                };
                 Arc::new(
                     self.files
                         .borrow()
