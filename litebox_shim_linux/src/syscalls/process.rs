@@ -9317,20 +9317,17 @@ impl<FS: ShimFS> Task<FS> {
                     // BrokerPipeFd keeps the rc alive in the gap
                     // between worker B startup and its install call.
                     //
-                    // Phase F TODO: investigate whether pipe should adopt
+                    // Phase F.9 TODO: investigate whether pipe should adopt
                     // the same emit-side dup_handle pattern that socketpair
                     // uses (process.rs ~line 9335). Naively adding the dup
                     // here caused PB.c2p.* non-PIE tests to TIMEOUT (writer
-                    // never seen EOF by reader) — likely the dup keeps a
-                    // BrokerPipeWriteEnd ref alive beyond when the writer
-                    // wants to close. socketpair doesn't see this because
-                    // sockets are bidi and don't have the same "writer
-                    // close → reader EOF" data-flow contract. Pipe needs
-                    // a different shape: maybe release the dup explicitly
-                    // when the migrating worker's close_all_fds runs, or
-                    // use a "transient transit" model that the migrating
-                    // worker's close DOES NOT release (only the spawned
-                    // worker's install/close releases).
+                    // never seen EOF by reader) — confirmed reproducible
+                    // again 2026-05-17 with PE.5+PE.9+PE.10+PE.11 substrate
+                    // in place. Pipe needs a different shape: maybe release
+                    // the dup explicitly when the migrating worker's
+                    // close_all_fds runs, or use a "transient transit" model
+                    // that the migrating worker's close DOES NOT release
+                    // (only the spawned worker's install/close releases).
                     let dir_char = match direction {
                         litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
                         litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
