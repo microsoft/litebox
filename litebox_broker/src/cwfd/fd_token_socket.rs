@@ -61,8 +61,13 @@ use tracing::{debug, info, warn};
 /// waiting on EOF.
 #[derive(Default)]
 struct ConnRefTracker {
-    state_refs: HashMap<u64, u32>,
-    process_refs: HashMap<u64, u32>,
+    /// Per-(caller_pid, handle_id) refcount. caller_pid=0 is the
+    /// "unspecified / legacy / pre-PE.1" bucket; all current shims
+    /// send caller_pid=0 until PE.1 Step C lands. Per-pid lookups
+    /// therefore degenerate to (0, id) keys today and only diverge
+    /// once the shim is taught to set caller_pid in outgoing frames.
+    state_refs: HashMap<(u32, u64), u32>,
+    process_refs: HashMap<(u32, u64), u32>,
 }
 
 impl ConnRefTracker {
@@ -70,43 +75,46 @@ impl ConnRefTracker {
         Self::default()
     }
 
-    fn record_state(&mut self, id: u64) {
-        *self.state_refs.entry(id).or_insert(0) += 1;
+    fn record_state(&mut self, caller_pid: u32, id: u64) {
+        *self.state_refs.entry((caller_pid, id)).or_insert(0) += 1;
     }
 
-    fn record_process(&mut self, id: u64) {
-        *self.process_refs.entry(id).or_insert(0) += 1;
+    fn record_process(&mut self, caller_pid: u32, id: u64) {
+        *self.process_refs.entry((caller_pid, id)).or_insert(0) += 1;
     }
 
     /// Returns true iff this connection has a positive reference
-    /// count for `id` in the state registry — i.e., this connection
-    /// owns at least one outstanding acquire (Create response or
-    /// DupHandle) for this handle.
-    fn owns_state(&self, id: u64) -> bool {
-        self.state_refs.get(&id).copied().unwrap_or(0) > 0
+    /// count for `id` from `caller_pid` in the state registry.
+    fn owns_state(&self, caller_pid: u32, id: u64) -> bool {
+        self.state_refs.get(&(caller_pid, id)).copied().unwrap_or(0) > 0
     }
 
-    fn owns_process(&self, id: u64) -> bool {
-        self.process_refs.get(&id).copied().unwrap_or(0) > 0
+    fn owns_process(&self, caller_pid: u32, id: u64) -> bool {
+        self.process_refs
+            .get(&(caller_pid, id))
+            .copied()
+            .unwrap_or(0)
+            > 0
     }
 
-    /// Worker called Release on `id`. We don't know which registry
-    /// without round-tripping the cascade, so decrement whichever
-    /// map has a positive count for it (state first, then process).
-    fn record_release(&mut self, id: u64) {
-        if let Some(c) = self.state_refs.get_mut(&id) {
+    /// Worker called Release on `id`. Decrement the matching
+    /// (caller_pid, id) bucket; try state first, then process.
+    fn record_release(&mut self, caller_pid: u32, id: u64) {
+        if let Some(c) = self.state_refs.get_mut(&(caller_pid, id)) {
             if *c > 0 {
                 *c -= 1;
                 return;
             }
         }
-        if let Some(c) = self.process_refs.get_mut(&id) {
+        if let Some(c) = self.process_refs.get_mut(&(caller_pid, id)) {
             if *c > 0 {
                 *c -= 1;
             }
         }
     }
 
+    /// Force-release every (pid, id) entry. Used on disconnect.
+    /// Returns (state_total, process_total) for diagnostics.
     fn cleanup_on_disconnect(
         self,
         state_registry: &BrokerStateRegistry,
@@ -114,13 +122,13 @@ impl ConnRefTracker {
     ) {
         let mut total_state = 0usize;
         let mut total_process = 0usize;
-        for (id, count) in self.state_refs {
+        for ((_pid, id), count) in self.state_refs {
             for _ in 0..count {
                 let _ = state_registry.release(StateHandle::from_id(id));
                 total_state += 1;
             }
         }
-        for (id, count) in self.process_refs {
+        for ((_pid, id), count) in self.process_refs {
             for _ in 0..count {
                 let _ = process_registry.release(StateHandle::from_id(id));
                 total_process += 1;
@@ -169,6 +177,7 @@ impl ConnRefTracker {
 /// request/response round on the socket loop.
 fn update_tracker_from_response(
     tracker: &mut ConnRefTracker,
+    caller_pid: u32,
     request_opcode: Opcode,
     request_body: &[u8],
     response: &OwnedFrame,
@@ -180,7 +189,7 @@ fn update_tracker_from_response(
         // State-registry creators: response body is one or two handle ids.
         Opcode::CreateEventfd | Opcode::CreatePidfd | Opcode::CreateSignalfd => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
-                tracker.record_state(id);
+                tracker.record_state(caller_pid, id);
             }
         }
         Opcode::CreatePipe => {
@@ -188,8 +197,8 @@ fn update_tracker_from_response(
             if response.body.len() >= 16 {
                 let r = u64::from_le_bytes(response.body[..8].try_into().unwrap());
                 let w = u64::from_le_bytes(response.body[8..16].try_into().unwrap());
-                tracker.record_state(r);
-                tracker.record_state(w);
+                tracker.record_state(caller_pid, r);
+                tracker.record_state(caller_pid, w);
             }
         }
         Opcode::CreateSocketPair => {
@@ -197,42 +206,34 @@ fn update_tracker_from_response(
             if response.body.len() >= 16 {
                 let a = u64::from_le_bytes(response.body[..8].try_into().unwrap());
                 let b = u64::from_le_bytes(response.body[8..16].try_into().unwrap());
-                tracker.record_state(a);
-                tracker.record_state(b);
+                tracker.record_state(caller_pid, a);
+                tracker.record_state(caller_pid, b);
             }
         }
         Opcode::CreatePty => {
             if let Ok((master, slave, _flags)) = parse_create_pty_response_ok(&response.body) {
-                tracker.record_state(master);
-                tracker.record_state(slave);
+                tracker.record_state(caller_pid, master);
+                tracker.record_state(caller_pid, slave);
             }
         }
         // Process-registry creator.
         Opcode::RegisterProcess => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
-                tracker.record_process(id);
+                tracker.record_process(caller_pid, id);
             }
         }
         // DupHandle: request body is one u64 handle id; response is empty.
-        // The +1 goes on whichever registry holds it (try state first via
-        // record_release symmetry — actually we want the inverse: record_state
-        // by default since state is checked first elsewhere).
         Opcode::DupHandle => {
             if request_body.len() >= 8 {
                 let id = u64::from_le_bytes(request_body[..8].try_into().unwrap());
-                // We don't know which registry without resolve. Pick state
-                // (statistically dominant for pipe/eventfd workloads).
-                // Worst case: a process-registry DupHandle is tracked as
-                // state — on disconnect we try state.release first, which
-                // fails with UnknownHandle and falls through to process.
-                tracker.record_state(id);
+                tracker.record_state(caller_pid, id);
             }
         }
         // Release: -1 on whichever registry.
         Opcode::Release => {
             if request_body.len() >= 8 {
                 let id = u64::from_le_bytes(request_body[..8].try_into().unwrap());
-                tracker.record_release(id);
+                tracker.record_release(caller_pid, id);
             }
         }
         _ => {}
@@ -507,6 +508,7 @@ fn handle_control_connection_inner(
                 };
                 let request_opcode = frame.opcode;
                 let request_body = frame.body.to_vec();
+                let caller_pid = frame.caller_pid;
                 let result = match frame.opcode {
                     Opcode::Register | Opcode::Materialize => {
                         // Host-fd opcodes: route to fd_token_service.
@@ -570,7 +572,7 @@ fn handle_control_connection_inner(
                                 frame: host_result.frame,
                                 out_fd: host_result.out_fd,
                             }
-                        } else if tracker.owns_state(release_id) {
+                        } else if tracker.owns_state(caller_pid, release_id) {
                             // State-registry release. Owner-gated.
                             let state_result = state_handle_request(
                                 state_registry,
@@ -582,7 +584,7 @@ fn handle_control_connection_inner(
                                 frame: state_result.frame,
                                 out_fd: state_result.out_fd,
                             }
-                        } else if tracker.owns_process(release_id) {
+                        } else if tracker.owns_process(caller_pid, release_id) {
                             // Process-registry release. Owner-gated.
                             let proc_result = state_handle_request(
                                 process_registry,
@@ -697,7 +699,13 @@ fn handle_control_connection_inner(
                         return;
                     }
                 };
-                update_tracker_from_response(tracker, request_opcode, &request_body, &result.frame);
+                update_tracker_from_response(
+                    tracker,
+                    caller_pid,
+                    request_opcode,
+                    &request_body,
+                    &result.frame,
+                );
                 if let Err(e) = write_response(&stream, result.frame, result.out_fd) {
                     warn!(error = %e, "fd-token control: write error");
                     return;
