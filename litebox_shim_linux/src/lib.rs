@@ -2182,6 +2182,9 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         unix: impl FnOnce(&Arc<TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>>) -> R,
         host_pipe: impl FnOnce(&Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>) -> R,
         broker_pipe: impl FnOnce(&Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>) -> R,
+        broker_socketpair: impl FnOnce(
+            &Arc<TypedFd<syscalls::broker_socketpair::BrokerSocketPairSubsystem>>,
+        ) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -2215,6 +2218,10 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(broker_pipe(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(broker_socketpair(&fd));
         }
         Err(Errno::EBADF)
     }
@@ -2457,6 +2464,7 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| alloc::format!("raw={raw_fd} epoll"),
                 |_fd| alloc::format!("raw={raw_fd} unix"),
                 |_fd| alloc::format!("raw={raw_fd} host_pipe"),
+                |_fd| alloc::format!("raw={raw_fd} broker_pipe"),
                 |_fd| alloc::format!("raw={raw_fd} broker_pipe"),
             )
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))
