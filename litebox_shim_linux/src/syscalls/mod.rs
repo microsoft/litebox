@@ -30,7 +30,8 @@ pub use eventfd::set_broker_pidfd_provider;
 pub use eventfd::set_broker_pty_provider;
 pub use guest_pid::{
     broker_guest_pid_provider, set_broker_guest_pid_provider, try_mark_broker_process_exited,
-    try_register_broker_guest_pid, try_release_broker_guest_pid, try_subscribe_broker_process_exit,
+    try_register_broker_guest_pid, try_release_all_broker_for_pid, try_release_broker_guest_pid,
+    try_subscribe_broker_process_exit,
 };
 pub use signalfd::broker_signalfd_provider;
 pub use signalfd::set_broker_signalfd_provider;

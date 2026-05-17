@@ -289,6 +289,31 @@ impl FdTokenClient {
         }
     }
 
+    /// Phase F.5+ PE.1 Step D: release every (pid, *) entry the
+    /// broker is tracking for this connection on behalf of `pid`.
+    /// Returns the number of refs released (for diagnostics).
+    pub fn release_all_for_pid(&self, pid: u32) -> Result<u32, ClientError> {
+        use crate::fd_token_protocol::{
+            build_release_all_for_pid_request, parse_release_all_for_pid_response_ok,
+        };
+        let stream = self.lock();
+        send_frame(&stream, &build_release_all_for_pid_request(pid), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::ReleaseAllForPidResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_release_all_for_pid_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
+            s => Err(map_status_with_handle(resp.opcode, s, u64::from(pid))),
+        }
+    }
+
     /// Marks a broker-owned process as exited and wakes subscribers.
     pub fn mark_process_exited(&self, pid: u32, exit_code: i32) -> Result<(), ClientError> {
         let stream = self.lock();

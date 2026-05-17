@@ -149,6 +149,14 @@ pub enum Opcode {
     SubscribeProcessExit = 0x71,
     /// Mark a broker-owned process as exited and wake exit subscribers.
     MarkProcessExited = 0x72,
+    /// Phase F.5+ PE.1 Step D: release every (pid, *) entry this
+    /// connection holds for the given guest pid. Sent by the shim
+    /// during `prepare_for_exit` after `close_all_fds`. Body:
+    /// `pid: u32` followed by 4 reserved bytes (must be zero).
+    /// Response body: `released_count: u32` (number of refs
+    /// decremented across both state and process registries),
+    /// then 4 reserved bytes.
+    ReleaseAllForPid = 0x73,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -178,6 +186,8 @@ pub enum Opcode {
     RegisterProcessResponse = 0xF0,
     SubscribeProcessExitResponse = 0xF1,
     MarkProcessExitedResponse = 0xF2,
+    /// Response for [`Opcode::ReleaseAllForPid`].
+    ReleaseAllForPidResponse = 0xF3,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -296,6 +306,7 @@ impl Opcode {
             Opcode::RegisterProcess => Some(Opcode::RegisterProcessResponse),
             Opcode::SubscribeProcessExit => Some(Opcode::SubscribeProcessExitResponse),
             Opcode::MarkProcessExited => Some(Opcode::MarkProcessExitedResponse),
+            Opcode::ReleaseAllForPid => Some(Opcode::ReleaseAllForPidResponse),
             _ => None,
         }
     }
@@ -332,6 +343,7 @@ impl Opcode {
                 | Opcode::RegisterProcess
                 | Opcode::SubscribeProcessExit
                 | Opcode::MarkProcessExited
+                | Opcode::ReleaseAllForPid
         )
     }
 
@@ -383,6 +395,7 @@ impl TryFrom<u8> for Opcode {
             0x70 => Ok(Opcode::RegisterProcess),
             0x71 => Ok(Opcode::SubscribeProcessExit),
             0x72 => Ok(Opcode::MarkProcessExited),
+            0x73 => Ok(Opcode::ReleaseAllForPid),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -411,6 +424,7 @@ impl TryFrom<u8> for Opcode {
             0xF0 => Ok(Opcode::RegisterProcessResponse),
             0xF1 => Ok(Opcode::SubscribeProcessExitResponse),
             0xF2 => Ok(Opcode::MarkProcessExitedResponse),
+            0xF3 => Ok(Opcode::ReleaseAllForPidResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -856,6 +870,65 @@ pub fn build_mark_process_exited_response_ok() -> OwnedFrame {
         caller_pid: 0,
         body: Vec::new(),
     }
+}
+
+/// Body for [`Opcode::ReleaseAllForPid`]: (pid: u32, pad: 4).
+pub fn build_release_all_for_pid_request(pid: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&pid.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::ReleaseAllForPid,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+/// Decodes the body of a ReleaseAllForPid request.
+pub fn parse_release_all_for_pid_body(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReleaseAllForPid,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let pid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    if body[4..8].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok(pid)
+}
+
+/// Body for [`Opcode::ReleaseAllForPidResponse`]:
+/// `(released_count: u32, pad: 4)`.
+pub fn build_release_all_for_pid_response_ok(released: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&released.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::ReleaseAllForPidResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+/// Decode a ReleaseAllForPidResponse OK body.
+pub fn parse_release_all_for_pid_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReleaseAllForPidResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let released = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    if body[4..8].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok(released)
 }
 
 /// Body for [`Opcode::RegisterNotificationRing`]: empty (ring fd via SCM_RIGHTS).

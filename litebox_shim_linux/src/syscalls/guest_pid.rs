@@ -122,6 +122,31 @@ pub fn try_mark_broker_process_exited(pid: u32, exit_code: i32) {
     }
 }
 
+/// Phase F.5+ PE.1 Step D: release every (pid, *) entry the broker
+/// is tracking on the worker's control connection. Best-effort; exit
+/// teardown must proceed if the RPC fails. Called from
+/// `prepare_for_exit` after the per-fd `close_all_fds` pass — that
+/// pass releases broker-backed fd refs explicitly via on_close, and
+/// this RPC is the belt-and-braces sweep for anything that wasn't
+/// covered (non-fd state like ProcessState refs, future broker-held
+/// resources not tracked through the fd table). It's a no-op when
+/// per-pid tracking is gated off (caller_pid=0) because the broker
+/// has no per-pid buckets to release.
+pub fn try_release_all_broker_for_pid(pid: u32) {
+    if let Some(provider) = broker_guest_pid_provider() {
+        match provider.release_all_for_pid(pid) {
+            Ok(0) => {}
+            Ok(_n) => {
+                // Silent on success path — release count is for
+                // diagnostics only and would be very chatty.
+            }
+            Err(err) => {
+                log_unsupported!("broker ReleaseAllForPid failed for pid {pid}: {err:?}");
+            }
+        }
+    }
+}
+
 /// Subscribe to broker-owned process exit for a guest [`ProcessId`].
 ///
 /// Phase B.2 can use the returned [`BrokerProcessExitWake::subject`] as

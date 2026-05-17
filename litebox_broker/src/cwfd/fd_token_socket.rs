@@ -113,6 +113,48 @@ impl ConnRefTracker {
         }
     }
 
+    /// Phase F.5+ PE.1 Step D: release every (pid, id) entry for
+    /// the given `pid`. Called from the broker's ReleaseAllForPid
+    /// handler when a guest process exits cleanly. Returns the
+    /// total number of refs decremented across both registries.
+    fn release_all_for_pid(
+        &mut self,
+        pid: u32,
+        state_registry: &BrokerStateRegistry,
+        process_registry: &BrokerStateRegistry,
+    ) -> u32 {
+        let mut released = 0u32;
+        let state_keys: Vec<(u32, u64)> = self
+            .state_refs
+            .keys()
+            .filter(|(p, _)| *p == pid)
+            .copied()
+            .collect();
+        for key in state_keys {
+            if let Some(count) = self.state_refs.remove(&key) {
+                for _ in 0..count {
+                    let _ = state_registry.release(StateHandle::from_id(key.1));
+                    released = released.saturating_add(1);
+                }
+            }
+        }
+        let process_keys: Vec<(u32, u64)> = self
+            .process_refs
+            .keys()
+            .filter(|(p, _)| *p == pid)
+            .copied()
+            .collect();
+        for key in process_keys {
+            if let Some(count) = self.process_refs.remove(&key) {
+                for _ in 0..count {
+                    let _ = process_registry.release(StateHandle::from_id(key.1));
+                    released = released.saturating_add(1);
+                }
+            }
+        }
+        released
+    }
+
     /// Force-release every (pid, id) entry. Used on disconnect.
     /// Returns (state_total, process_total) for diagnostics.
     fn cleanup_on_disconnect(
@@ -679,6 +721,39 @@ fn handle_control_connection_inner(
                         SocketHandlerResult {
                             frame: state_result.frame,
                             out_fd: state_result.out_fd,
+                        }
+                    }
+                    Opcode::ReleaseAllForPid => {
+                        // Phase F.5+ PE.1 Step D: parse pid, release every
+                        // (pid, *) entry tracked on this connection across
+                        // both registries, and return the count.
+                        match litebox_common_linux::fd_token_protocol::parse_release_all_for_pid_body(
+                            &request_body,
+                        ) {
+                            Ok(target_pid) => {
+                                let released = tracker.release_all_for_pid(
+                                    target_pid,
+                                    state_registry,
+                                    process_registry,
+                                );
+                                if released > 0 {
+                                    debug!(
+                                        target_pid,
+                                        released,
+                                        "fd-token control: ReleaseAllForPid"
+                                    );
+                                }
+                                SocketHandlerResult {
+                                    frame: litebox_common_linux::fd_token_protocol::build_release_all_for_pid_response_ok(
+                                        released,
+                                    ),
+                                    out_fd: None,
+                                }
+                            }
+                            Err(_) => {
+                                warn!("fd-token control: malformed ReleaseAllForPid body; closing");
+                                return;
+                            }
                         }
                     }
                     Opcode::RegisterProcess

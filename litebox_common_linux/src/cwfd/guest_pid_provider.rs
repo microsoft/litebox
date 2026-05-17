@@ -86,6 +86,16 @@ pub trait GuestPidProvider: Send + Sync {
 
     /// Remove a process-exit subscription. Best-effort during drop.
     fn unsubscribe_process_exit(&self, pid: u32, subscription_id: u64);
+
+    /// Phase F.5+ PE.1 Step D: release every (pid, *) entry the broker
+    /// is tracking on this connection. Used during shim
+    /// `prepare_for_exit` to release non-fd broker state and serve as
+    /// a crash-safety belt-and-braces against ref leaks. Default-
+    /// implemented as a no-op so existing in-process test impls that
+    /// don't need per-pid release do not have to implement it.
+    fn release_all_for_pid(&self, _pid: u32) -> Result<u32, GuestPidProviderError> {
+        Ok(0)
+    }
 }
 
 /// Convenience: the `Arc<dyn GuestPidProvider>` shape the shim

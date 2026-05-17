@@ -983,6 +983,11 @@ impl<FS: ShimFS> Task<FS> {
                 }
             };
             super::guest_pid::try_mark_broker_process_exited(self.process_id.0, exit_status);
+            // Phase F.5+ PE.1 Step D: sweep broker-tracked refs for
+            // this pid. No-op when per-pid ownership is gated off;
+            // belt-and-braces sweep for non-fd state and any
+            // SIGKILL-leaked refs otherwise.
+            super::guest_pid::try_release_all_broker_for_pid(self.process_id.0);
             let removed_owner = self
                 .global
                 .control_plane
