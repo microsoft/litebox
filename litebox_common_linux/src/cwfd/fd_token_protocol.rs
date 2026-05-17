@@ -563,6 +563,10 @@ impl std::error::Error for ProtocolError {}
 pub struct Frame<'a> {
     pub opcode: Opcode,
     pub status: StatusCode,
+    /// Phase F.5+ PE.1: guest pid of the caller. 0 = unspecified
+    /// (pre-PE.1 caller, or response frame). Used by the broker to
+    /// attribute refcount changes to a guest process.
+    pub caller_pid: u32,
     pub body: &'a [u8],
     /// Total bytes consumed (header + body). Caller advances by this.
     pub consumed: usize,
@@ -573,10 +577,22 @@ pub struct Frame<'a> {
 pub struct OwnedFrame {
     pub opcode: Opcode,
     pub status: StatusCode,
+    /// Phase F.5+ PE.1: guest pid of the caller. 0 = unspecified.
+    /// Initial value when building via the existing helpers; the
+    /// shim sets this just before send via `with_caller_pid` or
+    /// the equivalent.
+    pub caller_pid: u32,
     pub body: Vec<u8>,
 }
 
 impl OwnedFrame {
+    /// Sets the caller_pid field (builder style). Use this on the
+    /// shim side just before sending. Returns self for chaining.
+    pub fn with_caller_pid(mut self, pid: u32) -> Self {
+        self.caller_pid = pid;
+        self
+    }
+
     /// Encodes the frame to a contiguous byte buffer.
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         let body_len = self.body.len();
@@ -594,7 +610,11 @@ impl OwnedFrame {
         out.push(self.status as u8);
         #[allow(clippy::cast_possible_truncation)]
         out.extend_from_slice(&(body_len as u32).to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        // Phase F.5+ PE.1 Step A: bytes 12-15 carry the caller's
+        // guest pid (formerly "reserved must be zero"). 0 = unspecified
+        // (pre-PE.1 callers). Backwards compatible: legacy senders
+        // pass 0 here, legacy receivers can treat 0 as "anonymous".
+        out.extend_from_slice(&self.caller_pid.to_le_bytes());
         out.extend_from_slice(&self.body);
         Ok(out)
     }
@@ -629,10 +649,10 @@ pub fn decode(buf: &[u8]) -> Result<Frame<'_>, ProtocolError> {
             max: BODY_MAX,
         });
     }
-    let reserved = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-    if reserved != 0 {
-        return Err(ProtocolError::NonZeroReserved { reserved });
-    }
+    // Phase F.5+ PE.1 Step A: bytes 12-15 are now caller_pid (was
+    // reserved-must-be-zero). 0 is valid (means unspecified). Any
+    // non-zero is the caller's guest pid.
+    let caller_pid = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
     let total = CTRL_HEADER_LEN + body_len as usize;
     if buf.len() < total {
         return Err(ProtocolError::BodyTruncated {
@@ -643,6 +663,7 @@ pub fn decode(buf: &[u8]) -> Result<Frame<'_>, ProtocolError> {
     Ok(Frame {
         opcode,
         status,
+        caller_pid,
         body: &buf[CTRL_HEADER_LEN..total],
         consumed: total,
     })
@@ -659,6 +680,7 @@ pub fn build_register_request() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::Register,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -668,6 +690,7 @@ pub fn build_register_response_ok(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::RegisterResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -677,6 +700,7 @@ pub fn build_materialize_request(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::Materialize,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -686,6 +710,7 @@ pub fn build_materialize_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::MaterializeResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -695,6 +720,7 @@ pub fn build_release_request(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::Release,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -704,6 +730,7 @@ pub fn build_release_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::ReleaseResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -713,6 +740,7 @@ pub fn build_register_process_request() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::RegisterProcess,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -722,6 +750,7 @@ pub fn build_register_process_response_ok(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::RegisterProcessResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -740,6 +769,7 @@ pub fn build_subscribe_process_exit_request(
     OwnedFrame {
         opcode: Opcode::SubscribeProcessExit,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -758,6 +788,7 @@ pub fn build_subscribe_process_exit_response_ok(exit_code: Option<i32>) -> Owned
     OwnedFrame {
         opcode: Opcode::SubscribeProcessExitResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -793,6 +824,7 @@ pub fn build_mark_process_exited_request(pid: u32, exit_code: i32) -> OwnedFrame
     OwnedFrame {
         opcode: Opcode::MarkProcessExited,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -821,6 +853,7 @@ pub fn build_mark_process_exited_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::MarkProcessExitedResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -830,6 +863,7 @@ pub fn build_register_notification_ring_request() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::RegisterNotificationRing,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -839,6 +873,7 @@ pub fn build_register_notification_ring_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::RegisterNotificationRingResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -852,6 +887,7 @@ pub fn build_create_eventfd_request(initial: u64, semaphore: bool) -> OwnedFrame
     OwnedFrame {
         opcode: Opcode::CreateEventfd,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -881,6 +917,7 @@ pub fn build_create_eventfd_response_ok(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::CreateEventfdResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -890,6 +927,7 @@ pub fn build_create_pidfd_request(target_host_pid: u32) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::CreatePidfd,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: target_host_pid.to_le_bytes().to_vec(),
     }
 }
@@ -911,6 +949,7 @@ pub fn build_create_pidfd_response_ok(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::CreatePidfdResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -925,6 +964,7 @@ pub fn build_pidfd_exited_request(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::PidfdExited,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -941,6 +981,7 @@ pub fn build_pidfd_exited_response_ok(exited: bool) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::PidfdExitedResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -962,6 +1003,7 @@ pub fn build_read_eventfd_request(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::ReadEventfd,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -971,6 +1013,7 @@ pub fn build_read_eventfd_response_ok(value: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::ReadEventfdResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: value.to_le_bytes().to_vec(),
     }
 }
@@ -983,6 +1026,7 @@ pub fn build_write_eventfd_request(handle_id: u64, value: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::WriteEventfd,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1010,6 +1054,7 @@ pub fn build_write_eventfd_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::WriteEventfdResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -1028,6 +1073,7 @@ pub fn build_subscribe_eventfd_request(
     OwnedFrame {
         opcode: Opcode::SubscribeEventfd,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1063,6 +1109,7 @@ pub fn build_subscribe_eventfd_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::SubscribeEventfdResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -1075,6 +1122,7 @@ pub fn build_create_signalfd_request(sigmask_lo: u64, sigmask_hi: u64) -> OwnedF
     OwnedFrame {
         opcode: Opcode::CreateSignalfd,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1102,6 +1150,7 @@ pub fn build_create_signalfd_response_ok(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::CreateSignalfdResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -1111,6 +1160,7 @@ pub fn build_read_siginfo_request(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::ReadSiginfo,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -1125,6 +1175,7 @@ pub fn build_read_siginfo_response_ok(payload: &[u8]) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::ReadSiginfoResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1161,6 +1212,7 @@ pub fn build_create_pipe_request(capacity: u64, atomic_write_size: u64) -> Owned
     OwnedFrame {
         opcode: Opcode::CreatePipe,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1185,6 +1237,7 @@ pub fn build_create_pipe_response_ok(read_handle_id: u64, write_handle_id: u64) 
     OwnedFrame {
         opcode: Opcode::CreatePipeResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1211,6 +1264,7 @@ pub fn build_read_pipe_request(handle_id: u64, max_len: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::ReadPipe,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1239,6 +1293,7 @@ pub fn build_read_pipe_response_ok(bytes: &[u8]) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::ReadPipeResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1277,6 +1332,7 @@ pub fn build_write_pipe_request(handle_id: u64, bytes: &[u8]) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::WritePipe,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1309,6 +1365,7 @@ pub fn build_write_pipe_response_ok(written: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::WritePipeResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: written.to_le_bytes().to_vec(),
     }
 }
@@ -1333,6 +1390,7 @@ pub fn build_create_socketpair_request(capacity: u64, atomic_write_size: u64) ->
     OwnedFrame {
         opcode: Opcode::CreateSocketPair,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1361,6 +1419,7 @@ pub fn build_create_socketpair_response_ok(
     OwnedFrame {
         opcode: Opcode::CreateSocketPairResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1387,6 +1446,7 @@ pub fn build_read_socketpair_request(handle_id: u64, max_len: u64) -> OwnedFrame
     OwnedFrame {
         opcode: Opcode::ReadSocketPair,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1416,6 +1476,7 @@ pub fn build_read_socketpair_response_ok(bytes: &[u8]) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::ReadSocketPairResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1455,6 +1516,7 @@ pub fn build_write_socketpair_request(handle_id: u64, bytes: &[u8]) -> OwnedFram
     OwnedFrame {
         opcode: Opcode::WriteSocketPair,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1487,6 +1549,7 @@ pub fn build_write_socketpair_response_ok(written: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::WriteSocketPairResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: written.to_le_bytes().to_vec(),
     }
 }
@@ -1500,6 +1563,7 @@ pub fn build_create_pty_request() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::CreatePty,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -1518,6 +1582,7 @@ pub fn build_create_pty_response_ok(
     OwnedFrame {
         opcode: Opcode::CreatePtyResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1548,6 +1613,7 @@ pub fn build_pty_read_request(handle_id: u64, max_len: u32) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::PtyRead,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1577,6 +1643,7 @@ pub fn build_pty_read_response_ok(data: &[u8]) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::PtyReadResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1595,6 +1662,7 @@ pub fn build_pty_write_request(handle_id: u64, data: &[u8]) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::PtyWrite,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1623,6 +1691,7 @@ pub fn build_pty_write_response_ok(bytes_written: u32) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::PtyWriteResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: bytes_written.to_le_bytes().to_vec(),
     }
 }
@@ -1656,6 +1725,7 @@ pub fn build_subscribe_pty_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::SubscribePtyResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -1670,6 +1740,7 @@ pub fn build_pty_ioctl_request(handle_id: u64, op: PtyIoctlOp, payload: &[u8]) -
     OwnedFrame {
         opcode: Opcode::PtyIoctl,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1708,6 +1779,7 @@ pub fn build_pty_ioctl_response_ok(payload: &[u8]) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::PtyIoctlResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1747,6 +1819,7 @@ pub fn build_unsubscribe_request(handle_id: u64, subscription_id: u64) -> OwnedF
     OwnedFrame {
         opcode: Opcode::Unsubscribe,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body,
     }
 }
@@ -1774,6 +1847,7 @@ pub fn build_unsubscribe_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::UnsubscribeResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -1788,6 +1862,7 @@ pub fn build_dup_handle_request(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::DupHandle,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: handle_id.to_le_bytes().to_vec(),
     }
 }
@@ -1797,6 +1872,7 @@ pub fn build_dup_handle_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::DupHandleResponse,
         status: StatusCode::Ok,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -1808,6 +1884,7 @@ pub fn build_error_response(response_opcode: Opcode, status: StatusCode) -> Owne
     OwnedFrame {
         opcode: response_opcode,
         status,
+        caller_pid: 0,
         body: Vec::new(),
     }
 }
@@ -2144,13 +2221,34 @@ mod tests {
     }
 
     #[test]
-    fn decode_nonzero_reserved_rejected() {
+    fn decode_caller_pid_roundtrip() {
+        // Phase F.5+ PE.1: bytes 12-15 (formerly "reserved must be
+        // zero") now carry caller_pid. A non-zero value should round
+        // trip through decode, not be rejected.
         let mut buf = build_register_request().encode().unwrap();
-        buf[12..16].copy_from_slice(&1u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&42u32.to_le_bytes());
         match decode(&buf) {
-            Err(ProtocolError::NonZeroReserved { reserved: 1 }) => {}
-            other => panic!("expected NonZeroReserved, got {other:?}"),
+            Ok(frame) => assert_eq!(frame.caller_pid, 42),
+            other => panic!("expected Ok with caller_pid=42, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn caller_pid_zero_by_default() {
+        // Builders default caller_pid to 0 (legacy / unspecified).
+        let frame = build_register_request();
+        assert_eq!(frame.caller_pid, 0);
+        let buf = frame.encode().unwrap();
+        assert_eq!(&buf[12..16], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn with_caller_pid_sets_field() {
+        let frame = build_register_request().with_caller_pid(7);
+        assert_eq!(frame.caller_pid, 7);
+        let buf = frame.encode().unwrap();
+        let decoded = decode(&buf).unwrap();
+        assert_eq!(decoded.caller_pid, 7);
     }
 
     #[test]
