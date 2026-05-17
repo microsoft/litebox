@@ -140,7 +140,21 @@ fn client_err_to_broker_err(err: ClientError) -> BrokerOpError {
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
         ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
         ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
-        _ => BrokerOpError::Io,
+        other => {
+            // PE.5 diagnostic: log the actual ClientError shape when
+            // we fall through to a generic Io. Goes to /tmp/rst-diag.log
+            // (the runner/shim diagnostic file) so it's visible in
+            // LITEBOX_KEEP_CONTAINER inspections.
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(f, "[PE.5-diag] broker eventfd Io fallthrough: {other:?}");
+            }
+            BrokerOpError::Io
+        }
     }
 }
 

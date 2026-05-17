@@ -2402,11 +2402,19 @@ impl<FS: ShimFS> Task<FS> {
             // FD table is duplicated now so the child can safely do dup2/close
             // between fork and exec without corrupting the parent's FD state.
             let vfork_done = Arc::new(crate::VforkDone::new(self.wait_cx().waker().clone()));
-            let child_files_state = Arc::new(
-                self.files
-                    .borrow()
-                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
-            );
+            let child_files_state = {
+                // Phase F.5+ PE.5: see the matching scope at the
+                // independent-fork branch below. Same rationale —
+                // dup_handles from on_dup must be attributed to
+                // child_pid in the broker's per-(pid, id) tracker.
+                let _scope =
+                    litebox_common_linux::fd_token_client::set_caller_pid_scope(child_pid_u32);
+                Arc::new(
+                    self.files
+                        .borrow()
+                        .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+                )
+            };
 
             // Set up CoW protection for fork memory sharing.
             //
@@ -2760,11 +2768,24 @@ impl<FS: ShimFS> Task<FS> {
                     deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
                 }),
             });
-            let child_files_state = Arc::new(
-                self.files
-                    .borrow()
-                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
-            );
+            let child_files_state = {
+                // Phase F.5+ PE.5: stamp caller_pid = child_pid for all
+                // broker dup_handle RPCs emitted during clone_for_fork's
+                // on_dup invocations. Without this, the dup_handles
+                // would be attributed to parent_pid in the broker's
+                // per-(pid, id) tracker, and the child would later
+                // hit a PROTOCOL VIOLATION when its release fires with
+                // caller_pid = child_pid against an entry only tracked
+                // under (parent_pid, id). Scope drops at end of block;
+                // outer code returns to parent's caller_pid.
+                let _scope =
+                    litebox_common_linux::fd_token_client::set_caller_pid_scope(child_pid_u32);
+                Arc::new(
+                    self.files
+                        .borrow()
+                        .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+                )
+            };
             (
                 core::cell::RefCell::new(child_ps),          // own ProcessState
                 core::cell::RefCell::new(child_files_state), // own FD table

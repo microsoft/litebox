@@ -85,24 +85,77 @@ impl ConnRefTracker {
 
     /// Returns true iff this connection has a positive reference
     /// count for `id` from `caller_pid` in the state registry.
+    ///
+    /// caller_pid=0 ("ambient" / "unspecified") falls back to "owned
+    /// by ANY pid on this conn". This preserves correctness for
+    /// asynchronous Drop paths in the shim that release a
+    /// broker-backed fd from a non-syscall thread (e.g. tokio worker
+    /// task drops, fd-table cleanup outside `Task::handle_syscall_request`),
+    /// where the caller_pid thread-local is the default 0.
     fn owns_state(&self, caller_pid: u32, id: u64) -> bool {
-        self.state_refs.get(&(caller_pid, id)).copied().unwrap_or(0) > 0
+        if caller_pid == 0 {
+            self.state_refs.iter().any(|((_, h), c)| *h == id && *c > 0)
+        } else {
+            self.state_refs.get(&(caller_pid, id)).copied().unwrap_or(0) > 0
+        }
     }
 
     fn owns_process(&self, caller_pid: u32, id: u64) -> bool {
-        self.process_refs
-            .get(&(caller_pid, id))
-            .copied()
-            .unwrap_or(0)
-            > 0
+        if caller_pid == 0 {
+            self.process_refs
+                .iter()
+                .any(|((_, h), c)| *h == id && *c > 0)
+        } else {
+            self.process_refs
+                .get(&(caller_pid, id))
+                .copied()
+                .unwrap_or(0)
+                > 0
+        }
     }
 
     /// Worker called Release on `id`. Decrement the matching
     /// (caller_pid, id) bucket; try state first, then process.
     /// Removes the entry entirely when its count drops to 0 so
-    /// the invariant "key present ⇒ count > 0" holds (any present
-    /// entry observed by code below is therefore live).
+    /// the invariant "key present ⇒ count > 0" holds.
+    ///
+    /// caller_pid=0 falls back to "decrement an arbitrary pid bucket
+    /// holding this id" (see [`owns_state`]). This handles the shim's
+    /// asynchronous Drop paths where caller_pid isn't stamped.
     fn record_release(&mut self, caller_pid: u32, id: u64) {
+        if caller_pid == 0 {
+            // Ambient release: pick any (pid, id) bucket with a
+            // positive count and decrement. Prefer state over process
+            // (matches the per-pid branch order below).
+            let state_key = self
+                .state_refs
+                .iter()
+                .find(|((_, h), c)| *h == id && **c > 0)
+                .map(|(k, _)| *k);
+            if let Some(key) = state_key {
+                if let Some(c) = self.state_refs.get_mut(&key) {
+                    *c -= 1;
+                    if *c == 0 {
+                        self.state_refs.remove(&key);
+                    }
+                }
+                return;
+            }
+            let proc_key = self
+                .process_refs
+                .iter()
+                .find(|((_, h), c)| *h == id && **c > 0)
+                .map(|(k, _)| *k);
+            if let Some(key) = proc_key {
+                if let Some(c) = self.process_refs.get_mut(&key) {
+                    *c -= 1;
+                    if *c == 0 {
+                        self.process_refs.remove(&key);
+                    }
+                }
+            }
+            return;
+        }
         if let Some(c) = self.state_refs.get_mut(&(caller_pid, id)) {
             debug_assert!(
                 *c > 0,
@@ -682,12 +735,29 @@ fn handle_control_connection_inner(
                                     handle_id = release_id,
                                     state_exists,
                                     process_exists,
+                                    caller_pid,
                                     "fd-token control: PROTOCOL VIOLATION: Release of \
                                      broker-held resource not owned by this connection; \
                                      closing. Likely a shim-side bug — a fork-inherited \
                                      fd-table entry's on_close firing release without a \
                                      matching DupHandle."
                                 );
+                                // PE.5 diag: also write to the runner-side
+                                // diagnostic file so it's visible in
+                                // LITEBOX_KEEP_CONTAINER inspections.
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("/tmp/rst-diag.log")
+                                {
+                                    let _ = writeln!(
+                                        f,
+                                        "[PE.5-diag] BROKER PROTOCOL VIOLATION: Release \
+                                         handle_id={release_id} caller_pid={caller_pid} \
+                                         state_exists={state_exists} process_exists={process_exists}"
+                                    );
+                                }
                                 return;
                             }
                             // Handle is truly unknown to the broker — preserve existing
@@ -765,6 +835,24 @@ fn handle_control_connection_inner(
                                     state_registry,
                                     process_registry,
                                 );
+                                // PE.5 diag (gated): trace every
+                                // ReleaseAllForPid invocation when
+                                // LITEBOX_PE5_DIAG=1. Useful when
+                                // chasing premature-release / read-empty
+                                // patterns; spammy in normal use.
+                                if std::env::var_os("LITEBOX_PE5_DIAG").is_some() {
+                                    use std::io::Write;
+                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("/tmp/rst-diag.log")
+                                    {
+                                        let _ = writeln!(
+                                            f,
+                                            "[PE.5-diag] ReleaseAllForPid target_pid={target_pid} released={released}"
+                                        );
+                                    }
+                                }
                                 if released > 0 {
                                     debug!(
                                         target_pid,
