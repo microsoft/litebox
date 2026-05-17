@@ -99,16 +99,33 @@ impl ConnRefTracker {
 
     /// Worker called Release on `id`. Decrement the matching
     /// (caller_pid, id) bucket; try state first, then process.
+    /// Removes the entry entirely when its count drops to 0 so
+    /// the invariant "key present ⇒ count > 0" holds (any present
+    /// entry observed by code below is therefore live).
     fn record_release(&mut self, caller_pid: u32, id: u64) {
         if let Some(c) = self.state_refs.get_mut(&(caller_pid, id)) {
+            debug_assert!(
+                *c > 0,
+                "ConnRefTracker invariant: zero-count state_refs entry present for (pid={caller_pid}, id={id})"
+            );
             if *c > 0 {
                 *c -= 1;
+                if *c == 0 {
+                    self.state_refs.remove(&(caller_pid, id));
+                }
                 return;
             }
         }
         if let Some(c) = self.process_refs.get_mut(&(caller_pid, id)) {
+            debug_assert!(
+                *c > 0,
+                "ConnRefTracker invariant: zero-count process_refs entry present for (pid={caller_pid}, id={id})"
+            );
             if *c > 0 {
                 *c -= 1;
+                if *c == 0 {
+                    self.process_refs.remove(&(caller_pid, id));
+                }
             }
         }
     }
@@ -152,6 +169,18 @@ impl ConnRefTracker {
                 }
             }
         }
+        // P3 invariant: after release_all_for_pid, no (pid, *) entry
+        // remains in either tracker. Cheap to check (linear in tracker
+        // size, debug-only). A failure here indicates a concurrent
+        // insertion or a bug in the removal loop above.
+        debug_assert!(
+            !self.state_refs.keys().any(|(p, _)| *p == pid),
+            "P3: state_refs still has entries for released pid {pid}"
+        );
+        debug_assert!(
+            !self.process_refs.keys().any(|(p, _)| *p == pid),
+            "P3: process_refs still has entries for released pid {pid}"
+        );
         released
     }
 
