@@ -162,23 +162,29 @@ impl SubscriptionList {
                     continue;
                 }
                 let frame = NotificationFrame::fixed(sub.id, matched);
-                // Lock the sender briefly to write one frame. Hold time
-                // bounded by the size of the notification frame plus
-                // futex syscall — microseconds in the steady state.
                 let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
                 if let Err(err) = sender.send(&frame) {
-                    // PE.9 fix: a send failure means the receiving
-                    // notification ring is dead (subscriber's conn
-                    // closed without explicit Unsubscribe — typical
-                    // SIGKILL path). Mark the subscription for
-                    // removal so we don't keep retrying and keep
-                    // a leaked subscription alive indefinitely.
-                    tracing::warn!(
-                        subscription_id = sub.id,
-                        error = %err,
-                        "notification send failed; removing dead subscription",
-                    );
-                    to_remove.push(sub.id);
+                    // PE.9 fix: only remove the subscription on
+                    // "peer is gone" errors. Transient errors
+                    // (WouldBlock, Interrupted, ring-buffer
+                    // saturated) MUST NOT remove a live
+                    // subscription — that would silently break
+                    // notification delivery for a still-attached
+                    // subscriber.
+                    if is_peer_gone(&err) {
+                        tracing::warn!(
+                            subscription_id = sub.id,
+                            error = %err,
+                            "notification send failed (peer gone); removing dead subscription",
+                        );
+                        to_remove.push(sub.id);
+                    } else {
+                        tracing::warn!(
+                            subscription_id = sub.id,
+                            error = %err,
+                            "notification send failed (transient); leaving subscription in list",
+                        );
+                    }
                 }
             }
         }
@@ -201,13 +207,20 @@ impl SubscriptionList {
                 let frame = NotificationFrame::payload(sub.id, matched, payload.clone());
                 let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
                 if let Err(err) = sender.send(&frame) {
-                    // PE.9 fix: see notify() above.
-                    tracing::warn!(
-                        subscription_id = sub.id,
-                        error = %err,
-                        "payload notification send failed; removing dead subscription",
-                    );
-                    to_remove.push(sub.id);
+                    if is_peer_gone(&err) {
+                        tracing::warn!(
+                            subscription_id = sub.id,
+                            error = %err,
+                            "payload notification send failed (peer gone); removing dead subscription",
+                        );
+                        to_remove.push(sub.id);
+                    } else {
+                        tracing::warn!(
+                            subscription_id = sub.id,
+                            error = %err,
+                            "payload notification send failed (transient); leaving subscription in list",
+                        );
+                    }
                 }
             }
         }
@@ -238,6 +251,17 @@ impl SubscriptionList {
         let mut entries = self.entries.lock().expect("SubscriptionList poisoned");
         entries.retain(|s| Arc::strong_count(&s.sender) > 1);
     }
+}
+
+/// PE.9 helper: classify a notification-send error as "the peer is
+/// definitely gone" vs "this was a transient that may recover". Only
+/// the former should remove the subscription from the list.
+fn is_peer_gone(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+    )
 }
 
 #[cfg(test)]

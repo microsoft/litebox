@@ -47,16 +47,14 @@ pub struct ProcessState {
 
 impl Drop for ProcessState {
     fn drop(&mut self) {
-        // PE.9 diagnostic: live exit subscriptions at Drop =
-        // subscriber disconnected before unsubscribe (typical
-        // SIGKILL path, cleaned via cleanup_on_disconnect). Logged
-        // for chasing notification-delivery issues, not a bug.
-        if !self.subscription_list.is_empty() {
-            tracing::debug!(
-                count = self.subscription_list.len(),
-                "ProcessState dropped with live exit subscription(s)"
-            );
-        }
+        // PE.9 invariant: with eager per-conn unsubscribe at
+        // disconnect, no live exit-sub should remain at Drop.
+        debug_assert!(
+            self.subscription_list.is_empty(),
+            "ProcessState dropped with {} live exit subscription(s) — \
+             eager per-conn unsubscribe not running",
+            self.subscription_list.len()
+        );
     }
 }
 
@@ -202,6 +200,7 @@ mod tests {
         assert_eq!(frame.subscription_id(), 7);
         assert_eq!(frame.events(), PROCESS_EXIT_EVENTS);
         assert_eq!(frame.payload_bytes(), Some(&23i32.to_le_bytes()[..]));
+        s.unsubscribe(7).unwrap();
     }
 
     #[test]
@@ -219,6 +218,7 @@ mod tests {
         assert_eq!(frame.subscription_id(), 9);
         assert_eq!(frame.events(), PROCESS_EXIT_EVENTS);
         assert_eq!(frame.payload_bytes(), Some(&42i32.to_le_bytes()[..]));
+        s.unsubscribe(9).unwrap();
     }
 
     #[test]

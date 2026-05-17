@@ -81,17 +81,15 @@ pub struct PidfdState {
 
 impl Drop for PidfdState {
     fn drop(&mut self) {
-        // PE.9 diagnostic: live subscriptions at Drop = subscriber
-        // disconnected before unsubscribe (typical SIGKILL path,
-        // cleaned via cleanup_on_disconnect). Logged for chasing
-        // notification-delivery issues, not a bug.
-        if !self.subscriptions.is_empty() {
-            tracing::debug!(
-                target_host_pid = self.target_host_pid,
-                count = self.subscriptions.len(),
-                "PidfdState dropped with live subscription(s)"
-            );
-        }
+        // PE.9 invariant: with eager per-conn unsubscribe at
+        // disconnect, no live sub should remain at Drop.
+        debug_assert!(
+            self.subscriptions.is_empty(),
+            "PidfdState (target_host_pid={}) dropped with {} live \
+             subscription(s) — eager per-conn unsubscribe not running",
+            self.target_host_pid,
+            self.subscriptions.len()
+        );
     }
 }
 

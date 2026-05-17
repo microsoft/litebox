@@ -34,23 +34,20 @@ pub struct PtyState {
 
 impl Drop for PtyState {
     fn drop(&mut self) {
-        // PE.9 diagnostic: live subscriptions at Drop = subscriber
-        // disconnected before unsubscribe. Logged not asserted; the
-        // PTY open_count latent bug (master_open_count /
-        // slave_open_count never decremented — see PE.7) means PTY
-        // Drop currently fires later than it should anyway.
+        // PE.9 invariant: with eager per-conn unsubscribe at
+        // disconnect, no live sub should remain at Drop.
         let sublist = match self.endpoint {
             PtyEndpoint::Master => &self.pair.master_subject,
             PtyEndpoint::Slave => &self.pair.slave_subject,
         };
-        if !sublist.is_empty() {
-            tracing::debug!(
-                pty_id = self.pair.pty_id,
-                endpoint = ?self.endpoint,
-                count = sublist.len(),
-                "PtyState dropped with live subscription(s)"
-            );
-        }
+        debug_assert!(
+            sublist.is_empty(),
+            "PtyState (pty_id={}, endpoint={:?}) dropped with {} live \
+             subscription(s) — eager per-conn unsubscribe not running",
+            self.pair.pty_id,
+            self.endpoint,
+            sublist.len()
+        );
     }
 }
 

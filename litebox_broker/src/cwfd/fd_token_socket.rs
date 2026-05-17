@@ -603,6 +603,27 @@ pub fn handle_control_connection(
         &mut conn_state,
         &mut tracker,
     );
+    // PE.9 fix: BEFORE releasing tracked state refs, force-unsubscribe
+    // every subscription this conn issued. If we release first, a
+    // state might Drop with our subscription still in its
+    // SubscriptionList — a leak (the subscribe-doesn't-bump-rc
+    // gap documented in the PE.9 fix commit). Doing the unsubscribe
+    // pass first ensures the SubscriptionList is empty before the
+    // state's refcount can hit zero from our release.
+    for (handle_id, subscription_id) in conn_state.drain_tracked_subscriptions() {
+        // Subscription handle could live in either registry. Try
+        // state first, then process. Best-effort: failures (e.g.
+        // state already Dropped) are silently ignored — the
+        // subscription is gone either way.
+        let handle = StateHandle::from_id(handle_id);
+        let state_obj = state_registry
+            .resolve_untyped(handle)
+            .ok()
+            .or_else(|| process_registry.resolve_untyped(handle).ok());
+        if let Some(obj) = state_obj {
+            let _ = obj.unsubscribe(subscription_id);
+        }
+    }
     // Force-release any broker-registry refs this connection contributed
     // but did not release before disconnect. Critical for SIGKILL'd
     // workers whose shim never got to run `on_close` on inherited

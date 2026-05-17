@@ -88,20 +88,21 @@ pub struct EventfdState {
 
 impl Drop for EventfdState {
     fn drop(&mut self) {
-        // PE.9 diagnostic: live subscriptions at Drop indicate a
-        // subscriber that didn't explicitly Unsubscribe before
-        // releasing the state — typically a SIGKILL'd worker
-        // whose conn was cleaned up via cleanup_on_disconnect.
-        // Not a bug per se (cleanup_on_disconnect is the
-        // intended path), but a useful breadcrumb when chasing
-        // notification-delivery issues. Cheap; debug-only.
-        if !self.subscriptions.is_empty() {
-            tracing::debug!(
-                count = self.subscriptions.len(),
-                "EventfdState dropped with live subscription(s) — \
-                 expected when subscriber disconnected uncleanly"
-            );
-        }
+        // PE.9 invariant: with eager per-conn subscription cleanup
+        // (fd_token_socket::handle_control_connection drains
+        // ConnState::tracked_subscriptions BEFORE releasing state
+        // refs), no subscription should still be attached when the
+        // last refcount drops. A live sub at Drop = either the
+        // subscriber didn't go through the conn-disconnect path
+        // (e.g. internal broker bookkeeping bug) or a state was
+        // released without going through the per-conn tracker.
+        debug_assert!(
+            self.subscriptions.is_empty(),
+            "EventfdState dropped with {} live subscription(s) — \
+             eager per-conn unsubscribe is not running, or a Release \
+             bypassed ConnRefTracker.drain_tracked_subscriptions",
+            self.subscriptions.len()
+        );
     }
 }
 
@@ -382,6 +383,7 @@ mod tests {
         let f = receiver.recv().unwrap();
         assert_eq!(f.subscription_id(), 1);
         assert_eq!(f.events(), NOTIFY_EVENT_IN);
+        s.unsubscribe(1).unwrap();
     }
 
     #[test]
@@ -396,6 +398,7 @@ mod tests {
         let f = receiver.recv().unwrap();
         assert_eq!(f.subscription_id(), 1);
         assert_eq!(f.events(), NOTIFY_EVENT_IN);
+        s.unsubscribe(1).unwrap();
     }
 
     #[test]
@@ -418,6 +421,7 @@ mod tests {
         assert_eq!(v, 5);
         let f = receiver.recv().unwrap();
         assert_eq!(f.events(), NOTIFY_EVENT_OUT);
+        s.unsubscribe(7).unwrap();
     }
 
     #[test]
@@ -434,6 +438,8 @@ mod tests {
         let f2 = r2.recv().unwrap();
         assert_eq!(f1.subscription_id(), 10);
         assert_eq!(f2.subscription_id(), 20);
+        s.unsubscribe(10).unwrap();
+        s.unsubscribe(20).unwrap();
     }
 
     #[test]
