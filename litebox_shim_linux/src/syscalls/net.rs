@@ -92,7 +92,30 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
             .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
             .map_err(|err| match err {
                 litebox::fd::ErrRawIntFd::NotFound => Errno::EBADF,
-                litebox::fd::ErrRawIntFd::InvalidSubsystem => Errno::ENOTSOCK,
+                litebox::fd::ErrRawIntFd::InvalidSubsystem => {
+                    // PE.11 invariant: if we reach this branch, the fd
+                    // exists in the descriptor table as SOME subsystem
+                    // that's neither INET nor shim-Unix. For
+                    // socket-like subsystems (BrokerSocketPair today,
+                    // future broker-backed Unix variants), returning
+                    // ENOTSOCK silently is the same class of bug that
+                    // caused tokio's "Bad read on self-pipe: ENOTSOCK"
+                    // panic under eager-broker-socketpair (PE.10).
+                    // The caller of with_socket should have dispatched
+                    // them BEFORE entering with_socket.
+                    //
+                    // For genuinely-not-a-socket subsystems (regular
+                    // file, pipe, eventfd, signalfd, epoll, host-pipe),
+                    // ENOTSOCK is the correct errno per POSIX.
+                    //
+                    // assert_socket_like_handled() panics if the fd's
+                    // subsystem is one we've classified as socket-like
+                    // and forgot to dispatch — converting a silent
+                    // mis-routing into a loud bug. Always-on (release-
+                    // build too).
+                    assert_no_unhandled_socket_subsystem::<FS>(&self.raw_descriptor_store, raw_fd);
+                    Errno::ENOTSOCK
+                }
             })?;
         let handle = global
             .litebox
@@ -101,6 +124,45 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
             .ok_or(Errno::EBADF)?;
         handle.with_entry(|entry| unix_op(entry))
     }
+}
+
+/// PE.11 invariant helper: panics if `raw_fd` resolves to a
+/// subsystem that's been classified as "socket-like" but wasn't
+/// dispatched by [`FilesState::with_socket`]. The canonical
+/// failure caught is `BrokerSocketPairSubsystem` (Phase F broker-
+/// backed AF_UNIX socketpair) being routed through with_socket
+/// without an explicit fast path — which is exactly how tokio's
+/// "Bad read on self-pipe: ENOTSOCK" panic surfaced under eager-
+/// broker-socketpair.
+///
+/// When future broker-backed socket-like subsystems (e.g. broker-
+/// backed inet, broker-backed seqpacket) are added, append them
+/// to the match. The compiler doesn't enforce exhaustiveness over
+/// "subsystems with the socket-like property" (no central enum
+/// classifies them), so we list explicitly and rely on this
+/// assertion + the PE.5 / PE.10 / PE.11 commit comments to keep
+/// the list aware.
+fn assert_no_unhandled_socket_subsystem<FS: ShimFS>(
+    raw_descriptor_store: &litebox::sync::RwLock<
+        litebox_platform_multiplex::Platform,
+        litebox::fd::RawDescriptorStorage,
+    >,
+    raw_fd: usize,
+) {
+    let rds = raw_descriptor_store.read();
+    if rds
+        .fd_from_raw_integer::<crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+            raw_fd,
+        )
+        .is_ok()
+    {
+        panic!(
+            "with_socket: fd={raw_fd} is a BrokerSocketPairSubsystem entry — \
+             the caller must dispatch broker-backed socketpair fds BEFORE \
+             calling with_socket (see PE.10 recv() fast path in do_recvfrom_with_fds)"
+        );
+    }
+    // No socket-like subsystem matched → genuine ENOTSOCK.
 }
 
 #[derive(Clone, Copy, FromBytes, IntoBytes)]
