@@ -153,44 +153,67 @@ impl SubscriptionList {
     /// caller wants to GC dead subscriptions sooner it can call
     /// [`Self::retain_live`] periodically.
     pub fn notify(&self, events: u32) {
-        let entries = self.entries.lock().expect("SubscriptionList poisoned");
-        for sub in entries.iter() {
-            let matched = events & sub.events_mask;
-            if matched == 0 {
-                continue;
+        let mut to_remove: Vec<u64> = Vec::new();
+        {
+            let entries = self.entries.lock().expect("SubscriptionList poisoned");
+            for sub in entries.iter() {
+                let matched = events & sub.events_mask;
+                if matched == 0 {
+                    continue;
+                }
+                let frame = NotificationFrame::fixed(sub.id, matched);
+                // Lock the sender briefly to write one frame. Hold time
+                // bounded by the size of the notification frame plus
+                // futex syscall — microseconds in the steady state.
+                let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
+                if let Err(err) = sender.send(&frame) {
+                    // PE.9 fix: a send failure means the receiving
+                    // notification ring is dead (subscriber's conn
+                    // closed without explicit Unsubscribe — typical
+                    // SIGKILL path). Mark the subscription for
+                    // removal so we don't keep retrying and keep
+                    // a leaked subscription alive indefinitely.
+                    tracing::warn!(
+                        subscription_id = sub.id,
+                        error = %err,
+                        "notification send failed; removing dead subscription",
+                    );
+                    to_remove.push(sub.id);
+                }
             }
-            let frame = NotificationFrame::fixed(sub.id, matched);
-            // Lock the sender briefly to write one frame. Hold time
-            // bounded by the size of the notification frame plus
-            // futex syscall — microseconds in the steady state.
-            let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
-            if let Err(err) = sender.send(&frame) {
-                tracing::warn!(
-                    subscription_id = sub.id,
-                    error = %err,
-                    "notification send failed; leaving subscription in list",
-                );
-            }
+        }
+        if !to_remove.is_empty() {
+            let mut entries = self.entries.lock().expect("SubscriptionList poisoned");
+            entries.retain(|s| !to_remove.contains(&s.id));
         }
     }
 
     /// Notifies subscribers with an opaque payload frame.
     pub fn notify_payload(&self, events: u32, payload: Vec<u8>) {
-        let entries = self.entries.lock().expect("SubscriptionList poisoned");
-        for sub in entries.iter() {
-            let matched = events & sub.events_mask;
-            if matched == 0 {
-                continue;
+        let mut to_remove: Vec<u64> = Vec::new();
+        {
+            let entries = self.entries.lock().expect("SubscriptionList poisoned");
+            for sub in entries.iter() {
+                let matched = events & sub.events_mask;
+                if matched == 0 {
+                    continue;
+                }
+                let frame = NotificationFrame::payload(sub.id, matched, payload.clone());
+                let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
+                if let Err(err) = sender.send(&frame) {
+                    // PE.9 fix: see notify() above.
+                    tracing::warn!(
+                        subscription_id = sub.id,
+                        error = %err,
+                        "payload notification send failed; removing dead subscription",
+                    );
+                    to_remove.push(sub.id);
+                }
             }
-            let frame = NotificationFrame::payload(sub.id, matched, payload.clone());
-            let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
-            if let Err(err) = sender.send(&frame) {
-                tracing::warn!(
-                    subscription_id = sub.id,
-                    error = %err,
-                    "payload notification send failed; leaving subscription in list",
-                );
-            }
+        }
+        if !to_remove.is_empty() {
+            let mut entries = self.entries.lock().expect("SubscriptionList poisoned");
+            entries.retain(|s| !to_remove.contains(&s.id));
         }
     }
 
