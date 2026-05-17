@@ -92,11 +92,10 @@ impl Drop for EventfdState {
         // (fd_token_socket::handle_control_connection drains
         // ConnState::tracked_subscriptions BEFORE releasing state
         // refs), no subscription should still be attached when the
-        // last refcount drops. A live sub at Drop = either the
-        // subscriber didn't go through the conn-disconnect path
-        // (e.g. internal broker bookkeeping bug) or a state was
-        // released without going through the per-conn tracker.
-        debug_assert!(
+        // last refcount drops. Always-on assertion: a leak here is a
+        // real bug we want to know about in production, not just
+        // debug builds.
+        assert!(
             self.subscriptions.is_empty(),
             "EventfdState dropped with {} live subscription(s) — \
              eager per-conn unsubscribe is not running, or a Release \

@@ -47,9 +47,9 @@ pub struct ProcessState {
 
 impl Drop for ProcessState {
     fn drop(&mut self) {
-        // PE.9 invariant: with eager per-conn unsubscribe at
-        // disconnect, no live exit-sub should remain at Drop.
-        debug_assert!(
+        // PE.9 invariant: always-on. A leak here means eager per-conn
+        // unsubscribe isn't running for this state.
+        assert!(
             self.subscription_list.is_empty(),
             "ProcessState dropped with {} live exit subscription(s) — \
              eager per-conn unsubscribe not running",

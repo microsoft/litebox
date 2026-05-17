@@ -81,9 +81,9 @@ pub struct PidfdState {
 
 impl Drop for PidfdState {
     fn drop(&mut self) {
-        // PE.9 invariant: with eager per-conn unsubscribe at
-        // disconnect, no live sub should remain at Drop.
-        debug_assert!(
+        // PE.9 invariant: always-on. A leak here means eager per-conn
+        // unsubscribe isn't running for this state.
+        assert!(
             self.subscriptions.is_empty(),
             "PidfdState (target_host_pid={}) dropped with {} live \
              subscription(s) — eager per-conn unsubscribe not running",

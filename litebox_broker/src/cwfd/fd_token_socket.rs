@@ -62,17 +62,53 @@ use tracing::{debug, info, warn};
 #[derive(Default)]
 struct ConnRefTracker {
     /// Per-(caller_pid, handle_id) refcount. caller_pid=0 is the
-    /// "unspecified / legacy / pre-PE.1" bucket; all current shims
-    /// send caller_pid=0 until PE.1 Step C lands. Per-pid lookups
-    /// therefore degenerate to (0, id) keys today and only diverge
-    /// once the shim is taught to set caller_pid in outgoing frames.
+    /// "unspecified / legacy / pre-PE.1" bucket; today's shims send
+    /// caller_pid=0 when LITEBOX_PER_PID_OWNERSHIP is unset, and from
+    /// async-Drop paths in any configuration. Per-pid lookups
+    /// degenerate to the (0, id) bucket in that case.
     state_refs: HashMap<(u32, u64), u32>,
     process_refs: HashMap<(u32, u64), u32>,
+    /// PE.9 diagnostic: set to true the first time this conn sends a
+    /// non-zero caller_pid frame. Once set, every subsequent
+    /// caller_pid=0 frame from this conn is suspicious — it means
+    /// the shim stamps caller_pid in some paths but not others on
+    /// the same worker. That's a bug class (shim async-drop or
+    /// otherwise-unscoped code path). Logged loudly so the gap is
+    /// hunted down. When all such paths are fixed and
+    /// LITEBOX_PER_PID_OWNERSHIP becomes the default, the
+    /// ambient-fallback branch in record_release / owns_* should
+    /// be deleted and caller_pid=0 promoted to a hard protocol
+    /// violation.
+    seen_nonzero_caller_pid: bool,
 }
 
 impl ConnRefTracker {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// PE.9 diagnostic: called from every opcode entrypoint that
+    /// carries a caller_pid in the frame header, before tracker
+    /// mutations. Trips the conn into "gate-on" mode on first
+    /// non-zero pid; subsequent caller_pid=0 ops then warn.
+    fn note_caller_pid(&mut self, caller_pid: u32) {
+        if caller_pid != 0 {
+            self.seen_nonzero_caller_pid = true;
+        } else if self.seen_nonzero_caller_pid {
+            // Loud-but-not-fatal: signals a shim-side stamping gap
+            // (an async-Drop path or other unscoped release that
+            // didn't go through Task::handle_syscall_request's
+            // set_caller_pid_scope). Action: track the call site
+            // down and either add a scope or refactor to know the
+            // owning pid. Not fatal because the ambient-fallback
+            // branch in record_release / owns_state lets the op
+            // still succeed.
+            warn!(
+                "fd-token control: PE.9 PER-PID GAP: caller_pid=0 on a conn that \
+                 previously sent non-zero pids — shim has an unscoped release \
+                 path. Operation continues via ambient fallback."
+            );
+        }
     }
 
     fn record_state(&mut self, caller_pid: u32, id: u64) {
@@ -654,6 +690,7 @@ fn handle_control_connection_inner(
                 let request_opcode = frame.opcode;
                 let request_body = frame.body.to_vec();
                 let caller_pid = frame.caller_pid;
+                tracker.note_caller_pid(caller_pid);
                 let result = match frame.opcode {
                     Opcode::Register | Opcode::Materialize => {
                         // Host-fd opcodes: route to fd_token_service.

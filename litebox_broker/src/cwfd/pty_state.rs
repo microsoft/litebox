@@ -34,13 +34,13 @@ pub struct PtyState {
 
 impl Drop for PtyState {
     fn drop(&mut self) {
-        // PE.9 invariant: with eager per-conn unsubscribe at
-        // disconnect, no live sub should remain at Drop.
+        // PE.9 invariant: always-on. A leak here means eager per-conn
+        // unsubscribe isn't running for this state.
         let sublist = match self.endpoint {
             PtyEndpoint::Master => &self.pair.master_subject,
             PtyEndpoint::Slave => &self.pair.slave_subject,
         };
-        debug_assert!(
+        assert!(
             sublist.is_empty(),
             "PtyState (pty_id={}, endpoint={:?}) dropped with {} live \
              subscription(s) — eager per-conn unsubscribe not running",
