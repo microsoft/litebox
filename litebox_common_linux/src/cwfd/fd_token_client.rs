@@ -110,6 +110,50 @@ pub struct FdTokenClient {
     stream: Mutex<UnixStream>,
 }
 
+// Phase F.5+ PE.1 Step C: thread-local caller_pid stamp.
+//
+// Before any shim-side call into `FdTokenClient`, the shim sets this
+// to the current guest pid (the pid the operation is being performed
+// on behalf of). The `send_frame_with_fds` low-level send path stamps
+// the encoded frame's header bytes 12-15 from this value.
+//
+// Zero (the default) means "unspecified" and preserves the pre-PE.1
+// protocol shape — broker-side per-pid tracking degenerates to a
+// single shared (0, id) bucket.
+std::thread_local! {
+    static CALLER_PID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets the thread-local caller_pid stamp for outbound broker RPCs.
+/// Returns a guard that restores the previous value on drop, so calls
+/// can nest cleanly (e.g., a syscall handler stamps once, an inner
+/// helper re-stamps for a sub-operation on behalf of a different pid).
+pub fn set_caller_pid_scope(pid: u32) -> CallerPidScope {
+    let previous = CALLER_PID.with(|c| {
+        let prev = c.get();
+        c.set(pid);
+        prev
+    });
+    CallerPidScope { previous }
+}
+
+/// RAII guard returned by [`set_caller_pid_scope`].
+pub struct CallerPidScope {
+    previous: u32,
+}
+
+impl Drop for CallerPidScope {
+    fn drop(&mut self) {
+        CALLER_PID.with(|c| c.set(self.previous));
+    }
+}
+
+/// Reads the current thread-local caller_pid stamp (mostly for tests
+/// and diagnostics).
+pub fn current_caller_pid() -> u32 {
+    CALLER_PID.with(std::cell::Cell::get)
+}
+
 impl FdTokenClient {
     /// Connects to the broker control socket at `path`.
     pub fn connect(path: &Path) -> io::Result<Self> {
@@ -883,7 +927,19 @@ fn send_frame_with_fds(
         fds.len()
     );
 
-    let bytes = frame.encode().map_err(ClientError::Protocol)?;
+    let mut bytes = frame.encode().map_err(ClientError::Protocol)?;
+    // Phase F.5+ PE.1 Step C: stamp the encoded frame's caller_pid
+    // header field (bytes 12-15) from the thread-local set by the
+    // shim before invoking any FdTokenClient method. If the
+    // thread-local is unset, caller_pid stays at the value the
+    // builder used (typically 0 = unspecified), preserving today's
+    // behaviour for callers that have not yet been ported to set
+    // CALLER_PID (notification ring registration, response paths,
+    // etc.).
+    let stamp = CALLER_PID.with(std::cell::Cell::get);
+    if stamp != 0 && bytes.len() >= CTRL_HEADER_LEN {
+        bytes[12..16].copy_from_slice(&stamp.to_le_bytes());
+    }
 
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr() as *mut _,

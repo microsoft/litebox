@@ -2697,7 +2697,29 @@ impl<FS: ShimFS> Task<FS> {
         }
         self.log_fatal_signal_recent_activity();
     }
+}
 
+/// Phase F.5+ PE.1 Step C gate: enable per-pid caller_pid stamping
+/// on outbound broker control RPCs. Default off; flip to true via
+/// runner reading `LITEBOX_PER_PID_OWNERSHIP=1` at startup. The
+/// substrate (wire format + tracker keying) lands regardless of
+/// this gate; only the syscall-handler scope stamp is gated.
+static PER_PID_OWNERSHIP_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Setter for [`PER_PID_OWNERSHIP_ENABLED`]. Called once at runner
+/// startup. Idempotent.
+pub fn set_per_pid_ownership_enabled(enabled: bool) {
+    PER_PID_OWNERSHIP_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+/// Reader for [`PER_PID_OWNERSHIP_ENABLED`].
+#[inline]
+pub fn per_pid_ownership_enabled() -> bool {
+    PER_PID_OWNERSHIP_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+impl<FS: ShimFS> Task<FS> {
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::ExecutionContext) {
         // Mark that ctx.r11 holds the call-site scratch address (not the
         // real guest R11). Cleared by the exception/interrupt entry path.
@@ -2731,6 +2753,24 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let is_thread_exit = ctx.orig_rax == ::syscalls::Sysno::exit as usize;
+        // Phase F.5+ PE.1 Step C (substrate, gated): stamp the broker
+        // control protocol caller_pid header on every broker RPC
+        // issued by this syscall. Disabled by default — fork
+        // inheritance currently emits dup_handle on behalf of the
+        // child pid from the parent's syscall path, so naively
+        // stamping caller_pid = current pid would mis-attribute
+        // those refs. Enable per process via
+        // `LITEBOX_PER_PID_OWNERSHIP=1` for targeted unit/integration
+        // testing of the wire-format substrate; PE.5 will fix the
+        // fork-emit-side caller_pid plumbing before this becomes
+        // the default.
+        let _caller_pid_guard = if per_pid_ownership_enabled() {
+            Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                self.pid as u32,
+            ))
+        } else {
+            None
+        };
         let return_value = match self.do_syscall(ctx) {
             Ok(v) => {
                 #[cfg(feature = "trace_syscalls")]
