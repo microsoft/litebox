@@ -147,6 +147,13 @@ LITEBOX_TEST_JOBS=8 cargo test -p litebox_test_harness --test integration
 # Only native or only litebox:
 cargo test -p litebox_test_harness --test integration -- 'native::'
 cargo test -p litebox_test_harness --test integration -- 'litebox::'
+
+# Multiple disjoint filters in one invocation (OR'd, like stock libtest).
+# Prefer this over a bash for-loop: one process means one amortized
+# setup() and a single LITEBOX_TEST_JOBS pool spanning all prefixes,
+# so the tail of one filter overlaps with the head of the next.
+cargo test -p litebox_test_harness --test integration -- \
+  'litebox::PB' 'litebox::PXEOF' 'litebox::EPIPE' 'litebox::PXP'
 ```
 
 Each Trial spawns its own `docker run` (`litebox-test` image), gets a
