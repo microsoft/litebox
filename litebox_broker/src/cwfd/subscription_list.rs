@@ -184,6 +184,26 @@ impl SubscriptionList {
                             error = %err,
                             "notification send failed (transient); leaving subscription in list",
                         );
+                        // PE.14 diag: always-on file log of transient
+                        // send failures. Hypothesis: under-load PB.many
+                        // 'ok=9/10' race may be caused by silent
+                        // notification drops here when the ring fills up.
+                        use std::io::Write;
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/rst-diag.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "[PE.14-diag] ts={ts} NOTIFICATION DROPPED (transient) sub_id={} events={:#x}: {}",
+                                sub.id, matched, err
+                            );
+                        }
                     }
                 }
             }
