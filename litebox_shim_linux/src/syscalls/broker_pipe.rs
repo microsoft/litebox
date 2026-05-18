@@ -77,6 +77,11 @@ pub(crate) struct BrokerPipeFd<P: RawSyncPrimitivesProvider + litebox::platform:
     direction: BrokerPipeEnd,
     status: AtomicU32,
     pollee: Arc<Pollee<P>>,
+    // PE.14 invariant: count read_pipe RPCs issued through this fd
+    // (for the Read direction). On on_close, if this is a Read end
+    // with read_count=0 AND the broker side reported buffered data,
+    // we have a "reader closed without reading" data-loss bug.
+    read_count: AtomicU32,
 }
 
 impl<P> BrokerPipeFd<P>
@@ -148,6 +153,7 @@ where
             direction,
             status: AtomicU32::new((access | (flags & OFlags::STATUS_FLAGS_MASK)).bits()),
             pollee: Arc::new(Pollee::new()),
+            read_count: AtomicU32::new(0),
         }
     }
 
@@ -206,6 +212,7 @@ impl BrokerPipeFd<Platform> {
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::IN, || {
+                self.read_count.fetch_add(1, Ordering::Relaxed);
                 match self.provider.read_pipe(self.handle(), capped_len as u64) {
                     Ok(bytes) => {
                         let n = bytes.len().min(buf.len());
@@ -323,6 +330,21 @@ impl FdEnabledSubsystemEntry for BrokerPipeFd<Platform> {
         // registry refcount. When the last slot is removed, the
         // broker StateObject Drops and notifies the OTHER end's
         // subscribers (HUP → reader EOF, ERR → writer EPIPE).
+        //
+        // PE.14 invariant: if this is a Read end that closes without
+        // EVER issuing a read_pipe RPC, log it. Pair with the
+        // broker-side PIPE READ-END DATA LOSS invariant: if both fire
+        // for the same handle, we have a "reader closed without
+        // reading" data-loss bug.
+        if self.direction == BrokerPipeEnd::Read
+            && self.read_count.load(Ordering::Relaxed) == 0
+        {
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "[PE.14-invariant] BrokerPipeFd READ-END CLOSED WITHOUT READING handle={} (no read_pipe RPC ever issued)",
+                self.handle(),
+            );
+        }
         self.provider.release(self.handle());
     }
 }

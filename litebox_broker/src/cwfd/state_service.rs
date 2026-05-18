@@ -487,8 +487,13 @@ fn handle_create_pipe(
         return protocol_err(Opcode::CreatePipeResponse);
     };
     let (read_end, write_end) = crate::pipe_state::new_pipe(capacity, atomic);
-    let read_handle = registry.register(read_end);
+    let read_handle = registry.register(read_end.clone());
     let write_handle = registry.register(write_end);
+    // PE.14: stamp the read end with its handle id so PipeReadEnd::Drop
+    // can include it in the DATA LOSS invariant log.
+    read_end
+        .handle_id
+        .store(read_handle.id(), std::sync::atomic::Ordering::Relaxed);
     HandlerResult {
         frame: build_create_pipe_response_ok(read_handle.id(), write_handle.id()),
         out_fd: None,

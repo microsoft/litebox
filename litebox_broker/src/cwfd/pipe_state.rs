@@ -21,7 +21,7 @@
 
 use core::any::Any;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
@@ -181,6 +181,7 @@ pub fn new_pipe(
     let inner = Arc::new(PipeInner::new(capacity, atomic_write_size));
     let read_end = Arc::new(PipeReadEnd {
         inner: Arc::clone(&inner),
+        handle_id: AtomicU64::new(0),
     });
     let write_end = Arc::new(PipeWriteEnd { inner });
     (read_end, write_end)
@@ -194,6 +195,11 @@ pub fn new_pipe(
 #[derive(Debug)]
 pub struct PipeReadEnd {
     pub(crate) inner: Arc<PipeInner>,
+    /// PE.14: the registry handle id this read end was registered under.
+    /// Set by the call site immediately after register so Drop can
+    /// emit handle-tagged data-loss warnings. 0 = unset (legacy paths
+    /// that didn't call set_handle_id; benign for invariant logs).
+    pub(crate) handle_id: AtomicU64,
 }
 
 /// Broker-hosted write end. Symmetric to [`PipeReadEnd`]; drop fires
@@ -226,6 +232,35 @@ impl Drop for PipeReadEnd {
             self.inner.read_open.load(Ordering::Acquire),
             "PipeReadEnd::drop with read_open=false (double-Drop?)"
         );
+        // PE.14 invariant: if the buffer still has data when the read
+        // end drops, this is data loss — the reader closed (or was
+        // force-cleaned-up via ReleaseAllForPid) WITHOUT reading the
+        // bytes the writer had successfully buffered. Loud always-on
+        // file log: this is the smoking gun for the PB.multi/many
+        // 'ok=N-1/N' under-load race we are hunting.
+        let unread = {
+            let buf = self.inner.buffer.lock().expect("PipeInner poisoned");
+            buf.buf.len()
+        };
+        if unread > 0 {
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let hid = self.handle_id.load(Ordering::Relaxed);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.14-invariant] ts={ts} PIPE READ-END DATA LOSS handle={hid}: unread_bytes={unread} write_open={} (reader closed without draining)",
+                    self.inner.write_open.load(Ordering::Acquire),
+                );
+            }
+        }
         self.inner.read_open.store(false, Ordering::Release);
         self.inner.write_subject.notify(NOTIFY_EVENT_ERR);
     }
