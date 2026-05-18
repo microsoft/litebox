@@ -515,12 +515,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     //     evidently still off for this specific case. Needs separate
     //     investigation.
     //
-    // F.9 default flip still deferred. eager-pipe stays opt-in.
+    // F.9: flipped default to ON 2026-05-18. The under-load PB suite
+    // races that previously blocked this flip were the EINTR-from-
+    // SIGCHLD signal-disposition bug in sys_epoll_pwait/sys_ppoll
+    // (fixed in this branch). PB full suite is 113/113 stable across
+    // 5 runs under load; PXEOF/EPIPE/PXP all 100%. Opt-out via
+    // LITEBOX_EAGER_BROKER_PIPE=0.
     {
         let enabled = std::env::var("LITEBOX_EAGER_BROKER_PIPE")
             .ok()
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+            .unwrap_or(true);
         litebox_shim_linux::syscalls::set_eager_broker_pipe_enabled(enabled);
     }
 
