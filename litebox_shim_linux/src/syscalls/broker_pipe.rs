@@ -56,6 +56,21 @@ pub fn eager_broker_pipe_enabled() -> bool {
     EAGER_BROKER_PIPE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// PE.14: gate for the per-slot "closed without reading" diagnostic
+/// log in `BrokerPipeFd::on_close`. Default off (noisy). Set by the
+/// runner from `LITEBOX_PE14_SLOT_DIAG=1`.
+static SHIM_SLOT_DIAG_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_shim_slot_diag_enabled(enabled: bool) {
+    SHIM_SLOT_DIAG_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+pub fn shim_slot_diag_enabled() -> bool {
+    SHIM_SLOT_DIAG_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub fn set_broker_pipe_provider(
     provider: Arc<dyn BrokerPipeProvider>,
 ) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerPipeProvider>>> {
@@ -341,21 +356,20 @@ impl FdEnabledSubsystemEntry for BrokerPipeFd<Platform> {
         // broker StateObject Drops and notifies the OTHER end's
         // subscribers (HUP → reader EOF, ERR → writer EPIPE).
         //
-        // PE.14 invariant: if this is a Read end that closes without
-        // EVER issuing a read_pipe RPC, log it. Pair with the
-        // broker-side PIPE READ-END DATA LOSS invariant: if both fire
-        // for the same handle, we have a "reader closed without
-        // reading" data-loss bug.
+        // PE.14 invariant: per-slot "closed without reading" diag is
+        // noisy (fires on legitimate inherited fds). The broker side
+        // owns the authoritative data-loss check (PipeReadEnd::drop
+        // now distinguishes real loss vs legitimate non-drain).
+        // Keep this gated on LITEBOX_PE14_SLOT_DIAG for deep traces.
         if self.direction == BrokerPipeEnd::Read
             && self.read_count.load(Ordering::Relaxed) == 0
+            && shim_slot_diag_enabled()
         {
-            // PE.14: log the host pid so we can distinguish slots in
-            // different worker processes vs slots in the same process.
-            // SAFETY: getpid is always safe and has no side effects.
+            // SAFETY: getpid is always safe.
             let host_pid = unsafe { ::syscalls::raw::syscall0(::syscalls::Sysno::getpid) };
             litebox::log_println!(
                 litebox_platform_multiplex::platform(),
-                "[PE.14-invariant] BrokerPipeFd READ-END CLOSED WITHOUT READING handle={} creation_site={} host_pid={host_pid} (no read_pipe RPC ever issued)",
+                "[PE.14-diag] BrokerPipeFd READ-END CLOSED WITHOUT READING handle={} creation_site={} host_pid={host_pid}",
                 self.handle(),
                 self.creation_site,
             );

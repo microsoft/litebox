@@ -75,6 +75,15 @@ pub struct PipeInner {
     atomic_write_size: usize,
     read_subject: SubscriptionList,
     write_subject: SubscriptionList,
+    /// PE.14 invariant: count of read RPCs that returned at least one
+    /// byte. Used to distinguish "real data loss" (reader started but
+    /// didn't finish draining → bytes lost) from "legitimate non-drain"
+    /// (reader never tried — fd inherited and ignored).
+    successful_reads: AtomicU64,
+    /// PE.14 invariant: count of write RPCs that buffered at least one
+    /// byte. For symmetry with `successful_reads` (helps spot "all
+    /// writes are zero-byte" edge cases that wouldn't be data loss).
+    successful_writes: AtomicU64,
 }
 
 impl PipeInner {
@@ -89,6 +98,8 @@ impl PipeInner {
             atomic_write_size,
             read_subject: SubscriptionList::new(),
             write_subject: SubscriptionList::new(),
+            successful_reads: AtomicU64::new(0),
+            successful_writes: AtomicU64::new(0),
         }
     }
 
@@ -121,6 +132,9 @@ impl PipeInner {
         if writable && self.write_open() {
             self.write_subject.notify(NOTIFY_EVENT_OUT);
         }
+        if n > 0 {
+            self.successful_reads.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(out)
     }
 
@@ -142,6 +156,9 @@ impl PipeInner {
         drop(buf);
         if has_data {
             self.read_subject.notify(NOTIFY_EVENT_IN);
+        }
+        if n > 0 {
+            self.successful_writes.fetch_add(1, Ordering::Relaxed);
         }
         Ok(n)
     }
@@ -232,23 +249,62 @@ impl Drop for PipeReadEnd {
             self.inner.read_open.load(Ordering::Acquire),
             "PipeReadEnd::drop with read_open=false (double-Drop?)"
         );
-        // PE.14 invariant: if the buffer still has data when the read
-        // end drops, this is data loss — the reader closed (or was
-        // force-cleaned-up via ReleaseAllForPid) WITHOUT reading the
-        // bytes the writer had successfully buffered. Loud always-on
-        // file log: this is the smoking gun for the PB.multi/many
-        // 'ok=N-1/N' under-load race we are hunting.
+        // PE.14 invariant: data-loss check refined to fire only on
+        // TRUE data loss (reader started reading but didn't finish):
+        //   - unread bytes in buffer (writer wrote)
+        //   - successful_writes > 0 (writer produced data)
+        //   - successful_reads > 0 (reader started draining, then
+        //     stopped → real loss)
+        // Excludes the legitimate case where successful_reads==0:
+        // reader never tried, so the data was "never wanted" — e.g.,
+        // inherited fds for telemetry pipes that the test doesn't drain.
+        // When all three conditions hold, the bug is concrete.
+        // Debug builds panic to surface regressions immediately;
+        // release builds file-log for post-mortem.
         let unread = {
             let buf = self.inner.buffer.lock().expect("PipeInner poisoned");
             buf.buf.len()
         };
-        if unread > 0 {
+        let writes = self.inner.successful_writes.load(Ordering::Relaxed);
+        let reads = self.inner.successful_reads.load(Ordering::Relaxed);
+        if unread > 0 && writes > 0 && reads > 0 {
+            let handle_id = self.handle_id.load(Ordering::Relaxed);
+            let msg = std::format!(
+                "PIPE READ-END DATA LOSS handle={handle_id}: unread={unread} writes={writes} reads={reads} \
+                 (reader partially drained then closed without finishing)"
+            );
             use std::io::Write;
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let hid = self.handle_id.load(Ordering::Relaxed);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(f, "[PE.14-invariant] ts={ts} {msg}");
+            }
+            // PE.14 invariant: always-on (matches PE.9 leak-detection
+            // pattern in eventfd_state/process_state/pidfd_state/
+            // pty_state). A real data-loss bug needs to fire in
+            // production runs too, not just debug builds. The
+            // refined predicate (unread > 0 AND writes > 0 AND reads
+            // > 0) excludes the legitimate-non-drain case, so this
+            // should never fire on healthy paths.
+            assert!(
+                false,
+                "{msg}"
+            );
+        } else if unread > 0 && writes > 0 {
+            // Soft data-loss (reader never tried): still log but do
+            // not assert. Often legitimate (inherited fds).
+            let handle_id = self.handle_id.load(Ordering::Relaxed);
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -256,8 +312,7 @@ impl Drop for PipeReadEnd {
             {
                 let _ = writeln!(
                     f,
-                    "[PE.14-invariant] ts={ts} PIPE READ-END DATA LOSS handle={hid}: unread_bytes={unread} write_open={} (reader closed without draining)",
-                    self.inner.write_open.load(Ordering::Acquire),
+                    "[PE.14-diag] ts={ts} PIPE READ-END soft-unread handle={handle_id}: unread={unread} writes={writes} reads=0 (reader never tried — legitimate or potential leak)"
                 );
             }
         }
