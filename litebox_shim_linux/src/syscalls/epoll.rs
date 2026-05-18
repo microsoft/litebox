@@ -395,6 +395,19 @@ impl<FS: ShimFS> EpollFile<FS> {
                             // Otherwise it was just our poll interval — continue.
                         }
                         Err(TryOpError::WaitError(WaitError::Interrupted)) => {
+                            // PE.14: before honoring EINTR, do one more
+                            // pass to collect events that may have become
+                            // ready concurrently with the signal. Matches
+                            // Linux's epoll_wait semantics: if events are
+                            // available, return them; only EINTR if not.
+                            self.refresh_ready_interests(global, fs);
+                            self.ready.pop_multiple(global, fs, maxevents, &mut events);
+                            if !events.is_empty() {
+                                self.collect_additional_socket_events(
+                                    global, fs, maxevents, &mut events,
+                                );
+                                return Ok(events);
+                            }
                             return Err(WaitError::Interrupted);
                         }
                         Err(TryOpError::Other(infallible)) => match infallible {},
@@ -416,6 +429,20 @@ impl<FS: ShimFS> EpollFile<FS> {
                     Ok(WaitOutcome::Ready) => return Ok(events),
                     Ok(WaitOutcome::RecheckMode) => {}
                     Err(TryOpError::TryAgain) => unreachable!(),
+                    Err(TryOpError::WaitError(WaitError::Interrupted)) => {
+                        // PE.14: before honoring EINTR, do one more pass
+                        // to collect events that may have become ready
+                        // concurrently with the signal.
+                        self.drive_network_for_socket_interests(global);
+                        self.ready.pop_multiple(global, fs, maxevents, &mut events);
+                        if !events.is_empty() {
+                            self.collect_additional_socket_events(
+                                global, fs, maxevents, &mut events,
+                            );
+                            return Ok(events);
+                        }
+                        return Err(WaitError::Interrupted);
+                    }
                     Err(TryOpError::WaitError(e)) => return Err(e),
                     Err(TryOpError::Other(infallible)) => match infallible {},
                 }
@@ -1200,19 +1227,40 @@ impl PollSet {
                             return Err(WaitError::TimedOut);
                         }
                     }
-                    WaitError::Interrupted => return Err(WaitError::Interrupted),
+                    WaitError::Interrupted => {
+                        // PE.14: before honoring EINTR, do one more scan
+                        // for ready entries. Matches Linux's poll/ppoll
+                        // semantics: events available concurrent with a
+                        // signal are returned first.
+                        if self.scan_once(global, files, None) {
+                            return Ok(());
+                        }
+                        return Err(WaitError::Interrupted);
+                    }
                 }
             }
         } else {
             let mut register = true;
-            cx.wait_until(|| {
+            let res = cx.wait_until(|| {
                 if self.scan_once(global, files, register.then_some(cx.waker())) {
                     return true;
                 }
                 // Don't register observers again in the next iteration.
                 register = false;
                 false
-            })
+            });
+            // PE.14: even on Interrupted, check once more if any entry
+            // became ready (between observer fire and signal arrival).
+            match res {
+                Err(WaitError::Interrupted) => {
+                    if self.scan_once(global, files, None) {
+                        Ok(())
+                    } else {
+                        Err(WaitError::Interrupted)
+                    }
+                }
+                other => other,
+            }
         }
     }
 
