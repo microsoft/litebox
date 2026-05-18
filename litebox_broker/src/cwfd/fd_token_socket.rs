@@ -700,6 +700,44 @@ fn handle_control_connection_inner(
     conn_state: &mut ConnState,
     tracker: &mut ConnRefTracker,
 ) {
+    // PE.14 diag: RAII guard that fires when this function returns
+    // OR panics. Captures the FINAL return path. Tag each CONN CLOSE
+    // log line with a high-resolution monotonic timestamp so we can
+    // reconstruct chronology vs runner-side diag lines from the same
+    // /tmp/rst-diag.log file (multi-process appends arrive out of
+    // order).
+    struct CloseGuard {
+        conn_id: u64,
+        fd: i32,
+    }
+    impl Drop for CloseGuard {
+        fn drop(&mut self) {
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let bt = std::backtrace::Backtrace::force_capture();
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.14-diag] ts={ts} CONN HANDLER EXIT conn_id={} fd={} (UnixStream about to drop)\nbacktrace:\n{bt}",
+                    self.conn_id, self.fd
+                );
+            }
+        }
+    }
+    let _close_guard = CloseGuard {
+        conn_id: tracker.conn_id,
+        fd: {
+            use std::os::unix::io::AsRawFd;
+            stream.as_raw_fd()
+        },
+    };
     loop {
         match read_request(&stream) {
             Ok((bytes, in_fds)) => {

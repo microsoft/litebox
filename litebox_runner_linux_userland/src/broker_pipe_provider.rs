@@ -133,6 +133,10 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
             use std::io::Write;
             let bt = std::backtrace::Backtrace::force_capture();
             let pid = std::process::id();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let mut fd_snapshot = String::new();
             if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
                 for e in entries.flatten() {
@@ -151,7 +155,7 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
             {
                 let _ = writeln!(
                     f,
-                    "[PE.14-diag] BrokerPipeProvider Io fallthrough pid={pid}: {other:?}\n\
+                    "[PE.14-diag] ts={ts} BrokerPipeProvider Io fallthrough pid={pid}: {other:?}\n\
                      /proc/self/fd:\n{fd_snapshot}\
                      backtrace:\n{bt}"
                 );
