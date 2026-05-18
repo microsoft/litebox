@@ -54,6 +54,26 @@ impl BrokerSubscribable for RunnerBrokerPipeProvider {
 
     fn release(&self, handle: u64) {
         if let Err(e) = self.client.release(handle) {
+            // PE.13 fix follow-up: surface release failures loudly to
+            // /tmp/rst-diag.log. The most diagnostic case is when the
+            // broker side hits PROTOCOL VIOLATION and closes the conn
+            // — subsequent provider operations then see BrokenPipe. A
+            // tracing::warn alone wasn't visible during PE.13
+            // investigation because the runner doesn't init a tracing
+            // subscriber. File logging is always-on (cheap; only fires
+            // on the error path) and was essential to root-causing
+            // the fork-snapshot restore bug.
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.13-diag] BrokerPipeProvider::release(handle={handle}) failed: {e}"
+                );
+            }
             tracing::warn!(handle, error = %e, "pipe release failed; broker handle may leak");
         }
     }

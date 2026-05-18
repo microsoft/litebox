@@ -85,6 +85,18 @@ impl<P> BrokerSocketPairFd<P>
 where
     P: RawSyncPrimitivesProvider + litebox::platform::TimeProvider,
 {
+    /// Constructs a BrokerSocketPairFd wrapping an existing broker
+    /// socketpair handle.
+    ///
+    /// ## STRUCTURAL INVARIANT — caller responsibility
+    ///
+    /// **Every `BrokerSocketPairFd::new` call MUST be paired with a
+    /// prior `provider.dup_handle(handle)`** (or be the initial
+    /// `create_socketpair` consumer whose refcount=1 baseline
+    /// suffices). `on_close` ALWAYS fires `provider.release(handle)`;
+    /// unpaired construction is a structural bug. See
+    /// `broker_pipe::BrokerPipeFd::new`'s doc comment for the
+    /// detailed rationale and the PE.13 historical precedent.
     pub(crate) fn new(
         provider: Arc<dyn BrokerSocketPairProvider>,
         handle: u64,

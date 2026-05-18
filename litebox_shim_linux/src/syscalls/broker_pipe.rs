@@ -83,6 +83,33 @@ impl<P> BrokerPipeFd<P>
 where
     P: RawSyncPrimitivesProvider + litebox::platform::TimeProvider,
 {
+    /// Constructs a BrokerPipeFd wrapping an existing broker pipe
+    /// handle.
+    ///
+    /// ## STRUCTURAL INVARIANT — caller responsibility
+    ///
+    /// **Every `BrokerPipeFd::new` call MUST be paired with a prior
+    /// `provider.dup_handle(handle)` (or its equivalent: an initial
+    /// `create_pipe` that returns the handle with refcount=1, or an
+    /// install_broker_bridge_fd's dup_handle).** This is because
+    /// `BrokerPipeFd`'s `on_close` (called when an fd-table slot
+    /// referring to it is removed) ALWAYS fires
+    /// `provider.release(handle)`. If construction wasn't paired with
+    /// a dup, the release leaves the broker side with negative net
+    /// rc accounting (and under PE.9's strict per-conn ownership
+    /// check, triggers a PROTOCOL VIOLATION that closes the broker
+    /// conn).
+    ///
+    /// PE.13 (2026-05-18) fixed a violation of this invariant in the
+    /// fork-snapshot restore path at lib.rs:1573 (now correctly calls
+    /// dup_handle). Other construction sites:
+    /// - file.rs:4812 (sys_pipe2): `create_pipe` provides the
+    ///   refcount=1 baseline; no additional dup needed.
+    /// - lib.rs:285 (install_broker_bridge_fd): explicit dup_handle
+    ///   call before construction.
+    ///
+    /// If you add a fourth construction site, AUDIT the caller for
+    /// a matching dup_handle.
     pub(crate) fn new(
         provider: Arc<dyn BrokerPipeProvider>,
         handle: u64,
