@@ -654,14 +654,45 @@ pub fn handle_control_connection(
     let mut conn_state = ConnState::new();
     let mut tracker = ConnRefTracker::new();
     tracker.conn_id = conn_id;
-    let result = handle_control_connection_inner(
-        stream,
-        &fd_registry,
-        &state_registry,
-        &process_registry,
-        &mut conn_state,
-        &mut tracker,
-    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_control_connection_inner(
+            stream,
+            &fd_registry,
+            &state_registry,
+            &process_registry,
+            &mut conn_state,
+            &mut tracker,
+        )
+    }));
+    // PE.14 diag: if the inner handler panicked, log the payload.
+    // A panic here typically poisons one of the global registries'
+    // mutexes; subsequent conns' RPC handlers will then panic at
+    // `.expect("...poisoned")` and drop their UnixStreams,
+    // surfacing as "BrokenPipe" on the runner side.
+    if let Err(payload) = &result {
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            format!("non-string panic payload (type_id={:?})", payload.type_id())
+        };
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = writeln!(
+                f,
+                "[PE.14-diag] ts={ts} BROKER CONN HANDLER PANIC conn_id={conn_id}: {msg}"
+            );
+        }
+    }
     // PE.9 fix: BEFORE releasing tracked state refs, force-unsubscribe
     // every subscription this conn issued. If we release first, a
     // state might Drop with our subscription still in its
@@ -687,6 +718,17 @@ pub fn handle_control_connection(
     // but did not release before disconnect. Critical for SIGKILL'd
     // workers whose shim never got to run `on_close` on inherited
     // broker-backed fds.
+    //
+    // PE.14 experiment: optional pre-cleanup delay to test the
+    // hypothesis that `cleanup_on_disconnect` racing with concurrent
+    // RPCs on sibling conns is the bug. Set
+    // `LITEBOX_CLEANUP_DELAY_MS=N` to inject N ms before cleanup.
+    if let Ok(s) = std::env::var("LITEBOX_CLEANUP_DELAY_MS")
+        && let Ok(ms) = s.parse::<u64>()
+        && ms > 0
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     let final_tracker = std::mem::take(&mut tracker);
     final_tracker.cleanup_on_disconnect(&state_registry, &process_registry);
     let _ = result;

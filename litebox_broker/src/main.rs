@@ -216,6 +216,46 @@ fn build_local_services(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // PE.14 diag: global panic hook so panics in ANY broker thread
+    // are captured with location + payload + backtrace to the shared
+    // /tmp/rst-diag.log. Strong hypothesis for eager-pipe races is
+    // a panic in a conn handler thread that poisons one of the
+    // broker registries' mutexes, indirectly killing other conns
+    // via `.expect("...poisoned")`.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let bt = std::backtrace::Backtrace::force_capture();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = writeln!(
+                f,
+                "[PE.14-diag] ts={ts} BROKER PANIC thread={thread_name} at {location}: {payload}\nbacktrace:\n{bt}"
+            );
+        }
+        default_hook(info);
+    }));
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

@@ -197,6 +197,7 @@ fn docker_run_base_args() -> Vec<String> {
         "LITEBOX_PER_PID_OWNERSHIP",
         "LITEBOX_PE10_DIAG",
         "LITEBOX_PE5_DIAG",
+        "LITEBOX_CLEANUP_DELAY_MS",
         "RUST_LOG",
     ] {
         if let Ok(val) = std::env::var(var) {
