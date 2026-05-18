@@ -287,6 +287,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     handle_id,
                     direction,
                     litebox::fs::OFlags::empty(),
+                    1, // creation_site: install_broker_bridge_fd
                 );
                 let typed: litebox::fd::TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem> = self
                     .task
@@ -1594,6 +1595,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     broker_handle.handle_id,
                     direction,
                     litebox::fs::OFlags::empty(),
+                    2, // creation_site: fork_snapshot_restore
                 );
                 let typed = self
                     .global

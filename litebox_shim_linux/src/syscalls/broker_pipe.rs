@@ -82,6 +82,9 @@ pub(crate) struct BrokerPipeFd<P: RawSyncPrimitivesProvider + litebox::platform:
     // with read_count=0 AND the broker side reported buffered data,
     // we have a "reader closed without reading" data-loss bug.
     read_count: AtomicU32,
+    // PE.14 diag: creation-site tag for orphan-slot identification.
+    // 0=sys_pipe2, 1=install_broker_bridge_fd, 2=fork_snapshot_restore.
+    creation_site: u8,
 }
 
 impl<P> BrokerPipeFd<P>
@@ -115,11 +118,17 @@ where
     ///
     /// If you add a fourth construction site, AUDIT the caller for
     /// a matching dup_handle.
+    /// Per PE.14 instrumentation: `creation_site` is a small tag
+    /// (0=sys_pipe2, 1=install_broker_bridge_fd, 2=fork_snapshot_restore)
+    /// recorded on this slot. When `on_close` fires with read_count==0
+    /// (orphan read-end), the tag is logged so we can identify which
+    /// construction path produced the orphan slot.
     pub(crate) fn new(
         provider: Arc<dyn BrokerPipeProvider>,
         handle: u64,
         direction: BrokerPipeEnd,
         flags: OFlags,
+        creation_site: u8,
     ) -> Self {
         let access = match direction {
             BrokerPipeEnd::Read => OFlags::RDONLY,
@@ -154,6 +163,7 @@ where
             status: AtomicU32::new((access | (flags & OFlags::STATUS_FLAGS_MASK)).bits()),
             pollee: Arc::new(Pollee::new()),
             read_count: AtomicU32::new(0),
+            creation_site,
         }
     }
 
@@ -339,10 +349,15 @@ impl FdEnabledSubsystemEntry for BrokerPipeFd<Platform> {
         if self.direction == BrokerPipeEnd::Read
             && self.read_count.load(Ordering::Relaxed) == 0
         {
+            // PE.14: log the host pid so we can distinguish slots in
+            // different worker processes vs slots in the same process.
+            // SAFETY: getpid is always safe and has no side effects.
+            let host_pid = unsafe { ::syscalls::raw::syscall0(::syscalls::Sysno::getpid) };
             litebox::log_println!(
                 litebox_platform_multiplex::platform(),
-                "[PE.14-invariant] BrokerPipeFd READ-END CLOSED WITHOUT READING handle={} (no read_pipe RPC ever issued)",
+                "[PE.14-invariant] BrokerPipeFd READ-END CLOSED WITHOUT READING handle={} creation_site={} host_pid={host_pid} (no read_pipe RPC ever issued)",
                 self.handle(),
+                self.creation_site,
             );
         }
         self.provider.release(self.handle());

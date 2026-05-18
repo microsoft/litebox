@@ -1325,6 +1325,96 @@ impl<FS: ShimFS> Task<FS> {
         !shared_pending.is_empty()
     }
 
+    /// PE.14: returns true iff every pending non-blocked signal is
+    /// effectively a no-op (SIG_IGN or SIG_DFL with default-ignore
+    /// disposition like SIGCHLD). Used at sys_epoll_pwait to suppress
+    /// spurious EINTR caused by SIGCHLD-from-child-exit racing with
+    /// broker pipe data delivery under load.
+    pub(crate) fn pending_signals_all_ignored(&self) -> bool {
+        use litebox_common_linux::signal::{Signal, SignalDisposition};
+        let blocked = self.signals.blocked.get();
+        let remote = self.thread.remote().pending_signals.lock().pending & !blocked;
+        let thread = self.signals.pending.borrow().pending & !blocked;
+        let shared = self.signals.shared_pending.lock().pending & !blocked;
+        let all = remote | thread | shared;
+        if all.is_empty() {
+            return false;
+        }
+        let handlers = self.signals.handlers.borrow();
+        let inner = handlers.inner.lock();
+        for n in 1..=64i32 {
+            if let Ok(sig) = Signal::try_from(n) {
+                if all.contains(sig) {
+                    let action = inner[sig].action.sigaction;
+                    let ignored = action == SIG_IGN
+                        || (action == SIG_DFL
+                            && matches!(
+                                sig.default_disposition(),
+                                SignalDisposition::Ignore
+                            ));
+                    if !ignored {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// PE.14: clear pending signals that are effectively ignored. Pair
+    /// with pending_signals_all_ignored — after a spurious EINTR, drain
+    /// the ignored signals so the wait loop doesn't see them again.
+    pub(crate) fn drain_ignored_pending(&self) {
+        use litebox_common_linux::signal::{Signal, SignalDisposition};
+        let handlers = self.signals.handlers.borrow();
+        let inner = handlers.inner.lock();
+        let mut ignored_set = litebox_common_linux::signal::SigSet::empty();
+        for n in 1..=64i32 {
+            if let Ok(sig) = Signal::try_from(n) {
+                let action = inner[sig].action.sigaction;
+                let is_ignored = action == SIG_IGN
+                    || (action == SIG_DFL
+                        && matches!(
+                            sig.default_disposition(),
+                            SignalDisposition::Ignore
+                        ));
+                if is_ignored {
+                    ignored_set.add(sig);
+                }
+            }
+        }
+        drop(inner);
+        drop(handlers);
+        // Clear from pending sets.
+        {
+            let mut remote = self.thread.remote().pending_signals.lock();
+            remote.pending = remote.pending & !ignored_set;
+            remote.queue.retain(|si| {
+                Signal::try_from(si.signo)
+                    .map(|s| !ignored_set.contains(s))
+                    .unwrap_or(true)
+            });
+        }
+        {
+            let mut thread = self.signals.pending.borrow_mut();
+            thread.pending = thread.pending & !ignored_set;
+            thread.queue.retain(|si| {
+                Signal::try_from(si.signo)
+                    .map(|s| !ignored_set.contains(s))
+                    .unwrap_or(true)
+            });
+        }
+        {
+            let mut shared = self.signals.shared_pending.lock();
+            shared.pending = shared.pending & !ignored_set;
+            shared.queue.retain(|si| {
+                Signal::try_from(si.signo)
+                    .map(|s| !ignored_set.contains(s))
+                    .unwrap_or(true)
+            });
+        }
+    }
+
     /// Returns the set of all pending (deliverable) signals.
     pub(crate) fn pending_signal_set(&self) -> SigSet {
         let blocked = self.signals.blocked.get();
