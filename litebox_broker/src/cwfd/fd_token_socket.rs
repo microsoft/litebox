@@ -80,6 +80,9 @@ struct ConnRefTracker {
     /// be deleted and caller_pid=0 promoted to a hard protocol
     /// violation.
     seen_nonzero_caller_pid: bool,
+    /// PE.12 diagnostic: stable per-conn ID used to correlate frames
+    /// across the broker log. Set by `handle_control_connection`.
+    conn_id: u64,
 }
 
 impl ConnRefTracker {
@@ -634,8 +637,23 @@ pub fn handle_control_connection(
     state_registry: Arc<BrokerStateRegistry>,
     process_registry: Arc<BrokerStateRegistry>,
 ) {
+    // PE.12 diag: assign a per-conn id so we can correlate frames
+    // across the broker log. Counter is process-global, monotonic.
+    static CONN_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let conn_id = CONN_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = writeln!(f, "[PE.12-diag] CONN OPEN: conn_id={conn_id}");
+        }
+    }
     let mut conn_state = ConnState::new();
     let mut tracker = ConnRefTracker::new();
+    tracker.conn_id = conn_id;
     let result = handle_control_connection_inner(
         stream,
         &fd_registry,
@@ -696,6 +714,32 @@ fn handle_control_connection_inner(
                 let request_body = frame.body.to_vec();
                 let caller_pid = frame.caller_pid;
                 tracker.note_caller_pid(caller_pid);
+                // PE.12 diag: log every frame received, gated on
+                // LITEBOX_PE10_DIAG. Tracker state pid_count helps
+                // identify which conn (by tracker fingerprint) the
+                // frame belongs to.
+                if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rst-diag.log")
+                    {
+                        let tracker_size = tracker.state_refs.len() + tracker.process_refs.len();
+                        let body_first = request_body
+                            .iter()
+                            .take(8)
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        let _ = writeln!(
+                            f,
+                            "[PE.12-diag] FRAME conn_id={} opcode={request_opcode:?} caller_pid={caller_pid} \
+                             body[..8]={body_first} tracker_size={tracker_size}",
+                            tracker.conn_id
+                        );
+                    }
+                }
                 let result = match frame.opcode {
                     Opcode::Register | Opcode::Materialize => {
                         // Host-fd opcodes: route to fd_token_service.
@@ -808,17 +852,31 @@ fn handle_control_connection_inner(
                                 // PE.5 diag: also write to the runner-side
                                 // diagnostic file so it's visible in
                                 // LITEBOX_KEEP_CONTAINER inspections.
+                                // Includes tracker state dump for the
+                                // current conn so we can see which
+                                // (pid, id) buckets exist when the
+                                // violation fires.
                                 use std::io::Write;
                                 if let Ok(mut f) = std::fs::OpenOptions::new()
                                     .create(true)
                                     .append(true)
                                     .open("/tmp/rst-diag.log")
                                 {
+                                    let state_entries: Vec<((u32, u64), u32)> =
+                                        tracker.state_refs.iter().map(|(k, v)| (*k, *v)).collect();
+                                    let proc_entries: Vec<((u32, u64), u32)> = tracker
+                                        .process_refs
+                                        .iter()
+                                        .map(|(k, v)| (*k, *v))
+                                        .collect();
                                     let _ = writeln!(
                                         f,
-                                        "[PE.5-diag] BROKER PROTOCOL VIOLATION: Release \
+                                        "[PE.5-diag] BROKER PROTOCOL VIOLATION conn_id={}: Release \
                                          handle_id={release_id} caller_pid={caller_pid} \
-                                         state_exists={state_exists} process_exists={process_exists}"
+                                         state_exists={state_exists} process_exists={process_exists}\n  \
+                                         conn state_refs: {state_entries:?}\n  \
+                                         conn process_refs: {proc_entries:?}",
+                                        tracker.conn_id
                                     );
                                 }
                                 return;

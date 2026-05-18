@@ -6518,8 +6518,25 @@ impl<FS: ShimFS> Task<FS> {
 
             let global = self.global.clone();
             let child_proc_id = self.process_id;
+            // PE.13 (2026-05-18): move the fork_snapshot_broker_transit
+            // list into the wait task so we can release the parent's
+            // emit-side dup_handle refs AFTER the child worker exits.
+            // Pair with my new dup_handle in the fork-snapshot restore
+            // (lib.rs:1573 area): net broker rc change across the
+            // fork is 0 (parent +1 transit, child +1 restore dup, child
+            // -1 close, parent -1 this drain).
+            let transit_refs: alloc::vec::Vec<
+                crate::syscalls::fork_snapshot::ForkSnapshotBrokerTransit,
+            > = core::mem::take(&mut fc.fork_snapshot_broker_transit);
             self.global.platform.spawn_background_task(move || {
                 let exit_code = global.platform.wait_worker_host(host_pid);
+
+                // Release the parent's emit-side dup_handle transit
+                // refs now that the child has exited and no longer
+                // needs the bridge state alive.
+                for transit in transit_refs {
+                    transit.releaser.release(transit.handle_id);
+                }
 
                 let exit_status = if exit_code > 255 {
                     (exit_code - 256) + 128

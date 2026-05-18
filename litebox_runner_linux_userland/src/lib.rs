@@ -498,21 +498,24 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // codepaths without recompiling. `LITEBOX_EAGER_BROKER_PIPE=1`
     // (or 'true' / 'yes', case-insensitive) flips it on.
     //
-    // **F.9 status**: substrate complete (emit-side dup_handle +
-    // post-wait_worker_host release of pipe transit refs, in
-    // litebox_shim_linux/src/syscalls/process.rs ~lines 9300, 9745).
-    // PB.c2p 20/20 under LITEBOX_EAGER_BROKER_PIPE=1.
+    // **F.9 status (2026-05-18)**: substrate complete (emit-side
+    // dup_handle + post-wait_worker_host release in
+    // exec_on_remote_host) PLUS PE.13 fix (fork-snapshot restore
+    // calls dup_handle so PE.9's strict ownership check doesn't fire
+    // on the implicit on_close release; matching parent-side release
+    // moved to spawn-async-wait task in commit_delayed_fork).
     //
-    // **NOT flipped to default true yet**: PIDF.exit_self regressed
-    // under eager-pipe default ON in a PROTOCOL VIOLATION pattern
-    // unrelated to PB.c2p. Diagnostics showed
-    //   `Release handle_id=12 caller_pid=0 state_exists=true
-    //    process_exists=false`
-    // — a release for a pipe handle that the conn's tracker doesn't
-    // have a record for. Likely some pipe ref-accounting interaction
-    // with tokio process spawn under eager-broker-pipe + PIDF's
-    // Command::output() stdout/stderr capture. Needs separate
-    // investigation before flipping.
+    // Under LITEBOX_EAGER_BROKER_PIPE=1:
+    // - PB.c2p: 20/20
+    // - PIDF: 9/11 (PE.13 improved from 6/11)
+    //   * Remaining 2/11: PIDF.exit_self.{nonpie-glibc, non-pie-static-musl}
+    //     fail with EIO at std::process::Command::output's read of
+    //     the child's stdout pipe. Cross-bt (nonpie) exec uses
+    //     exec_on_remote_host. The transit ref accounting is
+    //     evidently still off for this specific case. Needs separate
+    //     investigation.
+    //
+    // F.9 default flip still deferred. eager-pipe stays opt-in.
     {
         let enabled = std::env::var("LITEBOX_EAGER_BROKER_PIPE")
             .ok()

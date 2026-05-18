@@ -1570,6 +1570,25 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 let Some(provider) = syscalls::broker_pipe::broker_pipe_provider() else {
                     continue;
                 };
+                // PE.13 fix (2026-05-18): bump broker rc and record
+                // on this conn's tracker so the BrokerPipeFd's on_close
+                // release later finds a matching tracker entry. Without
+                // this, PE.9's strict ownership check fires a PROTOCOL
+                // VIOLATION on the implicit release at close-time
+                // (the original "adopts the parent's emit-side dup_handle
+                // ref" design predated PE.9's per-conn tracking).
+                //
+                // The corresponding release of the parent's emit-side
+                // dup happens in process.rs's commit_delayed_fork
+                // success path via `fork_snapshot_broker_transit`
+                // drain — see process.rs:4519. Net broker rc change
+                // across the fork: +1 (our dup) -1 (parent's transit
+                // release) = 0. Matches the pre-PE.9 design intent
+                // while satisfying strict ownership checking.
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(broker_handle.handle_id);
                 let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
                     provider,
                     broker_handle.handle_id,
