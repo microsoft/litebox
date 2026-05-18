@@ -15,7 +15,14 @@
 //!   cargo test -p `litebox_test_harness` --test integration -- `native::fork`          # native fork groups
 //!   cargo test -p `litebox_test_harness` --test integration -- `native::fork::capture_pipe`  # one group
 //!   cargo test -p `litebox_test_harness` --test integration -- fork                  # fork in both passes
+//!   cargo test -p `litebox_test_harness` --test integration -- `litebox::PB` `litebox::EPIPE`  # OR of multiple filters (one process, one setup, shared LITEBOX_TEST_JOBS pool)
 //!   cargo test -p `litebox_test_harness` --test integration -- --list                # list all trials
+//!
+//! Multi-filter note: stock libtest treats multiple positional args as
+//! OR'd filters (see <https://doc.rust-lang.org/rustc/tests/index.html#filters>).
+//! `libtest-mimic` 0.8 only accepts a single positional, so `main()`
+//! pre-scans argv and pre-filters trials before handing them to
+//! libtest-mimic, restoring the documented behavior.
 //!
 //! Target directory: uses `CARGO_TARGET_DIR` if set, otherwise `target/`.
 //!
@@ -637,8 +644,91 @@ fn spawn_drain(
 
 // ── Main ─────────────────────────────────────────────────────────────
 
+/// libtest-mimic 0.8 long options that consume the next argv token as
+/// their value (i.e. `--foo BAR`). The `--foo=BAR` form is handled
+/// separately since it's a single token. Keep in sync with
+/// `libtest_mimic::Arguments` (see vendored crate, src/args.rs).
+const VALUE_TAKING_LONG: &[&str] = &[
+    "--test-threads",
+    "--logfile",
+    "--skip",
+    "--color",
+    "--format",
+];
+
+/// Walk `argv` (with `argv[0]` being the program name) and return the
+/// indices of positional arguments. Implements the standard rule:
+///   * args after a bare `--` are all positional;
+///   * options of the form `--opt=value` or short flags are a single
+///     token;
+///   * options listed in [`VALUE_TAKING_LONG`] and the short `-Z`
+///     consume the next token as their value;
+///   * everything else not starting with `-` is positional.
+///
+/// Pre-scanning ourselves lets us recover stock-libtest's OR-of-
+/// positionals filter semantics (see rustc book, "CLI arguments →
+/// Filters"). libtest-mimic 0.8 only accepts a single positional and
+/// errors otherwise; we strip the extras before handing argv to it.
+fn collect_positionals(argv: &[String]) -> Vec<usize> {
+    let mut positionals = Vec::new();
+    let mut i = 1;
+    let mut after_dashdash = false;
+    while i < argv.len() {
+        let a = &argv[i];
+        if after_dashdash {
+            positionals.push(i);
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            after_dashdash = true;
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix("--") {
+            if rest.contains('=') {
+                i += 1;
+            } else if VALUE_TAKING_LONG.iter().any(|v| &v[2..] == rest) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if a.starts_with('-') && a.len() > 1 {
+            // Short option. `-Z` is the only short option in
+            // libtest-mimic that takes a value.
+            if a == "-Z" {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            positionals.push(i);
+            i += 1;
+        }
+    }
+    positionals
+}
+
 fn main() {
-    let args = Arguments::from_args();
+    let argv: Vec<String> = std::env::args().collect();
+    let pos_idx = collect_positionals(&argv);
+
+    // Extract the positional strings, then strip all but the first
+    // from the argv we hand to libtest-mimic (so its single-positional
+    // parser doesn't error). We'll apply OR-filtering ourselves below.
+    let positionals: Vec<String> = pos_idx.iter().map(|&i| argv[i].clone()).collect();
+    let args = if positionals.len() >= 2 {
+        let drop: std::collections::HashSet<usize> = pos_idx.iter().skip(1).copied().collect();
+        let trimmed: Vec<String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !drop.contains(i))
+            .map(|(_, s)| s.clone())
+            .collect();
+        Arguments::from_iter(trimmed)
+    } else {
+        Arguments::from_args()
+    };
 
     let mut trials: Vec<Trial> = Vec::new();
 
@@ -667,6 +757,27 @@ fn main() {
         run_host_fwd(&bins.pie_glibc, &bins.nonpie_glibc);
         Ok(())
     }));
+
+    // OR-of-positionals prefilter. When two or more positional filters
+    // were given, we already stripped the extras from libtest-mimic's
+    // argv; here we drop trials that don't match ANY positional and
+    // null out `args.filter` so libtest-mimic doesn't double-filter
+    // with just the first positional.
+    let args = if positionals.len() >= 2 {
+        let exact = args.exact;
+        trials.retain(|t| {
+            let name = t.name();
+            positionals
+                .iter()
+                .any(|p| if exact { name == p } else { name.contains(p) })
+        });
+        Arguments {
+            filter: None,
+            ..args
+        }
+    } else {
+        args
+    };
 
     libtest_mimic::run(&args, trials).exit();
 }
