@@ -26,6 +26,7 @@ pub(crate) mod process_exit;
 pub(crate) mod pty;
 pub(crate) mod pxeof;
 pub(crate) mod registry;
+pub(crate) mod resource_lifetime;
 pub(crate) mod run_context;
 pub(crate) mod scm_rights;
 pub(crate) mod shell;
@@ -981,6 +982,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     file_tcp::register_file_tcp(&mut registry::Registry::new(&mut tests));
     port_router::register_port_router(&mut registry::Registry::new(&mut tests));
     pty::register_pty_tests(&mut registry::Registry::new(&mut tests));
+    resource_lifetime::register_resource_lifetime_tests(&mut registry::Registry::new(&mut tests));
     pid_uniqueness::register_pid_uniqueness_tests(&mut registry::Registry::new(&mut tests));
     pxeof::register_pxeof_tests(&mut registry::Registry::new(&mut tests));
     special_cases::register_contamination_sequence(&mut registry::Registry::new(&mut tests));
