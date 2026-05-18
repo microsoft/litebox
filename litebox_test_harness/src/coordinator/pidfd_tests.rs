@@ -31,6 +31,11 @@
 //!   grandchild it just forked and observe its exit via poll. Same
 //!   role as the legacy `PIFH.basic` test from the cwfd-p2-pidfd
 //!   branch.
+//!
+//! - `PIDFI.*`: focused pidfd inheritance edge cases. These extend
+//!   `PIDF.exit_inherit` with representative parent/child binary-type
+//!   transitions, explicit `FD_CLOEXEC` survival/non-survival checks,
+//!   and dup-to-specific-fd inheritance.
 
 use serde::{Deserialize, Serialize};
 
@@ -39,7 +44,7 @@ use crate::os::pidfd::Pidfd;
 use crate::register_handler;
 
 use super::TestOutcome;
-use super::agents::AgentName;
+use super::agents::{AgentName, SpawnKind};
 use super::registry::Registry;
 
 // ─── Outputs ────────────────────────────────────────────────────────
@@ -84,12 +89,40 @@ struct ExitInheritOut {
     grandchild_reaped: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct PidfiInheritArgs {
+    child_binary: String,
+    timeout_ms: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PidfiInheritOut {
+    exit_code: i32,
+    stderr: String,
+    grandchild_reaped: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PidfiCloexecOut {
+    clear_exit_code: i32,
+    clear_stderr: String,
+    cloexec_exit_code: i32,
+    cloexec_stderr: String,
+    grandchild_reaped: bool,
+}
+
 // ─── Typed handler tokens ──────────────────────────────────────────
 
 const SPAWN_AND_OPEN: HandlerToken<(), SpawnAndOpenOut> = HandlerToken::new("pidfd.spawn_and_open");
 const EXIT_SELF: HandlerToken<ExitSelfArgs, ExitSelfOut> = HandlerToken::new("pidfd.exit_self");
 const EXIT_INHERIT: HandlerToken<ExitInheritArgs, ExitInheritOut> =
     HandlerToken::new("pidfd.exit_inherit");
+const PIDFI_BASIC: HandlerToken<PidfiInheritArgs, PidfiInheritOut> =
+    HandlerToken::new("pidfd_inherit.basic");
+const PIDFI_CLOEXEC: HandlerToken<PidfiInheritArgs, PidfiCloexecOut> =
+    HandlerToken::new("pidfd_inherit.cloexec");
+const PIDFI_DUP: HandlerToken<PidfiInheritArgs, PidfiInheritOut> =
+    HandlerToken::new("pidfd_inherit.dup_then_exec");
 
 // ─── Handlers ───────────────────────────────────────────────────────
 
@@ -237,12 +270,196 @@ async fn handle_exit_inherit(
     })
 }
 
+fn fork_sleep_target(seconds: u32) -> Result<i32, HandlerError> {
+    // SAFETY: fork creates a child process. The child only sleeps and exits.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(HandlerError(format!(
+            "fork target: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if child == 0 {
+        // SAFETY: child process terminates directly after sleeping.
+        unsafe {
+            libc::sleep(seconds);
+            libc::_exit(0);
+        }
+    }
+    Ok(child)
+}
+
+fn reap_child(pid: i32) -> bool {
+    let mut status = 0;
+    // SAFETY: waiting for a known child pid returned by fork.
+    unsafe { libc::waitpid(pid, std::ptr::from_mut(&mut status), 0) == pid }
+}
+
+fn kill_and_reap_child(pid: i32) {
+    // SAFETY: best-effort cleanup for a known child pid.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        let mut status = 0;
+        libc::waitpid(pid, std::ptr::from_mut(&mut status), 0);
+    }
+}
+
+fn set_fd_cloexec(fd: i32, cloexec: bool) -> Result<(), HandlerError> {
+    let flags = if cloexec { libc::FD_CLOEXEC } else { 0 };
+    // SAFETY: fcntl on a live descriptor owned by this process.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "fcntl(F_SETFD, {flags:#x}) on fd {fd}: {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+fn pidfd_open_for_child(pid: i32) -> Result<Pidfd, HandlerError> {
+    let child_pid = u32::try_from(pid).map_err(|e| HandlerError(e.to_string()))?;
+    Pidfd::open(child_pid).map_err(|e| HandlerError(format!("pidfd_open({child_pid}): {e}")))
+}
+
+fn output_exit_code(out: &std::process::Output) -> i32 {
+    out.status.code().unwrap_or(-1)
+}
+
+async fn handle_pidfi_basic(
+    args: PidfiInheritArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PidfiInheritOut, HandlerError> {
+    let target = fork_sleep_target(2)?;
+    let pidfd = match pidfd_open_for_child(target) {
+        Ok(pidfd) => pidfd,
+        Err(e) => {
+            kill_and_reap_child(target);
+            return Err(e);
+        }
+    };
+    if let Err(e) = set_fd_cloexec(pidfd.as_raw_fd(), false) {
+        kill_and_reap_child(target);
+        return Err(e);
+    }
+
+    let fd_arg = pidfd.as_raw_fd().to_string();
+    let timeout_arg = args.timeout_ms.to_string();
+    let out = std::process::Command::new(&args.child_binary)
+        .args(["pidfd-test", "poll-inherited", &fd_arg, &timeout_arg])
+        .output();
+    let grandchild_reaped = reap_child(target);
+    let out = out.map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+    Ok(PidfiInheritOut {
+        exit_code: output_exit_code(&out),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        grandchild_reaped,
+    })
+}
+
+async fn handle_pidfi_cloexec(
+    args: PidfiInheritArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PidfiCloexecOut, HandlerError> {
+    let target = fork_sleep_target(2)?;
+    let clear_pidfd = match pidfd_open_for_child(target) {
+        Ok(pidfd) => pidfd,
+        Err(e) => {
+            kill_and_reap_child(target);
+            return Err(e);
+        }
+    };
+    let cloexec_pidfd = match pidfd_open_for_child(target) {
+        Ok(pidfd) => pidfd,
+        Err(e) => {
+            kill_and_reap_child(target);
+            return Err(e);
+        }
+    };
+    if let Err(e) = set_fd_cloexec(clear_pidfd.as_raw_fd(), false) {
+        kill_and_reap_child(target);
+        return Err(e);
+    }
+    if let Err(e) = set_fd_cloexec(cloexec_pidfd.as_raw_fd(), true) {
+        kill_and_reap_child(target);
+        return Err(e);
+    }
+
+    let cloexec_fd_arg = cloexec_pidfd.as_raw_fd().to_string();
+    let cloexec_out = std::process::Command::new(&args.child_binary)
+        .args(["pidfd-test", "expect-closed", &cloexec_fd_arg])
+        .output()
+        .map_err(|e| HandlerError(format!("spawn expect-closed {}: {e}", args.child_binary)))?;
+
+    let clear_fd_arg = clear_pidfd.as_raw_fd().to_string();
+    let timeout_arg = args.timeout_ms.to_string();
+    let clear_out = std::process::Command::new(&args.child_binary)
+        .args(["pidfd-test", "poll-inherited", &clear_fd_arg, &timeout_arg])
+        .output()
+        .map_err(|e| HandlerError(format!("spawn poll-inherited {}: {e}", args.child_binary)))?;
+
+    let grandchild_reaped = reap_child(target);
+    Ok(PidfiCloexecOut {
+        clear_exit_code: output_exit_code(&clear_out),
+        clear_stderr: String::from_utf8_lossy(&clear_out.stderr).into_owned(),
+        cloexec_exit_code: output_exit_code(&cloexec_out),
+        cloexec_stderr: String::from_utf8_lossy(&cloexec_out.stderr).into_owned(),
+        grandchild_reaped,
+    })
+}
+
+async fn handle_pidfi_dup(
+    args: PidfiInheritArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PidfiInheritOut, HandlerError> {
+    let target = fork_sleep_target(2)?;
+    let pidfd = match pidfd_open_for_child(target) {
+        Ok(pidfd) => pidfd,
+        Err(e) => {
+            kill_and_reap_child(target);
+            return Err(e);
+        }
+    };
+    // SAFETY: fcntl duplicates a live fd to a process-owned descriptor >= 50.
+    let dup_fd = unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_DUPFD, 50) };
+    if dup_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        kill_and_reap_child(target);
+        return Err(HandlerError(format!("fcntl(F_DUPFD): {err}")));
+    }
+    if let Err(e) = set_fd_cloexec(dup_fd, false) {
+        // SAFETY: dup_fd was returned by F_DUPFD and is owned by this process.
+        unsafe { libc::close(dup_fd) };
+        kill_and_reap_child(target);
+        return Err(e);
+    }
+
+    let fd_arg = dup_fd.to_string();
+    let timeout_arg = args.timeout_ms.to_string();
+    let out = std::process::Command::new(&args.child_binary)
+        .args(["pidfd-test", "poll-inherited", &fd_arg, &timeout_arg])
+        .output();
+    // SAFETY: dup_fd was returned by F_DUPFD and is owned by this process.
+    unsafe { libc::close(dup_fd) };
+    let grandchild_reaped = reap_child(target);
+    let out = out.map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+    Ok(PidfiInheritOut {
+        exit_code: output_exit_code(&out),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        grandchild_reaped,
+    })
+}
+
 // ─── Registration ──────────────────────────────────────────────────
 
 pub(crate) fn register_pidfd_tests(reg: &mut Registry<'_>) {
     register_handler!(SPAWN_AND_OPEN, handle_spawn_and_open);
     register_handler!(EXIT_SELF, handle_exit_self);
     register_handler!(EXIT_INHERIT, handle_exit_inherit);
+    register_handler!(PIDFI_BASIC, handle_pidfi_basic);
+    register_handler!(PIDFI_CLOEXEC, handle_pidfi_cloexec);
+    register_handler!(PIDFI_DUP, handle_pidfi_dup);
     // pidfd-test argv subcommand: the PIDF.* tests invoke
     // `<target_bt> pidfd-test self-test|poll-inherited …` directly via
     // tokio::process::Command (not through a handler) to exercise the
@@ -362,12 +579,216 @@ pub(crate) fn register_pidfd_tests(reg: &mut Registry<'_>) {
                 })
             });
     }
+
+    register_pidfi_tests(reg);
 }
+
+fn pidfi_inherit_pass(out: &PidfiInheritOut) -> bool {
+    out.exit_code == 0 && out.grandchild_reaped
+}
+
+fn pidfi_inherit_failure(out: &PidfiInheritOut) -> String {
+    format!(
+        "exit_code={} reaped={} stderr={:?}",
+        out.exit_code, out.grandchild_reaped, out.stderr
+    )
+}
+
+fn register_pidfi_tests(reg: &mut Registry<'_>) {
+    reg.test("vscode", "pidfd", "PIDFI.basic.pie-glibc")
+        .timeout(30)
+        .build(|cx| {
+            let agent = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let self_exe = run.self_exe().to_string();
+                    let child_binary = crate::binary_path(crate::BinaryType::PieGlibc, &self_exe);
+                    let result = run
+                        .send_named_typed(
+                            &agent,
+                            &PIDFI_BASIC,
+                            PidfiInheritArgs {
+                                child_binary,
+                                timeout_ms: 5000,
+                            },
+                        )
+                        .await;
+                    match result {
+                        Ok(out) if pidfi_inherit_pass(&out) => TestOutcome::new(
+                            "Dpg1",
+                            true,
+                            "child polled inherited pidfd after exec",
+                        ),
+                        Ok(out) => TestOutcome::new("Dpg1", false, pidfi_inherit_failure(&out)),
+                        Err(e) => TestOutcome::new("Dpg1", false, format!("handler: {e}")),
+                    }
+                })
+            })
+        });
+
+    const CROSS_BT: &[(crate::BinaryType, crate::BinaryType)] = &[
+        (
+            crate::BinaryType::NonPieGlibc,
+            crate::BinaryType::StaticPieMusl,
+        ),
+        (
+            crate::BinaryType::StaticPieMusl,
+            crate::BinaryType::NonPieGlibc,
+        ),
+        (
+            crate::BinaryType::NonPieStaticMusl,
+            crate::BinaryType::StaticPieGlibc,
+        ),
+    ];
+    for &(parent_bt, child_bt) in CROSS_BT {
+        let parent_label = parent_bt.label();
+        let child_label = child_bt.label();
+        reg.test(
+            "vscode",
+            "pidfd",
+            format!("PIDFI.cross_bt.{parent_label}.{child_label}"),
+        )
+        .timeout(45)
+        .build(move |cx| {
+            let parent = cx.declare_ephemeral(
+                AgentName::Dpg1,
+                format!(
+                    "PidfiCross_{}_{}",
+                    parent_bt.short_label(),
+                    child_bt.short_label()
+                ),
+                SpawnKind::Fork {
+                    binary: super::pipe_bridge::fork_binary_label(parent_bt),
+                    inherit_listen_ports: vec![],
+                },
+            );
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let self_exe = run.self_exe().to_string();
+                    let child_binary = crate::binary_path(child_bt, &self_exe);
+                    let result = run
+                        .run_leaf(
+                            &parent,
+                            &PIDFI_BASIC,
+                            PidfiInheritArgs {
+                                child_binary,
+                                timeout_ms: 5000,
+                            },
+                        )
+                        .await;
+                    let label = format!("{parent_label}->{child_label}");
+                    match result {
+                        Ok(out) if pidfi_inherit_pass(&out) => TestOutcome::new(
+                            &label,
+                            true,
+                            "parent-bt child-bt fork+exec preserved pidfd",
+                        ),
+                        Ok(out) => TestOutcome::new(&label, false, pidfi_inherit_failure(&out)),
+                        Err(e) => TestOutcome::new(&label, false, format!("handler: {e}")),
+                    }
+                })
+            })
+        });
+    }
+
+    for &bt in &[
+        crate::BinaryType::PieGlibc,
+        crate::BinaryType::NonPieGlibc,
+        crate::BinaryType::StaticPieMusl,
+    ] {
+        let bt_label = bt.label();
+        reg.test(
+            "vscode",
+            "pidfd",
+            format!("PIDFI.cloexec_clear.{bt_label}"),
+        )
+        .timeout(45)
+        .build(move |cx| {
+            let agent = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let self_exe = run.self_exe().to_string();
+                    let child_binary = crate::binary_path(bt, &self_exe);
+                    let result = run
+                        .send_named_typed(
+                            &agent,
+                            &PIDFI_CLOEXEC,
+                            PidfiInheritArgs {
+                                child_binary,
+                                timeout_ms: 5000,
+                            },
+                        )
+                        .await;
+                    match result {
+                        Ok(out)
+                            if out.clear_exit_code == 0
+                                && out.cloexec_exit_code == 0
+                                && out.grandchild_reaped =>
+                        {
+                            TestOutcome::new(
+                                "Dpg1",
+                                true,
+                                "clear fd survived exec; cloexec fd was closed",
+                            )
+                        }
+                        Ok(out) => TestOutcome::new(
+                            "Dpg1",
+                            false,
+                            format!(
+                                "clear_exit={} cloexec_exit={} reaped={} clear_stderr={:?} cloexec_stderr={:?}",
+                                out.clear_exit_code,
+                                out.cloexec_exit_code,
+                                out.grandchild_reaped,
+                                out.clear_stderr,
+                                out.cloexec_stderr
+                            ),
+                        ),
+                        Err(e) => TestOutcome::new("Dpg1", false, format!("handler: {e}")),
+                    }
+                })
+            })
+        });
+    }
+
+    reg.test("vscode", "pidfd", "PIDFI.dup_then_exec.non-pie-static-musl")
+        .timeout(30)
+        .build(|cx| {
+            let agent = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let self_exe = run.self_exe().to_string();
+                    let child_binary =
+                        crate::binary_path(crate::BinaryType::NonPieStaticMusl, &self_exe);
+                    let result = run
+                        .send_named_typed(
+                            &agent,
+                            &PIDFI_DUP,
+                            PidfiInheritArgs {
+                                child_binary,
+                                timeout_ms: 5000,
+                            },
+                        )
+                        .await;
+                    match result {
+                        Ok(out) if pidfi_inherit_pass(&out) => TestOutcome::new(
+                            "Dpg1",
+                            true,
+                            "dup fd inherited by exec child and polled target exit",
+                        ),
+                        Ok(out) => TestOutcome::new("Dpg1", false, pidfi_inherit_failure(&out)),
+                        Err(e) => TestOutcome::new("Dpg1", false, format!("handler: {e}")),
+                    }
+                })
+            })
+        });
+}
+
 mod leaf_subcmd {
     pub(super) fn run(sub: &str, args: &[String]) -> i32 {
         match sub {
             "self-test" => self_test(),
             "poll-inherited" => poll_inherited(args),
+            "expect-closed" => expect_closed(args),
             other => {
                 eprintln!("pidfd-test: unknown subcommand: {other}");
                 2
@@ -495,5 +916,29 @@ mod leaf_subcmd {
             return 1;
         }
         0
+    }
+
+    fn expect_closed(args: &[String]) -> i32 {
+        let fd: i32 = match args.get(3).and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!("pidfd-test expect-closed: bad fd arg");
+                return 2;
+            }
+        };
+        // SAFETY: fcntl probes the descriptor number; no ownership is taken.
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
+            return 0;
+        }
+        if rc >= 0 {
+            eprintln!("pidfd-test expect-closed: fd {fd} unexpectedly open flags={rc:#x}");
+        } else {
+            eprintln!(
+                "pidfd-test expect-closed: expected EBADF, got {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        1
     }
 }
