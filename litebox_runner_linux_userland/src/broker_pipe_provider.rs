@@ -124,6 +124,24 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
         ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
         ClientError::Protocol(_) => BrokerOpError::InvalidValue,
-        _ => BrokerOpError::Io,
+        other => {
+            // PE.14 diag: log the underlying ClientError when we
+            // fall through to the generic Io variant. PE.13's
+            // investigation needed this for the eventfd provider;
+            // adding the same here for pipe. Always-on (only fires
+            // on error path).
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.14-diag] BrokerPipeProvider Io fallthrough: {other:?}"
+                );
+            }
+            BrokerOpError::Io
+        }
     }
 }

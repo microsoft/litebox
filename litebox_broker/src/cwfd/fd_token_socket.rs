@@ -1021,15 +1021,58 @@ fn handle_control_connection_inner(
                 );
                 if let Err(e) = write_response(&stream, result.frame, result.out_fd) {
                     warn!(error = %e, "fd-token control: write error");
+                    // PE.14 diag: persistent log of conn-close reasons.
+                    if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/rst-diag.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "[PE.14-diag] CONN CLOSE conn_id={} reason=write_error: {e}",
+                                tracker.conn_id
+                            );
+                        }
+                    }
                     return;
                 }
             }
             Err(ConnError::PeerClosed) => {
                 debug!("fd-token control: peer closed");
+                if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rst-diag.log")
+                    {
+                        let _ = writeln!(
+                            f,
+                            "[PE.14-diag] CONN CLOSE conn_id={} reason=peer_closed",
+                            tracker.conn_id
+                        );
+                    }
+                }
                 return;
             }
             Err(e) => {
                 warn!(error = %e, "fd-token control: read error");
+                if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rst-diag.log")
+                    {
+                        let _ = writeln!(
+                            f,
+                            "[PE.14-diag] CONN CLOSE conn_id={} reason=read_error: {e}",
+                            tracker.conn_id
+                        );
+                    }
+                }
                 return;
             }
         }
