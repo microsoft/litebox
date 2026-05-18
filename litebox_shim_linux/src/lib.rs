@@ -278,18 +278,6 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             BrokerHandleKind::Pipe => {
                 let provider = syscalls::broker_pipe::broker_pipe_provider().ok_or(())?;
                 let direction = pipe_direction.ok_or(())?;
-                // C.5j: explicitly dup_handle on THIS worker's broker
-                // connection so the per-connection ref tracker in
-                // `litebox_broker::fd_token_socket` records our
-                // ownership. Without this, the cross-bt fork-snapshot
-                // transfer leaks the inherited refcount when the
-                // worker is SIGKILL'd: the BrokerPipeFd's on_close
-                // (which calls `release`) never fires, and there's no
-                // per-connection record on the broker for the
-                // disconnect cleanup to find. Paired with removal of
-                // the emit-side transit dup_handle in
-                // exec_on_remote_host so net rc change across the
-                // migration stays at 0.
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
                 let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
                     alloc::sync::Arc::clone(&provider) as _;

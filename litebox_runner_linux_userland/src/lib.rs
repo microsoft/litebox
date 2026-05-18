@@ -496,8 +496,23 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // C.5* follow-up: gate eager-broker `sys_pipe2` on an env var
     // so tests can probe both legacy host-pipe and eager-broker
     // codepaths without recompiling. `LITEBOX_EAGER_BROKER_PIPE=1`
-    // (or 'true' / 'yes', case-insensitive) flips it on. Default
-    // off matches the committed-state regression baseline.
+    // (or 'true' / 'yes', case-insensitive) flips it on.
+    //
+    // **F.9 status**: substrate complete (emit-side dup_handle +
+    // post-wait_worker_host release of pipe transit refs, in
+    // litebox_shim_linux/src/syscalls/process.rs ~lines 9300, 9745).
+    // PB.c2p 20/20 under LITEBOX_EAGER_BROKER_PIPE=1.
+    //
+    // **NOT flipped to default true yet**: PIDF.exit_self regressed
+    // under eager-pipe default ON in a PROTOCOL VIOLATION pattern
+    // unrelated to PB.c2p. Diagnostics showed
+    //   `Release handle_id=12 caller_pid=0 state_exists=true
+    //    process_exists=false`
+    // — a release for a pipe handle that the conn's tracker doesn't
+    // have a record for. Likely some pipe ref-accounting interaction
+    // with tokio process spawn under eager-broker-pipe + PIDF's
+    // Command::output() stdout/stderr capture. Needs separate
+    // investigation before flipping.
     {
         let enabled = std::env::var("LITEBOX_EAGER_BROKER_PIPE")
             .ok()

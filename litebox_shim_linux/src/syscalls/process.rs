@@ -9177,6 +9177,18 @@ impl<FS: ShimFS> Task<FS> {
             >,
             u64,
         )> = alloc::vec::Vec::new();
+        // Phase F.9 (2026-05-18): separate list for pipe-specific
+        // transit releases. Drained after wait_worker_host returns
+        // (worker B has exited) so the broker rc can reach 0 for the
+        // writer end and the reader gets HUP/EOF. Eventfd/signalfd/
+        // pty transit refs use the OTHER list and are NOT post-wait
+        // drained — they're cleaned up via worker-conn cleanup.
+        let mut broker_pipe_transit_release: alloc::vec::Vec<(
+            alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            >,
+            u64,
+        )> = alloc::vec::Vec::new();
         {
             // Collect EventfdSubsystem fds (non-stdio) and promote each to
             // broker-backed if not already. Skip on broker-provider absence
@@ -9294,46 +9306,34 @@ impl<FS: ShimFS> Task<FS> {
                     },
                 );
                 drop(dt_local);
-                if let (Some(_provider), Some((handle_id, direction))) = (pipe_provider, pipe_info)
-                {
-                    // C.5j: emit-side dup_handle removed. Previously
-                    // `releaser.dup_handle(handle_id)` here bumped the
-                    // broker rc to "ship the ref over" to worker B;
-                    // worker B's install just attached without
-                    // bumping. That left the +1 untracked on any
-                    // connection, so SIGKILL of worker B leaked the
-                    // ref forever (PXEOF.signal_kill cross-bt
-                    // failures).
+                if let (Some(provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
+                    // Phase F.9 (2026-05-18): emit-side dup_handle for
+                    // broker pipe at cross-worker exec, paired with an
+                    // explicit POST-wait release (drained after
+                    // wait_worker_host returns, below near line 9714).
+                    // Recorded in `broker_pipe_transit_release` rather
+                    // than the shared `broker_eventfd_transit_release`
+                    // because pipe needs to release its transit ref
+                    // ON SPAWN SUCCESS (after worker B finishes
+                    // writing + exits) so the reader gets HUP/EOF,
+                    // whereas eventfd/signalfd/pty transit refs need
+                    // to stay alive past spawn success (their cleanup
+                    // happens via the worker's broker-conn cleanup).
                     //
-                    // Now worker B's `install_broker_bridge_fd` calls
-                    // `dup_handle` itself, so the +1 is tracked on
-                    // worker B's connection and the broker's per-
-                    // connection cleanup on disconnect can release
-                    // it. The emit side just enumerates the spec.
-                    //
-                    // Race note: the placeholder shim task in worker
-                    // A is blocked in `wait_worker_host` from
-                    // spawn-time until worker B exits, so its fd's
-                    // BrokerPipeFd keeps the rc alive in the gap
-                    // between worker B startup and its install call.
-                    //
-                    // Phase F.9 TODO: investigate whether pipe should adopt
-                    // the same emit-side dup_handle pattern that socketpair
-                    // uses (process.rs ~line 9335). Naively adding the dup
-                    // here caused PB.c2p.* non-PIE tests to TIMEOUT (writer
-                    // never seen EOF by reader) — confirmed reproducible
-                    // again 2026-05-17 with PE.5+PE.9+PE.10+PE.11 substrate
-                    // in place. Pipe needs a different shape: maybe release
-                    // the dup explicitly when the migrating worker's
-                    // close_all_fds runs, or use a "transient transit" model
-                    // that the migrating worker's close DOES NOT release
-                    // (only the spawned worker's install/close releases).
+                    // See process.rs around line 9714 for the release.
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
                     let dir_char = match direction {
                         litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
                         litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
                     };
                     broker_eventfd_specs
                         .push(alloc::format!("{raw_fd}:pipe:{handle_id}:{dir_char}"));
+                    broker_pipe_transit_release.push((releaser, handle_id));
                 }
             }
 
@@ -9588,6 +9588,10 @@ impl<FS: ShimFS> Task<FS> {
                 for (releaser, handle_id) in &broker_eventfd_transit_release {
                     releaser.release(*handle_id);
                 }
+                // Phase F.9: same for pipe transit refs.
+                for (releaser, handle_id) in &broker_pipe_transit_release {
+                    releaser.release(*handle_id);
+                }
                 signal_on_error(&vfork_info);
                 Errno::ENOMEM
             })?;
@@ -9734,6 +9738,24 @@ impl<FS: ShimFS> Task<FS> {
             .fork_child_host_pids
             .write()
             .remove(&self.process_id.0);
+
+        // Phase F.9: now that worker B has exited, release the pipe
+        // transit dup_handle refs that the emit-side bumped at exec
+        // time. This lets the broker rc reach 0 if no other holder
+        // remains (e.g. the parent's reader expecting writer-close →
+        // reader-EOF). Without this release, the transit refs stay
+        // alive on the parent worker's broker conn until the parent
+        // worker itself exits — which is too late, the parent's
+        // reader times out.
+        //
+        // Only pipe transit refs are drained here. Eventfd/signalfd/
+        // pty transit refs stay alive (they're cleaned via worker-
+        // conn cleanup); releasing them here breaks PIDF tests where
+        // the pidfd subscription needs the broker state alive past
+        // exec.
+        for (releaser, handle_id) in broker_pipe_transit_release.drain(..) {
+            releaser.release(handle_id);
+        }
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
