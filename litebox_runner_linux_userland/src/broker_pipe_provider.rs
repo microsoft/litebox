@@ -144,8 +144,11 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
                     let target = std::fs::read_link(e.path())
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|err| format!("(read_link err: {err})"));
-                    fd_snapshot
-                        .push_str(&format!("  fd {} -> {}\n", name.to_string_lossy(), target));
+                    fd_snapshot.push_str(&format!(
+                        "  fd {} -> {}\n",
+                        name.to_string_lossy(),
+                        target
+                    ));
                 }
             }
             if let Ok(mut f) = std::fs::OpenOptions::new()
