@@ -613,8 +613,15 @@ fn handle_create_socketpair(
         return protocol_err(Opcode::CreateSocketPairResponse);
     };
     let (end_a, end_b) = crate::socketpair_state::new_socketpair(capacity, atomic);
-    let handle_a = registry.register(end_a);
-    let handle_b = registry.register(end_b);
+    let handle_a = registry.register(end_a.clone());
+    let handle_b = registry.register(end_b.clone());
+    // PE.14: stamp each endpoint with its handle id (mirrors pipe pattern).
+    end_a
+        .handle_id
+        .store(handle_a.id(), std::sync::atomic::Ordering::Relaxed);
+    end_b
+        .handle_id
+        .store(handle_b.id(), std::sync::atomic::Ordering::Relaxed);
     HandlerResult {
         frame: build_create_socketpair_response_ok(handle_a.id(), handle_b.id()),
         out_fd: None,

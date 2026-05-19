@@ -259,10 +259,12 @@ pub fn new_socketpair(
     let end_a = Arc::new(SocketPairEnd {
         inner: Arc::clone(&inner),
         endpoint: SocketPairEndpoint::A,
+        handle_id: AtomicU64::new(0),
     });
     let end_b = Arc::new(SocketPairEnd {
         inner,
         endpoint: SocketPairEndpoint::B,
+        handle_id: AtomicU64::new(0),
     });
     (end_a, end_b)
 }
@@ -277,6 +279,11 @@ pub fn new_socketpair(
 pub struct SocketPairEnd {
     pub(crate) inner: Arc<SocketPairInner>,
     pub endpoint: SocketPairEndpoint,
+    /// PE.14: the registry handle id this endpoint was registered under.
+    /// Set by the call site immediately after register. Used in the
+    /// SOCKETPAIR DATA LOSS invariant log for cross-reference with the
+    /// shim's per-slot diagnostics.
+    pub(crate) handle_id: AtomicU64,
 }
 
 impl SocketPairEnd {
@@ -336,8 +343,9 @@ impl Drop for SocketPairEnd {
         let writes = writes_into_x.load(Ordering::Relaxed);
         let reads = reads_by_x.load(Ordering::Relaxed);
         if unread > 0 && writes > 0 && reads > 0 {
+            let handle_id = self.handle_id.load(Ordering::Relaxed);
             let msg = std::format!(
-                "SOCKETPAIR DATA LOSS direction={dir_label} endpoint={:?}: \
+                "SOCKETPAIR DATA LOSS direction={dir_label} endpoint={:?} handle={handle_id}: \
                  unread={unread} writes={writes} reads={reads} \
                  (reader partially drained then closed without finishing)",
                 self.endpoint
