@@ -892,6 +892,19 @@ impl<FS: ShimFS> Task<FS> {
                 .wake_all();
         }
 
+        // `sys_exit`/`sys_exit_group` only mark the task as terminated; actual
+        // fd cleanup runs later from Task drop, after the syscall-level
+        // caller_pid guard has unwound. Re-stamp this cleanup so per-pid broker
+        // releases hit the exiting process's bucket instead of the ambient
+        // caller_pid=0 fallback picking another inherited owner.
+        let _caller_pid_guard = if crate::per_pid_ownership_enabled() {
+            Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                self.process_id.0,
+            ))
+        } else {
+            None
+        };
+
         // If this task was migrated to a remote worker host via delayed fork,
         // all exit notification and cleanup was handled by commit_delayed_fork
         // and its background waiter.  Skip the rest of prepare_for_exit to
