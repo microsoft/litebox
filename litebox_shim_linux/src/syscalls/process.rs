@@ -579,6 +579,11 @@ pub(crate) enum ThreadInitState {
         tls: Option<ThreadLocalDescriptor>,
         set_child_tid: Option<MutPtr<i32>>,
     },
+    ForkChild {
+        stack: Option<usize>,
+        tls_base: Option<usize>,
+        set_child_tid: Option<MutPtr<i32>>,
+    },
     /// Restored from a fork snapshot — the full execution context is provided.
     ForkRestore {
         exec_ctx: alloc::boxed::Box<litebox_common_linux::ExecutionContext>,
@@ -2819,7 +2824,7 @@ impl<FS: ShimFS> Task<FS> {
                 .get_punchthrough_token_for(punchthrough)
                 .expect("GetFsBase punchthrough");
             let fsbase = token.execute().expect("GetFsBase execute");
-            Some(crate::MutPtr::<u8>::from_usize(fsbase))
+            Some(fsbase)
         };
         #[cfg(not(target_arch = "x86_64"))]
         let parent_tls = None;
@@ -2893,9 +2898,9 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             None
         };
-        child_thread.init_state.set(ThreadInitState::NewThread {
+        child_thread.init_state.set(ThreadInitState::ForkChild {
             stack: child_stack,
-            tls: parent_tls, // inherit parent's guest TLS
+            tls_base: parent_tls, // inherit parent's guest TLS at the final pre-entry boundary
             set_child_tid,
         });
         child_thread.clear_child_tid.set(clear_child_tid);
@@ -10279,6 +10284,41 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 false
             }
+            ThreadInitState::ForkChild {
+                stack,
+                tls_base,
+                set_child_tid,
+            } => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.rsp = stack;
+                    }
+                    ctx.rax = 0;
+                }
+                #[cfg(target_arch = "x86")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.esp = stack;
+                    }
+                    ctx.eax = 0;
+                }
+
+                #[cfg(target_arch = "x86_64")]
+                if let Some(fsbase) = tls_base {
+                    <Platform as litebox::platform::ThreadLocalStorageProvider>::prepare_fork_child_guest_thread_local_storage(
+                        core::ptr::from_mut(ctx).cast(),
+                        fsbase,
+                    );
+                }
+
+                if let Some(child_tid_ptr) = set_child_tid {
+                    let _ = self.prepare_guest_write(child_tid_ptr, 1);
+                    let _ = child_tid_ptr.write_at_offset(0, self.tid);
+                }
+
+                true
+            }
             ThreadInitState::ForkRestore {
                 exec_ctx,
                 tls_base,
@@ -10289,11 +10329,14 @@ impl<FS: ShimFS> Task<FS> {
                 ctx.regs = exec_ctx.regs;
                 ctx.fp_regs = exec_ctx.fp_regs;
 
-                // Restore the TLS base address.
+                // Restore the TLS base address at the final pre-entry boundary.
                 if let Some(tls) = tls_base {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        self.sys_arch_prctl(ArchPrctlArg::SetFs(tls)).unwrap();
+                        <Platform as litebox::platform::ThreadLocalStorageProvider>::prepare_fork_child_guest_thread_local_storage(
+                            core::ptr::from_mut(ctx).cast(),
+                            tls,
+                        );
                     }
                     #[cfg(target_arch = "x86")]
                     {
