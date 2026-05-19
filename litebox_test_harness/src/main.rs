@@ -108,9 +108,7 @@ fn main() {
 
     // Log the resolved binary path so stale rootfs copies are immediately
     // obvious (args[0] may differ from the real on-disk path).
-    if !is_pty_child
-        && let Ok(real) = std::env::current_exe()
-    {
+    if !is_pty_child && let Ok(real) = std::env::current_exe() {
         eprintln!("[harness] self_exe={self_exe} resolved={}", real.display());
     }
 
