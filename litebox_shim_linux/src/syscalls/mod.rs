@@ -23,9 +23,11 @@ pub use broker_socketpair::{
     set_eager_broker_socketpair_enabled,
 };
 pub use eventfd::broker_eventfd_provider;
+pub use eventfd::broker_pgrp_signal_provider;
 pub use eventfd::broker_pidfd_provider;
 pub use eventfd::broker_pty_provider;
 pub use eventfd::set_broker_eventfd_provider;
+pub use eventfd::set_broker_pgrp_signal_provider;
 pub use eventfd::set_broker_pidfd_provider;
 pub use eventfd::set_broker_pty_provider;
 pub use guest_pid::{

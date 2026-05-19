@@ -3185,6 +3185,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     litebox_shim_linux::syscalls::set_broker_socketpair_provider(socketpair_provider)
         .map_err(|_| anyhow!("socketpair provider already set"))?;
 
+    let pgrp_signal_provider = Arc::new(
+        crate::broker_pgrp_signal_provider::RunnerBrokerPgrpSignalProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_pgrp_signal_provider(pgrp_signal_provider)
+        .map_err(|_| anyhow!("pgrp signal provider already set"))?;
+
     let pty_provider = Arc::new(crate::broker_pty_provider::RunnerBrokerPtyProvider::new(
         Arc::clone(&client),
         Arc::clone(&dispatcher),

@@ -26,6 +26,7 @@ use litebox::{
 use litebox_common_linux::{
     ClockId, EfdFlags, ItimerSpec, TimerfdFlags, TimerfdTimerFlags,
     broker_eventfd_provider::{BrokerEventfdProvider, BrokerOpError},
+    broker_pgrp_signal_provider::BrokerPgrpSignalProvider,
     broker_pidfd_provider::BrokerPidfdProvider,
     broker_pty_provider::BrokerPtyProvider,
     errno::Errno,
@@ -49,6 +50,8 @@ impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 static BROKER_EVENTFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerEventfdProvider>> =
     once_cell::race::OnceBox::new();
 static BROKER_PIDFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPidfdProvider>> =
+    once_cell::race::OnceBox::new();
+static BROKER_PGRP_SIGNAL_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPgrpSignalProvider>> =
     once_cell::race::OnceBox::new();
 static BROKER_PTY_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPtyProvider>> =
     once_cell::race::OnceBox::new();
@@ -82,6 +85,19 @@ pub fn set_broker_pidfd_provider(
 /// Returns the broker pidfd provider if one has been set.
 pub fn broker_pidfd_provider() -> Option<Arc<dyn BrokerPidfdProvider>> {
     BROKER_PIDFD_PROVIDER.get().cloned()
+}
+
+/// Sets the process-global broker pgrp signal provider.
+#[allow(dead_code)]
+pub fn set_broker_pgrp_signal_provider(
+    provider: Arc<dyn BrokerPgrpSignalProvider>,
+) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerPgrpSignalProvider>>> {
+    BROKER_PGRP_SIGNAL_PROVIDER.set(alloc::boxed::Box::new(provider))
+}
+
+/// Returns the broker pgrp signal provider if one has been set.
+pub fn broker_pgrp_signal_provider() -> Option<Arc<dyn BrokerPgrpSignalProvider>> {
+    BROKER_PGRP_SIGNAL_PROVIDER.get().cloned()
 }
 
 /// Sets the process-global broker PTY provider.

@@ -6,8 +6,14 @@
 //! `subscription_id`s are worker-local, so this structure keys subscribers by
 //! `(pgid, conn_id)` and stores the worker's `subscription_id` only as the
 //! routing id to put in broker→worker notification frames.
+//!
+//! # Invariants
+//!
+//! PG.1: cleanup logs (without panicking) if a worker disconnects after this
+//! inbox failed to enqueue any signal notification for one of its subscriptions.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use litebox_common_linux::notification_frame::{
@@ -34,10 +40,12 @@ struct PgrpSubscription {
     signal_mask: u32,
     events_mask: u32,
     sender: Arc<Mutex<NotificationSender>>,
+    deliveries_sent: AtomicU64,
+    deliveries_dropped: AtomicU64,
 }
 
 pub struct PgrpSignalInbox {
-    subscriptions: Mutex<HashMap<u32, HashMap<u64, PgrpSubscription>>>,
+    subscriptions: Mutex<HashMap<u32, HashMap<u64, Arc<PgrpSubscription>>>>,
 }
 
 impl Default for PgrpSignalInbox {
@@ -75,12 +83,14 @@ impl PgrpSignalInbox {
         }
         by_conn.insert(
             conn_id,
-            PgrpSubscription {
+            Arc::new(PgrpSubscription {
                 subscription_id: sub_id,
                 signal_mask,
                 events_mask,
                 sender,
-            },
+                deliveries_sent: AtomicU64::new(0),
+                deliveries_dropped: AtomicU64::new(0),
+            }),
         );
         Ok(())
     }
@@ -107,8 +117,21 @@ impl PgrpSignalInbox {
             .subscriptions
             .lock()
             .expect("PgrpSignalInbox subscriptions poisoned");
-        subscriptions.retain(|_, by_conn| {
-            by_conn.remove(&conn_id);
+        subscriptions.retain(|pgid, by_conn| {
+            if let Some(sub) = by_conn.remove(&conn_id) {
+                let sent = sub.deliveries_sent.load(Ordering::Relaxed);
+                let dropped = sub.deliveries_dropped.load(Ordering::Relaxed);
+                if dropped > 0 || sent > 0 {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    eprintln!(
+                        "[PG.1-invariant] ts={ts} SIGNAL INBOX UNDELIVERED conn_id={} pgid={} sent={} dropped={} — worker disconnected with unprocessed signals",
+                        conn_id, pgid, sent, dropped
+                    );
+                }
+            }
             !by_conn.is_empty()
         });
     }
@@ -124,28 +147,45 @@ impl PgrpSignalInbox {
                 .subscriptions
                 .lock()
                 .expect("PgrpSignalInbox subscriptions poisoned");
-            let Some(by_conn) = subscriptions.get(&pgid) else {
-                return 0;
-            };
-            by_conn
-                .values()
+            let mut targets = subscriptions
+                .get(&pgid)
+                .into_iter()
+                .flat_map(|by_conn| by_conn.values())
                 .filter(|sub| signal_matches(sub.signal_mask, signum))
                 .filter_map(|sub| {
                     let matched_events = sub.events_mask & NOTIFY_EVENT_IN;
-                    (matched_events != 0)
-                        .then(|| (sub.subscription_id, matched_events, Arc::clone(&sub.sender)))
+                    (matched_events != 0).then(|| Arc::clone(sub))
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                // PR-3 has only a per-worker local pgid view. During remote exec,
+                // the master worker can briefly hold a stale foreground pgid;
+                // broadcast standard signals to subscribed workers rather than
+                // dropping SIGWINCH until PR-4 adds broker-side setpgid tracking.
+                targets = subscriptions
+                    .values()
+                    .flat_map(|by_conn| by_conn.values())
+                    .filter(|sub| signal_matches(sub.signal_mask, signum))
+                    .filter_map(|sub| {
+                        let matched_events = sub.events_mask & NOTIFY_EVENT_IN;
+                        (matched_events != 0).then(|| Arc::clone(sub))
+                    })
+                    .collect();
+            }
+            targets
         };
 
         let mut delivered = 0;
-        for (subscription_id, events, sender) in targets {
-            let frame = NotificationFrame::payload(subscription_id, events, payload.clone());
-            let mut sender = sender.lock().expect("NotificationSender poisoned");
+        for sub in targets {
+            let events = sub.events_mask & NOTIFY_EVENT_IN;
+            let frame = NotificationFrame::payload(sub.subscription_id, events, payload.clone());
+            let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
             if let Err(err) = sender.send(&frame) {
-                tracing::warn!(subscription_id, pgid, signum, error = %err, "pgrp signal notification send failed");
+                sub.deliveries_dropped.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(subscription_id = sub.subscription_id, pgid, signum, error = %err, "pgrp signal notification send failed");
                 continue;
             }
+            sub.deliveries_sent.fetch_add(1, Ordering::Relaxed);
             delivered += 1;
         }
         delivered

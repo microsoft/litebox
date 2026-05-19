@@ -994,6 +994,12 @@ impl<FS: ShimFS> Task<FS> {
                     ExitStatus::Signal(sig) => sig.as_i32() + 128,
                 }
             };
+            let exiting_pgid = self
+                .global
+                .litebox
+                .process_registry()
+                .get_pgid(self.process_id)
+                .map(|pgid| pgid.0);
             super::guest_pid::try_mark_broker_process_exited(self.process_id.0, exit_status);
             // Phase F.5+ PE.1 Step D: sweep broker-tracked refs for
             // this pid. No-op when per-pid ownership is gated off;
@@ -1027,6 +1033,9 @@ impl<FS: ShimFS> Task<FS> {
                         self.notify_parent_of_child_exit(notif);
                     }
                 });
+            if let Some(pgid) = exiting_pgid {
+                self.global.cleanup_pgrp_signal_subscription_if_empty(pgid);
+            }
 
             // Release the process's VA partition. For a vfork child that
             // hasn't exec'd, destroy the child's reserved partition (from

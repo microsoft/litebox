@@ -8,6 +8,10 @@
 //! standard-signal use (SIGWINCH and job-control signals) because the shim's
 //! pending-signal queues coalesce standard signals at delivery time.
 
+use litebox_common_linux::cwfd::broker_pgrp_signal_provider::{
+    BrokerPgrpSignalCallback, BrokerPgrpSignalProvider,
+};
+use litebox_common_linux::cwfd::broker_subscribable::BrokerOpError;
 use litebox_common_linux::cwfd::notification_frame::{NOTIFY_EVENT_IN, NotificationFrame};
 use litebox_common_linux::{
     broker_eventfd::NotificationDispatcher, fd_token_client::FdTokenClient,
@@ -73,29 +77,58 @@ impl RunnerBrokerPgrpSignalProvider {
     pub fn new(client: Arc<FdTokenClient>, dispatcher: Arc<NotificationDispatcher>) -> Self {
         Self { client, dispatcher }
     }
+}
 
-    pub fn subscribe(
+impl BrokerPgrpSignalProvider for RunnerBrokerPgrpSignalProvider {
+    fn subscribe_pgrp_signal(
         &self,
         pgid: u32,
         signal_mask: u32,
-        callback: Arc<WorkerSignalInboxCallback>,
-    ) -> Result<u64, litebox_common_linux::fd_token_client::ClientError> {
+        callback: Arc<dyn BrokerPgrpSignalCallback>,
+    ) -> Result<u64, BrokerOpError> {
         let subscription_id = self.dispatcher.alloc_subscription_id();
-        self.dispatcher.register_callback(subscription_id, callback);
+        let subscribed_pgid = i32::try_from(pgid).map_err(|_| BrokerOpError::InvalidValue)?;
+        let deliver = Arc::new(move |_payload_pgid, signum, siginfo: &[u8]| {
+            callback.on_signal(subscribed_pgid, signum, siginfo);
+        });
+        let inbox_callback = Arc::new(WorkerSignalInboxCallback::new(deliver));
+        self.dispatcher
+            .register_callback(subscription_id, inbox_callback);
         if let Err(err) =
             self.client
                 .subscribe_signal_inbox(pgid, signal_mask, subscription_id, NOTIFY_EVENT_IN)
         {
             self.dispatcher.unregister_callback(subscription_id);
-            return Err(err);
+            return Err(client_err_to_broker_err(err));
         }
         Ok(subscription_id)
     }
 
-    pub fn unsubscribe(&self, pgid: u32, subscription_id: u64) {
+    fn unsubscribe_pgrp_signal(&self, pgid: u32, subscription_id: u64) {
         self.dispatcher.unregister_callback(subscription_id);
         if let Err(err) = self.client.unsubscribe_signal_inbox(pgid, subscription_id) {
             tracing::warn!(pgid, subscription_id, error = %err, "signal inbox unsubscribe failed");
         }
+    }
+
+    fn deliver_pgrp_signal(&self, pgid: u32, signum: u32) -> Result<(), BrokerOpError> {
+        self.client
+            .deliver_signal_inbox(pgid, signum)
+            .map_err(client_err_to_broker_err)
+    }
+}
+
+fn client_err_to_broker_err(
+    err: litebox_common_linux::fd_token_client::ClientError,
+) -> BrokerOpError {
+    match err {
+        litebox_common_linux::fd_token_client::ClientError::WouldBlock => BrokerOpError::WouldBlock,
+        litebox_common_linux::fd_token_client::ClientError::InvalidValue { .. } => {
+            BrokerOpError::InvalidValue
+        }
+        litebox_common_linux::fd_token_client::ClientError::UnknownHandle { .. } => {
+            BrokerOpError::UnknownHandle
+        }
+        _ => BrokerOpError::Io,
     }
 }
