@@ -555,16 +555,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
     }
 
-    // Phase F.5+ PE.1 Step C: gate per-pid caller_pid stamping on
-    // outbound broker control RPCs. Default off; flip via
-    // `LITEBOX_PER_PID_OWNERSHIP=1`. The wire-format substrate and
-    // per-(pid,id) broker tracking land regardless; only the
-    // shim-side syscall-handler stamping is gated.
+    // Phase F.5+ PE.1 Step C / PE.5: per-pid caller_pid stamping on
+    // outbound broker control RPCs. Default FLIPPED ON 2026-05-19
+    // after the 5-site attribution fix landed (commit 5f9463fa);
+    // PB+PXEOF+PIDF+PIDFI+EPIPE+PXP all 199/199 under
+    // LITEBOX_PER_PID_OWNERSHIP=1. Opt out via the env var = 0.
     {
         let enabled = std::env::var("LITEBOX_PER_PID_OWNERSHIP")
             .ok()
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+            .unwrap_or(true);
         litebox_shim_linux::set_per_pid_ownership_enabled(enabled);
     }
 
