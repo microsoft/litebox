@@ -61,6 +61,13 @@ use tracing::{debug, info, warn};
 /// sees EOF). Without this, a SIGKILL'd worker leaks broker
 /// pipe/eventfd/etc. refcounts and the peer worker stalls forever
 /// waiting on EOF.
+#[derive(Clone, Copy)]
+struct PeerCred {
+    pid: libc::pid_t,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
 #[derive(Default)]
 struct ConnRefTracker {
     /// Per-(caller_pid, handle_id) refcount. caller_pid=0 still occurs
@@ -83,6 +90,8 @@ struct ConnRefTracker {
     /// PE.12 diagnostic: stable per-conn ID used to correlate frames
     /// across the broker log. Set by `handle_control_connection`.
     conn_id: u64,
+    /// Host credentials of the worker process connected to this socket.
+    peer_cred: Option<PeerCred>,
 }
 
 impl ConnRefTracker {
@@ -337,6 +346,43 @@ impl ConnRefTracker {
                 "fd-token control: state-registry leak preview"
             );
         }
+    }
+}
+
+fn peer_cred(stream: &UnixStream) -> Option<PeerCred> {
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` points to writable storage of `len` bytes, `len` points to
+    // initialized socklen_t storage, and `stream.as_raw_fd()` is a valid socket fd.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 && len as usize >= std::mem::size_of::<libc::ucred>() {
+        // SAFETY: getsockopt returned success and reported a complete ucred.
+        let cred = unsafe { cred.assume_init() };
+        Some(PeerCred {
+            pid: cred.pid,
+            uid: cred.uid,
+            gid: cred.gid,
+        })
+    } else {
+        None
+    }
+}
+
+fn peer_cred_fields(peer_cred: Option<PeerCred>) -> String {
+    match peer_cred {
+        Some(cred) => format!(
+            "peer_pid={} peer_uid={} peer_gid={}",
+            cred.pid, cred.uid, cred.gid
+        ),
+        None => "peer_pid=? peer_uid=? peer_gid=?".to_string(),
     }
 }
 
@@ -641,6 +687,7 @@ pub fn handle_control_connection(
     // across the broker log. Counter is process-global, monotonic.
     static CONN_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let conn_id = CONN_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let peer_cred = peer_cred(&stream);
     if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -648,12 +695,17 @@ pub fn handle_control_connection(
             .append(true)
             .open("/tmp/rst-diag.log")
         {
-            let _ = writeln!(f, "[PE.12-diag] CONN OPEN: conn_id={conn_id}");
+            let _ = writeln!(
+                f,
+                "[PE.12-diag] CONN OPEN: conn_id={conn_id} {}",
+                peer_cred_fields(peer_cred)
+            );
         }
     }
     let mut conn_state = ConnState::new();
     let mut tracker = ConnRefTracker::new();
     tracker.conn_id = conn_id;
+    tracker.peer_cred = peer_cred;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handle_control_connection_inner(
             stream,
@@ -689,7 +741,8 @@ pub fn handle_control_connection(
         {
             let _ = writeln!(
                 f,
-                "[PE.14-diag] ts={ts} BROKER CONN HANDLER PANIC conn_id={conn_id}: {msg}"
+                "[PE.14-diag] ts={ts} BROKER CONN HANDLER PANIC conn_id={conn_id} {}: {msg}",
+                peer_cred_fields(peer_cred)
             );
         }
     }
@@ -750,6 +803,7 @@ fn handle_control_connection_inner(
     struct CloseGuard {
         conn_id: u64,
         fd: i32,
+        peer_cred: Option<PeerCred>,
     }
     impl Drop for CloseGuard {
         fn drop(&mut self) {
@@ -766,8 +820,10 @@ fn handle_control_connection_inner(
             {
                 let _ = writeln!(
                     f,
-                    "[PE.14-diag] ts={ts} CONN HANDLER EXIT conn_id={} fd={} (UnixStream about to drop)\nbacktrace:\n{bt}",
-                    self.conn_id, self.fd
+                    "[PE.14-diag] ts={ts} CONN HANDLER EXIT conn_id={} fd={} {} (UnixStream about to drop)\nbacktrace:\n{bt}",
+                    self.conn_id,
+                    self.fd,
+                    peer_cred_fields(self.peer_cred)
                 );
             }
         }
@@ -778,6 +834,7 @@ fn handle_control_connection_inner(
             use std::os::unix::io::AsRawFd;
             stream.as_raw_fd()
         },
+        peer_cred: tracker.peer_cred,
     };
     loop {
         match read_request(&stream) {
@@ -1122,8 +1179,9 @@ fn handle_control_connection_inner(
                         {
                             let _ = writeln!(
                                 f,
-                                "[PE.14-diag] CONN CLOSE conn_id={} reason=write_error: {e}",
-                                tracker.conn_id
+                                "[PE.14-diag] CONN CLOSE conn_id={} {} reason=write_error: {e}",
+                                tracker.conn_id,
+                                peer_cred_fields(tracker.peer_cred)
                             );
                         }
                     }
@@ -1141,8 +1199,9 @@ fn handle_control_connection_inner(
                     {
                         let _ = writeln!(
                             f,
-                            "[PE.14-diag] CONN CLOSE conn_id={} reason=peer_closed",
-                            tracker.conn_id
+                            "[PE.14-diag] CONN CLOSE conn_id={} {} reason=peer_closed",
+                            tracker.conn_id,
+                            peer_cred_fields(tracker.peer_cred)
                         );
                     }
                 }
@@ -1159,8 +1218,9 @@ fn handle_control_connection_inner(
                     {
                         let _ = writeln!(
                             f,
-                            "[PE.14-diag] CONN CLOSE conn_id={} reason=read_error: {e}",
-                            tracker.conn_id
+                            "[PE.14-diag] CONN CLOSE conn_id={} {} reason=read_error: {e}",
+                            tracker.conn_id,
+                            peer_cred_fields(tracker.peer_cred)
                         );
                     }
                 }
