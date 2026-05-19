@@ -158,6 +158,10 @@ pub enum Opcode {
     /// decremented across both state and process registries),
     /// then 4 reserved bytes.
     ReleaseAllForPid = 0x73,
+    /// Subscribe this worker's notification ring to pgrp signal delivery.
+    SubscribeSignalInbox = 0x74,
+    /// Remove this worker's pgrp signal delivery subscription.
+    UnsubscribeSignalInbox = 0x75,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -190,6 +194,8 @@ pub enum Opcode {
     MarkProcessExitedResponse = 0xF2,
     /// Response for [`Opcode::ReleaseAllForPid`].
     ReleaseAllForPidResponse = 0xF3,
+    SubscribeSignalInboxResponse = 0xF4,
+    UnsubscribeSignalInboxResponse = 0xF5,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -310,6 +316,8 @@ impl Opcode {
             Opcode::SubscribeProcessExit => Some(Opcode::SubscribeProcessExitResponse),
             Opcode::MarkProcessExited => Some(Opcode::MarkProcessExitedResponse),
             Opcode::ReleaseAllForPid => Some(Opcode::ReleaseAllForPidResponse),
+            Opcode::SubscribeSignalInbox => Some(Opcode::SubscribeSignalInboxResponse),
+            Opcode::UnsubscribeSignalInbox => Some(Opcode::UnsubscribeSignalInboxResponse),
             _ => None,
         }
     }
@@ -348,6 +356,8 @@ impl Opcode {
                 | Opcode::SubscribeProcessExit
                 | Opcode::MarkProcessExited
                 | Opcode::ReleaseAllForPid
+                | Opcode::SubscribeSignalInbox
+                | Opcode::UnsubscribeSignalInbox
         )
     }
 
@@ -401,6 +411,8 @@ impl TryFrom<u8> for Opcode {
             0x71 => Ok(Opcode::SubscribeProcessExit),
             0x72 => Ok(Opcode::MarkProcessExited),
             0x73 => Ok(Opcode::ReleaseAllForPid),
+            0x74 => Ok(Opcode::SubscribeSignalInbox),
+            0x75 => Ok(Opcode::UnsubscribeSignalInbox),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -431,6 +443,8 @@ impl TryFrom<u8> for Opcode {
             0xF1 => Ok(Opcode::SubscribeProcessExitResponse),
             0xF2 => Ok(Opcode::MarkProcessExitedResponse),
             0xF3 => Ok(Opcode::ReleaseAllForPidResponse),
+            0xF4 => Ok(Opcode::SubscribeSignalInboxResponse),
+            0xF5 => Ok(Opcode::UnsubscribeSignalInboxResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -872,6 +886,100 @@ pub fn parse_mark_process_exited_body(body: &[u8]) -> Result<(u64, i32), Protoco
 pub fn build_mark_process_exited_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::MarkProcessExitedResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::SubscribeSignalInbox`]:
+/// `(pgid: u32, signal_mask: u32, subscription_id: u64, events: u32, pad: 4)`.
+pub fn build_subscribe_signal_inbox_request(
+    pgid: u32,
+    signal_mask: u32,
+    subscription_id: u64,
+    events_mask: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&pgid.to_le_bytes());
+    body.extend_from_slice(&signal_mask.to_le_bytes());
+    body.extend_from_slice(&subscription_id.to_le_bytes());
+    body.extend_from_slice(&events_mask.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::SubscribeSignalInbox,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_subscribe_signal_inbox_body(
+    body: &[u8],
+) -> Result<(u32, u32, u64, u32), ProtocolError> {
+    if body.len() != 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SubscribeSignalInbox,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    let pgid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let signal_mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    let subscription_id = u64::from_le_bytes([
+        body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
+    ]);
+    let events_mask = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
+    if body[20..24].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((pgid, signal_mask, subscription_id, events_mask))
+}
+
+pub fn build_subscribe_signal_inbox_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SubscribeSignalInboxResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::UnsubscribeSignalInbox`]: `(pgid: u32, subscription_id: u64, pad: 4)`.
+pub fn build_unsubscribe_signal_inbox_request(pgid: u32, subscription_id: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&pgid.to_le_bytes());
+    body.extend_from_slice(&subscription_id.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::UnsubscribeSignalInbox,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_unsubscribe_signal_inbox_body(body: &[u8]) -> Result<(u32, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::UnsubscribeSignalInbox,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let pgid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+    let subscription_id = u64::from_le_bytes([
+        body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
+    ]);
+    if body[12..16].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((pgid, subscription_id))
+}
+
+pub fn build_unsubscribe_signal_inbox_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::UnsubscribeSignalInboxResponse,
         status: StatusCode::Ok,
         caller_pid: 0,
         body: Vec::new(),
@@ -2204,6 +2312,35 @@ mod tests {
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.opcode, Opcode::PidfdExitedResponse);
         assert!(parse_pidfd_exited_response_ok(decoded.body).unwrap());
+    }
+
+    #[test]
+    fn signal_inbox_protocol_frames_round_trip() {
+        let sub = build_subscribe_signal_inbox_request(42, 1u32 << 28, 7, 0x0001);
+        let bytes = sub.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::SubscribeSignalInbox);
+        assert_eq!(
+            parse_subscribe_signal_inbox_body(decoded.body).unwrap(),
+            (42, 1u32 << 28, 7, 0x0001)
+        );
+        assert_eq!(
+            decoded.opcode.response_for(),
+            Some(Opcode::SubscribeSignalInboxResponse)
+        );
+
+        let unsub = build_unsubscribe_signal_inbox_request(42, 7);
+        let bytes = unsub.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::UnsubscribeSignalInbox);
+        assert_eq!(
+            parse_unsubscribe_signal_inbox_body(decoded.body).unwrap(),
+            (42, 7)
+        );
+        assert_eq!(
+            decoded.opcode.response_for(),
+            Some(Opcode::UnsubscribeSignalInboxResponse)
+        );
     }
 
     #[test]
