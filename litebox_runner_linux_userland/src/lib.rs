@@ -9,6 +9,22 @@ use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
+fn monotonic_nanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer for `clock_gettime`.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+    if rc == 0 {
+        let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
+        let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
+        secs * 1_000_000_000 + nanos
+    } else {
+        0
+    }
+}
+
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
@@ -2513,6 +2529,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
 
+    eprintln!("[TIMING] litebox_shim_ready_ns={}", monotonic_nanos());
     unsafe {
         litebox_platform_linux_userland::run_thread(
             program.entrypoints,
