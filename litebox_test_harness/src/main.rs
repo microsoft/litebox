@@ -91,17 +91,24 @@ fn monotonic_nanos() -> u64 {
 
 #[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 fn main() {
-    if std::env::var_os("LITEBOX_TIMING_CONTAINER_PID1").is_some() {
-        eprintln!("[TIMING] container_pid1_started_ns={}", monotonic_nanos());
-    }
-    eprintln!("[TIMING] harness_first_output_ns={}", monotonic_nanos());
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map_or("spawn-tree", String::as_str);
     let self_exe = &args[0];
+    // Gate diagnostic prints when invoked as a PTY-test child: the PTY
+    // captures the child's stderr alongside its stdout, so any harness
+    // boilerplate contaminates PTY-test output assertions.
+    let is_pty_child = cmd.starts_with("pty-");
+
+    if !is_pty_child {
+        if std::env::var_os("LITEBOX_TIMING_CONTAINER_PID1").is_some() {
+            eprintln!("[TIMING] container_pid1_started_ns={}", monotonic_nanos());
+        }
+        eprintln!("[TIMING] harness_first_output_ns={}", monotonic_nanos());
+    }
 
     // Log the resolved binary path so stale rootfs copies are immediately
     // obvious (args[0] may differ from the real on-disk path).
-    if !cmd.starts_with("pty-")
+    if !is_pty_child
         && let Ok(real) = std::env::current_exe()
     {
         eprintln!("[harness] self_exe={self_exe} resolved={}", real.display());
