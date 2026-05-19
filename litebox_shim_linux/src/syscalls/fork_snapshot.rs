@@ -247,6 +247,17 @@ pub struct FdMetadataSnapshot {
     /// broker provider's `dup_handle` and construct the right
     /// broker-backed shim variant.
     pub broker_handle: Option<BrokerHandleSnapshot>,
+    /// Host-fd token for descriptors whose authoritative object is a real
+    /// host fd held by the broker fd-token registry. Fork-restore
+    /// materializes this token in the child worker and installs the result.
+    pub broker_fd_token: Option<BrokerFdTokenSnapshot>,
+}
+
+/// Host-fd token reference carried through `FdMetadataSnapshot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrokerFdTokenSnapshot {
+    pub token_id: u64,
+    pub host_pipe_direction: Option<crate::syscalls::host_pipe::HostPipeDirection>,
 }
 
 /// Broker handle reference carried through `FdMetadataSnapshot` so a
@@ -336,6 +347,12 @@ pub struct ForkSnapshotBrokerTransit {
         alloc::sync::Arc<dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable>,
     pub handle_id: u64,
     pub kind: BrokerHandleKind,
+}
+
+/// Rollback ledger entry for a host-fd token registered during fork-snapshot.
+pub struct ForkSnapshotFdTokenTransit {
+    pub client: alloc::sync::Arc<litebox_common_linux::fd_token_client::FdTokenClient>,
+    pub token_id: u64,
 }
 
 impl core::fmt::Debug for ForkSnapshotBrokerTransit {
@@ -1163,6 +1180,20 @@ impl FdMetadataSnapshot {
                 w.write_u8(0);
             }
         }
+        match &self.broker_fd_token {
+            Some(token) => {
+                w.write_u8(1);
+                w.write_u64(token.token_id);
+                let dir_byte = match token.host_pipe_direction {
+                    None => 0,
+                    Some(crate::syscalls::host_pipe::HostPipeDirection::Read) => 1,
+                    Some(crate::syscalls::host_pipe::HostPipeDirection::Write) => 2,
+                    Some(crate::syscalls::host_pipe::HostPipeDirection::ReadWrite) => 3,
+                };
+                w.write_u8(dir_byte);
+            }
+            None => w.write_u8(0),
+        }
     }
 
     fn read(r: &mut SnapshotReader<'_>) -> Result<Self, SnapshotDeserializeError> {
@@ -1219,6 +1250,35 @@ impl FdMetadataSnapshot {
                 ));
             }
         };
+        let broker_fd_token = match r.read_u8()? {
+            0 => None,
+            1 => {
+                let token_id = r.read_u64()?;
+                let dir_byte = r.read_u8()?;
+                let host_pipe_direction = match dir_byte {
+                    0 => None,
+                    1 => Some(crate::syscalls::host_pipe::HostPipeDirection::Read),
+                    2 => Some(crate::syscalls::host_pipe::HostPipeDirection::Write),
+                    3 => Some(crate::syscalls::host_pipe::HostPipeDirection::ReadWrite),
+                    other => {
+                        return Err(SnapshotDeserializeError::InvalidEnum(
+                            "BrokerFdTokenSnapshot::host_pipe_direction",
+                            other,
+                        ));
+                    }
+                };
+                Some(BrokerFdTokenSnapshot {
+                    token_id,
+                    host_pipe_direction,
+                })
+            }
+            other => {
+                return Err(SnapshotDeserializeError::InvalidEnum(
+                    "FdMetadataSnapshot::broker_fd_token option tag",
+                    other,
+                ));
+            }
+        };
         Ok(Self {
             host_stdio_source_fd,
             is_host_tty_alias,
@@ -1228,6 +1288,7 @@ impl FdMetadataSnapshot {
             anon_ino,
             diroff,
             broker_handle,
+            broker_fd_token,
         })
     }
 }
@@ -1559,6 +1620,7 @@ mod tests {
                             anon_ino: None,
                             diroff: None,
                             broker_handle: None,
+                            broker_fd_token: None,
                         },
                     },
                     FdEntrySnapshot {
@@ -1576,6 +1638,7 @@ mod tests {
                             anon_ino: None,
                             diroff: None,
                             broker_handle: None,
+                            broker_fd_token: None,
                         },
                     },
                     FdEntrySnapshot {
@@ -1593,6 +1656,7 @@ mod tests {
                             anon_ino: Some(12345),
                             diroff: Some(42),
                             broker_handle: None,
+                            broker_fd_token: None,
                         },
                     },
                     // fd 4 is a dup of fd 3 — shares the same object_id (OFD aliasing).
@@ -1611,6 +1675,7 @@ mod tests {
                             anon_ino: None,
                             diroff: None,
                             broker_handle: None,
+                            broker_fd_token: None,
                         },
                     },
                 ],

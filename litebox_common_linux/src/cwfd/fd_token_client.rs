@@ -43,7 +43,7 @@ use crate::fd_token_protocol::{
 };
 use std::format;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -168,6 +168,24 @@ impl FdTokenClient {
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }
+    }
+
+    /// Duplicates a raw host fd and registers the duplicate with the broker.
+    pub fn register_dup_raw_fd(&self, raw_fd: i32) -> Result<u64, ClientError> {
+        // SAFETY: fcntl does not dereference pointers for F_DUPFD_CLOEXEC; raw_fd is
+        // supplied by the caller and errors are reported via the return value.
+        let duped = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duped < 0 {
+            return Err(ClientError::Io(io::Error::last_os_error()));
+        }
+        // SAFETY: `duped` is a fresh fd returned by fcntl above.
+        let owned = unsafe { OwnedFd::from_raw_fd(duped) };
+        self.register(owned)
+    }
+
+    /// Materializes a broker token and returns ownership as a raw host fd.
+    pub fn materialize_raw_fd(&self, handle_id: u64) -> Result<i32, ClientError> {
+        self.materialize(handle_id).map(OwnedFd::into_raw_fd)
     }
 
     /// Decrements the registry refcount for `handle_id`. When the
