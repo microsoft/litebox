@@ -150,6 +150,23 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .descriptor_table_mut()
                 .remove(&old_sock);
             rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_host) =
+            rds.fd_consume_raw_integer::<syscalls::host_pipe::HostPipeSubsystem>(guest_fd)
+        {
+            drop(rds);
+            let entry = self
+                .task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_host);
+            if let Some(entry) = entry {
+                let host_fd = entry.take_fd();
+                if host_fd >= 0 {
+                    self.task.global.platform.close_host_fd(host_fd);
+                }
+            }
+            rds = files.raw_descriptor_store.write();
         }
 
         // Install the HostPipe FD at the same guest fd number.
@@ -217,6 +234,23 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .litebox
                 .descriptor_table_mut()
                 .remove(&old_sock);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_host) =
+            rds.fd_consume_raw_integer::<syscalls::host_pipe::HostPipeSubsystem>(guest_fd)
+        {
+            drop(rds);
+            let entry = self
+                .task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_host);
+            if let Some(entry) = entry {
+                let host_fd = entry.take_fd();
+                if host_fd >= 0 {
+                    self.task.global.platform.close_host_fd(host_fd);
+                }
+            }
             rds = files.raw_descriptor_store.write();
         }
 
@@ -1531,6 +1565,49 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 debug_assert!(
                     success,
                     "eventfd fd slot {} occupied during restore",
+                    entry.fd
+                );
+            }
+        }
+
+        // Restore host-fd tokens for HostPipeFd entries. Snapshot capture
+        // registered a duplicated host fd with the broker fd-token registry;
+        // this worker materializes a fresh fd and then releases the token's
+        // transient registry reference.
+        {
+            use syscalls::fork_snapshot::FdClass;
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::Pipe {
+                    continue;
+                }
+                let Some(token) = entry.metadata.broker_fd_token else {
+                    continue;
+                };
+                let Some(direction) = token.host_pipe_direction else {
+                    continue;
+                };
+                let Some(client) = litebox_common_linux::fd_token_client::global_client() else {
+                    continue;
+                };
+                let Ok(raw_fd) = client.materialize_raw_fd(token.token_id) else {
+                    let _ = client.release(token.token_id);
+                    continue;
+                };
+                let _ = client.release(token.token_id);
+                let host_entry = syscalls::host_pipe::HostPipeFd::new(raw_fd, direction);
+                let typed = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<syscalls::host_pipe::HostPipeSubsystem>(host_entry);
+                let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
+                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                debug_assert!(
+                    success,
+                    "host-token fd slot {} occupied during restore",
                     entry.fd
                 );
             }
@@ -4426,6 +4503,8 @@ struct ForkContext {
     /// failure path we drain this list and call `release` on each
     /// to undo the dup so the broker refcount returns to baseline.
     fork_snapshot_broker_transit: Vec<crate::syscalls::fork_snapshot::ForkSnapshotBrokerTransit>,
+    /// Rollback list for host-fd tokens registered for fork-restore.
+    fork_snapshot_fd_token_transit: Vec<crate::syscalls::fork_snapshot::ForkSnapshotFdTokenTransit>,
 }
 
 const SHELL_WRITE_SCAN_LEN: usize = 1024;

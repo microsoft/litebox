@@ -2745,6 +2745,7 @@ impl<FS: ShimFS> Task<FS> {
                 parent_mux_pipe_pair_ids: self.mux_pipe_pair_ids.borrow().clone(),
                 parent_is_delayed_fork: self.delayed_fork_pending.get(),
                 fork_snapshot_broker_transit: Vec::new(),
+                fork_snapshot_fd_token_transit: Vec::new(),
             };
             (
                 self.process_state.clone(),                  // share parent's PM
@@ -4519,6 +4520,9 @@ impl<FS: ShimFS> Task<FS> {
             for transit in fc.fork_snapshot_broker_transit.drain(..) {
                 transit.releaser.release(transit.handle_id);
             }
+            for transit in fc.fork_snapshot_fd_token_transit.drain(..) {
+                let _ = transit.client.release(transit.token_id);
+            }
             *this.fork_context.borrow_mut() = Some(fc);
         };
 
@@ -4652,7 +4656,11 @@ impl<FS: ShimFS> Task<FS> {
             "[DELAYED-FORK] pid={}: snapshot_fs",
             self.pid
         );
-        let fd_table = self.snapshot_fd_table(&mut reject, &mut fc.fork_snapshot_broker_transit);
+        let fd_table = self.snapshot_fd_table(
+            &mut reject,
+            &mut fc.fork_snapshot_broker_transit,
+            &mut fc.fork_snapshot_fd_token_transit,
+        );
         let memory = self.snapshot_memory(&mut reject);
 
         // Check rejection gate.
@@ -6671,7 +6679,13 @@ impl<FS: ShimFS> Task<FS> {
         let fs = self.snapshot_fs();
         let mut _true_fork_transit: Vec<super::fork_snapshot::ForkSnapshotBrokerTransit> =
             Vec::new();
-        let fd_table = self.snapshot_fd_table(&mut reject, &mut _true_fork_transit);
+        let mut _true_fork_fd_token_transit: Vec<super::fork_snapshot::ForkSnapshotFdTokenTransit> =
+            Vec::new();
+        let fd_table = self.snapshot_fd_table(
+            &mut reject,
+            &mut _true_fork_transit,
+            &mut _true_fork_fd_token_transit,
+        );
         let memory = self.snapshot_memory(&mut reject);
 
         // Unpark sibling threads — snapshot is complete.
@@ -6689,6 +6703,9 @@ impl<FS: ShimFS> Task<FS> {
                 child_pid,
                 reject,
             );
+            for transit in _true_fork_fd_token_transit.drain(..) {
+                let _ = transit.client.release(transit.token_id);
+            }
             cleanup(self, child_as_id, child_process_id);
             return Err(Errno::ENOSYS);
         }
@@ -6728,6 +6745,9 @@ impl<FS: ShimFS> Task<FS> {
                     child_pid,
                     e,
                 );
+                for transit in _true_fork_fd_token_transit.drain(..) {
+                    let _ = transit.client.release(transit.token_id);
+                }
                 cleanup(self, child_as_id, child_process_id);
                 return Err(Errno::ENOSYS);
             }
@@ -6752,6 +6772,9 @@ impl<FS: ShimFS> Task<FS> {
                     child_pid,
                     err,
                 );
+                for transit in _true_fork_fd_token_transit.drain(..) {
+                    let _ = transit.client.release(transit.token_id);
+                }
                 cleanup(self, child_as_id, child_process_id);
                 return Err(Errno::ENOMEM);
             }
@@ -7011,10 +7034,12 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         reject: &mut super::fork_snapshot::ForkRejectReasons,
         broker_transit: &mut Vec<super::fork_snapshot::ForkSnapshotBrokerTransit>,
+        fd_token_transit: &mut Vec<super::fork_snapshot::ForkSnapshotFdTokenTransit>,
     ) -> super::fork_snapshot::FdTableSnapshot {
         use super::fork_snapshot::{
-            BrokerHandleKind, BrokerHandleSnapshot, FdClass, FdEntrySnapshot, FdMetadataSnapshot,
-            ForkRejectReason, ForkSnapshotBrokerTransit,
+            BrokerFdTokenSnapshot, BrokerHandleKind, BrokerHandleSnapshot, FdClass,
+            FdEntrySnapshot, FdMetadataSnapshot, ForkRejectReason, ForkSnapshotBrokerTransit,
+            ForkSnapshotFdTokenTransit,
         };
 
         let files = self.files.borrow();
@@ -7447,8 +7472,40 @@ impl<FS: ShimFS> Task<FS> {
                 None
             };
 
+            let broker_fd_token_meta: Option<BrokerFdTokenSnapshot> = if let Ok(typed) =
+                rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
+            {
+                let direction =
+                    dt.with_entry(&typed, |hp: &super::host_pipe::HostPipeFd| hp.direction);
+                let raw_host_fd =
+                    dt.with_entry(&typed, |hp: &super::host_pipe::HostPipeFd| hp.raw_fd());
+                match (
+                    direction,
+                    raw_host_fd,
+                    litebox_common_linux::fd_token_client::global_client(),
+                ) {
+                    (Some(direction), Some(raw_host_fd), Some(client)) if raw_host_fd >= 0 => {
+                        match client.register_dup_raw_fd(raw_host_fd) {
+                            Ok(token_id) => {
+                                fd_token_transit
+                                    .push(ForkSnapshotFdTokenTransit { client, token_id });
+                                Some(BrokerFdTokenSnapshot {
+                                    token_id,
+                                    host_pipe_direction: Some(direction),
+                                })
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             let mut metadata = terminal_meta.unwrap_or_default();
             metadata.broker_handle = broker_handle_meta;
+            metadata.broker_fd_token = broker_fd_token_meta;
 
             entries.push(FdEntrySnapshot {
                 fd: raw_fd,
