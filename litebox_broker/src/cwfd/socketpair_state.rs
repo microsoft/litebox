@@ -21,7 +21,7 @@
 
 use core::any::Any;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
@@ -85,6 +85,17 @@ pub struct SocketPairInner {
     /// in `buffer_ab`, B's close).
     subject_a: SubscriptionList,
     subject_b: SubscriptionList,
+    /// PE.14 invariant counters (mirrors PE.14 PIPE READ-END DATA LOSS
+    /// in pipe_state.rs). Track per-direction successful (non-zero-byte)
+    /// reads and writes so SocketPairEnd::drop can distinguish real
+    /// data loss (writes>0 AND reads>0 AND unread>0) from legitimate
+    /// non-drain (reader never tried).
+    /// `_ab_*` = direction A→B (A writes, B reads).
+    /// `_ba_*` = direction B→A (B writes, A reads).
+    ab_writes: AtomicU64,
+    ab_reads: AtomicU64,
+    ba_writes: AtomicU64,
+    ba_reads: AtomicU64,
 }
 
 impl SocketPairInner {
@@ -103,6 +114,10 @@ impl SocketPairInner {
             atomic_write_size,
             subject_a: SubscriptionList::new(),
             subject_b: SubscriptionList::new(),
+            ab_writes: AtomicU64::new(0),
+            ab_reads: AtomicU64::new(0),
+            ba_writes: AtomicU64::new(0),
+            ba_reads: AtomicU64::new(0),
         }
     }
 
@@ -163,6 +178,12 @@ impl SocketPairInner {
         if writable && peer_open {
             peer_subject.notify(NOTIFY_EVENT_OUT);
         }
+        if n > 0 {
+            match endpoint {
+                SocketPairEndpoint::A => self.ba_reads.fetch_add(1, Ordering::Relaxed),
+                SocketPairEndpoint::B => self.ab_reads.fetch_add(1, Ordering::Relaxed),
+            };
+        }
         Ok(out)
     }
 
@@ -191,6 +212,12 @@ impl SocketPairInner {
         if has_data {
             // Wake peer's IN subscribers (data now available to them).
             peer_subject.notify(NOTIFY_EVENT_IN);
+        }
+        if n > 0 {
+            match endpoint {
+                SocketPairEndpoint::A => self.ab_writes.fetch_add(1, Ordering::Relaxed),
+                SocketPairEndpoint::B => self.ba_writes.fetch_add(1, Ordering::Relaxed),
+            };
         }
         Ok(n)
     }
@@ -279,6 +306,71 @@ impl Drop for SocketPairEnd {
                 self.inner.a_open.load(Ordering::Acquire),
                 self.inner.b_open.load(Ordering::Acquire)
             );
+        }
+        // PE.14 invariant (mirrors PIPE READ-END DATA LOSS):
+        //   When endpoint X drops, X's INBOUND buffer holds bytes that
+        //   the peer wrote but X never read. Check (writes_into_X>0
+        //   AND reads_by_X>0 AND unread>0) for real data loss.
+        //   Soft case (reads==0) = X never read; logged but not assert.
+        let (inbound_buf_mutex, writes_into_x, reads_by_x, dir_label) = match self.endpoint {
+            // A's inbound = buffer_ba; B wrote into it (ba_writes); A read from it (ba_reads).
+            SocketPairEndpoint::A => (
+                &self.inner.buffer_ba,
+                &self.inner.ba_writes,
+                &self.inner.ba_reads,
+                "B->A",
+            ),
+            // B's inbound = buffer_ab; A wrote into it (ab_writes); B read from it (ab_reads).
+            SocketPairEndpoint::B => (
+                &self.inner.buffer_ab,
+                &self.inner.ab_writes,
+                &self.inner.ab_reads,
+                "A->B",
+            ),
+        };
+        let unread = inbound_buf_mutex
+            .lock()
+            .expect("SocketPairInner poisoned")
+            .buf
+            .len();
+        let writes = writes_into_x.load(Ordering::Relaxed);
+        let reads = reads_by_x.load(Ordering::Relaxed);
+        if unread > 0 && writes > 0 && reads > 0 {
+            let msg = std::format!(
+                "SOCKETPAIR DATA LOSS direction={dir_label} endpoint={:?}: \
+                 unread={unread} writes={writes} reads={reads} \
+                 (reader partially drained then closed without finishing)",
+                self.endpoint
+            );
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(f, "[PE.14-invariant] ts={ts} {msg}");
+            }
+            // Always-on assert (matches PE.9 + PE.14 PIPE pattern).
+            assert!(false, "{msg}");
+        } else if unread > 0 && writes > 0 {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.14-diag] ts={ts} SOCKETPAIR soft-unread direction={dir_label} endpoint={:?}: unread={unread} writes={writes} reads=0 (reader never tried)",
+                    self.endpoint
+                );
+            }
         }
         match self.endpoint {
             SocketPairEndpoint::A => {
