@@ -80,6 +80,12 @@ impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 #[derive(Clone)]
 pub(crate) struct MuxPtySlaveFd;
 
+#[derive(Clone, Copy)]
+pub(crate) struct BrokerPtyHandles {
+    pub(crate) master: u64,
+    pub(crate) slave: u64,
+}
+
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     #[cfg(debug_assertions)]
@@ -674,6 +680,7 @@ impl LinuxShimBuilder {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
+            broker_pty_handles: litebox::sync::Mutex::new(BTreeMap::new()),
             pgrp_signal_subscriptions: litebox::sync::Mutex::new(BTreeMap::new()),
             process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             host_tty_foreground_pgrp: litebox::sync::Mutex::new(
@@ -4151,6 +4158,8 @@ struct GlobalState<FS: ShimFS> {
     /// SIGCHLD) between processes owned by this host. Entries are consumed by
     /// the target task during signal processing.
     cross_process_signals: litebox::sync::Mutex<Platform, Vec<CrossProcessSignal>>,
+    /// Broker PTY handles keyed by the local PTY index allocated by the device FS.
+    broker_pty_handles: litebox::sync::Mutex<Platform, BTreeMap<u32, BrokerPtyHandles>>,
     /// PR-3 single-worker-pgrp scope: pgids this worker has subscribed to using
     /// its local ProcessRegistry view. Cross-worker setpgid reconciliation is PR-4.
     pgrp_signal_subscriptions: litebox::sync::Mutex<Platform, BTreeMap<u32, u64>>,
@@ -4206,6 +4215,28 @@ impl<FS: ShimFS> litebox_common_linux::broker_pgrp_signal_provider::BrokerPgrpSi
 }
 
 impl<FS: ShimFS> GlobalState<FS> {
+    fn broker_pty_handle(&self, pty_idx: u32, is_master: bool) -> Result<u64, Errno> {
+        if let Some(handles) = self.broker_pty_handles.lock().get(&pty_idx).copied() {
+            return Ok(if is_master {
+                handles.master
+            } else {
+                handles.slave
+            });
+        }
+        let provider = syscalls::eventfd::broker_pty_provider().ok_or(Errno::EIO)?;
+        let pair = provider.create_pty().map_err(|_| Errno::EIO)?;
+        let handles = BrokerPtyHandles {
+            master: pair.master_handle,
+            slave: pair.slave_handle,
+        };
+        self.broker_pty_handles.lock().insert(pty_idx, handles);
+        Ok(if is_master {
+            handles.master
+        } else {
+            handles.slave
+        })
+    }
+
     fn ensure_pgrp_signal_subscription(self: &Arc<Self>, pgid: u32) {
         let Some(provider) = syscalls::eventfd::broker_pgrp_signal_provider() else {
             return;
