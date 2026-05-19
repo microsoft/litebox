@@ -1036,6 +1036,23 @@ impl<FS: ShimFS> UnixDatagramInner<FS> {
         self.recv_channel = Some(recv_channel);
         Ok(())
     }
+
+    fn shutdown(&self, how: ShutdownHow) {
+        let mut events = Events::empty();
+        if how.affects_read()
+            && let Some(recv_channel) = &self.recv_channel
+            && recv_channel.shutdown()
+        {
+            events |= Events::IN | Events::RDHUP;
+        }
+        if how.affects_write()
+            && let Some((connected_send_channel, _)) = &self.connected_send_channel
+            && connected_send_channel.shutdown()
+        {
+            events |= Events::OUT | Events::HUP;
+        }
+        self.pollee.notify_observers(events);
+    }
 }
 
 impl<FS: ShimFS> UnixDatagram<FS> {
@@ -1220,21 +1237,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
     }
 
     fn shutdown(&self, how: ShutdownHow) {
-        let inner = self.inner.read();
-        let mut events = Events::empty();
-        if how.affects_read()
-            && let Some(recv_channel) = &inner.recv_channel
-        {
-            recv_channel.shutdown();
-            events |= Events::IN | Events::RDHUP;
-        }
-        if how.affects_write()
-            && let Some((connected_send_channel, _)) = &inner.connected_send_channel
-        {
-            connected_send_channel.shutdown();
-            events |= Events::OUT | Events::HUP;
-        }
-        inner.pollee.notify_observers(events);
+        self.inner.read().shutdown(how);
     }
 }
 

@@ -23,11 +23,14 @@ macro_rules! common_functions_for_channel {
         ///
         /// On the first transition, wakes the peer's pollee so a
         /// peer blocked in send/recv unblocks immediately.
-        pub(crate) fn shutdown(&self) {
+        pub(crate) fn shutdown(&self) -> bool {
             if self.endpoint.shutdown() {
                 if let Some(peer) = self.peer.upgrade() {
                     peer.pollee.notify_observers(litebox::event::Events::HUP);
                 }
+                true
+            } else {
+                false
             }
         }
 
