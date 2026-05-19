@@ -895,15 +895,10 @@ impl<FS: ShimFS> Task<FS> {
         // `sys_exit`/`sys_exit_group` only mark the task as terminated; actual
         // fd cleanup runs later from Task drop, after the syscall-level
         // caller_pid guard has unwound. Re-stamp this cleanup so per-pid broker
-        // releases hit the exiting process's bucket instead of the ambient
-        // caller_pid=0 fallback picking another inherited owner.
-        let _caller_pid_guard = if crate::per_pid_ownership_enabled() {
-            Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
-                self.process_id.0,
-            ))
-        } else {
-            None
-        };
+        // releases hit the exiting process's bucket.
+        let _caller_pid_guard = litebox_common_linux::fd_token_client::set_caller_pid_scope(
+            self.process_id.0,
+        );
 
         // If this task was migrated to a remote worker host via delayed fork,
         // all exit notification and cleanup was handled by commit_delayed_fork
@@ -2423,19 +2418,13 @@ impl<FS: ShimFS> Task<FS> {
                 //
                 // **Gated on per_pid_ownership_enabled()** (PE.10 fix):
                 // stamping child_pid here while releases run with
-                // caller_pid=0 (gate off, ambient fallback path)
-                // mis-attributes the tracker bookkeeping and causes
-                // ReleaseAllForPid(child_pid) at child exit to
-                // double-release the broker state. When the gate is
-                // off, leave caller_pid=0 so dup_handle and release
-                // both target the same (0, id) bucket.
-                let _emit_scope = if crate::per_pid_ownership_enabled() {
-                    Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
-                        child_pid_u32,
-                    ))
-                } else {
-                    None
-                };
+                // PE.5: stamp dup_handle RPCs with child_pid so the
+                // broker tracker records inherited refs under the
+                // child's bucket, balancing the
+                // ReleaseAllForPid(child_pid) at child exit.
+                let _emit_scope = litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                    child_pid_u32,
+                );
                 Arc::new(
                     self.files
                         .borrow()
@@ -2797,17 +2786,13 @@ impl<FS: ShimFS> Task<FS> {
                 }),
             });
             let child_files_state = {
-                // Phase F.5+ PE.5: stamp caller_pid = child_pid for all
-                // broker dup_handle RPCs emitted during clone_for_fork's
-                // on_dup invocations. Gated on per_pid_ownership_enabled()
-                // — see PE.10 comment at the vfork branch above for why.
-                let _emit_scope = if crate::per_pid_ownership_enabled() {
-                    Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
-                        child_pid_u32,
-                    ))
-                } else {
-                    None
-                };
+                // PE.5: stamp caller_pid = child_pid for all broker
+                // dup_handle RPCs emitted during clone_for_fork's
+                // on_dup invocations, so the inherited refs land in
+                // the child's per-pid bucket.
+                let _emit_scope = litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                    child_pid_u32,
+                );
                 Arc::new(
                     self.files
                         .borrow()
@@ -4530,13 +4515,9 @@ impl<FS: ShimFS> Task<FS> {
         // list to release in-flight dup'd handles so the broker
         // refcount returns to baseline.
         let put_fc_back = |this: &Self, mut fc: crate::ForkContext| {
-            let _caller_pid_guard = if crate::per_pid_ownership_enabled() {
-                Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
-                    this.process_id.0,
-                ))
-            } else {
-                None
-            };
+            let _caller_pid_guard = litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                this.process_id.0,
+            );
             for transit in fc.fork_snapshot_broker_transit.drain(..) {
                 transit.releaser.release(transit.handle_id);
             }
@@ -6563,14 +6544,10 @@ impl<FS: ShimFS> Task<FS> {
                 // refs now that the child has exited and no longer
                 // needs the bridge state alive. These dup_handles were
                 // emitted on behalf of the child pid, so the asynchronous
-                // waiter must re-stamp the same caller_pid before releasing.
-                let _caller_pid_guard = if crate::per_pid_ownership_enabled() {
-                    Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
-                        child_proc_id.0,
-                    ))
-                } else {
-                    None
-                };
+                // waiter re-stamps the same caller_pid before releasing.
+                let _caller_pid_guard = litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                    child_proc_id.0,
+                );
                 for transit in transit_refs {
                     transit.releaser.release(transit.handle_id);
                 }

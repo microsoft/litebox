@@ -201,7 +201,6 @@ fn docker_run_base_args() -> Vec<String> {
     for var in [
         "LITEBOX_EAGER_BROKER_PIPE",
         "LITEBOX_EAGER_BROKER_SOCKETPAIR",
-        "LITEBOX_PER_PID_OWNERSHIP",
         "LITEBOX_PE10_DIAG",
         "LITEBOX_PE5_DIAG",
         "LITEBOX_CLEANUP_DELAY_MS",

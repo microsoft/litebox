@@ -63,11 +63,12 @@ use tracing::{debug, info, warn};
 /// waiting on EOF.
 #[derive(Default)]
 struct ConnRefTracker {
-    /// Per-(caller_pid, handle_id) refcount. caller_pid=0 is the
-    /// "unspecified / legacy / pre-PE.1" bucket; today's shims send
-    /// caller_pid=0 when LITEBOX_PER_PID_OWNERSHIP is unset, and from
-    /// async-Drop paths in any configuration. Per-pid lookups
-    /// degenerate to the (0, id) bucket in that case.
+    /// Per-(caller_pid, handle_id) refcount. caller_pid=0 still occurs
+    /// for async-Drop paths that fire after the syscall-level
+    /// caller_pid scope has unwound (PE.5 exit-cleanup path
+    /// re-stamps these explicitly). Per-pid lookups degenerate to the
+    /// (0, id) bucket only when async-drop occurs outside any
+    /// process scope.
     state_refs: HashMap<(u32, u64), u32>,
     process_refs: HashMap<(u32, u64), u32>,
     /// PE.9 diagnostic: set to true the first time this conn sends a
@@ -76,11 +77,8 @@ struct ConnRefTracker {
     /// the shim stamps caller_pid in some paths but not others on
     /// the same worker. That's a bug class (shim async-drop or
     /// otherwise-unscoped code path). Logged loudly so the gap is
-    /// hunted down. When all such paths are fixed and
-    /// LITEBOX_PER_PID_OWNERSHIP becomes the default, the
-    /// ambient-fallback branch in record_release / owns_* should
-    /// be deleted and caller_pid=0 promoted to a hard protocol
-    /// violation.
+    /// hunted down. Future: caller_pid=0 should be promoted to a
+    /// hard protocol violation once async-drop paths are audited.
     seen_nonzero_caller_pid: bool,
     /// PE.12 diagnostic: stable per-conn ID used to correlate frames
     /// across the broker log. Set by `handle_control_connection`.

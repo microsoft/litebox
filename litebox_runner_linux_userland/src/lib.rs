@@ -555,19 +555,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
     }
 
-    // Phase F.5+ PE.1 Step C / PE.5: per-pid caller_pid stamping on
-    // outbound broker control RPCs. Default FLIPPED ON 2026-05-19
-    // after the 5-site attribution fix landed (commit 5f9463fa);
-    // PB+PXEOF+PIDF+PIDFI+EPIPE+PXP all 199/199 under
-    // LITEBOX_PER_PID_OWNERSHIP=1. Opt out via the env var = 0.
-    {
-        let enabled = std::env::var("LITEBOX_PER_PID_OWNERSHIP")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(true);
-        litebox_shim_linux::set_per_pid_ownership_enabled(enabled);
-    }
-
     // Phase B-Step8c: if --fd-token-broker is supplied, connect to
     // the broker's fd-token control socket and register a
     // BrokerEventfdProvider so subsequent sys_eventfd2 calls produce
@@ -1245,13 +1232,9 @@ fn task_params_with_overrides(
 fn set_broker_fd_bridge_caller_pid_scope(
     task_params: litebox_common_linux::TaskParams,
 ) -> Option<litebox_common_linux::fd_token_client::CallerPidScope> {
-    if litebox_shim_linux::per_pid_ownership_enabled() {
-        u32::try_from(task_params.pid)
-            .ok()
-            .map(litebox_common_linux::fd_token_client::set_caller_pid_scope)
-    } else {
-        None
-    }
+    u32::try_from(task_params.pid)
+        .ok()
+        .map(litebox_common_linux::fd_token_client::set_caller_pid_scope)
 }
 
 fn worker_task_params(cli_args: &CliArgs) -> litebox_common_linux::TaskParams {
