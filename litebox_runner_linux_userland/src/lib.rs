@@ -1028,9 +1028,11 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         );
         let combined_fs = std::sync::Arc::new(combined);
 
+        let task_params =
+            task_override.unwrap_or_else(|| task_params_with_overrides(cli_args, platform));
         let program = shim.load_program_with_exec_filename(
             combined_fs,
-            task_override.unwrap_or_else(|| task_params_with_overrides(cli_args, platform)),
+            task_params,
             load_prog_path,
             exec_prog_path,
             argv,
@@ -1080,6 +1082,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         // Install broker-backed shim fd entries for fds inherited across
         // the cross-binary-type exec boundary (Phase 2.F follow-up,
         // extended in Phase C.3 to handle pipe).
+        let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
         for spec in &cli_args.broker_fd_bridge {
             let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
                 parse_broker_fd_bridge_spec(spec)?;
@@ -1155,9 +1158,10 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     );
     let combined_fs = std::sync::Arc::new(combined);
 
+    let task_params = task_override.unwrap_or_else(|| platform.init_task());
     let program = shim.load_program_with_exec_filename(
         combined_fs,
-        task_override.unwrap_or_else(|| platform.init_task()),
+        task_params,
         load_prog_path,
         exec_prog_path,
         argv,
@@ -1181,6 +1185,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // Install broker-backed shim fd entries for fds inherited across
     // the cross-binary-type exec boundary (Phase 2.F follow-up,
     // extended in Phase C.3 to handle pipe).
+    let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
     for spec in &cli_args.broker_fd_bridge {
         let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
             parse_broker_fd_bridge_spec(spec)?;
@@ -1237,6 +1242,18 @@ fn task_params_with_overrides(
 }
 
 #[allow(clippy::similar_names)]
+fn set_broker_fd_bridge_caller_pid_scope(
+    task_params: litebox_common_linux::TaskParams,
+) -> Option<litebox_common_linux::fd_token_client::CallerPidScope> {
+    if litebox_shim_linux::per_pid_ownership_enabled() {
+        u32::try_from(task_params.pid)
+            .ok()
+            .map(litebox_common_linux::fd_token_client::set_caller_pid_scope)
+    } else {
+        None
+    }
+}
+
 fn worker_task_params(cli_args: &CliArgs) -> litebox_common_linux::TaskParams {
     let pid: i32 = cli_args.guest_pid.unwrap_or(1);
     let ppid: i32 = cli_args.guest_ppid.unwrap_or(0);
@@ -2474,6 +2491,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         // Install broker-backed shim fd entries for fds inherited across
         // the cross-binary-type exec boundary (Phase 2.F follow-up,
         // extended in Phase C.3 to handle pipe).
+        let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(guest_task);
         for spec in &cli_args.broker_fd_bridge {
             let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
                 parse_broker_fd_bridge_spec(spec)?;

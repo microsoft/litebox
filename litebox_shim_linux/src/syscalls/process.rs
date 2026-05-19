@@ -4530,6 +4530,13 @@ impl<FS: ShimFS> Task<FS> {
         // list to release in-flight dup'd handles so the broker
         // refcount returns to baseline.
         let put_fc_back = |this: &Self, mut fc: crate::ForkContext| {
+            let _caller_pid_guard = if crate::per_pid_ownership_enabled() {
+                Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                    this.process_id.0,
+                ))
+            } else {
+                None
+            };
             for transit in fc.fork_snapshot_broker_transit.drain(..) {
                 transit.releaser.release(transit.handle_id);
             }
@@ -6554,7 +6561,16 @@ impl<FS: ShimFS> Task<FS> {
 
                 // Release the parent's emit-side dup_handle transit
                 // refs now that the child has exited and no longer
-                // needs the bridge state alive.
+                // needs the bridge state alive. These dup_handles were
+                // emitted on behalf of the child pid, so the asynchronous
+                // waiter must re-stamp the same caller_pid before releasing.
+                let _caller_pid_guard = if crate::per_pid_ownership_enabled() {
+                    Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                        child_proc_id.0,
+                    ))
+                } else {
+                    None
+                };
                 for transit in transit_refs {
                     transit.releaser.release(transit.handle_id);
                 }
