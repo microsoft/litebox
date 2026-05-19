@@ -2153,6 +2153,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Alarm {
         seconds: u32,
     },
+    Pause,
     SetITimer {
         which: IntervalTimer,
         new_value: Platform::RawConstPointer<ItimerVal>,
@@ -2623,6 +2624,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::pause => SyscallRequest::Pause,
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

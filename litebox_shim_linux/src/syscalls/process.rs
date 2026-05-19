@@ -1174,6 +1174,14 @@ impl<FS: ShimFS> Task<FS> {
         Ok(remaining)
     }
 
+    /// Handle syscall `pause`.
+    pub(crate) fn sys_pause(&self) -> Result<(), Errno> {
+        match self.wait_cx().sleep() {
+            WaitError::Interrupted => Err(Errno::EINTR),
+            WaitError::TimedOut => unreachable!("pause sleep has no deadline"),
+        }
+    }
+
     /// Handle syscall `getpid`.
     pub(crate) fn sys_getpid(&self) -> i32 {
         self.pid
