@@ -19,6 +19,8 @@ use litebox_common_linux::fd_token_protocol::{
     decode, parse_create_pidfd_response_ok, parse_create_pty_response_ok, parse_handle_body,
 };
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroU32;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -68,16 +70,63 @@ struct PeerCred {
     gid: libc::gid_t,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallerScope {
+    /// Syscall-stamped guest pid; non-zero by construction.
+    Owned(NonZeroU32),
+    /// Async-Drop / unscoped release path; falls back to "any pid on this conn".
+    Ambient,
+}
+
+impl Hash for CallerScope {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Preserve the old `(caller_pid: u32, id)` HashMap bucket order so
+        // Ambient release keeps choosing the same arbitrary bucket.
+        self.to_wire().hash(state);
+    }
+}
+
+impl CallerScope {
+    fn from_wire(pid: u32) -> Self {
+        match NonZeroU32::new(pid) {
+            Some(pid) => Self::Owned(pid),
+            None => Self::Ambient,
+        }
+    }
+
+    fn to_wire(self) -> u32 {
+        match self {
+            Self::Owned(pid) => pid.get(),
+            Self::Ambient => 0,
+        }
+    }
+
+    fn assert_or_diagnose(&mut self, seen_owned_caller_pid: &mut bool) -> Self {
+        match *self {
+            Self::Owned(_) => *seen_owned_caller_pid = true,
+            Self::Ambient if *seen_owned_caller_pid => {
+                // TODO: future hardening — flip this diagnostic to Err once
+                // async-Drop / unscoped release paths have explicit ownership.
+                warn!(
+                    "fd-token control: PE.9 PER-PID GAP: caller_pid=0 on a conn that \
+                     previously sent non-zero pids — shim has an unscoped release \
+                     path. Operation continues via ambient fallback."
+                );
+            }
+            Self::Ambient => {}
+        }
+        *self
+    }
+}
+
 #[derive(Default)]
 struct ConnRefTracker {
-    /// Per-(caller_pid, handle_id) refcount. caller_pid=0 still occurs
-    /// for async-Drop paths that fire after the syscall-level
-    /// caller_pid scope has unwound (PE.5 exit-cleanup path
-    /// re-stamps these explicitly). Per-pid lookups degenerate to the
-    /// (0, id) bucket only when async-drop occurs outside any
-    /// process scope.
-    state_refs: HashMap<(u32, u64), u32>,
-    process_refs: HashMap<(u32, u64), u32>,
+    /// Per-(caller scope, handle_id) refcount. Wire caller_pid=0 decodes
+    /// to [`CallerScope::Ambient`], preserving the historical `(0, id)`
+    /// bucket for genuinely unscoped creates while making ambient fallback
+    /// explicit at type level.
+    state_refs: HashMap<(CallerScope, u64), u32>,
+    process_refs: HashMap<(CallerScope, u64), u32>,
     /// PE.9 diagnostic: set to true the first time this conn sends a
     /// non-zero caller_pid frame. Once set, every subsequent
     /// caller_pid=0 frame from this conn is suspicious — it means
@@ -103,83 +152,67 @@ impl ConnRefTracker {
     /// carries a caller_pid in the frame header, before tracker
     /// mutations. Trips the conn into "gate-on" mode on first
     /// non-zero pid; subsequent caller_pid=0 ops then warn.
-    fn note_caller_pid(&mut self, caller_pid: u32) {
-        if caller_pid != 0 {
-            self.seen_nonzero_caller_pid = true;
-        } else if self.seen_nonzero_caller_pid {
-            // Loud-but-not-fatal: signals a shim-side stamping gap
-            // (an async-Drop path or other unscoped release that
-            // didn't go through Task::handle_syscall_request's
-            // set_caller_pid_scope). Action: track the call site
-            // down and either add a scope or refactor to know the
-            // owning pid. Not fatal because the ambient-fallback
-            // branch in record_release / owns_state lets the op
-            // still succeed.
-            warn!(
-                "fd-token control: PE.9 PER-PID GAP: caller_pid=0 on a conn that \
-                 previously sent non-zero pids — shim has an unscoped release \
-                 path. Operation continues via ambient fallback."
-            );
-        }
+    fn note_caller_scope(&mut self, mut caller_scope: CallerScope) -> CallerScope {
+        caller_scope.assert_or_diagnose(&mut self.seen_nonzero_caller_pid)
     }
 
-    fn record_state(&mut self, caller_pid: u32, id: u64) {
-        *self.state_refs.entry((caller_pid, id)).or_insert(0) += 1;
+    fn record_state(&mut self, caller_scope: CallerScope, id: u64) {
+        *self.state_refs.entry((caller_scope, id)).or_insert(0) += 1;
     }
 
-    fn record_process(&mut self, caller_pid: u32, id: u64) {
-        *self.process_refs.entry((caller_pid, id)).or_insert(0) += 1;
+    fn record_process(&mut self, caller_scope: CallerScope, id: u64) {
+        *self.process_refs.entry((caller_scope, id)).or_insert(0) += 1;
     }
 
     /// Returns true iff this connection has a positive reference
-    /// count for `id` from `caller_pid` in the state registry.
+    /// count for `id` from `caller_scope` in the state registry.
     ///
-    /// caller_pid=0 ("ambient" / "unspecified") falls back to "owned
-    /// by ANY pid on this conn". This preserves correctness for
-    /// asynchronous Drop paths in the shim that release a
-    /// broker-backed fd from a non-syscall thread (e.g. tokio worker
-    /// task drops, fd-table cleanup outside `Task::handle_syscall_request`),
-    /// where the caller_pid thread-local is the default 0.
-    fn owns_state(&self, caller_pid: u32, id: u64) -> bool {
-        if caller_pid == 0 {
-            self.state_refs.iter().any(|((_, h), c)| *h == id && *c > 0)
-        } else {
-            self.state_refs.get(&(caller_pid, id)).copied().unwrap_or(0) > 0
+    /// [`CallerScope::Ambient`] falls back to "owned by ANY scope on
+    /// this conn" (including an Ambient bucket from an unscoped acquire).
+    /// This preserves correctness for asynchronous Drop paths in the shim
+    /// that release a broker-backed fd from a non-syscall thread.
+    fn owns_state(&self, caller_scope: CallerScope, id: u64) -> bool {
+        match caller_scope {
+            CallerScope::Ambient => self.state_refs.iter().any(|((_, h), c)| *h == id && *c > 0),
+            CallerScope::Owned(_) => {
+                self.state_refs
+                    .get(&(caller_scope, id))
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+            }
         }
     }
 
-    fn owns_process(&self, caller_pid: u32, id: u64) -> bool {
-        if caller_pid == 0 {
-            self.process_refs
+    fn owns_process(&self, caller_scope: CallerScope, id: u64) -> bool {
+        match caller_scope {
+            CallerScope::Ambient => self
+                .process_refs
                 .iter()
-                .any(|((_, h), c)| *h == id && *c > 0)
-        } else {
-            self.process_refs
-                .get(&(caller_pid, id))
-                .copied()
-                .unwrap_or(0)
-                > 0
+                .any(|((_, h), c)| *h == id && *c > 0),
+            CallerScope::Owned(_) => {
+                self.process_refs
+                    .get(&(caller_scope, id))
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+            }
         }
     }
 
     /// Worker called Release on `id`. Decrement the matching
-    /// (caller_pid, id) bucket; try state first, then process.
+    /// (caller scope, id) bucket; try state first, then process.
     /// Removes the entry entirely when its count drops to 0 so
     /// the invariant "key present ⇒ count > 0" holds.
     ///
-    /// caller_pid=0 falls back to "decrement an arbitrary pid bucket
-    /// holding this id" (see [`owns_state`]). This handles the shim's
-    /// asynchronous Drop paths where caller_pid isn't stamped.
-    fn record_release(&mut self, caller_pid: u32, id: u64) {
-        if caller_pid == 0 {
-            // Ambient release: pick any (pid, id) bucket with a
-            // positive count and decrement. With PE.10's gate on
-            // PE.5 fork-emit scope (only stamping child_pid when
-            // per_pid_ownership_enabled), at gate-off everything
-            // is in (0, id) and this falls back to the natural
-            // (0, id) match; at gate-on the shim consistently
-            // stamps non-zero caller_pid so this path is rare
-            // (only async-Drop / unscoped paths hit it).
+    /// [`CallerScope::Ambient`] falls back to "decrement an arbitrary
+    /// scope bucket holding this id" (see [`owns_state`]). This handles
+    /// the shim's asynchronous Drop paths where caller_pid isn't stamped.
+    fn record_release(&mut self, caller_scope: CallerScope, id: u64) {
+        if caller_scope == CallerScope::Ambient {
+            // Ambient release: preserve the historical HashMap iteration
+            // behavior by picking the first positive bucket for this id,
+            // including an Ambient bucket if the acquire was also unscoped.
             let state_key = self
                 .state_refs
                 .iter()
@@ -209,28 +242,28 @@ impl ConnRefTracker {
             }
             return;
         }
-        if let Some(c) = self.state_refs.get_mut(&(caller_pid, id)) {
+        if let Some(c) = self.state_refs.get_mut(&(caller_scope, id)) {
             debug_assert!(
                 *c > 0,
-                "ConnRefTracker invariant: zero-count state_refs entry present for (pid={caller_pid}, id={id})"
+                "ConnRefTracker invariant: zero-count state_refs entry present for (scope={caller_scope:?}, id={id})"
             );
             if *c > 0 {
                 *c -= 1;
                 if *c == 0 {
-                    self.state_refs.remove(&(caller_pid, id));
+                    self.state_refs.remove(&(caller_scope, id));
                 }
                 return;
             }
         }
-        if let Some(c) = self.process_refs.get_mut(&(caller_pid, id)) {
+        if let Some(c) = self.process_refs.get_mut(&(caller_scope, id)) {
             debug_assert!(
                 *c > 0,
-                "ConnRefTracker invariant: zero-count process_refs entry present for (pid={caller_pid}, id={id})"
+                "ConnRefTracker invariant: zero-count process_refs entry present for (scope={caller_scope:?}, id={id})"
             );
             if *c > 0 {
                 *c -= 1;
                 if *c == 0 {
-                    self.process_refs.remove(&(caller_pid, id));
+                    self.process_refs.remove(&(caller_scope, id));
                 }
             }
         }
@@ -247,10 +280,11 @@ impl ConnRefTracker {
         process_registry: &BrokerStateRegistry,
     ) -> u32 {
         let mut released = 0u32;
-        let state_keys: Vec<(u32, u64)> = self
+        let target_scope = CallerScope::from_wire(pid);
+        let state_keys: Vec<(CallerScope, u64)> = self
             .state_refs
             .keys()
-            .filter(|(p, _)| *p == pid)
+            .filter(|(scope, _)| *scope == target_scope)
             .copied()
             .collect();
         for key in state_keys {
@@ -261,10 +295,10 @@ impl ConnRefTracker {
                 }
             }
         }
-        let process_keys: Vec<(u32, u64)> = self
+        let process_keys: Vec<(CallerScope, u64)> = self
             .process_refs
             .keys()
-            .filter(|(p, _)| *p == pid)
+            .filter(|(scope, _)| *scope == target_scope)
             .copied()
             .collect();
         for key in process_keys {
@@ -280,11 +314,17 @@ impl ConnRefTracker {
         // size, debug-only). A failure here indicates a concurrent
         // insertion or a bug in the removal loop above.
         debug_assert!(
-            !self.state_refs.keys().any(|(p, _)| *p == pid),
+            !self
+                .state_refs
+                .keys()
+                .any(|(scope, _)| *scope == target_scope),
             "P3: state_refs still has entries for released pid {pid}"
         );
         debug_assert!(
-            !self.process_refs.keys().any(|(p, _)| *p == pid),
+            !self
+                .process_refs
+                .keys()
+                .any(|(scope, _)| *scope == target_scope),
             "P3: process_refs still has entries for released pid {pid}"
         );
         released
@@ -299,13 +339,13 @@ impl ConnRefTracker {
     ) {
         let mut total_state = 0usize;
         let mut total_process = 0usize;
-        for ((_pid, id), count) in self.state_refs {
+        for ((_scope, id), count) in self.state_refs {
             for _ in 0..count {
                 let _ = state_registry.release(StateHandle::from_id(id));
                 total_state += 1;
             }
         }
-        for ((_pid, id), count) in self.process_refs {
+        for ((_scope, id), count) in self.process_refs {
             for _ in 0..count {
                 let _ = process_registry.release(StateHandle::from_id(id));
                 total_process += 1;
@@ -391,7 +431,7 @@ fn peer_cred_fields(peer_cred: Option<PeerCred>) -> String {
 /// request/response round on the socket loop.
 fn update_tracker_from_response(
     tracker: &mut ConnRefTracker,
-    caller_pid: u32,
+    caller_scope: CallerScope,
     request_opcode: Opcode,
     request_body: &[u8],
     response: &OwnedFrame,
@@ -403,7 +443,7 @@ fn update_tracker_from_response(
         // State-registry creators: response body is one or two handle ids.
         Opcode::CreateEventfd | Opcode::CreatePidfd | Opcode::CreateSignalfd => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
-                tracker.record_state(caller_pid, id);
+                tracker.record_state(caller_scope, id);
             }
         }
         Opcode::CreatePipe => {
@@ -411,8 +451,8 @@ fn update_tracker_from_response(
             if response.body.len() >= 16 {
                 let r = u64::from_le_bytes(response.body[..8].try_into().unwrap());
                 let w = u64::from_le_bytes(response.body[8..16].try_into().unwrap());
-                tracker.record_state(caller_pid, r);
-                tracker.record_state(caller_pid, w);
+                tracker.record_state(caller_scope, r);
+                tracker.record_state(caller_scope, w);
             }
         }
         Opcode::CreateSocketPair => {
@@ -420,34 +460,34 @@ fn update_tracker_from_response(
             if response.body.len() >= 16 {
                 let a = u64::from_le_bytes(response.body[..8].try_into().unwrap());
                 let b = u64::from_le_bytes(response.body[8..16].try_into().unwrap());
-                tracker.record_state(caller_pid, a);
-                tracker.record_state(caller_pid, b);
+                tracker.record_state(caller_scope, a);
+                tracker.record_state(caller_scope, b);
             }
         }
         Opcode::CreatePty => {
             if let Ok((master, slave, _flags)) = parse_create_pty_response_ok(&response.body) {
-                tracker.record_state(caller_pid, master);
-                tracker.record_state(caller_pid, slave);
+                tracker.record_state(caller_scope, master);
+                tracker.record_state(caller_scope, slave);
             }
         }
         // Process-registry creator.
         Opcode::RegisterProcess => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
-                tracker.record_process(caller_pid, id);
+                tracker.record_process(caller_scope, id);
             }
         }
         // DupHandle: request body is one u64 handle id; response is empty.
         Opcode::DupHandle => {
             if request_body.len() >= 8 {
                 let id = u64::from_le_bytes(request_body[..8].try_into().unwrap());
-                tracker.record_state(caller_pid, id);
+                tracker.record_state(caller_scope, id);
             }
         }
         // Release: -1 on whichever registry.
         Opcode::Release => {
             if request_body.len() >= 8 {
                 let id = u64::from_le_bytes(request_body[..8].try_into().unwrap());
-                tracker.record_release(caller_pid, id);
+                tracker.record_release(caller_scope, id);
             }
         }
         _ => {}
@@ -849,7 +889,7 @@ fn handle_control_connection_inner(
                 let request_opcode = frame.opcode;
                 let request_body = frame.body.to_vec();
                 let caller_pid = frame.caller_pid;
-                tracker.note_caller_pid(caller_pid);
+                let caller_scope = tracker.note_caller_scope(CallerScope::from_wire(caller_pid));
                 // PE.12 diag: log every frame received, gated on
                 // LITEBOX_PE10_DIAG. Tracker state pid_count helps
                 // identify which conn (by tracker fingerprint) the
@@ -939,7 +979,7 @@ fn handle_control_connection_inner(
                                 frame: host_result.frame,
                                 out_fd: host_result.out_fd,
                             }
-                        } else if tracker.owns_state(caller_pid, release_id) {
+                        } else if tracker.owns_state(caller_scope, release_id) {
                             // State-registry release. Owner-gated.
                             let state_result = state_handle_request(
                                 state_registry,
@@ -951,7 +991,7 @@ fn handle_control_connection_inner(
                                 frame: state_result.frame,
                                 out_fd: state_result.out_fd,
                             }
-                        } else if tracker.owns_process(caller_pid, release_id) {
+                        } else if tracker.owns_process(caller_scope, release_id) {
                             // Process-registry release. Owner-gated.
                             let proc_result = state_handle_request(
                                 process_registry,
@@ -998,12 +1038,19 @@ fn handle_control_connection_inner(
                                     .append(true)
                                     .open("/tmp/rst-diag.log")
                                 {
-                                    let state_entries: Vec<((u32, u64), u32)> =
-                                        tracker.state_refs.iter().map(|(k, v)| (*k, *v)).collect();
+                                    let state_entries: Vec<((u32, u64), u32)> = tracker
+                                        .state_refs
+                                        .iter()
+                                        .map(|((scope, id), count)| {
+                                            (((*scope).to_wire(), *id), *count)
+                                        })
+                                        .collect();
                                     let proc_entries: Vec<((u32, u64), u32)> = tracker
                                         .process_refs
                                         .iter()
-                                        .map(|(k, v)| (*k, *v))
+                                        .map(|((scope, id), count)| {
+                                            (((*scope).to_wire(), *id), *count)
+                                        })
                                         .collect();
                                     let _ = writeln!(
                                         f,
@@ -1162,7 +1209,7 @@ fn handle_control_connection_inner(
                 };
                 update_tracker_from_response(
                     tracker,
-                    caller_pid,
+                    caller_scope,
                     request_opcode,
                     &request_body,
                     &result.frame,
