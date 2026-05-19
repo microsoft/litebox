@@ -2429,7 +2429,7 @@ impl<FS: ShimFS> Task<FS> {
                 // double-release the broker state. When the gate is
                 // off, leave caller_pid=0 so dup_handle and release
                 // both target the same (0, id) bucket.
-                let _scope = if crate::per_pid_ownership_enabled() {
+                let _emit_scope = if crate::per_pid_ownership_enabled() {
                     Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
                         child_pid_u32,
                     ))
@@ -2801,7 +2801,7 @@ impl<FS: ShimFS> Task<FS> {
                 // broker dup_handle RPCs emitted during clone_for_fork's
                 // on_dup invocations. Gated on per_pid_ownership_enabled()
                 // — see PE.10 comment at the vfork branch above for why.
-                let _scope = if crate::per_pid_ownership_enabled() {
+                let _emit_scope = if crate::per_pid_ownership_enabled() {
                     Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
                         child_pid_u32,
                     ))
