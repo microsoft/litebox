@@ -8,6 +8,7 @@ Usage:
 
 Each input line is one JSON object with the schema emitted by tests/integration.rs:
   {"test":..., "pass":..., "t_acquire_ms":..., "t_docker_start_ms":...,
+   "t_docker_spawn_ms":..., "t_litebox_init_ms":..., "t_harness_load_ms":...,
    "t_useful_ms":..., "t_drain_ms":..., "verdict":..., "jobs":...}
 """
 import json
@@ -62,7 +63,10 @@ def summary(rows, label):
     jobs_cap = rows[0].get("jobs", "?")
     print(f"jobs cap: {jobs_cap}")
 
-    phases = ["t_acquire_ms", "t_docker_start_ms", "t_useful_ms", "t_drain_ms"]
+    phases = [
+        "t_acquire_ms", "t_docker_start_ms", "t_docker_spawn_ms",
+        "t_litebox_init_ms", "t_harness_load_ms", "t_useful_ms", "t_drain_ms",
+    ]
     print(f"\n{'phase':<22} {'p50':>10} {'p90':>10} {'p99':>10} {'max':>10} {'sum':>10}")
     for ph in phases:
         xs = [r[ph] for r in rows if ph in r]
@@ -78,12 +82,16 @@ def summary(rows, label):
 
     rows_by_total = sorted(rows, key=total, reverse=True)
     print("\nslowest 20 (total wall):")
-    print(f"  {'test':<55} {'total':>8} {'acq':>6} {'start':>6} {'useful':>7} {'drain':>7} verdict")
+    print(f"  {'test':<55} {'total':>8} {'acq':>6} {'start':>6} "
+          f"{'spawn':>6} {'init':>6} {'load':>6} {'useful':>7} {'drain':>7} verdict")
     for r in rows_by_total[:20]:
         t = total(r)
         print(f"  {r['test'][:55]:<55} {fmt_ms(t):>8} "
               f"{fmt_ms(r.get('t_acquire_ms', 0)):>6} "
               f"{fmt_ms(r.get('t_docker_start_ms', 0)):>6} "
+              f"{fmt_ms(r.get('t_docker_spawn_ms', 0)):>6} "
+              f"{fmt_ms(r.get('t_litebox_init_ms', 0)):>6} "
+              f"{fmt_ms(r.get('t_harness_load_ms', 0)):>6} "
               f"{fmt_ms(r.get('t_useful_ms', 0)):>7} "
               f"{fmt_ms(r.get('t_drain_ms', 0)):>7} "
               f"{r['verdict']}")

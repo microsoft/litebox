@@ -73,8 +73,28 @@ mod agent_listen;
 use litebox_test_harness::coordinator;
 use litebox_test_harness::protocol;
 
+fn monotonic_nanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer for `clock_gettime`.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+    if rc == 0 {
+        let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
+        let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
+        secs * 1_000_000_000 + nanos
+    } else {
+        0
+    }
+}
+
 #[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 fn main() {
+    if std::env::var_os("LITEBOX_TIMING_CONTAINER_PID1").is_some() {
+        eprintln!("[TIMING] container_pid1_started_ns={}", monotonic_nanos());
+    }
+    eprintln!("[TIMING] harness_first_output_ns={}", monotonic_nanos());
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map_or("spawn-tree", String::as_str);
     let self_exe = &args[0];

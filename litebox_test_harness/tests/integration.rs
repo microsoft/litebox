@@ -31,8 +31,24 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+fn monotonic_nanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer for `clock_gettime`.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+    if rc == 0 {
+        let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
+        let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
+        secs * 1_000_000_000 + nanos
+    } else {
+        0
+    }
+}
 
 use libtest_mimic::{Arguments, Failed, Trial};
 
@@ -70,19 +86,89 @@ fn emit_timing_main(
     pass: &str,
     t_acquire_ms: u128,
     t_docker_start_ms: u128,
+    t_docker_spawn_ms: Option<u128>,
+    t_litebox_init_ms: Option<u128>,
+    t_harness_load_ms: Option<u128>,
     t_useful_ms: u128,
     verdict: &str,
     jobs: usize,
 ) {
     use std::io::Write as _;
-    let line = format!(
+    let mut line = format!(
         "{{\"test\":\"{test}\",\"pass\":\"{pass}\",\
-         \"t_acquire_ms\":{t_acquire_ms},\"t_docker_start_ms\":{t_docker_start_ms},\
-         \"t_useful_ms\":{t_useful_ms},\"verdict\":\"{verdict}\",\"jobs\":{jobs}}}\n",
+         \"t_acquire_ms\":{t_acquire_ms},\"t_docker_start_ms\":{t_docker_start_ms}",
     );
+    if let Some(v) = t_docker_spawn_ms {
+        line.push_str(&format!(",\"t_docker_spawn_ms\":{v}"));
+    }
+    if let Some(v) = t_litebox_init_ms {
+        line.push_str(&format!(",\"t_litebox_init_ms\":{v}"));
+    }
+    if let Some(v) = t_harness_load_ms {
+        line.push_str(&format!(",\"t_harness_load_ms\":{v}"));
+    }
+    line.push_str(&format!(
+        ",\"t_useful_ms\":{t_useful_ms},\"verdict\":\"{verdict}\",\"jobs\":{jobs}}}\n"
+    ));
     if let Ok(mut f) = timing_file().lock() {
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TimingMarkers {
+    container_pid1_started_ns: Option<u64>,
+    litebox_shim_ready_ns: Option<u64>,
+    harness_first_output_ns: Option<u64>,
+}
+
+fn record_timing_marker(markers: &mut TimingMarkers, line: &str, pass: &str, arrival_ns: u64) {
+    let Some(rest) = line.strip_prefix("[TIMING] ") else {
+        return;
+    };
+    let Some((name, value)) = rest.split_once('=') else {
+        return;
+    };
+    let Ok(marker_ns) = value.parse::<u64>() else {
+        return;
+    };
+    let ns = if name == "harness_first_output_ns" && pass == "litebox" {
+        arrival_ns
+    } else {
+        marker_ns
+    };
+    match name {
+        "container_pid1_started_ns" if markers.container_pid1_started_ns.is_none() => {
+            markers.container_pid1_started_ns = Some(ns);
+        }
+        "litebox_shim_ready_ns" if markers.litebox_shim_ready_ns.is_none() => {
+            markers.litebox_shim_ready_ns = Some(ns);
+        }
+        "harness_first_output_ns" if markers.harness_first_output_ns.is_none() => {
+            markers.harness_first_output_ns = Some(ns);
+        }
+        _ => {}
+    }
+}
+
+fn wait_for_timing_markers(markers: &Arc<Mutex<TimingMarkers>>, pass: &str) -> TimingMarkers {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let snapshot = *markers.lock().expect("timing markers lock poisoned");
+        let has_required = snapshot.container_pid1_started_ns.is_some()
+            && snapshot.harness_first_output_ns.is_some()
+            && (pass == "native" || snapshot.litebox_shim_ready_ns.is_some());
+        if has_required || Instant::now() >= deadline {
+            return snapshot;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn ns_delta_ms(start_ns: u64, end_ns: u64) -> Option<u128> {
+    end_ns
+        .checked_sub(start_ns)
+        .map(|delta_ns| u128::from(delta_ns) / 1_000_000)
 }
 
 fn emit_timing_drain(test: &str, pass: &str, t_drain_ms: u128) {
@@ -373,8 +459,11 @@ fn build_docker_cmd(
         .arg(format!(
             "{}:/opt/non-pie-static-musl:ro",
             bins.non_pie_static_musl.display()
-        ))
-        .arg("litebox-test");
+        ));
+    if pass == "native" {
+        cmd.args(["-e", "LITEBOX_TIMING_CONTAINER_PID1=1"]);
+    }
+    cmd.arg("litebox-test");
     match pass {
         "native" => {
             cmd.arg("/opt/litebox/litebox_test_harness")
@@ -467,18 +556,33 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
 
     let mut cmd = build_docker_cmd(pass, test_id, &container_name, &bins);
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::from(
-        std::fs::File::create(&stderr_log)
-            .unwrap_or_else(|e| panic!("create {}: {e}", stderr_log.display())),
-    ));
+    cmd.stderr(Stdio::piped());
 
     let label = format!("{pass}[{test_id}]");
     let t_spawn = Instant::now();
+    let docker_run_invoke_ns = monotonic_nanos();
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("docker spawn failed for {label}: {e}"));
 
     let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let timing_markers = Arc::new(Mutex::new(TimingMarkers::default()));
+    let stderr_timing_markers = Arc::clone(&timing_markers);
+    let stderr_log_for_thread = stderr_log.clone();
+    let pass_for_stderr = pass.to_string();
+    let _stderr_thread = std::thread::spawn(move || {
+        let mut stderr_log_file = std::fs::File::create(&stderr_log_for_thread)
+            .unwrap_or_else(|e| panic!("create {}: {e}", stderr_log_for_thread.display()));
+        for line in BufReader::new(stderr).lines() {
+            let arrival_ns = monotonic_nanos();
+            let Ok(line) = line else { break };
+            if let Ok(mut markers) = stderr_timing_markers.lock() {
+                record_timing_marker(&mut markers, &line, &pass_for_stderr, arrival_ns);
+            }
+            let _ = writeln!(stderr_log_file, "{line}");
+        }
+    });
 
     // Read stdout line by line; tee each line to the stdout log
     // file, and record the first JSON line whose "test" field
@@ -507,10 +611,31 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         }
     }
     let t_json = Instant::now();
+    let t_json_ns = monotonic_nanos();
 
     let t_first_byte = t_first_byte.unwrap_or(t_json);
-    let t_docker_start_ms = t_first_byte.duration_since(t_spawn).as_millis();
-    let t_useful_ms = t_json.duration_since(t_first_byte).as_millis();
+    let markers = wait_for_timing_markers(&timing_markers, pass);
+    let shim_ready_ns = markers
+        .litebox_shim_ready_ns
+        .or(markers.container_pid1_started_ns);
+    let t_docker_spawn_ms = markers
+        .container_pid1_started_ns
+        .and_then(|ns| ns_delta_ms(docker_run_invoke_ns, ns));
+    let t_litebox_init_ms = markers
+        .container_pid1_started_ns
+        .zip(shim_ready_ns)
+        .and_then(|(start, end)| ns_delta_ms(start, end));
+    let t_harness_load_ms = shim_ready_ns
+        .zip(markers.harness_first_output_ns)
+        .and_then(|(start, end)| ns_delta_ms(start, end));
+    let t_docker_start_ms = markers
+        .harness_first_output_ns
+        .and_then(|ns| ns_delta_ms(docker_run_invoke_ns, ns))
+        .unwrap_or_else(|| t_first_byte.duration_since(t_spawn).as_millis());
+    let t_useful_ms = markers
+        .harness_first_output_ns
+        .and_then(|ns| ns_delta_ms(ns, t_json_ns))
+        .unwrap_or_else(|| t_json.duration_since(t_first_byte).as_millis());
     let verdict: &'static str = match &found {
         Some(v) => match v.get("result").and_then(|r| r.as_str()) {
             Some("pass") => "pass",
@@ -533,6 +658,9 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         pass_static,
         t_acquire_ms,
         t_docker_start_ms,
+        t_docker_spawn_ms,
+        t_litebox_init_ms,
+        t_harness_load_ms,
         t_useful_ms,
         verdict,
         jobs,
