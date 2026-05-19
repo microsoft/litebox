@@ -152,6 +152,7 @@ const CREATE_TABLE: &str = "\
 CREATE TABLE syscalls (
     seq         INTEGER NOT NULL,
     worker      INTEGER NOT NULL,
+    host_tid    INTEGER NOT NULL,
     pid         INTEGER NOT NULL,
     tid         INTEGER NOT NULL,
     syscall     TEXT NOT NULL,
@@ -183,6 +184,7 @@ struct ImportStats {
 struct PendingEntry {
     seq: i64,
     worker: i64,
+    host_tid: i64,
     pid: i64,
     tid: i64,
     syscall: String,
@@ -233,8 +235,8 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
         .map_err(|e| format!("begin: {e}"))?;
 
     let insert_sql = "INSERT INTO syscalls \
-         (seq, worker, pid, tid, syscall, args, enter_ts, exit_ts, duration_ns, result_ok, result_err) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+         (seq, worker, host_tid, pid, tid, syscall, args, enter_ts, exit_ts, duration_ns, result_ok, result_err) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
 
     {
         let mut insert_stmt = conn
@@ -261,6 +263,7 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
             let phase = v["phase"].as_str().unwrap_or("");
             let seq = v["seq"].as_i64().unwrap_or(0);
             let worker = v["worker"].as_i64().unwrap_or(0);
+            let host_tid = v["host_tid"].as_i64().unwrap_or(0);
             let pid = v["pid"].as_i64().unwrap_or(0);
             let tid = v["tid"].as_i64().unwrap_or(0);
             let ts = v["ts"].as_i64().unwrap_or(0);
@@ -275,6 +278,7 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
                         PendingEntry {
                             seq,
                             worker,
+                            host_tid,
                             pid,
                             tid,
                             syscall,
@@ -294,6 +298,7 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
                             .execute(params![
                                 entry.seq,
                                 entry.worker,
+                                entry.host_tid,
                                 entry.pid,
                                 entry.tid,
                                 entry.syscall,
@@ -337,8 +342,8 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
         let mut insert_orphan = conn
             .prepare(
                 "INSERT INTO syscalls \
-                 (seq, worker, pid, tid, syscall, args, enter_ts, exit_ts, duration_ns, result_ok, result_err) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, NULL)",
+                 (seq, worker, host_tid, pid, tid, syscall, args, enter_ts, exit_ts, duration_ns, result_ok, result_err) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, NULL)",
             )
             .map_err(|e| format!("prepare orphan: {e}"))?;
 
@@ -348,6 +353,7 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
                 .execute(params![
                     entry.seq,
                     entry.worker,
+                    entry.host_tid,
                     entry.pid,
                     entry.tid,
                     entry.syscall,
@@ -520,6 +526,7 @@ fn print_schema() {
 Column reference:
   seq         - Monotonic sequence number (unique per worker)          NOT NULL
   worker      - Host OS PID of the runner process                      NOT NULL
+  host_tid    - Host OS TID that emitted the audit event                NOT NULL
   pid         - Guest virtual PID                                      NOT NULL
   tid         - Guest virtual TID (important for Node.js worker threads) NOT NULL
   syscall     - Canonical snake_case Linux syscall name (e.g. "openat",      NOT NULL
@@ -547,7 +554,7 @@ Error codes: result_err is the negated errno, e.g.:
 === Example queries ===
 
 -- Top 20 slowest syscalls
-SELECT syscall, seq, worker, pid, tid, duration_ns/1000 AS duration_us, args
+SELECT syscall, seq, worker, host_tid, pid, tid, duration_ns/1000 AS duration_us, args
 FROM syscalls ORDER BY duration_ns DESC LIMIT 20;
 
 -- Error distribution by syscall
@@ -557,7 +564,7 @@ GROUP BY syscall, result_err ORDER BY cnt DESC;
 
 -- Incomplete syscalls: pending_ns distinguishes hung from shutdown-interrupted.
 -- Large pending_ns (seconds+) = potentially hung. Small = interrupted by shutdown.
-SELECT syscall, args, worker, pid, tid, pending_ns/1000000 AS pending_ms
+SELECT syscall, args, worker, host_tid, pid, tid, pending_ns/1000000 AS pending_ms
 FROM syscalls WHERE exit_ts IS NULL ORDER BY pending_ns DESC;
 
 -- Per-syscall timing summary (count, min, avg, max in microseconds)
@@ -580,14 +587,14 @@ FROM syscalls WHERE worker = 42 AND pid = 9
 ORDER BY enter_ts;
 
 -- File operations that failed
-SELECT seq, worker, pid, syscall, args, result_err
+SELECT seq, worker, host_tid, pid, syscall, args, result_err
 FROM syscalls
 WHERE syscall IN ('openat', 'read', 'write', 'close', 'unlinkat', 'mkdir')
   AND result_err IS NOT NULL
 ORDER BY enter_ts;
 
 -- Network syscalls
-SELECT seq, worker, pid, syscall, args, result_ok, result_err, duration_ns/1000 AS us
+SELECT seq, worker, host_tid, pid, syscall, args, result_ok, result_err, duration_ns/1000 AS us
 FROM syscalls
 WHERE syscall IN ('socket', 'connect', 'bind', 'listen', 'accept')
 ORDER BY enter_ts;
@@ -617,13 +624,13 @@ mod tests {
 
     fn sample_jsonl() -> String {
         r#"# Header comment
-{"phase":"enter","ts":100000,"seq":0,"pid":9,"tid":9,"worker":42,"syscall":"openat","args":[{"fd":-100},{"path":"/etc/passwd"},{"int":0},{"int":0}]}
-{"phase":"exit","ts":100500,"seq":0,"pid":9,"tid":9,"worker":42,"syscall":"openat","result":{"ok":3}}
-{"phase":"enter","ts":101000,"seq":1,"pid":9,"tid":9,"worker":42,"syscall":"read","args":[{"fd":3},{"int":4096}]}
-{"phase":"exit","ts":101200,"seq":1,"pid":9,"tid":9,"worker":42,"syscall":"read","result":{"ok":256}}
-{"phase":"enter","ts":102000,"seq":2,"pid":9,"tid":9,"worker":42,"syscall":"connect","args":[{"fd":5},{"addr":"10.0.0.1:443"}]}
-{"phase":"exit","ts":102100,"seq":2,"pid":9,"tid":9,"worker":42,"syscall":"connect","result":{"err":-13}}
-{"phase":"enter","ts":103000,"seq":3,"pid":9,"tid":9,"worker":42,"syscall":"futex","args":[{"int":0}]}
+{"phase":"enter","ts":100000,"seq":0,"pid":9,"tid":9,"worker":42,"host_tid":4201,"syscall":"openat","args":[{"fd":-100},{"path":"/etc/passwd"},{"int":0},{"int":0}]}
+{"phase":"exit","ts":100500,"seq":0,"pid":9,"tid":9,"worker":42,"host_tid":4201,"syscall":"openat","result":{"ok":3}}
+{"phase":"enter","ts":101000,"seq":1,"pid":9,"tid":9,"worker":42,"host_tid":4201,"syscall":"read","args":[{"fd":3},{"int":4096}]}
+{"phase":"exit","ts":101200,"seq":1,"pid":9,"tid":9,"worker":42,"host_tid":4201,"syscall":"read","result":{"ok":256}}
+{"phase":"enter","ts":102000,"seq":2,"pid":9,"tid":9,"worker":42,"host_tid":4202,"syscall":"connect","args":[{"fd":5},{"addr":"10.0.0.1:443"}]}
+{"phase":"exit","ts":102100,"seq":2,"pid":9,"tid":9,"worker":42,"host_tid":4202,"syscall":"connect","result":{"err":-13}}
+{"phase":"enter","ts":103000,"seq":3,"pid":9,"tid":9,"worker":42,"host_tid":4201,"syscall":"futex","args":[{"int":0}]}
 "#
         .to_string()
     }
