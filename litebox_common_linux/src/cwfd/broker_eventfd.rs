@@ -34,7 +34,6 @@
 //! is Step 7b.
 
 use crate::fd_token_client::{ClientError, FdTokenClient};
-#[cfg(test)]
 use crate::notification_frame::NotificationFrame;
 use crate::notification_ring::NotificationReceiver;
 use std::collections::HashMap;
@@ -47,6 +46,10 @@ use std::thread::{self, JoinHandle};
 /// `Pollee` so that `epoll_wait` / `poll` callers return.
 pub trait NotificationCallback: Send + Sync {
     fn on_events(&self, events: u32);
+
+    fn on_frame(&self, frame: &NotificationFrame) {
+        self.on_events(frame.events());
+    }
 }
 
 /// Routes notification frames arriving on the worker's ring to the
@@ -112,7 +115,7 @@ impl NotificationDispatcher {
                 // the under-load PB.many "ok=9/10" race mode).
                 let events = frame.events();
                 let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb.on_events(events)));
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb.on_frame(&frame)));
                 if result.is_err() {
                     if let Ok(mut f) = std::fs::OpenOptions::new()
                         .create(true)

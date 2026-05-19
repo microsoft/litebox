@@ -32,12 +32,13 @@ use crate::fd_token_protocol::{
     build_read_siginfo_request, build_read_socketpair_request,
     build_register_notification_ring_request, build_register_process_request,
     build_register_request, build_release_request, build_subscribe_eventfd_request,
-    build_subscribe_process_exit_request, build_subscribe_pty_request, build_unsubscribe_request,
-    build_write_eventfd_request, build_write_pipe_request, build_write_socketpair_request, decode,
-    parse_create_pidfd_response_ok, parse_create_pty_response_ok,
-    parse_create_socketpair_response_body, parse_handle_body, parse_pidfd_exited_response_ok,
-    parse_pty_ioctl_response_body, parse_pty_read_response_body, parse_pty_write_response_ok,
-    parse_read_pipe_response_body, parse_read_siginfo_response_body,
+    build_subscribe_process_exit_request, build_subscribe_pty_request,
+    build_subscribe_signal_inbox_request, build_unsubscribe_request,
+    build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
+    build_write_socketpair_request, decode, parse_create_pidfd_response_ok,
+    parse_create_pty_response_ok, parse_create_socketpair_response_body, parse_handle_body,
+    parse_pidfd_exited_response_ok, parse_pty_ioctl_response_body, parse_pty_read_response_body,
+    parse_pty_write_response_ok, parse_read_pipe_response_body, parse_read_siginfo_response_body,
     parse_read_socketpair_response_body, parse_subscribe_process_exit_response_ok,
     parse_write_pipe_response_ok, parse_write_socketpair_response_ok,
 };
@@ -392,6 +393,67 @@ impl FdTokenClient {
             StatusCode::NoNotificationRing => Err(ClientError::NoNotificationRing),
             StatusCode::SubsystemMismatch => Err(ClientError::SubsystemMismatch),
             s => Err(map_status_with_handle(resp.opcode, s, u64::from(pid))),
+        }
+    }
+
+    /// Subscribes this worker to broker-delivered pgrp signals.
+    pub fn subscribe_signal_inbox(
+        &self,
+        pgid: u32,
+        signal_mask: u32,
+        subscription_id: u64,
+        events_mask: u32,
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_subscribe_signal_inbox_request(pgid, signal_mask, subscription_id, events_mask),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::SubscribeSignalInboxResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::DuplicateSubscription => {
+                Err(ClientError::DuplicateSubscription(subscription_id))
+            }
+            StatusCode::NoNotificationRing => Err(ClientError::NoNotificationRing),
+            s => Err(map_status_with_handle(resp.opcode, s, u64::from(pgid))),
+        }
+    }
+
+    /// Unsubscribes this worker from broker-delivered pgrp signals.
+    pub fn unsubscribe_signal_inbox(
+        &self,
+        pgid: u32,
+        subscription_id: u64,
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_unsubscribe_signal_inbox_request(pgid, subscription_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::UnsubscribeSignalInboxResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownSubscription => {
+                Err(ClientError::UnknownSubscription(subscription_id))
+            }
+            s => Err(map_status_with_handle(resp.opcode, s, u64::from(pgid))),
         }
     }
 
