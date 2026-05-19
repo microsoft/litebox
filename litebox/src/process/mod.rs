@@ -1013,6 +1013,38 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         self.with_context(id, |ctx| ctx.pgid)
     }
 
+    /// Validate a process group change without mutating the registry.
+    pub fn check_set_pgid(
+        &self,
+        caller: ProcessId,
+        target: ProcessId,
+        pgid: ProcessGroupId,
+    ) -> Option<Result<(), SetPgidError>> {
+        let table = self.table.read();
+        let entry = table.get(&target)?;
+        let is_self = target == caller;
+        let is_child = entry.context.parent == Some(caller);
+        if !is_self && !is_child {
+            return Some(Err(SetPgidError::NotPermitted));
+        }
+        let caller_sid = table.get(&caller)?.context.sid;
+        if entry.context.sid != caller_sid {
+            return Some(Err(SetPgidError::NotPermitted));
+        }
+        if entry.context.sid == SessionId::from(target) {
+            return Some(Err(SetPgidError::NotPermitted));
+        }
+        if pgid != ProcessGroupId::from(target) {
+            let group_exists = table
+                .values()
+                .any(|e| e.context.pgid == pgid && e.context.sid == caller_sid);
+            if !group_exists {
+                return Some(Err(SetPgidError::NoSuchGroup));
+            }
+        }
+        Some(Ok(()))
+    }
+
     /// Set the process group ID of a process.
     ///
     /// `target` is the process to modify, `pgid` is the new process group.
@@ -1029,43 +1061,11 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         target: ProcessId,
         pgid: ProcessGroupId,
     ) -> Option<Result<(), SetPgidError>> {
+        if let Err(err) = self.check_set_pgid(caller, target, pgid)? {
+            return Some(Err(err));
+        }
         let mut table = self.table.write();
-        // Target must exist.
-        let entry = table.get(&target)?;
-
-        // Can only change pgid of self or a direct child.
-        let is_self = target == caller;
-        let is_child = entry.context.parent == Some(caller);
-        if !is_self && !is_child {
-            return Some(Err(SetPgidError::NotPermitted));
-        }
-
-        // Target must be in the same session as caller.
-        let caller_sid = table.get(&caller)?.context.sid;
-        if entry.context.sid != caller_sid {
-            return Some(Err(SetPgidError::NotPermitted));
-        }
-
-        // Cannot change pgid of a session leader.
-        let target_sid = SessionId::from(target);
-        if entry.context.sid == target_sid {
-            return Some(Err(SetPgidError::NotPermitted));
-        }
-
-        // If setting to a specific pgid (not target's own), the target group
-        // must already exist in the same session. We check if any process in
-        // the table has that pgid and the same session.
-        let target_pid_as_pgid = ProcessGroupId::from(target);
-        if pgid != target_pid_as_pgid {
-            let group_exists = table
-                .values()
-                .any(|e| e.context.pgid == pgid && e.context.sid == caller_sid);
-            if !group_exists {
-                return Some(Err(SetPgidError::NoSuchGroup));
-            }
-        }
-
-        table.get_mut(&target).unwrap().context.pgid = pgid;
+        table.get_mut(&target)?.context.pgid = pgid;
         Some(Ok(()))
     }
 
@@ -1115,6 +1115,16 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             .collect()
     }
 
+    /// Validate session creation without mutating the registry.
+    pub fn check_setsid(&self, caller: ProcessId) -> Option<Result<SessionId, SetsidError>> {
+        let table = self.table.read();
+        let entry = table.get(&caller)?;
+        if entry.context.pgid == ProcessGroupId::from(caller) {
+            return Some(Err(SetsidError::AlreadyGroupLeader));
+        }
+        Some(Ok(SessionId::from(caller)))
+    }
+
     /// Create a new session with `caller` as the session leader and sole
     /// member of a new process group.
     ///
@@ -1125,17 +1135,13 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
     ///
     /// Panics if the internal lock is poisoned.
     pub fn setsid(&self, caller: ProcessId) -> Option<Result<SessionId, SetsidError>> {
-        let mut table = self.table.write();
-        let entry = table.get(&caller)?;
-
-        // Fail if caller is already a process group leader (pgid == pid).
-        if entry.context.pgid == ProcessGroupId::from(caller) {
-            return Some(Err(SetsidError::AlreadyGroupLeader));
-        }
-
-        let new_sid = SessionId::from(caller);
+        let new_sid = match self.check_setsid(caller)? {
+            Ok(sid) => sid,
+            Err(err) => return Some(Err(err)),
+        };
         let new_pgid = ProcessGroupId::from(caller);
-        let entry = table.get_mut(&caller).unwrap();
+        let mut table = self.table.write();
+        let entry = table.get_mut(&caller)?;
         entry.context.sid = new_sid;
         entry.context.pgid = new_pgid;
         Some(Ok(new_sid))
