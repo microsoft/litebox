@@ -7174,6 +7174,10 @@ impl<FS: ShimFS> Task<FS> {
             {
                 (FdClass::EventFd, Some(fd.object_id()), None, None)
             } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
+            {
+                (FdClass::Signalfd, Some(fd.object_id()), None, None)
+            } else if let Ok(fd) =
                 rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
             {
                 (FdClass::Epoll, Some(fd.object_id()), None, None)
@@ -7235,7 +7239,7 @@ impl<FS: ShimFS> Task<FS> {
                 // for BrokerBacked the restore path reattaches to the
                 // same broker handle (state IS preserved because the
                 // broker owns it).
-                FdClass::EventFd => {}
+                FdClass::EventFd | FdClass::Signalfd => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
@@ -7354,6 +7358,38 @@ impl<FS: ShimFS> Task<FS> {
                                 }
                             } else {
                                 None
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else if class == FdClass::Signalfd {
+                if let Ok(typed) =
+                    rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
+                {
+                    let signalfd_provider = super::signalfd::broker_signalfd_provider();
+                    let result = dt.with_entry(&typed, |sfd: &super::signalfd::SignalfdFile| {
+                        sfd.fork_snapshot_handle()
+                    });
+                    match (result, signalfd_provider) {
+                        (Some((kind, handle_id)), Some(releaser)) => {
+                            match releaser.dup_handle(handle_id) {
+                                Ok(()) => {
+                                    broker_transit.push(ForkSnapshotBrokerTransit {
+                                        releaser: releaser as _,
+                                        handle_id,
+                                        kind,
+                                    });
+                                    Some(BrokerHandleSnapshot {
+                                        kind,
+                                        handle_id,
+                                        pipe_direction: None,
+                                        socketpair_endpoint: None,
+                                    })
+                                }
+                                Err(_) => None,
                             }
                         }
                         _ => None,

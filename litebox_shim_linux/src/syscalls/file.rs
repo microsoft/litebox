@@ -1560,7 +1560,21 @@ impl<FS: ShimFS> Task<FS> {
                 .descriptor_table()
                 .entry_handle(&sfd)
                 .ok_or(Errno::EBADF)?;
-            return handle.with_entry(|file| file.read(buf));
+            if buf.len() < 128 {
+                return Err(Errno::EINVAL);
+            }
+            loop {
+                self.drain_cross_process_signals();
+                if let Some(payload) = handle.with_entry(|file| file.read_siginfo())? {
+                    let n = payload.len().min(buf.len());
+                    buf[..n].copy_from_slice(&payload[..n]);
+                    return Ok(n);
+                }
+                if handle.with_entry(|file| file.get_status().contains(OFlags::NONBLOCK)) {
+                    return Err(Errno::EAGAIN);
+                }
+                core::hint::spin_loop();
+            }
         }
 
         // Phase F: broker-backed socketpair early-dispatch.

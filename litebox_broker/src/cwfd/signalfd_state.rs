@@ -71,7 +71,7 @@ impl SignalfdState {
             .expect("spawn signalfd watcher");
     }
 
-    fn enqueue_and_notify(&self, payload: Vec<u8>) {
+    pub fn enqueue_siginfo(&self, payload: Vec<u8>) {
         self.queue
             .lock()
             .expect("SignalfdState poisoned")
@@ -150,7 +150,7 @@ fn watcher_loop(weak: Weak<SignalfdState>, fd: RawFd) {
         };
         loop {
             match read_one_siginfo(fd) {
-                Ok(Some(payload)) => state.enqueue_and_notify(payload),
+                Ok(Some(payload)) => state.enqueue_siginfo(payload),
                 Ok(None) => break,
                 Err(_) => return,
             }

@@ -1613,6 +1613,48 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }
         }
 
+        // Recreate broker-backed signalfd entries inherited across fork/exec.
+        {
+            use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::Signalfd {
+                    continue;
+                }
+                let Some(broker_handle) = entry.metadata.broker_handle else {
+                    continue;
+                };
+                if broker_handle.kind != BrokerHandleKind::Signalfd {
+                    continue;
+                }
+                let Some(provider) = syscalls::signalfd::broker_signalfd_provider() else {
+                    continue;
+                };
+                let nonblock = litebox::fs::OFlags::from_bits_retain(entry.status_flags)
+                    .contains(litebox::fs::OFlags::NONBLOCK);
+                let file = syscalls::signalfd::SignalfdFile::new_broker_backed(
+                    provider,
+                    broker_handle.handle_id,
+                    nonblock,
+                    litebox_common_linux::signal::SigSet::from_u64(u64::MAX),
+                );
+                let file = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<syscalls::signalfd::SignalfdSubsystem>(file);
+                let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
+                let success = rds.fd_into_specific_raw_integer(file, entry.fd);
+                debug_assert!(
+                    success,
+                    "signalfd fd slot {} occupied during restore",
+                    entry.fd
+                );
+            }
+        }
+
         // C.5l: Phase C.3 follow-up — restore BrokerPipeFd entries for
         // FdClass::Pipe slots whose snapshot carries a broker_handle.
         // Previously these fell through to the local-pipe restore branch
