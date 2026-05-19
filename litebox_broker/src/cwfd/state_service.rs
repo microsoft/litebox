@@ -54,19 +54,25 @@ use litebox_common_linux::shmem_ring::ShmemRingPair;
 use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscriptionRegistry {
+    State,
+    Process,
+}
+
 /// Per-connection mutable state. Currently carries the optional
 /// notification-ring sender registered via RegisterNotificationRing.
 #[derive(Default)]
 pub struct ConnState {
     notification_sender: Option<Arc<Mutex<NotificationSender>>>,
     /// PE.9 fix: per-conn subscription bookkeeping. Each entry records
-    /// a (handle_id, subscription_id) pair this conn issued via any of
-    /// the Subscribe* opcodes. On disconnect, the socket loop drains
-    /// this list and force-unsubscribes each one so subscriptions
-    /// don't outlive the conn that owns them (eager cleanup, in
-    /// addition to the SubscriptionList::notify reactive auto-removal
-    /// on send failure). Belt and braces.
-    tracked_subscriptions: Vec<(u64, u64)>,
+    /// a (registry, handle_id, subscription_id) tuple this conn issued
+    /// via any of the Subscribe* opcodes. On disconnect, the socket
+    /// loop drains this list and force-unsubscribes each one so
+    /// subscriptions don't outlive the conn that owns them (eager
+    /// cleanup, in addition to the SubscriptionList::notify reactive
+    /// auto-removal on send failure). Belt and braces.
+    tracked_subscriptions: Vec<(SubscriptionRegistry, u64, u64)>,
 }
 
 impl ConnState {
@@ -77,26 +83,39 @@ impl ConnState {
     /// Record a Subscribe* success. Called from each subscribe
     /// handler immediately after the underlying SubscriptionList
     /// has accepted the subscription.
-    pub fn record_subscription(&mut self, handle_id: u64, subscription_id: u64) {
+    pub fn record_subscription(
+        &mut self,
+        registry: SubscriptionRegistry,
+        handle_id: u64,
+        subscription_id: u64,
+    ) {
         self.tracked_subscriptions
-            .push((handle_id, subscription_id));
+            .push((registry, handle_id, subscription_id));
     }
 
     /// Forget a tracked subscription. Called from handle_unsubscribe
     /// on success so we don't try to double-unsubscribe at disconnect.
-    pub fn forget_subscription(&mut self, handle_id: u64, subscription_id: u64) {
+    pub fn forget_subscription(
+        &mut self,
+        registry: SubscriptionRegistry,
+        handle_id: u64,
+        subscription_id: u64,
+    ) -> bool {
         if let Some(idx) = self
             .tracked_subscriptions
             .iter()
-            .position(|&(h, s)| h == handle_id && s == subscription_id)
+            .position(|&(r, h, s)| r == registry && h == handle_id && s == subscription_id)
         {
             self.tracked_subscriptions.swap_remove(idx);
+            true
+        } else {
+            false
         }
     }
 
     /// Drain all tracked subscriptions. Called from the socket loop's
     /// cleanup_on_disconnect path.
-    pub fn drain_tracked_subscriptions(&mut self) -> Vec<(u64, u64)> {
+    pub fn drain_tracked_subscriptions(&mut self) -> Vec<(SubscriptionRegistry, u64, u64)> {
         std::mem::take(&mut self.tracked_subscriptions)
     }
 }
@@ -332,19 +351,30 @@ fn handle_subscribe_process_exit(
         .as_any()
         .downcast_ref::<ProcessState>()
         .expect("subsystem_tag check guarantees ProcessState");
+    let handle = StateHandle::from_id(pid);
+    if registry.dup(handle).is_err() {
+        return status_err(
+            Opcode::SubscribeProcessExitResponse,
+            StatusCode::UnknownHandle,
+        );
+    }
     match process.subscribe(subscription_id, events_mask, sender) {
         Ok(snapshot) => {
-            conn.record_subscription(pid, subscription_id);
+            conn.record_subscription(SubscriptionRegistry::Process, pid, subscription_id);
             HandlerResult {
                 frame: build_subscribe_process_exit_response_ok(snapshot.map(|s| s.exit_code)),
                 out_fd: None,
             }
         }
-        Err(SubscribeError::DuplicateId(_)) => status_err(
-            Opcode::SubscribeProcessExitResponse,
-            StatusCode::DuplicateSubscription,
-        ),
+        Err(SubscribeError::DuplicateId(_)) => {
+            let _ = registry.release(handle);
+            status_err(
+                Opcode::SubscribeProcessExitResponse,
+                StatusCode::DuplicateSubscription,
+            )
+        }
         Err(SubscribeError::UnknownEventBits { .. }) => {
+            let _ = registry.release(handle);
             protocol_err(Opcode::SubscribeProcessExitResponse)
         }
     }
@@ -969,7 +999,7 @@ fn handle_subscribe_pty(
     };
     match state.subscribe(subscription_id, events_mask, sender) {
         Ok(()) => {
-            conn.record_subscription(handle_id, subscription_id);
+            conn.record_subscription(SubscriptionRegistry::State, handle_id, subscription_id);
             HandlerResult {
                 frame: build_subscribe_pty_response_ok(),
                 out_fd: None,
@@ -1013,7 +1043,7 @@ fn handle_subscribe_eventfd(
     };
     match state.subscribe(subscription_id, events_mask, sender) {
         Ok(()) => {
-            conn.record_subscription(handle_id, subscription_id);
+            conn.record_subscription(SubscriptionRegistry::State, handle_id, subscription_id);
             HandlerResult {
                 frame: build_subscribe_eventfd_response_ok(),
                 out_fd: None,
@@ -1052,7 +1082,16 @@ fn handle_unsubscribe(
     };
     match state.unsubscribe(subscription_id) {
         Ok(()) => {
-            conn.forget_subscription(handle_id, subscription_id);
+            let registry_kind = if state.subsystem_tag() == SubsystemTag::Process {
+                SubscriptionRegistry::Process
+            } else {
+                SubscriptionRegistry::State
+            };
+            if conn.forget_subscription(registry_kind, handle_id, subscription_id)
+                && registry_kind == SubscriptionRegistry::Process
+            {
+                let _ = registry.release(handle);
+            }
             HandlerResult {
                 frame: build_unsubscribe_response_ok(),
                 out_fd: None,
