@@ -14,7 +14,7 @@ use crate::pgrp_signal_inbox::PgrpSignalInbox;
 use crate::state_registry::{BrokerStateRegistry, StateHandle};
 use crate::state_service::{
     ConnState, SubscriptionRegistry, handle_deliver_signal_inbox, handle_pty_ioctl,
-    handle_request as state_handle_request, handle_set_pgid, handle_set_sid,
+    handle_pty_write, handle_request as state_handle_request, handle_set_pgid, handle_set_sid,
     handle_subscribe_signal_inbox, handle_unsubscribe_signal_inbox,
 };
 use litebox_common_linux::fd_token_protocol::{
@@ -1189,13 +1189,24 @@ fn handle_control_connection_inner(
                     | Opcode::WriteSocketPair
                     | Opcode::CreatePty
                     | Opcode::PtyRead
-                    | Opcode::PtyWrite
                     | Opcode::SubscribePty
                     | Opcode::SubscribeEventfd
                     | Opcode::DupHandle => {
                         // State-object opcodes: route to state_service on the fd-state registry.
                         let state_result =
                             state_handle_request(state_registry, conn_state, &frame, in_fds);
+                        SocketHandlerResult {
+                            frame: state_result.frame,
+                            out_fd: state_result.out_fd,
+                        }
+                    }
+                    Opcode::PtyWrite => {
+                        let state_result = handle_pty_write(
+                            state_registry,
+                            Some(pgrp_signal_inbox.as_ref()),
+                            &frame,
+                            in_fds,
+                        );
                         SocketHandlerResult {
                             frame: state_result.frame,
                             out_fd: state_result.out_fd,

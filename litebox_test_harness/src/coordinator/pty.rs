@@ -39,6 +39,8 @@ enum ScenarioKind {
     Resize,
     WinsizeCrossWorker,
     SetpgidCrossWorker,
+    LdiscCtrlcCrossWorker,
+    LdiscCanonBasic,
     ExecShellSession,
     /// PTYR.stdout_roundtrip — child writes a unique marker to fd 1
     /// (PTY slave) via `printf` after exec; parent reads from master.
@@ -100,6 +102,16 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "ldisc_ctrlc_cross_worker",
+        kind: ScenarioKind::LdiscCtrlcCrossWorker,
+        per_binary_type: true,
+    },
+    ScenarioDef {
+        name: "ldisc_canon_basic",
+        kind: ScenarioKind::LdiscCanonBasic,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "exec_shell_session",
         kind: ScenarioKind::ExecShellSession,
         per_binary_type: false,
@@ -146,6 +158,12 @@ const WINSIZE_CROSS_WORKER: HandlerToken<TargetArgs, PtyOut> =
 const SETPGID_CROSS_WORKER: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.setpgid_cross_worker");
 const EXEC_SHELL_SESSION: HandlerToken<(), PtyOut> = HandlerToken::new("pty.exec_shell_session");
+const LDISC_CTRLC_CROSS_WORKER: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.ldisc_ctrlc_cross_worker");
+const LDISC_CTRLZ_CROSS_WORKER: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.ldisc_ctrlz_cross_worker");
+const LDISC_CANON_BASIC: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.ldisc_canon_basic");
 // PTYR.* tokens — regression coverage for non-PIE worker-handoff stdio.
 const PTYR_STDOUT_ROUNDTRIP: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.stdout_roundtrip");
@@ -241,6 +259,58 @@ async fn handle_setpgid_cross_worker(
     handle_winsize_cross_worker(args, ctx).await
 }
 
+async fn handle_ldisc_signal_cross_worker(
+    args: TargetArgs,
+    signum: i32,
+    byte: u8,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(
+        &[args.target, "pty-ldisc-signal".into(), signum.to_string()],
+        true,
+    )?;
+    read_until(&pty, "READY\r\n")?;
+    pty.write_all(&[byte])?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    let marker = format!("LDISC_SIGNAL signum={signum} count=1\r\n");
+    if data.contains(&marker) {
+        Ok(PtyOut { detail: marker })
+    } else {
+        Err(format!("expected marker {marker:?}, got {data:?}").into())
+    }
+}
+
+async fn handle_ldisc_ctrlc_cross_worker(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    handle_ldisc_signal_cross_worker(args, libc::SIGINT, 0x03).await
+}
+
+async fn handle_ldisc_ctrlz_cross_worker(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    handle_ldisc_signal_cross_worker(args, libc::SIGTSTP, 0x1a).await
+}
+
+async fn handle_ldisc_canon_basic(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-ldisc-canon".into()], true)?;
+    read_until(&pty, "READY\r\n")?;
+    pty.write_all(b"hello\x7f\x7fworld\nabc\x15def\n")?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    let detail = exact(&data, "CANON line1=helworld line2=def\r\n")?;
+    Ok(PtyOut { detail })
+}
+
 async fn handle_exec_shell_session(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
@@ -306,6 +376,9 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(RESIZE, handle_resize);
     register_handler!(WINSIZE_CROSS_WORKER, handle_winsize_cross_worker);
     register_handler!(SETPGID_CROSS_WORKER, handle_setpgid_cross_worker);
+    register_handler!(LDISC_CTRLC_CROSS_WORKER, handle_ldisc_ctrlc_cross_worker);
+    register_handler!(LDISC_CTRLZ_CROSS_WORKER, handle_ldisc_ctrlz_cross_worker);
+    register_handler!(LDISC_CANON_BASIC, handle_ldisc_canon_basic);
     register_handler!(EXEC_SHELL_SESSION, handle_exec_shell_session);
     register_handler!(PTYR_STDOUT_ROUNDTRIP, handle_ptyr_stdout_roundtrip);
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
@@ -318,6 +391,8 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         "pty-winsize-cross-worker",
         leaf_subcmd::subcmd_pty_winsize_cross_worker
     );
+    crate::register_leaf_subcommand!("pty-ldisc-signal", leaf_subcmd::subcmd_pty_ldisc_signal);
+    crate::register_leaf_subcommand!("pty-ldisc-canon", leaf_subcmd::subcmd_pty_ldisc_canon);
     crate::register_leaf_subcommand!("pty-stdout-print", leaf_subcmd::subcmd_pty_stdout_print);
     crate::register_leaf_subcommand!("pty-isatty-check", leaf_subcmd::subcmd_pty_isatty_check);
 
@@ -325,16 +400,18 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         for def in PTY_SCENARIOS {
             // Per-binary-type scenarios fan out across BinaryType::ALL;
             // others use the legacy 3-segment ID with no binary axis.
-            let bts: &[Option<crate::BinaryType>] = if def.per_binary_type {
-                &[
+            let bts: &[Option<crate::BinaryType>] = match def.kind {
+                ScenarioKind::LdiscCtrlcCrossWorker | ScenarioKind::LdiscCanonBasic => {
+                    &[Some(crate::BinaryType::PieGlibc)]
+                }
+                _ if def.per_binary_type => &[
                     Some(crate::BinaryType::PieGlibc),
                     Some(crate::BinaryType::NonPieGlibc),
                     Some(crate::BinaryType::StaticPieGlibc),
                     Some(crate::BinaryType::StaticPieMusl),
                     Some(crate::BinaryType::NonPieStaticMusl),
-                ]
-            } else {
-                &[None]
+                ],
+                _ => &[None],
             };
             for &bt_opt in bts {
                 let test_id = match bt_opt {
@@ -410,6 +487,14 @@ async fn drive_target(
         }
         ScenarioKind::SetpgidCrossWorker => {
             run.send_named_typed(handle, &SETPGID_CROSS_WORKER, args)
+                .await?
+        }
+        ScenarioKind::LdiscCtrlcCrossWorker => {
+            run.send_named_typed(handle, &LDISC_CTRLC_CROSS_WORKER, args)
+                .await?
+        }
+        ScenarioKind::LdiscCanonBasic => {
+            run.send_named_typed(handle, &LDISC_CANON_BASIC, args)
                 .await?
         }
         ScenarioKind::StdoutRoundtrip => {
@@ -512,9 +597,15 @@ mod leaf_subcmd {
 
     static PTY_SIGWINCH_SEEN: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    static PTY_LDISC_SIGNAL_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     extern "C" fn pty_sigwinch_handler(_: i32) {
         PTY_SIGWINCH_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    extern "C" fn pty_ldisc_signal_handler(_: i32) {
+        PTY_LDISC_SIGNAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(super) fn subcmd_pty_tiocgpgrp(_args: &[String]) -> i32 {
@@ -625,6 +716,79 @@ mod leaf_subcmd {
         } else {
             println!("{label} rows={} cols={}", ws.ws_row, ws.ws_col);
         }
+        0
+    }
+
+    pub(super) fn subcmd_pty_ldisc_signal(args: &[String]) -> i32 {
+        let signum = args
+            .first()
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(libc::SIGINT);
+        // SAFETY: getpgrp has no preconditions.
+        let mut pgrp = unsafe { libc::getpgrp() };
+        // SAFETY: TIOCSPGRP reads a pid_t from the provided pointer for fd 0.
+        if unsafe { libc::ioctl(0, libc::TIOCSPGRP, &mut pgrp) } != 0 {
+            eprintln!("TIOCSPGRP failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        PTY_LDISC_SIGNAL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: installing a simple one-argument handler for the requested standard signal.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = pty_ldisc_signal_handler as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = 0;
+            if libc::sigaction(signum, &action, std::ptr::null_mut()) != 0 {
+                eprintln!("sigaction failed: {}", std::io::Error::last_os_error());
+                return 1;
+            }
+        }
+        println!("READY");
+        let _ = std::io::stdout().flush();
+        for _ in 0..200 {
+            if PTY_LDISC_SIGNAL_COUNT.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            // SAFETY: usleep only blocks the current process briefly.
+            unsafe { libc::usleep(10_000) };
+        }
+        let count = PTY_LDISC_SIGNAL_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        println!("LDISC_SIGNAL signum={signum} count={count}");
+        let _ = std::io::stdout().flush();
+        if count > 0 { 0 } else { 1 }
+    }
+
+    pub(super) fn subcmd_pty_ldisc_canon(_args: &[String]) -> i32 {
+        // SAFETY: tcgetattr/tcsetattr operate on the live PTY slave stdin fd.
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut termios) != 0 {
+                eprintln!("tcgetattr failed: {}", std::io::Error::last_os_error());
+                return 1;
+            }
+            termios.c_lflag &= !libc::ECHO;
+            termios.c_lflag |= libc::ICANON;
+            if libc::tcsetattr(0, libc::TCSANOW, &termios) != 0 {
+                eprintln!("tcsetattr failed: {}", std::io::Error::last_os_error());
+                return 1;
+            }
+        }
+        println!("READY");
+        let _ = std::io::stdout().flush();
+        let mut line1 = String::new();
+        let mut line2 = String::new();
+        if std::io::stdin().read_line(&mut line1).is_err()
+            || std::io::stdin().read_line(&mut line2).is_err()
+        {
+            eprintln!("read_line failed");
+            return 1;
+        }
+        println!(
+            "CANON line1={} line2={}",
+            line1.trim_end(),
+            line2.trim_end()
+        );
+        let _ = std::io::stdout().flush();
         0
     }
 

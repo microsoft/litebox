@@ -63,6 +63,9 @@ struct PtyPairState {
 struct PtyInner {
     master_to_slave: VecDeque<u8>,
     slave_to_master: VecDeque<u8>,
+    canonical_buffer: Vec<u8>,
+    last_emitted_line: Vec<u8>,
+    master_to_slave_eof: usize,
     termios: Termios,
     winsize: Winsize,
     foreground_pgrp: Option<i32>,
@@ -77,6 +80,13 @@ pub struct PtyPairHandles {
     pub master: Arc<PtyState>,
     pub slave: Arc<PtyState>,
     pub pty_id: u32,
+}
+
+/// Result returned by PTY write operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtyWriteResult {
+    pub bytes_written: usize,
+    pub signal_pgrps: Vec<(i32, i32)>,
 }
 
 /// Result returned by PTY ioctl operations.
@@ -105,6 +115,9 @@ impl PtyState {
             inner: Mutex::new(PtyInner {
                 master_to_slave: VecDeque::new(),
                 slave_to_master: VecDeque::new(),
+                canonical_buffer: Vec::new(),
+                last_emitted_line: Vec::new(),
+                master_to_slave_eof: 0,
                 termios: default_termios(),
                 winsize: Winsize {
                     row: 40,
@@ -158,6 +171,12 @@ impl PtyState {
             }
             PtyEndpoint::Slave => {
                 if inner.master_to_slave.is_empty() {
+                    if inner.master_to_slave_eof > 0 {
+                        // Canonical VEOF at the start of a line produces one zero-length
+                        // read for the slave without closing either side of the PTY.
+                        inner.master_to_slave_eof -= 1;
+                        return Ok(Vec::new());
+                    }
                     return if inner.master_open_count > 0 {
                         Err(PtyError::WouldBlock)
                     } else {
@@ -170,9 +189,10 @@ impl PtyState {
         }
     }
 
-    pub fn write(&self, data: &[u8]) -> Result<usize, PtyError> {
+    pub fn write(&self, data: &[u8]) -> Result<PtyWriteResult, PtyError> {
         let mut notify_master = false;
         let mut notify_slave = false;
+        let mut signal_pgrps = Vec::new();
         {
             let mut inner = self.pair.inner.lock().expect("PtyState poisoned");
             match self.endpoint {
@@ -180,32 +200,52 @@ impl PtyState {
                     if inner.slave_open_count == 0 {
                         return Err(PtyError::Closed);
                     }
-                    let icrnl = inner.termios.c_iflag & 0x100 != 0;
-                    let echo = inner.termios.c_lflag & 0x8 != 0;
-                    let onlcr = inner.termios.c_oflag & 0x4 != 0;
+                    let iflag = inner.termios.c_iflag;
+                    let oflag = inner.termios.c_oflag;
+                    let lflag = inner.termios.c_lflag;
+                    let cc = inner.termios.c_cc;
+                    let isig = lflag & LFLAG_ISIG != 0;
+                    let icanon = lflag & LFLAG_ICANON != 0;
+                    let echo = lflag & LFLAG_ECHO != 0;
+                    let echoe = lflag & LFLAG_ECHOE != 0;
+                    let echok = lflag & LFLAG_ECHOK != 0;
+                    let echonl = lflag & LFLAG_ECHONL != 0;
                     for &b in data {
-                        let translated = if icrnl && b == b'\r' { b'\n' } else { b };
-                        inner.master_to_slave.push_back(translated);
-                        if echo {
-                            if onlcr && translated == b'\n' {
-                                inner.slave_to_master.push_back(b'\r');
+                        let Some(translated) = translate_input_byte(iflag, b) else {
+                            continue;
+                        };
+
+                        if isig && let Some(signum) = signal_for_input_byte(&cc, translated) {
+                            inner.canonical_buffer.clear();
+                            if let Some(pgrp) = inner.foreground_pgrp {
+                                signal_pgrps.push((pgrp, signum));
                             }
-                            inner.slave_to_master.push_back(translated);
-                            notify_master = true;
+                            continue;
+                        }
+
+                        if icanon {
+                            let completed = process_canonical_byte(
+                                &mut inner, translated, &cc, oflag, echo, echoe, echok, echonl,
+                            );
+                            notify_master |= completed.echoed;
+                            notify_slave |= completed.input_ready;
+                        } else {
+                            inner.master_to_slave.push_back(translated);
+                            notify_slave = true;
+                            if echo || (echonl && translated == b'\n') {
+                                push_output_byte(&mut inner.slave_to_master, oflag, translated);
+                                notify_master = true;
+                            }
                         }
                     }
-                    notify_slave = !data.is_empty();
                 }
                 PtyEndpoint::Slave => {
                     if inner.master_open_count == 0 {
                         return Err(PtyError::Closed);
                     }
-                    let onlcr = inner.termios.c_oflag & 0x4 != 0;
+                    let oflag = inner.termios.c_oflag;
                     for &b in data {
-                        if onlcr && b == b'\n' {
-                            inner.slave_to_master.push_back(b'\r');
-                        }
-                        inner.slave_to_master.push_back(b);
+                        push_output_byte(&mut inner.slave_to_master, oflag, b);
                     }
                     notify_master = !data.is_empty();
                 }
@@ -221,7 +261,10 @@ impl PtyState {
                 .slave_subject
                 .notify(NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT);
         }
-        Ok(data.len())
+        Ok(PtyWriteResult {
+            bytes_written: data.len(),
+            signal_pgrps,
+        })
     }
 
     pub fn ioctl(
@@ -305,7 +348,7 @@ impl PtyState {
             }
             PtyEndpoint::Slave => {
                 let mut events = NOTIFY_EVENT_OUT;
-                if !inner.master_to_slave.is_empty() {
+                if !inner.master_to_slave.is_empty() || inner.master_to_slave_eof > 0 {
                     events |= NOTIFY_EVENT_IN;
                 }
                 if inner.master_open_count == 0 {
@@ -365,14 +408,202 @@ impl StateObject for PtyState {
     }
 }
 
+const IFLAG_INLCR: u32 = 0x0040;
+const IFLAG_IGNCR: u32 = 0x0080;
+const IFLAG_ICRNL: u32 = 0x0100;
+
+const OFLAG_OPOST: u32 = 0x0001;
+const OFLAG_ONLCR: u32 = 0x0004;
+const OFLAG_OCRNL: u32 = 0x0008;
+
+const LFLAG_ISIG: u32 = 0x0001;
+const LFLAG_ICANON: u32 = 0x0002;
+const LFLAG_ECHO: u32 = 0x0008;
+const LFLAG_ECHOE: u32 = 0x0010;
+const LFLAG_ECHOK: u32 = 0x0020;
+const LFLAG_ECHONL: u32 = 0x0040;
+
+const VINTR: usize = 0;
+const VQUIT: usize = 1;
+const VERASE: usize = 2;
+const VKILL: usize = 3;
+const VEOF: usize = 4;
+const VSTART: usize = 8;
+const VSTOP: usize = 9;
+const VSUSP: usize = 10;
+const VEOL: usize = 11;
+const VREPRINT: usize = 12;
+const VWERASE: usize = 14;
+const VEOL2: usize = 16;
+
+const SIGINT: i32 = 2;
+const SIGQUIT: i32 = 3;
+const SIGTSTP: i32 = 20;
+const DISABLED_CC: u8 = 0xff;
+
+#[derive(Default)]
+struct CanonicalOutcome {
+    input_ready: bool,
+    echoed: bool,
+}
+
 fn default_termios() -> Termios {
     Termios {
-        c_iflag: 0x100,
-        c_oflag: 0x5,
-        c_cflag: 0xbf,
+        c_iflag: 0x6d02,
+        c_oflag: 0x0005,
+        c_cflag: 0x04bf,
         c_lflag: 0x8a3b,
         c_line: 0,
-        c_cc: [0; 19],
+        c_cc: [
+            0x03, 0x1c, 0x7f, 0x15, 0x04, 0x00, 0x01, 0x00, 0x11, 0x13, 0x1a, 0xff, 0x12, 0x0f,
+            0x17, 0x16, 0xff, 0x00, 0x00,
+        ],
+    }
+}
+
+fn translate_input_byte(iflag: u32, b: u8) -> Option<u8> {
+    match b {
+        b'\r' if iflag & IFLAG_IGNCR != 0 => None,
+        b'\r' if iflag & IFLAG_ICRNL != 0 => Some(b'\n'),
+        b'\n' if iflag & IFLAG_INLCR != 0 => Some(b'\r'),
+        _ => Some(b),
+    }
+}
+
+fn signal_for_input_byte(cc: &[u8; 19], b: u8) -> Option<i32> {
+    if cc_matches(cc[VINTR], b) {
+        Some(SIGINT)
+    } else if cc_matches(cc[VQUIT], b) {
+        Some(SIGQUIT)
+    } else if cc_matches(cc[VSUSP], b) {
+        Some(SIGTSTP)
+    } else {
+        None
+    }
+}
+
+fn cc_matches(cc: u8, b: u8) -> bool {
+    cc != 0 && cc != DISABLED_CC && cc == b
+}
+
+fn process_canonical_byte(
+    inner: &mut PtyInner,
+    b: u8,
+    cc: &[u8; 19],
+    oflag: u32,
+    echo: bool,
+    echoe: bool,
+    echok: bool,
+    echonl: bool,
+) -> CanonicalOutcome {
+    let mut outcome = CanonicalOutcome::default();
+    if cc_matches(cc[VEOF], b) {
+        if inner.canonical_buffer.is_empty() {
+            inner.master_to_slave_eof += 1;
+        } else {
+            commit_canonical_buffer(inner);
+        }
+        outcome.input_ready = true;
+        return outcome;
+    }
+    if b == b'\n' || cc_matches(cc[VEOL], b) || cc_matches(cc[VEOL2], b) {
+        inner.canonical_buffer.push(b);
+        if echo || (echonl && b == b'\n') {
+            push_output_byte(&mut inner.slave_to_master, oflag, b);
+            outcome.echoed = true;
+        }
+        commit_canonical_buffer(inner);
+        outcome.input_ready = true;
+        return outcome;
+    }
+    if cc_matches(cc[VERASE], b) {
+        if inner.canonical_buffer.pop().is_some() && echo && echoe {
+            echo_erase(&mut inner.slave_to_master);
+            outcome.echoed = true;
+        }
+        return outcome;
+    }
+    if cc_matches(cc[VKILL], b) {
+        let had_bytes = !inner.canonical_buffer.is_empty();
+        inner.canonical_buffer.clear();
+        if echo && echok && had_bytes {
+            push_output_byte(&mut inner.slave_to_master, oflag, b'\n');
+            outcome.echoed = true;
+        }
+        return outcome;
+    }
+    if cc_matches(cc[VWERASE], b) {
+        let erased = erase_word(&mut inner.canonical_buffer);
+        if echo && echoe {
+            for _ in 0..erased {
+                echo_erase(&mut inner.slave_to_master);
+            }
+            outcome.echoed = erased > 0;
+        }
+        return outcome;
+    }
+    if cc_matches(cc[VREPRINT], b) {
+        if echo {
+            push_output_byte(&mut inner.slave_to_master, oflag, b'\n');
+            let queued = inner.canonical_buffer.clone();
+            for b in queued {
+                push_output_byte(&mut inner.slave_to_master, oflag, b);
+            }
+            outcome.echoed = true;
+        }
+        return outcome;
+    }
+    if cc_matches(cc[VSTART], b) || cc_matches(cc[VSTOP], b) {
+        return outcome;
+    }
+
+    inner.canonical_buffer.push(b);
+    if echo {
+        push_output_byte(&mut inner.slave_to_master, oflag, b);
+        outcome.echoed = true;
+    }
+    outcome
+}
+
+fn commit_canonical_buffer(inner: &mut PtyInner) {
+    inner.last_emitted_line.clear();
+    inner
+        .last_emitted_line
+        .extend_from_slice(&inner.canonical_buffer);
+    inner
+        .master_to_slave
+        .extend(inner.canonical_buffer.drain(..));
+}
+
+fn erase_word(buf: &mut Vec<u8>) -> usize {
+    let mut erased = 0;
+    while buf.last().is_some_and(|b| b.is_ascii_whitespace()) {
+        buf.pop();
+        erased += 1;
+    }
+    while buf.last().is_some_and(|b| !b.is_ascii_whitespace()) {
+        buf.pop();
+        erased += 1;
+    }
+    erased
+}
+
+fn echo_erase(out: &mut VecDeque<u8>) {
+    out.push_back(0x08);
+    out.push_back(b' ');
+    out.push_back(0x08);
+}
+
+fn push_output_byte(out: &mut VecDeque<u8>, oflag: u32, b: u8) {
+    if oflag & OFLAG_OPOST == 0 {
+        out.push_back(b);
+    } else if oflag & OFLAG_OCRNL != 0 && b == b'\r' {
+        out.push_back(b'\n');
+    } else {
+        if oflag & OFLAG_ONLCR != 0 && b == b'\n' {
+            out.push_back(b'\r');
+        }
+        out.push_back(b);
     }
 }
 
@@ -466,10 +697,92 @@ mod tests {
     #[test]
     fn data_moves_between_endpoints() {
         let pair = PtyState::new_pair(1);
-        pair.master.write(b"abc").unwrap();
-        assert_eq!(pair.slave.read(8).unwrap(), b"abc");
+        pair.master.write(b"abc\n").unwrap();
+        assert_eq!(pair.slave.read(8).unwrap(), b"abc\n");
         let _echo = pair.master.read(8).unwrap();
         pair.slave.write(b"xyz").unwrap();
         assert_eq!(pair.master.read(8).unwrap(), b"xyz");
+    }
+
+    #[test]
+    fn master_vintr_generates_sigint_when_isig_enabled() {
+        let pair = PtyState::new_pair(2);
+        pair.slave
+            .ioctl(PtyIoctlOp::Tiocspgrp, &123i32.to_le_bytes(), 1, 1, 1)
+            .unwrap();
+        let result = pair.master.write(&[0x03]).unwrap();
+        assert_eq!(result.bytes_written, 1);
+        assert_eq!(result.signal_pgrps, vec![(123, SIGINT)]);
+        assert_eq!(pair.slave.read(8), Err(PtyError::WouldBlock));
+    }
+
+    #[test]
+    fn master_vsusp_generates_sigtstp_when_isig_enabled() {
+        let pair = PtyState::new_pair(3);
+        pair.slave
+            .ioctl(PtyIoctlOp::Tiocspgrp, &124i32.to_le_bytes(), 1, 1, 1)
+            .unwrap();
+        let result = pair.master.write(&[0x1a]).unwrap();
+        assert_eq!(result.signal_pgrps, vec![(124, SIGTSTP)]);
+    }
+
+    #[test]
+    fn master_vquit_generates_sigquit_when_isig_enabled() {
+        let pair = PtyState::new_pair(4);
+        pair.slave
+            .ioctl(PtyIoctlOp::Tiocspgrp, &125i32.to_le_bytes(), 1, 1, 1)
+            .unwrap();
+        let result = pair.master.write(&[0x1c]).unwrap();
+        assert_eq!(result.signal_pgrps, vec![(125, SIGQUIT)]);
+    }
+
+    #[test]
+    fn vintr_passes_through_when_isig_disabled() {
+        let pair = PtyState::new_pair(5);
+        let mut t = default_termios();
+        t.c_lflag &= !LFLAG_ISIG;
+        pair.master
+            .ioctl(PtyIoctlOp::Tcsets, &termios_to_bytes(&t), 1, 1, 1)
+            .unwrap();
+        let result = pair.master.write(&[0x03, b'\n']).unwrap();
+        assert!(result.signal_pgrps.is_empty());
+        assert_eq!(pair.slave.read(8).unwrap(), b"\x03\n");
+    }
+
+    #[test]
+    fn canonical_verase_edits_pending_line() {
+        let pair = PtyState::new_pair(6);
+        pair.master.write(b"hello\x7f\x7fworld\n").unwrap();
+        assert_eq!(pair.slave.read(32).unwrap(), b"helworld\n");
+    }
+
+    #[test]
+    fn canonical_vkill_clears_pending_line() {
+        let pair = PtyState::new_pair(7);
+        pair.master.write(b"abc\x15def\n").unwrap();
+        assert_eq!(pair.slave.read(32).unwrap(), b"def\n");
+    }
+
+    #[test]
+    fn canonical_vwerase_drops_previous_word() {
+        let pair = PtyState::new_pair(8);
+        pair.master.write(b"abc def\x17ghi\n").unwrap();
+        assert_eq!(pair.slave.read(32).unwrap(), b"abc ghi\n");
+    }
+
+    #[test]
+    fn canonical_veof_at_start_returns_zero_length_read_once() {
+        let pair = PtyState::new_pair(9);
+        pair.master.write(&[0x04]).unwrap();
+        assert_eq!(pair.slave.read(32).unwrap(), b"");
+        assert_eq!(pair.slave.read(32), Err(PtyError::WouldBlock));
+    }
+
+    #[test]
+    fn input_cr_processing_and_echo_onlcr_are_preserved() {
+        let pair = PtyState::new_pair(10);
+        pair.master.write(b"a\r").unwrap();
+        assert_eq!(pair.slave.read(8).unwrap(), b"a\n");
+        assert_eq!(pair.master.read(8).unwrap(), b"a\r\n");
     }
 }

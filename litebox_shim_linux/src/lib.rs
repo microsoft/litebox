@@ -4247,7 +4247,10 @@ impl<FS: ShimFS> GlobalState<FS> {
                 return;
             }
         }
-        let signal_mask = 1u32 << litebox_common_linux::signal::Signal::SIGWINCH.as_i32();
+        let signal_mask = (1u32 << litebox_common_linux::signal::Signal::SIGWINCH.as_i32())
+            | (1u32 << litebox_common_linux::signal::Signal::SIGINT.as_i32())
+            | (1u32 << litebox_common_linux::signal::Signal::SIGQUIT.as_i32())
+            | (1u32 << litebox_common_linux::signal::Signal::SIGTSTP.as_i32());
         let callback = Arc::new(PgrpSignalCallback {
             global: Arc::clone(self),
         });

@@ -184,7 +184,7 @@ pub fn handle_request(
         Opcode::PushSiginfo => handle_push_siginfo(registry, request, in_fds),
         Opcode::CreatePty => handle_create_pty(registry, request, in_fds),
         Opcode::PtyRead => handle_pty_read(registry, request, in_fds),
-        Opcode::PtyWrite => handle_pty_write(registry, request, in_fds),
+        Opcode::PtyWrite => handle_pty_write(registry, None, request, in_fds),
         Opcode::SubscribePty => handle_subscribe_pty(registry, conn, request, in_fds),
         Opcode::PtyIoctl => handle_pty_ioctl(registry, None, request, in_fds),
         Opcode::SubscribeEventfd => handle_subscribe_eventfd(registry, conn, request, in_fds),
@@ -1097,8 +1097,9 @@ fn handle_pty_read(
     }
 }
 
-fn handle_pty_write(
+pub fn handle_pty_write(
     registry: &BrokerStateRegistry,
+    pgrp_signal_inbox: Option<&PgrpSignalInbox>,
     request: &Frame<'_>,
     in_fds: Vec<OwnedFd>,
 ) -> HandlerResult {
@@ -1118,10 +1119,21 @@ fn handle_pty_write(
         .downcast_ref::<PtyState>()
         .expect("Pty tag guarantees PtyState");
     match pty.write(&data) {
-        Ok(n) => HandlerResult {
-            frame: build_pty_write_response_ok(n as u32),
-            out_fd: None,
-        },
+        Ok(result) => {
+            if let Some(inbox) = pgrp_signal_inbox {
+                let siginfo =
+                    vec![0u8; core::mem::size_of::<litebox_common_linux::signal::Siginfo>()];
+                for (pgrp, signum) in &result.signal_pgrps {
+                    if *pgrp > 0 && *signum > 0 {
+                        inbox.deliver(*pgrp as u32, *signum as u32, &siginfo);
+                    }
+                }
+            }
+            HandlerResult {
+                frame: build_pty_write_response_ok(result.bytes_written as u32),
+                out_fd: None,
+            }
+        }
         Err(PtyError::WouldBlock) => status_err(Opcode::PtyWriteResponse, StatusCode::WouldBlock),
         Err(PtyError::Invalid) | Err(PtyError::Closed) => {
             status_err(Opcode::PtyWriteResponse, StatusCode::InvalidValue)

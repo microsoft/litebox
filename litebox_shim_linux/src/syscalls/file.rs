@@ -1857,8 +1857,10 @@ impl<FS: ShimFS> Task<FS> {
                         && is_master
                     {
                         // Mirror master writes through the broker first so broker-owned PTY
-                        // line discipline sees input-control characters; the local write below
-                        // continues to feed existing shim-side queues until reads are migrated.
+                        // line discipline sees input-control characters and dispatches
+                        // SIGINT/SIGTSTP/SIGQUIT via PgrpSignalInbox automatically. PR-5's
+                        // earlier shim-side pty_master_ldisc_signals helper would have
+                        // double-delivered — replaced by this broker mirror (PR-7 stage 1).
                         let _ = self.broker_pty_write(&files.fs, fd, buf)?;
                     }
                     let result = files.fs.write(fd, buf, offset).map_err(Errno::from);
