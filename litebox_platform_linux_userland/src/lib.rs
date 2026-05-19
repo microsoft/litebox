@@ -3685,6 +3685,10 @@ guest_context_top:
 .globl guest_fsbase
 guest_fsbase:
     .quad 0
+fork_child_guest_fsbase:
+    .quad 0
+fork_child_guest_ctx:
+    .quad 0
 in_guest:
     .byte 0
 .globl interrupt
@@ -3737,6 +3741,55 @@ fn get_guest_fsbase() -> usize {
         }
     }
     value
+}
+
+#[cfg(target_arch = "x86_64")]
+fn prepare_fork_child_guest_fsbase(
+    ctx: *const litebox_common_linux::ExecutionContext,
+    fsbase: usize,
+) {
+    unsafe {
+        core::arch::asm! {
+            "mov fs:fork_child_guest_ctx@tpoff, {ctx}",
+            "mov fs:fork_child_guest_fsbase@tpoff, {fsbase}",
+            ctx = in(reg) ctx,
+            fsbase = in(reg) fsbase,
+            options(nostack, preserves_flags)
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn apply_fork_child_guest_fsbase(ctx: *const litebox_common_linux::ExecutionContext) {
+    let pending_ctx: usize;
+    let fsbase: usize;
+    unsafe {
+        core::arch::asm! {
+            "mov {pending_ctx}, fs:fork_child_guest_ctx@tpoff",
+            "mov {fsbase}, fs:fork_child_guest_fsbase@tpoff",
+            pending_ctx = out(reg) pending_ctx,
+            fsbase = out(reg) fsbase,
+            options(nostack, preserves_flags)
+        }
+    }
+
+    if pending_ctx == 0 {
+        return;
+    }
+
+    assert_eq!(
+        pending_ctx, ctx as usize,
+        "fork-child FS handoff armed for a different guest context"
+    );
+
+    set_guest_fsbase(fsbase);
+    unsafe {
+        core::arch::asm! {
+            "mov QWORD PTR fs:fork_child_guest_ctx@tpoff, 0",
+            "mov QWORD PTR fs:fork_child_guest_fsbase@tpoff, 0",
+            options(nostack, preserves_flags)
+        }
+    }
 }
 
 /// Runs the guest thread until it terminates.
@@ -6029,7 +6082,13 @@ impl ThreadContext<'_> {
         }
         let op = f(self.shim, self.ctx);
         match op {
-            ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
+            ContinueOperation::Resume => {
+                #[cfg(target_arch = "x86_64")]
+                <LinuxUserland as litebox::platform::ThreadLocalStorageProvider>::apply_fork_child_guest_thread_local_storage(
+                    core::ptr::from_ref(self.ctx).cast(),
+                );
+                unsafe { switch_to_guest(self.ctx) }
+            }
             ContinueOperation::Terminate => {}
         }
     }
@@ -6080,6 +6139,16 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     #[cfg(target_arch = "x86_64")]
     fn clear_guest_thread_local_storage() {
         set_guest_fsbase(0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn prepare_fork_child_guest_thread_local_storage(ctx: *const (), fsbase: usize) {
+        prepare_fork_child_guest_fsbase(ctx.cast(), fsbase);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn apply_fork_child_guest_thread_local_storage(ctx: *const ()) {
+        apply_fork_child_guest_fsbase(ctx.cast());
     }
 
     #[cfg(target_arch = "x86")]

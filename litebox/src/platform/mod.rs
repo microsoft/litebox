@@ -1033,6 +1033,22 @@ pub unsafe trait ThreadLocalStorageProvider {
     fn clear_guest_thread_local_storage(#[cfg(target_arch = "x86")] _selector: u16) {
         unimplemented!()
     }
+
+    /// Arm a fork-child guest TLS handoff for the provided execution context.
+    ///
+    /// This is called only while initializing the process leader created by
+    /// `fork`/fork-like `clone`. Platforms that defer hardware TLS restore until
+    /// guest entry must consume the handoff from
+    /// [`apply_fork_child_guest_thread_local_storage`] at the final pre-entry
+    /// boundary for this exact context.
+    fn prepare_fork_child_guest_thread_local_storage(
+        _ctx: *const (),
+        #[cfg(target_arch = "x86_64")] _fsbase: usize,
+    ) {
+    }
+
+    /// Consume any fork-child guest TLS handoff for the provided context.
+    fn apply_fork_child_guest_thread_local_storage(_ctx: *const ()) {}
 }
 
 /// A provider of cryptographically-secure random data.
