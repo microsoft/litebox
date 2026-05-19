@@ -59,6 +59,12 @@ macro_rules! convert_flags {
 }
 
 pub(crate) type SocketFd = litebox::net::SocketFd<Platform>;
+type BrokerSocketPairTypedFd =
+    litebox::fd::TypedFd<crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem>;
+type BrokerSocketPairHandle = litebox::fd::EntryHandle<
+    Platform,
+    crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem,
+>;
 
 impl<FS: ShimFS> super::file::FilesState<FS> {
     /// Helper to dispatch socket operations based on socket type (INET vs Unix).
@@ -1205,6 +1211,47 @@ fn parse_type_and_flags(type_and_flags: u32) -> Result<(SockType, SockFlags), Er
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// Returns `Some(result)` if `sockfd` is a broker socketpair fd; returns
+    /// `None` so callers can fall through to the legacy `with_socket` dispatch
+    /// otherwise.
+    ///
+    /// The closure receives the typed fd rather than an entry handle because some
+    /// existing broker-socketpair socket ops only need fd classification. Write
+    /// call sites obtain the entry handle inside the closure, preserving their
+    /// existing `EBADF` behavior if the descriptor entry disappeared.
+    fn try_with_broker_sp<R>(
+        &self,
+        sockfd: u32,
+        op: impl FnOnce(&BrokerSocketPairTypedFd) -> Result<R, Errno>,
+    ) -> Option<Result<R, Errno>> {
+        let raw_fd = match usize::try_from(sockfd) {
+            Ok(raw_fd) => raw_fd,
+            Err(_) => return Some(Err(Errno::EBADF)),
+        };
+        let broker_sp = {
+            let files = self.files.borrow();
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
+                .ok()
+        };
+        broker_sp.map(|typed| op(typed.as_ref()))
+    }
+
+    fn broker_sp_handle(
+        &self,
+        typed: &BrokerSocketPairTypedFd,
+    ) -> Result<BrokerSocketPairHandle, Errno> {
+        self.global
+            .litebox
+            .descriptor_table()
+            .entry_handle(typed)
+            .ok_or(Errno::EBADF)
+    }
+}
+
+impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `socket`
     pub(crate) fn sys_socket(
         &self,
@@ -1979,28 +2026,14 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(nl) = self.netlink_sockets.borrow_mut().get_mut(&sockfd) {
             return nl.sendto(buf).map_err(|_| Errno::EINVAL);
         }
-        let broker_sp = {
-            let files = self.files.borrow();
-            files
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(
-                    usize::try_from(sockfd).map_err(|_| Errno::EBADF)?,
-                )
-                .ok()
-        };
-        if let Some(typed) = broker_sp {
-            let ret = if sockaddr.is_some() {
+        if let Some(ret) = self.try_with_broker_sp(sockfd, |typed| {
+            if sockaddr.is_some() {
                 Err(Errno::EISCONN)
             } else {
-                let handle = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .entry_handle(&typed)
-                    .ok_or(Errno::EBADF)?;
+                let handle = self.broker_sp_handle(typed)?;
                 handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
-            };
+            }
+        }) {
             if let Err(Errno::EPIPE) = ret
                 && !flags.contains(SendFlags::NOSIGNAL)
             {
@@ -2419,28 +2452,13 @@ impl<FS: ShimFS> Task<FS> {
             .iter()
             .try_fold(0usize, |acc, iov| acc.checked_add(iov.iov_len))
             .ok_or(Errno::EINVAL)?;
-        let broker_sp = {
-            let files = self.files.borrow();
-            files
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(
-                    usize::try_from(sockfd).map_err(|_| Errno::EBADF)?,
-                )
-                .ok()
-        };
-        if let Some(typed) = broker_sp {
-            let ret = if sock_addr.is_some() {
+        if let Some(ret) = self.try_with_broker_sp(sockfd, |typed| {
+            if sock_addr.is_some() {
                 Err(Errno::EISCONN)
             } else if msg.msg_controllen != 0 {
                 Err(Errno::EOPNOTSUPP)
             } else {
-                let handle = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .entry_handle(&typed)
-                    .ok_or(Errno::EBADF)?;
+                let handle = self.broker_sp_handle(typed)?;
                 if total_len == 0 {
                     handle.with_entry(|entry| entry.write(&self.wait_cx(), &[]))
                 } else {
@@ -2448,7 +2466,8 @@ impl<FS: ShimFS> Task<FS> {
                         handle.with_entry(|entry| entry.write(&self.wait_cx(), chunk))
                     })
                 }
-            };
+            }
+        }) {
             if let Err(Errno::EPIPE) = ret
                 && !flags.contains(SendFlags::NOSIGNAL)
             {
@@ -2984,12 +3003,7 @@ impl<FS: ShimFS> Task<FS> {
                 .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
                 .ok();
             if let Some(typed) = broker_sp {
-                let handle = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .entry_handle(&typed)
-                    .ok_or(Errno::EBADF)?;
+                let handle = self.broker_sp_handle(typed.as_ref())?;
                 let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))?;
                 return Ok(size);
             }
@@ -3076,35 +3090,25 @@ impl<FS: ShimFS> Task<FS> {
         if self.netlink_sockets.borrow().contains_key(&sockfd) {
             return Ok(());
         }
-        let broker_sp = {
-            let files = self.files.borrow();
-            files
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(
-                    usize::try_from(sockfd).map_err(|_| Errno::EBADF)?,
-                )
-                .is_ok()
-        };
-        if broker_sp {
-            return match optname {
-                SocketOptionName::Socket(
-                    SocketOption::RCVTIMEO
-                    | SocketOption::SNDTIMEO
-                    | SocketOption::LINGER
-                    | SocketOption::REUSEADDR
-                    | SocketOption::REUSEPORT
-                    | SocketOption::BROADCAST
-                    | SocketOption::KEEPALIVE,
-                ) => self
-                    .global
-                    .setsockopt_common(optname, optval, optlen, |_sopt, _value| Ok(())),
-                SocketOptionName::TCP(TcpOption::NODELAY | TcpOption::CORK) => {
-                    let _val: u32 = super::read_from_user(optval, optlen)?;
-                    Ok(())
-                }
-                _ => Err(Errno::ENOPROTOOPT),
-            };
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| match optname {
+            SocketOptionName::Socket(
+                SocketOption::RCVTIMEO
+                | SocketOption::SNDTIMEO
+                | SocketOption::LINGER
+                | SocketOption::REUSEADDR
+                | SocketOption::REUSEPORT
+                | SocketOption::BROADCAST
+                | SocketOption::KEEPALIVE,
+            ) => self
+                .global
+                .setsockopt_common(optname, optval, optlen, |_sopt, _value| Ok(())),
+            SocketOptionName::TCP(TcpOption::NODELAY | TcpOption::CORK) => {
+                let _val: u32 = super::read_from_user(optval, optlen)?;
+                Ok(())
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        }) {
+            return result;
         }
         self.files.borrow().with_socket(
             &self.global,
@@ -3165,47 +3169,37 @@ impl<FS: ShimFS> Task<FS> {
             }
             return Ok(0);
         }
-        let broker_sp = {
-            let files = self.files.borrow();
-            files
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(
-                    usize::try_from(sockfd).map_err(|_| Errno::EBADF)?,
-                )
-                .is_ok()
-        };
-        if broker_sp {
-            return match optname {
-                SocketOptionName::Socket(
-                    SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER,
-                ) => self
-                    .global
-                    .getsockopt_common(optname, optval, len, |_sopt| {
-                        SocketOptionValue::Timeout(None)
-                    }),
-                SocketOptionName::Socket(
-                    SocketOption::REUSEADDR
-                    | SocketOption::REUSEPORT
-                    | SocketOption::KEEPALIVE
-                    | SocketOption::BROADCAST,
-                ) => self
-                    .global
-                    .getsockopt_common(optname, optval, len, |_sopt| SocketOptionValue::U32(0)),
-                SocketOptionName::Socket(SocketOption::ERROR) => {
-                    super::write_to_user(0u32, optval, len)
-                }
-                SocketOptionName::Socket(SocketOption::TYPE) => {
-                    super::write_to_user(SockType::Stream as u32, optval, len)
-                }
-                SocketOptionName::Socket(SocketOption::RCVBUF | SocketOption::SNDBUF) => {
-                    super::write_to_user(64u32 * 1024, optval, len)
-                }
-                SocketOptionName::TCP(TcpOption::NODELAY | TcpOption::CORK) => {
-                    super::write_to_user(0u32, optval, len)
-                }
-                _ => Err(Errno::ENOPROTOOPT),
-            };
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| match optname {
+            SocketOptionName::Socket(
+                SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER,
+            ) => self
+                .global
+                .getsockopt_common(optname, optval, len, |_sopt| {
+                    SocketOptionValue::Timeout(None)
+                }),
+            SocketOptionName::Socket(
+                SocketOption::REUSEADDR
+                | SocketOption::REUSEPORT
+                | SocketOption::KEEPALIVE
+                | SocketOption::BROADCAST,
+            ) => self
+                .global
+                .getsockopt_common(optname, optval, len, |_sopt| SocketOptionValue::U32(0)),
+            SocketOptionName::Socket(SocketOption::ERROR) => {
+                super::write_to_user(0u32, optval, len)
+            }
+            SocketOptionName::Socket(SocketOption::TYPE) => {
+                super::write_to_user(SockType::Stream as u32, optval, len)
+            }
+            SocketOptionName::Socket(SocketOption::RCVBUF | SocketOption::SNDBUF) => {
+                super::write_to_user(64u32 * 1024, optval, len)
+            }
+            SocketOptionName::TCP(TcpOption::NODELAY | TcpOption::CORK) => {
+                super::write_to_user(0u32, optval, len)
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        }) {
+            return result;
         }
         self.files.borrow().with_socket(
             &self.global,
@@ -3253,18 +3247,10 @@ impl<FS: ShimFS> Task<FS> {
         if self.netlink_sockets.borrow().contains_key(&sockfd) {
             return Ok(SocketAddress::default());
         }
-        let broker_sp = {
-            let files = self.files.borrow();
-            files
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(
-                    usize::try_from(sockfd).map_err(|_| Errno::EBADF)?,
-                )
-                .is_ok()
-        };
-        if broker_sp {
-            return Ok(SocketAddress::Unix(super::unix::UnixSocketAddr::Unnamed));
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| {
+            Ok(SocketAddress::Unix(super::unix::UnixSocketAddr::Unnamed))
+        }) {
+            return result;
         }
         self.files.borrow().with_socket(
             &self.global,
@@ -3300,18 +3286,10 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
     fn do_getpeername(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
-        let broker_sp = {
-            let files = self.files.borrow();
-            files
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(
-                    usize::try_from(sockfd).map_err(|_| Errno::EBADF)?,
-                )
-                .is_ok()
-        };
-        if broker_sp {
-            return Ok(SocketAddress::Unix(super::unix::UnixSocketAddr::Unnamed));
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| {
+            Ok(SocketAddress::Unix(super::unix::UnixSocketAddr::Unnamed))
+        }) {
+            return result;
         }
         self.files.borrow().with_socket(
             &self.global,

@@ -3232,6 +3232,7 @@ mod tests {
             fork_restore_fd: None,
             fork_restore_ack_fd: None,
             pipe_bridge: Vec::new(),
+            broker_fd_bridge: Vec::new(),
             mux_fd: None,
             mux_stream: Vec::new(),
             local_pipe: Vec::new(),
