@@ -17,4 +17,7 @@ pub trait BrokerSignalfdProvider: BrokerSubscribable {
 
     /// Reads one `signalfd_siginfo` payload, or `None` if the fd would block.
     fn read_siginfo(&self, handle: u64) -> Result<Option<Vec<u8>>, BrokerOpError>;
+
+    /// Pushes one shim-synthesized `signalfd_siginfo` payload into the signalfd queue.
+    fn push_siginfo(&self, handle: u64, payload: &[u8]) -> Result<(), BrokerOpError>;
 }

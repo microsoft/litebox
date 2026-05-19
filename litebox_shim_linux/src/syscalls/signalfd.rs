@@ -13,6 +13,7 @@ use litebox::fs::OFlags;
 use litebox_common_linux::broker_signalfd_provider::{BrokerOpError, BrokerSignalfdProvider};
 use litebox_common_linux::cwfd::notification_frame::NOTIFY_EVENT_IN;
 use litebox_common_linux::errno::Errno;
+use litebox_common_linux::signal::{SigSet, Siginfo, Signal};
 use litebox_platform_multiplex::Platform;
 
 pub(crate) struct SignalfdSubsystem;
@@ -37,6 +38,7 @@ pub fn broker_signalfd_provider() -> Option<Arc<dyn BrokerSignalfdProvider>> {
 pub(crate) struct SignalfdFile {
     provider: Arc<dyn BrokerSignalfdProvider>,
     common: super::broker_backed::BrokerBackedCommon<Platform>,
+    mask: SigSet,
     status: core::sync::atomic::AtomicU32,
     pollee: Arc<Pollee<Platform>>,
 }
@@ -46,6 +48,7 @@ impl SignalfdFile {
         provider: Arc<dyn BrokerSignalfdProvider>,
         handle: u64,
         nonblock: bool,
+        mask: SigSet,
     ) -> Self {
         let subscribable: Arc<
             dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
@@ -59,8 +62,35 @@ impl SignalfdFile {
                 handle,
                 NOTIFY_EVENT_IN,
             ),
+            mask,
             status: core::sync::atomic::AtomicU32::new(status.bits()),
             pollee: Arc::new(Pollee::new()),
+        }
+    }
+
+    pub(crate) fn fork_snapshot_handle(&self) -> (super::fork_snapshot::BrokerHandleKind, u64) {
+        (
+            super::fork_snapshot::BrokerHandleKind::Signalfd,
+            self.common.handle(),
+        )
+    }
+
+    pub(crate) fn handles_signal(&self, signal: Signal) -> bool {
+        self.mask.contains(signal)
+    }
+
+    pub(crate) fn push_siginfo(&self, siginfo: &Siginfo, sender_pid: i32) -> Result<(), Errno> {
+        let payload = signalfd_siginfo_payload(siginfo, sender_pid);
+        match self.provider.push_siginfo(self.common.handle(), &payload) {
+            Ok(()) => {
+                self.common.set_readable(true);
+                self.pollee.notify_observers(Events::IN);
+                Ok(())
+            }
+            Err(BrokerOpError::UnknownHandle) => Err(Errno::EBADF),
+            Err(BrokerOpError::InvalidValue) => Err(Errno::EINVAL),
+            Err(BrokerOpError::WouldBlock) => Err(Errno::EAGAIN),
+            Err(BrokerOpError::Io) => Err(Errno::EIO),
         }
     }
 
@@ -146,6 +176,7 @@ impl<FS: crate::ShimFS> crate::Task<FS> {
             provider,
             handle,
             flags.contains(litebox_common_linux::SfdFlags::NONBLOCK),
+            mask,
         );
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<SignalfdSubsystem>(file);
@@ -168,4 +199,14 @@ impl<FS: crate::ShimFS> crate::Task<FS> {
         })?;
         Ok(raw_fd.try_into().unwrap())
     }
+}
+
+fn signalfd_siginfo_payload(siginfo: &Siginfo, sender_pid: i32) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(128);
+    payload.resize(128, 0);
+    payload[0..4].copy_from_slice(&(siginfo.signo as u32).to_ne_bytes());
+    payload[4..8].copy_from_slice(&siginfo.errno.to_ne_bytes());
+    payload[8..12].copy_from_slice(&siginfo.code.to_ne_bytes());
+    payload[12..16].copy_from_slice(&(sender_pid as u32).to_ne_bytes());
+    payload
 }

@@ -658,6 +658,7 @@ fn handle_control_connection_inner(
                     | Opcode::WriteEventfd
                     | Opcode::CreateSignalfd
                     | Opcode::ReadSiginfo
+                    | Opcode::PushSiginfo
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe

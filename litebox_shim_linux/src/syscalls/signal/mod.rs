@@ -1385,11 +1385,13 @@ impl<FS: ShimFS> Task<FS> {
                     // target thread has exited.
                 } else {
                     // Process-directed signal — goes to shared_pending.
-                    self.signals.shared_pending.lock().push(
-                        &self.process().limits,
-                        sig.signal,
-                        sig.siginfo,
-                    );
+                    if !self.deliver_signal_to_signalfd(sig.signal, &sig.siginfo) {
+                        self.signals.shared_pending.lock().push(
+                            &self.process().limits,
+                            sig.signal,
+                            sig.siginfo,
+                        );
+                    }
                 }
             } else {
                 i += 1;
@@ -1650,8 +1652,48 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    fn deliver_signal_to_signalfd(&self, signal: Signal, siginfo: &Siginfo) -> bool {
+        if !self.signals.blocked.get().contains(signal) {
+            return false;
+        }
+
+        let files = self.files.borrow();
+        let rds = files.raw_descriptor_store.read();
+        let signalfds: Vec<_> = rds
+            .iter_alive()
+            .filter_map(|raw_fd| {
+                rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
+                    .ok()
+            })
+            .collect();
+        drop(rds);
+        drop(files);
+
+        for sfd in signalfds {
+            let delivered = self
+                .global
+                .litebox
+                .descriptor_table()
+                .with_entry(&sfd, |file| {
+                    if file.handles_signal(signal) {
+                        file.push_siginfo(siginfo, self.pid).is_ok()
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if delivered {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Queue a thread-directed signal on the current task's pending set.
     pub(crate) fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
+        if self.deliver_signal_to_signalfd(signal, &siginfo) {
+            return;
+        }
         if self.is_signal_ignored(signal) {
             return;
         }
@@ -1663,6 +1705,9 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Sends a process-directed signal (stored in shared_pending).
     pub(crate) fn send_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
+        if self.deliver_signal_to_signalfd(signal, &siginfo) {
+            return;
+        }
         if self.is_signal_ignored(signal) {
             return;
         }

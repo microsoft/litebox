@@ -34,19 +34,19 @@ use litebox_common_linux::fd_token_protocol::{
     build_create_signalfd_response_ok, build_create_socketpair_response_ok, build_error_response,
     build_mark_process_exited_response_ok, build_pidfd_exited_response_ok,
     build_pty_ioctl_response_ok, build_pty_read_response_ok, build_pty_write_response_ok,
-    build_read_eventfd_response_ok, build_read_pipe_response_ok, build_read_siginfo_response_ok,
-    build_read_socketpair_response_ok, build_register_notification_ring_response_ok,
-    build_register_process_response_ok, build_release_response_ok,
-    build_subscribe_eventfd_response_ok, build_subscribe_process_exit_response_ok,
-    build_subscribe_pty_response_ok, build_unsubscribe_response_ok,
-    build_write_eventfd_response_ok, build_write_pipe_response_ok,
+    build_push_siginfo_response_ok, build_read_eventfd_response_ok, build_read_pipe_response_ok,
+    build_read_siginfo_response_ok, build_read_socketpair_response_ok,
+    build_register_notification_ring_response_ok, build_register_process_response_ok,
+    build_release_response_ok, build_subscribe_eventfd_response_ok,
+    build_subscribe_process_exit_response_ok, build_subscribe_pty_response_ok,
+    build_unsubscribe_response_ok, build_write_eventfd_response_ok, build_write_pipe_response_ok,
     build_write_socketpair_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
     parse_create_pipe_body, parse_create_signalfd_body, parse_create_socketpair_body,
     parse_handle_body, parse_mark_process_exited_body, parse_pidfd_exited_request,
-    parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_read_pipe_body,
-    parse_read_socketpair_body, parse_subscribe_eventfd_body, parse_subscribe_process_exit_body,
-    parse_subscribe_pty_body, parse_unsubscribe_body, parse_write_eventfd_body,
-    parse_write_pipe_body, parse_write_socketpair_body,
+    parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body,
+    parse_read_pipe_body, parse_read_socketpair_body, parse_subscribe_eventfd_body,
+    parse_subscribe_process_exit_body, parse_subscribe_pty_body, parse_unsubscribe_body,
+    parse_write_eventfd_body, parse_write_pipe_body, parse_write_socketpair_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -100,6 +100,7 @@ pub fn handle_request(
         Opcode::ReadSocketPair => handle_read_socketpair(registry, request, in_fds),
         Opcode::WriteSocketPair => handle_write_socketpair(registry, request, in_fds),
         Opcode::ReadSiginfo => handle_read_siginfo(registry, request, in_fds),
+        Opcode::PushSiginfo => handle_push_siginfo(registry, request, in_fds),
         Opcode::CreatePty => handle_create_pty(registry, request, in_fds),
         Opcode::PtyRead => handle_pty_read(registry, request, in_fds),
         Opcode::PtyWrite => handle_pty_write(registry, request, in_fds),
@@ -723,6 +724,42 @@ fn handle_read_siginfo(
             tracing::warn!(error = %err, "ReadSiginfo failed");
             status_err(Opcode::ReadSiginfoResponse, StatusCode::Internal)
         }
+    }
+}
+
+fn handle_push_siginfo(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::PushSiginfoResponse);
+    }
+    let (handle_id, payload) = match parse_push_siginfo_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::PushSiginfoResponse),
+    };
+    if payload.len() != 128 {
+        return status_err(Opcode::PushSiginfoResponse, StatusCode::InvalidValue);
+    }
+    let state = match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Signalfd) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return status_err(Opcode::PushSiginfoResponse, StatusCode::UnknownHandle);
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            return status_err(Opcode::PushSiginfoResponse, StatusCode::SubsystemMismatch);
+        }
+        Err(_) => return status_err(Opcode::PushSiginfoResponse, StatusCode::Internal),
+    };
+    let signalfd = state
+        .as_any()
+        .downcast_ref::<SignalfdState>()
+        .expect("subsystem_tag check guarantees SignalfdState");
+    signalfd.enqueue_siginfo(payload);
+    HandlerResult {
+        frame: build_push_siginfo_response_ok(),
+        out_fd: None,
     }
 }
 

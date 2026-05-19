@@ -125,6 +125,7 @@ pub enum Opcode {
     SubscribeEventfd = 0x13,
     CreateSignalfd = 0x40,
     ReadSiginfo = 0x41,
+    PushSiginfo = 0x42,
     CreatePipe = 0x50,
     ReadPipe = 0x51,
     WritePipe = 0x52,
@@ -160,6 +161,7 @@ pub enum Opcode {
     SubscribeEventfdResponse = 0x93,
     CreateSignalfdResponse = 0xC0,
     ReadSiginfoResponse = 0xC1,
+    PushSiginfoResponse = 0xC2,
     CreatePipeResponse = 0xD0,
     ReadPipeResponse = 0xD1,
     WritePipeResponse = 0xD2,
@@ -278,6 +280,7 @@ impl Opcode {
             Opcode::SubscribeEventfd => Some(Opcode::SubscribeEventfdResponse),
             Opcode::CreateSignalfd => Some(Opcode::CreateSignalfdResponse),
             Opcode::ReadSiginfo => Some(Opcode::ReadSiginfoResponse),
+            Opcode::PushSiginfo => Some(Opcode::PushSiginfoResponse),
             Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
             Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
             Opcode::WritePipe => Some(Opcode::WritePipeResponse),
@@ -314,6 +317,7 @@ impl Opcode {
                 | Opcode::SubscribeEventfd
                 | Opcode::CreateSignalfd
                 | Opcode::ReadSiginfo
+                | Opcode::PushSiginfo
                 | Opcode::CreatePipe
                 | Opcode::ReadPipe
                 | Opcode::WritePipe
@@ -365,6 +369,7 @@ impl TryFrom<u8> for Opcode {
             0x13 => Ok(Opcode::SubscribeEventfd),
             0x40 => Ok(Opcode::CreateSignalfd),
             0x41 => Ok(Opcode::ReadSiginfo),
+            0x42 => Ok(Opcode::PushSiginfo),
             0x50 => Ok(Opcode::CreatePipe),
             0x51 => Ok(Opcode::ReadPipe),
             0x52 => Ok(Opcode::WritePipe),
@@ -393,6 +398,7 @@ impl TryFrom<u8> for Opcode {
             0x93 => Ok(Opcode::SubscribeEventfdResponse),
             0xC0 => Ok(Opcode::CreateSignalfdResponse),
             0xC1 => Ok(Opcode::ReadSiginfoResponse),
+            0xC2 => Ok(Opcode::PushSiginfoResponse),
             0xD0 => Ok(Opcode::CreatePipeResponse),
             0xD1 => Ok(Opcode::ReadPipeResponse),
             0xD2 => Ok(Opcode::WritePipeResponse),
@@ -1151,6 +1157,55 @@ pub fn parse_read_siginfo_response_body(body: &[u8]) -> Result<Vec<u8>, Protocol
         });
     }
     Ok(body[8..].to_vec())
+}
+
+/// Body for [`Opcode::PushSiginfo`]: (handle id, payload_len: u32, pad: u32, payload bytes).
+pub fn build_push_siginfo_request(handle_id: u64, payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + payload.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(payload);
+    OwnedFrame {
+        opcode: Opcode::PushSiginfo,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Body for [`Opcode::PushSiginfoResponse`]: empty on success.
+pub fn build_push_siginfo_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::PushSiginfoResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+/// Decodes a PushSiginfo request body.
+pub fn parse_push_siginfo_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PushSiginfo,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let len = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 16 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PushSiginfo,
+            got: body.len(),
+            want: 16 + len,
+        });
+    }
+    Ok((handle, body[16..].to_vec()))
 }
 
 /// Body for [`Opcode::CreatePipe`]: (capacity: u64, atomic_write_size: u64).

@@ -367,6 +367,8 @@ pub enum FdClass {
     Epoll,
     /// eventfd.
     EventFd,
+    /// signalfd.
+    Signalfd,
     /// timerfd.
     TimerFd,
     /// pidfd.
@@ -1100,6 +1102,7 @@ impl FdClass {
             Self::UnixSocket => 4,
             Self::Epoll => 5,
             Self::EventFd => 6,
+            Self::Signalfd => 12,
             Self::TimerFd => 7,
             Self::PidFd => 8,
             Self::AnonSpecialFd => 9,
@@ -1117,6 +1120,7 @@ impl FdClass {
             4 => Ok(Self::UnixSocket),
             5 => Ok(Self::Epoll),
             6 => Ok(Self::EventFd),
+            12 => Ok(Self::Signalfd),
             7 => Ok(Self::TimerFd),
             8 => Ok(Self::PidFd),
             9 => Ok(Self::AnonSpecialFd),

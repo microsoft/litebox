@@ -28,12 +28,12 @@ use crate::fd_token_protocol::{
     build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
     build_mark_process_exited_request, build_materialize_request, build_pidfd_exited_request,
     build_pty_ioctl_request, build_pty_read_request, build_pty_write_request,
-    build_read_eventfd_request, build_read_pipe_request, build_read_siginfo_request,
-    build_read_socketpair_request, build_register_notification_ring_request,
-    build_register_process_request, build_register_request, build_release_request,
-    build_subscribe_eventfd_request, build_subscribe_process_exit_request,
-    build_subscribe_pty_request, build_unsubscribe_request, build_write_eventfd_request,
-    build_write_pipe_request, build_write_socketpair_request, decode,
+    build_push_siginfo_request, build_read_eventfd_request, build_read_pipe_request,
+    build_read_siginfo_request, build_read_socketpair_request,
+    build_register_notification_ring_request, build_register_process_request,
+    build_register_request, build_release_request, build_subscribe_eventfd_request,
+    build_subscribe_process_exit_request, build_subscribe_pty_request, build_unsubscribe_request,
+    build_write_eventfd_request, build_write_pipe_request, build_write_socketpair_request, decode,
     parse_create_pidfd_response_ok, parse_create_pty_response_ok,
     parse_create_socketpair_response_body, parse_handle_body, parse_pidfd_exited_response_ok,
     parse_pty_ioctl_response_body, parse_pty_read_response_body, parse_pty_write_response_ok,
@@ -573,6 +573,32 @@ impl FdTokenClient {
                 .map_err(ClientError::Protocol),
             StatusCode::WouldBlock => Ok(None),
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    /// Pushes one shim-synthesized `signalfd_siginfo` payload into a broker-hosted signalfd.
+    pub fn push_siginfo(&self, handle_id: u64, payload: &[u8]) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_push_siginfo_request(handle_id, payload),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::PushSiginfoResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: payload.len() as u64,
+            }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }
     }
