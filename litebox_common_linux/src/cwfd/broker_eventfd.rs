@@ -84,7 +84,7 @@ impl NotificationDispatcher {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             callbacks: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(initial_subscription_id()),
             thread_handle: Mutex::new(None),
         })
     }
@@ -106,7 +106,31 @@ impl NotificationDispatcher {
                 map.get(&frame.subscription_id()).cloned()
             };
             if let Some(cb) = cb {
-                cb.on_events(frame.events());
+                // PE.14: catch callback panics so a single bad callback
+                // doesn't kill the dispatcher thread (which would silently
+                // halt ALL notification delivery for this worker — likely
+                // the under-load PB.many "ok=9/10" race mode).
+                let events = frame.events();
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb.on_events(events)));
+                if result.is_err() {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rst-diag.log")
+                    {
+                        use std::io::Write;
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        let _ = writeln!(
+                            f,
+                            "[PE.14-diag] ts={ts} NOTIFICATION CALLBACK PANIC sub_id={} events={events:#x}",
+                            frame.subscription_id()
+                        );
+                    }
+                }
             }
         }
     }
@@ -133,12 +157,12 @@ impl NotificationDispatcher {
     pub fn start_without_reader_thread() -> Arc<Self> {
         Arc::new(Self {
             callbacks: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(initial_subscription_id()),
             thread_handle: Mutex::new(None),
         })
     }
 
-    /// Allocates a fresh `subscription_id` unique to this dispatcher.
+    /// Allocates a fresh `subscription_id` unique to this worker process.
     pub fn alloc_subscription_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -251,6 +275,10 @@ impl BrokerEventfd {
     pub fn close(self) -> Result<(), ClientError> {
         self.client.release(self.handle_id)
     }
+}
+
+fn initial_subscription_id() -> u64 {
+    (u64::from(std::process::id()) << 32) | 1
 }
 
 #[cfg(test)]

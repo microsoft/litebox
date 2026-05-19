@@ -87,6 +87,12 @@ impl GuestPidProvider for RunnerGuestPidProvider {
             tracing::warn!(pid, subscription_id, error = %e, "process-exit unsubscribe failed");
         }
     }
+
+    fn release_all_for_pid(&self, pid: u32) -> Result<u32, GuestPidProviderError> {
+        self.client
+            .release_all_for_pid(pid)
+            .map_err(|e| map_client_error(pid, e))
+    }
 }
 
 struct CallbackBridge {

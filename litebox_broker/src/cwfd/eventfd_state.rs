@@ -86,6 +86,25 @@ pub struct EventfdState {
     subscriptions: SubscriptionList,
 }
 
+impl Drop for EventfdState {
+    fn drop(&mut self) {
+        // PE.9 invariant: with eager per-conn subscription cleanup
+        // (fd_token_socket::handle_control_connection drains
+        // ConnState::tracked_subscriptions BEFORE releasing state
+        // refs), no subscription should still be attached when the
+        // last refcount drops. Always-on assertion: a leak here is a
+        // real bug we want to know about in production, not just
+        // debug builds.
+        assert!(
+            self.subscriptions.is_empty(),
+            "EventfdState dropped with {} live subscription(s) — \
+             eager per-conn unsubscribe is not running, or a Release \
+             bypassed ConnRefTracker.drain_tracked_subscriptions",
+            self.subscriptions.len()
+        );
+    }
+}
+
 #[derive(Debug)]
 struct EventfdInner {
     counter: u64,
@@ -363,6 +382,7 @@ mod tests {
         let f = receiver.recv().unwrap();
         assert_eq!(f.subscription_id(), 1);
         assert_eq!(f.events(), NOTIFY_EVENT_IN);
+        s.unsubscribe(1).unwrap();
     }
 
     #[test]
@@ -377,6 +397,7 @@ mod tests {
         let f = receiver.recv().unwrap();
         assert_eq!(f.subscription_id(), 1);
         assert_eq!(f.events(), NOTIFY_EVENT_IN);
+        s.unsubscribe(1).unwrap();
     }
 
     #[test]
@@ -399,6 +420,7 @@ mod tests {
         assert_eq!(v, 5);
         let f = receiver.recv().unwrap();
         assert_eq!(f.events(), NOTIFY_EVENT_OUT);
+        s.unsubscribe(7).unwrap();
     }
 
     #[test]
@@ -415,6 +437,8 @@ mod tests {
         let f2 = r2.recv().unwrap();
         assert_eq!(f1.subscription_id(), 10);
         assert_eq!(f2.subscription_id(), 20);
+        s.unsubscribe(10).unwrap();
+        s.unsubscribe(20).unwrap();
     }
 
     #[test]

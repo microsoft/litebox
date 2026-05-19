@@ -222,6 +222,12 @@ fn monotonic_nanos() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// Return the current host thread ID for audit correlation.
+fn host_tid() -> u32 {
+    // SAFETY: gettid takes no arguments and has no memory-safety preconditions.
+    unsafe { syscalls::raw::syscall0(syscalls::Sysno::gettid) as u32 }
+}
+
 /// Allocate a new sequence number and emit the entry (pre-syscall) event.
 ///
 /// Returns the sequence number for pairing with the exit event.
@@ -232,12 +238,13 @@ pub fn emit_entry_event(event: &AuditEvent) -> u64 {
     }
     let seq = AUDIT_SEQ.fetch_add(1, Ordering::Relaxed);
     let worker = WORKER_ID.load(Ordering::Relaxed);
+    let host_tid = host_tid();
     let ts = monotonic_nanos();
     let mut buf = ArrayString::<512>::new();
     use core::fmt::Write;
     let fit = write!(
         &mut buf,
-        "{{\"phase\":\"enter\",\"ts\":{ts},\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"syscall\":\"{}\",\"args\":[{}]}}\n",
+        "{{\"phase\":\"enter\",\"ts\":{ts},\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"host_tid\":{host_tid},\"syscall\":\"{}\",\"args\":[{}]}}\n",
         event.pid,
         event.tid,
         event.syscall_name,
@@ -248,7 +255,7 @@ pub fn emit_entry_event(event: &AuditEvent) -> u64 {
         write_audit_line_to_fd(fd, buf.as_str());
     } else {
         let msg = alloc::format!(
-            "{{\"phase\":\"enter\",\"ts\":{ts},\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"syscall\":\"{}\",\"args\":[{}]}}\n",
+            "{{\"phase\":\"enter\",\"ts\":{ts},\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"host_tid\":{host_tid},\"syscall\":\"{}\",\"args\":[{}]}}\n",
             event.pid,
             event.tid,
             event.syscall_name,
@@ -272,17 +279,18 @@ pub fn emit_exit_event(
         return;
     }
     let worker = WORKER_ID.load(Ordering::Relaxed);
+    let host_tid = host_tid();
     let ts = monotonic_nanos();
     let mut buf = ArrayString::<256>::new();
     use core::fmt::Write;
     let fit = match result {
         Ok(v) => write!(
             &mut buf,
-            "{{\"phase\":\"exit\",\"ts\":{ts},\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{{\"ok\":{v}}}}}\n",
+            "{{\"phase\":\"exit\",\"ts\":{ts},\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"host_tid\":{host_tid},\"syscall\":\"{syscall_name}\",\"result\":{{\"ok\":{v}}}}}\n",
         ),
         Err(e) => write!(
             &mut buf,
-            "{{\"phase\":\"exit\",\"ts\":{ts},\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{{\"err\":{e}}}}}\n",
+            "{{\"phase\":\"exit\",\"ts\":{ts},\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"host_tid\":{host_tid},\"syscall\":\"{syscall_name}\",\"result\":{{\"err\":{e}}}}}\n",
         ),
     }
     .is_ok();
@@ -294,7 +302,7 @@ pub fn emit_exit_event(
             Err(e) => alloc::format!("{{\"err\":{e}}}"),
         };
         let msg = alloc::format!(
-            "{{\"phase\":\"exit\",\"ts\":{ts},\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
+            "{{\"phase\":\"exit\",\"ts\":{ts},\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"host_tid\":{host_tid},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
         );
         write_audit_line_to_fd(fd, &msg);
     }

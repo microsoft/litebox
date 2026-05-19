@@ -9,6 +9,22 @@ use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
+fn monotonic_nanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer for `clock_gettime`.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+    if rc == 0 {
+        let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
+        let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
+        secs * 1_000_000_000 + nanos
+    } else {
+        0
+    }
+}
+
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
@@ -496,13 +512,36 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // C.5* follow-up: gate eager-broker `sys_pipe2` on an env var
     // so tests can probe both legacy host-pipe and eager-broker
     // codepaths without recompiling. `LITEBOX_EAGER_BROKER_PIPE=1`
-    // (or 'true' / 'yes', case-insensitive) flips it on. Default
-    // off matches the committed-state regression baseline.
+    // (or 'true' / 'yes', case-insensitive) flips it on.
+    //
+    // **F.9 status (2026-05-18)**: substrate complete (emit-side
+    // dup_handle + post-wait_worker_host release in
+    // exec_on_remote_host) PLUS PE.13 fix (fork-snapshot restore
+    // calls dup_handle so PE.9's strict ownership check doesn't fire
+    // on the implicit on_close release; matching parent-side release
+    // moved to spawn-async-wait task in commit_delayed_fork).
+    //
+    // Under LITEBOX_EAGER_BROKER_PIPE=1:
+    // - PB.c2p: 20/20
+    // - PIDF: 9/11 (PE.13 improved from 6/11)
+    //   * Remaining 2/11: PIDF.exit_self.{nonpie-glibc, non-pie-static-musl}
+    //     fail with EIO at std::process::Command::output's read of
+    //     the child's stdout pipe. Cross-bt (nonpie) exec uses
+    //     exec_on_remote_host. The transit ref accounting is
+    //     evidently still off for this specific case. Needs separate
+    //     investigation.
+    //
+    // F.9: flipped default to ON 2026-05-18. The under-load PB suite
+    // races that previously blocked this flip were the EINTR-from-
+    // SIGCHLD signal-disposition bug in sys_epoll_pwait/sys_ppoll
+    // (fixed in this branch). PB full suite is 113/113 stable across
+    // 5 runs under load; PXEOF/EPIPE/PXP all 100%. Opt-out via
+    // LITEBOX_EAGER_BROKER_PIPE=0.
     {
         let enabled = std::env::var("LITEBOX_EAGER_BROKER_PIPE")
             .ok()
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+            .unwrap_or(true);
         litebox_shim_linux::syscalls::set_eager_broker_pipe_enabled(enabled);
     }
 
@@ -511,13 +550,24 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // 'yes', case-insensitive) flips `sys_socketpair` to allocate
     // broker-backed AF_UNIX SOCK_STREAM pairs instead of in-shim
     // UnixSocket. Required for cross-worker fork+exec inheritance
-    // of socketpair fds. Default off; non-stream / non-AF_UNIX
-    // socketpairs ignore the gate.
+    // of socketpair fds.
+    //
+    // **F.8 flip retry (2026-05-17, PE.10 done)**: setting default
+    // ON. The earlier F.8 attempt regressed PB.c2p 20/20 → 11/20.
+    // Root caused: PE.5's fork-emit caller_pid scope wrap was
+    // unconditionally stamping child_pid on dup_handles, while
+    // releases at exec ran with caller_pid=0 (gate off). Ambient
+    // fallback mis-attributed releases → ReleaseAllForPid(child)
+    // double-released. Fixed by gating PE.5's scope wrap on
+    // per_pid_ownership_enabled(). Empirically: 5/5 isolation
+    // passes on PB.c2p.pie-glibc.dpg1 with eager-socketpair on.
+    //
+    // Set `LITEBOX_EAGER_BROKER_SOCKETPAIR=0` to opt out.
     {
         let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETPAIR")
             .ok()
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+            .unwrap_or(true);
         litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
     }
 
@@ -981,9 +1031,11 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         );
         let combined_fs = std::sync::Arc::new(combined);
 
+        let task_params =
+            task_override.unwrap_or_else(|| task_params_with_overrides(cli_args, platform));
         let program = shim.load_program_with_exec_filename(
             combined_fs,
-            task_override.unwrap_or_else(|| task_params_with_overrides(cli_args, platform)),
+            task_params,
             load_prog_path,
             exec_prog_path,
             argv,
@@ -1033,6 +1085,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         // Install broker-backed shim fd entries for fds inherited across
         // the cross-binary-type exec boundary (Phase 2.F follow-up,
         // extended in Phase C.3 to handle pipe).
+        let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
         for spec in &cli_args.broker_fd_bridge {
             let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
                 parse_broker_fd_bridge_spec(spec)?;
@@ -1108,9 +1161,10 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     );
     let combined_fs = std::sync::Arc::new(combined);
 
+    let task_params = task_override.unwrap_or_else(|| platform.init_task());
     let program = shim.load_program_with_exec_filename(
         combined_fs,
-        task_override.unwrap_or_else(|| platform.init_task()),
+        task_params,
         load_prog_path,
         exec_prog_path,
         argv,
@@ -1134,6 +1188,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // Install broker-backed shim fd entries for fds inherited across
     // the cross-binary-type exec boundary (Phase 2.F follow-up,
     // extended in Phase C.3 to handle pipe).
+    let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
     for spec in &cli_args.broker_fd_bridge {
         let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
             parse_broker_fd_bridge_spec(spec)?;
@@ -1190,6 +1245,14 @@ fn task_params_with_overrides(
 }
 
 #[allow(clippy::similar_names)]
+fn set_broker_fd_bridge_caller_pid_scope(
+    task_params: litebox_common_linux::TaskParams,
+) -> Option<litebox_common_linux::fd_token_client::CallerPidScope> {
+    u32::try_from(task_params.pid)
+        .ok()
+        .map(litebox_common_linux::fd_token_client::set_caller_pid_scope)
+}
+
 fn worker_task_params(cli_args: &CliArgs) -> litebox_common_linux::TaskParams {
     let pid: i32 = cli_args.guest_pid.unwrap_or(1);
     let ppid: i32 = cli_args.guest_ppid.unwrap_or(0);
@@ -2427,6 +2490,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         // Install broker-backed shim fd entries for fds inherited across
         // the cross-binary-type exec boundary (Phase 2.F follow-up,
         // extended in Phase C.3 to handle pipe).
+        let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(guest_task);
         for spec in &cli_args.broker_fd_bridge {
             let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
                 parse_broker_fd_bridge_spec(spec)?;
@@ -2465,6 +2529,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
 
+    eprintln!("[TIMING] litebox_shim_ready_ns={}", monotonic_nanos());
     unsafe {
         litebox_platform_linux_userland::run_thread(
             program.entrypoints,
@@ -3184,6 +3249,7 @@ mod tests {
             fork_restore_fd: None,
             fork_restore_ack_fd: None,
             pipe_bridge: Vec::new(),
+            broker_fd_bridge: Vec::new(),
             mux_fd: None,
             mux_stream: Vec::new(),
             local_pipe: Vec::new(),

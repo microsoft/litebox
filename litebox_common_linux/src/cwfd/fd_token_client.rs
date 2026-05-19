@@ -28,12 +28,12 @@ use crate::fd_token_protocol::{
     build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
     build_mark_process_exited_request, build_materialize_request, build_pidfd_exited_request,
     build_pty_ioctl_request, build_pty_read_request, build_pty_write_request,
-    build_read_eventfd_request, build_read_pipe_request, build_read_siginfo_request,
-    build_read_socketpair_request, build_register_notification_ring_request,
-    build_register_process_request, build_register_request, build_release_request,
-    build_subscribe_eventfd_request, build_subscribe_process_exit_request,
-    build_subscribe_pty_request, build_unsubscribe_request, build_write_eventfd_request,
-    build_write_pipe_request, build_write_socketpair_request, decode,
+    build_push_siginfo_request, build_read_eventfd_request, build_read_pipe_request,
+    build_read_siginfo_request, build_read_socketpair_request,
+    build_register_notification_ring_request, build_register_process_request,
+    build_register_request, build_release_request, build_subscribe_eventfd_request,
+    build_subscribe_process_exit_request, build_subscribe_pty_request, build_unsubscribe_request,
+    build_write_eventfd_request, build_write_pipe_request, build_write_socketpair_request, decode,
     parse_create_pidfd_response_ok, parse_create_pty_response_ok,
     parse_create_socketpair_response_body, parse_handle_body, parse_pidfd_exited_response_ok,
     parse_pty_ioctl_response_body, parse_pty_read_response_body, parse_pty_write_response_ok,
@@ -43,7 +43,7 @@ use crate::fd_token_protocol::{
 };
 use std::format;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -110,6 +110,50 @@ pub struct FdTokenClient {
     stream: Mutex<UnixStream>,
 }
 
+// Phase F.5+ PE.1 Step C: thread-local caller_pid stamp.
+//
+// Before any shim-side call into `FdTokenClient`, the shim sets this
+// to the current guest pid (the pid the operation is being performed
+// on behalf of). The `send_frame_with_fds` low-level send path stamps
+// the encoded frame's header bytes 12-15 from this value.
+//
+// Zero (the default) means "unspecified" and preserves the pre-PE.1
+// protocol shape — broker-side per-pid tracking degenerates to a
+// single shared (0, id) bucket.
+std::thread_local! {
+    static CALLER_PID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Sets the thread-local caller_pid stamp for outbound broker RPCs.
+/// Returns a guard that restores the previous value on drop, so calls
+/// can nest cleanly (e.g., a syscall handler stamps once, an inner
+/// helper re-stamps for a sub-operation on behalf of a different pid).
+pub fn set_caller_pid_scope(pid: u32) -> CallerPidScope {
+    let previous = CALLER_PID.with(|c| {
+        let prev = c.get();
+        c.set(pid);
+        prev
+    });
+    CallerPidScope { previous }
+}
+
+/// RAII guard returned by [`set_caller_pid_scope`].
+pub struct CallerPidScope {
+    previous: u32,
+}
+
+impl Drop for CallerPidScope {
+    fn drop(&mut self) {
+        CALLER_PID.with(|c| c.set(self.previous));
+    }
+}
+
+/// Reads the current thread-local caller_pid stamp (mostly for tests
+/// and diagnostics).
+pub fn current_caller_pid() -> u32 {
+    CALLER_PID.with(std::cell::Cell::get)
+}
+
 impl FdTokenClient {
     /// Connects to the broker control socket at `path`.
     pub fn connect(path: &Path) -> io::Result<Self> {
@@ -168,6 +212,24 @@ impl FdTokenClient {
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }
+    }
+
+    /// Duplicates a raw host fd and registers the duplicate with the broker.
+    pub fn register_dup_raw_fd(&self, raw_fd: i32) -> Result<u64, ClientError> {
+        // SAFETY: fcntl does not dereference pointers for F_DUPFD_CLOEXEC; raw_fd is
+        // supplied by the caller and errors are reported via the return value.
+        let duped = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duped < 0 {
+            return Err(ClientError::Io(io::Error::last_os_error()));
+        }
+        // SAFETY: `duped` is a fresh fd returned by fcntl above.
+        let owned = unsafe { OwnedFd::from_raw_fd(duped) };
+        self.register(owned)
+    }
+
+    /// Materializes a broker token and returns ownership as a raw host fd.
+    pub fn materialize_raw_fd(&self, handle_id: u64) -> Result<i32, ClientError> {
+        self.materialize(handle_id).map(OwnedFd::into_raw_fd)
     }
 
     /// Decrements the registry refcount for `handle_id`. When the
@@ -242,6 +304,31 @@ impl FdTokenClient {
                 parse_handle_body(resp.body, resp.opcode).map_err(ClientError::Protocol)
             }
             s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    /// Phase F.5+ PE.1 Step D: release every (pid, *) entry the
+    /// broker is tracking for this connection on behalf of `pid`.
+    /// Returns the number of refs released (for diagnostics).
+    pub fn release_all_for_pid(&self, pid: u32) -> Result<u32, ClientError> {
+        use crate::fd_token_protocol::{
+            build_release_all_for_pid_request, parse_release_all_for_pid_response_ok,
+        };
+        let stream = self.lock();
+        send_frame(&stream, &build_release_all_for_pid_request(pid), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::ReleaseAllForPidResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_release_all_for_pid_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
+            s => Err(map_status_with_handle(resp.opcode, s, u64::from(pid))),
         }
     }
 
@@ -577,6 +664,32 @@ impl FdTokenClient {
         }
     }
 
+    /// Pushes one shim-synthesized `signalfd_siginfo` payload into a broker-hosted signalfd.
+    pub fn push_siginfo(&self, handle_id: u64, payload: &[u8]) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_push_siginfo_request(handle_id, payload),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::PushSiginfoResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: payload.len() as u64,
+            }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
     /// Asks the broker to create a pipe state. The returned handle starts
     /// with one read-end ref and one write-end ref.
     pub fn create_pipe(
@@ -883,7 +996,19 @@ fn send_frame_with_fds(
         fds.len()
     );
 
-    let bytes = frame.encode().map_err(ClientError::Protocol)?;
+    let mut bytes = frame.encode().map_err(ClientError::Protocol)?;
+    // Phase F.5+ PE.1 Step C: stamp the encoded frame's caller_pid
+    // header field (bytes 12-15) from the thread-local set by the
+    // shim before invoking any FdTokenClient method. If the
+    // thread-local is unset, caller_pid stays at the value the
+    // builder used (typically 0 = unspecified), preserving today's
+    // behaviour for callers that have not yet been ported to set
+    // CALLER_PID (notification ring registration, response paths,
+    // etc.).
+    let stamp = CALLER_PID.with(std::cell::Cell::get);
+    if stamp != 0 && bytes.len() >= CTRL_HEADER_LEN {
+        bytes[12..16].copy_from_slice(&stamp.to_le_bytes());
+    }
 
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr() as *mut _,

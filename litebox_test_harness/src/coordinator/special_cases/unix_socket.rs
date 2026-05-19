@@ -36,6 +36,7 @@ pub fn run(sub: &str) -> i32 {
         "socketpair-fork-write" => test_socketpair_fork_write(),
         "socketpair-fork-read" => test_socketpair_fork_read(),
         "socketpair-exec" => test_socketpair_exec(),
+        "fork-errno-touch" => test_fork_errno_touch(),
         // Helper: child side of socketpair-exec (inherits fd from parent)
         "socketpair-exec-child" => socketpair_exec_child(),
         // Nested: exec a child that itself does socketpair+fork+exec
@@ -720,6 +721,43 @@ fn test_socketpair_fork_read() -> i32 {
         0
     } else {
         println!("US6R_SOCKETPAIR_FORK_READ_FAIL:exit={exit_code}");
+        1
+    }
+}
+
+/// FET: fork child touches libc errno before exec.
+/// Isolates fork return restoring guest FS/TLS before any child-side libc code.
+fn test_fork_errno_touch() -> i32 {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("FET_FORK_FAIL:{}", errno());
+        return 1;
+    }
+
+    if pid == 0 {
+        unsafe {
+            let errno_ptr = libc::__errno_location();
+            *errno_ptr = libc::EBADF;
+            libc::_exit(if *errno_ptr == libc::EBADF { 0 } else { 2 });
+        }
+    }
+
+    let mut status = 0i32;
+    unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    if libc::WIFEXITED(status) {
+        let exit_code = libc::WEXITSTATUS(status);
+        if exit_code == 0 {
+            println!("FET_FORK_ERRNO_TOUCH_OK");
+            0
+        } else {
+            println!("FET_FORK_ERRNO_TOUCH_FAIL:exit={exit_code}");
+            1
+        }
+    } else if libc::WIFSIGNALED(status) {
+        println!("FET_FORK_ERRNO_TOUCH_SIGNAL:sig={}", libc::WTERMSIG(status));
+        1
+    } else {
+        println!("FET_FORK_ERRNO_TOUCH_WAIT_FAIL:status={status}");
         1
     }
 }
@@ -1526,6 +1564,43 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                 }
             );
         }
+    }
+
+    for &bt in &[
+        crate::BinaryType::StaticPieMusl,
+        crate::BinaryType::NonPieStaticMusl,
+    ] {
+        let id = format!("FET.fork_errno_touch.{}.dpg1", bt.label());
+        typed_test!(
+            reg,
+            "xworker",
+            "unix_socket",
+            id,
+            timeout = 60,
+            agents[handle = AgentName::Dpg1],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let target = crate::binary_path(bt, &self_exe);
+                let resp = run
+                    .send_named_typed(
+                        &handle,
+                        &EXEC_BIN,
+                        ExecBinArgs {
+                            argv: vec![
+                                target,
+                                "unix-socket-test".into(),
+                                "fork-errno-touch".into(),
+                            ],
+                            timeout_ms: Some(10 * 1000),
+                            stdin: None,
+                            env: vec![],
+                        },
+                    )
+                    .await;
+                let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("FET_FORK_ERRNO_TOUCH_OK"));
+                crate::coordinator::TestOutcome::new("dpg1", pass, format!("{resp:?}"))
+            }
+        );
     }
 
     // Long-lived agents this fan-out runs in. One slot per

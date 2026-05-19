@@ -59,6 +59,12 @@ macro_rules! convert_flags {
 }
 
 pub(crate) type SocketFd = litebox::net::SocketFd<Platform>;
+type BrokerSocketPairTypedFd =
+    litebox::fd::TypedFd<crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem>;
+type BrokerSocketPairHandle = litebox::fd::EntryHandle<
+    Platform,
+    crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem,
+>;
 
 impl<FS: ShimFS> super::file::FilesState<FS> {
     /// Helper to dispatch socket operations based on socket type (INET vs Unix).
@@ -92,7 +98,30 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
             .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
             .map_err(|err| match err {
                 litebox::fd::ErrRawIntFd::NotFound => Errno::EBADF,
-                litebox::fd::ErrRawIntFd::InvalidSubsystem => Errno::ENOTSOCK,
+                litebox::fd::ErrRawIntFd::InvalidSubsystem => {
+                    // PE.11 invariant: if we reach this branch, the fd
+                    // exists in the descriptor table as SOME subsystem
+                    // that's neither INET nor shim-Unix. For
+                    // socket-like subsystems (BrokerSocketPair today,
+                    // future broker-backed Unix variants), returning
+                    // ENOTSOCK silently is the same class of bug that
+                    // caused tokio's "Bad read on self-pipe: ENOTSOCK"
+                    // panic under eager-broker-socketpair (PE.10).
+                    // The caller of with_socket should have dispatched
+                    // them BEFORE entering with_socket.
+                    //
+                    // For genuinely-not-a-socket subsystems (regular
+                    // file, pipe, eventfd, signalfd, epoll, host-pipe),
+                    // ENOTSOCK is the correct errno per POSIX.
+                    //
+                    // assert_socket_like_handled() panics if the fd's
+                    // subsystem is one we've classified as socket-like
+                    // and forgot to dispatch — converting a silent
+                    // mis-routing into a loud bug. Always-on (release-
+                    // build too).
+                    assert_no_unhandled_socket_subsystem::<FS>(&self.raw_descriptor_store, raw_fd);
+                    Errno::ENOTSOCK
+                }
             })?;
         let handle = global
             .litebox
@@ -101,6 +130,45 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
             .ok_or(Errno::EBADF)?;
         handle.with_entry(|entry| unix_op(entry))
     }
+}
+
+/// PE.11 invariant helper: panics if `raw_fd` resolves to a
+/// subsystem that's been classified as "socket-like" but wasn't
+/// dispatched by [`FilesState::with_socket`]. The canonical
+/// failure caught is `BrokerSocketPairSubsystem` (Phase F broker-
+/// backed AF_UNIX socketpair) being routed through with_socket
+/// without an explicit fast path — which is exactly how tokio's
+/// "Bad read on self-pipe: ENOTSOCK" panic surfaced under eager-
+/// broker-socketpair.
+///
+/// When future broker-backed socket-like subsystems (e.g. broker-
+/// backed inet, broker-backed seqpacket) are added, append them
+/// to the match. The compiler doesn't enforce exhaustiveness over
+/// "subsystems with the socket-like property" (no central enum
+/// classifies them), so we list explicitly and rely on this
+/// assertion + the PE.5 / PE.10 / PE.11 commit comments to keep
+/// the list aware.
+fn assert_no_unhandled_socket_subsystem<FS: ShimFS>(
+    raw_descriptor_store: &litebox::sync::RwLock<
+        litebox_platform_multiplex::Platform,
+        litebox::fd::RawDescriptorStorage,
+    >,
+    raw_fd: usize,
+) {
+    let rds = raw_descriptor_store.read();
+    if rds
+        .fd_from_raw_integer::<crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+            raw_fd,
+        )
+        .is_ok()
+    {
+        panic!(
+            "with_socket: fd={raw_fd} is a BrokerSocketPairSubsystem entry — \
+             the caller must dispatch broker-backed socketpair fds BEFORE \
+             calling with_socket (see PE.10 recv() fast path in do_recvfrom_with_fds)"
+        );
+    }
+    // No socket-like subsystem matched → genuine ENOTSOCK.
 }
 
 #[derive(Clone, Copy, FromBytes, IntoBytes)]
@@ -1143,6 +1211,47 @@ fn parse_type_and_flags(type_and_flags: u32) -> Result<(SockType, SockFlags), Er
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// Returns `Some(result)` if `sockfd` is a broker socketpair fd; returns
+    /// `None` so callers can fall through to the legacy `with_socket` dispatch
+    /// otherwise.
+    ///
+    /// The closure receives the typed fd rather than an entry handle because some
+    /// existing broker-socketpair socket ops only need fd classification. Write
+    /// call sites obtain the entry handle inside the closure, preserving their
+    /// existing `EBADF` behavior if the descriptor entry disappeared.
+    fn try_with_broker_sp<R>(
+        &self,
+        sockfd: u32,
+        op: impl FnOnce(&BrokerSocketPairTypedFd) -> Result<R, Errno>,
+    ) -> Option<Result<R, Errno>> {
+        let raw_fd = match usize::try_from(sockfd) {
+            Ok(raw_fd) => raw_fd,
+            Err(_) => return Some(Err(Errno::EBADF)),
+        };
+        let broker_sp = {
+            let files = self.files.borrow();
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
+                .ok()
+        };
+        broker_sp.map(|typed| op(typed.as_ref()))
+    }
+
+    fn broker_sp_handle(
+        &self,
+        typed: &BrokerSocketPairTypedFd,
+    ) -> Result<BrokerSocketPairHandle, Errno> {
+        self.global
+            .litebox
+            .descriptor_table()
+            .entry_handle(typed)
+            .ok_or(Errno::EBADF)
+    }
+}
+
+impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `socket`
     pub(crate) fn sys_socket(
         &self,
@@ -1917,6 +2026,24 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(nl) = self.netlink_sockets.borrow_mut().get_mut(&sockfd) {
             return nl.sendto(buf).map_err(|_| Errno::EINVAL);
         }
+        if let Some(ret) = self.try_with_broker_sp(sockfd, |typed| {
+            if sockaddr.is_some() {
+                Err(Errno::EISCONN)
+            } else {
+                let handle = self.broker_sp_handle(typed)?;
+                handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
+            }
+        }) {
+            if let Err(Errno::EPIPE) = ret
+                && !flags.contains(SendFlags::NOSIGNAL)
+            {
+                self.send_signal(
+                    litebox_common_linux::signal::Signal::SIGPIPE,
+                    super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+                );
+            }
+            return ret;
+        }
         let ret = self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -2325,6 +2452,32 @@ impl<FS: ShimFS> Task<FS> {
             .iter()
             .try_fold(0usize, |acc, iov| acc.checked_add(iov.iov_len))
             .ok_or(Errno::EINVAL)?;
+        if let Some(ret) = self.try_with_broker_sp(sockfd, |typed| {
+            if sock_addr.is_some() {
+                Err(Errno::EISCONN)
+            } else if msg.msg_controllen != 0 {
+                Err(Errno::EOPNOTSUPP)
+            } else {
+                let handle = self.broker_sp_handle(typed)?;
+                if total_len == 0 {
+                    handle.with_entry(|entry| entry.write(&self.wait_cx(), &[]))
+                } else {
+                    Self::sendmsg_stream_iovs(&iovs, |chunk| {
+                        handle.with_entry(|entry| entry.write(&self.wait_cx(), chunk))
+                    })
+                }
+            }
+        }) {
+            if let Err(Errno::EPIPE) = ret
+                && !flags.contains(SendFlags::NOSIGNAL)
+            {
+                self.send_signal(
+                    litebox_common_linux::signal::Signal::SIGPIPE,
+                    super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+                );
+            }
+            return ret;
+        }
         let ret = self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -2829,6 +2982,33 @@ impl<FS: ShimFS> Task<FS> {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
+
+        // F.8 prep: broker-backed AF_UNIX SOCK_STREAM socketpair fast
+        // path. with_socket's two-arm dispatch (INET / shim-UnixSocket)
+        // doesn't know about BrokerSocketPair, so without this branch
+        // any recv() on a broker-backed socketpair would fall through
+        // to ENOTSOCK. tokio's signal self-pipe is the prominent
+        // caller hitting this under eager-broker-socketpair.
+        //
+        // recv() on a connected stream socketpair degenerates to
+        // read() when caller doesn't ask for addr/fds — exactly
+        // tokio's use. Limit this fast path to that case; richer
+        // recvmsg semantics (SCM_RIGHTS, peer addr) are deferred
+        // until BrokerSocketPair is plumbed through with_socket
+        // properly.
+        if !want_source && received_fds.is_empty() && received_tokens.is_empty() {
+            let broker_sp = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
+                .ok();
+            if let Some(typed) = broker_sp {
+                let handle = self.broker_sp_handle(typed.as_ref())?;
+                let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))?;
+                return Ok(size);
+            }
+        }
+
         let (size, addr) = {
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
             files.with_socket(
@@ -2910,6 +3090,26 @@ impl<FS: ShimFS> Task<FS> {
         if self.netlink_sockets.borrow().contains_key(&sockfd) {
             return Ok(());
         }
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| match optname {
+            SocketOptionName::Socket(
+                SocketOption::RCVTIMEO
+                | SocketOption::SNDTIMEO
+                | SocketOption::LINGER
+                | SocketOption::REUSEADDR
+                | SocketOption::REUSEPORT
+                | SocketOption::BROADCAST
+                | SocketOption::KEEPALIVE,
+            ) => self
+                .global
+                .setsockopt_common(optname, optval, optlen, |_sopt, _value| Ok(())),
+            SocketOptionName::TCP(TcpOption::NODELAY | TcpOption::CORK) => {
+                let _val: u32 = super::read_from_user(optval, optlen)?;
+                Ok(())
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        }) {
+            return result;
+        }
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -2969,6 +3169,38 @@ impl<FS: ShimFS> Task<FS> {
             }
             return Ok(0);
         }
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| match optname {
+            SocketOptionName::Socket(
+                SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER,
+            ) => self
+                .global
+                .getsockopt_common(optname, optval, len, |_sopt| {
+                    SocketOptionValue::Timeout(None)
+                }),
+            SocketOptionName::Socket(
+                SocketOption::REUSEADDR
+                | SocketOption::REUSEPORT
+                | SocketOption::KEEPALIVE
+                | SocketOption::BROADCAST,
+            ) => self
+                .global
+                .getsockopt_common(optname, optval, len, |_sopt| SocketOptionValue::U32(0)),
+            SocketOptionName::Socket(SocketOption::ERROR) => {
+                super::write_to_user(0u32, optval, len)
+            }
+            SocketOptionName::Socket(SocketOption::TYPE) => {
+                super::write_to_user(SockType::Stream as u32, optval, len)
+            }
+            SocketOptionName::Socket(SocketOption::RCVBUF | SocketOption::SNDBUF) => {
+                super::write_to_user(64u32 * 1024, optval, len)
+            }
+            SocketOptionName::TCP(TcpOption::NODELAY | TcpOption::CORK) => {
+                super::write_to_user(0u32, optval, len)
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        }) {
+            return result;
+        }
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -3015,6 +3247,11 @@ impl<FS: ShimFS> Task<FS> {
         if self.netlink_sockets.borrow().contains_key(&sockfd) {
             return Ok(SocketAddress::default());
         }
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| {
+            Ok(SocketAddress::Unix(super::unix::UnixSocketAddr::Unnamed))
+        }) {
+            return result;
+        }
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -3049,6 +3286,11 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
     fn do_getpeername(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| {
+            Ok(SocketAddress::Unix(super::unix::UnixSocketAddr::Unnamed))
+        }) {
+            return result;
+        }
         self.files.borrow().with_socket(
             &self.global,
             sockfd,

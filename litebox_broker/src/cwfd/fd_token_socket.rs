@@ -11,12 +11,16 @@
 use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_request};
 use crate::fd_tokens::BrokerFdTokenRegistry;
 use crate::state_registry::{BrokerStateRegistry, StateHandle};
-use crate::state_service::{ConnState, handle_request as state_handle_request};
+use crate::state_service::{
+    ConnState, SubscriptionRegistry, handle_request as state_handle_request,
+};
 use litebox_common_linux::fd_token_protocol::{
     BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, StatusCode, build_error_response,
     decode, parse_create_pidfd_response_ok, parse_create_pty_response_ok, parse_handle_body,
 };
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroU32;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -59,10 +63,84 @@ use tracing::{debug, info, warn};
 /// sees EOF). Without this, a SIGKILL'd worker leaks broker
 /// pipe/eventfd/etc. refcounts and the peer worker stalls forever
 /// waiting on EOF.
+#[derive(Clone, Copy)]
+struct PeerCred {
+    pid: libc::pid_t,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallerScope {
+    /// Syscall-stamped guest pid; non-zero by construction.
+    Owned(NonZeroU32),
+    /// Async-Drop / unscoped release path; falls back to "any pid on this conn".
+    Ambient,
+}
+
+impl Hash for CallerScope {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Preserve the old `(caller_pid: u32, id)` HashMap bucket order so
+        // Ambient release keeps choosing the same arbitrary bucket.
+        self.to_wire().hash(state);
+    }
+}
+
+impl CallerScope {
+    fn from_wire(pid: u32) -> Self {
+        match NonZeroU32::new(pid) {
+            Some(pid) => Self::Owned(pid),
+            None => Self::Ambient,
+        }
+    }
+
+    fn to_wire(self) -> u32 {
+        match self {
+            Self::Owned(pid) => pid.get(),
+            Self::Ambient => 0,
+        }
+    }
+
+    fn assert_or_diagnose(&mut self, seen_owned_caller_pid: &mut bool) -> Self {
+        match *self {
+            Self::Owned(_) => *seen_owned_caller_pid = true,
+            Self::Ambient if *seen_owned_caller_pid => {
+                // TODO: future hardening — flip this diagnostic to Err once
+                // async-Drop / unscoped release paths have explicit ownership.
+                warn!(
+                    "fd-token control: PE.9 PER-PID GAP: caller_pid=0 on a conn that \
+                     previously sent non-zero pids — shim has an unscoped release \
+                     path. Operation continues via ambient fallback."
+                );
+            }
+            Self::Ambient => {}
+        }
+        *self
+    }
+}
+
 #[derive(Default)]
 struct ConnRefTracker {
-    state_refs: HashMap<u64, u32>,
-    process_refs: HashMap<u64, u32>,
+    /// Per-(caller scope, handle_id) refcount. Wire caller_pid=0 decodes
+    /// to [`CallerScope::Ambient`], preserving the historical `(0, id)`
+    /// bucket for genuinely unscoped creates while making ambient fallback
+    /// explicit at type level.
+    state_refs: HashMap<(CallerScope, u64), u32>,
+    process_refs: HashMap<(CallerScope, u64), u32>,
+    /// PE.9 diagnostic: set to true the first time this conn sends a
+    /// non-zero caller_pid frame. Once set, every subsequent
+    /// caller_pid=0 frame from this conn is suspicious — it means
+    /// the shim stamps caller_pid in some paths but not others on
+    /// the same worker. That's a bug class (shim async-drop or
+    /// otherwise-unscoped code path). Logged loudly so the gap is
+    /// hunted down. Future: caller_pid=0 should be promoted to a
+    /// hard protocol violation once async-drop paths are audited.
+    seen_nonzero_caller_pid: bool,
+    /// PE.12 diagnostic: stable per-conn ID used to correlate frames
+    /// across the broker log. Set by `handle_control_connection`.
+    conn_id: u64,
+    /// Host credentials of the worker process connected to this socket.
+    peer_cred: Option<PeerCred>,
 }
 
 impl ConnRefTracker {
@@ -70,43 +148,190 @@ impl ConnRefTracker {
         Self::default()
     }
 
-    fn record_state(&mut self, id: u64) {
-        *self.state_refs.entry(id).or_insert(0) += 1;
+    /// PE.9 diagnostic: called from every opcode entrypoint that
+    /// carries a caller_pid in the frame header, before tracker
+    /// mutations. Trips the conn into "gate-on" mode on first
+    /// non-zero pid; subsequent caller_pid=0 ops then warn.
+    fn note_caller_scope(&mut self, mut caller_scope: CallerScope) -> CallerScope {
+        caller_scope.assert_or_diagnose(&mut self.seen_nonzero_caller_pid)
     }
 
-    fn record_process(&mut self, id: u64) {
-        *self.process_refs.entry(id).or_insert(0) += 1;
+    fn record_state(&mut self, caller_scope: CallerScope, id: u64) {
+        *self.state_refs.entry((caller_scope, id)).or_insert(0) += 1;
+    }
+
+    fn record_process(&mut self, caller_scope: CallerScope, id: u64) {
+        *self.process_refs.entry((caller_scope, id)).or_insert(0) += 1;
     }
 
     /// Returns true iff this connection has a positive reference
-    /// count for `id` in the state registry — i.e., this connection
-    /// owns at least one outstanding acquire (Create response or
-    /// DupHandle) for this handle.
-    fn owns_state(&self, id: u64) -> bool {
-        self.state_refs.get(&id).copied().unwrap_or(0) > 0
+    /// count for `id` from `caller_scope` in the state registry.
+    ///
+    /// [`CallerScope::Ambient`] falls back to "owned by ANY scope on
+    /// this conn" (including an Ambient bucket from an unscoped acquire).
+    /// This preserves correctness for asynchronous Drop paths in the shim
+    /// that release a broker-backed fd from a non-syscall thread.
+    fn owns_state(&self, caller_scope: CallerScope, id: u64) -> bool {
+        match caller_scope {
+            CallerScope::Ambient => self.state_refs.iter().any(|((_, h), c)| *h == id && *c > 0),
+            CallerScope::Owned(_) => {
+                self.state_refs
+                    .get(&(caller_scope, id))
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+            }
+        }
     }
 
-    fn owns_process(&self, id: u64) -> bool {
-        self.process_refs.get(&id).copied().unwrap_or(0) > 0
+    fn owns_process(&self, caller_scope: CallerScope, id: u64) -> bool {
+        match caller_scope {
+            CallerScope::Ambient => self
+                .process_refs
+                .iter()
+                .any(|((_, h), c)| *h == id && *c > 0),
+            CallerScope::Owned(_) => {
+                self.process_refs
+                    .get(&(caller_scope, id))
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+            }
+        }
     }
 
-    /// Worker called Release on `id`. We don't know which registry
-    /// without round-tripping the cascade, so decrement whichever
-    /// map has a positive count for it (state first, then process).
-    fn record_release(&mut self, id: u64) {
-        if let Some(c) = self.state_refs.get_mut(&id) {
+    /// Worker called Release on `id`. Decrement the matching
+    /// (caller scope, id) bucket; try state first, then process.
+    /// Removes the entry entirely when its count drops to 0 so
+    /// the invariant "key present ⇒ count > 0" holds.
+    ///
+    /// [`CallerScope::Ambient`] falls back to "decrement an arbitrary
+    /// scope bucket holding this id" (see [`owns_state`]). This handles
+    /// the shim's asynchronous Drop paths where caller_pid isn't stamped.
+    fn record_release(&mut self, caller_scope: CallerScope, id: u64) {
+        if caller_scope == CallerScope::Ambient {
+            // Ambient release: preserve the historical HashMap iteration
+            // behavior by picking the first positive bucket for this id,
+            // including an Ambient bucket if the acquire was also unscoped.
+            let state_key = self
+                .state_refs
+                .iter()
+                .find(|((_, h), c)| *h == id && **c > 0)
+                .map(|(k, _)| *k);
+            if let Some(key) = state_key {
+                if let Some(c) = self.state_refs.get_mut(&key) {
+                    *c -= 1;
+                    if *c == 0 {
+                        self.state_refs.remove(&key);
+                    }
+                }
+                return;
+            }
+            let proc_key = self
+                .process_refs
+                .iter()
+                .find(|((_, h), c)| *h == id && **c > 0)
+                .map(|(k, _)| *k);
+            if let Some(key) = proc_key {
+                if let Some(c) = self.process_refs.get_mut(&key) {
+                    *c -= 1;
+                    if *c == 0 {
+                        self.process_refs.remove(&key);
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(c) = self.state_refs.get_mut(&(caller_scope, id)) {
+            debug_assert!(
+                *c > 0,
+                "ConnRefTracker invariant: zero-count state_refs entry present for (scope={caller_scope:?}, id={id})"
+            );
             if *c > 0 {
                 *c -= 1;
+                if *c == 0 {
+                    self.state_refs.remove(&(caller_scope, id));
+                }
                 return;
             }
         }
-        if let Some(c) = self.process_refs.get_mut(&id) {
+        if let Some(c) = self.process_refs.get_mut(&(caller_scope, id)) {
+            debug_assert!(
+                *c > 0,
+                "ConnRefTracker invariant: zero-count process_refs entry present for (scope={caller_scope:?}, id={id})"
+            );
             if *c > 0 {
                 *c -= 1;
+                if *c == 0 {
+                    self.process_refs.remove(&(caller_scope, id));
+                }
             }
         }
     }
 
+    /// Phase F.5+ PE.1 Step D: release every (pid, id) entry for
+    /// the given `pid`. Called from the broker's ReleaseAllForPid
+    /// handler when a guest process exits cleanly. Returns the
+    /// total number of refs decremented across both registries.
+    fn release_all_for_pid(
+        &mut self,
+        pid: u32,
+        state_registry: &BrokerStateRegistry,
+        process_registry: &BrokerStateRegistry,
+    ) -> u32 {
+        let mut released = 0u32;
+        let target_scope = CallerScope::from_wire(pid);
+        let state_keys: Vec<(CallerScope, u64)> = self
+            .state_refs
+            .keys()
+            .filter(|(scope, _)| *scope == target_scope)
+            .copied()
+            .collect();
+        for key in state_keys {
+            if let Some(count) = self.state_refs.remove(&key) {
+                for _ in 0..count {
+                    let _ = state_registry.release(StateHandle::from_id(key.1));
+                    released = released.saturating_add(1);
+                }
+            }
+        }
+        let process_keys: Vec<(CallerScope, u64)> = self
+            .process_refs
+            .keys()
+            .filter(|(scope, _)| *scope == target_scope)
+            .copied()
+            .collect();
+        for key in process_keys {
+            if let Some(count) = self.process_refs.remove(&key) {
+                for _ in 0..count {
+                    let _ = process_registry.release(StateHandle::from_id(key.1));
+                    released = released.saturating_add(1);
+                }
+            }
+        }
+        // P3 invariant: after release_all_for_pid, no (pid, *) entry
+        // remains in either tracker. Cheap to check (linear in tracker
+        // size, debug-only). A failure here indicates a concurrent
+        // insertion or a bug in the removal loop above.
+        debug_assert!(
+            !self
+                .state_refs
+                .keys()
+                .any(|(scope, _)| *scope == target_scope),
+            "P3: state_refs still has entries for released pid {pid}"
+        );
+        debug_assert!(
+            !self
+                .process_refs
+                .keys()
+                .any(|(scope, _)| *scope == target_scope),
+            "P3: process_refs still has entries for released pid {pid}"
+        );
+        released
+    }
+
+    /// Force-release every (pid, id) entry. Used on disconnect.
+    /// Returns (state_total, process_total) for diagnostics.
     fn cleanup_on_disconnect(
         self,
         state_registry: &BrokerStateRegistry,
@@ -114,13 +339,13 @@ impl ConnRefTracker {
     ) {
         let mut total_state = 0usize;
         let mut total_process = 0usize;
-        for (id, count) in self.state_refs {
+        for ((_scope, id), count) in self.state_refs {
             for _ in 0..count {
                 let _ = state_registry.release(StateHandle::from_id(id));
                 total_state += 1;
             }
         }
-        for (id, count) in self.process_refs {
+        for ((_scope, id), count) in self.process_refs {
             for _ in 0..count {
                 let _ = process_registry.release(StateHandle::from_id(id));
                 total_process += 1;
@@ -164,11 +389,49 @@ impl ConnRefTracker {
     }
 }
 
+fn peer_cred(stream: &UnixStream) -> Option<PeerCred> {
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` points to writable storage of `len` bytes, `len` points to
+    // initialized socklen_t storage, and `stream.as_raw_fd()` is a valid socket fd.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 && len as usize >= std::mem::size_of::<libc::ucred>() {
+        // SAFETY: getsockopt returned success and reported a complete ucred.
+        let cred = unsafe { cred.assume_init() };
+        Some(PeerCred {
+            pid: cred.pid,
+            uid: cred.uid,
+            gid: cred.gid,
+        })
+    } else {
+        None
+    }
+}
+
+fn peer_cred_fields(peer_cred: Option<PeerCred>) -> String {
+    match peer_cred {
+        Some(cred) => format!(
+            "peer_pid={} peer_uid={} peer_gid={}",
+            cred.pid, cred.uid, cred.gid
+        ),
+        None => "peer_pid=? peer_uid=? peer_gid=?".to_string(),
+    }
+}
+
 /// Inspect a successful response frame and record this connection's
 /// net contribution to broker registry refcounts. Called once per
 /// request/response round on the socket loop.
 fn update_tracker_from_response(
     tracker: &mut ConnRefTracker,
+    caller_scope: CallerScope,
     request_opcode: Opcode,
     request_body: &[u8],
     response: &OwnedFrame,
@@ -180,7 +443,7 @@ fn update_tracker_from_response(
         // State-registry creators: response body is one or two handle ids.
         Opcode::CreateEventfd | Opcode::CreatePidfd | Opcode::CreateSignalfd => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
-                tracker.record_state(id);
+                tracker.record_state(caller_scope, id);
             }
         }
         Opcode::CreatePipe => {
@@ -188,8 +451,8 @@ fn update_tracker_from_response(
             if response.body.len() >= 16 {
                 let r = u64::from_le_bytes(response.body[..8].try_into().unwrap());
                 let w = u64::from_le_bytes(response.body[8..16].try_into().unwrap());
-                tracker.record_state(r);
-                tracker.record_state(w);
+                tracker.record_state(caller_scope, r);
+                tracker.record_state(caller_scope, w);
             }
         }
         Opcode::CreateSocketPair => {
@@ -197,42 +460,34 @@ fn update_tracker_from_response(
             if response.body.len() >= 16 {
                 let a = u64::from_le_bytes(response.body[..8].try_into().unwrap());
                 let b = u64::from_le_bytes(response.body[8..16].try_into().unwrap());
-                tracker.record_state(a);
-                tracker.record_state(b);
+                tracker.record_state(caller_scope, a);
+                tracker.record_state(caller_scope, b);
             }
         }
         Opcode::CreatePty => {
             if let Ok((master, slave, _flags)) = parse_create_pty_response_ok(&response.body) {
-                tracker.record_state(master);
-                tracker.record_state(slave);
+                tracker.record_state(caller_scope, master);
+                tracker.record_state(caller_scope, slave);
             }
         }
         // Process-registry creator.
         Opcode::RegisterProcess => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
-                tracker.record_process(id);
+                tracker.record_process(caller_scope, id);
             }
         }
         // DupHandle: request body is one u64 handle id; response is empty.
-        // The +1 goes on whichever registry holds it (try state first via
-        // record_release symmetry — actually we want the inverse: record_state
-        // by default since state is checked first elsewhere).
         Opcode::DupHandle => {
             if request_body.len() >= 8 {
                 let id = u64::from_le_bytes(request_body[..8].try_into().unwrap());
-                // We don't know which registry without resolve. Pick state
-                // (statistically dominant for pipe/eventfd workloads).
-                // Worst case: a process-registry DupHandle is tracked as
-                // state — on disconnect we try state.release first, which
-                // fails with UnknownHandle and falls through to process.
-                tracker.record_state(id);
+                tracker.record_state(caller_scope, id);
             }
         }
         // Release: -1 on whichever registry.
         Opcode::Release => {
             if request_body.len() >= 8 {
                 let id = u64::from_le_bytes(request_body[..8].try_into().unwrap());
-                tracker.record_release(id);
+                tracker.record_release(caller_scope, id);
             }
         }
         _ => {}
@@ -468,20 +723,104 @@ pub fn handle_control_connection(
     state_registry: Arc<BrokerStateRegistry>,
     process_registry: Arc<BrokerStateRegistry>,
 ) {
+    // PE.12 diag: assign a per-conn id so we can correlate frames
+    // across the broker log. Counter is process-global, monotonic.
+    static CONN_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let conn_id = CONN_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let peer_cred = peer_cred(&stream);
+    if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = writeln!(
+                f,
+                "[PE.12-diag] CONN OPEN: conn_id={conn_id} {}",
+                peer_cred_fields(peer_cred)
+            );
+        }
+    }
     let mut conn_state = ConnState::new();
     let mut tracker = ConnRefTracker::new();
-    let result = handle_control_connection_inner(
-        stream,
-        &fd_registry,
-        &state_registry,
-        &process_registry,
-        &mut conn_state,
-        &mut tracker,
-    );
+    tracker.conn_id = conn_id;
+    tracker.peer_cred = peer_cred;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_control_connection_inner(
+            stream,
+            &fd_registry,
+            &state_registry,
+            &process_registry,
+            &mut conn_state,
+            &mut tracker,
+        )
+    }));
+    // PE.14 diag: if the inner handler panicked, log the payload.
+    // A panic here typically poisons one of the global registries'
+    // mutexes; subsequent conns' RPC handlers will then panic at
+    // `.expect("...poisoned")` and drop their UnixStreams,
+    // surfacing as "BrokenPipe" on the runner side.
+    if let Err(payload) = &result {
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            format!("non-string panic payload (type_id={:?})", payload.type_id())
+        };
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = writeln!(
+                f,
+                "[PE.14-diag] ts={ts} BROKER CONN HANDLER PANIC conn_id={conn_id} {}: {msg}",
+                peer_cred_fields(peer_cred)
+            );
+        }
+    }
+    // PE.9 fix: BEFORE releasing tracked state refs, force-unsubscribe
+    // every subscription this conn issued. If we release first, a
+    // state might Drop with our subscription still in its
+    // SubscriptionList — a leak (the subscribe-doesn't-bump-rc
+    // gap documented in the PE.9 fix commit). Doing the unsubscribe
+    // pass first ensures the SubscriptionList is empty before the
+    // state's refcount can hit zero from our release.
+    for (registry_kind, handle_id, subscription_id) in conn_state.drain_tracked_subscriptions() {
+        let handle = StateHandle::from_id(handle_id);
+        let registry = match registry_kind {
+            SubscriptionRegistry::State => state_registry.as_ref(),
+            SubscriptionRegistry::Process => process_registry.as_ref(),
+        };
+        if let Ok(obj) = registry.resolve_untyped(handle) {
+            let _ = obj.unsubscribe(subscription_id);
+            if registry_kind == SubscriptionRegistry::Process {
+                let _ = registry.release(handle);
+            }
+        }
+    }
     // Force-release any broker-registry refs this connection contributed
     // but did not release before disconnect. Critical for SIGKILL'd
     // workers whose shim never got to run `on_close` on inherited
     // broker-backed fds.
+    //
+    // PE.14 experiment: optional pre-cleanup delay to test the
+    // hypothesis that `cleanup_on_disconnect` racing with concurrent
+    // RPCs on sibling conns is the bug. Set
+    // `LITEBOX_CLEANUP_DELAY_MS=N` to inject N ms before cleanup.
+    if let Ok(s) = std::env::var("LITEBOX_CLEANUP_DELAY_MS")
+        && let Ok(ms) = s.parse::<u64>()
+        && ms > 0
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     let final_tracker = std::mem::take(&mut tracker);
     final_tracker.cleanup_on_disconnect(&state_registry, &process_registry);
     let _ = result;
@@ -495,6 +834,48 @@ fn handle_control_connection_inner(
     conn_state: &mut ConnState,
     tracker: &mut ConnRefTracker,
 ) {
+    // PE.14 diag: RAII guard that fires when this function returns
+    // OR panics. Captures the FINAL return path. Tag each CONN CLOSE
+    // log line with a high-resolution monotonic timestamp so we can
+    // reconstruct chronology vs runner-side diag lines from the same
+    // /tmp/rst-diag.log file (multi-process appends arrive out of
+    // order).
+    struct CloseGuard {
+        conn_id: u64,
+        fd: i32,
+        peer_cred: Option<PeerCred>,
+    }
+    impl Drop for CloseGuard {
+        fn drop(&mut self) {
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let bt = std::backtrace::Backtrace::force_capture();
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.14-diag] ts={ts} CONN HANDLER EXIT conn_id={} fd={} {} (UnixStream about to drop)\nbacktrace:\n{bt}",
+                    self.conn_id,
+                    self.fd,
+                    peer_cred_fields(self.peer_cred)
+                );
+            }
+        }
+    }
+    let _close_guard = CloseGuard {
+        conn_id: tracker.conn_id,
+        fd: {
+            use std::os::unix::io::AsRawFd;
+            stream.as_raw_fd()
+        },
+        peer_cred: tracker.peer_cred,
+    };
     loop {
         match read_request(&stream) {
             Ok((bytes, in_fds)) => {
@@ -507,6 +888,34 @@ fn handle_control_connection_inner(
                 };
                 let request_opcode = frame.opcode;
                 let request_body = frame.body.to_vec();
+                let caller_pid = frame.caller_pid;
+                let caller_scope = tracker.note_caller_scope(CallerScope::from_wire(caller_pid));
+                // PE.12 diag: log every frame received, gated on
+                // LITEBOX_PE10_DIAG. Tracker state pid_count helps
+                // identify which conn (by tracker fingerprint) the
+                // frame belongs to.
+                if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rst-diag.log")
+                    {
+                        let tracker_size = tracker.state_refs.len() + tracker.process_refs.len();
+                        let body_first = request_body
+                            .iter()
+                            .take(8)
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        let _ = writeln!(
+                            f,
+                            "[PE.12-diag] FRAME conn_id={} opcode={request_opcode:?} caller_pid={caller_pid} \
+                             body[..8]={body_first} tracker_size={tracker_size}",
+                            tracker.conn_id
+                        );
+                    }
+                }
                 let result = match frame.opcode {
                     Opcode::Register | Opcode::Materialize => {
                         // Host-fd opcodes: route to fd_token_service.
@@ -570,7 +979,7 @@ fn handle_control_connection_inner(
                                 frame: host_result.frame,
                                 out_fd: host_result.out_fd,
                             }
-                        } else if tracker.owns_state(release_id) {
+                        } else if tracker.owns_state(caller_scope, release_id) {
                             // State-registry release. Owner-gated.
                             let state_result = state_handle_request(
                                 state_registry,
@@ -582,7 +991,7 @@ fn handle_control_connection_inner(
                                 frame: state_result.frame,
                                 out_fd: state_result.out_fd,
                             }
-                        } else if tracker.owns_process(release_id) {
+                        } else if tracker.owns_process(caller_scope, release_id) {
                             // Process-registry release. Owner-gated.
                             let proc_result = state_handle_request(
                                 process_registry,
@@ -609,12 +1018,50 @@ fn handle_control_connection_inner(
                                     handle_id = release_id,
                                     state_exists,
                                     process_exists,
+                                    caller_pid,
                                     "fd-token control: PROTOCOL VIOLATION: Release of \
                                      broker-held resource not owned by this connection; \
                                      closing. Likely a shim-side bug — a fork-inherited \
                                      fd-table entry's on_close firing release without a \
                                      matching DupHandle."
                                 );
+                                // PE.5 diag: also write to the runner-side
+                                // diagnostic file so it's visible in
+                                // LITEBOX_KEEP_CONTAINER inspections.
+                                // Includes tracker state dump for the
+                                // current conn so we can see which
+                                // (pid, id) buckets exist when the
+                                // violation fires.
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("/tmp/rst-diag.log")
+                                {
+                                    let state_entries: Vec<((u32, u64), u32)> = tracker
+                                        .state_refs
+                                        .iter()
+                                        .map(|((scope, id), count)| {
+                                            (((*scope).to_wire(), *id), *count)
+                                        })
+                                        .collect();
+                                    let proc_entries: Vec<((u32, u64), u32)> = tracker
+                                        .process_refs
+                                        .iter()
+                                        .map(|((scope, id), count)| {
+                                            (((*scope).to_wire(), *id), *count)
+                                        })
+                                        .collect();
+                                    let _ = writeln!(
+                                        f,
+                                        "[PE.5-diag] BROKER PROTOCOL VIOLATION conn_id={}: Release \
+                                         handle_id={release_id} caller_pid={caller_pid} \
+                                         state_exists={state_exists} process_exists={process_exists}\n  \
+                                         conn state_refs: {state_entries:?}\n  \
+                                         conn process_refs: {proc_entries:?}",
+                                        tracker.conn_id
+                                    );
+                                }
                                 return;
                             }
                             // Handle is truly unknown to the broker — preserve existing
@@ -632,18 +1079,29 @@ fn handle_control_connection_inner(
                         // Unsubscribe is kind-agnostic: try fd-state first, then process-state.
                         let state_result =
                             state_handle_request(state_registry, conn_state, &frame, in_fds);
-                        if state_result.frame.status
-                            == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
-                        {
+                        if matches!(
+                            state_result.frame.status,
+                            litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
+                                | litebox_common_linux::fd_token_protocol::StatusCode::UnknownSubscription
+                        ) {
                             let proc_result = state_handle_request(
                                 process_registry,
                                 conn_state,
                                 &frame,
                                 Vec::new(),
                             );
-                            SocketHandlerResult {
-                                frame: proc_result.frame,
-                                out_fd: proc_result.out_fd,
+                            if proc_result.frame.status
+                                != litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
+                            {
+                                SocketHandlerResult {
+                                    frame: proc_result.frame,
+                                    out_fd: proc_result.out_fd,
+                                }
+                            } else {
+                                SocketHandlerResult {
+                                    frame: state_result.frame,
+                                    out_fd: state_result.out_fd,
+                                }
                             }
                         } else {
                             SocketHandlerResult {
@@ -658,6 +1116,7 @@ fn handle_control_connection_inner(
                     | Opcode::WriteEventfd
                     | Opcode::CreateSignalfd
                     | Opcode::ReadSiginfo
+                    | Opcode::PushSiginfo
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe
@@ -679,6 +1138,57 @@ fn handle_control_connection_inner(
                             out_fd: state_result.out_fd,
                         }
                     }
+                    Opcode::ReleaseAllForPid => {
+                        // Phase F.5+ PE.1 Step D: parse pid, release every
+                        // (pid, *) entry tracked on this connection across
+                        // both registries, and return the count.
+                        match litebox_common_linux::fd_token_protocol::parse_release_all_for_pid_body(
+                            &request_body,
+                        ) {
+                            Ok(target_pid) => {
+                                let released = tracker.release_all_for_pid(
+                                    target_pid,
+                                    state_registry,
+                                    process_registry,
+                                );
+                                // PE.5 diag (gated): trace every
+                                // ReleaseAllForPid invocation when
+                                // LITEBOX_PE5_DIAG=1. Useful when
+                                // chasing premature-release / read-empty
+                                // patterns; spammy in normal use.
+                                if std::env::var_os("LITEBOX_PE5_DIAG").is_some() {
+                                    use std::io::Write;
+                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("/tmp/rst-diag.log")
+                                    {
+                                        let _ = writeln!(
+                                            f,
+                                            "[PE.5-diag] ReleaseAllForPid target_pid={target_pid} released={released}"
+                                        );
+                                    }
+                                }
+                                if released > 0 {
+                                    debug!(
+                                        target_pid,
+                                        released,
+                                        "fd-token control: ReleaseAllForPid"
+                                    );
+                                }
+                                SocketHandlerResult {
+                                    frame: litebox_common_linux::fd_token_protocol::build_release_all_for_pid_response_ok(
+                                        released,
+                                    ),
+                                    out_fd: None,
+                                }
+                            }
+                            Err(_) => {
+                                warn!("fd-token control: malformed ReleaseAllForPid body; closing");
+                                return;
+                            }
+                        }
+                    }
                     Opcode::RegisterProcess
                     | Opcode::SubscribeProcessExit
                     | Opcode::MarkProcessExited => {
@@ -697,18 +1207,70 @@ fn handle_control_connection_inner(
                         return;
                     }
                 };
-                update_tracker_from_response(tracker, request_opcode, &request_body, &result.frame);
+                update_tracker_from_response(
+                    tracker,
+                    caller_scope,
+                    request_opcode,
+                    &request_body,
+                    &result.frame,
+                );
                 if let Err(e) = write_response(&stream, result.frame, result.out_fd) {
                     warn!(error = %e, "fd-token control: write error");
+                    // PE.14 diag: persistent log of conn-close reasons.
+                    if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/rst-diag.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "[PE.14-diag] CONN CLOSE conn_id={} {} reason=write_error: {e}",
+                                tracker.conn_id,
+                                peer_cred_fields(tracker.peer_cred)
+                            );
+                        }
+                    }
                     return;
                 }
             }
             Err(ConnError::PeerClosed) => {
                 debug!("fd-token control: peer closed");
+                if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rst-diag.log")
+                    {
+                        let _ = writeln!(
+                            f,
+                            "[PE.14-diag] CONN CLOSE conn_id={} {} reason=peer_closed",
+                            tracker.conn_id,
+                            peer_cred_fields(tracker.peer_cred)
+                        );
+                    }
+                }
                 return;
             }
             Err(e) => {
                 warn!(error = %e, "fd-token control: read error");
+                if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rst-diag.log")
+                    {
+                        let _ = writeln!(
+                            f,
+                            "[PE.14-diag] CONN CLOSE conn_id={} {} reason=read_error: {e}",
+                            tracker.conn_id,
+                            peer_cred_fields(tracker.peer_cred)
+                        );
+                    }
+                }
                 return;
             }
         }
@@ -1016,6 +1578,94 @@ mod tests {
         // Unsubscribe + close.
         efd.unsubscribe(&dispatcher, sub_id).expect("unsubscribe");
         efd.close().expect("close");
+        assert_eq!(state_registry.live_handle_count(), 0);
+    }
+
+    #[test]
+    fn release_all_for_pid_drains_per_pid_bucket() {
+        // Phase F.5+ PE.1 Step D: when the shim sends caller_pid != 0
+        // on resource creation, the broker tracks per-(pid, id), and
+        // ReleaseAllForPid(pid) drains every entry for that pid
+        // without touching entries owned by other pids.
+        use litebox_common_linux::fd_token_client::set_caller_pid_scope;
+
+        let (_dir, path, _fdr, state_registry, _proc) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        // Pid 7 creates two eventfds.
+        let (h7a, h7b) = {
+            let _guard = set_caller_pid_scope(7);
+            let a = client.create_eventfd(0, false).expect("create eventfd a");
+            let b = client.create_eventfd(0, false).expect("create eventfd b");
+            (a, b)
+        };
+        // Pid 8 creates one eventfd.
+        let h8 = {
+            let _guard = set_caller_pid_scope(8);
+            client.create_eventfd(0, false).expect("create eventfd c")
+        };
+        assert_eq!(state_registry.live_handle_count(), 3);
+
+        // ReleaseAllForPid(7) drops both pid-7 handles, keeps pid-8.
+        let released = {
+            let _guard = set_caller_pid_scope(7);
+            client.release_all_for_pid(7).expect("release_all_for_pid")
+        };
+        assert_eq!(released, 2, "should release exactly the two pid-7 refs");
+        assert_eq!(
+            state_registry.live_handle_count(),
+            1,
+            "pid-8 eventfd must remain"
+        );
+
+        // ReleaseAllForPid(7) again — nothing left to release.
+        let released_again = {
+            let _guard = set_caller_pid_scope(7);
+            client
+                .release_all_for_pid(7)
+                .expect("release_all_for_pid 2")
+        };
+        assert_eq!(released_again, 0);
+
+        // ReleaseAllForPid(8) drains the remaining handle.
+        let released_8 = {
+            let _guard = set_caller_pid_scope(8);
+            client
+                .release_all_for_pid(8)
+                .expect("release_all_for_pid 8")
+        };
+        assert_eq!(released_8, 1);
+        assert_eq!(state_registry.live_handle_count(), 0);
+
+        let _ = (h7a, h7b, h8);
+    }
+
+    #[test]
+    fn caller_pid_zero_is_distinct_bucket() {
+        use litebox_common_linux::fd_token_client::set_caller_pid_scope;
+
+        let (_dir, path, _fdr, state_registry, _proc) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        // Default (caller_pid=0) creates one.
+        let _h0 = client.create_eventfd(0, false).expect("create");
+        // pid=5 creates one.
+        let _h5 = {
+            let _guard = set_caller_pid_scope(5);
+            client.create_eventfd(0, false).expect("create")
+        };
+        assert_eq!(state_registry.live_handle_count(), 2);
+
+        // ReleaseAllForPid(0) drains the legacy bucket only.
+        let n = client.release_all_for_pid(0).expect("release_all 0");
+        assert_eq!(n, 1);
+        assert_eq!(state_registry.live_handle_count(), 1);
+
+        let n = {
+            let _guard = set_caller_pid_scope(5);
+            client.release_all_for_pid(5).expect("release_all 5")
+        };
+        assert_eq!(n, 1);
         assert_eq!(state_registry.live_handle_count(), 0);
     }
 }

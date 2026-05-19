@@ -207,9 +207,14 @@ impl Server {
             }
 
             let mut skipped_addrs = Vec::new();
-            if let Ok(patched) =
+            // PE.14: catch iced-x86 v1.21's ptr-truncation panic
+            // (decoder.rs:1421). Pre-warm path: on panic, just skip
+            // caching this entry; subsequent on-demand load will
+            // re-attempt and catch again if needed.
+            let pw_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 litebox_syscall_rewriter::hook_syscalls_in_elf(&content, None, &mut skipped_addrs)
-            {
+            }));
+            if let Ok(Ok(patched)) = pw_result {
                 let arc = Arc::new(patched);
                 let mut cache = mutex_lock(elf_cache, "elf_cache");
                 cache.insert(resolved.clone(), (current_mtime, Arc::clone(&arc)));
@@ -1937,13 +1942,43 @@ impl Server {
 
         let mut skipped_addrs = Vec::new();
         let start = std::time::Instant::now();
-        let patched = match litebox_syscall_rewriter::hook_syscalls_in_elf(
-            &content,
-            None,
-            &mut skipped_addrs,
-        ) {
-            Ok(p) => p,
-            Err(_) => {
+        // PE.14: wrap the rewriter call in catch_unwind. iced-x86 v1.21
+        // has a known panic in `decoder.rs:1421` ("attempt to subtract
+        // with overflow") when buffer pointers cross a 32-bit boundary.
+        // Fires non-deterministically based on ASLR. Without this catch
+        // the 9p-worker thread dies and subsequent fs ops on the same
+        // worker stall — a much worse outcome than failing this single
+        // file's syscall hook (which falls back to unhooked exec).
+        let patched_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            litebox_syscall_rewriter::hook_syscalls_in_elf(&content, None, &mut skipped_addrs)
+        }));
+        let patched = match patched_result {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => {
+                let _ = file.seek(SeekFrom::Start(0));
+                return None;
+            }
+            Err(panic_payload) => {
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<non-string panic>".to_string()
+                };
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/rst-diag.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "[PE.14-diag] iced-x86 panic recovered: hook_syscalls_in_elf({}, {} bytes) panicked: {msg} — falling back to unhooked binary",
+                        path.display(),
+                        content.len(),
+                    );
+                }
                 let _ = file.seek(SeekFrom::Start(0));
                 return None;
             }

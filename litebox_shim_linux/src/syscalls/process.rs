@@ -892,6 +892,13 @@ impl<FS: ShimFS> Task<FS> {
                 .wake_all();
         }
 
+        // `sys_exit`/`sys_exit_group` only mark the task as terminated; actual
+        // fd cleanup runs later from Task drop, after the syscall-level
+        // caller_pid guard has unwound. Re-stamp this cleanup so per-pid broker
+        // releases hit the exiting process's bucket.
+        let _caller_pid_guard =
+            litebox_common_linux::fd_token_client::set_caller_pid_scope(self.process_id.0);
+
         // If this task was migrated to a remote worker host via delayed fork,
         // all exit notification and cleanup was handled by commit_delayed_fork
         // and its background waiter.  Skip the rest of prepare_for_exit to
@@ -983,6 +990,11 @@ impl<FS: ShimFS> Task<FS> {
                 }
             };
             super::guest_pid::try_mark_broker_process_exited(self.process_id.0, exit_status);
+            // Phase F.5+ PE.1 Step D: sweep broker-tracked refs for
+            // this pid. No-op when per-pid ownership is gated off;
+            // belt-and-braces sweep for non-fd state and any
+            // SIGKILL-leaked refs otherwise.
+            super::guest_pid::try_release_all_broker_for_pid(self.process_id.0);
             let removed_owner = self
                 .global
                 .control_plane
@@ -2397,11 +2409,26 @@ impl<FS: ShimFS> Task<FS> {
             // FD table is duplicated now so the child can safely do dup2/close
             // between fork and exec without corrupting the parent's FD state.
             let vfork_done = Arc::new(crate::VforkDone::new(self.wait_cx().waker().clone()));
-            let child_files_state = Arc::new(
-                self.files
-                    .borrow()
-                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
-            );
+            let child_files_state = {
+                // Phase F.5+ PE.5: see the matching scope at the
+                // independent-fork branch below. Same rationale —
+                // dup_handles from on_dup must be attributed to
+                // child_pid in the broker's per-(pid, id) tracker.
+                //
+                // **Gated on per_pid_ownership_enabled()** (PE.10 fix):
+                // stamping child_pid here while releases run with
+                // PE.5: stamp dup_handle RPCs with child_pid so the
+                // broker tracker records inherited refs under the
+                // child's bucket, balancing the
+                // ReleaseAllForPid(child_pid) at child exit.
+                let _emit_scope =
+                    litebox_common_linux::fd_token_client::set_caller_pid_scope(child_pid_u32);
+                Arc::new(
+                    self.files
+                        .borrow()
+                        .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+                )
+            };
 
             // Set up CoW protection for fork memory sharing.
             //
@@ -2718,6 +2745,7 @@ impl<FS: ShimFS> Task<FS> {
                 parent_mux_pipe_pair_ids: self.mux_pipe_pair_ids.borrow().clone(),
                 parent_is_delayed_fork: self.delayed_fork_pending.get(),
                 fork_snapshot_broker_transit: Vec::new(),
+                fork_snapshot_fd_token_transit: Vec::new(),
             };
             (
                 self.process_state.clone(),                  // share parent's PM
@@ -2755,11 +2783,19 @@ impl<FS: ShimFS> Task<FS> {
                     deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
                 }),
             });
-            let child_files_state = Arc::new(
-                self.files
-                    .borrow()
-                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
-            );
+            let child_files_state = {
+                // PE.5: stamp caller_pid = child_pid for all broker
+                // dup_handle RPCs emitted during clone_for_fork's
+                // on_dup invocations, so the inherited refs land in
+                // the child's per-pid bucket.
+                let _emit_scope =
+                    litebox_common_linux::fd_token_client::set_caller_pid_scope(child_pid_u32);
+                Arc::new(
+                    self.files
+                        .borrow()
+                        .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+                )
+            };
             (
                 core::cell::RefCell::new(child_ps),          // own ProcessState
                 core::cell::RefCell::new(child_files_state), // own FD table
@@ -3181,8 +3217,8 @@ impl<FS: ShimFS> Task<FS> {
 
                     // Skip if a HostPipeFd is already installed at this slot
                     // (e.g. by a prior direct-pipe replacement targeting the
-                    // same parent slot — stdio at raw_fd > 2 can appear in
-                    // both spawn_result.direct_pipes and parent_pipe_replacements).
+                    // same parent slot — stdio at raw_fd > 2 can appear more
+                    // than once in spawn_result.direct_pipes).
                     // Close our extra host_fd so the bridge socketpair end
                     // doesn't leak; the bridge thread will exit on EPIPE.
                     {
@@ -4476,8 +4512,13 @@ impl<FS: ShimFS> Task<FS> {
         // list to release in-flight dup'd handles so the broker
         // refcount returns to baseline.
         let put_fc_back = |this: &Self, mut fc: crate::ForkContext| {
+            let _caller_pid_guard =
+                litebox_common_linux::fd_token_client::set_caller_pid_scope(this.process_id.0);
             for transit in fc.fork_snapshot_broker_transit.drain(..) {
                 transit.releaser.release(transit.handle_id);
+            }
+            for transit in fc.fork_snapshot_fd_token_transit.drain(..) {
+                let _ = transit.client.release(transit.token_id);
             }
             *this.fork_context.borrow_mut() = Some(fc);
         };
@@ -4612,7 +4653,11 @@ impl<FS: ShimFS> Task<FS> {
             "[DELAYED-FORK] pid={}: snapshot_fs",
             self.pid
         );
-        let fd_table = self.snapshot_fd_table(&mut reject, &mut fc.fork_snapshot_broker_transit);
+        let fd_table = self.snapshot_fd_table(
+            &mut reject,
+            &mut fc.fork_snapshot_broker_transit,
+            &mut fc.fork_snapshot_fd_token_transit,
+        );
         let memory = self.snapshot_memory(&mut reject);
 
         // Check rejection gate.
@@ -6478,8 +6523,29 @@ impl<FS: ShimFS> Task<FS> {
 
             let global = self.global.clone();
             let child_proc_id = self.process_id;
+            // PE.13 (2026-05-18): move the fork_snapshot_broker_transit
+            // list into the wait task so we can release the parent's
+            // emit-side dup_handle refs AFTER the child worker exits.
+            // Pair with my new dup_handle in the fork-snapshot restore
+            // (lib.rs:1573 area): net broker rc change across the
+            // fork is 0 (parent +1 transit, child +1 restore dup, child
+            // -1 close, parent -1 this drain).
+            let transit_refs: alloc::vec::Vec<
+                crate::syscalls::fork_snapshot::ForkSnapshotBrokerTransit,
+            > = core::mem::take(&mut fc.fork_snapshot_broker_transit);
             self.global.platform.spawn_background_task(move || {
                 let exit_code = global.platform.wait_worker_host(host_pid);
+
+                // Release the parent's emit-side dup_handle transit
+                // refs now that the child has exited and no longer
+                // needs the bridge state alive. These dup_handles were
+                // emitted on behalf of the child pid, so the asynchronous
+                // waiter re-stamps the same caller_pid before releasing.
+                let _caller_pid_guard =
+                    litebox_common_linux::fd_token_client::set_caller_pid_scope(child_proc_id.0);
+                for transit in transit_refs {
+                    transit.releaser.release(transit.handle_id);
+                }
 
                 let exit_status = if exit_code > 255 {
                     (exit_code - 256) + 128
@@ -6614,7 +6680,13 @@ impl<FS: ShimFS> Task<FS> {
         let fs = self.snapshot_fs();
         let mut _true_fork_transit: Vec<super::fork_snapshot::ForkSnapshotBrokerTransit> =
             Vec::new();
-        let fd_table = self.snapshot_fd_table(&mut reject, &mut _true_fork_transit);
+        let mut _true_fork_fd_token_transit: Vec<super::fork_snapshot::ForkSnapshotFdTokenTransit> =
+            Vec::new();
+        let fd_table = self.snapshot_fd_table(
+            &mut reject,
+            &mut _true_fork_transit,
+            &mut _true_fork_fd_token_transit,
+        );
         let memory = self.snapshot_memory(&mut reject);
 
         // Unpark sibling threads — snapshot is complete.
@@ -6632,6 +6704,9 @@ impl<FS: ShimFS> Task<FS> {
                 child_pid,
                 reject,
             );
+            for transit in _true_fork_fd_token_transit.drain(..) {
+                let _ = transit.client.release(transit.token_id);
+            }
             cleanup(self, child_as_id, child_process_id);
             return Err(Errno::ENOSYS);
         }
@@ -6671,6 +6746,9 @@ impl<FS: ShimFS> Task<FS> {
                     child_pid,
                     e,
                 );
+                for transit in _true_fork_fd_token_transit.drain(..) {
+                    let _ = transit.client.release(transit.token_id);
+                }
                 cleanup(self, child_as_id, child_process_id);
                 return Err(Errno::ENOSYS);
             }
@@ -6695,6 +6773,9 @@ impl<FS: ShimFS> Task<FS> {
                     child_pid,
                     err,
                 );
+                for transit in _true_fork_fd_token_transit.drain(..) {
+                    let _ = transit.client.release(transit.token_id);
+                }
                 cleanup(self, child_as_id, child_process_id);
                 return Err(Errno::ENOMEM);
             }
@@ -6954,10 +7035,12 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         reject: &mut super::fork_snapshot::ForkRejectReasons,
         broker_transit: &mut Vec<super::fork_snapshot::ForkSnapshotBrokerTransit>,
+        fd_token_transit: &mut Vec<super::fork_snapshot::ForkSnapshotFdTokenTransit>,
     ) -> super::fork_snapshot::FdTableSnapshot {
         use super::fork_snapshot::{
-            BrokerHandleKind, BrokerHandleSnapshot, FdClass, FdEntrySnapshot, FdMetadataSnapshot,
-            ForkRejectReason, ForkSnapshotBrokerTransit,
+            BrokerFdTokenSnapshot, BrokerHandleKind, BrokerHandleSnapshot, FdClass,
+            FdEntrySnapshot, FdMetadataSnapshot, ForkRejectReason, ForkSnapshotBrokerTransit,
+            ForkSnapshotFdTokenTransit,
         };
 
         let files = self.files.borrow();
@@ -7092,6 +7175,10 @@ impl<FS: ShimFS> Task<FS> {
             {
                 (FdClass::EventFd, Some(fd.object_id()), None, None)
             } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
+            {
+                (FdClass::Signalfd, Some(fd.object_id()), None, None)
+            } else if let Ok(fd) =
                 rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
             {
                 (FdClass::Epoll, Some(fd.object_id()), None, None)
@@ -7153,7 +7240,7 @@ impl<FS: ShimFS> Task<FS> {
                 // for BrokerBacked the restore path reattaches to the
                 // same broker handle (state IS preserved because the
                 // broker owns it).
-                FdClass::EventFd => {}
+                FdClass::EventFd | FdClass::Signalfd => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
@@ -7279,6 +7366,38 @@ impl<FS: ShimFS> Task<FS> {
                 } else {
                     None
                 }
+            } else if class == FdClass::Signalfd {
+                if let Ok(typed) =
+                    rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
+                {
+                    let signalfd_provider = super::signalfd::broker_signalfd_provider();
+                    let result = dt.with_entry(&typed, |sfd: &super::signalfd::SignalfdFile| {
+                        sfd.fork_snapshot_handle()
+                    });
+                    match (result, signalfd_provider) {
+                        (Some((kind, handle_id)), Some(releaser)) => {
+                            match releaser.dup_handle(handle_id) {
+                                Ok(()) => {
+                                    broker_transit.push(ForkSnapshotBrokerTransit {
+                                        releaser: releaser as _,
+                                        handle_id,
+                                        kind,
+                                    });
+                                    Some(BrokerHandleSnapshot {
+                                        kind,
+                                        handle_id,
+                                        pipe_direction: None,
+                                        socketpair_endpoint: None,
+                                    })
+                                }
+                                Err(_) => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
             } else if class == FdClass::Pipe {
                 // Phase C.3: emit a broker-Pipe handle snapshot when the fd
                 // is a `BrokerPipeSubsystem` entry. Local `Pipes<Platform>`
@@ -7390,8 +7509,40 @@ impl<FS: ShimFS> Task<FS> {
                 None
             };
 
+            let broker_fd_token_meta: Option<BrokerFdTokenSnapshot> = if let Ok(typed) =
+                rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
+            {
+                let direction =
+                    dt.with_entry(&typed, |hp: &super::host_pipe::HostPipeFd| hp.direction);
+                let raw_host_fd =
+                    dt.with_entry(&typed, |hp: &super::host_pipe::HostPipeFd| hp.raw_fd());
+                match (
+                    direction,
+                    raw_host_fd,
+                    litebox_common_linux::fd_token_client::global_client(),
+                ) {
+                    (Some(direction), Some(raw_host_fd), Some(client)) if raw_host_fd >= 0 => {
+                        match client.register_dup_raw_fd(raw_host_fd) {
+                            Ok(token_id) => {
+                                fd_token_transit
+                                    .push(ForkSnapshotFdTokenTransit { client, token_id });
+                                Some(BrokerFdTokenSnapshot {
+                                    token_id,
+                                    host_pipe_direction: Some(direction),
+                                })
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             let mut metadata = terminal_meta.unwrap_or_default();
             metadata.broker_handle = broker_handle_meta;
+            metadata.broker_fd_token = broker_fd_token_meta;
 
             entries.push(FdEntrySnapshot {
                 fd: raw_fd,
@@ -9110,20 +9261,10 @@ impl<FS: ShimFS> Task<FS> {
             false
         };
 
-        // Collect non-stdio fds to bridge to the remote worker.
-        // Two categories:
-        //   1. Unix socket fds with pair_ids (e.g. Node.js IPC socketpair on fd 3)
-        //   2. Pipe fds beyond stdio (e.g. extra pipes from child_process.fork)
-        // Create OS socketpair for each so the child can read/write.
-        let mut extra_fds: Vec<(usize, i32)> = Vec::new();
-        let mut parent_bidi_replacements: Vec<(usize, i32, usize, u64)> = Vec::new(); // (child_guest_fd, parent_os_fd, pair_id, child_oid)
-        // Pipe bridges: (child_guest_fd, parent_os_fd, pair_id, child_direction)
-        let mut parent_pipe_replacements: Vec<(
-            usize,
-            i32,
-            usize,
-            super::host_pipe::HostPipeDirection,
-        )> = Vec::new();
+        // Non-stdio broker-backed pipe/socketpair fds are transferred to the
+        // remote worker via --broker-fd-bridge specs below. Legacy local
+        // Pipes/UnixSocket fds no longer get bespoke OS-fd passthrough here.
+        let extra_fds: Vec<(usize, i32)> = Vec::new();
         // Phase 2.F follow-up: broker-backed EventFile bridges
         // (guest_fd:kind:handle_id strings) for inherited eventfd /
         // pidfd state. Each entry corresponds to one fd whose
@@ -9132,6 +9273,18 @@ impl<FS: ShimFS> Task<FS> {
         let mut broker_eventfd_specs: alloc::vec::Vec<alloc::string::String> =
             alloc::vec::Vec::new();
         let mut broker_eventfd_transit_release: alloc::vec::Vec<(
+            alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            >,
+            u64,
+        )> = alloc::vec::Vec::new();
+        // Phase F.9 (2026-05-18): separate list for pipe-specific
+        // transit releases. Drained after wait_worker_host returns
+        // (worker B has exited) so the broker rc can reach 0 for the
+        // writer end and the reader gets HUP/EOF. Eventfd/signalfd/
+        // pty transit refs use the OTHER list and are NOT post-wait
+        // drained — they're cleaned up via worker-conn cleanup.
+        let mut broker_pipe_transit_release: alloc::vec::Vec<(
             alloc::sync::Arc<
                 dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
             >,
@@ -9254,49 +9407,34 @@ impl<FS: ShimFS> Task<FS> {
                     },
                 );
                 drop(dt_local);
-                if let (Some(_provider), Some((handle_id, direction))) = (pipe_provider, pipe_info)
-                {
-                    // C.5j: emit-side dup_handle removed. Previously
-                    // `releaser.dup_handle(handle_id)` here bumped the
-                    // broker rc to "ship the ref over" to worker B;
-                    // worker B's install just attached without
-                    // bumping. That left the +1 untracked on any
-                    // connection, so SIGKILL of worker B leaked the
-                    // ref forever (PXEOF.signal_kill cross-bt
-                    // failures).
+                if let (Some(provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
+                    // Phase F.9 (2026-05-18): emit-side dup_handle for
+                    // broker pipe at cross-worker exec, paired with an
+                    // explicit POST-wait release (drained after
+                    // wait_worker_host returns, below near line 9714).
+                    // Recorded in `broker_pipe_transit_release` rather
+                    // than the shared `broker_eventfd_transit_release`
+                    // because pipe needs to release its transit ref
+                    // ON SPAWN SUCCESS (after worker B finishes
+                    // writing + exits) so the reader gets HUP/EOF,
+                    // whereas eventfd/signalfd/pty transit refs need
+                    // to stay alive past spawn success (their cleanup
+                    // happens via the worker's broker-conn cleanup).
                     //
-                    // Now worker B's `install_broker_bridge_fd` calls
-                    // `dup_handle` itself, so the +1 is tracked on
-                    // worker B's connection and the broker's per-
-                    // connection cleanup on disconnect can release
-                    // it. The emit side just enumerates the spec.
-                    //
-                    // Race note: the placeholder shim task in worker
-                    // A is blocked in `wait_worker_host` from
-                    // spawn-time until worker B exits, so its fd's
-                    // BrokerPipeFd keeps the rc alive in the gap
-                    // between worker B startup and its install call.
-                    //
-                    // Phase F TODO: investigate whether pipe should adopt
-                    // the same emit-side dup_handle pattern that socketpair
-                    // uses (process.rs ~line 9335). Naively adding the dup
-                    // here caused PB.c2p.* non-PIE tests to TIMEOUT (writer
-                    // never seen EOF by reader) — likely the dup keeps a
-                    // BrokerPipeWriteEnd ref alive beyond when the writer
-                    // wants to close. socketpair doesn't see this because
-                    // sockets are bidi and don't have the same "writer
-                    // close → reader EOF" data-flow contract. Pipe needs
-                    // a different shape: maybe release the dup explicitly
-                    // when the migrating worker's close_all_fds runs, or
-                    // use a "transient transit" model that the migrating
-                    // worker's close DOES NOT release (only the spawned
-                    // worker's install/close releases).
+                    // See process.rs around line 9714 for the release.
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
                     let dir_char = match direction {
                         litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
                         litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
                     };
                     broker_eventfd_specs
                         .push(alloc::format!("{raw_fd}:pipe:{handle_id}:{dir_char}"));
+                    broker_pipe_transit_release.push((releaser, handle_id));
                 }
             }
 
@@ -9372,130 +9510,6 @@ impl<FS: ShimFS> Task<FS> {
                     ));
                 }
             }
-
-            // Phase 1a: collect unix socket fds and pair_ids under read lock.
-            let socket_info: Vec<(
-                usize,
-                usize,
-                u64,
-                alloc::sync::Arc<litebox::fd::TypedFd<super::unix::UnixSocketSubsystem<FS>>>,
-            )> = {
-                let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
-                let dt = self.global.litebox.descriptor_table();
-                let mut out = Vec::new();
-                for raw_fd in rds.iter_alive() {
-                    if raw_fd <= 2 || !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
-                        continue;
-                    }
-                    if let Ok(typed) =
-                        rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
-                    {
-                        let pair_id = dt
-                            .with_entry(&typed, |sock: &super::unix::UnixSocket<FS>| {
-                                sock.socket_pair_id()
-                            })
-                            .flatten();
-                        if let Some(pair_id) = pair_id {
-                            out.push((raw_fd, pair_id, typed.object_id().as_u64(), typed));
-                        }
-                    }
-                }
-                out
-            }; // rds + dt dropped
-
-            // Phase 1b: collect pipe fds beyond stdio.
-            // These are extra pipes created by the parent (e.g. Node.js
-            // child_process.fork with stdio: ['pipe','pipe','pipe','ipc','pipe']).
-            // Skip mux-managed pipes to avoid nested bridging.
-            let pipe_info: Vec<(usize, usize, super::host_pipe::HostPipeDirection)> = {
-                let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
-                let mux_ids = self.mux_pipe_pair_ids.borrow();
-                let mut out = Vec::new();
-                for raw_fd in rds.iter_alive() {
-                    if raw_fd <= 2 || !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
-                        continue;
-                    }
-                    if let Ok(typed) =
-                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                    {
-                        let direction = match self.global.pipes.half_pipe_type(&typed) {
-                            Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
-                                super::host_pipe::HostPipeDirection::Read
-                            }
-                            Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
-                                super::host_pipe::HostPipeDirection::Write
-                            }
-                            Err(_) => continue,
-                        };
-                        let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) else {
-                            continue;
-                        };
-                        if mux_ids.contains(&pair_id) {
-                            continue;
-                        }
-                        // Skip pipes whose pair is also tied to worker stdio
-                        // (target_fd 0/1/2). Those are handled by direct_pipes
-                        // (stdin/stdout when use_direct_stdio) or by the
-                        // platform's output_bridges (stderr always). The
-                        // parent's existing virtual pipe at the matching slot
-                        // is the bridge sink; consuming and replacing it would
-                        // orphan the bridge thread.
-                        if stdio_pipe_info
-                            .iter()
-                            .any(|(_, sp_id, _)| *sp_id == pair_id)
-                        {
-                            continue;
-                        }
-                        out.push((raw_fd, pair_id, direction));
-                    }
-                }
-                out
-            };
-
-            // Phase 2a: create bridges for all non-stdio socket fds.
-            // CLOEXEC check is skipped — if the fd had CLOEXEC, exec would
-            // close it anyway and the bridge fd is harmless (unused by child).
-            for (raw_fd, pair_id, oid, _typed) in &socket_info {
-                if let Ok((child_end, parent_end)) = self.global.platform.create_host_socketpair() {
-                    // Dup parent end to a high fd number to prevent
-                    // clobbering by memfd/pipe creation in spawn.
-                    let safe_parent = self.global.platform.dup_host_fd(parent_end);
-                    match safe_parent {
-                        Ok(safe_fd) => {
-                            self.global.platform.close_host_fd(parent_end);
-                            extra_fds.push((*raw_fd, child_end));
-                            parent_bidi_replacements.push((*raw_fd, safe_fd, *pair_id, *oid));
-                        }
-                        Err(_) => {
-                            // dup failed — use original (risky)
-                            extra_fds.push((*raw_fd, child_end));
-                            parent_bidi_replacements.push((*raw_fd, parent_end, *pair_id, *oid));
-                        }
-                    }
-                }
-            }
-
-            // Phase 2b: create bridges for pipe fds beyond stdio.
-            // Use socketpair (bidirectional) even though pipes are unidirectional —
-            // the direction is enforced at the HostPipeFd level.
-            for &(raw_fd, pair_id, direction) in &pipe_info {
-                if let Ok((child_end, parent_end)) = self.global.platform.create_host_socketpair() {
-                    let safe_parent = self.global.platform.dup_host_fd(parent_end);
-                    match safe_parent {
-                        Ok(safe_fd) => {
-                            self.global.platform.close_host_fd(parent_end);
-                            extra_fds.push((raw_fd, child_end));
-                            parent_pipe_replacements.push((raw_fd, safe_fd, pair_id, direction));
-                        }
-                        Err(_) => {
-                            extra_fds.push((raw_fd, child_end));
-                            parent_pipe_replacements.push((raw_fd, parent_end, pair_id, direction));
-                        }
-                    }
-                }
-            }
         }
 
         // Resolve the worker load path through the current guest filesystem so
@@ -9536,19 +9550,16 @@ impl<FS: ShimFS> Task<FS> {
                     self.pid,
                     _err,
                 );
-                // Clean up bidi socketpair fds on failure.
                 for &(_, child_fd) in &extra_fds {
                     self.global.platform.close_host_fd(child_fd);
-                }
-                for &(_, parent_fd, _, _) in &parent_bidi_replacements {
-                    self.global.platform.close_host_fd(parent_fd);
-                }
-                for &(_, parent_fd, _, _) in &parent_pipe_replacements {
-                    self.global.platform.close_host_fd(parent_fd);
                 }
                 // Release broker eventfd transit refs that the worker
                 // never adopted (spawn failed).
                 for (releaser, handle_id) in &broker_eventfd_transit_release {
+                    releaser.release(*handle_id);
+                }
+                // Phase F.9: same for pipe transit refs.
+                for (releaser, handle_id) in &broker_pipe_transit_release {
                     releaser.release(*handle_id);
                 }
                 signal_on_error(&vfork_info);
@@ -9566,10 +9577,7 @@ impl<FS: ShimFS> Task<FS> {
             .write()
             .insert(self.process_id.0, host_pid);
 
-        // Replace parent's peer unix socket fds with HostPipeFd backed
-        // by the OS socketpair parent end. Find the peer by pair_id.
-        // Also replace parent's peer pipe fds.
-        if let Some((vd, parent_pipe_fds, parent_socket_fds)) = &vfork_info {
+        if let Some((vd, parent_pipe_fds, _parent_socket_fds)) = &vfork_info {
             for direct in spawn_result.direct_pipes {
                 let mut stored = false;
                 if let Some((_, child_pair_id, child_direction)) = stdio_pipe_info
@@ -9596,61 +9604,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            for &(_child_guest_fd, parent_os_fd, child_pair_id, child_oid) in
-                &parent_bidi_replacements
-            {
-                let mut stored = false;
-                for &(parent_fd, parent_pair_id, parent_oid) in parent_socket_fds {
-                    if parent_pair_id == child_pair_id && parent_oid != child_oid {
-                        vd.fd_replacements.lock().push(crate::FdReplacement {
-                            guest_fd: parent_fd,
-                            host_fd: parent_os_fd,
-                            direction: super::host_pipe::HostPipeDirection::ReadWrite,
-                            subsystem: crate::ReplacedSubsystem::UnixSocket,
-                            direct: true,
-                        });
-                        stored = true;
-                    }
-                }
-                if !stored {
-                    self.global.platform.close_host_fd(parent_os_fd);
-                }
-            }
-
-            // Replace parent's peer pipe fds.  The child has one end (read or
-            // write); the parent has the opposite end with the same pair_id.
-            // The parent's replacement direction is the OPPOSITE of the child's.
-            for &(_, parent_os_fd, child_pair_id, child_direction) in &parent_pipe_replacements {
-                let mut stored = false;
-                for &(parent_fd, parent_direction, parent_pair_id) in parent_pipe_fds {
-                    if parent_pair_id == child_pair_id && parent_direction != child_direction {
-                        // Parent's HostPipeFd direction matches its original
-                        // pipe direction: if parent had the read end, it reads
-                        // from the bridge; if write end, it writes.
-                        vd.fd_replacements.lock().push(crate::FdReplacement {
-                            guest_fd: parent_fd,
-                            host_fd: parent_os_fd,
-                            direction: parent_direction,
-                            subsystem: crate::ReplacedSubsystem::Pipe,
-                            direct: false,
-                        });
-                        stored = true;
-                    }
-                }
-                if !stored {
-                    self.global.platform.close_host_fd(parent_os_fd);
-                }
-            }
-
             vd.signal();
-        } else {
-            // No vfork info — close parent OS fds, signal nothing.
-            for &(_, parent_fd, _, _) in &parent_bidi_replacements {
-                self.global.platform.close_host_fd(parent_fd);
-            }
-            for &(_, parent_fd, _, _) in &parent_pipe_replacements {
-                self.global.platform.close_host_fd(parent_fd);
-            }
         }
 
         // The remote worker has taken over the exec image. The local placeholder
@@ -9697,6 +9651,24 @@ impl<FS: ShimFS> Task<FS> {
             .fork_child_host_pids
             .write()
             .remove(&self.process_id.0);
+
+        // Phase F.9: now that worker B has exited, release the pipe
+        // transit dup_handle refs that the emit-side bumped at exec
+        // time. This lets the broker rc reach 0 if no other holder
+        // remains (e.g. the parent's reader expecting writer-close →
+        // reader-EOF). Without this release, the transit refs stay
+        // alive on the parent worker's broker conn until the parent
+        // worker itself exits — which is too late, the parent's
+        // reader times out.
+        //
+        // Only pipe transit refs are drained here. Eventfd/signalfd/
+        // pty transit refs stay alive (they're cleaned via worker-
+        // conn cleanup); releasing them here breaks PIDF tests where
+        // the pidfd subscription needs the broker state alive past
+        // exec.
+        for (releaser, handle_id) in broker_pipe_transit_release.drain(..) {
+            releaser.release(handle_id);
+        }
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(

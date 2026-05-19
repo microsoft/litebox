@@ -56,6 +56,21 @@ pub fn eager_broker_pipe_enabled() -> bool {
     EAGER_BROKER_PIPE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// PE.14: gate for the per-slot "closed without reading" diagnostic
+/// log in `BrokerPipeFd::on_close`. Default off (noisy). Set by the
+/// runner from `LITEBOX_PE14_SLOT_DIAG=1`.
+static SHIM_SLOT_DIAG_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_shim_slot_diag_enabled(enabled: bool) {
+    SHIM_SLOT_DIAG_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+pub fn shim_slot_diag_enabled() -> bool {
+    SHIM_SLOT_DIAG_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub fn set_broker_pipe_provider(
     provider: Arc<dyn BrokerPipeProvider>,
 ) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerPipeProvider>>> {
@@ -77,17 +92,58 @@ pub(crate) struct BrokerPipeFd<P: RawSyncPrimitivesProvider + litebox::platform:
     direction: BrokerPipeEnd,
     status: AtomicU32,
     pollee: Arc<Pollee<P>>,
+    // PE.14 invariant: count read_pipe RPCs issued through this fd
+    // (for the Read direction). On on_close, if this is a Read end
+    // with read_count=0 AND the broker side reported buffered data,
+    // we have a "reader closed without reading" data-loss bug.
+    read_count: AtomicU32,
+    // PE.14 diag: creation-site tag for orphan-slot identification.
+    // 0=sys_pipe2, 1=install_broker_bridge_fd, 2=fork_snapshot_restore.
+    creation_site: u8,
 }
 
 impl<P> BrokerPipeFd<P>
 where
     P: RawSyncPrimitivesProvider + litebox::platform::TimeProvider,
 {
+    /// Constructs a BrokerPipeFd wrapping an existing broker pipe
+    /// handle.
+    ///
+    /// ## STRUCTURAL INVARIANT — caller responsibility
+    ///
+    /// **Every `BrokerPipeFd::new` call MUST be paired with a prior
+    /// `provider.dup_handle(handle)` (or its equivalent: an initial
+    /// `create_pipe` that returns the handle with refcount=1, or an
+    /// install_broker_bridge_fd's dup_handle).** This is because
+    /// `BrokerPipeFd`'s `on_close` (called when an fd-table slot
+    /// referring to it is removed) ALWAYS fires
+    /// `provider.release(handle)`. If construction wasn't paired with
+    /// a dup, the release leaves the broker side with negative net
+    /// rc accounting (and under PE.9's strict per-conn ownership
+    /// check, triggers a PROTOCOL VIOLATION that closes the broker
+    /// conn).
+    ///
+    /// PE.13 (2026-05-18) fixed a violation of this invariant in the
+    /// fork-snapshot restore path at lib.rs:1573 (now correctly calls
+    /// dup_handle). Other construction sites:
+    /// - file.rs:4812 (sys_pipe2): `create_pipe` provides the
+    ///   refcount=1 baseline; no additional dup needed.
+    /// - lib.rs:285 (install_broker_bridge_fd): explicit dup_handle
+    ///   call before construction.
+    ///
+    /// If you add a fourth construction site, AUDIT the caller for
+    /// a matching dup_handle.
+    /// Per PE.14 instrumentation: `creation_site` is a small tag
+    /// (0=sys_pipe2, 1=install_broker_bridge_fd, 2=fork_snapshot_restore)
+    /// recorded on this slot. When `on_close` fires with read_count==0
+    /// (orphan read-end), the tag is logged so we can identify which
+    /// construction path produced the orphan slot.
     pub(crate) fn new(
         provider: Arc<dyn BrokerPipeProvider>,
         handle: u64,
         direction: BrokerPipeEnd,
         flags: OFlags,
+        creation_site: u8,
     ) -> Self {
         let access = match direction {
             BrokerPipeEnd::Read => OFlags::RDONLY,
@@ -121,6 +177,8 @@ where
             direction,
             status: AtomicU32::new((access | (flags & OFlags::STATUS_FLAGS_MASK)).bits()),
             pollee: Arc::new(Pollee::new()),
+            read_count: AtomicU32::new(0),
+            creation_site,
         }
     }
 
@@ -179,6 +237,7 @@ impl BrokerPipeFd<Platform> {
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::IN, || {
+                self.read_count.fetch_add(1, Ordering::Relaxed);
                 match self.provider.read_pipe(self.handle(), capped_len as u64) {
                     Ok(bytes) => {
                         let n = bytes.len().min(buf.len());
@@ -296,6 +355,25 @@ impl FdEnabledSubsystemEntry for BrokerPipeFd<Platform> {
         // registry refcount. When the last slot is removed, the
         // broker StateObject Drops and notifies the OTHER end's
         // subscribers (HUP → reader EOF, ERR → writer EPIPE).
+        //
+        // PE.14 invariant: per-slot "closed without reading" diag is
+        // noisy (fires on legitimate inherited fds). The broker side
+        // owns the authoritative data-loss check (PipeReadEnd::drop
+        // now distinguishes real loss vs legitimate non-drain).
+        // Keep this gated on LITEBOX_PE14_SLOT_DIAG for deep traces.
+        if self.direction == BrokerPipeEnd::Read
+            && self.read_count.load(Ordering::Relaxed) == 0
+            && shim_slot_diag_enabled()
+        {
+            // SAFETY: getpid is always safe.
+            let host_pid = unsafe { ::syscalls::raw::syscall0(::syscalls::Sysno::getpid) };
+            litebox::log_println!(
+                litebox_platform_multiplex::platform(),
+                "[PE.14-diag] BrokerPipeFd READ-END CLOSED WITHOUT READING handle={} creation_site={} host_pid={host_pid}",
+                self.handle(),
+                self.creation_site,
+            );
+        }
         self.provider.release(self.handle());
     }
 }

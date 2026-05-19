@@ -79,6 +79,12 @@ impl BrokerSignalfdProvider for RunnerBrokerSignalfdProvider {
             .read_siginfo(handle)
             .map_err(client_err_to_broker_err)
     }
+
+    fn push_siginfo(&self, handle: u64, payload: &[u8]) -> Result<(), BrokerOpError> {
+        self.client
+            .push_siginfo(handle, payload)
+            .map_err(client_err_to_broker_err)
+    }
 }
 
 struct CallbackBridge {

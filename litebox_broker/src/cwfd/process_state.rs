@@ -45,6 +45,19 @@ pub struct ProcessState {
     subscription_list: SubscriptionList,
 }
 
+impl Drop for ProcessState {
+    fn drop(&mut self) {
+        // PE.9 invariant: always-on. A leak here means eager per-conn
+        // unsubscribe isn't running for this state.
+        assert!(
+            self.subscription_list.is_empty(),
+            "ProcessState dropped with {} live exit subscription(s) — \
+             eager per-conn unsubscribe not running",
+            self.subscription_list.len()
+        );
+    }
+}
+
 impl Default for ProcessState {
     fn default() -> Self {
         Self::new()
@@ -187,6 +200,7 @@ mod tests {
         assert_eq!(frame.subscription_id(), 7);
         assert_eq!(frame.events(), PROCESS_EXIT_EVENTS);
         assert_eq!(frame.payload_bytes(), Some(&23i32.to_le_bytes()[..]));
+        s.unsubscribe(7).unwrap();
     }
 
     #[test]
@@ -204,6 +218,7 @@ mod tests {
         assert_eq!(frame.subscription_id(), 9);
         assert_eq!(frame.events(), PROCESS_EXIT_EVENTS);
         assert_eq!(frame.payload_bytes(), Some(&42i32.to_le_bytes()[..]));
+        s.unsubscribe(9).unwrap();
     }
 
     #[test]

@@ -21,7 +21,7 @@
 
 use core::any::Any;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
@@ -75,6 +75,15 @@ pub struct PipeInner {
     atomic_write_size: usize,
     read_subject: SubscriptionList,
     write_subject: SubscriptionList,
+    /// PE.14 invariant: count of read RPCs that returned at least one
+    /// byte. Used to distinguish "real data loss" (reader started but
+    /// didn't finish draining → bytes lost) from "legitimate non-drain"
+    /// (reader never tried — fd inherited and ignored).
+    successful_reads: AtomicU64,
+    /// PE.14 invariant: count of write RPCs that buffered at least one
+    /// byte. For symmetry with `successful_reads` (helps spot "all
+    /// writes are zero-byte" edge cases that wouldn't be data loss).
+    successful_writes: AtomicU64,
 }
 
 impl PipeInner {
@@ -89,6 +98,8 @@ impl PipeInner {
             atomic_write_size,
             read_subject: SubscriptionList::new(),
             write_subject: SubscriptionList::new(),
+            successful_reads: AtomicU64::new(0),
+            successful_writes: AtomicU64::new(0),
         }
     }
 
@@ -121,6 +132,9 @@ impl PipeInner {
         if writable && self.write_open() {
             self.write_subject.notify(NOTIFY_EVENT_OUT);
         }
+        if n > 0 {
+            self.successful_reads.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(out)
     }
 
@@ -142,6 +156,9 @@ impl PipeInner {
         drop(buf);
         if has_data {
             self.read_subject.notify(NOTIFY_EVENT_IN);
+        }
+        if n > 0 {
+            self.successful_writes.fetch_add(1, Ordering::Relaxed);
         }
         Ok(n)
     }
@@ -181,6 +198,7 @@ pub fn new_pipe(
     let inner = Arc::new(PipeInner::new(capacity, atomic_write_size));
     let read_end = Arc::new(PipeReadEnd {
         inner: Arc::clone(&inner),
+        handle_id: AtomicU64::new(0),
     });
     let write_end = Arc::new(PipeWriteEnd { inner });
     (read_end, write_end)
@@ -194,6 +212,11 @@ pub fn new_pipe(
 #[derive(Debug)]
 pub struct PipeReadEnd {
     pub(crate) inner: Arc<PipeInner>,
+    /// PE.14: the registry handle id this read end was registered under.
+    /// Set by the call site immediately after register so Drop can
+    /// emit handle-tagged data-loss warnings. 0 = unset (legacy paths
+    /// that didn't call set_handle_id; benign for invariant logs).
+    pub(crate) handle_id: AtomicU64,
 }
 
 /// Broker-hosted write end. Symmetric to [`PipeReadEnd`]; drop fires
@@ -219,6 +242,86 @@ impl PipeWriteEnd {
 
 impl Drop for PipeReadEnd {
     fn drop(&mut self) {
+        // Invariant B6: Drop fires exactly when registry rc=0, which
+        // means no peer endpoint has registered a re-open. read_open
+        // must have been true (or this is a double-Drop bug).
+        debug_assert!(
+            self.inner.read_open.load(Ordering::Acquire),
+            "PipeReadEnd::drop with read_open=false (double-Drop?)"
+        );
+        // PE.14 invariant: data-loss check refined to fire only on
+        // TRUE data loss (reader started reading but didn't finish):
+        //   - unread bytes in buffer (writer wrote)
+        //   - successful_writes > 0 (writer produced data)
+        //   - successful_reads > 0 (reader started draining, then
+        //     stopped → real loss)
+        //
+        // Note (user feedback 2026-05-19): this predicate is
+        // FUNDAMENTALLY LOSSY. It matches both:
+        //   (a) Real litebox bug: shim erroneously closed the reader's
+        //       fd while data was buffered (e.g. the SIGCHLD-EINTR
+        //       race that motivated PE.14 originally — commit e8316f5d).
+        //   (b) Application crash: process died mid-read; kernel
+        //       reaped fds; on_close fired with data still buffered.
+        //       This is NOT a litebox bug.
+        //   (c) Application chose to close early: legitimate user code
+        //       deciding to discard remaining data.
+        //
+        // We can't distinguish these from broker side alone — the
+        // broker only sees "rc hit 0". So this is a DIAGNOSTIC
+        // (always-on file log) rather than a hard assertion. A real
+        // bug (a) would manifest as a TEST FAILURE elsewhere; the
+        // log helps the post-mortem.
+        let unread = {
+            let buf = self.inner.buffer.lock().expect("PipeInner poisoned");
+            buf.buf.len()
+        };
+        let writes = self.inner.successful_writes.load(Ordering::Relaxed);
+        let reads = self.inner.successful_reads.load(Ordering::Relaxed);
+        if unread > 0 && writes > 0 && reads > 0 {
+            let handle_id = self.handle_id.load(Ordering::Relaxed);
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.14-invariant] ts={ts} PIPE READ-END DATA LOSS handle={handle_id}: \
+                     unread={unread} writes={writes} reads={reads} \
+                     (reader partially drained then closed; could be litebox bug, \
+                     crash, or legitimate early-close — correlate with test result)"
+                );
+            }
+            // NO PANIC: process crash + early-close are legitimate
+            // scenarios indistinguishable from a real bug here.
+            // The log is the diagnostic; a true litebox bug would
+            // manifest as a separate test failure.
+        } else if unread > 0 && writes > 0 {
+            // Soft data-loss (reader never tried): still log but do
+            // not assert. Often legitimate (inherited fds).
+            let handle_id = self.handle_id.load(Ordering::Relaxed);
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.14-diag] ts={ts} PIPE READ-END soft-unread handle={handle_id}: unread={unread} writes={writes} reads=0 (reader never tried — legitimate or potential leak)"
+                );
+            }
+        }
         self.inner.read_open.store(false, Ordering::Release);
         self.inner.write_subject.notify(NOTIFY_EVENT_ERR);
     }
@@ -226,6 +329,10 @@ impl Drop for PipeReadEnd {
 
 impl Drop for PipeWriteEnd {
     fn drop(&mut self) {
+        debug_assert!(
+            self.inner.write_open.load(Ordering::Acquire),
+            "PipeWriteEnd::drop with write_open=false (double-Drop?)"
+        );
         self.inner.write_open.store(false, Ordering::Release);
         self.inner
             .read_subject

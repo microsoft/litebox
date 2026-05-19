@@ -153,44 +153,100 @@ impl SubscriptionList {
     /// caller wants to GC dead subscriptions sooner it can call
     /// [`Self::retain_live`] periodically.
     pub fn notify(&self, events: u32) {
-        let entries = self.entries.lock().expect("SubscriptionList poisoned");
-        for sub in entries.iter() {
-            let matched = events & sub.events_mask;
-            if matched == 0 {
-                continue;
+        let mut to_remove: Vec<u64> = Vec::new();
+        {
+            let entries = self.entries.lock().expect("SubscriptionList poisoned");
+            for sub in entries.iter() {
+                let matched = events & sub.events_mask;
+                if matched == 0 {
+                    continue;
+                }
+                let frame = NotificationFrame::fixed(sub.id, matched);
+                let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
+                if let Err(err) = sender.send(&frame) {
+                    // PE.9 fix: only remove the subscription on
+                    // "peer is gone" errors. Transient errors
+                    // (WouldBlock, Interrupted, ring-buffer
+                    // saturated) MUST NOT remove a live
+                    // subscription — that would silently break
+                    // notification delivery for a still-attached
+                    // subscriber.
+                    if is_peer_gone(&err) {
+                        tracing::warn!(
+                            subscription_id = sub.id,
+                            error = %err,
+                            "notification send failed (peer gone); removing dead subscription",
+                        );
+                        to_remove.push(sub.id);
+                    } else {
+                        tracing::warn!(
+                            subscription_id = sub.id,
+                            error = %err,
+                            "notification send failed (transient); leaving subscription in list",
+                        );
+                        // PE.14 diag: always-on file log of transient
+                        // send failures. Hypothesis: under-load PB.many
+                        // 'ok=9/10' race may be caused by silent
+                        // notification drops here when the ring fills up.
+                        use std::io::Write;
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/rst-diag.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "[PE.14-diag] ts={ts} NOTIFICATION DROPPED (transient) sub_id={} events={:#x}: {}",
+                                sub.id, matched, err
+                            );
+                        }
+                    }
+                }
             }
-            let frame = NotificationFrame::fixed(sub.id, matched);
-            // Lock the sender briefly to write one frame. Hold time
-            // bounded by the size of the notification frame plus
-            // futex syscall — microseconds in the steady state.
-            let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
-            if let Err(err) = sender.send(&frame) {
-                tracing::warn!(
-                    subscription_id = sub.id,
-                    error = %err,
-                    "notification send failed; leaving subscription in list",
-                );
-            }
+        }
+        if !to_remove.is_empty() {
+            let mut entries = self.entries.lock().expect("SubscriptionList poisoned");
+            entries.retain(|s| !to_remove.contains(&s.id));
         }
     }
 
     /// Notifies subscribers with an opaque payload frame.
     pub fn notify_payload(&self, events: u32, payload: Vec<u8>) {
-        let entries = self.entries.lock().expect("SubscriptionList poisoned");
-        for sub in entries.iter() {
-            let matched = events & sub.events_mask;
-            if matched == 0 {
-                continue;
+        let mut to_remove: Vec<u64> = Vec::new();
+        {
+            let entries = self.entries.lock().expect("SubscriptionList poisoned");
+            for sub in entries.iter() {
+                let matched = events & sub.events_mask;
+                if matched == 0 {
+                    continue;
+                }
+                let frame = NotificationFrame::payload(sub.id, matched, payload.clone());
+                let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
+                if let Err(err) = sender.send(&frame) {
+                    if is_peer_gone(&err) {
+                        tracing::warn!(
+                            subscription_id = sub.id,
+                            error = %err,
+                            "payload notification send failed (peer gone); removing dead subscription",
+                        );
+                        to_remove.push(sub.id);
+                    } else {
+                        tracing::warn!(
+                            subscription_id = sub.id,
+                            error = %err,
+                            "payload notification send failed (transient); leaving subscription in list",
+                        );
+                    }
+                }
             }
-            let frame = NotificationFrame::payload(sub.id, matched, payload.clone());
-            let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
-            if let Err(err) = sender.send(&frame) {
-                tracing::warn!(
-                    subscription_id = sub.id,
-                    error = %err,
-                    "payload notification send failed; leaving subscription in list",
-                );
-            }
+        }
+        if !to_remove.is_empty() {
+            let mut entries = self.entries.lock().expect("SubscriptionList poisoned");
+            entries.retain(|s| !to_remove.contains(&s.id));
         }
     }
 
@@ -215,6 +271,17 @@ impl SubscriptionList {
         let mut entries = self.entries.lock().expect("SubscriptionList poisoned");
         entries.retain(|s| Arc::strong_count(&s.sender) > 1);
     }
+}
+
+/// PE.9 helper: classify a notification-send error as "the peer is
+/// definitely gone" vs "this was a transient that may recover". Only
+/// the former should remove the subscription from the list.
+fn is_peer_gone(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+    )
 }
 
 #[cfg(test)]

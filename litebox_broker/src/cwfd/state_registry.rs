@@ -265,7 +265,20 @@ impl BrokerStateRegistry {
             .next_id
             .checked_add(1)
             .expect("BrokerStateRegistry id space exhausted");
+        let tag = state.subsystem_tag();
         s.table.insert(id, Entry { state, refcount: 1 });
+        drop(s);
+        // PE.10 diag: opt-in via LITEBOX_PE10_DIAG.
+        if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(f, "[PE.10-diag] REGISTER {tag:?} handle={id} new_rc=1");
+            }
+        }
         StateHandle(id)
     }
 
@@ -275,6 +288,11 @@ impl BrokerStateRegistry {
             .table
             .get_mut(&handle.0)
             .ok_or(StateRegistryError::UnknownHandle(handle))?;
+        debug_assert!(
+            entry.refcount > 0,
+            "BrokerStateRegistry::dup: entry for handle={} has refcount=0 (resurrection?)",
+            handle.0,
+        );
         entry.refcount = entry
             .refcount
             .checked_add(1)
@@ -282,6 +300,20 @@ impl BrokerStateRegistry {
         let new_rc = entry.refcount;
         let tag = entry.state.subsystem_tag();
         drop(s);
+        if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.10-diag] DUP {tag:?} handle={} new_rc={new_rc}",
+                    handle.0
+                );
+            }
+        }
         tracing::debug!(handle = handle.0, new_rc, ?tag, "REG-DUP");
         Ok(handle)
     }
@@ -297,6 +329,11 @@ impl BrokerStateRegistry {
             .table
             .get_mut(&handle.0)
             .ok_or(StateRegistryError::UnknownHandle(handle))?;
+        assert!(
+            entry.refcount > 0,
+            "BrokerStateRegistry::release: entry for handle={} has refcount=0 (stale/double-release)",
+            handle.0,
+        );
         entry.refcount -= 1;
         let new_rc = entry.refcount;
         let tag = entry.state.subsystem_tag();
@@ -304,6 +341,22 @@ impl BrokerStateRegistry {
             s.table.remove(&handle.0);
         }
         drop(s);
+        // PE.10 diag: log every release with the new rc. Opt-in via
+        // LITEBOX_PE10_DIAG to avoid spam in normal use.
+        if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.10-diag] release {tag:?} handle={} new_rc={new_rc}",
+                    handle.0
+                );
+            }
+        }
         tracing::debug!(handle = handle.0, new_rc, ?tag, "REG-REL");
         Ok(())
     }

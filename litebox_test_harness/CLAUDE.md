@@ -906,6 +906,20 @@ to `target/test-logs/<pass>-<sanitized_id>.{stdout,stderr}.log`
 parse for the JSON result line). On Trial failure, the `Err`
 message includes both log paths.
 
+**Per-test timing telemetry**: `target/test-logs/per-test-timing.jsonl`
+keeps the backward-compatible `t_docker_start_ms` field and also splits it
+using stable stderr markers of the form `[TIMING] <name>=<CLOCK_MONOTONIC ns>`:
+`container_pid1_started_ns`, `litebox_shim_ready_ns`, and
+`harness_first_output_ns`. The split fields are `t_docker_spawn_ms`,
+`t_litebox_init_ms`, and `t_harness_load_ms`. Native trials have no litebox
+shim, so the parser treats `litebox_shim_ready_ns` as equal to
+`container_pid1_started_ns` and reports `t_litebox_init_ms=0`. Docker
+containers share the host kernel clock, so the host-side markers are comparable
+to the wrapper's `docker_run_invoke_ns`; this assumes the normal single-kernel
+Docker/WSL2 model. In litebox trials, the guest harness's own `clock_gettime` is
+virtualized, so the wrapper uses host `CLOCK_MONOTONIC` at stderr marker arrival
+for the `harness_first_output_ns` boundary.
+
 **Lazy agent matrix**: the harness spawn_tree only spawns the
 non-PIE subtree (NP, NPC, D3, D4, D5) when at least one filtered
 test ID contains those agent names as a dot-separated component.

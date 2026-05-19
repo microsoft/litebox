@@ -1560,7 +1560,21 @@ impl<FS: ShimFS> Task<FS> {
                 .descriptor_table()
                 .entry_handle(&sfd)
                 .ok_or(Errno::EBADF)?;
-            return handle.with_entry(|file| file.read(buf));
+            if buf.len() < 128 {
+                return Err(Errno::EINVAL);
+            }
+            loop {
+                self.drain_cross_process_signals();
+                if let Some(payload) = handle.with_entry(|file| file.read_siginfo())? {
+                    let n = payload.len().min(buf.len());
+                    buf[..n].copy_from_slice(&payload[..n]);
+                    return Ok(n);
+                }
+                if handle.with_entry(|file| file.get_status().contains(OFlags::NONBLOCK)) {
+                    return Err(Errno::EAGAIN);
+                }
+                core::hint::spin_loop();
+            }
         }
 
         // Phase F: broker-backed socketpair early-dispatch.
@@ -4814,12 +4828,14 @@ impl<FS: ShimFS> Task<FS> {
                 write_handle,
                 litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
                 entry_flags,
+                0, // creation_site: sys_pipe2
             );
             let reader_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
                 provider,
                 read_handle,
                 litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
                 entry_flags,
+                0, // creation_site: sys_pipe2
             );
             let mut dt = self.global.litebox.descriptor_table_mut();
             let writer = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(writer_entry);
@@ -6285,25 +6301,48 @@ impl<FS: ShimFS> Task<FS> {
                 h
             }
         };
-        let result = handle.with_entry(|epoll_file| {
-            match epoll_file.wait(
-                &self.global,
-                &*self.files.borrow().fs,
-                &self.wait_cx().with_timeout(timeout),
-                maxevents,
-            ) {
+        // PE.14: loop to swallow spurious EINTR caused by signals
+        // whose disposition is "ignore" (e.g., SIGCHLD with SIG_DFL).
+        // Real Linux does not interrupt syscalls for these signals;
+        // our shim's check_for_interrupt is over-aggressive. Retry
+        // the wait until a real signal arrives, a timeout fires, or
+        // events become available. Bounded by the test's deadline.
+        let result = loop {
+            let inner_result = handle.with_entry(|epoll_file| {
+                epoll_file.wait(
+                    &self.global,
+                    &*self.files.borrow().fs,
+                    &self.wait_cx().with_timeout(timeout),
+                    maxevents,
+                )
+            });
+            match inner_result {
                 Ok(epoll_events) => {
                     if !epoll_events.is_empty() {
-                        events
+                        if let Err(e) = events
                             .copy_from_slice(0, &epoll_events)
-                            .ok_or(Errno::EFAULT)?;
+                            .ok_or(Errno::EFAULT)
+                        {
+                            break Err(e);
+                        }
                     }
-                    Ok(epoll_events.len())
+                    break Ok(epoll_events.len());
                 }
-                Err(WaitError::TimedOut) => Ok(0),
-                Err(WaitError::Interrupted) => Err(Errno::EINTR),
+                Err(WaitError::TimedOut) => break Ok(0),
+                Err(WaitError::Interrupted) => {
+                    // If only default-ignore signals are pending,
+                    // this was a spurious wake — retry. If any
+                    // deliverable signal is pending, propagate EINTR.
+                    if self.pending_signals_all_ignored() {
+                        // drain (clear) the ignored pending signals
+                        // so we don't infinite-loop on them.
+                        self.drain_ignored_pending();
+                        continue;
+                    }
+                    break Err(Errno::EINTR);
+                }
             }
-        });
+        };
 
         // Defer mask restore to process_signals() so that signals unblocked
         // by the caller's mask (like SIGCHLD) are delivered before the
@@ -6383,23 +6422,33 @@ impl<FS: ShimFS> Task<FS> {
 
         // If there are non-netlink fds, do the normal poll wait.
         if !set.is_empty() {
-            match set.wait(
-                &self.global,
-                &self.wait_cx().with_timeout(timeout),
-                &self.files.borrow(),
-            ) {
-                Ok(()) => {}
-                Err(WaitError::Interrupted) => {
-                    // Defer mask restore for process_signals.
-                    if let Some(old) = saved_mask {
-                        self.signals.set_restore_mask(old);
+            // PE.14: loop to swallow spurious EINTR from default-ignore
+            // signals (SIGCHLD with SIG_DFL). Same pattern as
+            // sys_epoll_pwait above.
+            loop {
+                match set.wait(
+                    &self.global,
+                    &self.wait_cx().with_timeout(timeout),
+                    &self.files.borrow(),
+                ) {
+                    Ok(()) => break,
+                    Err(WaitError::Interrupted) => {
+                        if self.pending_signals_all_ignored() {
+                            self.drain_ignored_pending();
+                            continue;
+                        }
+                        // Defer mask restore for process_signals.
+                        if let Some(old) = saved_mask {
+                            self.signals.set_restore_mask(old);
+                        }
+                        // TODO: update the remaining time.
+                        return Err(Errno::EINTR);
                     }
-                    // TODO: update the remaining time.
-                    return Err(Errno::EINTR);
-                }
-                Err(WaitError::TimedOut) => {
-                    // A timeout occurred. Scan one last time.
-                    set.scan(&self.global, &self.files.borrow());
+                    Err(WaitError::TimedOut) => {
+                        // A timeout occurred. Scan one last time.
+                        set.scan(&self.global, &self.files.borrow());
+                        break;
+                    }
                 }
             }
         }

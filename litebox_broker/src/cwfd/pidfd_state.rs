@@ -79,6 +79,20 @@ pub struct PidfdState {
     _pidfd: OwnedFd,
 }
 
+impl Drop for PidfdState {
+    fn drop(&mut self) {
+        // PE.9 invariant: always-on. A leak here means eager per-conn
+        // unsubscribe isn't running for this state.
+        assert!(
+            self.subscriptions.is_empty(),
+            "PidfdState (target_host_pid={}) dropped with {} live \
+             subscription(s) — eager per-conn unsubscribe not running",
+            self.target_host_pid,
+            self.subscriptions.len()
+        );
+    }
+}
+
 impl PidfdState {
     /// Creates a new broker-hosted pidfd watching `target_host_pid`.
     /// Performs `pidfd_open(target_host_pid)` and spawns a background

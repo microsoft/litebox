@@ -21,7 +21,7 @@
 
 use core::any::Any;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
@@ -85,6 +85,17 @@ pub struct SocketPairInner {
     /// in `buffer_ab`, B's close).
     subject_a: SubscriptionList,
     subject_b: SubscriptionList,
+    /// PE.14 invariant counters (mirrors PE.14 PIPE READ-END DATA LOSS
+    /// in pipe_state.rs). Track per-direction successful (non-zero-byte)
+    /// reads and writes so SocketPairEnd::drop can distinguish real
+    /// data loss (writes>0 AND reads>0 AND unread>0) from legitimate
+    /// non-drain (reader never tried).
+    /// `_ab_*` = direction A→B (A writes, B reads).
+    /// `_ba_*` = direction B→A (B writes, A reads).
+    ab_writes: AtomicU64,
+    ab_reads: AtomicU64,
+    ba_writes: AtomicU64,
+    ba_reads: AtomicU64,
 }
 
 impl SocketPairInner {
@@ -103,6 +114,10 @@ impl SocketPairInner {
             atomic_write_size,
             subject_a: SubscriptionList::new(),
             subject_b: SubscriptionList::new(),
+            ab_writes: AtomicU64::new(0),
+            ab_reads: AtomicU64::new(0),
+            ba_writes: AtomicU64::new(0),
+            ba_reads: AtomicU64::new(0),
         }
     }
 
@@ -131,6 +146,22 @@ impl SocketPairInner {
         let mut buf = buf_mutex.lock().expect("SocketPairInner poisoned");
         if buf.buf.is_empty() {
             if !peer_open {
+                // PE.10 diag: log first time we report EOF to a reader
+                // — this is the case that surfaces tokio's "EOF on
+                // self-pipe" panic when broker socketpair rc accounting
+                // drops the peer-end early. Helps debug the residual
+                // F.8 flip blocker.
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/rst-diag.log")
+                {
+                    let _ = writeln!(
+                        f,
+                        "[PE.10-diag] BrokerSocketPair read EOF: endpoint={endpoint:?}"
+                    );
+                }
                 // Peer-end closed and no data → EOF (zero-length read).
                 return Ok(Vec::new());
             }
@@ -146,6 +177,12 @@ impl SocketPairInner {
         // Notify peer that its outbound buffer now has more room.
         if writable && peer_open {
             peer_subject.notify(NOTIFY_EVENT_OUT);
+        }
+        if n > 0 {
+            match endpoint {
+                SocketPairEndpoint::A => self.ba_reads.fetch_add(1, Ordering::Relaxed),
+                SocketPairEndpoint::B => self.ab_reads.fetch_add(1, Ordering::Relaxed),
+            };
         }
         Ok(out)
     }
@@ -175,6 +212,12 @@ impl SocketPairInner {
         if has_data {
             // Wake peer's IN subscribers (data now available to them).
             peer_subject.notify(NOTIFY_EVENT_IN);
+        }
+        if n > 0 {
+            match endpoint {
+                SocketPairEndpoint::A => self.ab_writes.fetch_add(1, Ordering::Relaxed),
+                SocketPairEndpoint::B => self.ba_writes.fetch_add(1, Ordering::Relaxed),
+            };
         }
         Ok(n)
     }
@@ -216,10 +259,12 @@ pub fn new_socketpair(
     let end_a = Arc::new(SocketPairEnd {
         inner: Arc::clone(&inner),
         endpoint: SocketPairEndpoint::A,
+        handle_id: AtomicU64::new(0),
     });
     let end_b = Arc::new(SocketPairEnd {
         inner,
         endpoint: SocketPairEndpoint::B,
+        handle_id: AtomicU64::new(0),
     });
     (end_a, end_b)
 }
@@ -234,6 +279,11 @@ pub fn new_socketpair(
 pub struct SocketPairEnd {
     pub(crate) inner: Arc<SocketPairInner>,
     pub endpoint: SocketPairEndpoint,
+    /// PE.14: the registry handle id this endpoint was registered under.
+    /// Set by the call site immediately after register. Used in the
+    /// SOCKETPAIR DATA LOSS invariant log for cross-reference with the
+    /// shim's per-slot diagnostics.
+    pub(crate) handle_id: AtomicU64,
 }
 
 impl SocketPairEnd {
@@ -248,8 +298,96 @@ impl SocketPairEnd {
 
 impl Drop for SocketPairEnd {
     fn drop(&mut self) {
+        // PE.10 diag: log every Drop so we can correlate broker-side
+        // peer-close events with read-EOF observations.
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = writeln!(
+                f,
+                "[PE.10-diag] BrokerSocketPair Drop: endpoint={:?} a_open={} b_open={}",
+                self.endpoint,
+                self.inner.a_open.load(Ordering::Acquire),
+                self.inner.b_open.load(Ordering::Acquire)
+            );
+        }
+        // PE.14 invariant (mirrors PIPE READ-END DATA LOSS):
+        // FUNDAMENTALLY LOSSY predicate — matches real bugs AND
+        // legitimate process-crash / early-close. Log loudly, don't
+        // panic (a broker panic on every worker crash is worse than
+        // missing diagnostic). See pipe_state.rs Drop for full
+        // rationale.
+        let (inbound_buf_mutex, writes_into_x, reads_by_x, dir_label) = match self.endpoint {
+            // A's inbound = buffer_ba; B wrote into it (ba_writes); A read from it (ba_reads).
+            SocketPairEndpoint::A => (
+                &self.inner.buffer_ba,
+                &self.inner.ba_writes,
+                &self.inner.ba_reads,
+                "B->A",
+            ),
+            // B's inbound = buffer_ab; A wrote into it (ab_writes); B read from it (ab_reads).
+            SocketPairEndpoint::B => (
+                &self.inner.buffer_ab,
+                &self.inner.ab_writes,
+                &self.inner.ab_reads,
+                "A->B",
+            ),
+        };
+        let unread = inbound_buf_mutex
+            .lock()
+            .expect("SocketPairInner poisoned")
+            .buf
+            .len();
+        let writes = writes_into_x.load(Ordering::Relaxed);
+        let reads = reads_by_x.load(Ordering::Relaxed);
+        if unread > 0 && writes > 0 && reads > 0 {
+            let handle_id = self.handle_id.load(Ordering::Relaxed);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.14-invariant] ts={ts} SOCKETPAIR DATA LOSS direction={dir_label} \
+                     endpoint={:?} handle={handle_id}: unread={unread} writes={writes} reads={reads} \
+                     (reader partially drained then closed; could be litebox bug, crash, or legit close)",
+                    self.endpoint
+                );
+            }
+            // NO PANIC: see pipe_state.rs Drop rationale.
+        } else if unread > 0 && writes > 0 {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[PE.14-diag] ts={ts} SOCKETPAIR soft-unread direction={dir_label} endpoint={:?}: unread={unread} writes={writes} reads=0 (reader never tried)",
+                    self.endpoint
+                );
+            }
+        }
         match self.endpoint {
             SocketPairEndpoint::A => {
+                // Invariant B6: Drop fires when registry rc=0.
+                // a_open must be true (else double-Drop).
+                debug_assert!(
+                    self.inner.a_open.load(Ordering::Acquire),
+                    "SocketPairEnd::drop endpoint=A with a_open=false (double-Drop?)"
+                );
                 self.inner.a_open.store(false, Ordering::Release);
                 // Wake B: peer close = IN (read EOF) + HUP + ERR (write EPIPE).
                 self.inner
@@ -257,6 +395,10 @@ impl Drop for SocketPairEnd {
                     .notify(NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN | NOTIFY_EVENT_ERR);
             }
             SocketPairEndpoint::B => {
+                debug_assert!(
+                    self.inner.b_open.load(Ordering::Acquire),
+                    "SocketPairEnd::drop endpoint=B with b_open=false (double-Drop?)"
+                );
                 self.inner.b_open.store(false, Ordering::Release);
                 self.inner
                     .subject_a

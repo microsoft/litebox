@@ -199,8 +199,8 @@ mod tests {
             .expect("send");
 
         let got = reader_handle.join().expect("reader thread");
-        assert_eq!(got.subscription_id()(), 99);
-        assert_eq!(got.events()(), NOTIFY_EVENT_IN);
+        assert_eq!(got.subscription_id(), 99);
+        assert_eq!(got.events(), NOTIFY_EVENT_IN);
     }
 
     #[test]
