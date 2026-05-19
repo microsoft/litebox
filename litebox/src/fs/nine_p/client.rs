@@ -7,7 +7,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::utils::id_pool::IdPool;
@@ -106,6 +106,8 @@ pub(super) struct Client<Platform: RawSyncPrimitivesProvider, T: Read + Write> {
     fids: Arc<FidPool<Platform>>,
     /// Next tag for synchronous operations
     next_tag: AtomicU16,
+    /// Whether the transport state is no longer safe to use.
+    transport_failed: AtomicBool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
@@ -167,6 +169,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             rbuf: Mutex::new(rbuf),
             fids: Arc::new(FidPool::new()),
             next_tag: AtomicU16::new(1),
+            transport_failed: AtomicBool::new(false),
         })
     }
 
@@ -175,18 +178,32 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     where
         F: FnOnce(Fcall<'_>) -> Result<R, Error>,
     {
+        if self.transport_failed.load(Ordering::Acquire) {
+            return Err(Error::Io);
+        }
+
         let tag = self.next_tag();
 
         let mut write_state = self.write_state.lock();
         let ClientWriteState { transport, wbuf } = &mut *write_state;
-        transport::write_message(transport, wbuf, TaggedFcall { tag, fcall })
-            .map_err(|_| Error::Io)?;
+        if transport::write_message(transport, wbuf, TaggedFcall { tag, fcall }).is_err() {
+            self.transport_failed.store(true, Ordering::Release);
+            return Err(Error::Io);
+        }
 
         let mut rbuf = self.rbuf.lock();
         // Loop until we get a response with matching tag (in case of stale responses)
         // TODO: support concurrent requests by allowing out-of-order responses and matching tags accordingly
         loop {
-            let response = transport::read_message(transport, &mut rbuf, self.msize as usize)?;
+            let response = match transport::read_message(transport, &mut rbuf, self.msize as usize)
+            {
+                Ok(response) => response,
+                Err(Error::Io) => {
+                    self.transport_failed.store(true, Ordering::Release);
+                    return Err(Error::Io);
+                }
+                Err(err) => return Err(err),
+            };
             if response.tag == tag {
                 return f(response.fcall);
             }
@@ -217,7 +234,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     ) -> Result<(fcall::Qid, Fid<Platform>), Error> {
         let fid = self.fids.allocate()?;
         let id = fid.id();
-        self.fcall(
+        let result = self.fcall(
             Fcall::Tattach(fcall::Tattach {
                 afid: fcall::NOFID,
                 fid: id,
@@ -230,8 +247,16 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
-        )
-        .map(|qid| (qid, fid))
+        );
+        match result {
+            Ok(qid) => Ok((qid, fid)),
+            Err(err) => {
+                if !matches!(err, Error::Remote(_)) {
+                    self.clunk(fid);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Walks the path from the given fid.
@@ -250,7 +275,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         }
         let new_fid = self.fids.allocate()?;
         let wnames_len = wnames.len();
-        let wqids = self.fcall(
+        let result = self.fcall(
             Fcall::Twalk(fcall::Twalk {
                 fid: fid.id(),
                 new_fid: new_fid.id(),
@@ -268,8 +293,16 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 Fcall::Rlerror(err) => Err(Error::from(err)),
                 _ => Err(Error::InvalidResponse),
             },
-        )?;
-        Ok((wqids, new_fid))
+        );
+        match result {
+            Ok(wqids) => Ok((wqids, new_fid)),
+            Err(err) => {
+                if !matches!(err, Error::Remote(_)) {
+                    self.clunk(new_fid);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Walks the path from the given fid, handling paths longer than fcall::MAXWELEM by walking in chunks.
@@ -303,12 +336,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             }
             // It means that the walk failed at the nwqid-th element
             if new_len < chunk.len() {
-                if wqids
-                    .last()
-                    .is_some_and(|e| e.typ == fcall::QidType::SYMLINK)
-                {
-                    todo!("symlink");
-                }
                 self.clunk(new_f);
                 return Err(Error::Remote(super::ENOENT));
             }
@@ -536,9 +563,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 break;
             }
             let next_offset = entries.last().unwrap().offset;
-            if next_offset <= offset {
-                return Err(Error::InvalidResponse);
-            }
             if all_entries
                 .len()
                 .checked_add(entries.len())
