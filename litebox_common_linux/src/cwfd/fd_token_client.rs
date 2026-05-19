@@ -26,14 +26,14 @@ use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
     build_create_eventfd_request, build_create_pidfd_request, build_create_pipe_request,
     build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
-    build_mark_process_exited_request, build_materialize_request, build_pidfd_exited_request,
-    build_pty_ioctl_request, build_pty_read_request, build_pty_write_request,
-    build_push_siginfo_request, build_read_eventfd_request, build_read_pipe_request,
-    build_read_siginfo_request, build_read_socketpair_request,
-    build_register_notification_ring_request, build_register_process_request,
-    build_register_request, build_release_request, build_subscribe_eventfd_request,
-    build_subscribe_process_exit_request, build_subscribe_pty_request,
-    build_subscribe_signal_inbox_request, build_unsubscribe_request,
+    build_deliver_signal_inbox_request, build_mark_process_exited_request,
+    build_materialize_request, build_pidfd_exited_request, build_pty_ioctl_request,
+    build_pty_read_request, build_pty_write_request, build_push_siginfo_request,
+    build_read_eventfd_request, build_read_pipe_request, build_read_siginfo_request,
+    build_read_socketpair_request, build_register_notification_ring_request,
+    build_register_process_request, build_register_request, build_release_request,
+    build_subscribe_eventfd_request, build_subscribe_process_exit_request,
+    build_subscribe_pty_request, build_subscribe_signal_inbox_request, build_unsubscribe_request,
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
     build_write_socketpair_request, decode, parse_create_pidfd_response_ok,
     parse_create_pty_response_ok, parse_create_socketpair_response_body, parse_handle_body,
@@ -424,6 +424,28 @@ impl FdTokenClient {
                 Err(ClientError::DuplicateSubscription(subscription_id))
             }
             StatusCode::NoNotificationRing => Err(ClientError::NoNotificationRing),
+            s => Err(map_status_with_handle(resp.opcode, s, u64::from(pgid))),
+        }
+    }
+
+    /// Asks the broker to deliver a signal to subscribers of a pgrp.
+    pub fn deliver_signal_inbox(&self, pgid: u32, signum: u32) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_deliver_signal_inbox_request(pgid, signum),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::DeliverSignalInboxResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
             s => Err(map_status_with_handle(resp.opcode, s, u64::from(pgid))),
         }
     }

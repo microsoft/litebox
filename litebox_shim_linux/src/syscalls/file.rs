@@ -25,7 +25,6 @@ use litebox_common_linux::{
     AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
     IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, STATX_BASIC_STATS, StatfsBuf, StatxBuf,
     StatxTimestamp, TMPFS_MAGIC, TimeParam, TimerfdFlags, TimerfdTimerFlags, errno::Errno,
-    signal::Signal,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -1216,6 +1215,15 @@ impl<FS: ShimFS> Task<FS> {
         {
             let rdev = self.pty_rdev_for_raw_fd(&files, raw_fd);
             self.trace_pty_open(s, guest_fd, raw_fd, rdev);
+            if s.starts_with("/dev/pts/")
+                && let Some(pgid) = self
+                    .global
+                    .litebox
+                    .process_registry()
+                    .get_pgid(self.process_id)
+            {
+                self.global.ensure_pgrp_signal_subscription(pgid.0);
+            }
         }
 
         Ok(guest_fd)
@@ -5300,38 +5308,6 @@ impl<FS: ShimFS> Task<FS> {
         Ok(())
     }
 
-    fn send_signal_to_process_group(&self, pgrp: i32, signal: Signal) -> Result<(), Errno> {
-        if pgrp <= 0 {
-            return Ok(());
-        }
-        let pgid =
-            litebox::process::ProcessGroupId(u32::try_from(pgrp).map_err(|_| Errno::EINVAL)?);
-        let targets = self
-            .global
-            .litebox
-            .process_registry()
-            .process_ids_in_group(pgid);
-        let mut queue = self.global.cross_process_signals.lock();
-        for target in &targets {
-            queue.push(crate::CrossProcessSignal {
-                target_process_id: target.0,
-                target_tid: None,
-                signal,
-                siginfo: siginfo_kernel(signal),
-            });
-        }
-        drop(queue);
-
-        let handles = self.global.process_thread_handles.read();
-        for target in targets {
-            let key = target.0.cast_signed();
-            if let Some(remote) = handles.get(&key) {
-                remote.interrupt();
-            }
-        }
-        Ok(())
-    }
-
     fn host_stdio_ioctl(
         &self,
         fs: &FS,
@@ -5547,9 +5523,18 @@ impl<FS: ShimFS> Task<FS> {
                 if !fs.set_pty_window_size(fd, size) {
                     return Err(Errno::ENOTTY);
                 }
-                if size != old_size {
-                    let pgrp = fs.get_pty_foreground_pgrp(fd).unwrap_or(0);
-                    self.send_signal_to_process_group(pgrp, Signal::SIGWINCH)?;
+                let _ = fs.set_pty_winsize(fd, size);
+                if size != old_size
+                    && let Some(pgrp) = fs.get_pty_foreground_pgrp(fd)
+                    && pgrp > 0
+                    && let Some(provider) = super::eventfd::broker_pgrp_signal_provider()
+                {
+                    provider
+                        .deliver_pgrp_signal(
+                            pgrp as u32,
+                            litebox_common_linux::signal::Signal::SIGWINCH.as_i32() as u32,
+                        )
+                        .map_err(|_| Errno::EIO)?;
                 }
                 Ok(0)
             }
@@ -5569,6 +5554,9 @@ impl<FS: ShimFS> Task<FS> {
                 if !fs.set_pty_foreground_pgrp(fd, pgid) {
                     return Err(Errno::ENOTTY);
                 }
+                if let Ok(pgid_u32) = u32::try_from(pgid) {
+                    self.global.ensure_pgrp_signal_subscription(pgid_u32);
+                }
                 *self.process_state.borrow().controlling_pty.lock() = Some(pty_idx);
                 Ok(0)
             }
@@ -5579,6 +5567,9 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 if !fs.set_pty_foreground_pgrp(fd, pgrp) {
                     return Err(Errno::ENOTTY);
+                }
+                if let Ok(pgid) = u32::try_from(pgrp) {
+                    self.global.ensure_pgrp_signal_subscription(pgid);
                 }
                 Ok(0)
             }
@@ -5594,28 +5585,6 @@ impl<FS: ShimFS> Task<FS> {
                     },
                 )
                 .ok_or(Errno::EFAULT)?;
-                Ok(0)
-            }
-            IoctlArg::TIOCSWINSZ(ws_ptr) => {
-                let ws: litebox_common_linux::Winsize =
-                    ws_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                let size = litebox::platform::WindowSize {
-                    rows: ws.row,
-                    cols: ws.col,
-                    xpixel: ws.xpixel,
-                    ypixel: ws.ypixel,
-                };
-                if !fs.set_pty_winsize(fd, size) {
-                    return Err(Errno::ENOTTY);
-                }
-                if let Some(pgrp) = fs.get_pty_foreground_pgrp(fd)
-                    && pgrp > 0
-                {
-                    let _ = self.sys_kill(
-                        pgrp.saturating_neg(),
-                        litebox_common_linux::signal::Signal::SIGWINCH.as_i32(),
-                    );
-                }
                 Ok(0)
             }
             IoctlArg::TIOCGPTN(ptn) => {
@@ -6123,9 +6092,22 @@ impl<FS: ShimFS> Task<FS> {
                             if pgrp <= 0 {
                                 return Err(Errno::EINVAL);
                             }
+                            if let Ok(pgid) = u32::try_from(pgrp) {
+                                self.global.ensure_pgrp_signal_subscription(pgid);
+                            }
                             Ok(0)
                         }
-                        IoctlArg::TIOCSCTTY => Ok(0),
+                        IoctlArg::TIOCSCTTY => {
+                            if let Some(pgid) = self
+                                .global
+                                .litebox
+                                .process_registry()
+                                .get_pgid(self.process_id)
+                            {
+                                self.global.ensure_pgrp_signal_subscription(pgid.0);
+                            }
+                            Ok(0)
+                        }
                         IoctlArg::TIOCGWINSZ(ws) => {
                             ws.write_at_offset(
                                 0,

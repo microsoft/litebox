@@ -208,6 +208,15 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .litebox
                 .descriptor_table_mut()
                 .set_entry_metadata(&pipe_fd, MuxPtySlaveFd);
+            if let Some(pgid) = self
+                .task
+                .global
+                .litebox
+                .process_registry()
+                .get_pgid(self.task.process_id)
+            {
+                self.task.global.ensure_pgrp_signal_subscription(pgid.0);
+            }
         }
 
         let files = self.task.files.borrow();
@@ -665,6 +674,7 @@ impl LinuxShimBuilder {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
+            pgrp_signal_subscriptions: litebox::sync::Mutex::new(BTreeMap::new()),
             process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             host_tty_foreground_pgrp: litebox::sync::Mutex::new(
                 litebox::process::ProcessGroupId::from(init_process_id),
@@ -4141,6 +4151,9 @@ struct GlobalState<FS: ShimFS> {
     /// SIGCHLD) between processes owned by this host. Entries are consumed by
     /// the target task during signal processing.
     cross_process_signals: litebox::sync::Mutex<Platform, Vec<CrossProcessSignal>>,
+    /// PR-3 single-worker-pgrp scope: pgids this worker has subscribed to using
+    /// its local ProcessRegistry view. Cross-worker setpgid reconciliation is PR-4.
+    pgrp_signal_subscriptions: litebox::sync::Mutex<Platform, BTreeMap<u32, u64>>,
     /// Best-effort local thread handles used to interrupt a process when
     /// delivering a queued local cross-process signal.
     process_thread_handles: litebox::sync::RwLock<
@@ -4177,7 +4190,99 @@ struct GlobalState<FS: ShimFS> {
     >,
 }
 
+struct PgrpSignalCallback<FS: ShimFS> {
+    global: Arc<GlobalState<FS>>,
+}
+
+impl<FS: ShimFS> litebox_common_linux::broker_pgrp_signal_provider::BrokerPgrpSignalCallback
+    for PgrpSignalCallback<FS>
+{
+    fn on_signal(&self, pgid: i32, signum: i32, _siginfo: &[u8]) {
+        let Ok(signal) = litebox_common_linux::signal::Signal::try_from(signum) else {
+            return;
+        };
+        let _ = self.global.deliver_signal_to_process_group(pgid, signal);
+    }
+}
+
 impl<FS: ShimFS> GlobalState<FS> {
+    fn ensure_pgrp_signal_subscription(self: &Arc<Self>, pgid: u32) {
+        let Some(provider) = syscalls::eventfd::broker_pgrp_signal_provider() else {
+            return;
+        };
+        {
+            let subscriptions = self.pgrp_signal_subscriptions.lock();
+            if subscriptions.contains_key(&pgid) {
+                return;
+            }
+        }
+        let signal_mask = 1u32 << litebox_common_linux::signal::Signal::SIGWINCH.as_i32();
+        let callback = Arc::new(PgrpSignalCallback {
+            global: Arc::clone(self),
+        });
+        match provider.subscribe_pgrp_signal(pgid, signal_mask, callback) {
+            Ok(subscription_id) => {
+                self.pgrp_signal_subscriptions
+                    .lock()
+                    .insert(pgid, subscription_id);
+            }
+            Err(err) => litebox::log_println!(
+                self.platform,
+                "{}",
+                format_args!("pgrp signal subscribe failed pgid={pgid}: {err:?}")
+            ),
+        }
+    }
+
+    fn cleanup_pgrp_signal_subscription_if_empty(self: &Arc<Self>, pgid: u32) {
+        if !self
+            .litebox
+            .process_registry()
+            .process_ids_in_group(litebox::process::ProcessGroupId(pgid))
+            .is_empty()
+        {
+            return;
+        }
+        let Some(subscription_id) = self.pgrp_signal_subscriptions.lock().remove(&pgid) else {
+            return;
+        };
+        if let Some(provider) = syscalls::eventfd::broker_pgrp_signal_provider() {
+            provider.unsubscribe_pgrp_signal(pgid, subscription_id);
+        }
+    }
+
+    fn deliver_signal_to_process_group(
+        &self,
+        pgrp: i32,
+        signal: litebox_common_linux::signal::Signal,
+    ) -> Result<(), Errno> {
+        if pgrp <= 0 {
+            return Ok(());
+        }
+        let pgid =
+            litebox::process::ProcessGroupId(u32::try_from(pgrp).map_err(|_| Errno::EINVAL)?);
+        let targets = self.litebox.process_registry().process_ids_in_group(pgid);
+        let mut queue = self.cross_process_signals.lock();
+        for target in &targets {
+            queue.push(CrossProcessSignal {
+                target_process_id: target.0,
+                target_tid: None,
+                signal,
+                siginfo: syscalls::signal::siginfo_kernel(signal),
+            });
+        }
+        drop(queue);
+
+        let handles = self.process_thread_handles.read();
+        for target in targets {
+            let key = target.0.cast_signed();
+            if let Some(remote) = handles.get(&key) {
+                remote.interrupt();
+            }
+        }
+        Ok(())
+    }
+
     fn set_proc_cmdline(&self, pid: i32, cmdline: Vec<u8>) {
         self.proc_cmdlines.write().insert(pid, cmdline);
     }

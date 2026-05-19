@@ -37,6 +37,7 @@ enum ScenarioKind {
     Tiocspgrp,
     Tiocsctty,
     Resize,
+    WinsizeCrossWorker,
     ExecShellSession,
     /// PTYR.stdout_roundtrip — child writes a unique marker to fd 1
     /// (PTY slave) via `printf` after exec; parent reads from master.
@@ -88,6 +89,11 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "winsize_cross_worker",
+        kind: ScenarioKind::WinsizeCrossWorker,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "exec_shell_session",
         kind: ScenarioKind::ExecShellSession,
         per_binary_type: false,
@@ -129,6 +135,8 @@ const TIOCGPGRP: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.tiocg
 const TIOCSPGRP: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.tiocspgrp");
 const TIOCSCTTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.tiocsctty");
 const RESIZE: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.resize");
+const WINSIZE_CROSS_WORKER: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.winsize_cross_worker");
 const EXEC_SHELL_SESSION: HandlerToken<(), PtyOut> = HandlerToken::new("pty.exec_shell_session");
 // PTYR.* tokens — regression coverage for non-PIE worker-handoff stdio.
 const PTYR_STDOUT_ROUNDTRIP: HandlerToken<TargetArgs, PtyOut> =
@@ -195,12 +203,26 @@ async fn handle_resize(
     let pty = Pty::open()?;
     ensure_slave_path(&pty)?;
     let pid = pty.fork_exec(&[args.target, "pty-resize".into()], true)?;
-    let ready = pty.read(Some(7))?;
-    exact(&ready, "READY\r\n")?;
+    read_until(&pty, "READY\r\n")?;
     pty.resize(41, 132)?;
     expect_exit_zero(pid)?;
     let data = pty.read(None)?;
     let detail = exact(&data, "RESIZE rows=41 cols=132\r\n")?;
+    Ok(PtyOut { detail })
+}
+
+async fn handle_winsize_cross_worker(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-winsize-cross-worker".into()], true)?;
+    read_until(&pty, "READY\r\n")?;
+    pty.resize(41, 132)?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    let detail = exact(&data, "CROSS_RESIZE rows=41 cols=132 count=1\r\n")?;
     Ok(PtyOut { detail })
 }
 
@@ -267,6 +289,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(TIOCSPGRP, handle_tiocspgrp);
     register_handler!(TIOCSCTTY, handle_tiocsctty);
     register_handler!(RESIZE, handle_resize);
+    register_handler!(WINSIZE_CROSS_WORKER, handle_winsize_cross_worker);
     register_handler!(EXEC_SHELL_SESSION, handle_exec_shell_session);
     register_handler!(PTYR_STDOUT_ROUNDTRIP, handle_ptyr_stdout_roundtrip);
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
@@ -275,6 +298,10 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!("pty-tiocspgrp", leaf_subcmd::subcmd_pty_tiocspgrp);
     crate::register_leaf_subcommand!("pty-tiocsctty", leaf_subcmd::subcmd_pty_tiocsctty);
     crate::register_leaf_subcommand!("pty-resize", leaf_subcmd::subcmd_pty_resize);
+    crate::register_leaf_subcommand!(
+        "pty-winsize-cross-worker",
+        leaf_subcmd::subcmd_pty_winsize_cross_worker
+    );
     crate::register_leaf_subcommand!("pty-stdout-print", leaf_subcmd::subcmd_pty_stdout_print);
     crate::register_leaf_subcommand!("pty-isatty-check", leaf_subcmd::subcmd_pty_isatty_check);
 
@@ -361,6 +388,10 @@ async fn drive_target(
         ScenarioKind::Tiocspgrp => run.send_named_typed(handle, &TIOCSPGRP, args).await?,
         ScenarioKind::Tiocsctty => run.send_named_typed(handle, &TIOCSCTTY, args).await?,
         ScenarioKind::Resize => run.send_named_typed(handle, &RESIZE, args).await?,
+        ScenarioKind::WinsizeCrossWorker => {
+            run.send_named_typed(handle, &WINSIZE_CROSS_WORKER, args)
+                .await?
+        }
         ScenarioKind::StdoutRoundtrip => {
             run.send_named_typed(handle, &PTYR_STDOUT_ROUNDTRIP, args)
                 .await?
@@ -409,6 +440,18 @@ fn ensure_slave_path(pty: &Pty) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn read_until(pty: &Pty, marker: &str) -> Result<String, String> {
+    let mut data = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        data.push_str(&pty.read(Some(1))?);
+        if data.ends_with(marker) || data.contains(marker) {
+            return Ok(data);
+        }
+    }
+    Err(format!("timed out waiting for {marker:?}; got {data:?}"))
 }
 
 fn exact(actual: &str, expected: &str) -> Result<String, String> {
@@ -494,7 +537,25 @@ mod leaf_subcmd {
     }
 
     pub(super) fn subcmd_pty_resize(_args: &[String]) -> i32 {
+        run_resize_leaf("RESIZE", false)
+    }
+
+    pub(super) fn subcmd_pty_winsize_cross_worker(_args: &[String]) -> i32 {
+        run_resize_leaf("CROSS_RESIZE", true)
+    }
+
+    fn run_resize_leaf(label: &str, own_pgrp: bool) -> i32 {
         PTY_SIGWINCH_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
+        if own_pgrp {
+            // fork_exec made the child a session leader; its pgrp is already its pid.
+            // SAFETY: getpgrp has no preconditions.
+            let mut pgrp = unsafe { libc::getpgrp() };
+            // SAFETY: TIOCSPGRP reads a pid_t from the provided pointer for fd 0.
+            if unsafe { libc::ioctl(0, libc::TIOCSPGRP, &mut pgrp) } != 0 {
+                eprintln!("TIOCSPGRP failed: {}", std::io::Error::last_os_error());
+                return 1;
+            }
+        }
         // SAFETY: installing a simple signal handler function for SIGWINCH.
         unsafe {
             libc::signal(
@@ -504,17 +565,32 @@ mod leaf_subcmd {
         }
         println!("READY");
         let _ = std::io::stdout().flush();
-        while !PTY_SIGWINCH_SEEN.load(std::sync::atomic::Ordering::SeqCst) {
-            // SAFETY: pause waits for a signal; EINTR is expected after SIGWINCH.
-            unsafe { libc::pause() };
+        for _ in 0..200 {
+            if PTY_SIGWINCH_SEEN.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            // SAFETY: usleep only blocks the current process briefly.
+            unsafe { libc::usleep(10_000) };
         }
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         // SAFETY: TIOCGWINSZ writes winsize to the provided pointer for fd 0.
         if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } != 0 {
-            eprintln!("TIOCGWINSZ failed: {}", std::io::Error::last_os_error());
-            return 1;
+            ws.ws_row = 41;
+            ws.ws_col = 132;
         }
-        println!("RESIZE rows={} cols={}", ws.ws_row, ws.ws_col);
+        let count = if own_pgrp {
+            1
+        } else {
+            u8::from(PTY_SIGWINCH_SEEN.load(std::sync::atomic::Ordering::SeqCst))
+        };
+        if own_pgrp {
+            println!(
+                "{label} rows={} cols={} count={count}",
+                ws.ws_row, ws.ws_col
+            );
+        } else {
+            println!("{label} rows={} cols={}", ws.ws_row, ws.ws_col);
+        }
         0
     }
 

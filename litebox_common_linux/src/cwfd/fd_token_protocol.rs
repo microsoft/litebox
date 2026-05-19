@@ -162,6 +162,8 @@ pub enum Opcode {
     SubscribeSignalInbox = 0x74,
     /// Remove this worker's pgrp signal delivery subscription.
     UnsubscribeSignalInbox = 0x75,
+    /// Ask the broker to dispatch a pgrp signal through PgrpSignalInbox.
+    DeliverSignalInbox = 0x76,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -196,6 +198,7 @@ pub enum Opcode {
     ReleaseAllForPidResponse = 0xF3,
     SubscribeSignalInboxResponse = 0xF4,
     UnsubscribeSignalInboxResponse = 0xF5,
+    DeliverSignalInboxResponse = 0xF6,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -318,6 +321,7 @@ impl Opcode {
             Opcode::ReleaseAllForPid => Some(Opcode::ReleaseAllForPidResponse),
             Opcode::SubscribeSignalInbox => Some(Opcode::SubscribeSignalInboxResponse),
             Opcode::UnsubscribeSignalInbox => Some(Opcode::UnsubscribeSignalInboxResponse),
+            Opcode::DeliverSignalInbox => Some(Opcode::DeliverSignalInboxResponse),
             _ => None,
         }
     }
@@ -358,6 +362,7 @@ impl Opcode {
                 | Opcode::ReleaseAllForPid
                 | Opcode::SubscribeSignalInbox
                 | Opcode::UnsubscribeSignalInbox
+                | Opcode::DeliverSignalInbox
         )
     }
 
@@ -413,6 +418,7 @@ impl TryFrom<u8> for Opcode {
             0x73 => Ok(Opcode::ReleaseAllForPid),
             0x74 => Ok(Opcode::SubscribeSignalInbox),
             0x75 => Ok(Opcode::UnsubscribeSignalInbox),
+            0x76 => Ok(Opcode::DeliverSignalInbox),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -445,6 +451,7 @@ impl TryFrom<u8> for Opcode {
             0xF3 => Ok(Opcode::ReleaseAllForPidResponse),
             0xF4 => Ok(Opcode::SubscribeSignalInboxResponse),
             0xF5 => Ok(Opcode::UnsubscribeSignalInboxResponse),
+            0xF6 => Ok(Opcode::DeliverSignalInboxResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -980,6 +987,40 @@ pub fn parse_unsubscribe_signal_inbox_body(body: &[u8]) -> Result<(u32, u64), Pr
 pub fn build_unsubscribe_signal_inbox_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::UnsubscribeSignalInboxResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_deliver_signal_inbox_request(pgid: u32, signum: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&pgid.to_le_bytes());
+    body.extend_from_slice(&signum.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::DeliverSignalInbox,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_deliver_signal_inbox_body(body: &[u8]) -> Result<(u32, u32), ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::DeliverSignalInbox,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let pgid = u32::from_le_bytes(body[0..4].try_into().expect("slice length checked"));
+    let signum = u32::from_le_bytes(body[4..8].try_into().expect("slice length checked"));
+    Ok((pgid, signum))
+}
+
+pub fn build_deliver_signal_inbox_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::DeliverSignalInboxResponse,
         status: StatusCode::Ok,
         caller_pid: 0,
         body: Vec::new(),

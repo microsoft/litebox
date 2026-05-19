@@ -34,7 +34,8 @@ use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use litebox_common_linux::fd_token_protocol::{
     Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
     build_create_pidfd_response_ok, build_create_pipe_response_ok, build_create_pty_response_ok,
-    build_create_signalfd_response_ok, build_create_socketpair_response_ok, build_error_response,
+    build_create_signalfd_response_ok, build_create_socketpair_response_ok,
+    build_deliver_signal_inbox_response_ok, build_error_response,
     build_mark_process_exited_response_ok, build_pidfd_exited_response_ok,
     build_pty_ioctl_response_ok, build_pty_read_response_ok, build_pty_write_response_ok,
     build_push_siginfo_response_ok, build_read_eventfd_response_ok, build_read_pipe_response_ok,
@@ -46,12 +47,13 @@ use litebox_common_linux::fd_token_protocol::{
     build_unsubscribe_signal_inbox_response_ok, build_write_eventfd_response_ok,
     build_write_pipe_response_ok, build_write_socketpair_response_ok, parse_create_eventfd_body,
     parse_create_pidfd_body, parse_create_pipe_body, parse_create_signalfd_body,
-    parse_create_socketpair_body, parse_handle_body, parse_mark_process_exited_body,
-    parse_pidfd_exited_request, parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body,
-    parse_push_siginfo_body, parse_read_pipe_body, parse_read_socketpair_body,
-    parse_subscribe_eventfd_body, parse_subscribe_process_exit_body, parse_subscribe_pty_body,
-    parse_subscribe_signal_inbox_body, parse_unsubscribe_body, parse_unsubscribe_signal_inbox_body,
-    parse_write_eventfd_body, parse_write_pipe_body, parse_write_socketpair_body,
+    parse_create_socketpair_body, parse_deliver_signal_inbox_body, parse_handle_body,
+    parse_mark_process_exited_body, parse_pidfd_exited_request, parse_pty_ioctl_body,
+    parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body, parse_read_pipe_body,
+    parse_read_socketpair_body, parse_subscribe_eventfd_body, parse_subscribe_process_exit_body,
+    parse_subscribe_pty_body, parse_subscribe_signal_inbox_body, parse_unsubscribe_body,
+    parse_unsubscribe_signal_inbox_body, parse_write_eventfd_body, parse_write_pipe_body,
+    parse_write_socketpair_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -183,7 +185,7 @@ pub fn handle_request(
         Opcode::PtyRead => handle_pty_read(registry, request, in_fds),
         Opcode::PtyWrite => handle_pty_write(registry, request, in_fds),
         Opcode::SubscribePty => handle_subscribe_pty(registry, conn, request, in_fds),
-        Opcode::PtyIoctl => handle_pty_ioctl(registry, request, in_fds),
+        Opcode::PtyIoctl => handle_pty_ioctl(registry, None, request, in_fds),
         Opcode::SubscribeEventfd => handle_subscribe_eventfd(registry, conn, request, in_fds),
         Opcode::Unsubscribe => handle_unsubscribe(registry, conn, request, in_fds),
         Opcode::Release => handle_release_state(registry, request, in_fds),
@@ -278,6 +280,26 @@ pub fn handle_subscribe_signal_inbox(
         Err(PgrpSubscribeError::UnknownEventBits { .. }) => {
             protocol_err(Opcode::SubscribeSignalInboxResponse)
         }
+    }
+}
+
+pub fn handle_deliver_signal_inbox(
+    inbox: &PgrpSignalInbox,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::DeliverSignalInboxResponse);
+    }
+    let (pgid, signum) = match parse_deliver_signal_inbox_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::DeliverSignalInboxResponse),
+    };
+    let siginfo = vec![0u8; core::mem::size_of::<litebox_common_linux::signal::Siginfo>()];
+    inbox.deliver(pgid, signum, &siginfo);
+    HandlerResult {
+        frame: build_deliver_signal_inbox_response_ok(),
+        out_fd: None,
     }
 }
 
@@ -1035,8 +1057,9 @@ fn handle_pty_write(
     }
 }
 
-fn handle_pty_ioctl(
+pub fn handle_pty_ioctl(
     registry: &BrokerStateRegistry,
+    pgrp_signal_inbox: Option<&PgrpSignalInbox>,
     request: &Frame<'_>,
     in_fds: Vec<OwnedFd>,
 ) -> HandlerResult {
@@ -1058,10 +1081,20 @@ fn handle_pty_ioctl(
     // Caller ids are supplied as best-effort payload-independent defaults until
     // Phase G's broker process/session model can validate job control globally.
     match pty.ioctl(op, &payload, 1, 1, 1) {
-        Ok(result) => HandlerResult {
-            frame: build_pty_ioctl_response_ok(&result.payload),
-            out_fd: None,
-        },
+        Ok(result) => {
+            if let (Some(inbox), Some((pgrp, signum))) = (pgrp_signal_inbox, result.signal_pgrp)
+                && pgrp > 0
+                && signum > 0
+            {
+                let siginfo =
+                    vec![0u8; core::mem::size_of::<litebox_common_linux::signal::Siginfo>()];
+                inbox.deliver(pgrp as u32, signum as u32, &siginfo);
+            }
+            HandlerResult {
+                frame: build_pty_ioctl_response_ok(&result.payload),
+                out_fd: None,
+            }
+        }
         Err(PtyError::WouldBlock) => status_err(Opcode::PtyIoctlResponse, StatusCode::WouldBlock),
         Err(PtyError::Invalid) | Err(PtyError::Closed) => {
             status_err(Opcode::PtyIoctlResponse, StatusCode::InvalidValue)

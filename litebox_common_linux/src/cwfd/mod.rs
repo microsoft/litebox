@@ -19,6 +19,7 @@
 //!   token client with the notification dispatcher.
 
 pub mod broker_eventfd_provider;
+pub mod broker_pgrp_signal_provider;
 pub mod broker_pidfd_provider;
 pub mod broker_pipe_provider;
 pub mod broker_pty_provider;
