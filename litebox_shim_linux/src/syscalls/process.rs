@@ -2713,7 +2713,7 @@ impl<FS: ShimFS> Task<FS> {
                             // termios (both master and slave do).  We record
                             // all PTY fds — the bridging code will match by
                             // pty_index.
-                            if files.fs.get_pty_termios(&typed).is_some() {
+                            if files.fs.get_pty_pair_erased(&typed).is_some() {
                                 pty_fds.push((raw_fd, pty_index));
                             }
                         }

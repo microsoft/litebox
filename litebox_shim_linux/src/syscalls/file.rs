@@ -25,6 +25,7 @@ use litebox_common_linux::{
     AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
     IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, STATX_BASIC_STATS, StatfsBuf, StatxBuf,
     StatxTimestamp, TMPFS_MAGIC, TimeParam, TimerfdFlags, TimerfdTimerFlags, errno::Errno,
+    fd_token_protocol::PtyIoctlOp,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -84,6 +85,9 @@ const ANON_INODE_DEV: u64 = 0x000e;
 /// `fstat(reopened_fd)` is consistent with `fstat(0)`.
 #[derive(Clone)]
 pub(crate) struct HostPtyDeviceFd;
+
+#[derive(Clone)]
+struct BrokerPtyFd(u64);
 
 /// Monotonically increasing counter for unique inode numbers assigned to
 /// anonymous file descriptors (sockets, pipes, eventfds, epoll instances).
@@ -5464,7 +5468,54 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    /// Handle terminal ioctls for PTY slave devices (major=136).
+    fn broker_pty_handle_for_fd(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<u64, Errno> {
+        if let Ok(handle) = self
+            .global
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd, |metadata: &BrokerPtyFd| metadata.0)
+        {
+            return Ok(handle);
+        }
+
+        let Some((_pair, pty_idx, is_master)) = fs.get_pty_pair_erased(fd) else {
+            return Err(Errno::ENOTTY);
+        };
+        let handle = self.global.broker_pty_handle(pty_idx, is_master)?;
+        let _old = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .set_entry_metadata(fd, BrokerPtyFd(handle));
+        Ok(handle)
+    }
+
+    fn broker_pty_ioctl(
+        &self,
+        fs: &FS,
+        fd: &TypedFd<FS>,
+        op: PtyIoctlOp,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Errno> {
+        let handle = self.broker_pty_handle_for_fd(fs, fd)?;
+        let provider = super::eventfd::broker_pty_provider().ok_or(Errno::EIO)?;
+        provider
+            .ioctl_pty(handle, op, payload)
+            .map_err(|err| match err {
+                litebox_common_linux::broker_pty_provider::BrokerOpError::InvalidValue => {
+                    Errno::EINVAL
+                }
+                litebox_common_linux::broker_pty_provider::BrokerOpError::UnknownHandle => {
+                    Errno::ENOTTY
+                }
+                litebox_common_linux::broker_pty_provider::BrokerOpError::WouldBlock => {
+                    Errno::EAGAIN
+                }
+                litebox_common_linux::broker_pty_provider::BrokerOpError::Io => Errno::EIO,
+            })
+    }
+
+    /// Handle terminal ioctls for PTY devices (major=136).
     fn pty_ioctl(
         &self,
         fs: &FS,
@@ -5473,18 +5524,22 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<u32, Errno> {
         match arg {
             IoctlArg::TCGETS(termios) => {
-                // Return stored terminal attributes for this PTY.
-                let stored = fs.get_pty_termios(fd).ok_or(Errno::ENOTTY)?;
+                let payload = self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tcgets, &[])?;
+                if payload.len() != 36 {
+                    return Err(Errno::EIO);
+                }
+                let mut c_cc = [0u8; 19];
+                c_cc.copy_from_slice(&payload[17..36]);
                 termios
                     .write_at_offset(
                         0,
                         litebox_common_linux::Termios {
-                            c_iflag: stored.c_iflag,
-                            c_oflag: stored.c_oflag,
-                            c_cflag: stored.c_cflag,
-                            c_lflag: stored.c_lflag,
-                            c_line: stored.c_line,
-                            c_cc: stored.c_cc,
+                            c_iflag: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
+                            c_oflag: u32::from_le_bytes(payload[4..8].try_into().unwrap()),
+                            c_cflag: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+                            c_lflag: u32::from_le_bytes(payload[12..16].try_into().unwrap()),
+                            c_line: payload[16],
+                            c_cc,
                         },
                     )
                     .ok_or(Errno::EFAULT)?;
@@ -5493,67 +5548,57 @@ impl<FS: ShimFS> Task<FS> {
             IoctlArg::TCSETS(termios_ptr)
             | IoctlArg::TCSETSW(termios_ptr)
             | IoctlArg::TCSETSF(termios_ptr) => {
-                // Store the terminal attributes so future TCGETS and line
-                // discipline behaviour reflect what the application configured.
                 let t: litebox_common_linux::Termios =
                     termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                let stored = litebox::platform::TerminalAttributes {
-                    c_iflag: t.c_iflag,
-                    c_oflag: t.c_oflag,
-                    c_cflag: t.c_cflag,
-                    c_lflag: t.c_lflag,
-                    c_line: t.c_line,
-                    c_cc: t.c_cc,
-                };
-                if !fs.set_pty_termios(fd, stored) {
-                    return Err(Errno::ENOTTY);
+                let mut payload = Vec::with_capacity(36);
+                payload.extend_from_slice(&t.c_iflag.to_le_bytes());
+                payload.extend_from_slice(&t.c_oflag.to_le_bytes());
+                payload.extend_from_slice(&t.c_cflag.to_le_bytes());
+                payload.extend_from_slice(&t.c_lflag.to_le_bytes());
+                payload.push(t.c_line);
+                payload.extend_from_slice(&t.c_cc);
+                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tcsets, &payload)?;
+                if let Some((pair, _, _)) = fs.get_pty_pair_erased(fd)
+                    && let Ok(pair) = pair.downcast::<litebox::fs::devices::PtyPair<Platform>>()
+                {
+                    *pair.termios.lock() = litebox::platform::TerminalAttributes {
+                        c_iflag: t.c_iflag,
+                        c_oflag: t.c_oflag,
+                        c_cflag: t.c_cflag,
+                        c_lflag: t.c_lflag,
+                        c_line: t.c_line,
+                        c_cc: t.c_cc,
+                    };
                 }
                 Ok(0)
             }
             IoctlArg::TIOCSWINSZ(ws_ptr) => {
                 let ws: litebox_common_linux::Winsize =
                     ws_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                let size = litebox::platform::WindowSize {
-                    rows: ws.row,
-                    cols: ws.col,
-                    xpixel: ws.xpixel,
-                    ypixel: ws.ypixel,
-                };
-                let old_size = fs.get_pty_window_size(fd).ok_or(Errno::ENOTTY)?;
-                if !fs.set_pty_window_size(fd, size) {
-                    return Err(Errno::ENOTTY);
-                }
-                let _ = fs.set_pty_winsize(fd, size);
-                if size != old_size
-                    && let Some(pgrp) = fs.get_pty_foreground_pgrp(fd)
-                    && pgrp > 0
-                    && let Some(provider) = super::eventfd::broker_pgrp_signal_provider()
-                {
-                    provider
-                        .deliver_pgrp_signal(
-                            pgrp as u32,
-                            litebox_common_linux::signal::Signal::SIGWINCH.as_i32() as u32,
-                        )
-                        .map_err(|_| Errno::EIO)?;
-                }
+                let mut payload = Vec::with_capacity(8);
+                payload.extend_from_slice(&ws.row.to_le_bytes());
+                payload.extend_from_slice(&ws.col.to_le_bytes());
+                payload.extend_from_slice(&ws.xpixel.to_le_bytes());
+                payload.extend_from_slice(&ws.ypixel.to_le_bytes());
+                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocswinsz, &payload)?;
                 Ok(0)
             }
-            IoctlArg::TIOCSPTLK(_) | IoctlArg::TIOCNOTTY => Ok(0),
+            IoctlArg::TIOCSPTLK(lock_ptr) => {
+                let locked: i32 = lock_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocsptlk, &locked.to_le_bytes())?;
+                Ok(0)
+            }
+            IoctlArg::TIOCNOTTY => Ok(0),
             IoctlArg::TIOCSCTTY => {
-                // On real Linux, TIOCSCTTY installs this slave as /dev/tty for
-                // the session leader and initializes the foreground pgrp to the
-                // caller. Mirror both effects so later /dev/tty opens route to
-                // the sandbox PTY rather than the shim's host stdio alias.
                 let Some((_pair, pty_idx, is_master)) = fs.get_pty_pair_erased(fd) else {
                     return Err(Errno::ENOTTY);
                 };
                 if is_master {
                     return Err(Errno::ENOTTY);
                 }
+                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocsctty, &[])?;
                 let pgid = i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
-                if !fs.set_pty_foreground_pgrp(fd, pgid) {
-                    return Err(Errno::ENOTTY);
-                }
+                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocspgrp, &pgid.to_le_bytes())?;
                 if let Ok(pgid_u32) = u32::try_from(pgid) {
                     self.global.ensure_pgrp_signal_subscription(pgid_u32);
                 }
@@ -5562,54 +5607,53 @@ impl<FS: ShimFS> Task<FS> {
             }
             IoctlArg::TIOCSPGRP(pgrp_ptr) => {
                 let pgrp: i32 = pgrp_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                if pgrp <= 0 {
-                    return Err(Errno::EINVAL);
-                }
-                if !fs.set_pty_foreground_pgrp(fd, pgrp) {
-                    return Err(Errno::ENOTTY);
-                }
+                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocspgrp, &pgrp.to_le_bytes())?;
                 if let Ok(pgid) = u32::try_from(pgrp) {
                     self.global.ensure_pgrp_signal_subscription(pgid);
                 }
                 Ok(0)
             }
             IoctlArg::TIOCGWINSZ(ws) => {
-                let size = fs.get_pty_window_size(fd).ok_or(Errno::ENOTTY)?;
+                let payload = self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocgwinsz, &[])?;
+                if payload.len() != 8 {
+                    return Err(Errno::EIO);
+                }
                 ws.write_at_offset(
                     0,
                     litebox_common_linux::Winsize {
-                        row: size.rows,
-                        col: size.cols,
-                        xpixel: size.xpixel,
-                        ypixel: size.ypixel,
+                        row: u16::from_le_bytes(payload[0..2].try_into().unwrap()),
+                        col: u16::from_le_bytes(payload[2..4].try_into().unwrap()),
+                        xpixel: u16::from_le_bytes(payload[4..6].try_into().unwrap()),
+                        ypixel: u16::from_le_bytes(payload[6..8].try_into().unwrap()),
                     },
                 )
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
             IoctlArg::TIOCGPTN(ptn) => {
-                let status = fs.fd_file_status(fd).map_err(|_| Errno::EBADF)?;
-                let rdev = status.node_info.rdev.ok_or(Errno::ENOTTY)?;
-                let major = rdev.get() >> 8;
-                if major != 136 {
+                let Some((_pair, pty_idx, _is_master)) = fs.get_pty_pair_erased(fd) else {
                     return Err(Errno::ENOTTY);
-                }
-                let minor = u32::try_from(rdev.get() & 0xFF).expect("minor fits in u32");
-                ptn.write_at_offset(0, minor).ok_or(Errno::EFAULT)?;
+                };
+                let _ = self.broker_pty_handle_for_fd(fs, fd)?;
+                ptn.write_at_offset(0, pty_idx).ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
             IoctlArg::TIOCGPGRP(pgrp) => {
-                // Always return the caller's own pgid.  This avoids a race
-                // between the parent setting the PTY foreground pgrp (via
-                // TIOCSPGRP on the master) and the child checking it (via
-                // TIOCGPGRP on the slave): with vfork the parent can only
-                // call tcsetpgrp *after* the child execs, but bash checks
-                // tcgetpgrp during early init, before the parent had a chance
-                // to call setpgid+tcsetpgrp.  Returning the caller's pgid
-                // guarantees tcgetpgrp() == getpgrp() so shells always see
-                // themselves in the foreground.
-                let value = i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
-                pgrp.write_at_offset(0, value).ok_or(Errno::EFAULT)?;
+                let payload = self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocgpgrp, &[])?;
+                if payload.len() != 4 {
+                    return Err(Errno::EIO);
+                }
+                pgrp.write_at_offset(0, i32::from_le_bytes(payload[..4].try_into().unwrap()))
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCGSID(sid) => {
+                let payload = self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocgsid, &[])?;
+                if payload.len() != 4 {
+                    return Err(Errno::EIO);
+                }
+                sid.write_at_offset(0, i32::from_le_bytes(payload[..4].try_into().unwrap()))
+                    .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
             _ => Err(Errno::ENOTTY),
