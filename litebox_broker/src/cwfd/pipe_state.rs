@@ -255,12 +255,23 @@ impl Drop for PipeReadEnd {
         //   - successful_writes > 0 (writer produced data)
         //   - successful_reads > 0 (reader started draining, then
         //     stopped → real loss)
-        // Excludes the legitimate case where successful_reads==0:
-        // reader never tried, so the data was "never wanted" — e.g.,
-        // inherited fds for telemetry pipes that the test doesn't drain.
-        // When all three conditions hold, the bug is concrete.
-        // Debug builds panic to surface regressions immediately;
-        // release builds file-log for post-mortem.
+        //
+        // Note (user feedback 2026-05-19): this predicate is
+        // FUNDAMENTALLY LOSSY. It matches both:
+        //   (a) Real litebox bug: shim erroneously closed the reader's
+        //       fd while data was buffered (e.g. the SIGCHLD-EINTR
+        //       race that motivated PE.14 originally — commit e8316f5d).
+        //   (b) Application crash: process died mid-read; kernel
+        //       reaped fds; on_close fired with data still buffered.
+        //       This is NOT a litebox bug.
+        //   (c) Application chose to close early: legitimate user code
+        //       deciding to discard remaining data.
+        //
+        // We can't distinguish these from broker side alone — the
+        // broker only sees "rc hit 0". So this is a DIAGNOSTIC
+        // (always-on file log) rather than a hard assertion. A real
+        // bug (a) would manifest as a TEST FAILURE elsewhere; the
+        // log helps the post-mortem.
         let unread = {
             let buf = self.inner.buffer.lock().expect("PipeInner poisoned");
             buf.buf.len()
@@ -269,10 +280,6 @@ impl Drop for PipeReadEnd {
         let reads = self.inner.successful_reads.load(Ordering::Relaxed);
         if unread > 0 && writes > 0 && reads > 0 {
             let handle_id = self.handle_id.load(Ordering::Relaxed);
-            let msg = std::format!(
-                "PIPE READ-END DATA LOSS handle={handle_id}: unread={unread} writes={writes} reads={reads} \
-                 (reader partially drained then closed without finishing)"
-            );
             use std::io::Write;
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -283,19 +290,18 @@ impl Drop for PipeReadEnd {
                 .append(true)
                 .open("/tmp/rst-diag.log")
             {
-                let _ = writeln!(f, "[PE.14-invariant] ts={ts} {msg}");
+                let _ = writeln!(
+                    f,
+                    "[PE.14-invariant] ts={ts} PIPE READ-END DATA LOSS handle={handle_id}: \
+                     unread={unread} writes={writes} reads={reads} \
+                     (reader partially drained then closed; could be litebox bug, \
+                     crash, or legitimate early-close — correlate with test result)"
+                );
             }
-            // PE.14 invariant: always-on (matches PE.9 leak-detection
-            // pattern in eventfd_state/process_state/pidfd_state/
-            // pty_state). A real data-loss bug needs to fire in
-            // production runs too, not just debug builds. The
-            // refined predicate (unread > 0 AND writes > 0 AND reads
-            // > 0) excludes the legitimate-non-drain case, so this
-            // should never fire on healthy paths.
-            assert!(
-                false,
-                "{msg}"
-            );
+            // NO PANIC: process crash + early-close are legitimate
+            // scenarios indistinguishable from a real bug here.
+            // The log is the diagnostic; a true litebox bug would
+            // manifest as a separate test failure.
         } else if unread > 0 && writes > 0 {
             // Soft data-loss (reader never tried): still log but do
             // not assert. Often legitimate (inherited fds).

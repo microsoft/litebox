@@ -315,10 +315,11 @@ impl Drop for SocketPairEnd {
             );
         }
         // PE.14 invariant (mirrors PIPE READ-END DATA LOSS):
-        //   When endpoint X drops, X's INBOUND buffer holds bytes that
-        //   the peer wrote but X never read. Check (writes_into_X>0
-        //   AND reads_by_X>0 AND unread>0) for real data loss.
-        //   Soft case (reads==0) = X never read; logged but not assert.
+        // FUNDAMENTALLY LOSSY predicate — matches real bugs AND
+        // legitimate process-crash / early-close. Log loudly, don't
+        // panic (a broker panic on every worker crash is worse than
+        // missing diagnostic). See pipe_state.rs Drop for full
+        // rationale.
         let (inbound_buf_mutex, writes_into_x, reads_by_x, dir_label) = match self.endpoint {
             // A's inbound = buffer_ba; B wrote into it (ba_writes); A read from it (ba_reads).
             SocketPairEndpoint::A => (
@@ -344,12 +345,6 @@ impl Drop for SocketPairEnd {
         let reads = reads_by_x.load(Ordering::Relaxed);
         if unread > 0 && writes > 0 && reads > 0 {
             let handle_id = self.handle_id.load(Ordering::Relaxed);
-            let msg = std::format!(
-                "SOCKETPAIR DATA LOSS direction={dir_label} endpoint={:?} handle={handle_id}: \
-                 unread={unread} writes={writes} reads={reads} \
-                 (reader partially drained then closed without finishing)",
-                self.endpoint
-            );
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -359,10 +354,15 @@ impl Drop for SocketPairEnd {
                 .append(true)
                 .open("/tmp/rst-diag.log")
             {
-                let _ = writeln!(f, "[PE.14-invariant] ts={ts} {msg}");
+                let _ = writeln!(
+                    f,
+                    "[PE.14-invariant] ts={ts} SOCKETPAIR DATA LOSS direction={dir_label} \
+                     endpoint={:?} handle={handle_id}: unread={unread} writes={writes} reads={reads} \
+                     (reader partially drained then closed; could be litebox bug, crash, or legit close)",
+                    self.endpoint
+                );
             }
-            // Always-on assert (matches PE.9 + PE.14 PIPE pattern).
-            assert!(false, "{msg}");
+            // NO PANIC: see pipe_state.rs Drop rationale.
         } else if unread > 0 && writes > 0 {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
