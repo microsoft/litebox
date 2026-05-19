@@ -938,6 +938,17 @@ impl<FS: ShimFS> LinuxShim<FS> {
             is_delayed_fork: _,
         } = snapshot;
 
+        // Fork-restore runs before the restored task enters the syscall loop, so
+        // no syscall-level caller_pid guard is active yet. Attribute broker refs
+        // materialized from the snapshot to the restored child process.
+        let _caller_pid_guard = if per_pid_ownership_enabled() {
+            Some(litebox_common_linux::fd_token_client::set_caller_pid_scope(
+                u32::try_from(id.pid).map_err(|_| Errno::EINVAL)?,
+            ))
+        } else {
+            None
+        };
+
         // Reserve the child's thread ID so future clone() calls don't collide.
         self.global.reserve_thread_id(id.pid);
 
