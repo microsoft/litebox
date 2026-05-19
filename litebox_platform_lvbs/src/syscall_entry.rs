@@ -36,10 +36,10 @@ pub(crate) fn init() {
     // Mask some important bits of the FLAGS register.
     //
     // - IF: to block interrupts during syscall handling
-    // - DF: to maintain the direction of some instructions like `movs`.
-    // - AC: to maintain SMAP
+    // - DF: to maintain the direction of some instructions like `movs`
+    // - AC: to maintain SMAP enforcement active
     // - TF: to prevent kernel-mode single-stepping
-    // - NT and IOPL: Defense-in-depth. ring-3 cannot set these bits.
+    // - NT and IOPL: Defense-in-depth. ring-3 should not be able to affect these bits.
     let rflags = RFlags::INTERRUPT_FLAG
         | RFlags::DIRECTION_FLAG
         | RFlags::ALIGNMENT_CHECK

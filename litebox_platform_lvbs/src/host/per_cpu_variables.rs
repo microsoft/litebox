@@ -261,6 +261,8 @@ pub struct PerCpuVariablesAsm {
     vtl_return_addr: Cell<usize>,
     /// Scratch pad
     scratch: Cell<usize>,
+    /// User-mode RFLAGS captured at `syscall` entry
+    user_rflags: Cell<usize>,
     /// Top address of VTL0 VtlState
     vtl0_state_top_addr: Cell<usize>,
     /// Current kernel stack pointer
@@ -357,6 +359,9 @@ impl PerCpuVariablesAsm {
     }
     pub const fn scratch_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, scratch)
+    }
+    pub const fn user_rflags_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, user_rflags)
     }
     pub const fn vtl0_state_top_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, vtl0_state_top_addr)
