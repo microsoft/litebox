@@ -165,6 +165,7 @@ mod tests {
     use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
     use litebox_broker::state_registry::BrokerStateRegistry;
     use litebox_common_linux::broker_eventfd::NotificationDispatcher;
+    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
     use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
     use litebox_common_linux::notification_ring::NotificationReceiver;
     use litebox_common_linux::shmem_ring::ShmemRingPair;
