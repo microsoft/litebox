@@ -598,11 +598,11 @@ fn test_socketpair_fork_write() -> i32 {
         let n = unsafe { libc::write(child_fd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
         if n != msg.len() as isize {
             eprintln!("[US6a-child] write failed: n={n} errno={}", errno());
-            std::process::exit(1);
+            unsafe { libc::_exit(1) };
         }
         eprintln!("[US6a-child] wrote {n} bytes");
         unsafe { libc::close(child_fd) };
-        std::process::exit(0);
+        unsafe { libc::_exit(0) };
     }
 
     unsafe { libc::close(child_fd) };
@@ -688,7 +688,7 @@ fn test_socketpair_fork_read() -> i32 {
         let n = unsafe { libc::read(child_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         if n <= 0 {
             eprintln!("[US6b-child] read failed: n={n} errno={}", errno());
-            std::process::exit(1);
+            unsafe { libc::_exit(1) };
         }
         let msg = std::str::from_utf8(&buf[..n as usize]).unwrap_or("?");
         eprintln!("[US6b-child] got: {msg}");
@@ -1564,6 +1564,46 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                 }
             );
         }
+    }
+
+    for &(id, subcommand, ok_marker) in &[
+        (
+            "FET.socketpair_write.pie-glibc.dpg1",
+            "socketpair-fork-write",
+            "US6_SOCKETPAIR_FORK_OK",
+        ),
+        (
+            "FET.socketpair_read.pie-glibc.dpg1",
+            "socketpair-fork-read",
+            "US6R_SOCKETPAIR_FORK_READ_OK",
+        ),
+    ] {
+        typed_test!(
+            reg,
+            "xworker",
+            "unix_socket",
+            id,
+            timeout = 60,
+            agents[handle = AgentName::Dpg1],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let target = crate::binary_path(crate::BinaryType::PieGlibc, &self_exe);
+                let resp = run
+                    .send_named_typed(
+                        &handle,
+                        &EXEC_BIN,
+                        ExecBinArgs {
+                            argv: vec![target, "unix-socket-test".into(), subcommand.into()],
+                            timeout_ms: Some(15 * 1000),
+                            stdin: None,
+                            env: vec![],
+                        },
+                    )
+                    .await;
+                let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains(ok_marker));
+                crate::coordinator::TestOutcome::new("dpg1", pass, format!("{resp:?}"))
+            }
+        );
     }
 
     for &bt in &[
