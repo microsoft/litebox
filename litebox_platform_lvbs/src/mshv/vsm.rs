@@ -1364,18 +1364,16 @@ impl<'a> ModuleMemoryMetadataIters<'a> {
 /// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
 /// `pa` and `nranges` specify the physical address range containing one or more than one `HekiPage` structures.
 fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
-    let mut next_pa = PhysAddr::try_new(pa).ok()?;
     let mut heki_pages = Vec::with_capacity(nranges.truncate());
     let mut visited_pages = HashSet::new();
     let mut range: u64 = 0;
 
+    let mut cur_pa = PhysAddr::try_new(pa).ok()?;
     while range < nranges {
-        let cur_pa = next_pa;
         if visited_pages.contains(&cur_pa.as_u64()) {
             return None;
         }
-        let heki_page =
-            (unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(next_pa) })?;
+        let heki_page = (unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPage>(cur_pa) })?;
         if !heki_page.is_valid() {
             return None;
         }
@@ -1387,7 +1385,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
             return None;
         }
         // `HekiPage::is_valid` already validated `next_pa`.
-        next_pa = PhysAddr::new(heki_page.next_pa);
+        cur_pa = PhysAddr::new(heki_page.next_pa);
         heki_pages.push(*heki_page);
     }
 
