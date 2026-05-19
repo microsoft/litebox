@@ -120,9 +120,20 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
     command_parts.extend_from_slice(&args);
     let command = command_parts.join(" ");
 
-    // Check cache first
+    // Check cache first. Include any sibling `.h` files in the source's directory
+    // so cache invalidation tracks shared headers (e.g. test helper headers).
     let src_path_buf = Path::new(src_path);
-    let input_paths = vec![src_path_buf];
+    let mut sibling_headers: Vec<PathBuf> = src_path_buf
+        .parent()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("h"))
+        .collect();
+    sibling_headers.sort();
+    let mut input_paths: Vec<&Path> = vec![src_path_buf];
+    input_paths.extend(sibling_headers.iter().map(PathBuf::as_path));
 
     if let Ok(true) = crate::cache::is_cached_and_valid(&input_paths, &path, &command) {
         println!("Using cached compilation result for: {unique_name}");

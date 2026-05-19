@@ -40,6 +40,7 @@ pub(crate) struct UnixSocketSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>)
 impl<FS: ShimFS> FdEnabledSubsystem for UnixSocketSubsystem<FS> {
     type Entry = UnixSocket<FS>;
 }
+
 impl<FS: ShimFS> FdEnabledSubsystemEntry for UnixSocket<FS> {}
 
 /// C-compatible structure for Unix socket addresses.
@@ -193,10 +194,8 @@ struct UnixInitStream<FS: ShimFS> {
     /// Optional bound address for this socket
     addr: Option<UnixBoundSocketAddr<FS>>,
     pollee: Pollee<crate::Platform>,
-    /// Whether the read side of this socket is pending shutdown
-    pending_read_shutdown: AtomicBool,
-    /// Whether the write side of this socket is pending shutdown
-    pending_write_shutdown: AtomicBool,
+    read_shutdown: AtomicBool,
+    write_shutdown: AtomicBool,
 }
 
 impl<FS: ShimFS> UnixInitStream<FS> {
@@ -204,17 +203,17 @@ impl<FS: ShimFS> UnixInitStream<FS> {
         Self {
             addr: None,
             pollee: Pollee::new(),
-            pending_read_shutdown: AtomicBool::new(false),
-            pending_write_shutdown: AtomicBool::new(false),
+            read_shutdown: AtomicBool::new(false),
+            write_shutdown: AtomicBool::new(false),
         }
     }
 
     fn shutdown(&self, how: ShutdownHow) {
-        if how.affects_read() && !self.pending_read_shutdown.swap(true, Ordering::Release) {
+        if how.shuts_down_read() && !self.read_shutdown.swap(true, Ordering::Release) {
             self.pollee.notify_observers(Events::IN);
         }
-        if how.affects_write() {
-            self.pending_write_shutdown.store(true, Ordering::Release);
+        if how.shuts_down_write() {
+            self.write_shutdown.store(true, Ordering::Release);
         }
     }
 
@@ -263,15 +262,15 @@ impl<FS: ShimFS> UnixInitStream<FS> {
         let UnixInitStream {
             addr,
             pollee,
-            pending_read_shutdown,
-            pending_write_shutdown,
+            read_shutdown,
+            write_shutdown,
         } = self;
         UnixConnectedStream::new_pair(
             addr.map(Arc::new),
             Some(Arc::new(pollee)),
             Some(peer_addr),
-            pending_read_shutdown.load(Ordering::Acquire),
-            pending_write_shutdown.load(Ordering::Acquire),
+            read_shutdown.load(Ordering::Acquire),
+            write_shutdown.load(Ordering::Acquire),
         )
     }
 }
@@ -466,7 +465,9 @@ const UNIX_BUF_SIZE: usize = 65536;
 impl<FS: ShimFS> UnixConnectedStream<FS> {
     /// Creates a pair of connected Unix stream sockets.
     ///
-    /// `read_shutdown` and `write_shutdown` half-close the corresponding sides of the stream.
+    /// `read_shutdown` and `write_shutdown` half-close the corresponding sides of the
+    /// *first* returned socket only (used to carry pre-connect shutdown flags from
+    /// `UnixInitStream` across `connect(2)` into the connected state).
     fn new_pair(
         addr: Option<Arc<UnixBoundSocketAddr<FS>>>,
         pollee: Option<Arc<Pollee<crate::Platform>>>,
@@ -572,12 +573,10 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
 
     fn shutdown(&self, how: ShutdownHow) {
         let mut events = Events::empty();
-        if how.affects_read() {
-            self.recv_channel.shutdown();
+        if how.shuts_down_read() && self.recv_channel.shutdown() {
             events |= Events::IN | Events::RDHUP;
         }
-        if how.affects_write() {
-            self.connected_send_channel.shutdown();
+        if how.shuts_down_write() && self.connected_send_channel.shutdown() {
             events |= Events::OUT | Events::HUP;
         }
         self.pollee.notify_observers(events);
@@ -839,8 +838,8 @@ impl<FS: ShimFS> UnixStream<FS> {
                 },
             )
             .map_err(Errno::from);
-        // SO_RCVTIMEO expiry: Linux returns EAGAIN, not ETIMEDOUT.
         match res {
+            // Linux SO_RCVTIMEO expiry surfaces as `EAGAIN`, not `ETIMEDOUT`
             Err(Errno::ETIMEDOUT) => Err(Errno::EAGAIN),
             other => other,
         }
@@ -884,7 +883,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                 // (a recv would return EOF immediately). SHUT_WR has no observable
                 // effect on Init's poll output.
                 let mut events = Events::OUT | Events::HUP;
-                if init.pending_read_shutdown.load(Ordering::Acquire) {
+                if init.read_shutdown.load(Ordering::Acquire) {
                     events |= Events::IN;
                 }
                 events
@@ -1039,13 +1038,13 @@ impl<FS: ShimFS> UnixDatagramInner<FS> {
 
     fn shutdown(&self, how: ShutdownHow) {
         let mut events = Events::empty();
-        if how.affects_read()
+        if how.shuts_down_read()
             && let Some(recv_channel) = &self.recv_channel
             && recv_channel.shutdown()
         {
             events |= Events::IN | Events::RDHUP;
         }
-        if how.affects_write()
+        if how.shuts_down_write()
             && let Some((connected_send_channel, _)) = &self.connected_send_channel
             && connected_send_channel.shutdown()
         {
@@ -1155,12 +1154,12 @@ impl<FS: ShimFS> UnixDatagram<FS> {
                 },
             )
             .map_err(Errno::from);
-        // - Non-blocking + self-shutdown(SHUT_RD) with empty queue: Linux returns EAGAIN
-        //   instead of EOF (datagram boundaries — no message synthesized for the absent peer).
-        // - SO_RCVTIMEO expiry on a blocking recv: Linux returns EAGAIN, not ETIMEDOUT
-        //   (the latter is reserved for connect-style timeouts).
+        // Non-blocking + self-shutdown(SHUT_RD) on an empty queue: Linux returns
+        // EAGAIN instead of EOF — datagram boundaries mean no zero-length message
+        // can be synthesized for the absent peer.
         match res {
             Err(Errno::ESHUTDOWN) if is_nonblocking => Err(Errno::EAGAIN),
+            // Linux SO_RCVTIMEO expiry surfaces as `EAGAIN`, not `ETIMEDOUT`
             Err(Errno::ETIMEDOUT) => Err(Errno::EAGAIN),
             other => other,
         }
@@ -1218,20 +1217,34 @@ impl<FS: ShimFS> UnixDatagram<FS> {
 
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
-        if let Some(recv_channel) = &self.inner.read().recv_channel {
-            if recv_channel.is_shutdown() {
+        let inner = self.inner.read();
+        let recv_shutdown = inner
+            .recv_channel
+            .as_ref()
+            .is_some_and(ReadEnd::is_shutdown);
+        let send_shutdown = inner
+            .connected_send_channel
+            .as_ref()
+            .is_some_and(|(c, _)| c.is_shutdown());
+        if let Some(recv_channel) = &inner.recv_channel {
+            if recv_shutdown {
                 events |= Events::IN | Events::RDHUP;
             } else if !recv_channel.is_empty() {
                 events |= Events::IN;
             }
         }
-        if let Some((connected_send_channel, _)) = &self.inner.read().connected_send_channel {
+        if let Some((connected_send_channel, _)) = &inner.connected_send_channel {
             if !connected_send_channel.is_full() {
                 events |= Events::OUT;
             }
         } else {
-            // If not connected, allow to sendto any address?
             events |= Events::OUT;
+        }
+        // Linux reports POLLHUP on a dgram fd only when *both* local directions are
+        // shut down (peer-side shutdown is invisible since dgrams are connectionless).
+        // Matches `UnixConnectedStream::check_io_events`.
+        if recv_shutdown && send_shutdown {
+            events |= Events::HUP;
         }
         events
     }

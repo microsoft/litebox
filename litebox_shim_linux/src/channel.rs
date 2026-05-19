@@ -14,14 +14,13 @@ use ringbuf::traits::{Consumer as _, Observer as _, Producer as _};
 
 macro_rules! common_functions_for_channel {
     () => {
-        /// Has this been shut down?
         pub(crate) fn is_shutdown(&self) -> bool {
             self.endpoint.is_shutdown()
         }
 
-        /// Shut this channel down.
-        ///
-        /// On the first transition, wakes the peer's pollee so a
+        /// Shuts the endpoint down. Returns `true` only on the call that
+        /// effected the transition (idempotent thereafter — not a fallibility
+        /// signal). The first transition also wakes the peer's pollee so a
         /// peer blocked in send/recv unblocks immediately.
         pub(crate) fn shutdown(&self) -> bool {
             if self.endpoint.shutdown() {
@@ -34,7 +33,6 @@ macro_rules! common_functions_for_channel {
             }
         }
 
-        /// Has the peer (i.e., other end) been shut down?
         fn is_peer_shutdown(&self) -> bool {
             if let Some(peer) = self.peer.upgrade() {
                 peer.is_shutdown()
@@ -64,8 +62,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform,
         self.is_shutdown.load(Ordering::Acquire)
     }
 
-    /// Transition the endpoint to the shut-down state. Returns `true` on the first
-    /// transition so callers can gate one-shot side-effects (e.g. peer wake-ups).
+    /// Returns `true` on the call that effected the transition so callers can
+    /// gate one-shot side-effects (e.g. peer wake-ups); idempotent thereafter.
+    /// The boolean reports newness, not fallibility — the state is always shut
+    /// after this call.
     fn shutdown(&self) -> bool {
         !self.is_shutdown.swap(true, Ordering::Release)
     }

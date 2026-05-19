@@ -1,125 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#define _GNU_SOURCE
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/syscall.h>
-#include <sys/time.h>
-#include <unistd.h>
-
-static void die(const char *msg) {
-    perror(msg);
-    exit(1);
-}
-
-static void fail_errno(const char *op, int expected_errno) {
-    fprintf(stderr, "FAIL: %s expected errno=%d (%s), got errno=%d (%s)\n",
-            op, expected_errno, strerror(expected_errno), errno, strerror(errno));
-    exit(1);
-}
-
-static void expect_sys_shutdown(int fd, int how, const char *op) {
-    errno = 0;
-    if (syscall(SYS_shutdown, fd, how) != 0) {
-        die(op);
-    }
-}
-
-static void expect_send_errno(int fd, int expected_errno, const char *op) {
-    errno = 0;
-    ssize_t n = send(fd, "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL);
-    if (n != -1) {
-        fprintf(stderr, "FAIL: %s expected failure, got %zd\n", op, n);
-        exit(1);
-    }
-    if (errno != expected_errno) {
-        fail_errno(op, expected_errno);
-    }
-}
-
-// Blocking recv (no MSG_DONTWAIT) that we expect to time out via SO_RCVTIMEO. Distinct from
-// expect_recv_errno because we want to observe that the kernel kept blocking until the
-// timer expired, not that it gave up immediately with the same errno.
-static void expect_blocking_recv_eagain(int fd, const char *op) {
-    char buf[32];
-
-    errno = 0;
-    ssize_t n = recv(fd, buf, sizeof(buf), 0);
-    if (n != -1) {
-        fprintf(stderr, "FAIL: %s expected timeout failure, got %zd\n", op, n);
-        exit(1);
-    }
-    if (errno != EAGAIN) {
-        fail_errno(op, EAGAIN);
-    }
-}
-
-static void expect_recv_errno(int fd, int expected_errno, const char *op) {
-    char buf[32];
-
-    errno = 0;
-    ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-    if (n != -1) {
-        fprintf(stderr, "FAIL: %s expected failure, got %zd\n", op, n);
-        exit(1);
-    }
-    if (errno != expected_errno) {
-        fail_errno(op, expected_errno);
-    }
-}
-
-static void expect_recv_eof(int fd, const char *op) {
-    char buf[32];
-
-    errno = 0;
-    ssize_t n = recv(fd, buf, sizeof(buf), 0);
-    if (n < 0) {
-        die(op);
-    }
-    if (n != 0) {
-        fprintf(stderr, "FAIL: %s expected EOF, got %zd\n", op, n);
-        exit(1);
-    }
-}
-
-static void expect_recv_string(int fd, const char *expected, const char *op) {
-    char buf[64];
-    size_t expected_len = strlen(expected);
-
-    memset(buf, 0, sizeof(buf));
-    errno = 0;
-    ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-    if (n < 0) {
-        die(op);
-    }
-    if ((size_t)n != expected_len || memcmp(buf, expected, expected_len) != 0) {
-        fprintf(stderr, "FAIL: %s expected '%s' (%zu bytes), got '%.*s' (%zd bytes)\n",
-                op, expected, expected_len, (int)n, buf, n);
-        exit(1);
-    }
-}
+#include "helpers.h"
+#include <fcntl.h>
 
 static void make_dgram_pair(int sv[2]) {
-    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) {
-        die("socketpair(AF_UNIX, SOCK_DGRAM)");
-    }
-}
-
-static void set_recv_timeout(int fd) {
-    struct timeval timeout = { .tv_sec = 0, .tv_usec = 100000 };
-
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
-        die("setsockopt(SO_RCVTIMEO)");
-    }
-}
-
-static void close_pair(int sv[2]) {
-    close(sv[0]);
-    close(sv[1]);
+    make_socket_pair(SOCK_DGRAM, sv);
 }
 
 // SHUT_RD on a connected datagram socket: queued datagrams remain readable; once the queue
@@ -137,6 +23,13 @@ static void test_shutdown_read_keeps_queued_datagram(void) {
     }
 
     expect_sys_shutdown(sv[0], SHUT_RD, "shutdown(SHUT_RD)");
+
+    // Local SHUT_RD on a dgram fd reports IN|OUT|RDHUP but NOT HUP (HUP only when
+    // both sides are shut). Probed on host Linux.
+    expect_poll_has(sv[0], POLLIN | POLLOUT | POLLRDHUP,
+                    POLLIN | POLLOUT | POLLRDHUP, "poll(fd0) after SHUT_RD");
+    expect_poll_lacks(sv[0], POLLIN | POLLOUT | POLLRDHUP, POLLHUP,
+                      "poll(fd0) after SHUT_RD must not include HUP");
 
     expect_recv_string(sv[0], queued, "recv queued datagram after SHUT_RD");
     expect_send_errno(sv[1], EPIPE, "peer send after SHUT_RD");
@@ -168,6 +61,11 @@ static void test_shutdown_write_keeps_receive_side_open(void) {
 
     expect_sys_shutdown(sv[0], SHUT_WR, "shutdown(SHUT_WR)");
 
+    // Local SHUT_WR alone on a dgram fd reports only OUT — no HUP, no RDHUP.
+    // Probed on host Linux: HUP only fires when BOTH sides are shut.
+    expect_poll_lacks(sv[0], POLLIN | POLLOUT | POLLRDHUP, POLLHUP | POLLRDHUP,
+                      "poll(fd0) after SHUT_WR only must exclude HUP/RDHUP");
+
     expect_send_errno(sv[0], EPIPE, "local send after SHUT_WR");
     if (send(sv[1], inbound, strlen(inbound), MSG_NOSIGNAL) < 0) {
         die("peer send after SHUT_WR");
@@ -188,6 +86,19 @@ static void test_shutdown_both_combines_read_and_write_rules(void) {
     }
 
     expect_sys_shutdown(sv[0], SHUT_RDWR, "shutdown(SHUT_RDWR)");
+
+    // SHUT_RDWR on a dgram fd reports IN|OUT|HUP|RDHUP (HUP appears now that both
+    // sides are shut). Level-triggered: re-poll several times to confirm bits
+    // stay set without consuming the queued datagram.
+    for (int i = 0; i < 3; i++) {
+        expect_poll_has(sv[0], POLLIN | POLLOUT | POLLRDHUP,
+                        POLLIN | POLLOUT | POLLHUP | POLLRDHUP,
+                        "poll(fd0) after SHUT_RDWR (level-triggered repeat)");
+    }
+    // Peer (fd1) of a dgram socket sees no change when fd0 shuts down both sides —
+    // dgrams are connectionless. Probed on host Linux.
+    expect_poll_lacks(sv[1], POLLIN | POLLOUT | POLLRDHUP, POLLHUP | POLLRDHUP,
+                      "poll(fd1) peer of SHUT_RDWR dgram must exclude HUP/RDHUP");
 
     expect_send_errno(sv[0], EPIPE, "local send after SHUT_RDWR");
     expect_recv_string(sv[0], queued, "recv queued datagram after SHUT_RDWR");
@@ -237,6 +148,25 @@ static void test_shutdown_invalid_how_returns_einval(void) {
     close_pair(sv);
 }
 
+// Linux validates the fd before `how`, so a bad fd combined with a bad `how`
+// must surface EBADF / ENOTSOCK — not EINVAL. Probed on host Linux:
+//   shutdown(-1, 99)              -> EBADF
+//   shutdown(<closed_fd>, 99)     -> EBADF
+//   shutdown(<regular_file>, 99)  -> ENOTSOCK
+static void test_shutdown_fd_validated_before_how(void) {
+    expect_sys_shutdown_errno(-1, 99, EBADF, "shutdown(-1, 99) must be EBADF");
+    // Use a high-numbered fd that is unlikely to be opened by any test runner.
+    expect_sys_shutdown_errno(99999, 99, EBADF, "shutdown(<closed_fd>, 99) must be EBADF");
+
+    int regular = open("/dev/null", O_RDWR);
+    if (regular < 0) {
+        die("open(/dev/null)");
+    }
+    expect_sys_shutdown_errno(regular, 99, ENOTSOCK,
+                              "shutdown(<regular_file>, 99) must be ENOTSOCK");
+    close(regular);
+}
+
 int main(void) {
     printf("== unix datagram shutdown syscall tests ==\n");
 
@@ -246,6 +176,7 @@ int main(void) {
     test_shutdown_both_combines_read_and_write_rules();
     test_peer_shutdown_write_drains_then_blocks();
     test_shutdown_invalid_how_returns_einval();
+    test_shutdown_fd_validated_before_how();
 
     printf("All unix datagram shutdown tests passed.\n");
     return 0;

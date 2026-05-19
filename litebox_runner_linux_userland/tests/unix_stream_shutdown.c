@@ -1,110 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#define _GNU_SOURCE
-#include <errno.h>
+#include "helpers.h"
 #include <fcntl.h>
-#include <poll.h>
 #include <pthread.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/syscall.h>
-#include <sys/time.h>
 #include <sys/un.h>
-#include <unistd.h>
-
-static void die(const char *msg) {
-    perror(msg);
-    exit(1);
-}
-
-static void fail_errno(const char *op, int expected_errno) {
-    fprintf(stderr, "FAIL: %s expected errno=%d (%s), got errno=%d (%s)\n",
-            op, expected_errno, strerror(expected_errno), errno, strerror(errno));
-    exit(1);
-}
-
-static void expect_sys_shutdown(int fd, int how, const char *op) {
-    errno = 0;
-    if (syscall(SYS_shutdown, fd, how) != 0) {
-        die(op);
-    }
-}
-
-static void expect_sys_shutdown_errno(int fd, int how, int expected_errno, const char *op) {
-    errno = 0;
-    long ret = syscall(SYS_shutdown, fd, how);
-    if (ret != -1) {
-        fprintf(stderr, "FAIL: %s expected failure, got %ld\n", op, ret);
-        exit(1);
-    }
-    if (errno != expected_errno) {
-        fail_errno(op, expected_errno);
-    }
-}
-
-static void expect_send_errno(int fd, int expected_errno, const char *op) {
-    errno = 0;
-    ssize_t n = send(fd, "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL);
-    if (n != -1) {
-        fprintf(stderr, "FAIL: %s expected failure, got %zd\n", op, n);
-        exit(1);
-    }
-    if (errno != expected_errno) {
-        fail_errno(op, expected_errno);
-    }
-}
-
-static void expect_recv_eof(int fd, const char *op) {
-    char buf[32];
-
-    errno = 0;
-    ssize_t n = recv(fd, buf, sizeof(buf), 0);
-    if (n < 0) {
-        die(op);
-    }
-    if (n != 0) {
-        fprintf(stderr, "FAIL: %s expected EOF, got %zd\n", op, n);
-        exit(1);
-    }
-}
-
-static void expect_recv_string(int fd, const char *expected, const char *op) {
-    char buf[64];
-    size_t expected_len = strlen(expected);
-
-    memset(buf, 0, sizeof(buf));
-    errno = 0;
-    ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-    if (n < 0) {
-        die(op);
-    }
-    if ((size_t)n != expected_len || memcmp(buf, expected, expected_len) != 0) {
-        fprintf(stderr, "FAIL: %s expected '%s' (%zu bytes), got '%.*s' (%zd bytes)\n",
-                op, expected, expected_len, (int)n, buf, n);
-        exit(1);
-    }
-}
 
 static void make_stream_pair(int sv[2]) {
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-        die("socketpair(AF_UNIX, SOCK_STREAM)");
-    }
-}
-
-static void set_recv_timeout(int fd) {
-    struct timeval timeout = { .tv_sec = 0, .tv_usec = 100000 };
-
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
-        die("setsockopt(SO_RCVTIMEO)");
-    }
-}
-
-static void close_pair(int sv[2]) {
-    close(sv[0]);
-    close(sv[1]);
+    make_socket_pair(SOCK_STREAM, sv);
 }
 
 static void test_shutdown_read_drains_then_returns_eof(void) {

@@ -1804,20 +1804,22 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-        let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
         self.do_shutdown(sockfd, how)
     }
-    fn do_shutdown(&self, sockfd: u32, how: ShutdownHow) -> Result<(), Errno> {
+    fn do_shutdown(&self, sockfd: u32, how: i32) -> Result<(), Errno> {
+        // Linux validates the fd (EBADF, ENOTSOCK) before `how` (EINVAL),
+        // so resolve the socket through `with_socket` first and validate `how`
+        // only inside the matching branch.
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |_fd| {
-                // Half-close on inet sockets needs a hook through the smoltcp-backed
-                // Network that does not exist yet.
+                ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
                 log_unsupported!("shutdown on inet socket");
                 Err(Errno::EOPNOTSUPP)
             },
             |file| {
+                let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
                 file.shutdown(how);
                 Ok(())
             },
