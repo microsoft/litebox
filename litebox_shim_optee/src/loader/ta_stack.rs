@@ -125,11 +125,12 @@ impl TaStack {
     }
 
     /// Zero the unused stack region before a new session writes its parameters,
-    /// to avoid leaking leftover data from a prior session whose pages were recycled.
+    /// to avoid leaking leftover data from a prior session whose stack region was recycled.
     /// The trailing `UteeParams` slot is left untouched here because
     /// `set_utee_params` overwrites it in full.
     fn scrub(&mut self) -> Option<()> {
-        const ZERO_CHUNK: [u8; 4096] = [0; 4096];
+        use litebox::mm::linux::PAGE_SIZE;
+        const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 
         for offset in (0..self.pos).step_by(ZERO_CHUNK.len()) {
             let len = ZERO_CHUNK.len().min(self.pos - offset);
