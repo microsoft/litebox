@@ -67,8 +67,16 @@ pub enum SubscriptionRegistry {
 
 /// Per-connection mutable state. Currently carries the optional
 /// notification-ring sender registered via RegisterNotificationRing.
+///
+/// The [`Default`] implementation is intended for synthetic/test-only
+/// connections; in that case `conn_id == 0` means "no real connection".
 #[derive(Default)]
 pub struct ConnState {
+    /// Monotone per-process counter assigned at connection accept time.
+    /// Globally unique within this broker process; 1:1 with
+    /// FdTokenClient::connect. Used as the second half of `(pgid, conn_id)`
+    /// composite keys for pgrp-signal subscription tracking — see
+    /// files/pty-signal-delivery-rpc-design.md §2.
     pub conn_id: u64,
     notification_sender: Option<Arc<Mutex<NotificationSender>>>,
     /// PE.9 fix: per-conn subscription bookkeeping. Each entry records
