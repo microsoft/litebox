@@ -1348,10 +1348,7 @@ impl<FS: ShimFS> Task<FS> {
                     let action = inner[sig].action.sigaction;
                     let ignored = action == SIG_IGN
                         || (action == SIG_DFL
-                            && matches!(
-                                sig.default_disposition(),
-                                SignalDisposition::Ignore
-                            ));
+                            && matches!(sig.default_disposition(), SignalDisposition::Ignore));
                     if !ignored {
                         return false;
                     }
@@ -1374,10 +1371,7 @@ impl<FS: ShimFS> Task<FS> {
                 let action = inner[sig].action.sigaction;
                 let is_ignored = action == SIG_IGN
                     || (action == SIG_DFL
-                        && matches!(
-                            sig.default_disposition(),
-                            SignalDisposition::Ignore
-                        ));
+                        && matches!(sig.default_disposition(), SignalDisposition::Ignore));
                 if is_ignored {
                     ignored_set.add(sig);
                 }

@@ -2872,9 +2872,8 @@ impl<FS: ShimFS> Task<FS> {
         // header on every broker RPC issued by this syscall, so the
         // broker's per-(pid, id) tracker correctly attributes refs to
         // the calling process.
-        let _caller_pid_guard = litebox_common_linux::fd_token_client::set_caller_pid_scope(
-            self.pid as u32,
-        );
+        let _caller_pid_guard =
+            litebox_common_linux::fd_token_client::set_caller_pid_scope(self.pid as u32);
         let return_value = match self.do_syscall(ctx) {
             Ok(v) => {
                 #[cfg(feature = "trace_syscalls")]

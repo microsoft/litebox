@@ -404,7 +404,10 @@ impl<FS: ShimFS> EpollFile<FS> {
                             self.ready.pop_multiple(global, fs, maxevents, &mut events);
                             if !events.is_empty() {
                                 self.collect_additional_socket_events(
-                                    global, fs, maxevents, &mut events,
+                                    global,
+                                    fs,
+                                    maxevents,
+                                    &mut events,
                                 );
                                 return Ok(events);
                             }
@@ -437,7 +440,10 @@ impl<FS: ShimFS> EpollFile<FS> {
                         self.ready.pop_multiple(global, fs, maxevents, &mut events);
                         if !events.is_empty() {
                             self.collect_additional_socket_events(
-                                global, fs, maxevents, &mut events,
+                                global,
+                                fs,
+                                maxevents,
+                                &mut events,
                             );
                             return Ok(events);
                         }
