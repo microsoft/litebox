@@ -11,7 +11,9 @@
 use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_request};
 use crate::fd_tokens::BrokerFdTokenRegistry;
 use crate::state_registry::{BrokerStateRegistry, StateHandle};
-use crate::state_service::{ConnState, handle_request as state_handle_request};
+use crate::state_service::{
+    ConnState, SubscriptionRegistry, handle_request as state_handle_request,
+};
 use litebox_common_linux::fd_token_protocol::{
     BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, StatusCode, build_error_response,
     decode, parse_create_pidfd_response_ok, parse_create_pty_response_ok, parse_handle_body,
@@ -700,18 +702,17 @@ pub fn handle_control_connection(
     // gap documented in the PE.9 fix commit). Doing the unsubscribe
     // pass first ensures the SubscriptionList is empty before the
     // state's refcount can hit zero from our release.
-    for (handle_id, subscription_id) in conn_state.drain_tracked_subscriptions() {
-        // Subscription handle could live in either registry. Try
-        // state first, then process. Best-effort: failures (e.g.
-        // state already Dropped) are silently ignored — the
-        // subscription is gone either way.
+    for (registry_kind, handle_id, subscription_id) in conn_state.drain_tracked_subscriptions() {
         let handle = StateHandle::from_id(handle_id);
-        let state_obj = state_registry
-            .resolve_untyped(handle)
-            .ok()
-            .or_else(|| process_registry.resolve_untyped(handle).ok());
-        if let Some(obj) = state_obj {
+        let registry = match registry_kind {
+            SubscriptionRegistry::State => state_registry.as_ref(),
+            SubscriptionRegistry::Process => process_registry.as_ref(),
+        };
+        if let Ok(obj) = registry.resolve_untyped(handle) {
             let _ = obj.unsubscribe(subscription_id);
+            if registry_kind == SubscriptionRegistry::Process {
+                let _ = registry.release(handle);
+            }
         }
     }
     // Force-release any broker-registry refs this connection contributed
@@ -976,18 +977,29 @@ fn handle_control_connection_inner(
                         // Unsubscribe is kind-agnostic: try fd-state first, then process-state.
                         let state_result =
                             state_handle_request(state_registry, conn_state, &frame, in_fds);
-                        if state_result.frame.status
-                            == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
-                        {
+                        if matches!(
+                            state_result.frame.status,
+                            litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
+                                | litebox_common_linux::fd_token_protocol::StatusCode::UnknownSubscription
+                        ) {
                             let proc_result = state_handle_request(
                                 process_registry,
                                 conn_state,
                                 &frame,
                                 Vec::new(),
                             );
-                            SocketHandlerResult {
-                                frame: proc_result.frame,
-                                out_fd: proc_result.out_fd,
+                            if proc_result.frame.status
+                                != litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
+                            {
+                                SocketHandlerResult {
+                                    frame: proc_result.frame,
+                                    out_fd: proc_result.out_fd,
+                                }
+                            } else {
+                                SocketHandlerResult {
+                                    frame: state_result.frame,
+                                    out_fd: state_result.out_fd,
+                                }
                             }
                         } else {
                             SocketHandlerResult {
