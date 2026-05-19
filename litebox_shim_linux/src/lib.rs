@@ -2995,8 +2995,10 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::chdir | Sysno::fchdir
                 // Process group.
                 | Sysno::setpgid | Sysno::setsid
-                // Signal setup.
+                // Signal/thread-runtime setup. Static musl refreshes the child
+                // clear-TID pointer immediately after fork before user code.
                 | Sysno::rt_sigaction | Sysno::rt_sigprocmask | Sysno::sigaltstack
+                | Sysno::set_tid_address
                 // Identity.
                 | Sysno::setuid | Sysno::setgid | Sysno::setgroups
                 | Sysno::setreuid | Sysno::setregid

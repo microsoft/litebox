@@ -21,6 +21,9 @@
 
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
 use crate::eventfd_state::{EventfdError, EventfdState};
+use crate::pgrp_signal_inbox::{
+    PgrpSignalInbox, SubscribeError as PgrpSubscribeError, UnsubscribeError as PgrpUnsubscribeError,
+};
 use crate::pipe_state::{PipeError, PipeReadEnd, PipeWriteEnd};
 use crate::process_state::ProcessState;
 use crate::pty_state::{PtyError, PtyState};
@@ -39,13 +42,15 @@ use litebox_common_linux::fd_token_protocol::{
     build_register_notification_ring_response_ok, build_register_process_response_ok,
     build_release_response_ok, build_subscribe_eventfd_response_ok,
     build_subscribe_process_exit_response_ok, build_subscribe_pty_response_ok,
-    build_unsubscribe_response_ok, build_write_eventfd_response_ok, build_write_pipe_response_ok,
-    build_write_socketpair_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
-    parse_create_pipe_body, parse_create_signalfd_body, parse_create_socketpair_body,
-    parse_handle_body, parse_mark_process_exited_body, parse_pidfd_exited_request,
-    parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body,
-    parse_read_pipe_body, parse_read_socketpair_body, parse_subscribe_eventfd_body,
-    parse_subscribe_process_exit_body, parse_subscribe_pty_body, parse_unsubscribe_body,
+    build_subscribe_signal_inbox_response_ok, build_unsubscribe_response_ok,
+    build_unsubscribe_signal_inbox_response_ok, build_write_eventfd_response_ok,
+    build_write_pipe_response_ok, build_write_socketpair_response_ok, parse_create_eventfd_body,
+    parse_create_pidfd_body, parse_create_pipe_body, parse_create_signalfd_body,
+    parse_create_socketpair_body, parse_handle_body, parse_mark_process_exited_body,
+    parse_pidfd_exited_request, parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body,
+    parse_push_siginfo_body, parse_read_pipe_body, parse_read_socketpair_body,
+    parse_subscribe_eventfd_body, parse_subscribe_process_exit_body, parse_subscribe_pty_body,
+    parse_subscribe_signal_inbox_body, parse_unsubscribe_body, parse_unsubscribe_signal_inbox_body,
     parse_write_eventfd_body, parse_write_pipe_body, parse_write_socketpair_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
@@ -62,8 +67,17 @@ pub enum SubscriptionRegistry {
 
 /// Per-connection mutable state. Currently carries the optional
 /// notification-ring sender registered via RegisterNotificationRing.
+///
+/// The [`Default`] implementation is intended for synthetic/test-only
+/// connections; in that case `conn_id == 0` means "no real connection".
 #[derive(Default)]
 pub struct ConnState {
+    /// Monotone per-process counter assigned at connection accept time.
+    /// Globally unique within this broker process; 1:1 with
+    /// FdTokenClient::connect. Used as the second half of `(pgid, conn_id)`
+    /// composite keys for pgrp-signal subscription tracking — see
+    /// files/pty-signal-delivery-rpc-design.md §2.
+    pub conn_id: u64,
     notification_sender: Option<Arc<Mutex<NotificationSender>>>,
     /// PE.9 fix: per-conn subscription bookkeeping. Each entry records
     /// a (registry, handle_id, subscription_id) tuple this conn issued
@@ -78,6 +92,17 @@ pub struct ConnState {
 impl ConnState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_conn_id(conn_id: u64) -> Self {
+        Self {
+            conn_id,
+            ..Self::default()
+        }
+    }
+
+    pub fn notification_sender(&self) -> Option<Arc<Mutex<NotificationSender>>> {
+        self.notification_sender.as_ref().cloned()
     }
 
     /// Record a Subscribe* success. Called from each subscribe
@@ -211,6 +236,73 @@ fn handle_register_notification_ring(
     HandlerResult {
         frame: build_register_notification_ring_response_ok(),
         out_fd: None,
+    }
+}
+
+pub fn handle_subscribe_signal_inbox(
+    inbox: &PgrpSignalInbox,
+    conn: &mut ConnState,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SubscribeSignalInboxResponse);
+    }
+    let (pgid, signal_mask, subscription_id, events_mask) =
+        match parse_subscribe_signal_inbox_body(request.body) {
+            Ok(v) => v,
+            Err(_) => return protocol_err(Opcode::SubscribeSignalInboxResponse),
+        };
+    let Some(sender) = conn.notification_sender() else {
+        return status_err(
+            Opcode::SubscribeSignalInboxResponse,
+            StatusCode::NoNotificationRing,
+        );
+    };
+    match inbox.subscribe(
+        pgid,
+        conn.conn_id,
+        subscription_id,
+        signal_mask,
+        events_mask,
+        sender,
+    ) {
+        Ok(()) => HandlerResult {
+            frame: build_subscribe_signal_inbox_response_ok(),
+            out_fd: None,
+        },
+        Err(PgrpSubscribeError::DuplicateConnection { .. }) => status_err(
+            Opcode::SubscribeSignalInboxResponse,
+            StatusCode::DuplicateSubscription,
+        ),
+        Err(PgrpSubscribeError::UnknownEventBits { .. }) => {
+            protocol_err(Opcode::SubscribeSignalInboxResponse)
+        }
+    }
+}
+
+pub fn handle_unsubscribe_signal_inbox(
+    inbox: &PgrpSignalInbox,
+    conn: &mut ConnState,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::UnsubscribeSignalInboxResponse);
+    }
+    let (pgid, _subscription_id) = match parse_unsubscribe_signal_inbox_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::UnsubscribeSignalInboxResponse),
+    };
+    match inbox.unsubscribe(pgid, conn.conn_id) {
+        Ok(()) => HandlerResult {
+            frame: build_unsubscribe_signal_inbox_response_ok(),
+            out_fd: None,
+        },
+        Err(PgrpUnsubscribeError::UnknownConnection { .. }) => status_err(
+            Opcode::UnsubscribeSignalInboxResponse,
+            StatusCode::UnknownSubscription,
+        ),
     }
 }
 

@@ -10,9 +10,11 @@
 
 use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_request};
 use crate::fd_tokens::BrokerFdTokenRegistry;
+use crate::pgrp_signal_inbox::PgrpSignalInbox;
 use crate::state_registry::{BrokerStateRegistry, StateHandle};
 use crate::state_service::{
     ConnState, SubscriptionRegistry, handle_request as state_handle_request,
+    handle_subscribe_signal_inbox, handle_unsubscribe_signal_inbox,
 };
 use litebox_common_linux::fd_token_protocol::{
     BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, StatusCode, build_error_response,
@@ -722,6 +724,7 @@ pub fn handle_control_connection(
     fd_registry: Arc<BrokerFdTokenRegistry>,
     state_registry: Arc<BrokerStateRegistry>,
     process_registry: Arc<BrokerStateRegistry>,
+    pgrp_signal_inbox: Arc<PgrpSignalInbox>,
 ) {
     // PE.12 diag: assign a per-conn id so we can correlate frames
     // across the broker log. Counter is process-global, monotonic.
@@ -742,7 +745,7 @@ pub fn handle_control_connection(
             );
         }
     }
-    let mut conn_state = ConnState::new();
+    let mut conn_state = ConnState::with_conn_id(conn_id);
     let mut tracker = ConnRefTracker::new();
     tracker.conn_id = conn_id;
     tracker.peer_cred = peer_cred;
@@ -752,6 +755,7 @@ pub fn handle_control_connection(
             &fd_registry,
             &state_registry,
             &process_registry,
+            &pgrp_signal_inbox,
             &mut conn_state,
             &mut tracker,
         )
@@ -793,6 +797,7 @@ pub fn handle_control_connection(
     // gap documented in the PE.9 fix commit). Doing the unsubscribe
     // pass first ensures the SubscriptionList is empty before the
     // state's refcount can hit zero from our release.
+    pgrp_signal_inbox.cleanup_connection(conn_id);
     for (registry_kind, handle_id, subscription_id) in conn_state.drain_tracked_subscriptions() {
         let handle = StateHandle::from_id(handle_id);
         let registry = match registry_kind {
@@ -831,6 +836,7 @@ fn handle_control_connection_inner(
     fd_registry: &Arc<BrokerFdTokenRegistry>,
     state_registry: &Arc<BrokerStateRegistry>,
     process_registry: &Arc<BrokerStateRegistry>,
+    pgrp_signal_inbox: &Arc<PgrpSignalInbox>,
     conn_state: &mut ConnState,
     tracker: &mut ConnRefTracker,
 ) {
@@ -1075,6 +1081,30 @@ fn handle_control_connection_inner(
                             }
                         }
                     }
+                    Opcode::SubscribeSignalInbox => {
+                        let result = handle_subscribe_signal_inbox(
+                            pgrp_signal_inbox,
+                            conn_state,
+                            &frame,
+                            in_fds,
+                        );
+                        SocketHandlerResult {
+                            frame: result.frame,
+                            out_fd: result.out_fd,
+                        }
+                    }
+                    Opcode::UnsubscribeSignalInbox => {
+                        let result = handle_unsubscribe_signal_inbox(
+                            pgrp_signal_inbox,
+                            conn_state,
+                            &frame,
+                            in_fds,
+                        );
+                        SocketHandlerResult {
+                            frame: result.frame,
+                            out_fd: result.out_fd,
+                        }
+                    }
                     Opcode::Unsubscribe => {
                         // Unsubscribe is kind-agnostic: try fd-state first, then process-state.
                         let state_result =
@@ -1293,6 +1323,7 @@ pub fn spawn_control_listener(
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     info!(path = %path.display(), "fd-token control listener bound");
+    let pgrp_signal_inbox = Arc::new(PgrpSignalInbox::new());
     let path_owned = path.to_owned();
     thread::Builder::new()
         .name("fd-token-listener".into())
@@ -1303,6 +1334,7 @@ pub fn spawn_control_listener(
                         let fd_registry = Arc::clone(&fd_registry);
                         let state_registry = Arc::clone(&state_registry);
                         let process_registry = Arc::clone(&process_registry);
+                        let pgrp_signal_inbox = Arc::clone(&pgrp_signal_inbox);
                         if let Err(e) =
                             thread::Builder::new()
                                 .name("fd-token-conn".into())
@@ -1312,6 +1344,7 @@ pub fn spawn_control_listener(
                                         fd_registry,
                                         state_registry,
                                         process_registry,
+                                        pgrp_signal_inbox,
                                     )
                                 })
                         {
