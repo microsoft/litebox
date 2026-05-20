@@ -13,7 +13,7 @@ use litebox::{
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{
-    broker_pty_provider::{BrokerOpError, BrokerPtyProvider},
+    broker_pty_provider::{BrokerOpError, BrokerPtyProvider, BrokerPtyRole},
     cwfd::notification_frame::{
         NOTIFY_EVENT_ERR, NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
     },
@@ -86,6 +86,14 @@ where
         self.is_master
     }
 
+    pub(crate) fn role(&self) -> BrokerPtyRole {
+        if self.is_master {
+            BrokerPtyRole::Master
+        } else {
+            BrokerPtyRole::Slave
+        }
+    }
+
     pub(crate) fn get_status(&self) -> OFlags {
         OFlags::from_bits_truncate(self.status.load(Ordering::Relaxed)) & OFlags::STATUS_FLAGS_MASK
     }
@@ -100,6 +108,53 @@ where
 
     pub(crate) fn fork_snapshot_handle(&self) -> (BrokerHandleKind, u64) {
         (BrokerHandleKind::Pty, self.handle())
+    }
+}
+
+pub(crate) trait BrokerPtyProviderReacquireExt {
+    fn reacquire(
+        &self,
+        handle_id: u64,
+        role: BrokerPtyRole,
+    ) -> Result<BrokerPtyFd<Platform>, BrokerOpError>;
+}
+
+impl BrokerPtyProviderReacquireExt for Arc<dyn BrokerPtyProvider> {
+    fn reacquire(
+        &self,
+        handle_id: u64,
+        role: BrokerPtyRole,
+    ) -> Result<BrokerPtyFd<Platform>, BrokerOpError> {
+        self.dup_handle(handle_id)?;
+        let pty_id_payload = match self.ioctl_pty(handle_id, PtyIoctlOp::Tiocgptn, &[]) {
+            Ok(payload) => payload,
+            Err(err) => {
+                self.release(handle_id);
+                return Err(err);
+            }
+        };
+        let Some(pty_id_bytes) = pty_id_payload.get(..4) else {
+            self.release(handle_id);
+            return Err(BrokerOpError::InvalidValue);
+        };
+        let pty_id = u32::from_le_bytes(pty_id_bytes.try_into().map_err(|_| {
+            self.release(handle_id);
+            BrokerOpError::InvalidValue
+        })?);
+        let is_master = role == BrokerPtyRole::Master;
+        let slave_anchor_handle = if is_master {
+            self.open_pty_slave(pty_id).ok()
+        } else {
+            None
+        };
+        Ok(BrokerPtyFd::<Platform>::new(
+            Arc::clone(self),
+            handle_id,
+            pty_id,
+            is_master,
+            slave_anchor_handle,
+            OFlags::empty(),
+        ))
     }
 }
 
