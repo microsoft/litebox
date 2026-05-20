@@ -92,11 +92,27 @@ fn ensure_timing_log_file(path: &Path) {
         .unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
 }
 
-fn read_timing_log(path: &Path, markers: &mut TimingMarkers, pass: &str) {
+fn read_timing_log(
+    path: &Path,
+    markers: &mut TimingMarkers,
+    runtime_rewrites: &mut Vec<String>,
+    pass: &str,
+) {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return;
     };
     for raw in contents.lines() {
+        // Broker emits one of these per runtime ELF rewrite (cache
+        // miss in both memory and disk caches). We assert this list
+        // is empty for litebox pass — setup() pre-populates the
+        // disk cache for the 5 harness variants and the broker's
+        // own `pre_warm_elf_cache` covers the shared libraries.
+        if let Some(p) = raw.strip_prefix("broker_runtime_rewrite:") {
+            // Drop the trailing `=<ns>` value if present.
+            let path_only = p.split('=').next().unwrap_or(p);
+            runtime_rewrites.push(path_only.to_string());
+            continue;
+        }
         // The on-disk format is `name=ns\n` (no `[TIMING] ` prefix —
         // that prefix was only for the stderr channel). Prepend it so
         // `record_timing_marker` can reuse the existing parser.
@@ -668,41 +684,13 @@ fn build_docker_cmd(
             "{}:/opt/non-pie-static-musl:ro",
             bins.non_pie_static_musl.display()
         ));
-    // For litebox pass, override the mount with the pre-rewritten copy
-    // of `litebox_test_harness` so the broker's `LITEBOX0` magic-trailer
-    // fast path fires (no runtime ELF syscall rewriting). Native pass
-    // gets the original — pre-rewritten binaries would crash without
-    // the shim to handle the trampolines.
-    if pass == "litebox" {
-        // Each binary variant has its own /opt/<variant>/ mount; override
-        // the litebox_test_harness file inside each with its prewritten
-        // copy. Docker layers single-file binds on top of the directory.
-        for (mount_target, prewritten) in [
-            (
-                "/opt/litebox/litebox_test_harness",
-                &bins.pie_glibc_prewritten,
-            ),
-            (
-                "/opt/nonpie/litebox_test_harness",
-                &bins.nonpie_glibc_prewritten,
-            ),
-            (
-                "/opt/static-pie-glibc/litebox_test_harness",
-                &bins.static_pie_glibc_prewritten,
-            ),
-            (
-                "/opt/static-pie-musl/litebox_test_harness",
-                &bins.static_pie_musl_prewritten,
-            ),
-            (
-                "/opt/non-pie-static-musl/litebox_test_harness",
-                &bins.non_pie_static_musl_prewritten,
-            ),
-        ] {
-            cmd.arg("-v")
-                .arg(format!("{}:{mount_target}:ro", prewritten.display()));
-        }
-    }
+    // For litebox pass, no additional mounts are needed for the
+    // harness binaries — pre-rewriting is amortised in the broker's
+    // persistent ELF cache (LITEBOX_BROKER_ELF_CACHE_DIR) which
+    // setup() pre-populates from rewrites of all 5 variants. The
+    // broker hits the disk cache on first 9P read and never invokes
+    // the rewriter at runtime. Native pass gets the original
+    // (unmodified) binaries via the directory bind mounts above.
     cmd.arg("-v")
         // Bind-mount the host test-logs/ directory into the container so
         // all in-container processes (tool_executor, broker, runner, the
@@ -909,6 +897,7 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     // first-wins so the stderr arrival_ns proxy overrides the
     // file's virtual-clock value when both are present.
     let mut markers = TimingMarkers::default();
+    let mut runtime_rewrites: Vec<String> = Vec::new();
     {
         let stderr_snapshot = *timing_markers.lock().expect("timing markers lock poisoned");
         if let Some(ns) = stderr_snapshot.harness_first_output_ns {
@@ -921,7 +910,7 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
             markers.litebox_shim_ready_ns = Some(ns);
         }
     }
-    read_timing_log(&timing_log, &mut markers, pass);
+    read_timing_log(&timing_log, &mut markers, &mut runtime_rewrites, pass);
     let shim_ready_ns = markers
         .litebox_shim_ready_ns
         .or(markers.container_pid1_started_ns);
@@ -943,6 +932,33 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         .harness_first_output_ns
         .and_then(|ns| ns_delta_ms(ns, t_json_ns))
         .unwrap_or_else(|| t_json.duration_since(t_first_byte).as_millis());
+    // Runtime-rewrite assertion: every binary the test loaded should
+    // have been pre-populated in the broker ELF cache (harness
+    // variants from setup(), shared libraries from
+    // pre_warm_elf_cache). A non-empty list means some binary was
+    // rewritten in-band, which costs ~hundreds of ms per file —
+    // worth surfacing as a perf bug to investigate, not silently
+    // tolerating. Override with `LITEBOX_ALLOW_RUNTIME_REWRITES=1`
+    // for one-off debugging.
+    let allow_runtime_rewrites = std::env::var_os("LITEBOX_ALLOW_RUNTIME_REWRITES").is_some();
+    if pass == "litebox" && !runtime_rewrites.is_empty() && !allow_runtime_rewrites {
+        let mut unique: Vec<String> = runtime_rewrites.clone();
+        unique.sort();
+        unique.dedup();
+        let detail = format!(
+            "unexpected runtime ELF rewrites ({} unique path(s)): {}; \
+             pre-populate via setup() / pre_warm_elf_cache, or set \
+             LITEBOX_ALLOW_RUNTIME_REWRITES=1 to bypass",
+            unique.len(),
+            unique.join(", "),
+        );
+        found = Some(serde_json::json!({
+            "test": test_id,
+            "result": "FAIL",
+            "detail": detail,
+        }));
+    }
+
     let verdict: &'static str = match &found {
         Some(v) => match v.get("result").and_then(|r| r.as_str()) {
             Some("pass") => "pass",
@@ -1290,14 +1306,15 @@ fn non_pie_static_musl_dir() -> PathBuf {
 /// [`litebox_test_harness::BinaryType`] and is bind-mounted into the
 /// Docker container at the conventional `/opt/<label>` path.
 ///
-/// Track 1 amortisation: each variant's `litebox_test_harness` binary
-/// is also pre-rewritten by `litebox_syscall_rewriter` into a sibling
-/// cache file (mtime-validated). For litebox pass, the prewritten
-/// copy is bind-mounted over the original path inside the container
-/// so the broker's `LITEBOX0` magic-trailer fast path fires (no
-/// runtime ELF syscall rewriting). Native pass uses the original
-/// binary; pre-rewritten binaries would crash without the shim to
-/// handle the trampolines.
+/// Track 1+2 amortisation (unified): the syscall-rewriter is invoked
+/// once per variant in `setup()` and the resulting bytes are written
+/// directly into the broker's persistent ELF cache directory
+/// (`LITEBOX_BROKER_ELF_CACHE_DIR`, see [`broker_elf_cache_dir`]).
+/// On the first 9P read of each `litebox_test_harness` variant the
+/// broker hits the disk cache, populates its in-memory cache, and
+/// never invokes the rewriter at runtime. Same mechanism the broker
+/// uses for its own `pre_warm_elf_cache` of shared libraries —
+/// see `litebox_broker::nine_p::server::disk_cache_key`.
 #[derive(Debug, Clone)]
 struct BinaryPaths {
     pie_glibc: PathBuf,
@@ -1305,14 +1322,6 @@ struct BinaryPaths {
     static_pie_glibc: PathBuf,
     static_pie_musl: PathBuf,
     non_pie_static_musl: PathBuf,
-    // Pre-rewritten copies of the `litebox_test_harness` binary for
-    // each variant. Same filename so the mount target inside the
-    // container is the same. Used for litebox pass only.
-    pie_glibc_prewritten: PathBuf,
-    nonpie_glibc_prewritten: PathBuf,
-    static_pie_glibc_prewritten: PathBuf,
-    static_pie_musl_prewritten: PathBuf,
-    non_pie_static_musl_prewritten: PathBuf,
 }
 
 /// Find `litebox_syscall_rewriter` in the workspace's target dir.
@@ -1320,28 +1329,50 @@ fn rewriter_path() -> PathBuf {
     debug_dir().join("litebox_syscall_rewriter")
 }
 
-/// Ensure a syscall-rewritten copy of `binary` exists at `out`.
+/// Sanitise an absolute path into a filesystem-safe filename
+/// component, matching `litebox_broker::nine_p::server::disk_cache_key`
+/// (sans the mtime suffix it appends). Keep in sync — divergence
+/// would cause cache misses where hits are expected.
+fn broker_cache_path_component(p: &Path) -> String {
+    let mut out = String::new();
+    for c in p.as_os_str().to_string_lossy().chars() {
+        match c {
+            '/' => out.push('_'),
+            c if c.is_ascii_alphanumeric() || c == '-' || c == '.' => out.push(c),
+            _ => out.push('-'),
+        }
+    }
+    out
+}
+
+/// Rewrite `binary` and write the result directly into the broker's
+/// persistent ELF cache, keyed by the **in-container** path the
+/// broker will resolve when the runner asks for it
+/// (`in_container_path`) plus the host file's mtime (which equals
+/// the in-container mtime since the file is bind-mounted).
 ///
-/// Uses an mtime-based cache: if `out` exists with `mtime ==
-/// binary.mtime`, it's reused. Otherwise we invoke
-/// `litebox_syscall_rewriter` to produce a fresh copy and set the
-/// output's mtime to match the source. Concurrent writers are
-/// disambiguated with a temp file + atomic rename.
-fn ensure_rewritten(binary: &Path, out: &Path) {
-    let src_mtime = std::fs::metadata(binary)
-        .unwrap_or_else(|e| panic!("stat {}: {e}", binary.display()))
+/// Idempotent + mtime-validated: if the destination cache file
+/// already exists (concurrent setup() in another worktree, or a
+/// previous run with the same mtime), do nothing.
+fn ensure_rewritten_in_broker_cache(binary: &Path, in_container_path: &Path) {
+    let src_meta =
+        std::fs::metadata(binary).unwrap_or_else(|e| panic!("stat {}: {e}", binary.display()));
+    let mtime = src_meta
         .modified()
-        .unwrap();
-    if let Ok(meta) = std::fs::metadata(out)
-        && let Ok(out_mtime) = meta.modified()
-        && out_mtime == src_mtime
-    {
+        .unwrap()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = format!(
+        "{}.{mtime}.elf",
+        broker_cache_path_component(in_container_path),
+    );
+    let dir = broker_elf_cache_dir();
+    let cache_path = dir.join(&key);
+    if cache_path.exists() {
         return;
     }
-    if let Some(parent) = out.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = out.with_extension("tmp");
+    let tmp = dir.join(format!("{key}.tmp.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let rewriter = rewriter_path();
     let status = Command::new(&rewriter)
@@ -1357,29 +1388,14 @@ fn ensure_rewritten(binary: &Path, out: &Path) {
         binary.display(),
         tmp.display()
     );
-    // Stamp the output's mtime to match the source so the cache
-    // check above is sound. Using utimensat via filetime would be
-    // cleaner; touch via std on Unix uses the file_set_times API.
-    let src_meta = std::fs::metadata(binary).unwrap();
-    let times = std::fs::FileTimes::new()
-        .set_accessed(src_meta.accessed().unwrap_or(src_mtime))
-        .set_modified(src_mtime);
-    let f = std::fs::OpenOptions::new().write(true).open(&tmp).unwrap();
-    f.set_times(times).unwrap();
-    drop(f);
-    // Atomic rename — concurrent tests racing on the same cache file
-    // either see the old (mtime-valid) version or our new one. No
-    // partial writes are observable.
-    std::fs::rename(&tmp, out)
-        .unwrap_or_else(|e| panic!("rename {} -> {}: {e}", tmp.display(), out.display()));
-}
-
-/// Sibling cache file: a pre-rewritten copy of `litebox_test_harness`
-/// at the same filename inside a `.prewrite/` subdir of the variant's
-/// build directory. Same filename so the in-container mount target
-/// is the same as the original.
-fn prewritten_path(variant_dir: &Path) -> PathBuf {
-    variant_dir.join(".prewrite").join("litebox_test_harness")
+    // Atomic rename. If a concurrent writer beat us, the rename
+    // either replaces theirs with an identical-content file or our
+    // rename loses — either way the resulting file is valid because
+    // the rewriter is deterministic for a given input.
+    std::fs::rename(&tmp, &cache_path).unwrap_or_else(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        panic!("rename {} -> {}: {e}", tmp.display(), cache_path.display())
+    });
 }
 
 /// Build the Docker test image if needed.
@@ -1592,49 +1608,59 @@ fn setup() -> (PathBuf, BinaryPaths) {
                 static_pie_glibc: static_pie_glibc_dir(),
                 static_pie_musl: static_pie_musl_dir(),
                 non_pie_static_musl: non_pie_static_musl_dir(),
-                pie_glibc_prewritten: prewritten_path(&debug_dir()),
-                nonpie_glibc_prewritten: prewritten_path(&nonpie_dir()),
-                static_pie_glibc_prewritten: prewritten_path(&static_pie_glibc_dir()),
-                static_pie_musl_prewritten: prewritten_path(&static_pie_musl_dir()),
-                non_pie_static_musl_prewritten: prewritten_path(&non_pie_static_musl_dir()),
             };
-            for (label, dir, prewritten) in [
-                ("PIE-glibc", &bins.pie_glibc, &bins.pie_glibc_prewritten),
+            // Pre-populate the broker's persistent ELF cache so the
+            // first 9P read of each harness variant hits the disk
+            // cache and the broker never invokes the rewriter at
+            // runtime. The cache key is the **in-container** path
+            // the broker will resolve (e.g.
+            // `/opt/litebox/litebox_test_harness`) + the host file's
+            // mtime (which equals the in-container mtime via the
+            // bind mount). See
+            // `ensure_rewritten_in_broker_cache` for the key format,
+            // which mirrors `litebox_broker::nine_p::server::disk_cache_key`.
+            for (label, host_dir, in_container_path) in [
+                (
+                    "PIE-glibc",
+                    &bins.pie_glibc,
+                    "/opt/litebox/litebox_test_harness",
+                ),
                 (
                     "non-PIE-glibc",
                     &bins.nonpie_glibc,
-                    &bins.nonpie_glibc_prewritten,
+                    "/opt/nonpie/litebox_test_harness",
                 ),
                 (
                     "static-PIE-glibc",
                     &bins.static_pie_glibc,
-                    &bins.static_pie_glibc_prewritten,
+                    "/opt/static-pie-glibc/litebox_test_harness",
                 ),
                 (
                     "static-PIE-musl",
                     &bins.static_pie_musl,
-                    &bins.static_pie_musl_prewritten,
+                    "/opt/static-pie-musl/litebox_test_harness",
                 ),
                 (
                     "non-PIE-static-musl",
                     &bins.non_pie_static_musl,
-                    &bins.non_pie_static_musl_prewritten,
+                    "/opt/non-pie-static-musl/litebox_test_harness",
                 ),
             ] {
-                let bin = dir.join("litebox_test_harness");
+                let bin = host_dir.join("litebox_test_harness");
                 assert!(
                     bin.exists(),
                     "{label} litebox_test_harness not found at {} \
                      after ensure_binaries_built",
                     bin.display()
                 );
-                // Pre-rewrite (mtime-cached). One-time cost on rebuild,
-                // free thereafter. ~1.2s × 5 variants = ~6s on cold start.
                 let t0 = std::time::Instant::now();
-                ensure_rewritten(&bin, prewritten);
+                ensure_rewritten_in_broker_cache(&bin, Path::new(in_container_path));
                 let elapsed = t0.elapsed();
                 if elapsed.as_millis() > 50 {
-                    eprintln!("[setup] pre-rewrote {label} in {} ms", elapsed.as_millis());
+                    eprintln!(
+                        "[setup] pre-rewrote {label} into broker cache in {} ms",
+                        elapsed.as_millis()
+                    );
                 }
             }
             // Touch suppression: variable is fully initialised by the

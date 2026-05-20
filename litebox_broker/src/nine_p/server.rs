@@ -1952,6 +1952,23 @@ impl Server {
             }
         }
 
+        // Persistent (cross-broker) disk cache: integration tests set
+        // `LITEBOX_BROKER_ELF_CACHE_DIR` and may pre-populate entries
+        // from setup() so the very first request never pays the
+        // rewriter cost. Mtime-validated via the key itself.
+        let disk_cache_dir: Option<PathBuf> =
+            std::env::var_os("LITEBOX_BROKER_ELF_CACHE_DIR").map(PathBuf::from);
+        if let Some(ref d) = disk_cache_dir {
+            let key = disk_cache_key(path, current_mtime);
+            let cache_path = d.join(&key);
+            if let Ok(bytes) = fs::read(&cache_path) {
+                let arc = Arc::new(bytes);
+                let mut cache = mutex_lock(&self.elf_cache, "elf_cache");
+                cache.insert(path.to_owned(), (current_mtime, Arc::clone(&arc)));
+                return Some(arc);
+            }
+        }
+
         // Quick check: if the binary is already patched (has LITEBOX0 magic
         // trailer), skip the expensive full-file read + scan. Pre-rewritten
         // binaries on disk are served as-is through 9P.
@@ -2059,11 +2076,51 @@ impl Server {
             "patched ELF with syscall trampolines"
         );
 
+        // Persist to disk cache so the *next* broker process (same
+        // host, different container) skips the rewriter for this
+        // file. Atomic via tmp + rename. Best-effort.
+        if let Some(ref d) = disk_cache_dir {
+            let key = disk_cache_key(path, current_mtime);
+            let cache_path = d.join(&key);
+            let tmp = d.join(format!("{key}.tmp.{}", std::process::id()));
+            if fs::write(&tmp, &patched).is_ok() && fs::rename(&tmp, &cache_path).is_ok() {
+                // ok
+            } else {
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+
+        // Emit a marker per in-band runtime rewrite. Integration
+        // tests assert this count is zero (everything should be
+        // pre-populated by setup() or pre_warm_elf_cache).
+        // Encode the path in the marker name so the failure message
+        // can name what wasn't primed. The value is the rewrite
+        // duration in ns, which is the only numeric we have handy
+        // (litebox_timing's marker format is `name=u64\n`).
+        let path_key = sanitize_path_for_marker(path);
+        litebox_timing::emit(&format!("broker_runtime_rewrite:{path_key}"));
+
         let arc = Arc::new(patched);
         let mut cache = mutex_lock(&self.elf_cache, "elf_cache");
         cache.insert(path.to_owned(), (current_mtime, Arc::clone(&arc)));
         Some(arc)
     }
+}
+
+/// Replace path separators and non-ASCII-alphanumeric chars so the
+/// path is safe to embed in a `name=value` litebox_timing marker line.
+/// Mirrors `disk_cache_key`'s sanitisation rules (sans the mtime
+/// suffix) so cross-referencing is straightforward.
+fn sanitize_path_for_marker(p: &Path) -> String {
+    let mut out = String::new();
+    for c in p.as_os_str().to_string_lossy().chars() {
+        match c {
+            '/' => out.push('_'),
+            c if c.is_ascii_alphanumeric() || c == '-' || c == '.' => out.push(c),
+            _ => out.push('-'),
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -2327,14 +2384,17 @@ fn mutex_lock<'a, T>(lock: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
 
 /// Filesystem-safe disk-cache filename for `(resolved_path, mtime)`.
 ///
-/// Used by `pre_warm_elf_cache` to persist rewritten ELF bytes across
-/// broker process invocations. The key has to round-trip safely across
-/// any host filesystem; we drop the leading `/`, replace path
-/// separators with `_`, and append the mtime. Two different paths
-/// that collapse to the same key would be unsafe — we mitigate that
-/// in practice by always using the resolved (canonicalised) absolute
-/// path, which is unique on the host.
-fn disk_cache_key(resolved: &Path, mtime: i64) -> String {
+/// Used by `pre_warm_elf_cache` and `try_patch_elf` to persist
+/// rewritten ELF bytes across broker process invocations, and by the
+/// integration test harness to pre-populate the cache from `setup()`
+/// (see `litebox_test_harness/tests/integration.rs`).
+///
+/// The key has to round-trip safely across any host filesystem; we
+/// drop the leading `/`, replace path separators with `_`, and append
+/// the mtime. Two different paths that collapse to the same key would
+/// be unsafe — we mitigate that in practice by always using the
+/// resolved (canonicalised) absolute path, which is unique on the host.
+pub fn disk_cache_key(resolved: &Path, mtime: i64) -> String {
     let mut key = String::new();
     for part in resolved.as_os_str().to_string_lossy().chars() {
         match part {
