@@ -473,6 +473,7 @@ fn initial_program_data(
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_timing::init_from_env();
+    litebox_timing::emit("runner_started_ns");
     // Open audit log file if specified. Must happen before any early-return
     // path (worker_exec, fork_restore) so ALL workers get audit logging.
     #[cfg(feature = "audit_log")]
@@ -989,6 +990,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // Open a dedicated 9P channel using shared-memory ring buffers.
     if !is_tcp {
         let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
+        litebox_timing::emit("runner_broker_connected_ns");
 
         let shim = shim_builder.build();
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -1001,6 +1003,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         let (nine_p_fs, mut reader) =
             litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
                 .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+        litebox_timing::emit("runner_rootfs_ready_ns");
 
         // Spawn the 9P response worker thread.
         let worker_handle = nine_p_fs.worker_handle();
@@ -1028,6 +1031,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             envp,
             cli_args.working_directory.clone(),
         )?;
+        litebox_timing::emit("runner_program_loaded_ns");
 
         // Install pipe bridges for inherited non-stdio fds (e.g. socketpair IPC).
         let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;

@@ -89,6 +89,7 @@ fn main() {
     litebox_timing::emit("harness_first_output_ns");
 
     let args: Vec<String> = std::env::args().collect();
+    litebox_timing::emit("harness_args_parsed_ns");
     let cmd = args.get(1).map_or("spawn-tree", String::as_str);
     let self_exe = &args[0];
     // PTY tests dup the harness's stderr as stdout; gate diagnostic
@@ -127,9 +128,12 @@ fn main() {
     // arms below (which are being migrated family-by-family).
     if !matches!(cmd, "spawn-tree" | "agent" | "agent-listen") {
         let _ = coordinator::collect_all_tests();
+        litebox_timing::emit("harness_dispatch_ready_ns");
         if let Some(code) = coordinator::leaf_subcommand::dispatch(&args) {
             std::process::exit(code);
         }
+    } else {
+        litebox_timing::emit("harness_dispatch_ready_ns");
     }
 
     match cmd {

@@ -127,6 +127,7 @@ fn emit_timing_main(
     t_docker_spawn_ms: Option<u128>,
     t_litebox_init_ms: Option<u128>,
     t_harness_load_ms: Option<u128>,
+    sub_phases: &SubPhaseMs,
     t_useful_ms: u128,
     verdict: &str,
     jobs: usize,
@@ -145,6 +146,15 @@ fn emit_timing_main(
     if let Some(v) = t_harness_load_ms {
         line.push_str(&format!(",\"t_harness_load_ms\":{v}"));
     }
+    // Phase A sub-phase split. Each is the delta between adjacent
+    // markers in `litebox_timing`'s file channel; cumulative should
+    // sum to `t_litebox_init_ms`/`t_harness_load_ms` (within rounding).
+    // See `SubPhaseMs::compute` for the full marker order.
+    for (key, value) in sub_phases.fields() {
+        if let Some(v) = value {
+            line.push_str(&format!(",\"{key}\":{v}"));
+        }
+    }
     line.push_str(&format!(
         ",\"t_useful_ms\":{t_useful_ms},\"verdict\":\"{verdict}\",\"jobs\":{jobs}}}\n"
     ));
@@ -153,11 +163,102 @@ fn emit_timing_main(
     }
 }
 
+/// All timing markers we recognise on the file channel + the
+/// stderr `[TIMING] harness_first_output_ns=` proxy.
+///
+/// First-wins per name: see `record_timing_marker`. Fields are
+/// optional because (a) some code paths skip markers (e.g.
+/// `litebox_shim_ready_ns` is absent in native pass) and (b) the
+/// stderr scraper only sees `harness_first_output_ns`.
 #[derive(Clone, Copy, Default)]
 struct TimingMarkers {
     container_pid1_started_ns: Option<u64>,
+    tool_executor_args_parsed_ns: Option<u64>,
+    tool_executor_audit_open_ns: Option<u64>,
+    broker_spawn_called_ns: Option<u64>,
+    broker_socket_ready_ns: Option<u64>,
+    runner_spawn_called_ns: Option<u64>,
+    runner_started_ns: Option<u64>,
+    runner_broker_connected_ns: Option<u64>,
+    runner_rootfs_ready_ns: Option<u64>,
+    runner_program_loaded_ns: Option<u64>,
     litebox_shim_ready_ns: Option<u64>,
+    /// Host-clock view of "harness started" — populated from the
+    /// stderr arrival_ns proxy in litebox pass, or from the file in
+    /// native pass. Used for `t_harness_load_ms` which bridges
+    /// runner (host clock) → guest harness.
     harness_first_output_ns: Option<u64>,
+    /// Guest-clock view of harness_first_output_ns. In native pass
+    /// equal to `harness_first_output_ns`; in litebox pass differs
+    /// because the guest's CLOCK_MONOTONIC is virtualized. Used as
+    /// the start anchor for `t_harness_args_ms` so harness-internal
+    /// sub-phases stay on a single clock domain.
+    harness_first_output_ns_guest: Option<u64>,
+    harness_args_parsed_ns: Option<u64>,
+    harness_dispatch_ready_ns: Option<u64>,
+}
+
+/// Sub-phase deltas in milliseconds. All optional — only present when
+/// both endpoint markers were observed for the trial.
+#[derive(Default)]
+struct SubPhaseMs {
+    // t_litebox_init_ms breakdown (container_pid1 → litebox_shim_ready)
+    t_tool_executor_args_ms: Option<u128>,
+    t_tool_executor_audit_ms: Option<u128>,
+    t_broker_spawn_ms: Option<u128>,
+    t_broker_bind_ms: Option<u128>,
+    t_runner_spawn_call_ms: Option<u128>,
+    t_runner_fork_ms: Option<u128>,
+    t_runner_broker_conn_ms: Option<u128>,
+    t_runner_rootfs_ms: Option<u128>,
+    t_runner_program_load_ms: Option<u128>,
+    t_runner_shim_handoff_ms: Option<u128>,
+    // t_harness_load_ms breakdown
+    t_guest_runtime_init_ms: Option<u128>,
+    t_harness_args_ms: Option<u128>,
+    t_harness_dispatch_ms: Option<u128>,
+}
+
+impl SubPhaseMs {
+    fn compute(m: &TimingMarkers) -> Self {
+        let d = |a: Option<u64>, b: Option<u64>| a.zip(b).and_then(|(a, b)| ns_delta_ms(a, b));
+        Self {
+            t_tool_executor_args_ms: d(m.container_pid1_started_ns, m.tool_executor_args_parsed_ns),
+            t_tool_executor_audit_ms: d(
+                m.tool_executor_args_parsed_ns,
+                m.tool_executor_audit_open_ns,
+            ),
+            t_broker_spawn_ms: d(m.tool_executor_audit_open_ns, m.broker_spawn_called_ns),
+            t_broker_bind_ms: d(m.broker_spawn_called_ns, m.broker_socket_ready_ns),
+            t_runner_spawn_call_ms: d(m.broker_socket_ready_ns, m.runner_spawn_called_ns),
+            t_runner_fork_ms: d(m.runner_spawn_called_ns, m.runner_started_ns),
+            t_runner_broker_conn_ms: d(m.runner_started_ns, m.runner_broker_connected_ns),
+            t_runner_rootfs_ms: d(m.runner_broker_connected_ns, m.runner_rootfs_ready_ns),
+            t_runner_program_load_ms: d(m.runner_rootfs_ready_ns, m.runner_program_loaded_ns),
+            t_runner_shim_handoff_ms: d(m.runner_program_loaded_ns, m.litebox_shim_ready_ns),
+            t_guest_runtime_init_ms: d(m.litebox_shim_ready_ns, m.harness_first_output_ns),
+            t_harness_args_ms: d(m.harness_first_output_ns_guest, m.harness_args_parsed_ns),
+            t_harness_dispatch_ms: d(m.harness_args_parsed_ns, m.harness_dispatch_ready_ns),
+        }
+    }
+
+    fn fields(&self) -> [(&'static str, Option<u128>); 13] {
+        [
+            ("t_tool_executor_args_ms", self.t_tool_executor_args_ms),
+            ("t_tool_executor_audit_ms", self.t_tool_executor_audit_ms),
+            ("t_broker_spawn_ms", self.t_broker_spawn_ms),
+            ("t_broker_bind_ms", self.t_broker_bind_ms),
+            ("t_runner_spawn_call_ms", self.t_runner_spawn_call_ms),
+            ("t_runner_fork_ms", self.t_runner_fork_ms),
+            ("t_runner_broker_conn_ms", self.t_runner_broker_conn_ms),
+            ("t_runner_rootfs_ms", self.t_runner_rootfs_ms),
+            ("t_runner_program_load_ms", self.t_runner_program_load_ms),
+            ("t_runner_shim_handoff_ms", self.t_runner_shim_handoff_ms),
+            ("t_guest_runtime_init_ms", self.t_guest_runtime_init_ms),
+            ("t_harness_args_ms", self.t_harness_args_ms),
+            ("t_harness_dispatch_ms", self.t_harness_dispatch_ms),
+        ]
+    }
 }
 
 fn record_timing_marker(markers: &mut TimingMarkers, line: &str, pass: &str, arrival_ns: u64) {
@@ -170,21 +271,49 @@ fn record_timing_marker(markers: &mut TimingMarkers, line: &str, pass: &str, arr
     let Ok(marker_ns) = value.parse::<u64>() else {
         return;
     };
-    let ns = if name == "harness_first_output_ns" && pass == "litebox" {
+    let ns = if name == "harness_first_output_ns" && pass == "litebox" && arrival_ns != 0 {
+        // Stderr arrival_ns proxy: in litebox pass, the in-guest harness
+        // emits this on a virtualized CLOCK_MONOTONIC. The stderr line
+        // arrives on the host shortly after the guest writes it; use
+        // the host arrival time as the boundary for measurements that
+        // bridge the runner → guest seam. arrival_ns=0 means "called
+        // from the file reader" — keep the (virtual) value since we
+        // have no host-clock proxy to use instead.
         arrival_ns
     } else {
         marker_ns
     };
+    // Always preserve the guest-clock value of harness_first_output_ns
+    // for harness-internal sub-phase computation (`t_harness_args_ms`
+    // etc.) where mixing clocks would underflow.
+    if name == "harness_first_output_ns"
+        && arrival_ns == 0
+        && markers.harness_first_output_ns_guest.is_none()
+    {
+        markers.harness_first_output_ns_guest = Some(marker_ns);
+    }
+    macro_rules! first_wins {
+        ($field:ident) => {
+            if markers.$field.is_none() {
+                markers.$field = Some(ns);
+            }
+        };
+    }
     match name {
-        "container_pid1_started_ns" if markers.container_pid1_started_ns.is_none() => {
-            markers.container_pid1_started_ns = Some(ns);
-        }
-        "litebox_shim_ready_ns" if markers.litebox_shim_ready_ns.is_none() => {
-            markers.litebox_shim_ready_ns = Some(ns);
-        }
-        "harness_first_output_ns" if markers.harness_first_output_ns.is_none() => {
-            markers.harness_first_output_ns = Some(ns);
-        }
+        "container_pid1_started_ns" => first_wins!(container_pid1_started_ns),
+        "tool_executor_args_parsed_ns" => first_wins!(tool_executor_args_parsed_ns),
+        "tool_executor_audit_open_ns" => first_wins!(tool_executor_audit_open_ns),
+        "broker_spawn_called_ns" => first_wins!(broker_spawn_called_ns),
+        "broker_socket_ready_ns" => first_wins!(broker_socket_ready_ns),
+        "runner_spawn_called_ns" => first_wins!(runner_spawn_called_ns),
+        "runner_started_ns" => first_wins!(runner_started_ns),
+        "runner_broker_connected_ns" => first_wins!(runner_broker_connected_ns),
+        "runner_rootfs_ready_ns" => first_wins!(runner_rootfs_ready_ns),
+        "runner_program_loaded_ns" => first_wins!(runner_program_loaded_ns),
+        "litebox_shim_ready_ns" => first_wins!(litebox_shim_ready_ns),
+        "harness_first_output_ns" => first_wins!(harness_first_output_ns),
+        "harness_args_parsed_ns" => first_wins!(harness_args_parsed_ns),
+        "harness_dispatch_ready_ns" => first_wins!(harness_dispatch_ready_ns),
         _ => {}
     }
 }
@@ -725,6 +854,8 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     };
     let jobs = current_jobs_cap();
 
+    let sub_phases = SubPhaseMs::compute(&markers);
+
     // Emit the main timing line synchronously (drain may get cut off
     // if cargo-test exits early).
     emit_timing_main(
@@ -735,6 +866,7 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         t_docker_spawn_ms,
         t_litebox_init_ms,
         t_harness_load_ms,
+        &sub_phases,
         t_useful_ms,
         verdict,
         jobs,

@@ -113,6 +113,7 @@ fn main() -> anyhow::Result<()> {
     litebox_timing::init_from_env();
     litebox_timing::emit("container_pid1_started_ns");
     let cli = Cli::parse();
+    litebox_timing::emit("tool_executor_args_parsed_ns");
 
     // When --debug is set, re-exec the entire tool_executor under gdbserver
     // so that both the broker and runner (spawned as children) are debuggable.
@@ -158,6 +159,7 @@ fn main() -> anyhow::Result<()> {
 
     // Print binary build times for diagnostics.
     print_build_info(audit_log_file.as_deref());
+    litebox_timing::emit("tool_executor_audit_open_ns");
 
     if cli.vscode_server {
         ssh_mode(&cli, audit_log_file.as_deref(), SshPreset::VsCode)
@@ -486,6 +488,7 @@ impl BrokerProcess {
         // Give the broker a moment to create the socket.
         for _ in 0..50 {
             if socket_path.exists() {
+                litebox_timing::emit("broker_socket_ready_ns");
                 return Ok(Self {
                     child,
                     socket_path,
@@ -616,6 +619,16 @@ fn runner_command(
         cmd.arg("--env").arg("TERM=dumb");
     }
 
+    // Propagate LITEBOX_TIMING_PATH to the guest so the in-guest harness
+    // can append its `harness_args_parsed_ns` / `harness_dispatch_ready_ns`
+    // markers to the same side-channel file as tool_executor / runner.
+    // Without this, the guest's env doesn't include the path and
+    // litebox_timing::init_from_env silently disables the channel.
+    if let Ok(timing_path) = std::env::var("LITEBOX_TIMING_PATH") {
+        cmd.arg("--env")
+            .arg(format!("LITEBOX_TIMING_PATH={timing_path}"));
+    }
+
     // Run as root inside the sandbox. The host process runs as a normal
     // user, but the guest should appear as root so sshd/dropbear can
     // authenticate users and manage sessions.
@@ -701,6 +714,7 @@ fn run_sandbox(
         .iter()
         .map(|(h, g, p)| (*h, g.as_str(), *p))
         .collect();
+    litebox_timing::emit("broker_spawn_called_ns");
     let broker = spawn_broker(cli, audit_log_file, &forward_refs)?;
 
     let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
@@ -710,6 +724,7 @@ fn run_sandbox(
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
+    litebox_timing::emit("runner_spawn_called_ns");
     let status = cmd.status().map_err(|e| {
         anyhow::anyhow!(
             "Failed to spawn litebox_runner_linux_userland: {e}\n\
