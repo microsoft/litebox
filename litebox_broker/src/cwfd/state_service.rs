@@ -36,10 +36,10 @@ use litebox_common_linux::fd_token_protocol::{
     build_create_pidfd_response_ok, build_create_pipe_response_ok, build_create_pty_response_ok,
     build_create_signalfd_response_ok, build_create_socketpair_response_ok,
     build_deliver_signal_inbox_response_ok, build_error_response,
-    build_mark_process_exited_response_ok, build_pidfd_exited_response_ok,
-    build_pty_ioctl_response_ok, build_pty_read_response_ok, build_pty_write_response_ok,
-    build_push_siginfo_response_ok, build_read_eventfd_response_ok, build_read_pipe_response_ok,
-    build_read_siginfo_response_ok, build_read_socketpair_response_ok,
+    build_mark_process_exited_response_ok, build_open_pty_slave_response_ok,
+    build_pidfd_exited_response_ok, build_pty_ioctl_response_ok, build_pty_read_response_ok,
+    build_pty_write_response_ok, build_push_siginfo_response_ok, build_read_eventfd_response_ok,
+    build_read_pipe_response_ok, build_read_siginfo_response_ok, build_read_socketpair_response_ok,
     build_register_notification_ring_response_ok, build_register_process_response_ok,
     build_release_response_ok, build_set_pgid_response_ok, build_set_sid_response_ok,
     build_subscribe_eventfd_response_ok, build_subscribe_process_exit_response_ok,
@@ -49,12 +49,12 @@ use litebox_common_linux::fd_token_protocol::{
     build_write_socketpair_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
     parse_create_pipe_body, parse_create_signalfd_body, parse_create_socketpair_body,
     parse_deliver_signal_inbox_body, parse_handle_body, parse_mark_process_exited_body,
-    parse_pidfd_exited_request, parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body,
-    parse_push_siginfo_body, parse_read_pipe_body, parse_read_socketpair_body, parse_set_pgid_body,
-    parse_set_sid_body, parse_subscribe_eventfd_body, parse_subscribe_process_exit_body,
-    parse_subscribe_pty_body, parse_subscribe_signal_inbox_body, parse_unsubscribe_body,
-    parse_unsubscribe_signal_inbox_body, parse_write_eventfd_body, parse_write_pipe_body,
-    parse_write_socketpair_body,
+    parse_open_pty_slave_body, parse_pidfd_exited_request, parse_pty_ioctl_body,
+    parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body, parse_read_pipe_body,
+    parse_read_socketpair_body, parse_set_pgid_body, parse_set_sid_body,
+    parse_subscribe_eventfd_body, parse_subscribe_process_exit_body, parse_subscribe_pty_body,
+    parse_subscribe_signal_inbox_body, parse_unsubscribe_body, parse_unsubscribe_signal_inbox_body,
+    parse_write_eventfd_body, parse_write_pipe_body, parse_write_socketpair_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -183,6 +183,7 @@ pub fn handle_request(
         Opcode::ReadSiginfo => handle_read_siginfo(registry, request, in_fds),
         Opcode::PushSiginfo => handle_push_siginfo(registry, request, in_fds),
         Opcode::CreatePty => handle_create_pty(registry, request, in_fds),
+        Opcode::OpenPtySlave => handle_open_pty_slave(registry, request, in_fds),
         Opcode::PtyRead => handle_pty_read(registry, request, in_fds),
         Opcode::PtyWrite => handle_pty_write(registry, None, request, in_fds),
         Opcode::SubscribePty => handle_subscribe_pty(registry, conn, request, in_fds),
@@ -1044,6 +1045,45 @@ fn handle_create_pty(
         frame: build_create_pty_response_ok(master.id(), slave.id(), pair.pty_id),
         out_fd: None,
     }
+}
+
+fn handle_open_pty_slave(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::OpenPtySlaveResponse);
+    }
+    let pty_id = match parse_open_pty_slave_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::OpenPtySlaveResponse),
+    };
+    for entry in registry.diagnostic_snapshot() {
+        if entry.subsystem_tag != SubsystemTag::Pty {
+            continue;
+        }
+        let handle = StateHandle::from_id(entry.handle_id);
+        let Ok(state) = registry.resolve(handle, SubsystemTag::Pty) else {
+            continue;
+        };
+        let pty = state
+            .as_any()
+            .downcast_ref::<PtyState>()
+            .expect("Pty tag guarantees PtyState");
+        if pty.pty_id() == pty_id
+            && pty.endpoint() == litebox_common_linux::fd_token_protocol::PtyEndpoint::Slave
+        {
+            if registry.dup(handle).is_err() {
+                return status_err(Opcode::OpenPtySlaveResponse, StatusCode::Internal);
+            }
+            return HandlerResult {
+                frame: build_open_pty_slave_response_ok(entry.handle_id, pty_id),
+                out_fd: None,
+            };
+        }
+    }
+    status_err(Opcode::OpenPtySlaveResponse, StatusCode::UnknownHandle)
 }
 
 fn resolve_pty(

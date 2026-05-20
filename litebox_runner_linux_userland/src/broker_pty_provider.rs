@@ -78,6 +78,12 @@ impl BrokerPtyProvider for RunnerBrokerPtyProvider {
         })
     }
 
+    fn open_pty_slave(&self, pty_id: u32) -> Result<u64, BrokerOpError> {
+        self.client
+            .open_pty_slave(pty_id)
+            .map_err(client_err_to_broker_err)
+    }
+
     fn read_pty(&self, handle: u64, max_len: u32) -> Result<Vec<u8>, BrokerOpError> {
         self.client
             .pty_read(handle, max_len)

@@ -27,19 +27,20 @@ use crate::fd_token_protocol::{
     build_create_eventfd_request, build_create_pidfd_request, build_create_pipe_request,
     build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
     build_deliver_signal_inbox_request, build_mark_process_exited_request,
-    build_materialize_request, build_pidfd_exited_request, build_pty_ioctl_request,
-    build_pty_read_request, build_pty_write_request, build_push_siginfo_request,
-    build_read_eventfd_request, build_read_pipe_request, build_read_siginfo_request,
-    build_read_socketpair_request, build_register_notification_ring_request,
-    build_register_process_request, build_register_request, build_release_request,
-    build_set_pgid_request, build_set_sid_request, build_subscribe_eventfd_request,
-    build_subscribe_process_exit_request, build_subscribe_pty_request,
-    build_subscribe_signal_inbox_request, build_unsubscribe_request,
+    build_materialize_request, build_open_pty_slave_request, build_pidfd_exited_request,
+    build_pty_ioctl_request, build_pty_read_request, build_pty_write_request,
+    build_push_siginfo_request, build_read_eventfd_request, build_read_pipe_request,
+    build_read_siginfo_request, build_read_socketpair_request,
+    build_register_notification_ring_request, build_register_process_request,
+    build_register_request, build_release_request, build_set_pgid_request, build_set_sid_request,
+    build_subscribe_eventfd_request, build_subscribe_process_exit_request,
+    build_subscribe_pty_request, build_subscribe_signal_inbox_request, build_unsubscribe_request,
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
     build_write_socketpair_request, decode, parse_create_pidfd_response_ok,
     parse_create_pty_response_ok, parse_create_socketpair_response_body, parse_handle_body,
-    parse_pidfd_exited_response_ok, parse_pty_ioctl_response_body, parse_pty_read_response_body,
-    parse_pty_write_response_ok, parse_read_pipe_response_body, parse_read_siginfo_response_body,
+    parse_open_pty_slave_response_ok, parse_pidfd_exited_response_ok,
+    parse_pty_ioctl_response_body, parse_pty_read_response_body, parse_pty_write_response_ok,
+    parse_read_pipe_response_body, parse_read_siginfo_response_body,
     parse_read_socketpair_response_body, parse_set_sid_response_ok,
     parse_subscribe_process_exit_response_ok, parse_write_pipe_response_ok,
     parse_write_socketpair_response_ok,
@@ -657,6 +658,28 @@ impl FdTokenClient {
             StatusCode::Ok => {
                 parse_create_pty_response_ok(resp.body).map_err(ClientError::Protocol)
             }
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    pub fn open_pty_slave(&self, pty_id: u32) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_open_pty_slave_request(pty_id), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::OpenPtySlaveResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_open_pty_slave_response_ok(resp.body)
+                .map(|(handle, _)| handle)
+                .map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle {
+                handle_id: u64::from(pty_id),
+            }),
             s => Err(map_status_no_handle(resp.opcode, s)),
         }
     }
