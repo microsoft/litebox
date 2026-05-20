@@ -36,6 +36,173 @@ const NULL_BLOCK_SIZE: usize = 0x1000;
 /// Block size for /dev/urandom
 const URANDOM_BLOCK_SIZE: usize = 0x1000;
 
+const IFLAG_INLCR: u32 = 0x0040;
+const IFLAG_IGNCR: u32 = 0x0080;
+const IFLAG_ICRNL: u32 = 0x0100;
+
+const OFLAG_OPOST: u32 = 0x0001;
+const OFLAG_ONLCR: u32 = 0x0004;
+const OFLAG_OCRNL: u32 = 0x0008;
+
+const LFLAG_ISIG: u32 = 0x0001;
+const LFLAG_ICANON: u32 = 0x0002;
+const LFLAG_ECHO: u32 = 0x0008;
+const LFLAG_ECHOE: u32 = 0x0010;
+const LFLAG_ECHOK: u32 = 0x0020;
+const LFLAG_ECHONL: u32 = 0x0040;
+
+const VINTR: usize = 0;
+const VQUIT: usize = 1;
+const VERASE: usize = 2;
+const VKILL: usize = 3;
+const VEOF: usize = 4;
+const VSTART: usize = 8;
+const VSTOP: usize = 9;
+const VSUSP: usize = 10;
+const VEOL: usize = 11;
+const VREPRINT: usize = 12;
+const VWERASE: usize = 14;
+const VEOL2: usize = 16;
+const DISABLED_CC: u8 = 0xff;
+
+#[derive(Default)]
+struct CanonicalOutcome {
+    input_ready: bool,
+    echoed: bool,
+}
+
+fn cc_matches(cc: u8, b: u8) -> bool {
+    cc != 0 && cc != DISABLED_CC && cc == b
+}
+
+fn translate_input_byte(iflag: u32, b: u8) -> Option<u8> {
+    match b {
+        b'\r' if iflag & IFLAG_IGNCR != 0 => None,
+        b'\r' if iflag & IFLAG_ICRNL != 0 => Some(b'\n'),
+        b'\n' if iflag & IFLAG_INLCR != 0 => Some(b'\r'),
+        _ => Some(b),
+    }
+}
+
+fn signal_for_input_byte(cc: &[u8; 19], b: u8) -> Option<i32> {
+    if cc_matches(cc[VINTR], b) {
+        Some(2)
+    } else if cc_matches(cc[VQUIT], b) {
+        Some(3)
+    } else if cc_matches(cc[VSUSP], b) {
+        Some(20)
+    } else {
+        None
+    }
+}
+
+fn process_local_canonical_byte(
+    canonical: &mut Vec<u8>,
+    slave_ring: &mut VecDeque<u8>,
+    master_ring: &mut VecDeque<u8>,
+    eof_count: &core::sync::atomic::AtomicUsize,
+    b: u8,
+    cc: &[u8; 19],
+    oflag: u32,
+    echo: bool,
+    echoe: bool,
+    echok: bool,
+    echonl: bool,
+) -> CanonicalOutcome {
+    let mut outcome = CanonicalOutcome::default();
+    if cc_matches(cc[VEOF], b) {
+        if canonical.is_empty() {
+            eof_count.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        } else {
+            slave_ring.extend(canonical.drain(..));
+        }
+        outcome.input_ready = true;
+        return outcome;
+    }
+    if b == b'\n' || cc_matches(cc[VEOL], b) || cc_matches(cc[VEOL2], b) {
+        canonical.push(b);
+        if echo || (echonl && b == b'\n') {
+            push_output_byte(master_ring, oflag, b);
+            outcome.echoed = true;
+        }
+        slave_ring.extend(canonical.drain(..));
+        outcome.input_ready = true;
+        return outcome;
+    }
+    if cc_matches(cc[VERASE], b) {
+        if canonical.pop().is_some() && echo && echoe {
+            echo_erase(master_ring);
+            outcome.echoed = true;
+        }
+        return outcome;
+    }
+    if cc_matches(cc[VKILL], b) {
+        let had = !canonical.is_empty();
+        canonical.clear();
+        if echo && echok && had {
+            push_output_byte(master_ring, oflag, b'\n');
+            outcome.echoed = true;
+        }
+        return outcome;
+    }
+    if cc_matches(cc[VWERASE], b) {
+        let mut erased = 0;
+        while canonical.last().is_some_and(|b| b.is_ascii_whitespace()) {
+            canonical.pop();
+            erased += 1;
+        }
+        while canonical.last().is_some_and(|b| !b.is_ascii_whitespace()) {
+            canonical.pop();
+            erased += 1;
+        }
+        if echo && echoe {
+            for _ in 0..erased {
+                echo_erase(master_ring);
+            }
+            outcome.echoed = erased > 0;
+        }
+        return outcome;
+    }
+    if cc_matches(cc[VREPRINT], b) {
+        if echo {
+            push_output_byte(master_ring, oflag, b'\n');
+            for &queued in canonical.iter() {
+                push_output_byte(master_ring, oflag, queued);
+            }
+            outcome.echoed = true;
+        }
+        return outcome;
+    }
+    if cc_matches(cc[VSTART], b) || cc_matches(cc[VSTOP], b) {
+        return outcome;
+    }
+    canonical.push(b);
+    if echo {
+        push_output_byte(master_ring, oflag, b);
+        outcome.echoed = true;
+    }
+    outcome
+}
+
+fn echo_erase(out: &mut VecDeque<u8>) {
+    out.push_back(0x08);
+    out.push_back(b' ');
+    out.push_back(0x08);
+}
+
+fn push_output_byte(out: &mut VecDeque<u8>, oflag: u32, b: u8) {
+    if oflag & OFLAG_OPOST == 0 {
+        out.push_back(b);
+    } else if oflag & OFLAG_OCRNL != 0 && b == b'\r' {
+        out.push_back(b'\n');
+    } else {
+        if oflag & OFLAG_ONLCR != 0 && b == b'\n' {
+            out.push_back(b'\r');
+        }
+        out.push_back(b);
+    }
+}
+
 /// Constant node information for stdin.
 const STDIN_NODE_INFO: NodeInfo = NodeInfo {
     dev: 64,
@@ -118,6 +285,10 @@ pub struct PtyPair<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvid
     pub master_to_slave: crate::sync::Mutex<Platform, VecDeque<u8>>,
     /// Data written to slave, read by master (output from the child process).
     pub slave_to_master: crate::sync::Mutex<Platform, VecDeque<u8>>,
+    /// Pending canonical-mode bytes not yet released to the slave reader.
+    pub canonical_buffer: crate::sync::Mutex<Platform, Vec<u8>>,
+    /// Number of queued zero-length canonical VEOF reads.
+    pub master_to_slave_eof: core::sync::atomic::AtomicUsize,
     /// Whether the slave side has been unlocked via TIOCSPTLK.
     pub unlocked: core::sync::atomic::AtomicBool,
     /// Reference count of open slave FDs (used for EOF detection).
@@ -187,7 +358,13 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> IOPollable
 
     fn check_io_events(&self) -> Events {
         let mut events = Events::OUT; // slave is always writable
-        if !self.0.master_to_slave.lock().is_empty() {
+        if !self.0.master_to_slave.lock().is_empty()
+            || self
+                .0
+                .master_to_slave_eof
+                .load(core::sync::atomic::Ordering::Acquire)
+                > 0
+        {
             events |= Events::IN;
         }
         if self
@@ -247,6 +424,8 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> PtyManager
         pairs.push(Arc::new(PtyPair {
             master_to_slave: crate::sync::Mutex::new(VecDeque::new()),
             slave_to_master: crate::sync::Mutex::new(VecDeque::new()),
+            canonical_buffer: crate::sync::Mutex::new(Vec::new()),
+            master_to_slave_eof: core::sync::atomic::AtomicUsize::new(0),
             unlocked: true.into(),
             slave_open_count: core::sync::atomic::AtomicU32::new(0),
             master_open_count: core::sync::atomic::AtomicU32::new(1),
@@ -641,6 +820,15 @@ impl<
                     let mut ring = pair.master_to_slave.lock();
                     if ring.is_empty() {
                         if pair
+                            .master_to_slave_eof
+                            .load(core::sync::atomic::Ordering::Acquire)
+                            > 0
+                        {
+                            pair.master_to_slave_eof
+                                .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+                            return Ok(0);
+                        }
+                        if pair
                             .master_open_count
                             .load(core::sync::atomic::Ordering::Acquire)
                             == 0
@@ -702,36 +890,63 @@ impl<
                 return Ok(buf.len());
             }
             &Device::PtyMaster(idx) => {
-                // Master writes feed the slave's input buffer.
-                // Line discipline: ICRNL translates \r → \n (if enabled).
-                // ECHO reflects input back to master's read buffer.
                 let pair = self.pty_manager.get(idx).ok_or(WriteError::ClosedFd)?;
-                let termios = pair.termios.lock();
-                let icrnl = termios.icrnl_enabled();
-                let echo = termios.echo_enabled();
-                let onlcr = termios.onlcr_enabled();
-                drop(termios);
-                {
-                    let mut slave_ring = pair.master_to_slave.lock();
-                    if echo {
-                        let mut master_ring = pair.slave_to_master.lock();
-                        for &b in buf {
-                            let translated = if icrnl && b == b'\r' { b'\n' } else { b };
-                            slave_ring.push_back(translated);
-                            // Echo: reflect to master read, applying ONLCR.
-                            if onlcr && translated == b'\n' {
-                                master_ring.push_back(b'\r');
-                            }
-                            master_ring.push_back(translated);
-                        }
+                let termios = pair.termios.lock().clone();
+                let mut notify_slave = false;
+                let mut notify_master = false;
+                let iflag = termios.c_iflag;
+                let oflag = termios.c_oflag;
+                let lflag = termios.c_lflag;
+                let cc = termios.c_cc;
+                let isig = lflag & LFLAG_ISIG != 0;
+                let icanon = lflag & LFLAG_ICANON != 0;
+                let echo = lflag & LFLAG_ECHO != 0;
+                let echoe = lflag & LFLAG_ECHOE != 0;
+                let echok = lflag & LFLAG_ECHOK != 0;
+                let echonl = lflag & LFLAG_ECHONL != 0;
+                let mut slave_ring = pair.master_to_slave.lock();
+                let mut master_ring = pair.slave_to_master.lock();
+                let mut canonical = pair.canonical_buffer.lock();
+                for &raw in buf {
+                    let Some(b) = translate_input_byte(iflag, raw) else {
+                        continue;
+                    };
+                    if isig && signal_for_input_byte(&cc, b).is_some() {
+                        canonical.clear();
+                        continue;
+                    }
+                    if icanon {
+                        let outcome = process_local_canonical_byte(
+                            &mut canonical,
+                            &mut slave_ring,
+                            &mut master_ring,
+                            &pair.master_to_slave_eof,
+                            b,
+                            &cc,
+                            oflag,
+                            echo,
+                            echoe,
+                            echok,
+                            echonl,
+                        );
+                        notify_slave |= outcome.input_ready;
+                        notify_master |= outcome.echoed;
                     } else {
-                        for &b in buf {
-                            slave_ring.push_back(if icrnl && b == b'\r' { b'\n' } else { b });
+                        slave_ring.push_back(b);
+                        notify_slave = true;
+                        if echo || (echonl && b == b'\n') {
+                            push_output_byte(&mut master_ring, oflag, b);
+                            notify_master = true;
                         }
                     }
                 }
-                pair.slave_pollee.notify_observers(Events::IN);
-                if echo {
+                drop(canonical);
+                drop(master_ring);
+                drop(slave_ring);
+                if notify_slave {
+                    pair.slave_pollee.notify_observers(Events::IN);
+                }
+                if notify_master {
                     pair.master_pollee.notify_observers(Events::IN);
                 }
                 return Ok(buf.len());
@@ -740,20 +955,11 @@ impl<
                 // Slave writes feed the master's read buffer.
                 // Line discipline: ONLCR translates \n → \r\n (if enabled).
                 let pair = self.pty_manager.get(idx).ok_or(WriteError::ClosedFd)?;
-                let onlcr = pair.termios.lock().onlcr_enabled();
+                let oflag = pair.termios.lock().c_oflag;
                 {
                     let mut ring = pair.slave_to_master.lock();
-                    if onlcr {
-                        for &b in buf {
-                            if b == b'\n' {
-                                ring.push_back(b'\r');
-                            }
-                            ring.push_back(b);
-                        }
-                    } else {
-                        for &b in buf {
-                            ring.push_back(b);
-                        }
+                    for &b in buf {
+                        push_output_byte(&mut ring, oflag, b);
                     }
                 }
                 // Wake epoll watchers on the master side.

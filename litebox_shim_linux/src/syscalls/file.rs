@@ -1853,6 +1853,16 @@ impl<FS: ShimFS> Task<FS> {
                     } else {
                         None
                     };
+                    if let Some((_pair, _idx, is_master)) = files.fs.get_pty_pair_erased(fd)
+                        && is_master
+                    {
+                        // Mirror master writes through the broker first so broker-owned PTY
+                        // line discipline sees input-control characters and dispatches
+                        // SIGINT/SIGTSTP/SIGQUIT via PgrpSignalInbox automatically. PR-5's
+                        // earlier shim-side pty_master_ldisc_signals helper would have
+                        // double-delivered — replaced by this broker mirror (PR-7 stage 1).
+                        let _ = self.broker_pty_write(&files.fs, fd, buf)?;
+                    }
                     let result = files.fs.write(fd, buf, offset).map_err(Errno::from);
                     if matches!(result, Ok(n) if n > 0)
                         && let Some(path) = files.fs.fd_path(fd)
@@ -3225,6 +3235,11 @@ impl<FS: ShimFS> Task<FS> {
                         None
                     };
                     write_to_iovec(iovs, |buf: &[u8]| {
+                        if let Some((_pair, _idx, is_master)) = files.fs.get_pty_pair_erased(fd)
+                            && is_master
+                        {
+                            let _ = self.broker_pty_write(&files.fs, fd, buf)?;
+                        }
                         files.fs.write(fd, buf, None).map_err(Errno::from)
                     })
                 },
@@ -5490,6 +5505,19 @@ impl<FS: ShimFS> Task<FS> {
         Ok(handle)
     }
 
+    fn broker_pty_error_to_errno(
+        err: litebox_common_linux::broker_pty_provider::BrokerOpError,
+    ) -> Errno {
+        match err {
+            litebox_common_linux::broker_pty_provider::BrokerOpError::InvalidValue => Errno::EINVAL,
+            litebox_common_linux::broker_pty_provider::BrokerOpError::UnknownHandle => {
+                Errno::ENOTTY
+            }
+            litebox_common_linux::broker_pty_provider::BrokerOpError::WouldBlock => Errno::EAGAIN,
+            litebox_common_linux::broker_pty_provider::BrokerOpError::Io => Errno::EIO,
+        }
+    }
+
     fn broker_pty_ioctl(
         &self,
         fs: &FS,
@@ -5501,18 +5529,16 @@ impl<FS: ShimFS> Task<FS> {
         let provider = super::eventfd::broker_pty_provider().ok_or(Errno::EIO)?;
         provider
             .ioctl_pty(handle, op, payload)
-            .map_err(|err| match err {
-                litebox_common_linux::broker_pty_provider::BrokerOpError::InvalidValue => {
-                    Errno::EINVAL
-                }
-                litebox_common_linux::broker_pty_provider::BrokerOpError::UnknownHandle => {
-                    Errno::ENOTTY
-                }
-                litebox_common_linux::broker_pty_provider::BrokerOpError::WouldBlock => {
-                    Errno::EAGAIN
-                }
-                litebox_common_linux::broker_pty_provider::BrokerOpError::Io => Errno::EIO,
-            })
+            .map_err(Self::broker_pty_error_to_errno)
+    }
+
+    fn broker_pty_write(&self, fs: &FS, fd: &TypedFd<FS>, buf: &[u8]) -> Result<usize, Errno> {
+        let handle = self.broker_pty_handle_for_fd(fs, fd)?;
+        let provider = super::eventfd::broker_pty_provider().ok_or(Errno::EIO)?;
+        provider
+            .write_pty(handle, buf)
+            .map(|n| n as usize)
+            .map_err(Self::broker_pty_error_to_errno)
     }
 
     /// Handle terminal ioctls for PTY devices (major=136).
