@@ -19,6 +19,14 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub mod syscall_nr;
 
+/// Maximum size for a single memref parameter in syscalls that copy data
+/// between TA and OP-TEE shim.
+///
+/// OP-TEE shim copies input/inout memrefs into owned buffers, so this is a
+/// local resource policy to keep one userspace request from consuming a
+/// large fraction of the default 128 MiB memory budget.
+///
+/// Subject to change if the memory budget increases.
 const MAX_SYSCALL_COPY_SIZE: usize = 8 * 1024 * 1024;
 const MAX_CRYP_OBJ_POPULATE_ATTRS: usize = 1;
 
@@ -241,9 +249,10 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             TeeSyscallNr::CrypObjPopulate => SyscallRequest::CrypObjPopulate {
                 obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
                 attrs: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
-                attr_count: match ctx.syscall_arg(2) {
-                    count if count <= MAX_CRYP_OBJ_POPULATE_ATTRS => count,
-                    _ => return Err(Errno::EINVAL),
+                attr_count: if ctx.syscall_arg(2) <= MAX_CRYP_OBJ_POPULATE_ATTRS {
+                    ctx.syscall_arg(2)
+                } else {
+                    return Err(Errno::EINVAL);
                 },
             },
             TeeSyscallNr::CrypObjCopy => SyscallRequest::CrypObjCopy {

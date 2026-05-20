@@ -56,10 +56,13 @@ const MAX_NOTIF_VALUE: usize = 0;
 
 /// Maximum secure-world heap copy for a single OP-TEE memref parameter.
 ///
-/// OP-TEE OS validates memref sizes against their backing shared-memory objects, but it does not
-/// define a universal ABI maximum. OP-TEE shim copies input/inout memrefs into owned buffers, so
-/// this is a local resource policy to keep one normal-world request from consuming a large fraction
-/// of the default 128 MiB memory budget.
+/// OP-TEE OS validates memref sizes against their backing shared-memory
+/// objects, but it does not define a universal ABI maximum. OP-TEE shim
+/// copies input/inout memrefs into owned buffers, so this is a local
+/// resource policy to keep one normal-world request from consuming a large
+/// fraction of the default 128 MiB memory budget.
+///
+/// Subject to change if the memory budget increases.
 const MAX_SHM_MEMREF_SIZE: usize = 8 * 1024 * 1024;
 const MAX_SHM_REF_MAP_ENTRIES: usize = 1024;
 
@@ -717,9 +720,8 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         if page_offset >= ALIGN as u64 || aligned_size == 0 {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
-        let aligned_size_usize =
-            usize::try_from(aligned_size).map_err(|_| OpteeSmcReturnCode::ENomem)?;
-        if aligned_size_usize == 0 || aligned_size_usize > MAX_SHM_MEMREF_SIZE {
+        let aligned_size_usize: usize = aligned_size.truncate();
+        if aligned_size_usize > MAX_SHM_MEMREF_SIZE {
             return Err(OpteeSmcReturnCode::ENomem);
         }
         let num_pages = aligned_size_usize / ALIGN;
