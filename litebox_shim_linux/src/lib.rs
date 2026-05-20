@@ -1328,7 +1328,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // /dev/tty; tty-backed stdio aliases use their original /dev/std* path.
         {
             use litebox::fs::{Mode, OFlags};
-            use syscalls::fork_snapshot::FdClass;
+            use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
 
             for entry in &fd_table.entries {
                 // Skip stdio slots (already initialized above) and non-FS fds.
@@ -1380,6 +1380,66 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 drop(dt);
             }
 
+            // Restore broker-backed PTY fds by re-attaching to the broker handle.
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::FilesystemFd {
+                    continue;
+                }
+                let Some(broker_handle) = entry.metadata.broker_handle else {
+                    continue;
+                };
+                if broker_handle.kind != BrokerHandleKind::Pty {
+                    continue;
+                }
+                let Some(provider) = syscalls::broker_pty::broker_pty_provider() else {
+                    continue;
+                };
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(broker_handle.handle_id);
+                let pty_id = entry.metadata.sandbox_pty_index.unwrap_or_else(|| {
+                    provider
+                        .ioctl_pty(
+                            broker_handle.handle_id,
+                            litebox_common_linux::fd_token_protocol::PtyIoctlOp::Tiocgptn,
+                            &[],
+                        )
+                        .ok()
+                        .and_then(|p| {
+                            p.get(..4)
+                                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                        })
+                        .unwrap_or(0)
+                });
+                let is_master = !entry.metadata.is_sandbox_pty_slave;
+                let slave_anchor = if is_master {
+                    provider.open_pty_slave(pty_id).ok()
+                } else {
+                    None
+                };
+                let pty_fd = syscalls::broker_pty::BrokerPtyFd::<Platform>::new(
+                    provider,
+                    broker_handle.handle_id,
+                    pty_id,
+                    is_master,
+                    slave_anchor,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<syscalls::broker_pty::BrokerPtySubsystem> =
+                    self.global.litebox.descriptor_table_mut().insert(pty_fd);
+                let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
+                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                debug_assert!(
+                    success,
+                    "broker pty fd slot {} occupied during restore",
+                    entry.fd
+                );
+            }
+
             // Restore non-terminal FilesystemFd entries.  Reopen by path
             // if available, fall back to /dev/null.  For stdio slots (0-2),
             // consume the pre-populated entry first.
@@ -1388,10 +1448,13 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     continue;
                 }
                 let meta = &entry.metadata;
-                // Skip terminal fds and host stdio (already handled above).
+                // Skip terminal fds, host stdio, and broker-backed PTYs (already handled above).
                 if meta.is_host_tty_alias
                     || meta.is_host_pty_device
                     || meta.host_stdio_source_fd.is_some()
+                    || meta
+                        .broker_handle
+                        .is_some_and(|h| h.kind == BrokerHandleKind::Pty)
                 {
                     continue;
                 }
@@ -1450,9 +1513,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 }
 
                 // Phase F: if the snapshot carries a broker UnixSocket
-                // handle for this slot, install a BrokerSocketPairFd
-                // that adopts the parent's emit-side `dup_handle` ref.
-                // (Mirrors the Pipe-side restore at line ~1520.)
+                // handle for this slot, install a BrokerSocketPairFd. Bump
+                // the handle on this connection so its on_close release is
+                // tracked locally; the parent's transit ref is drained later.
                 if let Some(broker_handle) = entry.metadata.broker_handle {
                     if broker_handle.kind == BrokerHandleKind::UnixSocket {
                         let Some(provider) =
@@ -1463,6 +1526,10 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         let Some(endpoint) = broker_handle.socketpair_endpoint else {
                             continue;
                         };
+                        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                            alloc::sync::Arc::clone(&provider) as _;
+                        let _ = releaser.dup_handle(broker_handle.handle_id);
                         let sp_fd =
                             syscalls::broker_socketpair::BrokerSocketPairFd::<Platform>::new(
                                 provider,
@@ -1873,6 +1940,11 @@ impl LinuxShimProcess {
             // TODO: return the enum instead of just a code?
             syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 256,
         }
+    }
+
+    /// Returns whether all threads in this process have exited.
+    pub fn has_exited(&self) -> bool {
+        self.0.nr_threads() == 0
     }
 }
 
@@ -2967,15 +3039,18 @@ impl<FS: ShimFS> Task<FS> {
     fn is_pre_exec_syscall_for_task(&self, ctx: &litebox_common_linux::ExecutionContext) -> bool {
         use ::syscalls::Sysno;
 
-        let unix_socket_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read))
-            && self
-                .files
-                .borrow()
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
-                .is_ok();
-        Self::is_pre_exec_syscall_impl(ctx, unix_socket_read)
+        let socketpair_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read)) && {
+            let files = self.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            rds.fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
+                .is_ok()
+                || rds
+                    .fd_from_raw_integer::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+                        ctx.rdi,
+                    )
+                    .is_ok()
+        };
+        Self::is_pre_exec_syscall_impl(ctx, socketpair_read)
     }
 
     fn is_pre_exec_syscall_impl(
@@ -3012,10 +3087,10 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::chdir | Sysno::fchdir
                 // Process group.
                 | Sysno::setpgid | Sysno::setsid
-                // Signal/thread-runtime setup. Static musl refreshes the child
-                // clear-TID pointer immediately after fork before user code.
+                // Signal/thread-runtime setup. Static C runtimes refresh
+                // thread bookkeeping immediately after fork before user code.
                 | Sysno::rt_sigaction | Sysno::rt_sigprocmask | Sysno::sigaltstack
-                | Sysno::set_tid_address
+                | Sysno::set_tid_address | Sysno::set_robust_list
                 // Identity.
                 | Sysno::setuid | Sysno::setgid | Sysno::setgroups
                 | Sysno::setreuid | Sysno::setregid
@@ -4493,6 +4568,8 @@ struct MuxParentStream {
     /// For PTY-bridged streams: the PTY pair whose ring buffers the relay
     /// thread reads/writes.  `None` for pipe/socket streams.
     pty_pair: Option<Arc<litebox::fs::devices::PtyPair<Platform>>>,
+    /// For PTY-bridged streams: PTY manager index for broker mirroring.
+    pty_index: Option<u32>,
     /// For PTY-bridged streams: whether this is the master side of the pair.
     /// When bridging a child's slave fd, the relay acts as a proxy for the
     /// slave, so `pty_is_master` is `false`.
@@ -5062,6 +5139,8 @@ mod tests {
         assert_allowed(Sysno::rt_sigaction);
         assert_allowed(Sysno::rt_sigprocmask);
         assert_allowed(Sysno::sigaltstack);
+        assert_allowed(Sysno::set_tid_address);
+        assert_allowed(Sysno::set_robust_list);
     }
 
     #[test]
