@@ -1669,6 +1669,39 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
     }
 
     for &bt in &[
+        crate::BinaryType::StaticPieGlibc,
+        crate::BinaryType::StaticPieMusl,
+    ] {
+        let id = format!("FET.socketpair_exec.{}.dpg1", bt.label());
+        typed_test!(
+            reg,
+            "xworker",
+            "unix_socket",
+            id,
+            timeout = 90,
+            agents[handle = AgentName::Dpg1],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let target = crate::binary_path(bt, &self_exe);
+                let resp = run
+                    .send_named_typed(
+                        &handle,
+                        &EXEC_BIN,
+                        ExecBinArgs {
+                            argv: vec![target, "unix-socket-test".into(), "socketpair-exec".into()],
+                            timeout_ms: Some(60 * 1000),
+                            stdin: None,
+                            env: vec![],
+                        },
+                    )
+                    .await;
+                let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("US6E_SOCKETPAIR_EXEC_OK"));
+                crate::coordinator::TestOutcome::new("dpg1", pass, format!("{resp:?}"))
+            }
+        );
+    }
+
+    for &bt in &[
         crate::BinaryType::StaticPieMusl,
         crate::BinaryType::NonPieStaticMusl,
     ] {
