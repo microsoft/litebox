@@ -612,8 +612,43 @@ fn build_docker_cmd(
         .arg(format!(
             "{}:/opt/non-pie-static-musl:ro",
             bins.non_pie_static_musl.display()
-        ))
-        .arg("-v")
+        ));
+    // For litebox pass, override the mount with the pre-rewritten copy
+    // of `litebox_test_harness` so the broker's `LITEBOX0` magic-trailer
+    // fast path fires (no runtime ELF syscall rewriting). Native pass
+    // gets the original — pre-rewritten binaries would crash without
+    // the shim to handle the trampolines.
+    if pass == "litebox" {
+        // Each binary variant has its own /opt/<variant>/ mount; override
+        // the litebox_test_harness file inside each with its prewritten
+        // copy. Docker layers single-file binds on top of the directory.
+        for (mount_target, prewritten) in [
+            (
+                "/opt/litebox/litebox_test_harness",
+                &bins.pie_glibc_prewritten,
+            ),
+            (
+                "/opt/nonpie/litebox_test_harness",
+                &bins.nonpie_glibc_prewritten,
+            ),
+            (
+                "/opt/static-pie-glibc/litebox_test_harness",
+                &bins.static_pie_glibc_prewritten,
+            ),
+            (
+                "/opt/static-pie-musl/litebox_test_harness",
+                &bins.static_pie_musl_prewritten,
+            ),
+            (
+                "/opt/non-pie-static-musl/litebox_test_harness",
+                &bins.non_pie_static_musl_prewritten,
+            ),
+        ] {
+            cmd.arg("-v")
+                .arg(format!("{}:{mount_target}:ro", prewritten.display()));
+        }
+    }
+    cmd.arg("-v")
         // Bind-mount the host test-logs/ directory into the container so
         // all in-container processes (tool_executor, broker, runner, the
         // in-guest harness) can append timing markers via
@@ -1185,6 +1220,15 @@ fn non_pie_static_musl_dir() -> PathBuf {
 /// [`setup`]. Each path corresponds to a leg of
 /// [`litebox_test_harness::BinaryType`] and is bind-mounted into the
 /// Docker container at the conventional `/opt/<label>` path.
+///
+/// Track 1 amortisation: each variant's `litebox_test_harness` binary
+/// is also pre-rewritten by `litebox_syscall_rewriter` into a sibling
+/// cache file (mtime-validated). For litebox pass, the prewritten
+/// copy is bind-mounted over the original path inside the container
+/// so the broker's `LITEBOX0` magic-trailer fast path fires (no
+/// runtime ELF syscall rewriting). Native pass uses the original
+/// binary; pre-rewritten binaries would crash without the shim to
+/// handle the trampolines.
 #[derive(Debug, Clone)]
 struct BinaryPaths {
     pie_glibc: PathBuf,
@@ -1192,6 +1236,81 @@ struct BinaryPaths {
     static_pie_glibc: PathBuf,
     static_pie_musl: PathBuf,
     non_pie_static_musl: PathBuf,
+    // Pre-rewritten copies of the `litebox_test_harness` binary for
+    // each variant. Same filename so the mount target inside the
+    // container is the same. Used for litebox pass only.
+    pie_glibc_prewritten: PathBuf,
+    nonpie_glibc_prewritten: PathBuf,
+    static_pie_glibc_prewritten: PathBuf,
+    static_pie_musl_prewritten: PathBuf,
+    non_pie_static_musl_prewritten: PathBuf,
+}
+
+/// Find `litebox_syscall_rewriter` in the workspace's target dir.
+fn rewriter_path() -> PathBuf {
+    debug_dir().join("litebox_syscall_rewriter")
+}
+
+/// Ensure a syscall-rewritten copy of `binary` exists at `out`.
+///
+/// Uses an mtime-based cache: if `out` exists with `mtime ==
+/// binary.mtime`, it's reused. Otherwise we invoke
+/// `litebox_syscall_rewriter` to produce a fresh copy and set the
+/// output's mtime to match the source. Concurrent writers are
+/// disambiguated with a temp file + atomic rename.
+fn ensure_rewritten(binary: &Path, out: &Path) {
+    let src_mtime = std::fs::metadata(binary)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", binary.display()))
+        .modified()
+        .unwrap();
+    if let Ok(meta) = std::fs::metadata(out)
+        && let Ok(out_mtime) = meta.modified()
+        && out_mtime == src_mtime
+    {
+        return;
+    }
+    if let Some(parent) = out.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = out.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let rewriter = rewriter_path();
+    let status = Command::new(&rewriter)
+        .arg(binary)
+        .arg("-o")
+        .arg(&tmp)
+        .status()
+        .unwrap_or_else(|e| panic!("invoke {}: {e}", rewriter.display()));
+    assert!(
+        status.success(),
+        "{} {} -> {} failed",
+        rewriter.display(),
+        binary.display(),
+        tmp.display()
+    );
+    // Stamp the output's mtime to match the source so the cache
+    // check above is sound. Using utimensat via filetime would be
+    // cleaner; touch via std on Unix uses the file_set_times API.
+    let src_meta = std::fs::metadata(binary).unwrap();
+    let times = std::fs::FileTimes::new()
+        .set_accessed(src_meta.accessed().unwrap_or(src_mtime))
+        .set_modified(src_mtime);
+    let f = std::fs::OpenOptions::new().write(true).open(&tmp).unwrap();
+    f.set_times(times).unwrap();
+    drop(f);
+    // Atomic rename — concurrent tests racing on the same cache file
+    // either see the old (mtime-valid) version or our new one. No
+    // partial writes are observable.
+    std::fs::rename(&tmp, out)
+        .unwrap_or_else(|e| panic!("rename {} -> {}: {e}", tmp.display(), out.display()));
+}
+
+/// Sibling cache file: a pre-rewritten copy of `litebox_test_harness`
+/// at the same filename inside a `.prewrite/` subdir of the variant's
+/// build directory. Same filename so the in-container mount target
+/// is the same as the original.
+fn prewritten_path(variant_dir: &Path) -> PathBuf {
+    variant_dir.join(".prewrite").join("litebox_test_harness")
 }
 
 /// Build the Docker test image if needed.
@@ -1376,19 +1495,62 @@ fn setup() -> (PathBuf, BinaryPaths) {
             let ws_root = workspace_root();
             ensure_binaries_built(&ws_root);
             ensure_docker_image(&ws_root);
-            let bins = BinaryPaths {
+            // Also build the syscall rewriter so we can pre-rewrite the
+            // test_harness variants below. It lives in the default
+            // target dir; ensure_binaries_built already pulls it in
+            // transitively but be explicit.
+            let rewriter_status = Command::new("cargo")
+                .current_dir(&ws_root)
+                .args([
+                    "build",
+                    "--target-dir",
+                    &target_dir().to_string_lossy(),
+                    "-p",
+                    "litebox_syscall_rewriter",
+                ])
+                .status()
+                .expect("cargo build litebox_syscall_rewriter");
+            assert!(rewriter_status.success(), "cargo build rewriter failed");
+            assert!(
+                rewriter_path().exists(),
+                "rewriter binary missing at {}",
+                rewriter_path().display()
+            );
+
+            let mut bins = BinaryPaths {
                 pie_glibc: debug_dir(),
                 nonpie_glibc: nonpie_dir(),
                 static_pie_glibc: static_pie_glibc_dir(),
                 static_pie_musl: static_pie_musl_dir(),
                 non_pie_static_musl: non_pie_static_musl_dir(),
+                pie_glibc_prewritten: prewritten_path(&debug_dir()),
+                nonpie_glibc_prewritten: prewritten_path(&nonpie_dir()),
+                static_pie_glibc_prewritten: prewritten_path(&static_pie_glibc_dir()),
+                static_pie_musl_prewritten: prewritten_path(&static_pie_musl_dir()),
+                non_pie_static_musl_prewritten: prewritten_path(&non_pie_static_musl_dir()),
             };
-            for (label, dir) in [
-                ("PIE-glibc", &bins.pie_glibc),
-                ("non-PIE-glibc", &bins.nonpie_glibc),
-                ("static-PIE-glibc", &bins.static_pie_glibc),
-                ("static-PIE-musl", &bins.static_pie_musl),
-                ("non-PIE-static-musl", &bins.non_pie_static_musl),
+            for (label, dir, prewritten) in [
+                ("PIE-glibc", &bins.pie_glibc, &bins.pie_glibc_prewritten),
+                (
+                    "non-PIE-glibc",
+                    &bins.nonpie_glibc,
+                    &bins.nonpie_glibc_prewritten,
+                ),
+                (
+                    "static-PIE-glibc",
+                    &bins.static_pie_glibc,
+                    &bins.static_pie_glibc_prewritten,
+                ),
+                (
+                    "static-PIE-musl",
+                    &bins.static_pie_musl,
+                    &bins.static_pie_musl_prewritten,
+                ),
+                (
+                    "non-PIE-static-musl",
+                    &bins.non_pie_static_musl,
+                    &bins.non_pie_static_musl_prewritten,
+                ),
             ] {
                 let bin = dir.join("litebox_test_harness");
                 assert!(
@@ -1397,7 +1559,19 @@ fn setup() -> (PathBuf, BinaryPaths) {
                      after ensure_binaries_built",
                     bin.display()
                 );
+                // Pre-rewrite (mtime-cached). One-time cost on rebuild,
+                // free thereafter. ~1.2s × 5 variants = ~6s on cold start.
+                let t0 = std::time::Instant::now();
+                ensure_rewritten(&bin, prewritten);
+                let elapsed = t0.elapsed();
+                if elapsed.as_millis() > 50 {
+                    eprintln!("[setup] pre-rewrote {label} in {} ms", elapsed.as_millis());
+                }
             }
+            // Touch suppression to satisfy mutability of `bins` above
+            // — fields are populated via the literal, no further
+            // mutation needed.
+            let _ = &mut bins;
             (ws_root, bins)
         })
         .clone()
