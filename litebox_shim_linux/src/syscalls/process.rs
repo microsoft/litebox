@@ -25,7 +25,8 @@ use litebox::platform::{RawMutPointer as _, TimerHandle, TimerProvider};
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
+    ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
+    errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -134,6 +135,20 @@ pub(crate) struct Alarm {
     pub(crate) handle: Option<<Platform as litebox::platform::TimerProvider>::TimerHandle>,
     /// The deadline for the alarm.
     pub(crate) deadline: Option<<Platform as litebox::platform::TimeProvider>::Instant>,
+}
+
+impl Alarm {
+    /// Returns the time remaining until [`Self::deadline`], or zero if the
+    /// alarm is not armed or its deadline has already passed.
+    pub(crate) fn remaining(
+        &self,
+        now: <Platform as litebox::platform::TimeProvider>::Instant,
+    ) -> Duration {
+        self.deadline
+            .as_ref()
+            .and_then(|d| d.checked_duration_since(&now))
+            .unwrap_or(Duration::ZERO)
+    }
 }
 
 /// The locked portion of the process state.
@@ -1129,25 +1144,24 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// The alarm is per-process: all threads share the same alarm timer.
     pub(crate) fn sys_alarm(&self, seconds: u32) -> Result<u32, Errno> {
+        let prev = self.arm_real_timer(Duration::from_secs(u64::from(seconds)))?;
+        // Round remaining time up to whole seconds, saturating to u32::MAX.
+        if prev.is_zero() {
+            Ok(0)
+        } else {
+            let extra = u64::from(prev.subsec_nanos() > 0);
+            Ok(u32::try_from(prev.as_secs() + extra).unwrap_or(u32::MAX))
+        }
+    }
+
+    /// Arm or disarm the per-process `ITIMER_REAL` timer (the state `alarm()`
+    /// and `setitimer(ITIMER_REAL, ...)` both manipulate). Returns the raw
+    /// `Duration` remaining on the previous arming; zero means "was not
+    /// armed". `delay = 0` disarms.
+    fn arm_real_timer(&self, delay: Duration) -> Result<Duration, Errno> {
         let mut alarm = self.process().alarm_timer.lock();
         let now = self.global.platform.now();
-        // Get remaining seconds from any previous alarm (rounded up to second).
-        let remaining = match alarm.deadline {
-            Some(deadline) => {
-                match deadline.checked_duration_since(&now) {
-                    Some(dur) if !dur.is_zero() => {
-                        let secs = dur.as_secs();
-                        let extra = u64::from(dur.subsec_nanos() > 0);
-                        // Saturate to u32::MAX to avoid truncation.
-                        u32::try_from(secs + extra).unwrap_or(u32::MAX)
-                    }
-                    _ => 0, // Deadline already passed or is now.
-                }
-            }
-            None => 0,
-        };
-
-        let delay = Duration::from_secs(u64::from(seconds));
+        let prev = alarm.remaining(now);
         let new_deadline = if delay.is_zero() {
             None
         } else {
@@ -1159,9 +1173,7 @@ impl<FS: ShimFS> Task<FS> {
                 .platform
                 .create_timer(litebox_common_linux::signal::Signal::SIGALRM)
             {
-                Ok(handle) => {
-                    alarm.handle = Some(handle);
-                }
+                Ok(handle) => alarm.handle = Some(handle),
                 Err(litebox::platform::TimerCreationError::Unsupported) => {}
                 Err(_) => unimplemented!(),
             }
@@ -1170,8 +1182,60 @@ impl<FS: ShimFS> Task<FS> {
             handle.set_timer(delay);
         }
         alarm.deadline = new_deadline;
+        Ok(prev)
+    }
 
-        Ok(remaining)
+    /// Handle syscall `setitimer`.
+    pub(crate) fn sys_setitimer(
+        &self,
+        which: IntervalTimer,
+        new_value: Option<ConstPtr<ItimerVal>>,
+        old_value: Option<MutPtr<ItimerVal>>,
+    ) -> Result<(), Errno> {
+        let new = match new_value {
+            Some(ptr) => ptr.read_at_offset(0).ok_or(Errno::EFAULT)?,
+            // Linux supports NULL `new_value` but says it would be removed in the future.
+            None => ItimerVal::default(),
+        };
+        // tv_usec range check is performed by `Duration::try_from(TimeVal)`.
+        let new_interval = Duration::try_from(new.it_interval())?;
+        let new_remaining = Duration::try_from(new.it_value())?;
+
+        let prev = match which {
+            IntervalTimer::Real => {
+                // TODO: support periodic timers
+                if !new_interval.is_zero() {
+                    log_unsupported!("setitimer: nonzero it_interval not supported");
+                    return Err(Errno::ENOSYS);
+                }
+                ItimerVal::single_shot(self.arm_real_timer(new_remaining)?)
+            }
+            IntervalTimer::Virtual | IntervalTimer::Prof => {
+                log_unsupported!("setitimer: ITIMER_VIRTUAL/PROF not supported");
+                return Err(Errno::ENOSYS);
+            }
+        };
+
+        if let Some(out) = old_value {
+            out.write_at_offset(0, prev).ok_or(Errno::EFAULT)?;
+        }
+        Ok(())
+    }
+
+    /// Handle syscall `getitimer`.
+    pub(crate) fn sys_getitimer(&self, which: IntervalTimer) -> ItimerVal {
+        let value = match which {
+            IntervalTimer::Real => {
+                let alarm = self.process().alarm_timer.lock();
+                let now = self.global.platform.now();
+                alarm.remaining(now)
+            }
+            IntervalTimer::Virtual | IntervalTimer::Prof => {
+                log_unsupported!("getitimer: ITIMER_VIRTUAL/PROF not supported");
+                Duration::ZERO
+            }
+        };
+        ItimerVal::single_shot(value)
     }
 
     /// Handle syscall `pause`.

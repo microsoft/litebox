@@ -25,6 +25,7 @@ default = ["platform_linux_userland"]
 platform_linux_userland = ["litebox_platform_multiplex/platform_linux_userland_with_linux_syscall"]
 platform_windows_userland = ["litebox_platform_multiplex/platform_windows_userland"]
 platform_linux_snp = ["litebox_platform_multiplex/platform_linux_snp"]
+alarm_fallback = []
 
 [dev-dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }

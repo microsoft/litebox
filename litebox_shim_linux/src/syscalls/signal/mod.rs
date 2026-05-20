@@ -613,6 +613,8 @@ impl<FS: ShimFS> Task<FS> {
     /// enqueue `SIGALRM`.
     ///
     /// Note this is a fallback in case the platform does not support timers.
+    #[cfg(feature = "alarm_fallback")]
+    #[inline]
     pub(crate) fn check_alarm_deadline(&self) {
         use litebox::platform::TimeProvider as _;
         let mut alarm = self.process().alarm_timer.lock();
@@ -621,7 +623,6 @@ impl<FS: ShimFS> Task<FS> {
             // to check the deadline here.
             return;
         }
-
         if alarm
             .deadline
             .is_some_and(|deadline| self.global.platform.now() >= deadline)
