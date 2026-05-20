@@ -14,8 +14,8 @@ use crate::pgrp_signal_inbox::PgrpSignalInbox;
 use crate::state_registry::{BrokerStateRegistry, StateHandle};
 use crate::state_service::{
     ConnState, SubscriptionRegistry, handle_deliver_signal_inbox, handle_pty_ioctl,
-    handle_request as state_handle_request, handle_subscribe_signal_inbox,
-    handle_unsubscribe_signal_inbox,
+    handle_request as state_handle_request, handle_set_pgid, handle_set_sid,
+    handle_subscribe_signal_inbox, handle_unsubscribe_signal_inbox,
 };
 use litebox_common_linux::fd_token_protocol::{
     BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, StatusCode, build_error_response,
@@ -1103,6 +1103,32 @@ fn handle_control_connection_inner(
                     }
                     Opcode::UnsubscribeSignalInbox => {
                         let result = handle_unsubscribe_signal_inbox(
+                            pgrp_signal_inbox,
+                            conn_state,
+                            &frame,
+                            in_fds,
+                        );
+                        SocketHandlerResult {
+                            frame: result.frame,
+                            out_fd: result.out_fd,
+                        }
+                    }
+                    Opcode::SetPgid => {
+                        let result = handle_set_pgid(
+                            process_registry,
+                            pgrp_signal_inbox,
+                            conn_state,
+                            &frame,
+                            in_fds,
+                        );
+                        SocketHandlerResult {
+                            frame: result.frame,
+                            out_fd: result.out_fd,
+                        }
+                    }
+                    Opcode::SetSid => {
+                        let result = handle_set_sid(
+                            process_registry,
                             pgrp_signal_inbox,
                             conn_state,
                             &frame,

@@ -98,7 +98,11 @@ pub fn try_register_broker_guest_pid() -> Option<u32> {
     let provider = broker_guest_pid_provider()?;
     match provider.register_process() {
         Ok(pid) => Some(pid),
-        Err(GuestPidProviderError::UnknownHandle | GuestPidProviderError::Io) => None,
+        Err(
+            GuestPidProviderError::UnknownHandle
+            | GuestPidProviderError::NotPermitted
+            | GuestPidProviderError::Io,
+        ) => None,
     }
 }
 
@@ -119,6 +123,28 @@ pub fn try_mark_broker_process_exited(pid: u32, exit_code: i32) {
         log_unsupported!(
             "broker MarkProcessExited failed for pid {pid} status {exit_code}: {err:?}"
         );
+    }
+}
+
+/// Convenience: stamp a setpgid with the broker if a provider is installed.
+pub fn try_broker_set_pgid(
+    caller_pid: u32,
+    target_pid: u32,
+    new_pgid: u32,
+) -> Result<(), GuestPidProviderError> {
+    if let Some(provider) = broker_guest_pid_provider() {
+        provider.set_pgid(caller_pid, target_pid, new_pgid)
+    } else {
+        Ok(())
+    }
+}
+
+/// Convenience: stamp a setsid with the broker if a provider is installed.
+pub fn try_broker_set_sid(caller_pid: u32) -> Result<u32, GuestPidProviderError> {
+    if let Some(provider) = broker_guest_pid_provider() {
+        provider.set_sid(caller_pid)
+    } else {
+        Ok(caller_pid)
     }
 }
 

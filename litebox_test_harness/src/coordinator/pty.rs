@@ -38,6 +38,7 @@ enum ScenarioKind {
     Tiocsctty,
     Resize,
     WinsizeCrossWorker,
+    SetpgidCrossWorker,
     ExecShellSession,
     /// PTYR.stdout_roundtrip — child writes a unique marker to fd 1
     /// (PTY slave) via `printf` after exec; parent reads from master.
@@ -94,6 +95,11 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "setpgid_cross_worker",
+        kind: ScenarioKind::SetpgidCrossWorker,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "exec_shell_session",
         kind: ScenarioKind::ExecShellSession,
         per_binary_type: false,
@@ -137,6 +143,8 @@ const TIOCSCTTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.tiocs
 const RESIZE: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.resize");
 const WINSIZE_CROSS_WORKER: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.winsize_cross_worker");
+const SETPGID_CROSS_WORKER: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.setpgid_cross_worker");
 const EXEC_SHELL_SESSION: HandlerToken<(), PtyOut> = HandlerToken::new("pty.exec_shell_session");
 // PTYR.* tokens — regression coverage for non-PIE worker-handoff stdio.
 const PTYR_STDOUT_ROUNDTRIP: HandlerToken<TargetArgs, PtyOut> =
@@ -226,6 +234,13 @@ async fn handle_winsize_cross_worker(
     Ok(PtyOut { detail })
 }
 
+async fn handle_setpgid_cross_worker(
+    args: TargetArgs,
+    ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    handle_winsize_cross_worker(args, ctx).await
+}
+
 async fn handle_exec_shell_session(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
@@ -290,6 +305,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(TIOCSCTTY, handle_tiocsctty);
     register_handler!(RESIZE, handle_resize);
     register_handler!(WINSIZE_CROSS_WORKER, handle_winsize_cross_worker);
+    register_handler!(SETPGID_CROSS_WORKER, handle_setpgid_cross_worker);
     register_handler!(EXEC_SHELL_SESSION, handle_exec_shell_session);
     register_handler!(PTYR_STDOUT_ROUNDTRIP, handle_ptyr_stdout_roundtrip);
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
@@ -390,6 +406,10 @@ async fn drive_target(
         ScenarioKind::Resize => run.send_named_typed(handle, &RESIZE, args).await?,
         ScenarioKind::WinsizeCrossWorker => {
             run.send_named_typed(handle, &WINSIZE_CROSS_WORKER, args)
+                .await?
+        }
+        ScenarioKind::SetpgidCrossWorker => {
+            run.send_named_typed(handle, &SETPGID_CROSS_WORKER, args)
                 .await?
         }
         ScenarioKind::StdoutRoundtrip => {

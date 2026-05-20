@@ -43,6 +43,8 @@ pub enum GuestPidProviderError {
     /// The handle id was unknown to the broker (stale or never
     /// registered). Maps to no-op for release; for diagnostics only.
     UnknownHandle,
+    /// Operation was rejected with EPERM-like process-group/session semantics.
+    NotPermitted,
     /// Generic communications or broker-side failure.
     Io,
 }
@@ -74,6 +76,17 @@ pub trait GuestPidProvider: Send + Sync {
     /// wake any process-exit subscribers. Exit paths log failures but
     /// must not fail process teardown.
     fn mark_process_exited(&self, pid: u32, exit_code: i32) -> Result<(), GuestPidProviderError>;
+
+    /// Eagerly stamp a successful `setpgid` in the broker.
+    fn set_pgid(
+        &self,
+        caller_pid: u32,
+        target_pid: u32,
+        new_pgid: u32,
+    ) -> Result<(), GuestPidProviderError>;
+
+    /// Eagerly stamp a successful `setsid` in the broker and return the new pgid.
+    fn set_sid(&self, caller_pid: u32) -> Result<u32, GuestPidProviderError>;
 
     /// Subscribe to process-exit readiness for `pid`, using the same
     /// broker notification ring as other broker-backed wait sources.

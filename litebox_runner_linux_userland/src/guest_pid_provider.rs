@@ -56,6 +56,23 @@ impl GuestPidProvider for RunnerGuestPidProvider {
             .map_err(|e| map_client_error(pid, e))
     }
 
+    fn set_pgid(
+        &self,
+        caller_pid: u32,
+        target_pid: u32,
+        new_pgid: u32,
+    ) -> Result<(), GuestPidProviderError> {
+        self.client
+            .set_pgid(caller_pid, target_pid, new_pgid)
+            .map_err(|e| map_client_error(target_pid, e))
+    }
+
+    fn set_sid(&self, caller_pid: u32) -> Result<u32, GuestPidProviderError> {
+        self.client
+            .set_sid(caller_pid)
+            .map_err(|e| map_client_error(caller_pid, e))
+    }
+
     fn subscribe_process_exit(
         &self,
         pid: u32,
@@ -113,6 +130,10 @@ fn map_client_error(
         litebox_common_linux::fd_token_client::ClientError::UnknownHandle { .. } => {
             tracing::warn!(pid, "process-exit RPC returned UnknownHandle");
             GuestPidProviderError::UnknownHandle
+        }
+        litebox_common_linux::fd_token_client::ClientError::InvalidValue { .. } => {
+            tracing::warn!(pid, "process-group RPC returned EPERM-like rejection");
+            GuestPidProviderError::NotPermitted
         }
         other => {
             tracing::warn!(pid, error = %other, "process-exit RPC failed (mapped to Io)");

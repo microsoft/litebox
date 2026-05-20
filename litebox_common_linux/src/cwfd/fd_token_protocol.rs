@@ -164,6 +164,10 @@ pub enum Opcode {
     UnsubscribeSignalInbox = 0x75,
     /// Ask the broker to dispatch a pgrp signal through PgrpSignalInbox.
     DeliverSignalInbox = 0x76,
+    /// Stamp a process-group change in the broker before the shim cache mutates.
+    SetPgid = 0x77,
+    /// Stamp session creation in the broker before the shim cache mutates.
+    SetSid = 0x78,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -199,6 +203,8 @@ pub enum Opcode {
     SubscribeSignalInboxResponse = 0xF4,
     UnsubscribeSignalInboxResponse = 0xF5,
     DeliverSignalInboxResponse = 0xF6,
+    SetPgidResponse = 0xF7,
+    SetSidResponse = 0xF8,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -322,6 +328,8 @@ impl Opcode {
             Opcode::SubscribeSignalInbox => Some(Opcode::SubscribeSignalInboxResponse),
             Opcode::UnsubscribeSignalInbox => Some(Opcode::UnsubscribeSignalInboxResponse),
             Opcode::DeliverSignalInbox => Some(Opcode::DeliverSignalInboxResponse),
+            Opcode::SetPgid => Some(Opcode::SetPgidResponse),
+            Opcode::SetSid => Some(Opcode::SetSidResponse),
             _ => None,
         }
     }
@@ -363,6 +371,8 @@ impl Opcode {
                 | Opcode::SubscribeSignalInbox
                 | Opcode::UnsubscribeSignalInbox
                 | Opcode::DeliverSignalInbox
+                | Opcode::SetPgid
+                | Opcode::SetSid
         )
     }
 
@@ -419,6 +429,8 @@ impl TryFrom<u8> for Opcode {
             0x74 => Ok(Opcode::SubscribeSignalInbox),
             0x75 => Ok(Opcode::UnsubscribeSignalInbox),
             0x76 => Ok(Opcode::DeliverSignalInbox),
+            0x77 => Ok(Opcode::SetPgid),
+            0x78 => Ok(Opcode::SetSid),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -452,6 +464,8 @@ impl TryFrom<u8> for Opcode {
             0xF4 => Ok(Opcode::SubscribeSignalInboxResponse),
             0xF5 => Ok(Opcode::UnsubscribeSignalInboxResponse),
             0xF6 => Ok(Opcode::DeliverSignalInboxResponse),
+            0xF7 => Ok(Opcode::SetPgidResponse),
+            0xF8 => Ok(Opcode::SetSidResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -897,6 +911,105 @@ pub fn build_mark_process_exited_response_ok() -> OwnedFrame {
         caller_pid: 0,
         body: Vec::new(),
     }
+}
+
+/// Body for [`Opcode::SetPgid`]: `(caller_pid: u32, target_pid: u32, new_pgid: u32, pad: 4)`.
+pub fn build_set_pgid_request(caller_pid: u32, target_pid: u32, new_pgid: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&caller_pid.to_le_bytes());
+    body.extend_from_slice(&target_pid.to_le_bytes());
+    body.extend_from_slice(&new_pgid.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::SetPgid,
+        status: StatusCode::Ok,
+        caller_pid,
+        body,
+    }
+}
+
+pub fn parse_set_pgid_body(body: &[u8]) -> Result<(u32, u32, u32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SetPgid,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    if body[12..16].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((
+        u32::from_le_bytes(body[0..4].try_into().expect("slice length checked")),
+        u32::from_le_bytes(body[4..8].try_into().expect("slice length checked")),
+        u32::from_le_bytes(body[8..12].try_into().expect("slice length checked")),
+    ))
+}
+
+pub fn build_set_pgid_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SetPgidResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::SetSid`]: `(caller_pid: u32, pad: 4)`.
+pub fn build_set_sid_request(caller_pid: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&caller_pid.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::SetSid,
+        status: StatusCode::Ok,
+        caller_pid,
+        body,
+    }
+}
+
+pub fn parse_set_sid_body(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SetSid,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[4..8].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok(u32::from_le_bytes(
+        body[0..4].try_into().expect("slice length checked"),
+    ))
+}
+
+pub fn build_set_sid_response_ok(new_pgid: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&new_pgid.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::SetSidResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_set_sid_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SetSidResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[4..8].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok(u32::from_le_bytes(
+        body[0..4].try_into().expect("slice length checked"),
+    ))
 }
 
 /// Body for [`Opcode::SubscribeSignalInbox`]:
