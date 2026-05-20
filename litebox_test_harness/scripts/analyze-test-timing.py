@@ -66,6 +66,15 @@ def summary(rows, label):
     phases = [
         "t_acquire_ms", "t_docker_start_ms", "t_docker_spawn_ms",
         "t_litebox_init_ms", "t_harness_load_ms", "t_useful_ms", "t_drain_ms",
+        # Phase A sub-phases (t_litebox_init_ms breakdown). Some are
+        # absent in native pass (no shim) or when a marker didn't fire.
+        "t_tool_executor_args_ms", "t_tool_executor_audit_ms",
+        "t_broker_spawn_ms", "t_broker_bind_ms",
+        "t_runner_spawn_call_ms", "t_runner_fork_ms",
+        "t_runner_broker_conn_ms", "t_runner_rootfs_ms",
+        "t_runner_program_load_ms", "t_runner_shim_handoff_ms",
+        # t_harness_load_ms breakdown.
+        "t_guest_runtime_init_ms", "t_harness_args_ms", "t_harness_dispatch_ms",
     ]
     print(f"\n{'phase':<22} {'p50':>10} {'p90':>10} {'p99':>10} {'max':>10} {'sum':>10}")
     for ph in phases:
