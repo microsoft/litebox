@@ -402,10 +402,12 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                  not implemented yet (guest_fd={guest_fd}, handle_id={handle_id})"
             ),
             BrokerHandleKind::Pty => {
-                use syscalls::broker_pty::BrokerPtyProviderReacquireExt;
                 let provider = syscalls::broker_pty::broker_pty_provider().ok_or(())?;
                 let role = pty_role.ok_or(())?;
-                let pty_fd = provider.reacquire(handle_id, role).map_err(|_| ())?;
+                let pty_fd = syscalls::broker_pty::BrokerPtyProviderReacquireExt::reacquire(
+                    &provider, handle_id, role,
+                )
+                .map_err(|_| ())?;
                 self.install_broker_pty_at_slot(pty_fd, guest_fd, &files)
             }
         }
@@ -1421,13 +1423,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 let Some(provider) = syscalls::broker_pty::broker_pty_provider() else {
                     continue;
                 };
-                use syscalls::broker_pty::BrokerPtyProviderReacquireExt;
                 let role = if entry.metadata.is_sandbox_pty_slave {
                     litebox_common_linux::broker_pty_provider::BrokerPtyRole::Slave
                 } else {
                     litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master
                 };
-                let Ok(pty_fd) = provider.reacquire(broker_handle.handle_id, role) else {
+                let Ok(pty_fd) = syscalls::broker_pty::BrokerPtyProviderReacquireExt::reacquire(
+                    &provider,
+                    broker_handle.handle_id,
+                    role,
+                ) else {
                     continue;
                 };
                 let typed: litebox::fd::TypedFd<syscalls::broker_pty::BrokerPtySubsystem> =

@@ -270,20 +270,20 @@ struct MmappedFile {
     abs_path: PathBuf,
 }
 
-/// Parses a `--broker-fd-bridge` spec string of the form
-/// `fd:kind:handle_id[:subkind]` and returns the components.
-///
-/// `subkind` is required for pipe direction, unix socketpair endpoint, and PTY role.
-fn parse_broker_fd_bridge_spec(
-    spec: &str,
-) -> Result<(
+type BrokerFdBridgeParsed = (
     usize,
     litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind,
     u64,
     Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
     Option<litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint>,
     Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
-)> {
+);
+
+/// Parses a `--broker-fd-bridge` spec string of the form
+/// `fd:kind:handle_id[:subkind]` and returns the components.
+///
+/// `subkind` is required for pipe direction, unix socketpair endpoint, and PTY role.
+fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
     use litebox_common_linux::broker_pty_provider::BrokerPtyRole;
     use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
