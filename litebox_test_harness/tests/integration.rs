@@ -67,6 +67,44 @@ use libtest_mimic::{Arguments, Failed, Trial};
 // docker overhead trims, timeout budgets) actually help. See plan in
 // `~/.copilot/session-state/.../plan.md`.
 
+/// Path to the per-trial timing file (host side). Bind-mounted into the
+/// container at `/tmp/litebox-timing.log`; each in-container process
+/// opens that path via `litebox_timing::init_from_env` and appends its
+/// own `[TIMING] name=ns\n` lines.
+///
+/// The file must exist on the host before `docker run` so the bind
+/// mount creates a file (not an implicit directory).
+fn timing_log_path_for(pass: &str, test_id: &str) -> PathBuf {
+    log_dir().join(format!("{pass}-{}.timing", sanitize_id(test_id)))
+}
+
+fn ensure_timing_log_file(path: &Path) {
+    // Create (or truncate) so concurrent trials never see stale data.
+    // Mode defaults to 0o644; the container bind-mounts the parent
+    // directory (not the file itself), so the in-container process
+    // creates new file contents via append and host permissions are
+    // not the bottleneck.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+}
+
+fn read_timing_log(path: &Path, markers: &mut TimingMarkers, pass: &str) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for raw in contents.lines() {
+        // The on-disk format is `name=ns\n` (no `[TIMING] ` prefix —
+        // that prefix was only for the stderr channel). Prepend it so
+        // `record_timing_marker` can reuse the existing parser.
+        let synthetic = format!("[TIMING] {raw}");
+        record_timing_marker(markers, &synthetic, pass, 0);
+    }
+}
+
 fn timing_file() -> &'static Mutex<std::fs::File> {
     static FILE: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
     FILE.get_or_init(|| {
@@ -148,20 +186,6 @@ fn record_timing_marker(markers: &mut TimingMarkers, line: &str, pass: &str, arr
             markers.harness_first_output_ns = Some(ns);
         }
         _ => {}
-    }
-}
-
-fn wait_for_timing_markers(markers: &Arc<Mutex<TimingMarkers>>, pass: &str) -> TimingMarkers {
-    let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        let snapshot = *markers.lock().expect("timing markers lock poisoned");
-        let has_required = snapshot.container_pid1_started_ns.is_some()
-            && snapshot.harness_first_output_ns.is_some()
-            && (pass == "native" || snapshot.litebox_shim_ready_ns.is_some());
-        if has_required || Instant::now() >= deadline {
-            return snapshot;
-        }
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -459,7 +483,26 @@ fn build_docker_cmd(
         .arg(format!(
             "{}:/opt/non-pie-static-musl:ro",
             bins.non_pie_static_musl.display()
-        ));
+        ))
+        .arg("-v")
+        // Bind-mount the host test-logs/ directory into the container so
+        // all in-container processes (tool_executor, broker, runner, the
+        // in-guest harness) can append timing markers via
+        // `litebox_timing::emit` to a per-trial file. WSL2 + Docker
+        // returns EACCES on a single-file bind-mount even when the
+        // container runs as root, so we bind-mount the directory and
+        // each component opens the per-trial file name.
+        .arg(format!("{}:/litebox-test-logs", log_dir().display()))
+        .args([
+            "-e",
+            &format!(
+                "LITEBOX_TIMING_PATH=/litebox-test-logs/{}",
+                timing_log_path_for(pass, test_id)
+                    .file_name()
+                    .expect("timing_log_path_for has file name")
+                    .to_string_lossy(),
+            ),
+        ]);
     if pass == "native" {
         cmd.args(["-e", "LITEBOX_TIMING_CONTAINER_PID1=1"]);
     }
@@ -553,6 +596,8 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
 
     let stdout_log = log_path_for(pass, test_id, "stdout");
     let stderr_log = log_path_for(pass, test_id, "stderr");
+    let timing_log = timing_log_path_for(pass, test_id);
+    ensure_timing_log_file(&timing_log);
 
     let mut cmd = build_docker_cmd(pass, test_id, &container_name, &bins);
     cmd.stdout(Stdio::piped());
@@ -614,7 +659,36 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     let t_json_ns = monotonic_nanos();
 
     let t_first_byte = t_first_byte.unwrap_or(t_json);
-    let markers = wait_for_timing_markers(&timing_markers, pass);
+    // Markers come from two sources:
+    //   * The bind-mounted timing-log file: tool_executor + broker +
+    //     runner + in-guest harness append `name=ns\n` via
+    //     `litebox_timing::emit`. All on host CLOCK_MONOTONIC EXCEPT
+    //     the in-guest harness in litebox pass, whose clock is
+    //     virtualized.
+    //   * The stderr `[TIMING] harness_first_output_ns=` proxy line
+    //     from the harness — used as a host-side arrival_ns boundary
+    //     for `harness_first_output_ns` in litebox pass (where the
+    //     guest's CLOCK_MONOTONIC value is not comparable to the
+    //     host-side markers).
+    // We pre-populate from the file first (all init markers are
+    // flushed by the time the JSON result line arrives on stdout),
+    // then merge the stderr snapshot — `record_timing_marker` is
+    // first-wins so the stderr arrival_ns proxy overrides the
+    // file's virtual-clock value when both are present.
+    let mut markers = TimingMarkers::default();
+    {
+        let stderr_snapshot = *timing_markers.lock().expect("timing markers lock poisoned");
+        if let Some(ns) = stderr_snapshot.harness_first_output_ns {
+            markers.harness_first_output_ns = Some(ns);
+        }
+        if let Some(ns) = stderr_snapshot.container_pid1_started_ns {
+            markers.container_pid1_started_ns = Some(ns);
+        }
+        if let Some(ns) = stderr_snapshot.litebox_shim_ready_ns {
+            markers.litebox_shim_ready_ns = Some(ns);
+        }
+    }
+    read_timing_log(&timing_log, &mut markers, pass);
     let shim_ready_ns = markers
         .litebox_shim_ready_ns
         .or(markers.container_pid1_started_ns);

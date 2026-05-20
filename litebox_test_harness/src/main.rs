@@ -73,44 +73,49 @@ mod agent_listen;
 use litebox_test_harness::coordinator;
 use litebox_test_harness::protocol;
 
-fn monotonic_nanos() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid out-pointer for `clock_gettime`.
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
-    if rc == 0 {
-        let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
-        let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
-        secs * 1_000_000_000 + nanos
-    } else {
-        0
-    }
-}
-
 #[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 fn main() {
+    litebox_timing::init_from_env();
+    // In the native pass the harness is container PID 1, so the first
+    // marker it emits IS the container_pid1_started_ns boundary. The
+    // integration harness sets LITEBOX_TIMING_CONTAINER_PID1=1 in
+    // native pass to ask for this marker; we emit it BEFORE
+    // harness_first_output_ns so the file ordering reflects reality
+    // and `t_harness_load_ms = harness_first_output_ns - container_pid1`
+    // stays non-negative.
+    if std::env::var_os("LITEBOX_TIMING_CONTAINER_PID1").is_some() {
+        litebox_timing::emit("container_pid1_started_ns");
+    }
+    litebox_timing::emit("harness_first_output_ns");
+
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map_or("spawn-tree", String::as_str);
     let self_exe = &args[0];
-    // Gate diagnostic prints when invoked as a PTY-test child: the PTY
-    // captures the child's stderr alongside its stdout, so any harness
-    // boilerplate contaminates PTY-test output assertions.
+    // PTY tests dup the harness's stderr as stdout; gate diagnostic
+    // prints (including the stderr `[TIMING]` proxy line used by the
+    // integration harness to bracket the guest under a virtualized
+    // CLOCK_MONOTONIC) so they don't contaminate PTY assertions.
+    // The file-channel emissions above are structurally PTY-safe (they
+    // go to a bind-mounted host directory, not stderr), so they fire
+    // unconditionally.
     let is_pty_child = cmd.starts_with("pty-");
 
     if !is_pty_child {
-        if std::env::var_os("LITEBOX_TIMING_CONTAINER_PID1").is_some() {
-            eprintln!("[TIMING] container_pid1_started_ns={}", monotonic_nanos());
-        }
-        eprintln!("[TIMING] harness_first_output_ns={}", monotonic_nanos());
+        // Host-clock proxy: in litebox pass, the guest's
+        // CLOCK_MONOTONIC is virtualized, so the integration harness
+        // uses the host arrival time of this stderr line as the
+        // `harness_first_output_ns` boundary. Keep this minimal sentinel
+        // ONLY for that one boundary. All other markers live in the
+        // file channel (litebox_timing).
+        eprintln!(
+            "[TIMING] harness_first_output_ns={}",
+            litebox_timing::monotonic_nanos()
+        );
     }
 
     // Log the resolved binary path so stale rootfs copies are immediately
     // obvious (args[0] may differ from the real on-disk path).
-    if !is_pty_child
-        && let Ok(real) = std::env::current_exe()
-    {
+    if !is_pty_child && let Ok(real) = std::env::current_exe() {
         eprintln!("[harness] self_exe={self_exe} resolved={}", real.display());
     }
 

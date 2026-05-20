@@ -1800,6 +1800,7 @@ dependencies = [
  "litebox_platform_multiplex",
  "litebox_shim_linux",
  "litebox_syscall_rewriter",
+ "litebox_timing",
  "memmap2",
  "serde",
  "serde_json",
@@ -1946,9 +1947,17 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libtest-mimic",
+ "litebox_timing",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "litebox_timing"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -1958,6 +1967,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "litebox_timing",
 ]
 
 [[package]]
