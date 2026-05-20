@@ -271,9 +271,9 @@ struct MmappedFile {
 }
 
 /// Parses a `--broker-fd-bridge` spec string of the form
-/// `fd:kind:handle_id[:direction]` and returns the components.
+/// `fd:kind:handle_id[:subkind]` and returns the components.
 ///
-/// `direction` is required when `kind == Pipe` and rejected otherwise.
+/// `subkind` is required for pipe direction, unix socketpair endpoint, and PTY role.
 fn parse_broker_fd_bridge_spec(
     spec: &str,
 ) -> Result<(
@@ -282,8 +282,10 @@ fn parse_broker_fd_bridge_spec(
     u64,
     Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
     Option<litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint>,
+    Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
 )> {
     use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
+    use litebox_common_linux::broker_pty_provider::BrokerPtyRole;
     use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
     use litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind;
     let parts: Vec<&str> = spec.split(':').collect();
@@ -305,9 +307,9 @@ fn parse_broker_fd_bridge_spec(
     let handle_id: u64 = parts[2]
         .parse()
         .map_err(|e| anyhow!("broker-fd-bridge: bad handle {:?}: {e}", parts[2]))?;
-    let (direction, endpoint) = match (kind, parts.get(3)) {
-        (BrokerHandleKind::Pipe, Some(&"r")) => (Some(BrokerPipeEnd::Read), None),
-        (BrokerHandleKind::Pipe, Some(&"w")) => (Some(BrokerPipeEnd::Write), None),
+    let (direction, endpoint, pty_role) = match (kind, parts.get(3)) {
+        (BrokerHandleKind::Pipe, Some(&"r")) => (Some(BrokerPipeEnd::Read), None, None),
+        (BrokerHandleKind::Pipe, Some(&"w")) => (Some(BrokerPipeEnd::Write), None, None),
         (BrokerHandleKind::Pipe, Some(other)) => {
             anyhow::bail!("broker-fd-bridge: pipe direction must be 'r' or 'w', got {other:?}")
         }
@@ -316,8 +318,12 @@ fn parse_broker_fd_bridge_spec(
                 "broker-fd-bridge: pipe kind requires :r or :w direction suffix (spec {spec:?})"
             )
         }
-        (BrokerHandleKind::UnixSocket, Some(&"a")) => (None, Some(BrokerSocketPairEndpoint::A)),
-        (BrokerHandleKind::UnixSocket, Some(&"b")) => (None, Some(BrokerSocketPairEndpoint::B)),
+        (BrokerHandleKind::UnixSocket, Some(&"a")) => {
+            (None, Some(BrokerSocketPairEndpoint::A), None)
+        }
+        (BrokerHandleKind::UnixSocket, Some(&"b")) => {
+            (None, Some(BrokerSocketPairEndpoint::B), None)
+        }
         (BrokerHandleKind::UnixSocket, Some(other)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unix_socket endpoint must be 'a' or 'b', got {other:?}"
@@ -328,15 +334,23 @@ fn parse_broker_fd_bridge_spec(
                 "broker-fd-bridge: unix_socket kind requires :a or :b endpoint suffix (spec {spec:?})"
             )
         }
+        (BrokerHandleKind::Pty, Some(&"m")) => (None, None, Some(BrokerPtyRole::Master)),
+        (BrokerHandleKind::Pty, Some(&"s")) => (None, None, Some(BrokerPtyRole::Slave)),
+        (BrokerHandleKind::Pty, Some(other)) => {
+            anyhow::bail!("broker-fd-bridge: pty role must be 'm' or 's', got {other:?}")
+        }
+        (BrokerHandleKind::Pty, None) => {
+            anyhow::bail!("broker-fd-bridge: pty kind requires :m or :s suffix (spec {spec:?})")
+        }
         (_, Some(extra)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
                 parts[1]
             )
         }
-        (_, None) => (None, None),
+        (_, None) => (None, None, None),
     };
-    Ok((guest_fd, kind, handle_id, direction, endpoint))
+    Ok((guest_fd, kind, handle_id, direction, endpoint, pty_role))
 }
 
 fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
@@ -1077,7 +1091,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
+            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, _pty_role) =
                 parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
@@ -1180,7 +1194,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // extended in Phase C.3 to handle pipe).
     let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
     for spec in &cli_args.broker_fd_bridge {
-        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
+        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, _pty_role) =
             parse_broker_fd_bridge_spec(spec)?;
         program
             .entrypoints
@@ -2482,7 +2496,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(guest_task);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
+            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, _pty_role) =
                 parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
