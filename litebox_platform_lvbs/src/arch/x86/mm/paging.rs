@@ -161,7 +161,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         flush_tlb: bool,
         clean_up_page_tables: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
-        // This is based on `TLB_SINGLE_PAGE_FLUSH_CEILING` which is goverend by `HvCallFlushVirtualAddressList`.
+        // This is based on `TLB_SINGLE_PAGE_FLUSH_CEILING` which is governed by `HvCallFlushVirtualAddressList`.
         const UNMAP_BATCH: usize = 32;
         if range.is_empty() {
             return Ok(());
