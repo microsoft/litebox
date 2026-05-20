@@ -296,6 +296,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         socketpair_endpoint: Option<
             litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint,
         >,
+        pty_role: Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
     ) -> Result<(), ()> {
         use syscalls::fork_snapshot::BrokerHandleKind;
         let files = self.task.files.borrow();
@@ -400,10 +401,15 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 "install_broker_bridge_fd for BrokerHandleKind::Signalfd \
                  not implemented yet (guest_fd={guest_fd}, handle_id={handle_id})"
             ),
-            BrokerHandleKind::Pty => todo!(
-                "install_broker_bridge_fd for BrokerHandleKind::Pty \
-                 not implemented yet (guest_fd={guest_fd}, handle_id={handle_id})"
-            ),
+            BrokerHandleKind::Pty => {
+                let provider = syscalls::broker_pty::broker_pty_provider().ok_or(())?;
+                let role = pty_role.ok_or(())?;
+                let pty_fd = syscalls::broker_pty::BrokerPtyProviderReacquireExt::reacquire(
+                    &provider, handle_id, role,
+                )
+                .map_err(|_| ())?;
+                self.install_broker_pty_at_slot(pty_fd, guest_fd, &files)
+            }
         }
     }
 
@@ -416,7 +422,30 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         kind: syscalls::fork_snapshot::BrokerHandleKind,
         handle_id: u64,
     ) -> Result<(), ()> {
-        self.install_broker_bridge_fd(guest_fd, kind, handle_id, None, None)
+        self.install_broker_bridge_fd(guest_fd, kind, handle_id, None, None, None)
+    }
+
+    fn install_broker_pty_at_slot(
+        &self,
+        pty_fd: syscalls::broker_pty::BrokerPtyFd<Platform>,
+        guest_fd: usize,
+        files: &syscalls::file::FilesState<FS>,
+    ) -> Result<(), ()> {
+        let typed_fd: litebox::fd::TypedFd<syscalls::broker_pty::BrokerPtySubsystem> = self
+            .task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert(pty_fd);
+
+        let mut rds = files.raw_descriptor_store.write();
+        let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+        let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
+        debug_assert!(
+            ok,
+            "install_broker_bridge_fd(pty): slot {guest_fd} still occupied"
+        );
+        if ok { Ok(()) } else { Err(()) }
     }
 
     fn install_eventfd_at_slot(
@@ -1394,38 +1423,18 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 let Some(provider) = syscalls::broker_pty::broker_pty_provider() else {
                     continue;
                 };
-                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
-                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
-                    alloc::sync::Arc::clone(&provider) as _;
-                let _ = releaser.dup_handle(broker_handle.handle_id);
-                let pty_id = entry.metadata.sandbox_pty_index.unwrap_or_else(|| {
-                    provider
-                        .ioctl_pty(
-                            broker_handle.handle_id,
-                            litebox_common_linux::fd_token_protocol::PtyIoctlOp::Tiocgptn,
-                            &[],
-                        )
-                        .ok()
-                        .and_then(|p| {
-                            p.get(..4)
-                                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-                        })
-                        .unwrap_or(0)
-                });
-                let is_master = !entry.metadata.is_sandbox_pty_slave;
-                let slave_anchor = if is_master {
-                    provider.open_pty_slave(pty_id).ok()
+                let role = if entry.metadata.is_sandbox_pty_slave {
+                    litebox_common_linux::broker_pty_provider::BrokerPtyRole::Slave
                 } else {
-                    None
+                    litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master
                 };
-                let pty_fd = syscalls::broker_pty::BrokerPtyFd::<Platform>::new(
-                    provider,
+                let Ok(pty_fd) = syscalls::broker_pty::BrokerPtyProviderReacquireExt::reacquire(
+                    &provider,
                     broker_handle.handle_id,
-                    pty_id,
-                    is_master,
-                    slave_anchor,
-                    litebox::fs::OFlags::empty(),
-                );
+                    role,
+                ) else {
+                    continue;
+                };
                 let typed: litebox::fd::TypedFd<syscalls::broker_pty::BrokerPtySubsystem> =
                     self.global.litebox.descriptor_table_mut().insert(pty_fd);
                 let mut rds = child_files.raw_descriptor_store.write();
@@ -1626,19 +1635,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         // dedicated branch if FdClass::UnixSocket doesn't
                         // exist yet — handled near the FdClass::Pipe block).
                         BrokerHandleKind::UnixSocket => None,
-                        // `Signalfd` and `Pty` aren't yet wired into
-                        // fork-snapshot restore. If a snapshot carries one,
-                        // we have a real gap that should fail loud.
+                        // `Signalfd` is restored by its dedicated FdClass branch below.
                         BrokerHandleKind::Signalfd => todo!(
                             "fork-snapshot restore for BrokerHandleKind::Signalfd \
                              not implemented yet (handle_id={})",
                             broker_handle.handle_id
                         ),
-                        BrokerHandleKind::Pty => todo!(
-                            "fork-snapshot restore for BrokerHandleKind::Pty \
-                             not implemented yet (handle_id={})",
-                            broker_handle.handle_id
-                        ),
+                        // PTYs are restored by the broker-backed PTY FilesystemFd branch above.
+                        BrokerHandleKind::Pty => None,
                     };
                 let Some(event_file) = event_file else {
                     continue;
