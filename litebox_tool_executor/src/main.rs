@@ -485,8 +485,13 @@ impl BrokerProcess {
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn litebox_broker: {e}"))?;
 
-        // Give the broker a moment to create the socket.
-        for _ in 0..50 {
+        // Wait for the broker to bind its UDS. Poll on a tight 10 ms
+        // interval (down from 100 ms): before this change, p50
+        // `t_broker_bind_ms` was 105 ms — effectively one full poll
+        // cycle past actual readiness because the broker becomes
+        // ready within tens of ms. Total budget unchanged (5 s) but
+        // the typical case wakes up sooner.
+        for _ in 0..500 {
             if socket_path.exists() {
                 litebox_timing::emit("broker_socket_ready_ns");
                 return Ok(Self {
@@ -495,7 +500,7 @@ impl BrokerProcess {
                     fd_token_socket_path,
                 });
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         Ok(Self {
