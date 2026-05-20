@@ -902,6 +902,26 @@ impl<FS: ShimFS> Task<FS> {
                         .map(|()| 0)
                 })
             }),
+            SyscallRequest::Statx {
+                dirfd,
+                pathname,
+                flags,
+                mask,
+                statxbuf,
+            } => {
+                match pathname {
+                    None => Ok(c"".into()), // empty path means stat the dirfd itself
+                    Some(p) => p.to_cstring().ok_or(Errno::EFAULT),
+                }
+                .and_then(|path| {
+                    self.sys_statx(dirfd, path, flags, mask).and_then(|sx| {
+                        statxbuf
+                            .write_at_offset(0, sx)
+                            .ok_or(Errno::EFAULT)
+                            .map(|()| 0)
+                    })
+                })
+            }
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }

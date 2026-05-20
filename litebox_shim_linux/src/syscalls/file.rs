@@ -20,6 +20,7 @@ use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, InodeType,
     IoReadVec, IoWriteVec, IoctlArg, TimeParam, errno::Errno, signal::Signal,
 };
+use litebox_common_linux::{Statx, StatxMask};
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
@@ -932,114 +933,54 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileStat, Errno> {
-    let fstat = task
-        .files
-        .borrow()
+fn descriptor_stat<FS: ShimFS, T>(raw_fd: usize, task: &Task<FS>) -> Result<T, Errno>
+where
+    T: From<litebox::fs::FileStatus> + From<FileStat>,
+{
+    // TODO: give correct values for the synthesized branches.
+    let synthetic = |mode_bits: u32, blksize: usize| FileStat {
+        st_dev: 0,
+        st_ino: 0,
+        st_nlink: 1,
+        st_mode: mode_bits.truncate(),
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        st_size: 0,
+        st_blksize: blksize,
+        st_blocks: 0,
+        ..Default::default()
+    };
+    let socket_mode = litebox_common_linux::InodeType::Socket as u32
+        | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
+    let rw_user_mode = (Mode::RUSR | Mode::WUSR).bits();
+    let files = task.files.borrow();
+    files
         .run_on_raw_fd(
             raw_fd,
             |fd| {
-                task.files
-                    .borrow()
+                files
                     .fs
                     .fd_file_status(fd)
-                    .map(FileStat::from)
+                    .map(T::from)
                     .map_err(Errno::from)
             },
-            |_fd| {
-                Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
-                    st_nlink: 1,
-                    st_mode: (litebox_common_linux::InodeType::Socket as u32
-                        | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
-                    .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_rdev: 0,
-                    st_size: 0,
-                    st_blksize: 4096,
-                    st_blocks: 0,
-                    ..Default::default()
-                })
-            },
+            |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
             |fd| {
                 let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
                 let read_write_mode = match half_pipe_type {
                     litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
                     litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
                 };
-                Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
-                    st_nlink: 1,
-                    st_mode: (read_write_mode.bits()
-                        | litebox_common_linux::InodeType::NamedPipe as u32)
-                        .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_rdev: 0,
-                    st_size: 0,
-                    st_blksize: 4096,
-                    st_blocks: 0,
-                    ..Default::default()
-                })
+                let pipe_mode =
+                    read_write_mode.bits() | litebox_common_linux::InodeType::NamedPipe as u32;
+                Ok(T::from(synthetic(pipe_mode, 4096)))
             },
-            |_fd| {
-                Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
-                    st_nlink: 1,
-                    st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_rdev: 0,
-                    st_size: 0,
-                    st_blksize: 4096,
-                    st_blocks: 0,
-                    ..Default::default()
-                })
-            },
-            |_fd| {
-                Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
-                    st_nlink: 1,
-                    st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_rdev: 0,
-                    st_size: 0,
-                    st_blksize: 0,
-                    st_blocks: 0,
-                    ..Default::default()
-                })
-            },
-            |_fd| {
-                Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
-                    st_nlink: 1,
-                    st_mode: (litebox_common_linux::InodeType::Socket as u32
-                        | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
-                    .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
-                    st_rdev: 0,
-                    st_size: 0,
-                    st_blksize: 4096,
-                    st_blocks: 0,
-                    ..Default::default()
-                })
-            },
+            |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
+            |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
+            |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
         )
-        .flatten()?;
-    Ok(fstat)
+        .flatten()
 }
 
 pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
@@ -1103,7 +1044,11 @@ impl<FS: ShimFS> Task<FS> {
     /// Get the file status of `pathname`.
     ///
     /// The `pathname` must be absolute.
-    fn do_stat(&self, pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, Errno> {
+    fn do_stat<T: From<litebox::fs::FileStatus>>(
+        &self,
+        pathname: impl path::Arg,
+        follow_symlink: bool,
+    ) -> Result<T, Errno> {
         let normalized_path = pathname.normalized()?;
         let path = if follow_symlink {
             self.do_readlink(normalized_path.as_str())
@@ -1112,7 +1057,7 @@ impl<FS: ShimFS> Task<FS> {
             normalized_path
         };
         let status = self.files.borrow().fs.file_status(path)?;
-        Ok(FileStat::from(status))
+        Ok(T::from(status))
     }
 
     /// Handle syscall `stat`
@@ -1139,8 +1084,37 @@ impl<FS: ShimFS> Task<FS> {
         descriptor_stat(raw_fd, self)
     }
 
+    fn do_fstatat<T>(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: AtFlags,
+    ) -> Result<T, Errno>
+    where
+        T: From<litebox::fs::FileStatus> + From<FileStat>,
+    {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        match fs_path {
+            FsPath::Absolute { path } => {
+                self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
+            }
+            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                Ok(T::from(self.files.borrow().fs.file_status(get_cwd())?))
+            }
+            FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                descriptor_stat(fd as usize, self)
+            }
+            FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+            FsPath::FdRelative { .. } => {
+                log_unsupported!("relative fstatat with AT_EMPTY_PATH unset is not supported yet");
+                Err(Errno::EINVAL)
+            }
+        }
+    }
+
     /// Handle syscall `newfstatat`
-    pub fn sys_newfstatat(
+    pub(crate) fn sys_newfstatat(
         &self,
         dirfd: i32,
         pathname: impl path::Arg,
@@ -1152,26 +1126,38 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        let files = self.files.borrow();
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
-        let fstat: FileStat = match fs_path {
-            FsPath::Absolute { path } => {
-                self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))?
-            }
-            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                files.fs.file_status(get_cwd())?.into()
-            }
-            FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                descriptor_stat(fd as usize, self)?
-            }
-            FsPath::Cwd | FsPath::Fd(_) => return Err(Errno::ENOENT),
-            FsPath::FdRelative { .. } => {
-                log_unsupported!("relative fstatat with AT_EMPTY_PATH unset is not supported yet");
-                return Err(Errno::EINVAL);
-            }
-        };
-        Ok(fstat)
+        self.do_fstatat(dirfd, pathname, flags)
+    }
+
+    /// Handle syscall `statx`
+    pub(crate) fn sys_statx(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: AtFlags,
+        mask: StatxMask,
+    ) -> Result<Statx, Errno> {
+        if mask.contains(StatxMask::STATX__RESERVED) {
+            return Err(Errno::EINVAL);
+        }
+        // `AT_NO_AUTOMOUNT` and the `AT_STATX_*` sync
+        // hints are accepted as no-ops since LiteBox filesystems
+        // do not automount or sync to a remote.
+        let allowed = AtFlags::AT_EMPTY_PATH
+            | AtFlags::AT_NO_AUTOMOUNT
+            | AtFlags::AT_SYMLINK_NOFOLLOW
+            | AtFlags::AT_STATX_FORCE_SYNC
+            | AtFlags::AT_STATX_DONT_SYNC;
+        if flags.intersects(allowed.complement()) {
+            log_unsupported!("unsupported statx flags: {flags:?}");
+            return Err(Errno::EINVAL);
+        }
+
+        // `mask` is informational past this point: the underlying FS doesn't
+        // support field selection, so we always fill the basic stats and
+        // report the actual filled set via `Statx::stx_mask`. Matches Linux's
+        // documented behavior of returning more than what was asked.
+        self.do_fstatat(dirfd, pathname, flags)
     }
 
     pub(crate) fn sys_fcntl(

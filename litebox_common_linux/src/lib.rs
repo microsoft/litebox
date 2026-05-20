@@ -11,7 +11,7 @@ use int_enum::IntEnum;
 use litebox::{
     fs::OFlags,
     platform::{RawConstPointer, RawMutPointer},
-    utils::{ReinterpretSignedExt as _, TruncateExt},
+    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use syscalls::Sysno;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -369,6 +369,161 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_size: size,
             st_blksize: blksize,
             st_blocks: 0,
+            ..Default::default()
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// Field-selection mask for [`statx`].
+    ///
+    /// Each bit asks the kernel to fill the corresponding field in [`Statx`].
+    /// `STATX__RESERVED` (0x8000_0000) is rejected with `EINVAL` by Linux and
+    /// must not appear in user input.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct StatxMask: u32 {
+        const STATX_TYPE = 0x0000_0001;
+        const STATX_MODE = 0x0000_0002;
+        const STATX_NLINK = 0x0000_0004;
+        const STATX_UID = 0x0000_0008;
+        const STATX_GID = 0x0000_0010;
+        const STATX_ATIME = 0x0000_0020;
+        const STATX_MTIME = 0x0000_0040;
+        const STATX_CTIME = 0x0000_0080;
+        const STATX_INO = 0x0000_0100;
+        const STATX_SIZE = 0x0000_0200;
+        const STATX_BLOCKS = 0x0000_0400;
+        const STATX_BASIC_STATS = Self::STATX_TYPE.bits()
+            | Self::STATX_MODE.bits()
+            | Self::STATX_NLINK.bits()
+            | Self::STATX_UID.bits()
+            | Self::STATX_GID.bits()
+            | Self::STATX_ATIME.bits()
+            | Self::STATX_MTIME.bits()
+            | Self::STATX_CTIME.bits()
+            | Self::STATX_INO.bits()
+            | Self::STATX_SIZE.bits()
+            | Self::STATX_BLOCKS.bits();
+        /// The basic-stats fields LiteBox actually fills. Excludes the
+        /// time bits because `FileStatus` doesn't carry timestamps.
+        const STATX_BASIC_FILLED = Self::STATX_BASIC_STATS.bits()
+            & !(Self::STATX_ATIME.bits() | Self::STATX_MTIME.bits() | Self::STATX_CTIME.bits());
+        const STATX_BTIME = 0x0000_0800;
+        const STATX_MNT_ID = 0x0000_1000;
+        const STATX_DIOALIGN = 0x0000_2000;
+        const STATX_MNT_ID_UNIQUE = 0x0000_4000;
+        const STATX_SUBVOL = 0x0000_8000;
+        const STATX_WRITE_ATOMIC = 0x0001_0000;
+        const STATX_DIO_READ_ALIGN = 0x0002_0000;
+
+        /// Named constant so callers can spell out the EINVAL check explicitly.
+        const STATX__RESERVED = 0x8000_0000;
+
+        /// Accept unknown future bits without truncating; the kernel silently
+        /// ignores them and reports the actual filled set via [`Statx::stx_mask`].
+        const _ = !0;
+    }
+}
+
+/// Linux's `struct statx_timestamp` (16 bytes, `linux/stat.h`).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __reserved: i32,
+}
+
+/// Linux's `struct statx` (256 bytes, `linux/stat.h`).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct Statx {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __spare0: [u16; 1],
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: StatxTimestamp,
+    pub stx_btime: StatxTimestamp,
+    pub stx_ctime: StatxTimestamp,
+    pub stx_mtime: StatxTimestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
+    #[expect(clippy::pub_underscore_fields)]
+    pub __spare3: [u64; 12],
+}
+
+/// Extract the major component from a Linux `dev_t` (matches `major(3)` from glibc).
+fn dev_major(dev: u64) -> u32 {
+    (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)).truncate()
+}
+/// Extract the minor component from a Linux `dev_t` (matches `minor(3)`).
+fn dev_minor(dev: u64) -> u32 {
+    ((dev & 0xff) | ((dev >> 12) & !0xff)).truncate()
+}
+
+impl From<litebox::fs::FileStatus> for Statx {
+    fn from(value: litebox::fs::FileStatus) -> Self {
+        let litebox::fs::FileStatus {
+            file_type,
+            mode,
+            size,
+            owner: litebox::fs::UserInfo { user, group },
+            node_info: litebox::fs::NodeInfo { dev, ino, rdev },
+            blksize,
+            ..
+        } = value;
+        let dev = dev as u64;
+        let rdev = rdev.map_or(0u64, |r| r.get() as u64);
+        Self {
+            stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
+            stx_blksize: blksize.truncate(),
+            stx_nlink: 1,
+            stx_uid: u32::from(user),
+            stx_gid: u32::from(group),
+            stx_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
+            stx_ino: ino as u64,
+            stx_size: size as u64,
+            stx_blocks: 0,
+            stx_rdev_major: dev_major(rdev),
+            stx_rdev_minor: dev_minor(rdev),
+            stx_dev_major: dev_major(dev),
+            stx_dev_minor: dev_minor(dev),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<FileStat> for Statx {
+    fn from(value: FileStat) -> Self {
+        Self {
+            stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
+            stx_blksize: value.st_blksize.truncate(),
+            stx_nlink: value.st_nlink.truncate(),
+            stx_uid: value.st_uid,
+            stx_gid: value.st_gid,
+            stx_mode: value.st_mode.truncate(),
+            stx_ino: value.st_ino,
+            stx_size: value.st_size as u64,
+            stx_blocks: value.st_blocks.reinterpret_as_unsigned(),
+            stx_rdev_major: dev_major(value.st_rdev),
+            stx_rdev_minor: dev_minor(value.st_rdev),
+            stx_dev_major: dev_major(value.st_dev),
+            stx_dev_minor: dev_minor(value.st_dev),
             ..Default::default()
         }
     }
@@ -2188,6 +2343,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    Statx {
+        dirfd: i32,
+        pathname: Option<Platform::RawConstPointer<i8>>,
+        flags: AtFlags,
+        mask: StatxMask,
+        statxbuf: Platform::RawMutPointer<Statx>,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2655,9 +2817,15 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::pause => SyscallRequest::Pause,
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
-
+            Sysno::statx => sys_req!(Statx {
+                dirfd,
+                pathname:*,
+                flags,
+                mask,
+                statxbuf:*,
+            }),
             // Noisy unsupported syscalls.
-            Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {
@@ -2981,6 +3149,7 @@ reinterpret_truncated_from_usize_for! {
         EfdFlags,
         RngFlags,
         TimerFlags,
+        StatxMask,
     ],
 }
 
