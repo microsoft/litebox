@@ -32,15 +32,17 @@ use crate::fd_token_protocol::{
     build_read_eventfd_request, build_read_pipe_request, build_read_siginfo_request,
     build_read_socketpair_request, build_register_notification_ring_request,
     build_register_process_request, build_register_request, build_release_request,
-    build_subscribe_eventfd_request, build_subscribe_process_exit_request,
-    build_subscribe_pty_request, build_subscribe_signal_inbox_request, build_unsubscribe_request,
+    build_set_pgid_request, build_set_sid_request, build_subscribe_eventfd_request,
+    build_subscribe_process_exit_request, build_subscribe_pty_request,
+    build_subscribe_signal_inbox_request, build_unsubscribe_request,
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
     build_write_socketpair_request, decode, parse_create_pidfd_response_ok,
     parse_create_pty_response_ok, parse_create_socketpair_response_body, parse_handle_body,
     parse_pidfd_exited_response_ok, parse_pty_ioctl_response_body, parse_pty_read_response_body,
     parse_pty_write_response_ok, parse_read_pipe_response_body, parse_read_siginfo_response_body,
-    parse_read_socketpair_response_body, parse_subscribe_process_exit_response_ok,
-    parse_write_pipe_response_ok, parse_write_socketpair_response_ok,
+    parse_read_socketpair_response_body, parse_set_sid_response_ok,
+    parse_subscribe_process_exit_response_ok, parse_write_pipe_response_ok,
+    parse_write_socketpair_response_ok,
 };
 use std::format;
 use std::io;
@@ -393,6 +395,65 @@ impl FdTokenClient {
             StatusCode::NoNotificationRing => Err(ClientError::NoNotificationRing),
             StatusCode::SubsystemMismatch => Err(ClientError::SubsystemMismatch),
             s => Err(map_status_with_handle(resp.opcode, s, u64::from(pid))),
+        }
+    }
+
+    /// Stamps a process-group change in the broker before the shim-local cache mutates.
+    pub fn set_pgid(
+        &self,
+        caller_pid: u32,
+        target_pid: u32,
+        new_pgid: u32,
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_set_pgid_request(caller_pid, target_pid, new_pgid),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::SetPgidResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle {
+                handle_id: u64::from(target_pid),
+            }),
+            s => Err(map_status_with_handle(
+                resp.opcode,
+                s,
+                u64::from(target_pid),
+            )),
+        }
+    }
+
+    /// Stamps session creation in the broker. The response pgid is caller_pid.
+    pub fn set_sid(&self, caller_pid: u32) -> Result<u32, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_set_sid_request(caller_pid), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::SetSidResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_set_sid_response_ok(resp.body).map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle {
+                handle_id: u64::from(caller_pid),
+            }),
+            s => Err(map_status_with_handle(
+                resp.opcode,
+                s,
+                u64::from(caller_pid),
+            )),
         }
     }
 

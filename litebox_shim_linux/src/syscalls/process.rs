@@ -8762,10 +8762,11 @@ impl<FS: ShimFS> Task<FS> {
         if pid < 0 {
             return Err(Errno::EINVAL);
         }
-        if pid == 0 {
-            return Ok(self.pid.cast_unsigned());
-        }
-        let target = ProcessId(pid.cast_unsigned());
+        let target = if pid == 0 {
+            self.process_id
+        } else {
+            ProcessId(pid.cast_unsigned())
+        };
         self.global
             .litebox
             .process_registry()
@@ -8799,15 +8800,57 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             ProcessGroupId(pgid.cast_unsigned())
         };
-        match self
-            .global
-            .litebox
-            .process_registry()
-            .set_pgid(caller, target, target_pgid)
-        {
-            Some(Ok(())) => Ok(()),
-            Some(Err(SetPgidError::NotPermitted | SetPgidError::NoSuchGroup)) => Err(Errno::EPERM),
-            None => Err(Errno::ESRCH),
+        let registry = self.global.litebox.process_registry();
+        let old_pgid = registry.get_pgid(target);
+        match registry.check_set_pgid(caller, target, target_pgid) {
+            Some(Ok(())) => {}
+            Some(Err(SetPgidError::NotPermitted | SetPgidError::NoSuchGroup)) => {
+                return Err(Errno::EPERM);
+            }
+            None => return Err(Errno::ESRCH),
+        }
+        match super::guest_pid::try_broker_set_pgid(caller.0, target.0, target_pgid.0) {
+            Ok(()) => {}
+            Err(litebox_common_linux::guest_pid_provider::GuestPidProviderError::UnknownHandle) => {
+                return Err(Errno::ESRCH);
+            }
+            Err(litebox_common_linux::guest_pid_provider::GuestPidProviderError::NotPermitted) => {
+                return Err(Errno::EPERM);
+            }
+            Err(litebox_common_linux::guest_pid_provider::GuestPidProviderError::Io) => {
+                return Err(Errno::EIO);
+            }
+        }
+        match registry.set_pgid(caller, target, target_pgid) {
+            Some(Ok(())) => {
+                if old_pgid != Some(target_pgid) {
+                    if let Some(old) = old_pgid {
+                        self.global.cleanup_pgrp_signal_subscription_if_empty(old.0);
+                    }
+                    if target == self.process_id {
+                        self.global.ensure_pgrp_signal_subscription(target_pgid.0);
+                    }
+                }
+                Ok(())
+            }
+            Some(Err(err)) => {
+                log_unsupported!(
+                    "[PG.2-diag] PGRP STAMP GAP: broker SetPgid accepted but shim ProcessRegistry rejected caller={} target={} pgid={} err={err:?}",
+                    caller.0,
+                    target.0,
+                    target_pgid.0
+                );
+                Err(Errno::EPERM)
+            }
+            None => {
+                log_unsupported!(
+                    "[PG.2-diag] PGRP STAMP GAP: broker SetPgid accepted but shim target vanished caller={} target={} pgid={}",
+                    caller.0,
+                    target.0,
+                    target_pgid.0
+                );
+                Err(Errno::ESRCH)
+            }
         }
     }
 
@@ -8833,18 +8876,48 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `setsid`. Creates a new session with caller as leader.
     pub(crate) fn sys_setsid(&self) -> Result<u32, Errno> {
         use litebox::process::SetsidError;
-        match self
-            .global
-            .litebox
-            .process_registry()
-            .setsid(self.process_id)
-        {
+        let registry = self.global.litebox.process_registry();
+        let old_pgid = registry.get_pgid(self.process_id);
+        match registry.check_setsid(self.process_id) {
+            Some(Ok(_)) => {}
+            Some(Err(SetsidError::AlreadyGroupLeader)) => return Err(Errno::EPERM),
+            None => return Err(Errno::ESRCH),
+        }
+        match super::guest_pid::try_broker_set_sid(self.process_id.0) {
+            Ok(_) => {}
+            Err(litebox_common_linux::guest_pid_provider::GuestPidProviderError::UnknownHandle) => {
+                return Err(Errno::ESRCH);
+            }
+            Err(litebox_common_linux::guest_pid_provider::GuestPidProviderError::NotPermitted) => {
+                return Err(Errno::EPERM);
+            }
+            Err(litebox_common_linux::guest_pid_provider::GuestPidProviderError::Io) => {
+                return Err(Errno::EIO);
+            }
+        }
+        match registry.setsid(self.process_id) {
             Some(Ok(sid)) => {
                 *self.process_state.borrow().controlling_pty.lock() = None;
+                if let Some(old) = old_pgid {
+                    self.global.cleanup_pgrp_signal_subscription_if_empty(old.0);
+                }
+                self.global.ensure_pgrp_signal_subscription(sid.as_u32());
                 Ok(sid.as_u32())
             }
-            Some(Err(SetsidError::AlreadyGroupLeader)) => Err(Errno::EPERM),
-            None => Err(Errno::ESRCH),
+            Some(Err(err)) => {
+                log_unsupported!(
+                    "[PG.2-diag] PGRP STAMP GAP: broker SetSid accepted but shim ProcessRegistry rejected pid={} err={err:?}",
+                    self.process_id.0
+                );
+                Err(Errno::EPERM)
+            }
+            None => {
+                log_unsupported!(
+                    "[PG.2-diag] PGRP STAMP GAP: broker SetSid accepted but shim pid vanished pid={}",
+                    self.process_id.0
+                );
+                Err(Errno::ESRCH)
+            }
         }
     }
 

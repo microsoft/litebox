@@ -12,7 +12,7 @@
 //! PG.1: cleanup logs (without panicking) if a worker disconnects after this
 //! inbox failed to enqueue any signal notification for one of its subscriptions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -46,6 +46,7 @@ struct PgrpSubscription {
 
 pub struct PgrpSignalInbox {
     subscriptions: Mutex<HashMap<u32, HashMap<u64, Arc<PgrpSubscription>>>>,
+    stamped_pgids_by_conn: Mutex<HashMap<u64, HashSet<u32>>>,
 }
 
 impl Default for PgrpSignalInbox {
@@ -58,7 +59,25 @@ impl PgrpSignalInbox {
     pub fn new() -> Self {
         Self {
             subscriptions: Mutex::new(HashMap::new()),
+            stamped_pgids_by_conn: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn stamp_pgid(&self, conn_id: u64, pgid: u32) {
+        self.stamped_pgids_by_conn
+            .lock()
+            .expect("PgrpSignalInbox stamps poisoned")
+            .entry(conn_id)
+            .or_default()
+            .insert(pgid);
+    }
+
+    pub fn has_stamp(&self, conn_id: u64, pgid: u32) -> bool {
+        self.stamped_pgids_by_conn
+            .lock()
+            .expect("PgrpSignalInbox stamps poisoned")
+            .get(&conn_id)
+            .is_some_and(|pgids| pgids.contains(&pgid))
     }
 
     pub fn subscribe(
@@ -72,6 +91,9 @@ impl PgrpSignalInbox {
     ) -> Result<(), SubscribeError> {
         if events_mask & !NOTIFY_EVENT_MASK_ALL != 0 {
             return Err(SubscribeError::UnknownEventBits { events_mask });
+        }
+        if !self.has_stamp(conn_id, pgid) {
+            log_pg2_stamp_gap(conn_id, pgid);
         }
         let mut subscriptions = self
             .subscriptions
@@ -117,6 +139,10 @@ impl PgrpSignalInbox {
             .subscriptions
             .lock()
             .expect("PgrpSignalInbox subscriptions poisoned");
+        self.stamped_pgids_by_conn
+            .lock()
+            .expect("PgrpSignalInbox stamps poisoned")
+            .remove(&conn_id);
         subscriptions.retain(|pgid, by_conn| {
             if let Some(sub) = by_conn.remove(&conn_id) {
                 let sent = sub.deliveries_sent.load(Ordering::Relaxed);
@@ -201,6 +227,21 @@ impl PgrpSignalInbox {
     }
 }
 
+fn log_pg2_stamp_gap(conn_id: u64, pgid: u32) {
+    let msg = format!(
+        "[PG.2-diag] PGRP STAMP GAP: conn_id={conn_id} subscribing to pgid={pgid} without prior SetPgid/SetSid stamp on this conn — worker may be subscribing to a pgrp it has no members in, or pgid tracking has a gap"
+    );
+    eprintln!("{msg}");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/rst-diag.log")
+    {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 fn signal_matches(signal_mask: u32, signum: u32) -> bool {
     signum < u32::BITS && (signal_mask & (1u32 << signum)) != 0
 }
@@ -227,6 +268,8 @@ mod tests {
         let (sender_a, mut receiver_a) = make_pair();
         let (sender_b, mut receiver_b) = make_pair();
         let signal_mask = 1u32 << 28;
+        inbox.stamp_pgid(100, 42);
+        inbox.stamp_pgid(200, 42);
 
         inbox
             .subscribe(42, 100, 1, signal_mask, NOTIFY_EVENT_IN, sender_a)
@@ -250,10 +293,47 @@ mod tests {
     }
 
     #[test]
+    fn setpgid_stamp_then_two_worker_subscribe_delivers_to_both() {
+        let inbox = PgrpSignalInbox::new();
+        let (sender_a, mut receiver_a) = make_pair();
+        let (sender_b, mut receiver_b) = make_pair();
+        let signal_mask = 1u32 << 28;
+
+        // Simulate worker A issuing SetPgid(target_on_worker_b, 4242) and
+        // worker B later issuing its own eager stamp when refreshing local
+        // pgrp membership. Subscriptions are the implicit pgid -> conn index.
+        inbox.stamp_pgid(100, 4242);
+        inbox.stamp_pgid(200, 4242);
+        inbox
+            .subscribe(4242, 100, 11, signal_mask, NOTIFY_EVENT_IN, sender_a)
+            .unwrap();
+        inbox
+            .subscribe(4242, 200, 22, signal_mask, NOTIFY_EVENT_IN, sender_b)
+            .unwrap();
+
+        let siginfo = [0xCD; 128];
+        assert_eq!(inbox.deliver(4242, 28, &siginfo), 2);
+        assert_eq!(receiver_a.recv().unwrap().subscription_id(), 11);
+        assert_eq!(receiver_b.recv().unwrap().subscription_id(), 22);
+    }
+
+    #[test]
+    fn subscribe_without_stamp_is_log_only() {
+        let inbox = PgrpSignalInbox::new();
+        let (sender, _receiver) = make_pair();
+        inbox
+            .subscribe(99, 300, 3, 1u32 << 2, NOTIFY_EVENT_IN, sender)
+            .unwrap();
+        assert_eq!(inbox.subscription_count(), 1);
+    }
+
+    #[test]
     fn unsubscribe_and_cleanup_remove_entries() {
         let inbox = PgrpSignalInbox::new();
         let (sender_a, _receiver_a) = make_pair();
         let (sender_b, _receiver_b) = make_pair();
+        inbox.stamp_pgid(10, 7);
+        inbox.stamp_pgid(10, 8);
         inbox
             .subscribe(7, 10, 1, 1u32 << 2, NOTIFY_EVENT_IN, sender_a)
             .unwrap();
