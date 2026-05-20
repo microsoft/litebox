@@ -9606,6 +9606,54 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            // Stage A: collect BrokerPtySubsystem fds and emit pty
+            // bridge specs so the remote worker re-installs broker PTY
+            // handles at matching fd slots.
+            let broker_pty_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::broker_pty::BrokerPtySubsystem>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in broker_pty_fds {
+                let pty_provider = super::broker_pty::broker_pty_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let pty_info = dt_local.with_entry(
+                    &typed,
+                    |pty_fd: &super::broker_pty::BrokerPtyFd<crate::Platform>| {
+                        (pty_fd.handle(), pty_fd.role())
+                    },
+                );
+                drop(dt_local);
+                if let (Some(provider), Some((handle_id, role))) = (pty_provider, pty_info) {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
+                    let role_char = match role {
+                        litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master => 'm',
+                        litebox_common_linux::broker_pty_provider::BrokerPtyRole::Slave => 's',
+                    };
+                    broker_eventfd_specs
+                        .push(alloc::format!("{raw_fd}:pty:{handle_id}:{role_char}"));
+                }
+            }
+
             // Phase F: collect BrokerSocketPairSubsystem fds and emit
             // unix_socket bridge specs. Mirrors the BrokerPipe block
             // above. Worker B's install_broker_bridge_fd calls
