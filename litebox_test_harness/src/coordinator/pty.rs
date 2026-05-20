@@ -560,24 +560,10 @@ fn read_until(pty: &Pty, marker: &str) -> Result<String, String> {
 }
 
 fn exact(actual: &str, expected: &str) -> Result<String, String> {
-    // perf-split emits `[TIMING] name=value` markers on the harness/runner
-    // startup paths. When a PTY child execs a new worker (cross-bt fork),
-    // that worker's startup output appears in the captured PTY stream
-    // alongside the test child's intended output. Filter those lines so
-    // perf telemetry stays uniform without contaminating PTY assertions.
-    let filtered: String = actual
-        .split_inclusive('\n')
-        .filter(|line| !line.trim_start().starts_with("[TIMING] "))
-        .collect();
-    let actual_ref: &str = if filtered == actual {
-        actual
-    } else {
-        filtered.as_str()
-    };
-    if actual_ref == expected {
+    if actual == expected {
         Ok(format!("exact {expected:?}"))
     } else {
-        Err(format!("expected {expected:?}, got {actual_ref:?}"))
+        Err(format!("expected {expected:?}, got {actual:?}"))
     }
 }
 

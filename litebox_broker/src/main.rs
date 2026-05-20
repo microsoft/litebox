@@ -216,6 +216,8 @@ fn build_local_services(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    litebox_timing::init_from_env();
+    litebox_timing::emit("broker_main_started_ns");
     // PE.14 diag: global panic hook so panics in ANY broker thread
     // are captured with location + payload + backtrace to the shared
     // /tmp/rst-diag.log. Strong hypothesis for eager-pipe races is
@@ -263,7 +265,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    litebox_timing::emit("broker_args_parsed_ns");
     let sandbox_policy = load_sandbox_policy(&cli);
+    litebox_timing::emit("broker_policy_loaded_ns");
 
     // Phase B-Step8d: optionally host the fd-token / state-object
     // control listener. Runners connect via `--fd-token-broker <path>`
@@ -321,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 }
             });
+    litebox_timing::emit("broker_audit_open_ns");
 
     // Log policy summary to audit.
     if let (Some(al), Some(sp)) = (&audit_log, &sandbox_policy) {
@@ -369,6 +374,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener = IpcListener::bind_endpoint(listen_addr)?;
 
         info!(addr = %listen_addr, "network proxy listening");
+        litebox_timing::emit("broker_listen_called_ns");
 
         // Shared ELF patch cache — persists across connections so that
         // expensive ELF patching is amortized over the broker's lifetime.
@@ -389,15 +395,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33",
                         "/usr/lib/x86_64-linux-gnu/libm.so.6",
                         "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+                        // Binaries that test cases exec (caught by the
+                        // integration test's runtime-rewrite
+                        // assertion — see `run_one_test` in
+                        // `litebox_test_harness/tests/integration.rs`).
+                        // These live in the docker image so their
+                        // mtime is stable across containers.
+                        "/usr/bin/bash",
+                        "/usr/bin/true",
+                        "/usr/lib/x86_64-linux-gnu/libtinfo.so.6.4",
                     ],
                 );
             }
         }
+        litebox_timing::emit("broker_prewarm_done_ns");
         let extra_session_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // Accept connections, validating the LBNP handshake before entering the
         // proxy event loop.  Stray/slow clients are rejected quickly so they
         // cannot block the real runner from connecting.
+        let mut first_accept = true;
         loop {
             let registry = build_local_services(&cli, Arc::clone(&elf_cache), &sandbox_policy);
             let ipc = match litebox_broker::net_proxy::accept_ipc_client(
@@ -412,6 +429,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
+            if first_accept {
+                litebox_timing::emit("broker_first_accept_ns");
+                first_accept = false;
+            }
             info!("network proxy client connected");
             let forwards = parse_forward_specs(&cli.forward_port);
             if let Err(e) = litebox_broker::net_proxy::run_with_session_slots(
