@@ -1605,7 +1605,14 @@ impl<FS: ShimFS> Task<FS> {
                 .descriptor_table()
                 .entry_handle(&spfd)
                 .ok_or(Errno::EBADF)?;
-            return handle.with_entry(|entry| entry.read(&self.wait_cx(), buf));
+            loop {
+                match handle.with_entry(|entry| entry.read(&self.wait_cx(), buf)) {
+                    Err(Errno::EINTR) if self.pending_signals_all_ignored() => {
+                        self.drain_ignored_pending();
+                    }
+                    result => return result,
+                }
+            }
         }
 
         if let Some(instance) = files.inotify_instances.lock().get(&raw_fd).cloned() {

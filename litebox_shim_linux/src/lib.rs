@@ -1450,9 +1450,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 }
 
                 // Phase F: if the snapshot carries a broker UnixSocket
-                // handle for this slot, install a BrokerSocketPairFd
-                // that adopts the parent's emit-side `dup_handle` ref.
-                // (Mirrors the Pipe-side restore at line ~1520.)
+                // handle for this slot, install a BrokerSocketPairFd. Bump
+                // the handle on this connection so its on_close release is
+                // tracked locally; the parent's transit ref is drained later.
                 if let Some(broker_handle) = entry.metadata.broker_handle {
                     if broker_handle.kind == BrokerHandleKind::UnixSocket {
                         let Some(provider) =
@@ -1463,6 +1463,10 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         let Some(endpoint) = broker_handle.socketpair_endpoint else {
                             continue;
                         };
+                        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                            alloc::sync::Arc::clone(&provider) as _;
+                        let _ = releaser.dup_handle(broker_handle.handle_id);
                         let sp_fd =
                             syscalls::broker_socketpair::BrokerSocketPairFd::<Platform>::new(
                                 provider,
@@ -3012,10 +3016,10 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::chdir | Sysno::fchdir
                 // Process group.
                 | Sysno::setpgid | Sysno::setsid
-                // Signal/thread-runtime setup. Static musl refreshes the child
-                // clear-TID pointer immediately after fork before user code.
+                // Signal/thread-runtime setup. Static C runtimes refresh
+                // thread bookkeeping immediately after fork before user code.
                 | Sysno::rt_sigaction | Sysno::rt_sigprocmask | Sysno::sigaltstack
-                | Sysno::set_tid_address
+                | Sysno::set_tid_address | Sysno::set_robust_list
                 // Identity.
                 | Sysno::setuid | Sysno::setgid | Sysno::setgroups
                 | Sysno::setreuid | Sysno::setregid
@@ -5064,6 +5068,8 @@ mod tests {
         assert_allowed(Sysno::rt_sigaction);
         assert_allowed(Sysno::rt_sigprocmask);
         assert_allowed(Sysno::sigaltstack);
+        assert_allowed(Sysno::set_tid_address);
+        assert_allowed(Sysno::set_robust_list);
     }
 
     #[test]

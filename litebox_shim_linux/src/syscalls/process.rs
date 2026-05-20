@@ -10151,6 +10151,7 @@ impl<FS: ShimFS> Task<FS> {
             let _ = wake_robust_list(robust_list);
         }
         self.thread.clear_child_tid.set(None);
+        self.thread.rseq.set(None);
 
         self.signals.reset_for_exec();
 
