@@ -1517,7 +1517,7 @@ fn setup() -> (PathBuf, BinaryPaths) {
                 rewriter_path().display()
             );
 
-            let mut bins = BinaryPaths {
+            let bins = BinaryPaths {
                 pie_glibc: debug_dir(),
                 nonpie_glibc: nonpie_dir(),
                 static_pie_glibc: static_pie_glibc_dir(),
@@ -1568,10 +1568,8 @@ fn setup() -> (PathBuf, BinaryPaths) {
                     eprintln!("[setup] pre-rewrote {label} in {} ms", elapsed.as_millis());
                 }
             }
-            // Touch suppression to satisfy mutability of `bins` above
-            // — fields are populated via the literal, no further
-            // mutation needed.
-            let _ = &mut bins;
+            // Touch suppression: variable is fully initialised by the
+            // literal above. No further mutation needed.
             (ws_root, bins)
         })
         .clone()
