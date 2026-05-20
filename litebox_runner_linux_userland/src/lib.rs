@@ -277,6 +277,7 @@ type BrokerFdBridgeParsed = (
     Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
     Option<litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint>,
     Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
+    Option<u32>,
 );
 
 /// Parses a `--broker-fd-bridge` spec string of the form
@@ -289,7 +290,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
     use litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind;
     let parts: Vec<&str> = spec.split(':').collect();
-    if !(parts.len() == 3 || parts.len() == 4) {
+    if !(parts.len() == 3 || parts.len() == 4 || parts.len() == 5) {
         anyhow::bail!("broker-fd-bridge: bad spec {spec:?}");
     }
     let guest_fd: usize = parts[0]
@@ -350,7 +351,23 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         }
         (_, None) => (None, None, None),
     };
-    Ok((guest_fd, kind, handle_id, direction, endpoint, pty_role))
+    let pty_id = if kind == BrokerHandleKind::Pty {
+        match parts.get(4) {
+            Some(raw) => Some(
+                raw.parse()
+                    .map_err(|e| anyhow!("broker-fd-bridge: bad pty id {raw:?}: {e}"))?,
+            ),
+            None => None,
+        }
+    } else {
+        if parts.len() == 5 {
+            anyhow::bail!("broker-fd-bridge: pty id is only valid for pty specs");
+        }
+        None
+    };
+    Ok((
+        guest_fd, kind, handle_id, direction, endpoint, pty_role, pty_id,
+    ))
 }
 
 fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
@@ -1091,7 +1108,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role) =
+            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
                 parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
@@ -1102,6 +1119,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                     pipe_direction,
                     socketpair_endpoint,
                     pty_role,
+                    pty_id,
                 )
                 .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
         }
@@ -1195,7 +1213,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // extended in Phase C.3 to handle pipe).
     let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
     for spec in &cli_args.broker_fd_bridge {
-        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role) =
+        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
             parse_broker_fd_bridge_spec(spec)?;
         program
             .entrypoints
@@ -1206,6 +1224,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                 pipe_direction,
                 socketpair_endpoint,
                 pty_role,
+                pty_id,
             )
             .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
     }
@@ -2498,7 +2517,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(guest_task);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role) =
+            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
                 parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
@@ -2509,6 +2528,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
                     pipe_direction,
                     socketpair_endpoint,
                     pty_role,
+                    pty_id,
                 )
                 .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
         }

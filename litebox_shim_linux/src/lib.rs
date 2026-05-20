@@ -80,12 +80,6 @@ impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 #[derive(Clone)]
 pub(crate) struct MuxPtySlaveFd;
 
-#[derive(Clone, Copy)]
-pub(crate) struct BrokerPtyHandles {
-    pub(crate) master: u64,
-    pub(crate) slave: u64,
-}
-
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     #[cfg(debug_assertions)]
@@ -297,6 +291,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint,
         >,
         pty_role: Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
+        pty_id: Option<u32>,
     ) -> Result<(), ()> {
         use syscalls::fork_snapshot::BrokerHandleKind;
         let files = self.task.files.borrow();
@@ -405,7 +400,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 let provider = syscalls::broker_pty::broker_pty_provider().ok_or(())?;
                 let role = pty_role.ok_or(())?;
                 let pty_fd = syscalls::broker_pty::BrokerPtyProviderReacquireExt::reacquire(
-                    &provider, handle_id, role,
+                    &provider, handle_id, role, pty_id,
                 )
                 .map_err(|_| ())?;
                 self.install_broker_pty_at_slot(pty_fd, guest_fd, &files)
@@ -422,7 +417,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         kind: syscalls::fork_snapshot::BrokerHandleKind,
         handle_id: u64,
     ) -> Result<(), ()> {
-        self.install_broker_bridge_fd(guest_fd, kind, handle_id, None, None, None)
+        self.install_broker_bridge_fd(guest_fd, kind, handle_id, None, None, None, None)
     }
 
     fn install_broker_pty_at_slot(
@@ -709,7 +704,6 @@ impl LinuxShimBuilder {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
-            broker_pty_handles: litebox::sync::Mutex::new(BTreeMap::new()),
             pgrp_signal_subscriptions: litebox::sync::Mutex::new(BTreeMap::new()),
             process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             host_tty_foreground_pgrp: litebox::sync::Mutex::new(
@@ -1423,15 +1417,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 let Some(provider) = syscalls::broker_pty::broker_pty_provider() else {
                     continue;
                 };
-                let role = if entry.metadata.is_sandbox_pty_slave {
-                    litebox_common_linux::broker_pty_provider::BrokerPtyRole::Slave
-                } else {
-                    litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master
+                let Some(role) = broker_handle.pty_role else {
+                    continue;
                 };
                 let Ok(pty_fd) = syscalls::broker_pty::BrokerPtyProviderReacquireExt::reacquire(
                     &provider,
                     broker_handle.handle_id,
                     role,
+                    broker_handle.pty_id,
                 ) else {
                     continue;
                 };
@@ -4237,8 +4230,6 @@ struct GlobalState<FS: ShimFS> {
     /// SIGCHLD) between processes owned by this host. Entries are consumed by
     /// the target task during signal processing.
     cross_process_signals: litebox::sync::Mutex<Platform, Vec<CrossProcessSignal>>,
-    /// Broker PTY handles keyed by the local PTY index allocated by the device FS.
-    broker_pty_handles: litebox::sync::Mutex<Platform, BTreeMap<u32, BrokerPtyHandles>>,
     /// PR-3 single-worker-pgrp scope: pgids this worker has subscribed to using
     /// its local ProcessRegistry view. Cross-worker setpgid reconciliation is PR-4.
     pgrp_signal_subscriptions: litebox::sync::Mutex<Platform, BTreeMap<u32, u64>>,
@@ -4294,28 +4285,6 @@ impl<FS: ShimFS> litebox_common_linux::broker_pgrp_signal_provider::BrokerPgrpSi
 }
 
 impl<FS: ShimFS> GlobalState<FS> {
-    fn broker_pty_handle(&self, pty_idx: u32, is_master: bool) -> Result<u64, Errno> {
-        if let Some(handles) = self.broker_pty_handles.lock().get(&pty_idx).copied() {
-            return Ok(if is_master {
-                handles.master
-            } else {
-                handles.slave
-            });
-        }
-        let provider = syscalls::eventfd::broker_pty_provider().ok_or(Errno::EIO)?;
-        let pair = provider.create_pty().map_err(|_| Errno::EIO)?;
-        let handles = BrokerPtyHandles {
-            master: pair.master_handle,
-            slave: pair.slave_handle,
-        };
-        self.broker_pty_handles.lock().insert(pty_idx, handles);
-        Ok(if is_master {
-            handles.master
-        } else {
-            handles.slave
-        })
-    }
-
     fn ensure_pgrp_signal_subscription(self: &Arc<Self>, pgid: u32) {
         let Some(provider) = syscalls::eventfd::broker_pgrp_signal_provider() else {
             return;
@@ -4569,16 +4538,6 @@ struct MuxParentStream {
     /// by the dispatcher (nested fork case — one-sided pipe, other end is in
     /// the parent's own mux dispatcher).  The fd table entry is NOT replaced.
     use_existing_pipe: bool,
-    /// For PTY-bridged streams: the PTY pair whose ring buffers the relay
-    /// thread reads/writes.  `None` for pipe/socket streams.
-    pty_pair: Option<Arc<litebox::fs::devices::PtyPair<Platform>>>,
-    /// For PTY-bridged streams: PTY manager index for broker mirroring.
-    pty_index: Option<u32>,
-    /// For PTY-bridged streams: whether this is the master side of the pair.
-    /// When bridging a child's slave fd, the relay acts as a proxy for the
-    /// slave, so `pty_is_master` is `false`.
-    #[allow(dead_code)] // Reserved for future bidirectional PTY bridge logic.
-    pty_is_master: bool,
 }
 
 struct VforkDone {
@@ -4714,16 +4673,9 @@ struct ForkContext {
     /// Used by `commit_delayed_fork` to find the parent's peer socket endpoints
     /// so both sides can be bridged with real OS pipes.
     parent_unix_socket_fds: Vec<(usize, usize, u64)>,
-    /// Snapshot of the parent's PTY master FDs at fork time:
-    /// (guest_fd, pty_pair_index).
-    /// Used by `commit_delayed_fork` to find the parent's PTY master endpoint
-    /// for bridging sandbox PTY slave fds in the child.
-    #[allow(dead_code)] // Diagnostic; actual lookup uses parent_pty_pairs.
-    parent_pty_master_fds: Vec<(usize, u32)>,
-    /// PTY pair Arcs captured at fork time, keyed by pty_pair_index.
-    /// Used by `commit_delayed_fork` to set up PTY relay threads that bridge
-    /// between the parent's PTY ring buffers and the mux.
-    parent_pty_pairs: Vec<(u32, Arc<litebox::fs::devices::PtyPair<Platform>>)>,
+    /// Broker PTY raw fds that belonged to the parent at fork time. A vfork child
+    /// closing one of these must not invalidate the parent's descriptor slot.
+    pub(crate) parent_broker_pty_fds: Vec<usize>,
     /// Pipe pair_ids of virtual pipes created by prior siblings' mux
     /// dispatchers or fd-replacement relays.  Inherited from the parent's
     /// `mux_pipe_pair_ids`.  Used by `commit_delayed_fork` to exclude

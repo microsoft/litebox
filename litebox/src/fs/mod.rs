@@ -218,38 +218,13 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
 
     /// Get an `IOPollable` for a file descriptor, if the underlying device supports polling.
     ///
-    /// Returns `Some(pollable)` for device types with async event support (e.g., PTY master),
+    /// Returns `Some(pollable)` for device types with async event support,
     /// or `None` for regular files that don't support async I/O notifications.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn get_io_pollable(&self, fd: &TypedFd<Self>) -> Option<alloc::boxed::Box<dyn IOPollable>> {
         None
     }
 
-    /// Get the PTY pair for a file descriptor as a type-erased Arc.
-    ///
-    /// Returns `Some((arc, index, is_master))` if the fd refers to a PTY device.
-    /// The `Arc` can be downcast to `Arc<PtyPair<Platform>>` by the caller.
-    /// `index` is the PTY pair index, `is_master` indicates master vs slave side.
-    ///
-    /// This method exists to allow the shim to capture PTY pair references for
-    /// relay threads without knowing the concrete filesystem type.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn get_pty_pair_erased(
-        &self,
-        fd: &TypedFd<Self>,
-    ) -> Option<(
-        alloc::sync::Arc<dyn core::any::Any + Send + Sync>,
-        u32,
-        bool,
-    )> {
-        None
-    }
-
-    /// Read the target of a symbolic link.
-    ///
-    /// Returns the link target as a string. The default implementation returns
-    /// [`ReadLinkError::NotSupported`](errors::ReadLinkError::NotSupported),
-    /// since most in-memory filesystems don't have symlinks.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn read_link(
         &self,

@@ -4,7 +4,7 @@
 //! Implementation of file related syscalls, e.g., `open`, `read`, `write`, etc.
 
 use alloc::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::CString,
     string::{String, ToString as _},
     sync::Arc,
@@ -86,9 +86,6 @@ const ANON_INODE_DEV: u64 = 0x000e;
 #[derive(Clone)]
 pub(crate) struct HostPtyDeviceFd;
 
-#[derive(Clone)]
-struct BrokerPtyFd(u64);
-
 /// Monotonically increasing counter for unique inode numbers assigned to
 /// anonymous file descriptors (sockets, pipes, eventfds, epoll instances).
 static ANON_INO_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -107,8 +104,6 @@ struct AnonIno(u64);
 enum TerminalKind {
     /// Host stdio device (major=5) — forward ioctls to host kernel.
     HostStdio,
-    /// PTY slave device (major=136) — handle locally.
-    Pty,
     /// Not a terminal device.
     NotTerminal,
 }
@@ -308,6 +303,7 @@ pub(crate) struct FilesState<FS: ShimFS> {
         Platform,
         BTreeMap<usize, Arc<litebox::sync::Mutex<Platform, InotifyInstanceState>>>,
     >,
+    closed_broker_pty_fds: litebox::sync::Mutex<Platform, BTreeSet<usize>>,
     max_fd: AtomicUsize,
 }
 
@@ -321,6 +317,7 @@ impl<FS: ShimFS> FilesState<FS> {
             host_stdio_object_ids: litebox::sync::RwLock::new([None, None, None]),
             file_position_lock: Arc::new(litebox::sync::Mutex::new(())),
             inotify_instances: litebox::sync::Mutex::new(BTreeMap::new()),
+            closed_broker_pty_fds: litebox::sync::Mutex::new(BTreeSet::new()),
             max_fd: AtomicUsize::new(usize::MAX),
         }
     }
@@ -367,6 +364,7 @@ impl<FS: ShimFS> FilesState<FS> {
             host_stdio_object_ids: litebox::sync::RwLock::new(*self.host_stdio_object_ids.read()),
             file_position_lock: self.file_position_lock.clone(),
             inotify_instances: litebox::sync::Mutex::new(self.inotify_instances.lock().clone()),
+            closed_broker_pty_fds: litebox::sync::Mutex::new(BTreeSet::new()),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
         }
     }
@@ -748,12 +746,6 @@ impl<FS: ShimFS> Task<FS> {
     fn maybe_trace_pty_dup(&self, _oldfd: u32, _newfd: u32) {}
 
     fn open_broker_pty_path(&self, path: &str, flags: OFlags) -> Option<Result<u32, Errno>> {
-        // Disabled until delayed-fork stdio bridging no longer depends on
-        // filesystem PtyPair relay state (see PR-7d follow-up).
-        const EAGER_BROKER_PTY_ENABLED: bool = false;
-        if !EAGER_BROKER_PTY_ENABLED {
-            return None;
-        }
         let status = flags & OFlags::STATUS_FLAGS_MASK;
         let provider = super::broker_pty::broker_pty_provider()?;
         let (handle, pty_id, is_master, slave_anchor) = if path == "/dev/ptmx" {
@@ -1789,37 +1781,10 @@ impl<FS: ShimFS> Task<FS> {
                     } else {
                         None
                     };
-                    let use_broker_pty_read = files
+                    let result = files
                         .fs
-                        .get_pty_pair_erased(fd)
-                        .is_some_and(|(_, _, is_master)| is_master);
-                    // First attempt. PTY master data now lives in the broker; keep
-                    // PTY slave reads on the transitional filesystem path.
-                    let result = if use_broker_pty_read {
-                        let broker_result = {
-                            let mut borrowed = buf.borrow_mut();
-                            self.broker_pty_read(&files.fs, fd, &mut borrowed)
-                        };
-                        match broker_result {
-                            Ok(n) => {
-                                if n > 0 {
-                                    let mut discard = alloc::vec![0u8; n];
-                                    let _ = files.fs.read(fd, &mut discard, offset);
-                                }
-                                Ok(n)
-                            }
-                            Err(Errno::EAGAIN) => files
-                                .fs
-                                .read(fd, &mut buf.borrow_mut(), offset)
-                                .map_err(Errno::from),
-                            other => other,
-                        }
-                    } else {
-                        files
-                            .fs
-                            .read(fd, &mut buf.borrow_mut(), offset)
-                            .map_err(Errno::from)
-                    };
+                        .read(fd, &mut buf.borrow_mut(), offset)
+                        .map_err(Errno::from);
                     let nonblocking = self
                         .global
                         .litebox
@@ -1849,36 +1814,13 @@ impl<FS: ShimFS> Task<FS> {
                                 return Ok(0); // EOF — master closed
                             }
                             if events.contains(Events::IN) {
-                                if use_broker_pty_read {
-                                    match self.broker_pty_read(&files.fs, fd, &mut buf.borrow_mut())
-                                    {
-                                        Ok(n) => {
-                                            if n > 0 {
-                                                let mut discard = alloc::vec![0u8; n];
-                                                let _ = files.fs.read(fd, &mut discard, offset);
-                                            }
-                                            return Ok(n);
-                                        }
-                                        Err(Errno::EAGAIN) => {}
-                                        Err(e) => return Err(e),
+                                match files.fs.read(fd, &mut buf.borrow_mut(), offset) {
+                                    Ok(n) => return Ok(n),
+                                    Err(litebox::fs::errors::ReadError::WouldBlock) => {
+                                        core::hint::spin_loop();
+                                        continue;
                                     }
-                                    match files.fs.read(fd, &mut buf.borrow_mut(), offset) {
-                                        Ok(n) => return Ok(n),
-                                        Err(litebox::fs::errors::ReadError::WouldBlock) => {
-                                            core::hint::spin_loop();
-                                            continue;
-                                        }
-                                        Err(e) => return Err(Errno::from(e)),
-                                    }
-                                } else {
-                                    match files.fs.read(fd, &mut buf.borrow_mut(), offset) {
-                                        Ok(n) => return Ok(n),
-                                        Err(litebox::fs::errors::ReadError::WouldBlock) => {
-                                            core::hint::spin_loop();
-                                            continue;
-                                        }
-                                        Err(e) => return Err(Errno::from(e)),
-                                    }
+                                    Err(e) => return Err(Errno::from(e)),
                                 }
                             }
                             core::hint::spin_loop();
@@ -2075,12 +2017,6 @@ impl<FS: ShimFS> Task<FS> {
                     } else {
                         None
                     };
-                    if files.fs.get_pty_pair_erased(fd).is_some() {
-                        // Mirror PTY writes through the broker first so broker-owned PTY
-                        // line discipline sees input-control characters and broker reads
-                        // observe the same byte stream as the transitional local queues.
-                        let _ = self.broker_pty_write(&files.fs, fd, buf)?;
-                    }
                     let result = files.fs.write(fd, buf, offset).map_err(Errno::from);
                     if matches!(result, Ok(n) if n > 0)
                         && let Some(path) = files.fs.fd_path(fd)
@@ -2711,6 +2647,20 @@ impl<FS: ShimFS> Task<FS> {
                 .lock()
                 .retain(|registered| !Arc::ptr_eq(registered, &state));
         }
+        {
+            let rds = files.raw_descriptor_store.read();
+            if !rds.is_alive(raw_fd) && files.closed_broker_pty_fds.lock().remove(&raw_fd) {
+                return Ok(());
+            }
+            if self.fork_context.borrow().is_some()
+                && rds
+                    .fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
+                    .is_ok()
+            {
+                return Ok(());
+            }
+        }
+
         let mut rds = files.raw_descriptor_store.write();
         match rds.fd_consume_raw_integer(raw_fd) {
             Ok(fd) => {
@@ -2890,6 +2840,7 @@ impl<FS: ShimFS> Task<FS> {
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
         {
             drop(rds);
+            files.closed_broker_pty_fds.lock().insert(raw_fd);
             let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
             drop(entry);
             return Ok(());
@@ -3041,29 +2992,6 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
-                    if files
-                        .fs
-                        .get_pty_pair_erased(fd)
-                        .is_some_and(|(_, _, is_master)| is_master)
-                    {
-                        return read_once_to_iovecs(
-                            iovs,
-                            || self.park_if_deferred(),
-                            |buf| match self.broker_pty_read(&files.fs, fd, buf) {
-                                Ok(n) => {
-                                    if n > 0 {
-                                        let mut discard = alloc::vec![0u8; n];
-                                        let _ = files.fs.read(fd, &mut discard, None);
-                                    }
-                                    Ok(n)
-                                }
-                                Err(Errno::EAGAIN) => {
-                                    files.fs.read(fd, buf, None).map_err(Errno::from)
-                                }
-                                other => other,
-                            },
-                        );
-                    }
                     let needs_position_lock = matches!(
                         files.fs.fd_file_status(fd),
                         Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
@@ -3496,9 +3424,6 @@ impl<FS: ShimFS> Task<FS> {
                         None
                     };
                     write_to_iovec(iovs, |buf: &[u8]| {
-                        if files.fs.get_pty_pair_erased(fd).is_some() {
-                            let _ = self.broker_pty_write(&files.fs, fd, buf)?;
-                        }
                         files.fs.write(fd, buf, None).map_err(Errno::from)
                     })
                 },
@@ -5778,224 +5703,6 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    fn broker_pty_handle_for_fd(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<u64, Errno> {
-        if let Ok(handle) = self
-            .global
-            .litebox
-            .descriptor_table()
-            .with_metadata(fd, |metadata: &BrokerPtyFd| metadata.0)
-        {
-            return Ok(handle);
-        }
-
-        let Some((_pair, pty_idx, is_master)) = fs.get_pty_pair_erased(fd) else {
-            return Err(Errno::ENOTTY);
-        };
-        let handle = self.global.broker_pty_handle(pty_idx, is_master)?;
-        let _old = self
-            .global
-            .litebox
-            .descriptor_table_mut()
-            .set_entry_metadata(fd, BrokerPtyFd(handle));
-        Ok(handle)
-    }
-
-    fn broker_pty_error_to_errno(
-        err: litebox_common_linux::broker_pty_provider::BrokerOpError,
-    ) -> Errno {
-        match err {
-            litebox_common_linux::broker_pty_provider::BrokerOpError::InvalidValue => Errno::EINVAL,
-            litebox_common_linux::broker_pty_provider::BrokerOpError::UnknownHandle => {
-                Errno::ENOTTY
-            }
-            litebox_common_linux::broker_pty_provider::BrokerOpError::WouldBlock => Errno::EAGAIN,
-            litebox_common_linux::broker_pty_provider::BrokerOpError::Io => Errno::EIO,
-        }
-    }
-
-    fn broker_pty_ioctl(
-        &self,
-        fs: &FS,
-        fd: &TypedFd<FS>,
-        op: PtyIoctlOp,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, Errno> {
-        let handle = self.broker_pty_handle_for_fd(fs, fd)?;
-        let provider = super::eventfd::broker_pty_provider().ok_or(Errno::EIO)?;
-        provider
-            .ioctl_pty(handle, op, payload)
-            .map_err(Self::broker_pty_error_to_errno)
-    }
-
-    fn broker_pty_read(&self, fs: &FS, fd: &TypedFd<FS>, buf: &mut [u8]) -> Result<usize, Errno> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let handle = self.broker_pty_handle_for_fd(fs, fd)?;
-        let provider = super::eventfd::broker_pty_provider().ok_or(Errno::EIO)?;
-        let max_len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-        let bytes = provider
-            .read_pty(handle, max_len)
-            .map_err(Self::broker_pty_error_to_errno)?;
-        let n = bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
-        Ok(n)
-    }
-
-    fn broker_pty_write(&self, fs: &FS, fd: &TypedFd<FS>, buf: &[u8]) -> Result<usize, Errno> {
-        let handle = self.broker_pty_handle_for_fd(fs, fd)?;
-        let provider = super::eventfd::broker_pty_provider().ok_or(Errno::EIO)?;
-        provider
-            .write_pty(handle, buf)
-            .map(|n| n as usize)
-            .map_err(Self::broker_pty_error_to_errno)
-    }
-
-    /// Handle terminal ioctls for PTY devices (major=136).
-    fn pty_ioctl(
-        &self,
-        fs: &FS,
-        fd: &TypedFd<FS>,
-        arg: &IoctlArg<litebox_platform_multiplex::Platform>,
-    ) -> Result<u32, Errno> {
-        match arg {
-            IoctlArg::TCGETS(termios) => {
-                let payload = self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tcgets, &[])?;
-                if payload.len() != 36 {
-                    return Err(Errno::EIO);
-                }
-                let mut c_cc = [0u8; 19];
-                c_cc.copy_from_slice(&payload[17..36]);
-                termios
-                    .write_at_offset(
-                        0,
-                        litebox_common_linux::Termios {
-                            c_iflag: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
-                            c_oflag: u32::from_le_bytes(payload[4..8].try_into().unwrap()),
-                            c_cflag: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
-                            c_lflag: u32::from_le_bytes(payload[12..16].try_into().unwrap()),
-                            c_line: payload[16],
-                            c_cc,
-                        },
-                    )
-                    .ok_or(Errno::EFAULT)?;
-                Ok(0)
-            }
-            IoctlArg::TCSETS(termios_ptr)
-            | IoctlArg::TCSETSW(termios_ptr)
-            | IoctlArg::TCSETSF(termios_ptr) => {
-                let t: litebox_common_linux::Termios =
-                    termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                let mut payload = Vec::with_capacity(36);
-                payload.extend_from_slice(&t.c_iflag.to_le_bytes());
-                payload.extend_from_slice(&t.c_oflag.to_le_bytes());
-                payload.extend_from_slice(&t.c_cflag.to_le_bytes());
-                payload.extend_from_slice(&t.c_lflag.to_le_bytes());
-                payload.push(t.c_line);
-                payload.extend_from_slice(&t.c_cc);
-                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tcsets, &payload)?;
-                if let Some((pair, _, _)) = fs.get_pty_pair_erased(fd)
-                    && let Ok(pair) = pair.downcast::<litebox::fs::devices::PtyPair<Platform>>()
-                {
-                    *pair.termios.lock() = litebox::platform::TerminalAttributes {
-                        c_iflag: t.c_iflag,
-                        c_oflag: t.c_oflag,
-                        c_cflag: t.c_cflag,
-                        c_lflag: t.c_lflag,
-                        c_line: t.c_line,
-                        c_cc: t.c_cc,
-                    };
-                }
-                Ok(0)
-            }
-            IoctlArg::TIOCSWINSZ(ws_ptr) => {
-                let ws: litebox_common_linux::Winsize =
-                    ws_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                let mut payload = Vec::with_capacity(8);
-                payload.extend_from_slice(&ws.row.to_le_bytes());
-                payload.extend_from_slice(&ws.col.to_le_bytes());
-                payload.extend_from_slice(&ws.xpixel.to_le_bytes());
-                payload.extend_from_slice(&ws.ypixel.to_le_bytes());
-                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocswinsz, &payload)?;
-                Ok(0)
-            }
-            IoctlArg::TIOCSPTLK(lock_ptr) => {
-                let locked: i32 = lock_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocsptlk, &locked.to_le_bytes())?;
-                Ok(0)
-            }
-            IoctlArg::TIOCNOTTY => Ok(0),
-            IoctlArg::TIOCSCTTY => {
-                let Some((_pair, pty_idx, is_master)) = fs.get_pty_pair_erased(fd) else {
-                    return Err(Errno::ENOTTY);
-                };
-                if is_master {
-                    return Err(Errno::ENOTTY);
-                }
-                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocsctty, &[])?;
-                let pgid = i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
-                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocspgrp, &pgid.to_le_bytes())?;
-                if let Ok(pgid_u32) = u32::try_from(pgid) {
-                    self.global.ensure_pgrp_signal_subscription(pgid_u32);
-                }
-                *self.process_state.borrow().controlling_pty.lock() = Some(pty_idx);
-                Ok(0)
-            }
-            IoctlArg::TIOCSPGRP(pgrp_ptr) => {
-                let pgrp: i32 = pgrp_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocspgrp, &pgrp.to_le_bytes())?;
-                if let Ok(pgid) = u32::try_from(pgrp) {
-                    self.global.ensure_pgrp_signal_subscription(pgid);
-                }
-                Ok(0)
-            }
-            IoctlArg::TIOCGWINSZ(ws) => {
-                let payload = self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocgwinsz, &[])?;
-                if payload.len() != 8 {
-                    return Err(Errno::EIO);
-                }
-                ws.write_at_offset(
-                    0,
-                    litebox_common_linux::Winsize {
-                        row: u16::from_le_bytes(payload[0..2].try_into().unwrap()),
-                        col: u16::from_le_bytes(payload[2..4].try_into().unwrap()),
-                        xpixel: u16::from_le_bytes(payload[4..6].try_into().unwrap()),
-                        ypixel: u16::from_le_bytes(payload[6..8].try_into().unwrap()),
-                    },
-                )
-                .ok_or(Errno::EFAULT)?;
-                Ok(0)
-            }
-            IoctlArg::TIOCGPTN(ptn) => {
-                let Some((_pair, pty_idx, _is_master)) = fs.get_pty_pair_erased(fd) else {
-                    return Err(Errno::ENOTTY);
-                };
-                let _ = self.broker_pty_handle_for_fd(fs, fd)?;
-                ptn.write_at_offset(0, pty_idx).ok_or(Errno::EFAULT)?;
-                Ok(0)
-            }
-            IoctlArg::TIOCGPGRP(pgrp) => {
-                let payload = self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocgpgrp, &[])?;
-                if payload.len() != 4 {
-                    return Err(Errno::EIO);
-                }
-                pgrp.write_at_offset(0, i32::from_le_bytes(payload[..4].try_into().unwrap()))
-                    .ok_or(Errno::EFAULT)?;
-                Ok(0)
-            }
-            IoctlArg::TIOCGSID(sid) => {
-                let payload = self.broker_pty_ioctl(fs, fd, PtyIoctlOp::Tiocgsid, &[])?;
-                if payload.len() != 4 {
-                    return Err(Errno::EIO);
-                }
-                sid.write_at_offset(0, i32::from_le_bytes(payload[..4].try_into().unwrap()))
-                    .ok_or(Errno::EFAULT)?;
-                Ok(0)
-            }
-            _ => Err(Errno::ENOTTY),
-        }
-    }
-
     fn broker_pty_ioctl_entry(
         &self,
         entry: &super::broker_pty::BrokerPtyFd<Platform>,
@@ -6132,8 +5839,6 @@ impl<FS: ShimFS> Task<FS> {
                 match major {
                     // major 5: /dev/tty, /dev/console, /dev/ptmx — host stdio
                     5 => Ok(TerminalKind::HostStdio),
-                    // major 136-143: Unix98 PTY slaves (/dev/pts/*)
-                    136..=143 => Ok(TerminalKind::Pty),
                     _ => Ok(TerminalKind::NotTerminal),
                 }
             }
@@ -6273,7 +5978,7 @@ impl<FS: ShimFS> Task<FS> {
                                         }
                                         _ => Errno::EIO,
                                     })?,
-                                TerminalKind::Pty | TerminalKind::NotTerminal => {
+                                TerminalKind::NotTerminal => {
                                     return Err(Errno::ENOTTY);
                                 }
                             };
@@ -6651,7 +6356,6 @@ impl<FS: ShimFS> Task<FS> {
                 desc,
                 |term_fd| match self.classify_terminal(&files.fs, term_fd)? {
                     TerminalKind::HostStdio => self.host_stdio_ioctl(&files.fs, term_fd, &arg),
-                    TerminalKind::Pty => self.pty_ioctl(&files.fs, term_fd, &arg),
                     TerminalKind::NotTerminal => Err(Errno::ENOTTY),
                 },
                 |_fd| Err(Errno::ENOTTY),
@@ -7292,11 +6996,11 @@ impl<FS: ShimFS> Task<FS> {
         }
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
-        if let Ok(fd) = files
-            .raw_descriptor_store
-            .read()
-            .fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(file)
-        {
+        let broker_pty_fd = {
+            let rds = files.raw_descriptor_store.read();
+            rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(file)
+        };
+        if let Ok(fd) = broker_pty_fd {
             let new_fd = dup(
                 &self.global,
                 &files,

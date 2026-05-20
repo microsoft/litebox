@@ -116,6 +116,7 @@ pub(crate) trait BrokerPtyProviderReacquireExt {
         &self,
         handle_id: u64,
         role: BrokerPtyRole,
+        pty_id: Option<u32>,
     ) -> Result<BrokerPtyFd<Platform>, BrokerOpError>;
 }
 
@@ -124,23 +125,28 @@ impl BrokerPtyProviderReacquireExt for Arc<dyn BrokerPtyProvider> {
         &self,
         handle_id: u64,
         role: BrokerPtyRole,
+        pty_id: Option<u32>,
     ) -> Result<BrokerPtyFd<Platform>, BrokerOpError> {
         self.dup_handle(handle_id)?;
-        let pty_id_payload = match self.ioctl_pty(handle_id, PtyIoctlOp::Tiocgptn, &[]) {
-            Ok(payload) => payload,
-            Err(err) => {
+        let pty_id = if let Some(pty_id) = pty_id {
+            pty_id
+        } else {
+            let pty_id_payload = match self.ioctl_pty(handle_id, PtyIoctlOp::Tiocgptn, &[]) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    self.release(handle_id);
+                    return Err(err);
+                }
+            };
+            let Some(pty_id_bytes) = pty_id_payload.get(..4) else {
                 self.release(handle_id);
-                return Err(err);
-            }
+                return Err(BrokerOpError::InvalidValue);
+            };
+            u32::from_le_bytes(pty_id_bytes.try_into().map_err(|_| {
+                self.release(handle_id);
+                BrokerOpError::InvalidValue
+            })?)
         };
-        let Some(pty_id_bytes) = pty_id_payload.get(..4) else {
-            self.release(handle_id);
-            return Err(BrokerOpError::InvalidValue);
-        };
-        let pty_id = u32::from_le_bytes(pty_id_bytes.try_into().map_err(|_| {
-            self.release(handle_id);
-            BrokerOpError::InvalidValue
-        })?);
         let is_master = role == BrokerPtyRole::Master;
         let slave_anchor_handle = if is_master {
             self.open_pty_slave(pty_id).ok()
