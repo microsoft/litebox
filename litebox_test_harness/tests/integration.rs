@@ -67,6 +67,74 @@ use libtest_mimic::{Arguments, Failed, Trial};
 // docker overhead trims, timeout budgets) actually help. See plan in
 // `~/.copilot/session-state/.../plan.md`.
 
+/// Path to the per-trial timing file (host side). Bind-mounted into the
+/// container at `/tmp/litebox-timing.log`; each in-container process
+/// opens that path via `litebox_timing::init_from_env` and appends its
+/// own `[TIMING] name=ns\n` lines.
+///
+/// The file must exist on the host before `docker run` so the bind
+/// mount creates a file (not an implicit directory).
+fn timing_log_path_for(pass: &str, test_id: &str) -> PathBuf {
+    log_dir().join(format!("{pass}-{}.timing", sanitize_id(test_id)))
+}
+
+fn ensure_timing_log_file(path: &Path) {
+    // Create (or truncate) so concurrent trials never see stale data.
+    // Mode defaults to 0o644; the container bind-mounts the parent
+    // directory (not the file itself), so the in-container process
+    // creates new file contents via append and host permissions are
+    // not the bottleneck.
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+}
+
+fn read_timing_log(
+    path: &Path,
+    markers: &mut TimingMarkers,
+    runtime_rewrites: &mut Vec<String>,
+    pass: &str,
+) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for raw in contents.lines() {
+        // Broker emits one of these per runtime ELF rewrite (cache
+        // miss in both memory and disk caches). We assert this list
+        // is empty for litebox pass — setup() pre-populates the
+        // disk cache for the 5 harness variants and the broker's
+        // own `pre_warm_elf_cache` covers the shared libraries.
+        if let Some(p) = raw.strip_prefix("broker_runtime_rewrite:") {
+            // Drop the trailing `=<ns>` value if present.
+            let path_only = p.split('=').next().unwrap_or(p);
+            runtime_rewrites.push(path_only.to_string());
+            continue;
+        }
+        // The on-disk format is `name=ns\n` (no `[TIMING] ` prefix —
+        // that prefix was only for the stderr channel). Prepend it so
+        // `record_timing_marker` can reuse the existing parser.
+        let synthetic = format!("[TIMING] {raw}");
+        record_timing_marker(markers, &synthetic, pass, 0);
+    }
+}
+
+/// Per-cargo-test broker ELF cache directory (bind-mounted into every
+/// litebox-pass docker container). The broker writes pre-warmed
+/// rewritten copies of libc/ld-linux/libstdc++ etc. here on first
+/// miss; subsequent broker invocations populate their in-memory cache
+/// from disk and skip the ~400 ms rewriting step entirely.
+fn broker_elf_cache_dir() -> &'static PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = target_dir().join("litebox-broker-elf-cache");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
 fn timing_file() -> &'static Mutex<std::fs::File> {
     static FILE: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
     FILE.get_or_init(|| {
@@ -89,6 +157,7 @@ fn emit_timing_main(
     t_docker_spawn_ms: Option<u128>,
     t_litebox_init_ms: Option<u128>,
     t_harness_load_ms: Option<u128>,
+    sub_phases: &SubPhaseMs,
     t_useful_ms: u128,
     verdict: &str,
     jobs: usize,
@@ -107,6 +176,15 @@ fn emit_timing_main(
     if let Some(v) = t_harness_load_ms {
         line.push_str(&format!(",\"t_harness_load_ms\":{v}"));
     }
+    // Phase A sub-phase split. Each is the delta between adjacent
+    // markers in `litebox_timing`'s file channel; cumulative should
+    // sum to `t_litebox_init_ms`/`t_harness_load_ms` (within rounding).
+    // See `SubPhaseMs::compute` for the full marker order.
+    for (key, value) in sub_phases.fields() {
+        if let Some(v) = value {
+            line.push_str(&format!(",\"{key}\":{v}"));
+        }
+    }
     line.push_str(&format!(
         ",\"t_useful_ms\":{t_useful_ms},\"verdict\":\"{verdict}\",\"jobs\":{jobs}}}\n"
     ));
@@ -115,11 +193,136 @@ fn emit_timing_main(
     }
 }
 
+/// All timing markers we recognise on the file channel + the
+/// stderr `[TIMING] harness_first_output_ns=` proxy.
+///
+/// First-wins per name: see `record_timing_marker`. Fields are
+/// optional because (a) some code paths skip markers (e.g.
+/// `litebox_shim_ready_ns` is absent in native pass) and (b) the
+/// stderr scraper only sees `harness_first_output_ns`.
 #[derive(Clone, Copy, Default)]
 struct TimingMarkers {
     container_pid1_started_ns: Option<u64>,
+    tool_executor_args_parsed_ns: Option<u64>,
+    tool_executor_audit_open_ns: Option<u64>,
+    broker_spawn_called_ns: Option<u64>,
+    broker_socket_ready_ns: Option<u64>,
+    // Broker-internal phases (litebox_broker emits these via
+    // litebox_timing once it inherits LITEBOX_TIMING_PATH from
+    // tool_executor). All on host CLOCK_MONOTONIC.
+    broker_main_started_ns: Option<u64>,
+    broker_args_parsed_ns: Option<u64>,
+    broker_policy_loaded_ns: Option<u64>,
+    broker_audit_open_ns: Option<u64>,
+    broker_listen_called_ns: Option<u64>,
+    broker_prewarm_done_ns: Option<u64>,
+    broker_first_accept_ns: Option<u64>,
+    runner_spawn_called_ns: Option<u64>,
+    runner_started_ns: Option<u64>,
+    runner_broker_connected_ns: Option<u64>,
+    runner_rootfs_ready_ns: Option<u64>,
+    runner_program_loaded_ns: Option<u64>,
     litebox_shim_ready_ns: Option<u64>,
+    /// Host-clock view of "harness started" — populated from the
+    /// stderr arrival_ns proxy in litebox pass, or from the file in
+    /// native pass. Used for `t_harness_load_ms` which bridges
+    /// runner (host clock) → guest harness.
     harness_first_output_ns: Option<u64>,
+    /// Guest-clock view of harness_first_output_ns. In native pass
+    /// equal to `harness_first_output_ns`; in litebox pass differs
+    /// because the guest's CLOCK_MONOTONIC is virtualized. Used as
+    /// the start anchor for `t_harness_args_ms` so harness-internal
+    /// sub-phases stay on a single clock domain.
+    harness_first_output_ns_guest: Option<u64>,
+    harness_args_parsed_ns: Option<u64>,
+    harness_dispatch_ready_ns: Option<u64>,
+}
+
+/// Sub-phase deltas in milliseconds. All optional — only present when
+/// both endpoint markers were observed for the trial.
+#[derive(Default)]
+struct SubPhaseMs {
+    // t_litebox_init_ms breakdown (container_pid1 → litebox_shim_ready)
+    t_tool_executor_args_ms: Option<u128>,
+    t_tool_executor_audit_ms: Option<u128>,
+    t_broker_spawn_ms: Option<u128>,
+    t_broker_bind_ms: Option<u128>,
+    t_runner_spawn_call_ms: Option<u128>,
+    t_runner_fork_ms: Option<u128>,
+    t_runner_broker_conn_ms: Option<u128>,
+    t_runner_rootfs_ms: Option<u128>,
+    t_runner_program_load_ms: Option<u128>,
+    t_runner_shim_handoff_ms: Option<u128>,
+    // Broker-internal sub-phases. Bracket the broker's own startup
+    // gap between bind() and first_accept; on the host clock these
+    // overlap with t_runner_spawn_call_ms / t_runner_fork_ms / the
+    // tail of t_runner_broker_conn_ms (broker runs concurrently with
+    // runner spawn). The "broker_*_ms" deltas are reported separately
+    // so they don't double-count against t_litebox_init_ms.
+    t_broker_args_ms: Option<u128>,
+    t_broker_policy_ms: Option<u128>,
+    t_broker_audit_ms: Option<u128>,
+    t_broker_listen_ms: Option<u128>,
+    t_broker_prewarm_ms: Option<u128>,
+    t_broker_accept_ms: Option<u128>,
+    // t_harness_load_ms breakdown
+    t_guest_runtime_init_ms: Option<u128>,
+    t_harness_args_ms: Option<u128>,
+    t_harness_dispatch_ms: Option<u128>,
+}
+
+impl SubPhaseMs {
+    fn compute(m: &TimingMarkers) -> Self {
+        let d = |a: Option<u64>, b: Option<u64>| a.zip(b).and_then(|(a, b)| ns_delta_ms(a, b));
+        Self {
+            t_tool_executor_args_ms: d(m.container_pid1_started_ns, m.tool_executor_args_parsed_ns),
+            t_tool_executor_audit_ms: d(
+                m.tool_executor_args_parsed_ns,
+                m.tool_executor_audit_open_ns,
+            ),
+            t_broker_spawn_ms: d(m.tool_executor_audit_open_ns, m.broker_spawn_called_ns),
+            t_broker_bind_ms: d(m.broker_spawn_called_ns, m.broker_socket_ready_ns),
+            t_runner_spawn_call_ms: d(m.broker_socket_ready_ns, m.runner_spawn_called_ns),
+            t_runner_fork_ms: d(m.runner_spawn_called_ns, m.runner_started_ns),
+            t_runner_broker_conn_ms: d(m.runner_started_ns, m.runner_broker_connected_ns),
+            t_runner_rootfs_ms: d(m.runner_broker_connected_ns, m.runner_rootfs_ready_ns),
+            t_runner_program_load_ms: d(m.runner_rootfs_ready_ns, m.runner_program_loaded_ns),
+            t_runner_shim_handoff_ms: d(m.runner_program_loaded_ns, m.litebox_shim_ready_ns),
+            t_broker_args_ms: d(m.broker_main_started_ns, m.broker_args_parsed_ns),
+            t_broker_policy_ms: d(m.broker_args_parsed_ns, m.broker_policy_loaded_ns),
+            t_broker_audit_ms: d(m.broker_policy_loaded_ns, m.broker_audit_open_ns),
+            t_broker_listen_ms: d(m.broker_audit_open_ns, m.broker_listen_called_ns),
+            t_broker_prewarm_ms: d(m.broker_listen_called_ns, m.broker_prewarm_done_ns),
+            t_broker_accept_ms: d(m.broker_prewarm_done_ns, m.broker_first_accept_ns),
+            t_guest_runtime_init_ms: d(m.litebox_shim_ready_ns, m.harness_first_output_ns),
+            t_harness_args_ms: d(m.harness_first_output_ns_guest, m.harness_args_parsed_ns),
+            t_harness_dispatch_ms: d(m.harness_args_parsed_ns, m.harness_dispatch_ready_ns),
+        }
+    }
+
+    fn fields(&self) -> [(&'static str, Option<u128>); 19] {
+        [
+            ("t_tool_executor_args_ms", self.t_tool_executor_args_ms),
+            ("t_tool_executor_audit_ms", self.t_tool_executor_audit_ms),
+            ("t_broker_spawn_ms", self.t_broker_spawn_ms),
+            ("t_broker_bind_ms", self.t_broker_bind_ms),
+            ("t_runner_spawn_call_ms", self.t_runner_spawn_call_ms),
+            ("t_runner_fork_ms", self.t_runner_fork_ms),
+            ("t_runner_broker_conn_ms", self.t_runner_broker_conn_ms),
+            ("t_runner_rootfs_ms", self.t_runner_rootfs_ms),
+            ("t_runner_program_load_ms", self.t_runner_program_load_ms),
+            ("t_runner_shim_handoff_ms", self.t_runner_shim_handoff_ms),
+            ("t_broker_args_ms", self.t_broker_args_ms),
+            ("t_broker_policy_ms", self.t_broker_policy_ms),
+            ("t_broker_audit_ms", self.t_broker_audit_ms),
+            ("t_broker_listen_ms", self.t_broker_listen_ms),
+            ("t_broker_prewarm_ms", self.t_broker_prewarm_ms),
+            ("t_broker_accept_ms", self.t_broker_accept_ms),
+            ("t_guest_runtime_init_ms", self.t_guest_runtime_init_ms),
+            ("t_harness_args_ms", self.t_harness_args_ms),
+            ("t_harness_dispatch_ms", self.t_harness_dispatch_ms),
+        ]
+    }
 }
 
 fn record_timing_marker(markers: &mut TimingMarkers, line: &str, pass: &str, arrival_ns: u64) {
@@ -132,36 +335,57 @@ fn record_timing_marker(markers: &mut TimingMarkers, line: &str, pass: &str, arr
     let Ok(marker_ns) = value.parse::<u64>() else {
         return;
     };
-    let ns = if name == "harness_first_output_ns" && pass == "litebox" {
+    let ns = if name == "harness_first_output_ns" && pass == "litebox" && arrival_ns != 0 {
+        // Stderr arrival_ns proxy: in litebox pass, the in-guest harness
+        // emits this on a virtualized CLOCK_MONOTONIC. The stderr line
+        // arrives on the host shortly after the guest writes it; use
+        // the host arrival time as the boundary for measurements that
+        // bridge the runner → guest seam. arrival_ns=0 means "called
+        // from the file reader" — keep the (virtual) value since we
+        // have no host-clock proxy to use instead.
         arrival_ns
     } else {
         marker_ns
     };
-    match name {
-        "container_pid1_started_ns" if markers.container_pid1_started_ns.is_none() => {
-            markers.container_pid1_started_ns = Some(ns);
-        }
-        "litebox_shim_ready_ns" if markers.litebox_shim_ready_ns.is_none() => {
-            markers.litebox_shim_ready_ns = Some(ns);
-        }
-        "harness_first_output_ns" if markers.harness_first_output_ns.is_none() => {
-            markers.harness_first_output_ns = Some(ns);
-        }
-        _ => {}
+    // Always preserve the guest-clock value of harness_first_output_ns
+    // for harness-internal sub-phase computation (`t_harness_args_ms`
+    // etc.) where mixing clocks would underflow.
+    if name == "harness_first_output_ns"
+        && arrival_ns == 0
+        && markers.harness_first_output_ns_guest.is_none()
+    {
+        markers.harness_first_output_ns_guest = Some(marker_ns);
     }
-}
-
-fn wait_for_timing_markers(markers: &Arc<Mutex<TimingMarkers>>, pass: &str) -> TimingMarkers {
-    let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        let snapshot = *markers.lock().expect("timing markers lock poisoned");
-        let has_required = snapshot.container_pid1_started_ns.is_some()
-            && snapshot.harness_first_output_ns.is_some()
-            && (pass == "native" || snapshot.litebox_shim_ready_ns.is_some());
-        if has_required || Instant::now() >= deadline {
-            return snapshot;
-        }
-        std::thread::sleep(Duration::from_millis(5));
+    macro_rules! first_wins {
+        ($field:ident) => {
+            if markers.$field.is_none() {
+                markers.$field = Some(ns);
+            }
+        };
+    }
+    match name {
+        "container_pid1_started_ns" => first_wins!(container_pid1_started_ns),
+        "tool_executor_args_parsed_ns" => first_wins!(tool_executor_args_parsed_ns),
+        "tool_executor_audit_open_ns" => first_wins!(tool_executor_audit_open_ns),
+        "broker_spawn_called_ns" => first_wins!(broker_spawn_called_ns),
+        "broker_socket_ready_ns" => first_wins!(broker_socket_ready_ns),
+        "broker_main_started_ns" => first_wins!(broker_main_started_ns),
+        "broker_args_parsed_ns" => first_wins!(broker_args_parsed_ns),
+        "broker_policy_loaded_ns" => first_wins!(broker_policy_loaded_ns),
+        "broker_audit_open_ns" => first_wins!(broker_audit_open_ns),
+        "broker_listen_called_ns" => first_wins!(broker_listen_called_ns),
+        "broker_prewarm_done_ns" => first_wins!(broker_prewarm_done_ns),
+        "broker_first_accept_ns" => first_wins!(broker_first_accept_ns),
+        "runner_spawn_called_ns" => first_wins!(runner_spawn_called_ns),
+        "runner_started_ns" => first_wins!(runner_started_ns),
+        "runner_broker_connected_ns" => first_wins!(runner_broker_connected_ns),
+        "runner_rootfs_ready_ns" => first_wins!(runner_rootfs_ready_ns),
+        "runner_program_loaded_ns" => first_wins!(runner_program_loaded_ns),
+        "litebox_shim_ready_ns" => first_wins!(litebox_shim_ready_ns),
+        "harness_first_output_ns" => first_wins!(harness_first_output_ns),
+        "harness_args_parsed_ns" => first_wins!(harness_args_parsed_ns),
+        "harness_dispatch_ready_ns" => first_wins!(harness_dispatch_ready_ns),
+        _ => {}
     }
 }
 
@@ -460,6 +684,46 @@ fn build_docker_cmd(
             "{}:/opt/non-pie-static-musl:ro",
             bins.non_pie_static_musl.display()
         ));
+    // For litebox pass, no additional mounts are needed for the
+    // harness binaries — pre-rewriting is amortised in the broker's
+    // persistent ELF cache (LITEBOX_BROKER_ELF_CACHE_DIR) which
+    // setup() pre-populates from rewrites of all 5 variants. The
+    // broker hits the disk cache on first 9P read and never invokes
+    // the rewriter at runtime. Native pass gets the original
+    // (unmodified) binaries via the directory bind mounts above.
+    cmd.arg("-v")
+        // Bind-mount the host test-logs/ directory into the container so
+        // all in-container processes (tool_executor, broker, runner, the
+        // in-guest harness) can append timing markers via
+        // `litebox_timing::emit` to a per-trial file. WSL2 + Docker
+        // returns EACCES on a single-file bind-mount even when the
+        // container runs as root, so we bind-mount the directory and
+        // each component opens the per-trial file name.
+        .arg(format!("{}:/litebox-test-logs", log_dir().display()))
+        .args([
+            "-e",
+            &format!(
+                "LITEBOX_TIMING_PATH=/litebox-test-logs/{}",
+                timing_log_path_for(pass, test_id)
+                    .file_name()
+                    .expect("timing_log_path_for has file name")
+                    .to_string_lossy(),
+            ),
+        ])
+        // Bind-mount a persistent host directory for the broker's
+        // pre-warmed ELF cache. Without this, each test pays
+        // ~400ms in pre_warm_elf_cache for libc/ld-linux/libstdc++/etc.
+        // because the broker is per-container and its in-memory
+        // cache is cold on every spawn.
+        .arg("-v")
+        .arg(format!(
+            "{}:/litebox-broker-elf-cache",
+            broker_elf_cache_dir().display()
+        ))
+        .args([
+            "-e",
+            "LITEBOX_BROKER_ELF_CACHE_DIR=/litebox-broker-elf-cache",
+        ]);
     if pass == "native" {
         cmd.args(["-e", "LITEBOX_TIMING_CONTAINER_PID1=1"]);
     }
@@ -553,6 +817,8 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
 
     let stdout_log = log_path_for(pass, test_id, "stdout");
     let stderr_log = log_path_for(pass, test_id, "stderr");
+    let timing_log = timing_log_path_for(pass, test_id);
+    ensure_timing_log_file(&timing_log);
 
     let mut cmd = build_docker_cmd(pass, test_id, &container_name, &bins);
     cmd.stdout(Stdio::piped());
@@ -614,7 +880,37 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     let t_json_ns = monotonic_nanos();
 
     let t_first_byte = t_first_byte.unwrap_or(t_json);
-    let markers = wait_for_timing_markers(&timing_markers, pass);
+    // Markers come from two sources:
+    //   * The bind-mounted timing-log file: tool_executor + broker +
+    //     runner + in-guest harness append `name=ns\n` via
+    //     `litebox_timing::emit`. All on host CLOCK_MONOTONIC EXCEPT
+    //     the in-guest harness in litebox pass, whose clock is
+    //     virtualized.
+    //   * The stderr `[TIMING] harness_first_output_ns=` proxy line
+    //     from the harness — used as a host-side arrival_ns boundary
+    //     for `harness_first_output_ns` in litebox pass (where the
+    //     guest's CLOCK_MONOTONIC value is not comparable to the
+    //     host-side markers).
+    // We pre-populate from the file first (all init markers are
+    // flushed by the time the JSON result line arrives on stdout),
+    // then merge the stderr snapshot — `record_timing_marker` is
+    // first-wins so the stderr arrival_ns proxy overrides the
+    // file's virtual-clock value when both are present.
+    let mut markers = TimingMarkers::default();
+    let mut runtime_rewrites: Vec<String> = Vec::new();
+    {
+        let stderr_snapshot = *timing_markers.lock().expect("timing markers lock poisoned");
+        if let Some(ns) = stderr_snapshot.harness_first_output_ns {
+            markers.harness_first_output_ns = Some(ns);
+        }
+        if let Some(ns) = stderr_snapshot.container_pid1_started_ns {
+            markers.container_pid1_started_ns = Some(ns);
+        }
+        if let Some(ns) = stderr_snapshot.litebox_shim_ready_ns {
+            markers.litebox_shim_ready_ns = Some(ns);
+        }
+    }
+    read_timing_log(&timing_log, &mut markers, &mut runtime_rewrites, pass);
     let shim_ready_ns = markers
         .litebox_shim_ready_ns
         .or(markers.container_pid1_started_ns);
@@ -636,6 +932,33 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         .harness_first_output_ns
         .and_then(|ns| ns_delta_ms(ns, t_json_ns))
         .unwrap_or_else(|| t_json.duration_since(t_first_byte).as_millis());
+    // Runtime-rewrite assertion: every binary the test loaded should
+    // have been pre-populated in the broker ELF cache (harness
+    // variants from setup(), shared libraries from
+    // pre_warm_elf_cache). A non-empty list means some binary was
+    // rewritten in-band, which costs ~hundreds of ms per file —
+    // worth surfacing as a perf bug to investigate, not silently
+    // tolerating. Override with `LITEBOX_ALLOW_RUNTIME_REWRITES=1`
+    // for one-off debugging.
+    let allow_runtime_rewrites = std::env::var_os("LITEBOX_ALLOW_RUNTIME_REWRITES").is_some();
+    if pass == "litebox" && !runtime_rewrites.is_empty() && !allow_runtime_rewrites {
+        let mut unique: Vec<String> = runtime_rewrites.clone();
+        unique.sort();
+        unique.dedup();
+        let detail = format!(
+            "unexpected runtime ELF rewrites ({} unique path(s)): {}; \
+             pre-populate via setup() / pre_warm_elf_cache, or set \
+             LITEBOX_ALLOW_RUNTIME_REWRITES=1 to bypass",
+            unique.len(),
+            unique.join(", "),
+        );
+        found = Some(serde_json::json!({
+            "test": test_id,
+            "result": "FAIL",
+            "detail": detail,
+        }));
+    }
+
     let verdict: &'static str = match &found {
         Some(v) => match v.get("result").and_then(|r| r.as_str()) {
             Some("pass") => "pass",
@@ -651,6 +974,8 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     };
     let jobs = current_jobs_cap();
 
+    let sub_phases = SubPhaseMs::compute(&markers);
+
     // Emit the main timing line synchronously (drain may get cut off
     // if cargo-test exits early).
     emit_timing_main(
@@ -661,6 +986,7 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         t_docker_spawn_ms,
         t_litebox_init_ms,
         t_harness_load_ms,
+        &sub_phases,
         t_useful_ms,
         verdict,
         jobs,
@@ -979,6 +1305,16 @@ fn non_pie_static_musl_dir() -> PathBuf {
 /// [`setup`]. Each path corresponds to a leg of
 /// [`litebox_test_harness::BinaryType`] and is bind-mounted into the
 /// Docker container at the conventional `/opt/<label>` path.
+///
+/// Track 1+2 amortisation (unified): the syscall-rewriter is invoked
+/// once per variant in `setup()` and the resulting bytes are written
+/// directly into the broker's persistent ELF cache directory
+/// (`LITEBOX_BROKER_ELF_CACHE_DIR`, see [`broker_elf_cache_dir`]).
+/// On the first 9P read of each `litebox_test_harness` variant the
+/// broker hits the disk cache, populates its in-memory cache, and
+/// never invokes the rewriter at runtime. Same mechanism the broker
+/// uses for its own `pre_warm_elf_cache` of shared libraries —
+/// see `litebox_broker::nine_p::server::disk_cache_key`.
 #[derive(Debug, Clone)]
 struct BinaryPaths {
     pie_glibc: PathBuf,
@@ -986,6 +1322,80 @@ struct BinaryPaths {
     static_pie_glibc: PathBuf,
     static_pie_musl: PathBuf,
     non_pie_static_musl: PathBuf,
+}
+
+/// Find `litebox_syscall_rewriter` in the workspace's target dir.
+fn rewriter_path() -> PathBuf {
+    debug_dir().join("litebox_syscall_rewriter")
+}
+
+/// Sanitise an absolute path into a filesystem-safe filename
+/// component, matching `litebox_broker::nine_p::server::disk_cache_key`
+/// (sans the mtime suffix it appends). Keep in sync — divergence
+/// would cause cache misses where hits are expected.
+fn broker_cache_path_component(p: &Path) -> String {
+    let mut out = String::new();
+    for c in p.as_os_str().to_string_lossy().chars() {
+        match c {
+            '/' => out.push('_'),
+            c if c.is_ascii_alphanumeric() || c == '-' || c == '.' => out.push(c),
+            _ => out.push('-'),
+        }
+    }
+    out
+}
+
+/// Rewrite `binary` and write the result directly into the broker's
+/// persistent ELF cache, keyed by the **in-container** path the
+/// broker will resolve when the runner asks for it
+/// (`in_container_path`) plus the host file's mtime (which equals
+/// the in-container mtime since the file is bind-mounted).
+///
+/// Idempotent + mtime-validated: if the destination cache file
+/// already exists (concurrent setup() in another worktree, or a
+/// previous run with the same mtime), do nothing.
+fn ensure_rewritten_in_broker_cache(binary: &Path, in_container_path: &Path) {
+    let src_meta =
+        std::fs::metadata(binary).unwrap_or_else(|e| panic!("stat {}: {e}", binary.display()));
+    let mtime = src_meta
+        .modified()
+        .unwrap()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let key = format!(
+        "{}.{mtime}.elf",
+        broker_cache_path_component(in_container_path),
+    );
+    let dir = broker_elf_cache_dir();
+    let cache_path = dir.join(&key);
+    if cache_path.exists() {
+        return;
+    }
+    let tmp = dir.join(format!("{key}.tmp.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let rewriter = rewriter_path();
+    let status = Command::new(&rewriter)
+        .arg(binary)
+        .arg("-o")
+        .arg(&tmp)
+        .status()
+        .unwrap_or_else(|e| panic!("invoke {}: {e}", rewriter.display()));
+    assert!(
+        status.success(),
+        "{} {} -> {} failed",
+        rewriter.display(),
+        binary.display(),
+        tmp.display()
+    );
+    // Atomic rename. If a concurrent writer beat us, the rename
+    // either replaces theirs with an identical-content file or our
+    // rename loses — either way the resulting file is valid because
+    // the rewriter is deterministic for a given input.
+    std::fs::rename(&tmp, &cache_path).unwrap_or_else(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        panic!("rename {} -> {}: {e}", tmp.display(), cache_path.display())
+    });
 }
 
 /// Build the Docker test image if needed.
@@ -1170,6 +1580,28 @@ fn setup() -> (PathBuf, BinaryPaths) {
             let ws_root = workspace_root();
             ensure_binaries_built(&ws_root);
             ensure_docker_image(&ws_root);
+            // Also build the syscall rewriter so we can pre-rewrite the
+            // test_harness variants below. It lives in the default
+            // target dir; ensure_binaries_built already pulls it in
+            // transitively but be explicit.
+            let rewriter_status = Command::new("cargo")
+                .current_dir(&ws_root)
+                .args([
+                    "build",
+                    "--target-dir",
+                    &target_dir().to_string_lossy(),
+                    "-p",
+                    "litebox_syscall_rewriter",
+                ])
+                .status()
+                .expect("cargo build litebox_syscall_rewriter");
+            assert!(rewriter_status.success(), "cargo build rewriter failed");
+            assert!(
+                rewriter_path().exists(),
+                "rewriter binary missing at {}",
+                rewriter_path().display()
+            );
+
             let bins = BinaryPaths {
                 pie_glibc: debug_dir(),
                 nonpie_glibc: nonpie_dir(),
@@ -1177,21 +1609,62 @@ fn setup() -> (PathBuf, BinaryPaths) {
                 static_pie_musl: static_pie_musl_dir(),
                 non_pie_static_musl: non_pie_static_musl_dir(),
             };
-            for (label, dir) in [
-                ("PIE-glibc", &bins.pie_glibc),
-                ("non-PIE-glibc", &bins.nonpie_glibc),
-                ("static-PIE-glibc", &bins.static_pie_glibc),
-                ("static-PIE-musl", &bins.static_pie_musl),
-                ("non-PIE-static-musl", &bins.non_pie_static_musl),
+            // Pre-populate the broker's persistent ELF cache so the
+            // first 9P read of each harness variant hits the disk
+            // cache and the broker never invokes the rewriter at
+            // runtime. The cache key is the **in-container** path
+            // the broker will resolve (e.g.
+            // `/opt/litebox/litebox_test_harness`) + the host file's
+            // mtime (which equals the in-container mtime via the
+            // bind mount). See
+            // `ensure_rewritten_in_broker_cache` for the key format,
+            // which mirrors `litebox_broker::nine_p::server::disk_cache_key`.
+            for (label, host_dir, in_container_path) in [
+                (
+                    "PIE-glibc",
+                    &bins.pie_glibc,
+                    "/opt/litebox/litebox_test_harness",
+                ),
+                (
+                    "non-PIE-glibc",
+                    &bins.nonpie_glibc,
+                    "/opt/nonpie/litebox_test_harness",
+                ),
+                (
+                    "static-PIE-glibc",
+                    &bins.static_pie_glibc,
+                    "/opt/static-pie-glibc/litebox_test_harness",
+                ),
+                (
+                    "static-PIE-musl",
+                    &bins.static_pie_musl,
+                    "/opt/static-pie-musl/litebox_test_harness",
+                ),
+                (
+                    "non-PIE-static-musl",
+                    &bins.non_pie_static_musl,
+                    "/opt/non-pie-static-musl/litebox_test_harness",
+                ),
             ] {
-                let bin = dir.join("litebox_test_harness");
+                let bin = host_dir.join("litebox_test_harness");
                 assert!(
                     bin.exists(),
                     "{label} litebox_test_harness not found at {} \
                      after ensure_binaries_built",
                     bin.display()
                 );
+                let t0 = std::time::Instant::now();
+                ensure_rewritten_in_broker_cache(&bin, Path::new(in_container_path));
+                let elapsed = t0.elapsed();
+                if elapsed.as_millis() > 50 {
+                    eprintln!(
+                        "[setup] pre-rewrote {label} into broker cache in {} ms",
+                        elapsed.as_millis()
+                    );
+                }
             }
+            // Touch suppression: variable is fully initialised by the
+            // literal above. No further mutation needed.
             (ws_root, bins)
         })
         .clone()

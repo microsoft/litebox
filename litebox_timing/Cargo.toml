@@ -1,0 +1,28 @@
+[package]
+name = "litebox_timing"
+version = "0.1.0"
+edition = "2024"
+
+# Tiny side-channel telemetry for litebox test runs.
+#
+# * Each component (tool_executor, broker, runner, in-guest harness) calls
+#   `litebox_timing::init_from_env()` once at startup.
+# * Subsequent `litebox_timing::emit("name")` calls write
+#   `name=<CLOCK_MONOTONIC ns>\n` to the file pointed at by the
+#   `LITEBOX_TIMING_PATH` env var (opened `O_WRONLY | O_APPEND | O_CREAT`).
+# * If the env var is unset, `emit` is a single predicted-branch no-op.
+#   Production runs never touch the file system for telemetry.
+#
+# Why a dedicated side channel (not stderr)? See commit 9fb1ba3e:
+# PTY-test children dup the harness's stderr as stdout, so `[TIMING]`
+# lines on stderr contaminated PTY-test output assertions (PTY suite
+# regressed 175 → 60 passing). A side-channel file is structurally
+# immune to capture-seam collisions, and concurrent appenders on a
+# regular file are safe under Linux O_APPEND semantics for writes
+# smaller than `PIPE_BUF`.
+
+[dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
 libc = "0.2"
+litebox_timing = { version = "0.1.0", path = "../litebox_timing" }
 
 [lints.rust]
 warnings = "deny"

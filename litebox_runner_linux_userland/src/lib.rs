@@ -9,22 +9,6 @@ use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-fn monotonic_nanos() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid out-pointer for `clock_gettime`.
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
-    if rc == 0 {
-        let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
-        let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
-        secs * 1_000_000_000 + nanos
-    } else {
-        0
-    }
-}
-
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
@@ -488,6 +472,8 @@ fn initial_program_data(
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    litebox_timing::init_from_env();
+    litebox_timing::emit("runner_started_ns");
     // Open audit log file if specified. Must happen before any early-return
     // path (worker_exec, fork_restore) so ALL workers get audit logging.
     #[cfg(feature = "audit_log")]
@@ -1004,6 +990,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // Open a dedicated 9P channel using shared-memory ring buffers.
     if !is_tcp {
         let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
+        litebox_timing::emit("runner_broker_connected_ns");
 
         let shim = shim_builder.build();
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -1016,6 +1003,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         let (nine_p_fs, mut reader) =
             litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
                 .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+        litebox_timing::emit("runner_rootfs_ready_ns");
 
         // Spawn the 9P response worker thread.
         let worker_handle = nine_p_fs.worker_handle();
@@ -1043,6 +1031,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             envp,
             cli_args.working_directory.clone(),
         )?;
+        litebox_timing::emit("runner_program_loaded_ns");
 
         // Install pipe bridges for inherited non-stdio fds (e.g. socketpair IPC).
         let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
@@ -2530,7 +2519,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
 
-    eprintln!("[TIMING] litebox_shim_ready_ns={}", monotonic_nanos());
+    litebox_timing::emit("litebox_shim_ready_ns");
     let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         litebox_platform_linux_userland::run_thread(
             program.entrypoints,
