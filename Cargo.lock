@@ -1615,6 +1615,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_common_windows",
  "litebox_syscall_rewriter",
+ "litebox_timing",
  "serde",
  "serde_json",
  "simple-dns",

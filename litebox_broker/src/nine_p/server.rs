@@ -145,8 +145,22 @@ impl Server {
     /// background thread.  This is called at broker startup so that the
     /// first worker connection doesn't pay the ~3s rewriting cost for
     /// shared libraries like libc.
+    ///
+    /// Honours `LITEBOX_BROKER_ELF_CACHE_DIR` for cross-broker
+    /// amortisation: if the env var points at an existing directory,
+    /// rewritten ELF bytes are persisted there keyed by
+    /// `(canonical path, mtime)`. Subsequent broker invocations
+    /// (sharing that directory via a bind mount, for example) populate
+    /// the in-memory cache from disk and skip the (~300 ms / lib)
+    /// rewriting step entirely.
     pub fn pre_warm_elf_cache(elf_cache: &Arc<Mutex<ElfCache>>, root: &Path, paths: &[&str]) {
         use std::io::{Read, Seek, SeekFrom};
+
+        let disk_cache_dir: Option<PathBuf> =
+            std::env::var_os("LITEBOX_BROKER_ELF_CACHE_DIR").map(PathBuf::from);
+        if let Some(ref d) = disk_cache_dir {
+            let _ = fs::create_dir_all(d);
+        }
 
         for rel_path in paths {
             let full = root.join(rel_path.trim_start_matches('/'));
@@ -176,13 +190,30 @@ impl Server {
                 None => continue,
             };
 
-            // Already cached?
+            // Already cached in-memory?
             {
                 let cache = mutex_lock(elf_cache, "elf_cache");
                 if let Some((mtime, _)) = cache.get(&resolved) {
                     if *mtime == current_mtime {
                         continue;
                     }
+                }
+            }
+
+            // Try the persistent disk cache before doing any work.
+            if let Some(ref d) = disk_cache_dir {
+                let key = disk_cache_key(&resolved, current_mtime);
+                let cache_path = d.join(&key);
+                if let Ok(bytes) = fs::read(&cache_path) {
+                    let arc = Arc::new(bytes);
+                    let mut cache = mutex_lock(elf_cache, "elf_cache");
+                    cache.insert(resolved.clone(), (current_mtime, Arc::clone(&arc)));
+                    eprintln!(
+                        "[broker] pre-warmed ELF cache HIT (disk): {} ({} bytes)",
+                        resolved.display(),
+                        arc.len(),
+                    );
+                    continue;
                 }
             }
 
@@ -215,6 +246,24 @@ impl Server {
                 litebox_syscall_rewriter::hook_syscalls_in_elf(&content, None, &mut skipped_addrs)
             }));
             if let Ok(Ok(patched)) = pw_result {
+                // Persist to disk cache before populating in-memory so
+                // the next broker process sees it. Atomic via tmp +
+                // rename. Best-effort: failures don't block the
+                // in-memory cache population.
+                if let Some(ref d) = disk_cache_dir {
+                    let key = disk_cache_key(&resolved, current_mtime);
+                    let cache_path = d.join(&key);
+                    let tmp = d.join(format!("{key}.tmp.{}", std::process::id()));
+                    if fs::write(&tmp, &patched).is_ok() && fs::rename(&tmp, &cache_path).is_ok() {
+                        eprintln!(
+                            "[broker] pre-warmed ELF cache MISS → wrote {} ({} bytes)",
+                            cache_path.display(),
+                            patched.len(),
+                        );
+                    } else {
+                        let _ = fs::remove_file(&tmp);
+                    }
+                }
                 let arc = Arc::new(patched);
                 let mut cache = mutex_lock(elf_cache, "elf_cache");
                 cache.insert(resolved.clone(), (current_mtime, Arc::clone(&arc)));
@@ -2274,6 +2323,27 @@ fn mutex_lock<'a, T>(lock: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
             poisoned.into_inner()
         }
     }
+}
+
+/// Filesystem-safe disk-cache filename for `(resolved_path, mtime)`.
+///
+/// Used by `pre_warm_elf_cache` to persist rewritten ELF bytes across
+/// broker process invocations. The key has to round-trip safely across
+/// any host filesystem; we drop the leading `/`, replace path
+/// separators with `_`, and append the mtime. Two different paths
+/// that collapse to the same key would be unsafe — we mitigate that
+/// in practice by always using the resolved (canonicalised) absolute
+/// path, which is unique on the host.
+fn disk_cache_key(resolved: &Path, mtime: i64) -> String {
+    let mut key = String::new();
+    for part in resolved.as_os_str().to_string_lossy().chars() {
+        match part {
+            '/' => key.push('_'),
+            c if c.is_ascii_alphanumeric() || c == '-' || c == '.' => key.push(c),
+            _ => key.push('-'),
+        }
+    }
+    format!("{key}.{mtime}.elf")
 }
 
 /// Convert an `io::Error` to an Rlerror response.

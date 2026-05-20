@@ -105,6 +105,20 @@ fn read_timing_log(path: &Path, markers: &mut TimingMarkers, pass: &str) {
     }
 }
 
+/// Per-cargo-test broker ELF cache directory (bind-mounted into every
+/// litebox-pass docker container). The broker writes pre-warmed
+/// rewritten copies of libc/ld-linux/libstdc++ etc. here on first
+/// miss; subsequent broker invocations populate their in-memory cache
+/// from disk and skip the ~400 ms rewriting step entirely.
+fn broker_elf_cache_dir() -> &'static PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = target_dir().join("litebox-broker-elf-cache");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
 fn timing_file() -> &'static Mutex<std::fs::File> {
     static FILE: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
     FILE.get_or_init(|| {
@@ -177,6 +191,16 @@ struct TimingMarkers {
     tool_executor_audit_open_ns: Option<u64>,
     broker_spawn_called_ns: Option<u64>,
     broker_socket_ready_ns: Option<u64>,
+    // Broker-internal phases (litebox_broker emits these via
+    // litebox_timing once it inherits LITEBOX_TIMING_PATH from
+    // tool_executor). All on host CLOCK_MONOTONIC.
+    broker_main_started_ns: Option<u64>,
+    broker_args_parsed_ns: Option<u64>,
+    broker_policy_loaded_ns: Option<u64>,
+    broker_audit_open_ns: Option<u64>,
+    broker_listen_called_ns: Option<u64>,
+    broker_prewarm_done_ns: Option<u64>,
+    broker_first_accept_ns: Option<u64>,
     runner_spawn_called_ns: Option<u64>,
     runner_started_ns: Option<u64>,
     runner_broker_connected_ns: Option<u64>,
@@ -213,6 +237,18 @@ struct SubPhaseMs {
     t_runner_rootfs_ms: Option<u128>,
     t_runner_program_load_ms: Option<u128>,
     t_runner_shim_handoff_ms: Option<u128>,
+    // Broker-internal sub-phases. Bracket the broker's own startup
+    // gap between bind() and first_accept; on the host clock these
+    // overlap with t_runner_spawn_call_ms / t_runner_fork_ms / the
+    // tail of t_runner_broker_conn_ms (broker runs concurrently with
+    // runner spawn). The "broker_*_ms" deltas are reported separately
+    // so they don't double-count against t_litebox_init_ms.
+    t_broker_args_ms: Option<u128>,
+    t_broker_policy_ms: Option<u128>,
+    t_broker_audit_ms: Option<u128>,
+    t_broker_listen_ms: Option<u128>,
+    t_broker_prewarm_ms: Option<u128>,
+    t_broker_accept_ms: Option<u128>,
     // t_harness_load_ms breakdown
     t_guest_runtime_init_ms: Option<u128>,
     t_harness_args_ms: Option<u128>,
@@ -236,13 +272,19 @@ impl SubPhaseMs {
             t_runner_rootfs_ms: d(m.runner_broker_connected_ns, m.runner_rootfs_ready_ns),
             t_runner_program_load_ms: d(m.runner_rootfs_ready_ns, m.runner_program_loaded_ns),
             t_runner_shim_handoff_ms: d(m.runner_program_loaded_ns, m.litebox_shim_ready_ns),
+            t_broker_args_ms: d(m.broker_main_started_ns, m.broker_args_parsed_ns),
+            t_broker_policy_ms: d(m.broker_args_parsed_ns, m.broker_policy_loaded_ns),
+            t_broker_audit_ms: d(m.broker_policy_loaded_ns, m.broker_audit_open_ns),
+            t_broker_listen_ms: d(m.broker_audit_open_ns, m.broker_listen_called_ns),
+            t_broker_prewarm_ms: d(m.broker_listen_called_ns, m.broker_prewarm_done_ns),
+            t_broker_accept_ms: d(m.broker_prewarm_done_ns, m.broker_first_accept_ns),
             t_guest_runtime_init_ms: d(m.litebox_shim_ready_ns, m.harness_first_output_ns),
             t_harness_args_ms: d(m.harness_first_output_ns_guest, m.harness_args_parsed_ns),
             t_harness_dispatch_ms: d(m.harness_args_parsed_ns, m.harness_dispatch_ready_ns),
         }
     }
 
-    fn fields(&self) -> [(&'static str, Option<u128>); 13] {
+    fn fields(&self) -> [(&'static str, Option<u128>); 19] {
         [
             ("t_tool_executor_args_ms", self.t_tool_executor_args_ms),
             ("t_tool_executor_audit_ms", self.t_tool_executor_audit_ms),
@@ -254,6 +296,12 @@ impl SubPhaseMs {
             ("t_runner_rootfs_ms", self.t_runner_rootfs_ms),
             ("t_runner_program_load_ms", self.t_runner_program_load_ms),
             ("t_runner_shim_handoff_ms", self.t_runner_shim_handoff_ms),
+            ("t_broker_args_ms", self.t_broker_args_ms),
+            ("t_broker_policy_ms", self.t_broker_policy_ms),
+            ("t_broker_audit_ms", self.t_broker_audit_ms),
+            ("t_broker_listen_ms", self.t_broker_listen_ms),
+            ("t_broker_prewarm_ms", self.t_broker_prewarm_ms),
+            ("t_broker_accept_ms", self.t_broker_accept_ms),
             ("t_guest_runtime_init_ms", self.t_guest_runtime_init_ms),
             ("t_harness_args_ms", self.t_harness_args_ms),
             ("t_harness_dispatch_ms", self.t_harness_dispatch_ms),
@@ -305,6 +353,13 @@ fn record_timing_marker(markers: &mut TimingMarkers, line: &str, pass: &str, arr
         "tool_executor_audit_open_ns" => first_wins!(tool_executor_audit_open_ns),
         "broker_spawn_called_ns" => first_wins!(broker_spawn_called_ns),
         "broker_socket_ready_ns" => first_wins!(broker_socket_ready_ns),
+        "broker_main_started_ns" => first_wins!(broker_main_started_ns),
+        "broker_args_parsed_ns" => first_wins!(broker_args_parsed_ns),
+        "broker_policy_loaded_ns" => first_wins!(broker_policy_loaded_ns),
+        "broker_audit_open_ns" => first_wins!(broker_audit_open_ns),
+        "broker_listen_called_ns" => first_wins!(broker_listen_called_ns),
+        "broker_prewarm_done_ns" => first_wins!(broker_prewarm_done_ns),
+        "broker_first_accept_ns" => first_wins!(broker_first_accept_ns),
         "runner_spawn_called_ns" => first_wins!(runner_spawn_called_ns),
         "runner_started_ns" => first_wins!(runner_started_ns),
         "runner_broker_connected_ns" => first_wins!(runner_broker_connected_ns),
@@ -666,6 +721,20 @@ fn build_docker_cmd(
                     .expect("timing_log_path_for has file name")
                     .to_string_lossy(),
             ),
+        ])
+        // Bind-mount a persistent host directory for the broker's
+        // pre-warmed ELF cache. Without this, each test pays
+        // ~400ms in pre_warm_elf_cache for libc/ld-linux/libstdc++/etc.
+        // because the broker is per-container and its in-memory
+        // cache is cold on every spawn.
+        .arg("-v")
+        .arg(format!(
+            "{}:/litebox-broker-elf-cache",
+            broker_elf_cache_dir().display()
+        ))
+        .args([
+            "-e",
+            "LITEBOX_BROKER_ELF_CACHE_DIR=/litebox-broker-elf-cache",
         ]);
     if pass == "native" {
         cmd.args(["-e", "LITEBOX_TIMING_CONTAINER_PID1=1"]);
