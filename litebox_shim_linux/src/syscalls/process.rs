@@ -3788,6 +3788,10 @@ impl<FS: ShimFS> Task<FS> {
                             let platform = self.global.platform;
                             let pipes_clone = self.global.pipes.clone();
                             let direction = ms.direction;
+                            let broker_pty_provider = super::eventfd::broker_pty_provider();
+                            let broker_slave_handle = ms.pty_index.and_then(|pty_index| {
+                                self.global.broker_pty_handle(pty_index, false).ok()
+                            });
                             let relay_fd: alloc::sync::Arc<
                                 litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
                             > = parent_pipe_fd.into();
@@ -3838,6 +3842,12 @@ impl<FS: ShimFS> Task<FS> {
                                                     pty_pair.master_pollee.notify_observers(
                                                         litebox::event::Events::IN,
                                                     );
+                                                    if let (Some(provider), Some(handle)) =
+                                                        (&broker_pty_provider, broker_slave_handle)
+                                                    {
+                                                        let _ =
+                                                            provider.write_pty(handle, &buf[..n]);
+                                                    }
                                                 }
                                             }
                                         }
@@ -4732,6 +4742,7 @@ impl<FS: ShimFS> Task<FS> {
         let mut bridge_pty_pair: Vec<
             Option<alloc::sync::Arc<litebox::fs::devices::PtyPair<crate::Platform>>>,
         > = Vec::new();
+        let mut bridge_pty_index: Vec<Option<u32>> = Vec::new();
         let mut mux_worker_fd_raw: i32 = -1;
         // (stream_id, guest_fd, dir_byte, type_byte, initial_eof)
         let mut mux_stream_specs: Vec<(u32, usize, u8, u8, bool)> = Vec::new();
@@ -5137,6 +5148,7 @@ impl<FS: ShimFS> Task<FS> {
                 bridge_drained.push(this_drained);
                 bridge_host_fd.push(-1);
                 bridge_pty_pair.push(None);
+                bridge_pty_index.push(None);
 
                 // Record for dedup so aliases reuse this bridge.
                 pipe_dedup.push((child_pair_id, child_dir, child_pipe_bridges.len() - 1));
@@ -5329,6 +5341,7 @@ impl<FS: ShimFS> Task<FS> {
                 bridge_drained.push(Vec::new());
                 bridge_host_fd.push(host_fd);
                 bridge_pty_pair.push(None);
+                bridge_pty_index.push(None);
                 bridge_parent_info.push(Vec::new());
             }
 
@@ -5636,6 +5649,7 @@ impl<FS: ShimFS> Task<FS> {
                     bridge_drained.push(this_socket_drained);
                     bridge_host_fd.push(-1);
                     bridge_pty_pair.push(None);
+                    bridge_pty_index.push(None);
 
                     // Find ALL parent peers (same pair_id, different object_id).
                     let parent_dir = match info.direction {
@@ -5811,6 +5825,7 @@ impl<FS: ShimFS> Task<FS> {
                     bridge_drained.push(Vec::new());
                     bridge_host_fd.push(-1);
                     bridge_pty_pair.push(Some(pty_pair));
+                    bridge_pty_index.push(Some(pty_index));
                     // No parent fd counterpart — the PTY relay bridges
                     // between ring buffers and virtual pipes.
                     bridge_parent_info.push(Vec::new());
@@ -5923,6 +5938,7 @@ impl<FS: ShimFS> Task<FS> {
                     // real host terminal fd.
                     bridge_host_fd.push(source_fd);
                     bridge_pty_pair.push(None);
+                    bridge_pty_index.push(None);
                     bridge_parent_info.push(Vec::new());
                 }
             }
@@ -5961,6 +5977,7 @@ impl<FS: ShimFS> Task<FS> {
                     bridge_drained.push(Vec::new());
                     bridge_host_fd.push(-1);
                     bridge_pty_pair.push(None);
+                    bridge_pty_index.push(None);
                     bridge_parent_info.push(alloc::vec![(
                         entry.fd,
                         HostPipeDirection::Read,
@@ -6173,6 +6190,7 @@ impl<FS: ShimFS> Task<FS> {
                             host_pipe_fd: bridge_host_fd[i],
                             use_existing_pipe: false,
                             pty_pair: None,
+                            pty_index: None,
                             pty_is_master: false,
                         });
                     } else {
@@ -6267,6 +6285,7 @@ impl<FS: ShimFS> Task<FS> {
                                     host_pipe_fd: -1,
                                     use_existing_pipe: false,
                                     pty_pair: Some(pty_pair),
+                                    pty_index: bridge_pty_index.get(i).copied().flatten(),
                                     pty_is_master: false,
                                 });
                             } else {
@@ -6309,6 +6328,7 @@ impl<FS: ShimFS> Task<FS> {
                                         .iter()
                                         .any(|pr| pr.guest_fd == parent_fd),
                                     pty_pair: None,
+                                    pty_index: None,
                                     pty_is_master: false,
                                 });
                             }
