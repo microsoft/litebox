@@ -1637,11 +1637,37 @@ impl<FS: ShimFS> Task<FS> {
                     } else {
                         None
                     };
-                    // First attempt.
-                    let result = files
+                    let use_broker_pty_read = files
                         .fs
-                        .read(fd, &mut buf.borrow_mut(), offset)
-                        .map_err(Errno::from);
+                        .get_pty_pair_erased(fd)
+                        .is_some_and(|(_, _, is_master)| is_master);
+                    // First attempt. PTY master data now lives in the broker; keep
+                    // PTY slave reads on the transitional filesystem path.
+                    let result = if use_broker_pty_read {
+                        let broker_result = {
+                            let mut borrowed = buf.borrow_mut();
+                            self.broker_pty_read(&files.fs, fd, &mut borrowed)
+                        };
+                        match broker_result {
+                            Ok(n) => {
+                                if n > 0 {
+                                    let mut discard = alloc::vec![0u8; n];
+                                    let _ = files.fs.read(fd, &mut discard, offset);
+                                }
+                                Ok(n)
+                            }
+                            Err(Errno::EAGAIN) => files
+                                .fs
+                                .read(fd, &mut buf.borrow_mut(), offset)
+                                .map_err(Errno::from),
+                            other => other,
+                        }
+                    } else {
+                        files
+                            .fs
+                            .read(fd, &mut buf.borrow_mut(), offset)
+                            .map_err(Errno::from)
+                    };
                     let nonblocking = self
                         .global
                         .litebox
@@ -1671,13 +1697,36 @@ impl<FS: ShimFS> Task<FS> {
                                 return Ok(0); // EOF — master closed
                             }
                             if events.contains(Events::IN) {
-                                match files.fs.read(fd, &mut buf.borrow_mut(), offset) {
-                                    Ok(n) => return Ok(n),
-                                    Err(litebox::fs::errors::ReadError::WouldBlock) => {
-                                        core::hint::spin_loop();
-                                        continue;
+                                if use_broker_pty_read {
+                                    match self.broker_pty_read(&files.fs, fd, &mut buf.borrow_mut())
+                                    {
+                                        Ok(n) => {
+                                            if n > 0 {
+                                                let mut discard = alloc::vec![0u8; n];
+                                                let _ = files.fs.read(fd, &mut discard, offset);
+                                            }
+                                            return Ok(n);
+                                        }
+                                        Err(Errno::EAGAIN) => {}
+                                        Err(e) => return Err(e),
                                     }
-                                    Err(e) => return Err(Errno::from(e)),
+                                    match files.fs.read(fd, &mut buf.borrow_mut(), offset) {
+                                        Ok(n) => return Ok(n),
+                                        Err(litebox::fs::errors::ReadError::WouldBlock) => {
+                                            core::hint::spin_loop();
+                                            continue;
+                                        }
+                                        Err(e) => return Err(Errno::from(e)),
+                                    }
+                                } else {
+                                    match files.fs.read(fd, &mut buf.borrow_mut(), offset) {
+                                        Ok(n) => return Ok(n),
+                                        Err(litebox::fs::errors::ReadError::WouldBlock) => {
+                                            core::hint::spin_loop();
+                                            continue;
+                                        }
+                                        Err(e) => return Err(Errno::from(e)),
+                                    }
                                 }
                             }
                             core::hint::spin_loop();
@@ -1853,14 +1902,10 @@ impl<FS: ShimFS> Task<FS> {
                     } else {
                         None
                     };
-                    if let Some((_pair, _idx, is_master)) = files.fs.get_pty_pair_erased(fd)
-                        && is_master
-                    {
-                        // Mirror master writes through the broker first so broker-owned PTY
-                        // line discipline sees input-control characters and dispatches
-                        // SIGINT/SIGTSTP/SIGQUIT via PgrpSignalInbox automatically. PR-5's
-                        // earlier shim-side pty_master_ldisc_signals helper would have
-                        // double-delivered — replaced by this broker mirror (PR-7 stage 1).
+                    if files.fs.get_pty_pair_erased(fd).is_some() {
+                        // Mirror PTY writes through the broker first so broker-owned PTY
+                        // line discipline sees input-control characters and broker reads
+                        // observe the same byte stream as the transitional local queues.
                         let _ = self.broker_pty_write(&files.fs, fd, buf)?;
                     }
                     let result = files.fs.write(fd, buf, offset).map_err(Errno::from);
@@ -2816,6 +2861,29 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
+                    if files
+                        .fs
+                        .get_pty_pair_erased(fd)
+                        .is_some_and(|(_, _, is_master)| is_master)
+                    {
+                        return read_once_to_iovecs(
+                            iovs,
+                            || self.park_if_deferred(),
+                            |buf| match self.broker_pty_read(&files.fs, fd, buf) {
+                                Ok(n) => {
+                                    if n > 0 {
+                                        let mut discard = alloc::vec![0u8; n];
+                                        let _ = files.fs.read(fd, &mut discard, None);
+                                    }
+                                    Ok(n)
+                                }
+                                Err(Errno::EAGAIN) => {
+                                    files.fs.read(fd, buf, None).map_err(Errno::from)
+                                }
+                                other => other,
+                            },
+                        );
+                    }
                     let needs_position_lock = matches!(
                         files.fs.fd_file_status(fd),
                         Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
@@ -3235,9 +3303,7 @@ impl<FS: ShimFS> Task<FS> {
                         None
                     };
                     write_to_iovec(iovs, |buf: &[u8]| {
-                        if let Some((_pair, _idx, is_master)) = files.fs.get_pty_pair_erased(fd)
-                            && is_master
-                        {
+                        if files.fs.get_pty_pair_erased(fd).is_some() {
                             let _ = self.broker_pty_write(&files.fs, fd, buf)?;
                         }
                         files.fs.write(fd, buf, None).map_err(Errno::from)
@@ -5530,6 +5596,21 @@ impl<FS: ShimFS> Task<FS> {
         provider
             .ioctl_pty(handle, op, payload)
             .map_err(Self::broker_pty_error_to_errno)
+    }
+
+    fn broker_pty_read(&self, fs: &FS, fd: &TypedFd<FS>, buf: &mut [u8]) -> Result<usize, Errno> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let handle = self.broker_pty_handle_for_fd(fs, fd)?;
+        let provider = super::eventfd::broker_pty_provider().ok_or(Errno::EIO)?;
+        let max_len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        let bytes = provider
+            .read_pty(handle, max_len)
+            .map_err(Self::broker_pty_error_to_errno)?;
+        let n = bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
     }
 
     fn broker_pty_write(&self, fs: &FS, fd: &TypedFd<FS>, buf: &[u8]) -> Result<usize, Errno> {

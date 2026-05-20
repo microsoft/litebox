@@ -4493,6 +4493,8 @@ struct MuxParentStream {
     /// For PTY-bridged streams: the PTY pair whose ring buffers the relay
     /// thread reads/writes.  `None` for pipe/socket streams.
     pty_pair: Option<Arc<litebox::fs::devices::PtyPair<Platform>>>,
+    /// For PTY-bridged streams: PTY manager index for broker mirroring.
+    pty_index: Option<u32>,
     /// For PTY-bridged streams: whether this is the master side of the pair.
     /// When bridging a child's slave fd, the relay acts as a proxy for the
     /// slave, so `pty_is_master` is `false`.
