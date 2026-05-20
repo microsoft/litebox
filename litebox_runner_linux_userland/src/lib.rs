@@ -2531,12 +2531,12 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     litebox::sync::start_recording();
 
     eprintln!("[TIMING] litebox_shim_ready_ns={}", monotonic_nanos());
-    unsafe {
+    let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         litebox_platform_linux_userland::run_thread(
             program.entrypoints,
             &mut litebox_common_linux::ExecutionContext::default(),
         );
-    }
+    }));
 
     #[cfg(feature = "lock_tracing")]
     {
@@ -2552,6 +2552,18 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
         }
     }
 
+    if let Err(payload) = run_result {
+        // Some fork-restore teardown paths can panic after the guest has
+        // already exited. Preserve the guest status for the parent-side
+        // wait4 path before letting the worker process report the panic.
+        if program.process.has_exited() {
+            let wait_status = program.process.wait();
+            if let Some(worker_result_fd) = worker_result_fd {
+                write_worker_result(wait_status, worker_result_fd);
+            }
+        }
+        std::panic::resume_unwind(payload);
+    }
     if let Some(net_worker) = net_worker {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         litebox_platform_multiplex::platform().wake_network_worker();

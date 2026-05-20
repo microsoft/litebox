@@ -1874,6 +1874,11 @@ impl LinuxShimProcess {
             syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 256,
         }
     }
+
+    /// Returns whether all threads in this process have exited.
+    pub fn has_exited(&self) -> bool {
+        self.0.nr_threads() == 0
+    }
 }
 
 /// Create a default layered file system with the given in-memory and tar read-only layers.
@@ -2967,15 +2972,18 @@ impl<FS: ShimFS> Task<FS> {
     fn is_pre_exec_syscall_for_task(&self, ctx: &litebox_common_linux::ExecutionContext) -> bool {
         use ::syscalls::Sysno;
 
-        let unix_socket_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read))
-            && self
-                .files
-                .borrow()
-                .raw_descriptor_store
-                .read()
-                .fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
-                .is_ok();
-        Self::is_pre_exec_syscall_impl(ctx, unix_socket_read)
+        let socketpair_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read)) && {
+            let files = self.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            rds.fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
+                .is_ok()
+                || rds
+                    .fd_from_raw_integer::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+                        ctx.rdi,
+                    )
+                    .is_ok()
+        };
+        Self::is_pre_exec_syscall_impl(ctx, socketpair_read)
     }
 
     fn is_pre_exec_syscall_impl(
