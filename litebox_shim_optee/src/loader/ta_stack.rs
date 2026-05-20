@@ -226,7 +226,7 @@ impl TaStack {
         Some(())
     }
 
-    pub(crate) fn init(&mut self, params: &[UteeParamOwned]) -> Option<()> {
+    pub(crate) fn init(&mut self, task: &crate::Task, params: &[UteeParamOwned]) -> Option<()> {
         if params.len() > UteeParams::TEE_NUM_PARAMS {
             return None;
         }
@@ -259,11 +259,13 @@ impl TaStack {
 
         self.set_utee_params()?;
 
-        // TODO: generate a random value
-        self.push_bytes(&[
-            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
-            0xBE, 0xEF,
-        ])?;
+        // Random 16-byte stack canary
+        let mut canary = [0u8; 16];
+        <crate::Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
+            task.global.platform,
+            &mut canary,
+        );
+        self.push_bytes(&canary)?;
 
         // ensure stack is aligned
         self.pos = align_down(self.pos, Self::STACK_ALIGNMENT);
