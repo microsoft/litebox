@@ -3,7 +3,7 @@
 
 use crate::{Task, UserMutPtr};
 use litebox::mm::linux::PAGE_SIZE;
-use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox::platform::{RawConstPointer, RawMutPointer, SystemInfoProvider as _};
 use litebox_common_linux::{MapFlags, ProtFlags};
 use litebox_common_optee::{LdelfMapFlags, TeeResult, TeeUuid};
 
@@ -188,12 +188,37 @@ impl Task {
         }
         // TODO: on Arm, check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` to control cache behaviors
 
+        // Avoiding TA trampoline address conflict based on heuristics.
+        // Grow the underlying mmap by one page but keep trimming based on
+        // the original total_size so the extra page survives unseen by
+        // ldelf. ldelf reserves the address space for TA ELF via the main
+        // `sys_map_bin` call: addr=0 (PM picks the base), at least one of
+        // pad_begin/pad_end > 0 (reservation room around the first
+        // segment; ASLR-enabled builds put it in pad_begin, ASLR-disabled
+        // may put it entirely in pad_end), and LDELF_MAP_FLAG_EXECUTABLE
+        // (the first segment is .text). Skip on kernel-mode platforms
+        // which don't use a syscall trampoline.
+        //
+        // TODO: consider a reliable solution.
+        let should_extend_ta_reservation = addr == 0
+            && (pad_begin > 0 || pad_end > 0)
+            && flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE)
+            && self.global.platform.get_syscall_entry_point() != 0;
+        let mmap_size = if should_extend_ta_reservation {
+            // The size of OP-TEE TA trampoline is 0x3f8, so one page is enough.
+            total_size
+                .checked_add(PAGE_SIZE)
+                .ok_or(TeeResult::OutOfMemory)?
+        } else {
+            total_size
+        };
+
         // Currently, we do not support TA binary mapping. So, we create an anonymous mapping and copy
         // the content of the TA binary into it.
         let addr = self
             .sys_mmap(
                 addr,
-                total_size,
+                mmap_size,
                 ProtFlags::PROT_READ_WRITE,
                 flags_internal,
                 -1,
