@@ -1328,7 +1328,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // /dev/tty; tty-backed stdio aliases use their original /dev/std* path.
         {
             use litebox::fs::{Mode, OFlags};
-            use syscalls::fork_snapshot::FdClass;
+            use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
 
             for entry in &fd_table.entries {
                 // Skip stdio slots (already initialized above) and non-FS fds.
@@ -1380,6 +1380,66 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 drop(dt);
             }
 
+            // Restore broker-backed PTY fds by re-attaching to the broker handle.
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::FilesystemFd {
+                    continue;
+                }
+                let Some(broker_handle) = entry.metadata.broker_handle else {
+                    continue;
+                };
+                if broker_handle.kind != BrokerHandleKind::Pty {
+                    continue;
+                }
+                let Some(provider) = syscalls::broker_pty::broker_pty_provider() else {
+                    continue;
+                };
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(broker_handle.handle_id);
+                let pty_id = entry.metadata.sandbox_pty_index.unwrap_or_else(|| {
+                    provider
+                        .ioctl_pty(
+                            broker_handle.handle_id,
+                            litebox_common_linux::fd_token_protocol::PtyIoctlOp::Tiocgptn,
+                            &[],
+                        )
+                        .ok()
+                        .and_then(|p| {
+                            p.get(..4)
+                                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                        })
+                        .unwrap_or(0)
+                });
+                let is_master = !entry.metadata.is_sandbox_pty_slave;
+                let slave_anchor = if is_master {
+                    provider.open_pty_slave(pty_id).ok()
+                } else {
+                    None
+                };
+                let pty_fd = syscalls::broker_pty::BrokerPtyFd::<Platform>::new(
+                    provider,
+                    broker_handle.handle_id,
+                    pty_id,
+                    is_master,
+                    slave_anchor,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<syscalls::broker_pty::BrokerPtySubsystem> =
+                    self.global.litebox.descriptor_table_mut().insert(pty_fd);
+                let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
+                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                debug_assert!(
+                    success,
+                    "broker pty fd slot {} occupied during restore",
+                    entry.fd
+                );
+            }
+
             // Restore non-terminal FilesystemFd entries.  Reopen by path
             // if available, fall back to /dev/null.  For stdio slots (0-2),
             // consume the pre-populated entry first.
@@ -1388,10 +1448,13 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     continue;
                 }
                 let meta = &entry.metadata;
-                // Skip terminal fds and host stdio (already handled above).
+                // Skip terminal fds, host stdio, and broker-backed PTYs (already handled above).
                 if meta.is_host_tty_alias
                     || meta.is_host_pty_device
                     || meta.host_stdio_source_fd.is_some()
+                    || meta
+                        .broker_handle
+                        .is_some_and(|h| h.kind == BrokerHandleKind::Pty)
                 {
                     continue;
                 }

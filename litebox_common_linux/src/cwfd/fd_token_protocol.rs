@@ -133,6 +133,7 @@ pub enum Opcode {
     ReadSocketPair = 0x31,
     WriteSocketPair = 0x32,
     CreatePty = 0x60,
+    OpenPtySlave = 0x65,
     PtyRead = 0x61,
     PtyWrite = 0x62,
     SubscribePty = 0x63,
@@ -187,6 +188,7 @@ pub enum Opcode {
     ReadSocketPairResponse = 0xB1,
     WriteSocketPairResponse = 0xB2,
     CreatePtyResponse = 0xE0,
+    OpenPtySlaveResponse = 0xE5,
     PtyReadResponse = 0xE1,
     PtyWriteResponse = 0xE2,
     SubscribePtyResponse = 0xE3,
@@ -313,6 +315,7 @@ impl Opcode {
             Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
             Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
             Opcode::CreatePty => Some(Opcode::CreatePtyResponse),
+            Opcode::OpenPtySlave => Some(Opcode::OpenPtySlaveResponse),
             Opcode::PtyRead => Some(Opcode::PtyReadResponse),
             Opcode::PtyWrite => Some(Opcode::PtyWriteResponse),
             Opcode::SubscribePty => Some(Opcode::SubscribePtyResponse),
@@ -356,6 +359,7 @@ impl Opcode {
                 | Opcode::ReadSocketPair
                 | Opcode::WriteSocketPair
                 | Opcode::CreatePty
+                | Opcode::OpenPtySlave
                 | Opcode::PtyRead
                 | Opcode::PtyWrite
                 | Opcode::SubscribePty
@@ -414,6 +418,7 @@ impl TryFrom<u8> for Opcode {
             0x31 => Ok(Opcode::ReadSocketPair),
             0x32 => Ok(Opcode::WriteSocketPair),
             0x60 => Ok(Opcode::CreatePty),
+            0x65 => Ok(Opcode::OpenPtySlave),
             0x61 => Ok(Opcode::PtyRead),
             0x62 => Ok(Opcode::PtyWrite),
             0x63 => Ok(Opcode::SubscribePty),
@@ -449,6 +454,7 @@ impl TryFrom<u8> for Opcode {
             0xB1 => Ok(Opcode::ReadSocketPairResponse),
             0xB2 => Ok(Opcode::WriteSocketPairResponse),
             0xE0 => Ok(Opcode::CreatePtyResponse),
+            0xE5 => Ok(Opcode::OpenPtySlaveResponse),
             0xE1 => Ok(Opcode::PtyReadResponse),
             0xE2 => Ok(Opcode::PtyWriteResponse),
             0xE3 => Ok(Opcode::SubscribePtyResponse),
@@ -1977,6 +1983,64 @@ pub fn build_create_pty_response_ok(
         caller_pid: 0,
         body,
     }
+}
+
+/// Body for [`Opcode::OpenPtySlave`]: pty id + reserved.
+pub fn build_open_pty_slave_request(pty_id: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&pty_id.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::OpenPtySlave,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_open_pty_slave_body(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::OpenPtySlave,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[4..8].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
+}
+
+/// Body for [`Opcode::OpenPtySlaveResponse`]: slave handle + pty id + reserved.
+pub fn build_open_pty_slave_response_ok(slave_handle: u64, pty_id: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&slave_handle.to_le_bytes());
+    body.extend_from_slice(&pty_id.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::OpenPtySlaveResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_open_pty_slave_response_ok(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::OpenPtySlaveResponse,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    if body[12..16].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
 }
 
 pub fn parse_create_pty_response_ok(body: &[u8]) -> Result<(u64, u64, u32), ProtocolError> {

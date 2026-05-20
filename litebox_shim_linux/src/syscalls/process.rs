@@ -7205,6 +7205,27 @@ impl<FS: ShimFS> Task<FS> {
                 // same broker `SocketPairState` endpoint.
                 (FdClass::UnixSocket, Some(fd.object_id()), None, None)
             } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
+            {
+                let (pty_id, is_master) = dt
+                    .with_entry(
+                        &fd,
+                        |pty: &super::broker_pty::BrokerPtyFd<crate::Platform>| {
+                            (pty.pty_id(), pty.is_master())
+                        },
+                    )
+                    .unwrap_or((0, false));
+                (
+                    FdClass::FilesystemFd,
+                    Some(fd.object_id()),
+                    Some(FdMetadataSnapshot {
+                        is_sandbox_pty_slave: !is_master,
+                        sandbox_pty_index: Some(pty_id),
+                        ..Default::default()
+                    }),
+                    None,
+                )
+            } else if let Ok(fd) =
                 rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
             {
                 (FdClass::EventFd, Some(fd.object_id()), None, None)
@@ -7431,6 +7452,46 @@ impl<FS: ShimFS> Task<FS> {
                     }
                 } else {
                     None
+                }
+            } else if let Ok(typed) =
+                rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
+            {
+                let pty_provider = super::broker_pty::broker_pty_provider();
+                let entry_result = dt.with_entry(
+                    &typed,
+                    |pty_fd: &super::broker_pty::BrokerPtyFd<crate::Platform>| {
+                        pty_fd.fork_snapshot_handle()
+                    },
+                );
+                match entry_result {
+                    Some((kind, handle_id)) => {
+                        let releaser_opt: Option<
+                            alloc::sync::Arc<
+                                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                            >,
+                        > = pty_provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
+                        if let Some(releaser) = releaser_opt {
+                            match releaser.dup_handle(handle_id) {
+                                Ok(()) => {
+                                    broker_transit.push(ForkSnapshotBrokerTransit {
+                                        releaser,
+                                        handle_id,
+                                        kind,
+                                    });
+                                    Some(BrokerHandleSnapshot {
+                                        kind,
+                                        handle_id,
+                                        pipe_direction: None,
+                                        socketpair_endpoint: None,
+                                    })
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
                 }
             } else if class == FdClass::Pipe {
                 // Phase C.3: emit a broker-Pipe handle snapshot when the fd

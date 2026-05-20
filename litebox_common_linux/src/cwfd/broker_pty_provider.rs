@@ -24,6 +24,7 @@ pub struct BrokerPtyPair {
 
 pub trait BrokerPtyProvider: BrokerSubscribable {
     fn create_pty(&self) -> Result<BrokerPtyPair, BrokerOpError>;
+    fn open_pty_slave(&self, pty_id: u32) -> Result<u64, BrokerOpError>;
     fn read_pty(&self, handle: u64, max_len: u32) -> Result<alloc::vec::Vec<u8>, BrokerOpError>;
     fn write_pty(&self, handle: u64, data: &[u8]) -> Result<u32, BrokerOpError>;
     fn ioctl_pty(
