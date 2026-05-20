@@ -35,6 +35,7 @@ pub fn run(sub: &str) -> i32 {
         "mac" => test_mac_address(),
         "socketpair-fork-write" => test_socketpair_fork_write(),
         "socketpair-fork-read" => test_socketpair_fork_read(),
+        "socketpair-fork-read-bare" => test_socketpair_fork_read_bare(),
         "socketpair-exec" => test_socketpair_exec(),
         "fork-errno-touch" => test_fork_errno_touch(),
         // Helper: child side of socketpair-exec (inherits fd from parent)
@@ -721,6 +722,62 @@ fn test_socketpair_fork_read() -> i32 {
         0
     } else {
         println!("US6R_SOCKETPAIR_FORK_READ_FAIL:exit={exit_code}");
+        1
+    }
+}
+
+/// FET: bare socketpair + fork read leaf with no child-side Rust formatting after `fork()`.
+fn test_socketpair_fork_read_bare() -> i32 {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    if rc != 0 {
+        println!("US6R_BARE_SOCKETPAIR_FAIL:{}", errno());
+        return 1;
+    }
+
+    let parent_fd = fds[0];
+    let child_fd = fds[1];
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("US6R_BARE_FORK_FAIL:{}", errno());
+        unsafe {
+            libc::close(parent_fd);
+            libc::close(child_fd);
+        }
+        return 1;
+    }
+
+    if pid == 0 {
+        unsafe {
+            libc::close(parent_fd);
+            let mut byte = 0u8;
+            let n = libc::read(child_fd, (&raw mut byte).cast::<libc::c_void>(), 1);
+            libc::_exit(if n == 1 && byte == b'X' { 0 } else { 1 });
+        }
+    }
+
+    unsafe { libc::close(child_fd) };
+    let byte = b"X";
+    let n = unsafe { libc::write(parent_fd, byte.as_ptr().cast::<libc::c_void>(), 1) };
+    unsafe { libc::close(parent_fd) };
+    if n != 1 {
+        println!("US6R_BARE_WRITE_FAIL:n={n},errno={}", errno());
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        return 1;
+    }
+
+    let mut status = 0i32;
+    unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        println!("US6R_BARE_SOCKETPAIR_FORK_READ_OK");
+        0
+    } else {
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            99
+        };
+        println!("US6R_BARE_SOCKETPAIR_FORK_READ_FAIL:exit={exit_code}");
         1
     }
 }
@@ -1576,6 +1633,11 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
             "FET.socketpair_read.pie-glibc.dpg1",
             "socketpair-fork-read",
             "US6R_SOCKETPAIR_FORK_READ_OK",
+        ),
+        (
+            "FET.socketpair_read_bare.pie-glibc.dpg1",
+            "socketpair-fork-read-bare",
+            "US6R_BARE_SOCKETPAIR_FORK_READ_OK",
         ),
     ] {
         typed_test!(
