@@ -109,13 +109,22 @@ impl litebox::platform::CrngProvider for LvbsLinuxKernel {
 
         let mut random = RANDOM.lock();
         random
-            .get_or_insert_with(|| LvbsCrng::new(PRK_ONCE.wait(), rdrand_seed()))
+            .get_or_insert_with(|| {
+                LvbsCrng::new(
+                    PRK_ONCE.get().expect("Platform root key not initialized"),
+                    rdrand_seed().expect("RDRAND unavailable during CRNG initialization"),
+                )
+            })
             .fill_bytes(buf, rdrand_seed);
     }
 }
 
+type CrngSeed = <rand_chacha::ChaCha20Rng as SeedableRng>::Seed;
+
 const CRNG_RESEED_INTERVAL_BYTES: usize = 1024 * 1024;
+const CRNG_RESEED_BACKOFF_BYTES: usize = 64 * 1024;
 const CRNG_RESEED_STATE_BYTES: usize = 32;
+const RDRAND_RETRY_ATTEMPTS: u32 = 10;
 
 struct LvbsCrng {
     random: rand_chacha::ChaCha20Rng,
@@ -124,10 +133,7 @@ struct LvbsCrng {
 }
 
 impl LvbsCrng {
-    fn new(
-        prk: &[u8; PRK_LEN],
-        rdrand_seed: <rand_chacha::ChaCha20Rng as SeedableRng>::Seed,
-    ) -> Self {
+    fn new(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> Self {
         Self {
             random: rand_chacha::ChaCha20Rng::from_seed(crng_seed_from_prk_and_rdrand(
                 prk,
@@ -138,11 +144,7 @@ impl LvbsCrng {
         }
     }
 
-    fn fill_bytes(
-        &mut self,
-        mut buf: &mut [u8],
-        rdrand_seed: impl Fn() -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed,
-    ) {
+    fn fill_bytes(&mut self, mut buf: &mut [u8], rdrand_seed: impl Fn() -> Option<CrngSeed>) {
         while !buf.is_empty() {
             let len = buf.len().min(self.bytes_until_reseed);
             let (chunk, rest) = buf.split_at_mut(len);
@@ -151,12 +153,15 @@ impl LvbsCrng {
             self.bytes_until_reseed -= len;
 
             if self.bytes_until_reseed == 0 {
-                self.reseed(rdrand_seed());
+                match rdrand_seed() {
+                    Some(seed) => self.reseed(seed),
+                    None => self.bytes_until_reseed = CRNG_RESEED_BACKOFF_BYTES,
+                }
             }
         }
     }
 
-    fn reseed(&mut self, rdrand_seed: <rand_chacha::ChaCha20Rng as SeedableRng>::Seed) {
+    fn reseed(&mut self, rdrand_seed: CrngSeed) {
         self.reseed_counter += 1;
         let mut current_state = Zeroizing::new([0u8; CRNG_RESEED_STATE_BYTES]);
         self.random.fill_bytes(&mut *current_state);
@@ -210,27 +215,29 @@ impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
     }
 }
 
-fn rdrand_seed() -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed {
-    let mut seed = <rand_chacha::ChaCha20Rng as SeedableRng>::Seed::default();
+fn rdrand_seed() -> Option<CrngSeed> {
+    let mut seed = CrngSeed::default();
     for chunk in seed.chunks_mut(8) {
         let mut word = 0;
-        loop {
+        let mut ok = false;
+        for _ in 0..RDRAND_RETRY_ATTEMPTS {
             // Safety: `RDRAND` is available on the LVBS target CPUs. A false
             // carry flag means random data is temporarily unavailable.
             if unsafe { core::arch::x86_64::_rdrand64_step(&mut word) } == 1 {
+                ok = true;
                 break;
             }
             core::hint::spin_loop();
         }
+        if !ok {
+            return None;
+        }
         chunk.copy_from_slice(&word.to_ne_bytes()[..chunk.len()]);
     }
-    seed
+    Some(seed)
 }
 
-fn crng_seed_from_prk_and_rdrand(
-    prk: &[u8; PRK_LEN],
-    rdrand_seed: <rand_chacha::ChaCha20Rng as SeedableRng>::Seed,
-) -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed {
+fn crng_seed_from_prk_and_rdrand(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> CrngSeed {
     sha2::Sha256::new()
         .chain_update(b"litebox-lvbs-crng-seed-v1")
         .chain_update(prk)
@@ -240,10 +247,10 @@ fn crng_seed_from_prk_and_rdrand(
 }
 
 fn crng_reseed_from_rdrand_and_state(
-    rdrand_seed: <rand_chacha::ChaCha20Rng as SeedableRng>::Seed,
+    rdrand_seed: CrngSeed,
     reseed_counter: usize,
     current_state: &[u8; CRNG_RESEED_STATE_BYTES],
-) -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed {
+) -> CrngSeed {
     sha2::Sha256::new()
         .chain_update(b"litebox-lvbs-crng-reseed-v1")
         .chain_update(rdrand_seed)
