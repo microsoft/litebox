@@ -40,6 +40,10 @@ use crate::{
     syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
 };
 
+/// Linux's hard cap on the number of iovecs per `*msg`-style call, and on the
+/// number of entries per `*mmsg`-style call. See `UIO_MAXIOV` in `<uapi/linux/uio.h>`.
+const UIO_MAXIOV: usize = 1024;
+
 macro_rules! convert_flags {
     ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
         {
@@ -1396,8 +1400,11 @@ impl<FS: ShimFS> Task<FS> {
             log_unsupported!("ancillary data is not supported");
             return Err(Errno::EINVAL);
         }
-        if msg.msg_iovlen == 0 || msg.msg_iovlen > 1024 {
+        if msg.msg_iovlen == 0 {
             return Err(Errno::EINVAL);
+        }
+        if msg.msg_iovlen > UIO_MAXIOV {
+            return Err(Errno::EMSGSIZE);
         }
         let iovs = msg
             .msg_iov
@@ -1436,6 +1443,58 @@ impl<FS: ShimFS> Task<FS> {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
         res
+    }
+
+    /// Handle syscall `sendmmsg`
+    pub(crate) fn sys_sendmmsg(
+        &self,
+        fd: i32,
+        msgvec: MutPtr<litebox_common_linux::UserMmsgHdr<Platform>>,
+        vlen: u32,
+        flags: SendFlags,
+    ) -> Result<usize, Errno> {
+        let Ok(sockfd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let vlen = (vlen as usize).min(UIO_MAXIOV);
+
+        // Linux looks up the fd before touching vlen/msgvec, so a bogus fd
+        // takes priority over a bogus msgvec pointer or vlen == 0.
+        self.files.borrow().with_socket(
+            &self.global,
+            sockfd,
+            |_| Ok::<(), Errno>(()),
+            |_| Ok::<(), Errno>(()),
+        )?;
+
+        if vlen == 0 {
+            return Ok(0);
+        }
+
+        let stride = core::mem::size_of::<litebox_common_linux::UserMmsgHdr<Platform>>();
+        let msg_len_off =
+            core::mem::offset_of!(litebox_common_linux::UserMmsgHdr<Platform>, msg_len);
+
+        let mut sent: usize = 0;
+        for i in 0..vlen {
+            let bail = |e: Errno| if sent > 0 { Ok(sent) } else { Err(e) };
+            let Some(mmh) = msgvec.read_at_offset(isize::try_from(i).unwrap()) else {
+                return bail(Errno::EFAULT);
+            };
+            let inner = mmh.msg_hdr;
+            let n = match self.do_sendmsg(sockfd, &inner, flags) {
+                Ok(n) => n,
+                Err(e) => return bail(e),
+            };
+            let msg_len_ptr =
+                MutPtr::<u32>::from_usize(msgvec.as_usize() + i * stride + msg_len_off);
+            if msg_len_ptr.write_at_offset(0, n.truncate()).is_none() {
+                return bail(Errno::EFAULT);
+            }
+            sent += 1;
+        }
+        Ok(sent)
     }
 
     /// Handle syscall `recvfrom`
@@ -1565,8 +1624,8 @@ impl<FS: ShimFS> Task<FS> {
         if msg_controllen != 0 {
             log_unsupported!("ancillary data is not supported");
         }
-        if msg_iovlen > 1024 {
-            return Err(Errno::EINVAL);
+        if msg_iovlen > UIO_MAXIOV {
+            return Err(Errno::EMSGSIZE);
         }
 
         let iovs = msg_iov.to_owned_slice(msg_iovlen).ok_or(Errno::EFAULT)?;

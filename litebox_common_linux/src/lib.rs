@@ -327,21 +327,19 @@ pub type IoVec<P> = IoReadVec<P>;
 
 impl<P: RawConstPointer<u8>> Clone for IoWriteVec<P> {
     fn clone(&self) -> Self {
-        Self {
-            iov_base: self.iov_base,
-            iov_len: self.iov_len,
-        }
+        *self
     }
 }
 
+impl<P: RawConstPointer<u8>> Copy for IoWriteVec<P> {}
+
 impl<P: RawMutPointer<u8>> Clone for IoReadVec<P> {
     fn clone(&self) -> Self {
-        Self {
-            iov_base: self.iov_base,
-            iov_len: self.iov_len,
-        }
+        *self
     }
 }
+
+impl<P: RawMutPointer<u8>> Copy for IoReadVec<P> {}
 
 impl From<litebox::fs::FileStatus> for FileStat {
     fn from(value: litebox::fs::FileStatus) -> Self {
@@ -1869,21 +1867,30 @@ pub struct UserMsgHdr<Platform: litebox::platform::RawPointerProvider> {
 
 impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMsgHdr<Platform> {
     fn clone(&self) -> Self {
-        Self {
-            msg_name: self.msg_name,
-            msg_namelen: self.msg_namelen,
-            #[cfg(target_pointer_width = "64")]
-            _pad: 0,
-            msg_iov: self.msg_iov,
-            msg_iovlen: self.msg_iovlen,
-            msg_control: self.msg_control,
-            msg_controllen: self.msg_controllen,
-            msg_flags: self.msg_flags,
-            #[cfg(target_pointer_width = "64")]
-            _pad2: 0,
-        }
+        *self
     }
 }
+
+impl<Platform: litebox::platform::RawPointerProvider> Copy for UserMsgHdr<Platform> {}
+
+/// Linux's `struct mmsghdr`: a `msghdr` paired with the number of bytes
+/// transmitted, used by `sendmmsg`/`recvmmsg`.
+#[derive(Debug, FromBytes, IntoBytes)]
+#[repr(C, packed)]
+pub struct UserMmsgHdr<Platform: litebox::platform::RawPointerProvider> {
+    pub msg_hdr: UserMsgHdr<Platform>,
+    pub msg_len: u32,
+    #[cfg(target_pointer_width = "64")]
+    _pad: u32,
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> Clone for UserMmsgHdr<Platform> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Platform: litebox::platform::RawPointerProvider> Copy for UserMmsgHdr<Platform> {}
 
 #[repr(i32)]
 #[derive(Debug, IntEnum)]
@@ -2112,6 +2119,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     Sendmsg {
         sockfd: i32,
         msg: Platform::RawConstPointer<UserMsgHdr<Platform>>,
+        flags: SendFlags,
+    },
+    Sendmmsg {
+        sockfd: i32,
+        msgvec: Platform::RawMutPointer<UserMmsgHdr<Platform>>,
+        vlen: u32,
         flags: SendFlags,
     },
     Recvfrom {
@@ -2589,6 +2602,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::accept4 => sys_req!(Accept { sockfd, addr:*, addrlen:*, flags }),
             Sysno::sendto => sys_req!(Sendto { sockfd, buf:*, len, flags, addr:*, addrlen }),
             Sysno::sendmsg => sys_req!(Sendmsg { sockfd, msg:*, flags }),
+            Sysno::sendmmsg => sys_req!(Sendmmsg { sockfd, msgvec:*, vlen, flags }),
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::recvmsg => sys_req!(Recvmsg { sockfd, msg:*, flags }),
             Sysno::shutdown => sys_req!(Shutdown { sockfd, how }),
