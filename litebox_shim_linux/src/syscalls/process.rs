@@ -10339,6 +10339,10 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
             // --broker-fd-bridge install path wires the broker-pipe fd in
             // the worker after spawn; the spawn binding itself is Close.
             |_broker_pipe| false,
+            // BrokerPipeSubsystem (Phase C.3): supported. The
+            // --broker-fd-bridge install path wires the broker-pipe fd in
+            // the worker after spawn; the spawn binding itself is Close.
+            |_broker_pipe| false,
         )
         .unwrap_or_else(|_| {
             log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
@@ -10486,6 +10490,10 @@ fn worker_exec_input_binding<FS: ShimFS>(
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
             |_broker_pipe| WorkerExecInputBinding::Close,
+            // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
+            // before exec; the --broker-fd-bridge install path will install
+            // the broker pipe fd at the same slot during worker startup.
+            |_broker_pipe| WorkerExecInputBinding::Close,
         )
         .unwrap_or(WorkerExecInputBinding::Close)
 }
@@ -10615,6 +10623,10 @@ fn worker_exec_output_binding<FS: ShimFS>(
                 }
                 WorkerExecOutputBinding::Close
             },
+            // BrokerPipeSubsystem (Phase C.3): close the worker's output slot
+            // before exec; the --broker-fd-bridge install path will install
+            // the broker pipe fd at the same slot during worker startup.
+            |_broker_pipe| WorkerExecOutputBinding::Close,
             // BrokerPipeSubsystem (Phase C.3): close the worker's output slot
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
