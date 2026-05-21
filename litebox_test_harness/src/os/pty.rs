@@ -209,6 +209,63 @@ impl Pty {
         Ok(String::from_utf8_lossy(&out).to_string())
     }
 
+    /// Non-blocking read attempt — single `read(2)` with no poll wait.
+    /// Returns `Ok(Some(bytes))` if data is available, `Ok(None)` if
+    /// EAGAIN/empty, `Err(_)` on permanent failure. EOF (n=0) is
+    /// returned as `Ok(Some(empty))`.
+    ///
+    /// Used by `PTYR.slave_write_atomicity` to verify that after a
+    /// child writes to its slave fd and exits (parent has already
+    /// reaped the child), the bytes are IMMEDIATELY readable from the
+    /// master without any poll/wait latency. This is the invariant
+    /// dropbear's session loop relies on; without it, dropbear races
+    /// the broker-PTY's slave→master notification and loses the last
+    /// writes (Phase H "no output" symptom).
+    pub fn try_read_now(&self, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+        let fd = self.fd.as_raw_fd();
+        // SAFETY: fcntl reads the file status flags.
+        let saved_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if saved_flags < 0 {
+            return Err(format!(
+                "pty fcntl F_GETFL fd {fd}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: fcntl sets the file status flags.
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, saved_flags | libc::O_NONBLOCK) };
+        if rc < 0 {
+            return Err(format!(
+                "pty fcntl F_SETFL O_NONBLOCK fd {fd}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut buf = vec![0u8; max_bytes];
+        // SAFETY: buf is writable for at least max_bytes; fd is a live master.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), max_bytes) };
+        let read_err = if n < 0 {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        // SAFETY: restore prior flag state (best effort).
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, saved_flags) };
+        if n > 0 {
+            #[allow(clippy::cast_sign_loss)]
+            buf.truncate(n as usize);
+            Ok(Some(buf))
+        } else if n == 0 {
+            Ok(Some(Vec::new()))
+        } else if let Some(err) = read_err {
+            match err.raw_os_error() {
+                Some(libc::EAGAIN) => Ok(None),
+                Some(libc::EIO) => Ok(Some(Vec::new())),
+                _ => Err(format!("pty read fd {fd}: {err}")),
+            }
+        } else {
+            Err(format!("pty read fd {fd}: unexpected negative return {n}"))
+        }
+    }
+
     /// Resize the pty window.
     ///
     /// # Errors
