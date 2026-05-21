@@ -15,24 +15,24 @@ pub struct RingBuffer {
     rb_pa: PhysAddr,
     write_offset: usize,
     size: usize,
-    // True iff `rb_pa` is page-aligned and `size` is a non-zero page multiple.
-    // The fast path collapses wraparound into a single map/unmap by passing the
-    // wrap span as a non-contiguous page list; pages themselves are derived from
-    // `rb_pa + idx * PAGE_SIZE` since the ring is physically contiguous.
-    page_aligned: bool,
+    // True iff `rb_pa` is page-aligned and `size` is a non-zero page multiple,
+    // i.e. wraparound can be collapsed into a single non-contiguous mapping.
+    // Pages themselves are derived from `rb_pa + idx * PAGE_SIZE` since the ring
+    // is physically contiguous.
+    fast_path_eligible: bool,
 }
 
 impl RingBuffer {
     pub fn new(phys_addr: PhysAddr, requested_size: usize) -> Self {
         let pa: usize = phys_addr.as_u64().trunc();
-        let page_aligned = requested_size > 0
+        let fast_path_eligible = requested_size > 0
             && requested_size.is_multiple_of(PAGE_SIZE)
             && pa.is_multiple_of(PAGE_SIZE);
         RingBuffer {
             rb_pa: phys_addr,
             write_offset: 0,
             size: requested_size,
-            page_aligned,
+            fast_path_eligible,
         }
     }
 
@@ -40,7 +40,7 @@ impl RingBuffer {
         if self.size == 0 || buf.is_empty() {
             return;
         }
-        self.write_offset = if self.page_aligned {
+        self.write_offset = if self.fast_path_eligible {
             write_fast(self.rb_pa, self.size, self.write_offset, buf)
         } else {
             write_slow(self.rb_pa, self.size, self.write_offset, buf)
@@ -53,6 +53,7 @@ impl RingBuffer {
 /// the wrap span as `[rb_pa + (start_page + i) % page_count * PAGE_SIZE]`.
 /// Returns the new write offset (unchanged on failure).
 fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> usize {
+    const MAX_SPAN_PAGES: usize = 16;
     // If `buf` would force the start page into the span twice, vmap rejects the
     // duplicate. Hand off to the two-write slow path before truncating `buf`.
     if buf.len() < size && write_offset % PAGE_SIZE + buf.len() > size {
@@ -66,12 +67,16 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
         (buf, write_offset)
     };
 
-    let rb_pa: usize = rb_pa.as_u64().trunc();
     let page_count = size / PAGE_SIZE;
     let start_page = start / PAGE_SIZE;
     let in_page_offset = start % PAGE_SIZE;
     let span_pages = (in_page_offset + buf.len()).div_ceil(PAGE_SIZE);
-    let mut span = alloc::vec::Vec::with_capacity(span_pages);
+    if span_pages > MAX_SPAN_PAGES {
+        return write_slow(rb_pa, size, write_offset, buf);
+    }
+    let rb_pa: usize = rb_pa.as_u64().trunc();
+    let mut span: arrayvec::ArrayVec<PhysPageAddr<PAGE_SIZE>, MAX_SPAN_PAGES> =
+        arrayvec::ArrayVec::new();
     for i in 0..span_pages {
         let page_idx = (start_page + i) % page_count;
         let Some(addr) = page_idx
@@ -128,7 +133,7 @@ fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
             // `space_remaining` bytes written; cursor wraps to 0.
             return 0;
         }
-        wraparound_slice.len()
+        (write_offset + buf.len()) % size
     } else if write_slice(rb_pa + write_offset as u64, buf) {
         (write_offset + buf.len()) % size
     } else {
