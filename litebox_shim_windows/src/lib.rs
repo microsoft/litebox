@@ -13,7 +13,7 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use litebox::fd::TypedFd;
@@ -26,21 +26,22 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{LiteBox, platform::RawPointerProvider};
 use litebox_common_windows::loader::{
-    AccessMemory, Fault, MapMemory, MappingInfo, PeLoadError, PeParseError, PeParsedFile,
-    Protection, ReadAt,
+    AccessMemory, Fault, MapMemory, PAGE_SIZE, PeLoadError, PeParseError, PeParsedFile, Protection,
+    ReadAt, page_align_down,
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
-const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
-const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
+const PLACEHOLDER_EXIT_CODE: i32 = 1;
+const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+const FILE_CHUNK_BYTES: usize = 64 * 1024;
 
 type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
 
 pub type DefaultFS = WindowsFS;
 
-type WindowsFS = litebox::fs::layered::FileSystem<
+pub(crate) type WindowsFS = litebox::fs::layered::FileSystem<
     Platform,
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::layered::FileSystem<
@@ -51,8 +52,8 @@ type WindowsFS = litebox::fs::layered::FileSystem<
 >;
 
 /// A trait required for file systems to be used by the Windows shim.
-pub trait NtShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
-impl<T: litebox::fs::FileSystem + Send + Sync + 'static> NtShimFS for T {}
+pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
+impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
 /// Builds a Windows NT shim instance.
 pub struct WindowsShimBuilder {
@@ -66,7 +67,6 @@ impl Default for WindowsShimBuilder {
 }
 
 impl WindowsShimBuilder {
-    /// Returns a new shim builder.
     #[must_use]
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
@@ -75,13 +75,12 @@ impl WindowsShimBuilder {
         }
     }
 
-    /// Returns the LiteBox object for the shim.
     #[must_use]
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.litebox
     }
 
-    /// Create a default layered file system with the given in-memory and tar read-only layers.
+    /// Build a default layered file system with the given in-memory and tar read-only layers.
     #[must_use]
     pub fn default_fs(
         &self,
@@ -91,9 +90,8 @@ impl WindowsShimBuilder {
         default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
     }
 
-    /// Build the shim.
     #[must_use]
-    pub fn build<FS: NtShimFS>(self) -> WindowsShim<FS> {
+    pub fn build<FS: ShimFS>(self) -> WindowsShim<FS> {
         let page_manager = Arc::new(PageManager::new(&self.litebox));
         WindowsShim {
             litebox: Arc::new(self.litebox),
@@ -104,17 +102,16 @@ impl WindowsShimBuilder {
 }
 
 /// A placeholder Windows shim.
-pub struct WindowsShim<FS: NtShimFS> {
+pub struct WindowsShim<FS: ShimFS> {
     litebox: Arc<LiteBox<Platform>>,
     page_manager: Arc<WindowsPageManager>,
     _fs: PhantomData<FS>,
 }
 
-impl<FS: NtShimFS> WindowsShim<FS> {
+impl<FS: ShimFS> WindowsShim<FS> {
     /// Loads the program at `path` as the shim's initial task.
     ///
-    /// TODO: Implement PE parsing/loading, PEB/TEB setup, initial handle table
-    /// state, and register initialization.
+    /// TODO: PEB/TEB setup and initial handle table state are not yet implemented.
     pub fn load_program(
         &self,
         fs: Arc<FS>,
@@ -123,19 +120,26 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         _envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
         let file = PeImageFile::open(fs, path)?;
-        let parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
+        let parsed = PeParsedFile::parse(&mut &file).map_err(|e| match e {
+            PeParseError::Io(io) => WindowsLoadError::Access(io),
+            other => WindowsLoadError::Parse(other),
+        })?;
         let mut mapper = PeImageMapper {
             file: &file,
             page_manager: &self.page_manager,
+            chunk: alloc::vec![0u8; FILE_CHUNK_BYTES],
         };
         let mut memory = PeImageMemory;
-        let mapping = parsed
-            .load(&mut mapper, &mut memory)
-            .map_err(WindowsLoadError::Load)?;
+        let mapping = parsed.load(&mut mapper, &mut memory).map_err(|e| match e {
+            PeLoadError::Map(access) => WindowsLoadError::Access(access),
+            other => WindowsLoadError::Load(other),
+        })?;
         let entry_point = mapping.entry_point;
 
         let length =
             NonZeroPageSize::new(INITIAL_STACK_SIZE).ok_or(PeImageAccessError::AddressOverflow)?;
+        // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` does not set
+        // `fixed_addr`, so the kernel picks a free range — no existing mapping can be displaced.
         let stack_base = unsafe {
             self.page_manager
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
@@ -152,11 +156,10 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 stack_top,
                 _fs: PhantomData,
             },
-            process: WindowsShimProcess { mapping },
+            process: WindowsShimProcess,
         })
     }
 
-    /// Returns the LiteBox object for the shim.
     #[must_use]
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.litebox
@@ -164,13 +167,13 @@ impl<FS: NtShimFS> WindowsShim<FS> {
 }
 
 /// The shim entrypoint object passed to the platform.
-pub struct WindowsShimEntrypoints<FS: NtShimFS> {
+pub struct WindowsShimEntrypoints<FS: ShimFS> {
     entry_point: usize,
     stack_top: usize,
     _fs: PhantomData<FS>,
 }
 
-impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
+impl<FS: ShimFS> EnterShim for WindowsShimEntrypoints<FS> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -212,28 +215,24 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
 }
 
 /// A loaded Windows program and the process handle used to wait for it.
-pub struct LoadedProgram<FS: NtShimFS> {
+pub struct LoadedProgram<FS: ShimFS> {
+    /// The initial-thread entrypoint state passed to the platform's `run_thread`.
     pub entrypoints: WindowsShimEntrypoints<FS>,
+    /// Handle used to wait for the loaded program to exit.
     pub process: WindowsShimProcess,
 }
 
 /// A placeholder handle to a process loaded via [`WindowsShim::load_program`].
-pub struct WindowsShimProcess {
-    mapping: MappingInfo,
-}
+pub struct WindowsShimProcess;
 
 impl WindowsShimProcess {
-    /// Returns information about the loaded PE image mapping.
-    #[must_use]
-    pub fn mapping(&self) -> &MappingInfo {
-        &self.mapping
-    }
-
     /// Wait for the process to exit, returning its exit code.
+    ///
+    /// Currently a placeholder that returns a fixed exit code immediately.
+    /// Once NT process lifecycle exists, this will actually block.
     #[must_use]
     pub fn wait(&self) -> i32 {
-        // TODO: Wait for the NT process object once process lifecycle exists.
-        DEFAULT_PROCESS_EXIT_CODE
+        PLACEHOLDER_EXIT_CODE
     }
 }
 
@@ -280,12 +279,12 @@ pub enum PeImageAccessError {
     MemoryAccess,
 }
 
-struct PeImageFile<FS: NtShimFS> {
+struct PeImageFile<FS: ShimFS> {
     fs: Arc<FS>,
     fd: TypedFd<FS>,
 }
 
-impl<FS: NtShimFS> PeImageFile<FS> {
+impl<FS: ShimFS> PeImageFile<FS> {
     fn open(fs: Arc<FS>, path: &str) -> Result<Self, PeImageAccessError> {
         let fd = fs.open(path, OFlags::RDONLY, Mode::empty())?;
         Ok(Self { fs, fd })
@@ -310,13 +309,15 @@ impl<FS: NtShimFS> PeImageFile<FS> {
     }
 }
 
-impl<FS: NtShimFS> Drop for PeImageFile<FS> {
+impl<FS: ShimFS> Drop for PeImageFile<FS> {
     fn drop(&mut self) {
-        let _ = self.fs.close(&self.fd);
+        if let Err(e) = self.fs.close(&self.fd) {
+            litebox_util_log::warn!(error:? = e; "failed to close PE image file");
+        }
     }
 }
 
-impl<FS: NtShimFS> ReadAt for &'_ PeImageFile<FS> {
+impl<FS: ShimFS> ReadAt for &'_ PeImageFile<FS> {
     type Error = PeImageAccessError;
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
@@ -337,12 +338,14 @@ impl<FS: NtShimFS> ReadAt for &'_ PeImageFile<FS> {
     }
 }
 
-struct PeImageMapper<'a, FS: NtShimFS> {
+struct PeImageMapper<'a, FS: ShimFS> {
     file: &'a PeImageFile<FS>,
     page_manager: &'a WindowsPageManager,
+    /// Reusable per-call I/O staging buffer for [`MapMemory::map_file`].
+    chunk: Vec<u8>,
 }
 
-impl<FS: NtShimFS> MapMemory for PeImageMapper<'_, FS> {
+impl<FS: ShimFS> MapMemory for PeImageMapper<'_, FS> {
     type Error = PeImageAccessError;
 
     fn reserve(
@@ -358,8 +361,9 @@ impl<FS: NtShimFS> MapMemory for PeImageMapper<'_, FS> {
             Some(NonZeroAddress::new(preferred_base).ok_or(PeImageAccessError::AddressOverflow)?)
         };
 
-        // SAFETY: The PE loader owns this reserved image range and maps concrete
-        // headers/sections into it before any guest execution is allowed.
+        // SAFETY: `CreatePagesFlags::empty()` does not set `fixed_addr`, so the kernel
+        // treats `suggested_address` as a hint and never silently unmaps an existing
+        // mapping; the documented overlap precondition therefore does not apply.
         let ptr = unsafe {
             self.page_manager.create_inaccessible_pages(
                 suggested_address,
@@ -379,14 +383,12 @@ impl<FS: NtShimFS> MapMemory for PeImageMapper<'_, FS> {
     ) -> Result<(), Self::Error> {
         make_pages_writable(self.page_manager, address, len)?;
         let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(address);
-        for index in 0..len {
-            ptr.write_at_offset(
-                index
-                    .try_into()
-                    .map_err(|_| PeImageAccessError::AddressOverflow)?,
-                0,
-            )
-            .ok_or(PeImageAccessError::MemoryAccess)?;
+        let mut written = 0;
+        while written < len {
+            let chunk = (len - written).min(ZERO_CHUNK.len());
+            ptr.copy_from_slice(written, &ZERO_CHUNK[..chunk])
+                .ok_or(PeImageAccessError::MemoryAccess)?;
+            written += chunk;
         }
         protect_pages(self.page_manager, address, len, *prot)
     }
@@ -399,16 +401,24 @@ impl<FS: NtShimFS> MapMemory for PeImageMapper<'_, FS> {
         prot: &Protection,
     ) -> Result<(), Self::Error> {
         make_pages_writable(self.page_manager, address, len)?;
-        let mut data = vec![0; len];
-        self.file.read_exact_at(
-            offset
-                .try_into()
-                .map_err(|_| PeImageAccessError::AddressOverflow)?,
-            &mut data,
-        )?;
         let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(address);
-        ptr.copy_from_slice(0, &data)
-            .ok_or(PeImageAccessError::MemoryAccess)?;
+        let file_offset: usize = offset
+            .try_into()
+            .map_err(|_| PeImageAccessError::AddressOverflow)?;
+        let mut read = 0;
+        while read < len {
+            let remaining = len - read;
+            let n = remaining.min(self.chunk.len());
+            self.file.read_exact_at(
+                file_offset
+                    .checked_add(read)
+                    .ok_or(PeImageAccessError::AddressOverflow)?,
+                &mut self.chunk[..n],
+            )?;
+            ptr.copy_from_slice(read, &self.chunk[..n])
+                .ok_or(PeImageAccessError::MemoryAccess)?;
+            read += n;
+        }
         protect_pages(self.page_manager, address, len, *prot)
     }
 
@@ -463,15 +473,18 @@ fn protect_pages(
         return Ok(());
     }
     let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(start);
-    // SAFETY: Loading and final image protection happen before guest execution.
-    unsafe {
-        match (prot.read, prot.write, prot.execute) {
-            (_, true, true) => page_manager.make_pages_rwx(ptr, len)?,
-            (_, true, false) => page_manager.make_pages_writable(ptr, len)?,
-            (_, false, true) => page_manager.make_pages_executable(ptr, len)?,
-            (true, false, false) => page_manager.make_pages_readable(ptr, len)?,
-            (false, false, false) => page_manager.make_pages_inaccessible(ptr, len)?,
-        }
+    // SAFETY: All `make_pages_*` calls happen during PE load, before the initial
+    // guest thread starts, so there is no concurrent read/write/execute on these
+    // pages. The RWX arm is only reached when a section's COFF characteristics
+    // demand WRITE|EXECUTE; the bytes copied into the section come from the
+    // attacker-controlled PE file and are not executed until protections are set,
+    // so this is no looser than running the same PE under the real Windows loader.
+    match (prot.read, prot.write, prot.execute) {
+        (_, true, true) => unsafe { page_manager.make_pages_rwx(ptr, len)? },
+        (_, true, false) => unsafe { page_manager.make_pages_writable(ptr, len)? },
+        (_, false, true) => unsafe { page_manager.make_pages_executable(ptr, len)? },
+        (true, false, false) => unsafe { page_manager.make_pages_readable(ptr, len)? },
+        (false, false, false) => unsafe { page_manager.make_pages_inaccessible(ptr, len)? },
     }
     Ok(())
 }
@@ -481,21 +494,11 @@ fn page_range(address: usize, len: usize) -> Result<(usize, usize), PeImageAcces
         return Ok((address, 0));
     }
     let start = page_align_down(address);
-    let end = page_align_up(
-        address
-            .checked_add(len)
-            .ok_or(PeImageAccessError::AddressOverflow)?,
-    )
-    .ok_or(PeImageAccessError::AddressOverflow)?;
+    let end = address
+        .checked_add(len)
+        .and_then(|v| v.checked_next_multiple_of(PAGE_SIZE))
+        .ok_or(PeImageAccessError::AddressOverflow)?;
     Ok((start, end - start))
-}
-
-fn page_align_down(address: usize) -> usize {
-    address & !(PAGE_SIZE - 1)
-}
-
-fn page_align_up(address: usize) -> Option<usize> {
-    address.checked_add(PAGE_SIZE - 1).map(page_align_down)
 }
 
 fn default_fs(

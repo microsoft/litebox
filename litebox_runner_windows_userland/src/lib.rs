@@ -7,7 +7,7 @@
 
 extern crate alloc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_platform_multiplex::Platform;
 use std::path::PathBuf;
@@ -41,7 +41,8 @@ pub struct CliArgs {
 ///
 /// # Panics
 ///
-/// Can panic if the placeholder Windows shim encounters an unrecoverable platform setup issue.
+/// Panics if the initial in-memory file system fails to create `/tmp` — those
+/// operations cannot fail against a freshly-constructed file system.
 pub fn run(cli_args: CliArgs) -> Result<()> {
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
@@ -64,14 +65,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
     }
     let tar_data = std::fs::read(tar_file)
-        .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
+        .with_context(|| format!("Could not read tar file at {}", tar_file.display()))?;
 
     let platform = Platform::new();
     litebox_platform_multiplex::set_platform(platform);
     let shim_builder = litebox_shim_windows::WindowsShimBuilder::new();
     let litebox = shim_builder.litebox();
 
-    let program_path = &cli_args.program_and_arguments[0];
+    let (program_path, program_args) = cli_args
+        .program_and_arguments
+        .split_first()
+        .context("program path missing — clap should have required at least one argument")?;
 
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
@@ -81,8 +85,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 "/tmp",
                 litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
             )
-            .unwrap();
-            fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
+            .expect("/tmp creation cannot fail on a fresh in-memory file system");
+            fs.chown("/tmp", Some(1000), Some(1000))
+                .expect("/tmp chown cannot fail on a fresh in-memory file system");
         });
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
@@ -91,35 +96,32 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     let shim = shim_builder.build();
-    let argv = cli_args
-        .program_and_arguments
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
-    let envp: Vec<_> = cli_args
+    let argv = std::iter::once(program_path.as_str())
+        .chain(program_args.iter().map(String::as_str))
+        .map(to_cstring)
+        .collect::<Result<Vec<_>>>()
+        .context("argv contained an interior NUL byte")?;
+    let mut envp = cli_args
         .environment_variables
         .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
-    let envp = if cli_args.forward_environment_variables {
-        envp.into_iter()
-            .chain(std::env::vars().map(|(key, value)| {
-                std::ffi::CString::new(
-                    key.bytes()
-                        .chain([b'='])
-                        .chain(value.bytes())
-                        .collect::<Vec<u8>>(),
-                )
-                .unwrap()
-            }))
-            .collect()
-    } else {
-        envp
-    };
+        .map(|s| to_cstring(s))
+        .collect::<Result<Vec<_>>>()
+        .context("--env value contained an interior NUL byte")?;
+    if cli_args.forward_environment_variables {
+        for (key, value) in std::env::vars() {
+            envp.push(
+                to_cstring(&format!("{key}={value}"))
+                    .context("forwarded environment variable contained an interior NUL byte")?,
+            );
+        }
+    }
 
     let program = shim
         .load_program(initial_file_system, program_path, argv, envp)
-        .map_err(|e| anyhow!("failed to load Windows PE program: {e}"))?;
+        .context("failed to load Windows PE program")?;
+    // SAFETY: `WindowsShimEntrypoints::init` populates `rip`/`rsp`/`eflags` inside
+    // `run_thread` before the initial guest thread executes, so the `PtRegs::default()`
+    // we hand in is fully initialized before any guest instruction runs.
     unsafe {
         litebox_platform_windows_userland::run_thread(
             program.entrypoints,
@@ -127,4 +129,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
     std::process::exit(program.process.wait())
+}
+
+fn to_cstring(s: &str) -> Result<std::ffi::CString> {
+    std::ffi::CString::new(s.as_bytes()).map_err(Into::into)
 }

@@ -3,21 +3,22 @@
 
 //! PE loader-facing parser and mapper.
 //!
-//! This module parses PE metadata and maps images through platform-provided
-//! traits. Resolving imports and initializing process state are shim
-//! responsibilities that will be built on top of this parser.
+//! This module parses PE metadata and maps images through platform-provided traits.
 
 use alloc::vec::Vec;
 use core::cmp;
+use core::mem::size_of;
 
 use object::endian::LittleEndian as LE;
-use object::pe::{self, ImageNtHeaders64};
-use object::read::Object as _;
-use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64, Relocation};
+use object::pe;
+use object::pod::Pod;
 use thiserror::Error;
 
-/// The page size used by Windows x86-64 image mappings.
+/// x86-64 page size used for all PE alignment and protection math.
 pub const PAGE_SIZE: usize = 4096;
+
+/// Maximum supported section count. PE limit per spec is 96.
+const MAX_SECTIONS: usize = 96;
 
 /// The result of parsing a PE32+ file.
 #[derive(Debug)]
@@ -28,101 +29,43 @@ pub struct PeParsedFile {
     pub sections: Vec<pe::ImageSectionHeader>,
     /// Data directory entries indexed by `IMAGE_DIRECTORY_ENTRY_*`.
     pub data_directories: Vec<PeDataDirectory>,
-    /// Import lookup table entries grouped only by their source DLL name in each entry.
-    pub imports: Vec<PeImport>,
-    /// Base relocation entries from the `.reloc` directory.
-    pub relocations: Vec<Relocation>,
 }
 
 /// Basic PE image metadata needed by the Windows shim loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeImageInfo {
-    /// COFF machine type.
     pub machine: u16,
-    /// COFF image characteristics.
     pub characteristics: u16,
-    /// Preferred image base.
     pub image_base: usize,
-    /// Entry point RVA.
     pub entry_point_rva: usize,
-    /// Entry point virtual address at the preferred image base.
-    pub entry_point: usize,
-    /// Required image mapping size.
     pub size_of_image: usize,
-    /// Header bytes that must be mapped at the start of the image.
     pub size_of_headers: usize,
-    /// Section alignment in virtual memory.
     pub section_alignment: usize,
-    /// File alignment for raw section data.
     pub file_alignment: usize,
-    /// Windows subsystem value, such as `IMAGE_SUBSYSTEM_WINDOWS_CUI`.
+    /// e.g. `IMAGE_SUBSYSTEM_WINDOWS_CUI`.
     pub subsystem: u16,
-    /// PE DLL characteristics flags.
     pub dll_characteristics: u16,
-    /// Initial thread stack reservation size.
-    pub size_of_stack_reserve: usize,
-    /// Initial thread stack commit size.
-    pub size_of_stack_commit: usize,
-    /// Default process heap reservation size.
     pub size_of_heap_reserve: usize,
-    /// Default process heap commit size.
     pub size_of_heap_commit: usize,
 }
 
 /// Information about the mapped PE image.
 pub struct MappingInfo {
-    /// The base address where the PE image is mapped.
     pub base_addr: usize,
-    /// The mapped image size.
     pub image_size: usize,
-    /// The entry point, where execution begins.
     pub entry_point: usize,
 }
 
 /// A PE data directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeDataDirectory {
-    /// Directory index, one of the `IMAGE_DIRECTORY_ENTRY_*` constants.
-    pub index: usize,
-    /// Directory RVA.
     pub virtual_address: u32,
-    /// Directory byte size.
     pub size: u32,
-}
-
-/// A PE import table entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeImport {
-    /// DLL name from the import descriptor.
-    pub library: Vec<u8>,
-    /// Import lookup table slot RVA.
-    pub lookup_rva: u32,
-    /// Import address table slot RVA that the loader must patch.
-    pub iat_rva: u32,
-    /// Import target.
-    pub target: PeImportTarget,
-}
-
-/// A PE import target.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeImportTarget {
-    /// Import by ordinal.
-    Ordinal(u16),
-    /// Import by name with the PE hint value.
-    Name {
-        /// Export name table hint.
-        hint: u16,
-        /// Imported symbol name.
-        name: Vec<u8>,
-    },
 }
 
 /// Errors that can occur when parsing a PE file.
 #[derive(Debug, Error)]
 pub enum PeParseError<E> {
-    /// PE parsing error reported by the object parser.
-    #[error("PE parsing error")]
-    Pe(#[from] object::read::Error),
     /// The input file could not be read.
     #[error("I/O error")]
     Io(#[source] E),
@@ -154,19 +97,46 @@ pub enum PeLoadError<E> {
     Fault(#[from] Fault),
 }
 
+macro_rules! checked_add {
+    ($a:expr, $b:expr, $e:expr) => {
+        $a.checked_add($b).ok_or($e)
+    };
+}
+macro_rules! checked_add_invalid {
+    ($a:expr, $b:expr) => {
+        checked_add!($a, $b, PeLoadError::InvalidImage)
+    };
+}
+macro_rules! checked_add_overflow {
+    ($a:expr, $b:expr) => {
+        checked_add!($a, $b, PeParseError::Overflow)
+    };
+}
+
+macro_rules! checked_next_multiple_of {
+    ($x:expr, $align:expr, $e:expr) => {
+        $x.checked_next_multiple_of($align).ok_or($e)
+    };
+}
+
 impl PeParsedFile {
     /// Parse a PE32+ x86-64 image from the given file.
+    ///
+    /// Only the PE headers are read into memory; section contents — including
+    /// `.reloc` — are left on disk and streamed by [`MapMemory::map_file`] during
+    /// [`PeParsedFile::load`]. Base relocations are then applied by reading the
+    /// mapped image in place, avoiding a redundant disk read of the `.reloc` bytes.
     pub fn parse<F: ReadAt>(file: &mut F) -> Result<Self, PeParseError<F::Error>> {
         let size = file.size().map_err(PeParseError::Io)?;
-        let len: usize = size.try_into().map_err(|_| PeParseError::Overflow)?;
-        let mut data = alloc::vec![0; len];
-        file.read_at(0, &mut data).map_err(PeParseError::Io)?;
-        parse_bytes(&data)
-    }
+        let file_size: usize = usize_from_u64(size)?;
 
-    /// Parse a PE32+ x86-64 image from file bytes.
-    pub fn parse_bytes(data: &[u8]) -> Result<Self, PeParseError<core::convert::Infallible>> {
-        parse_bytes(data)
+        let (image, sections, data_directories) = parse_headers(file, file_size)?;
+
+        Ok(PeParsedFile {
+            image,
+            sections,
+            data_directories,
+        })
     }
 
     /// Load the PE image into memory.
@@ -181,8 +151,11 @@ impl PeParsedFile {
         mem: &mut impl AccessMemory,
     ) -> Result<MappingInfo, PeLoadError<M::Error>> {
         let preferred_base = self.image.image_base;
-        let image_size =
-            page_align_up(self.image.size_of_image).ok_or(PeLoadError::InvalidImage)?;
+        let image_size = checked_next_multiple_of!(
+            self.image.size_of_image,
+            PAGE_SIZE,
+            PeLoadError::InvalidImage
+        )?;
         if image_size == 0 {
             return Err(PeLoadError::InvalidImage);
         }
@@ -190,9 +163,7 @@ impl PeParsedFile {
         let base_addr = mapper
             .reserve(preferred_base, image_size, PAGE_SIZE)
             .map_err(PeLoadError::Map)?;
-        let image_end = base_addr
-            .checked_add(image_size)
-            .ok_or(PeLoadError::InvalidImage)?;
+        let image_end = checked_add_invalid!(base_addr, image_size)?;
 
         let headers_size = self.image.size_of_headers;
         if headers_size > image_size {
@@ -200,16 +171,7 @@ impl PeParsedFile {
         }
         if headers_size != 0 {
             mapper
-                .map_file(
-                    base_addr,
-                    headers_size,
-                    0,
-                    &Protection {
-                        read: true,
-                        write: false,
-                        execute: false,
-                    },
-                )
+                .map_file(base_addr, headers_size, 0, &Protection::R)
                 .map_err(PeLoadError::Map)?;
         }
 
@@ -218,53 +180,31 @@ impl PeParsedFile {
             let virtual_size = section.virtual_size.get(LE) as usize;
             let raw_size = section.size_of_raw_data.get(LE) as usize;
             let raw_offset = section.pointer_to_raw_data.get(LE) as usize;
-            let mapped_size =
-                page_align_up(cmp::max(virtual_size, raw_size)).ok_or(PeLoadError::InvalidImage)?;
+            let mapped_size = checked_next_multiple_of!(
+                cmp::max(virtual_size, raw_size),
+                PAGE_SIZE,
+                PeLoadError::InvalidImage
+            )?;
 
             if mapped_size == 0 {
                 continue;
             }
-            let section_start = base_addr
-                .checked_add(section_rva)
-                .ok_or(PeLoadError::InvalidImage)?;
-            let section_end = section_start
-                .checked_add(mapped_size)
-                .ok_or(PeLoadError::InvalidImage)?;
+            let section_start = checked_add_invalid!(base_addr, section_rva)?;
+            let section_end = checked_add_invalid!(section_start, mapped_size)?;
             if section_end > image_end {
                 return Err(PeLoadError::InvalidImage);
             }
 
             if raw_size != 0 {
                 mapper
-                    .map_file(
-                        section_start,
-                        raw_size,
-                        raw_offset
-                            .try_into()
-                            .map_err(|_| PeLoadError::InvalidImage)?,
-                        &Protection {
-                            read: true,
-                            write: true,
-                            execute: false,
-                        },
-                    )
+                    .map_file(section_start, raw_size, raw_offset as u64, &Protection::RW)
                     .map_err(PeLoadError::Map)?;
             }
 
             if mapped_size > raw_size {
-                let zero_start = section_start
-                    .checked_add(raw_size)
-                    .ok_or(PeLoadError::InvalidImage)?;
+                let zero_start = checked_add_invalid!(section_start, raw_size)?;
                 mapper
-                    .map_zero(
-                        zero_start,
-                        mapped_size - raw_size,
-                        &Protection {
-                            read: true,
-                            write: true,
-                            execute: false,
-                        },
-                    )
+                    .map_zero(zero_start, mapped_size - raw_size, &Protection::RW)
                     .map_err(PeLoadError::Map)?;
             }
         }
@@ -275,25 +215,25 @@ impl PeParsedFile {
             let section_rva: usize = section.virtual_address.get(LE) as usize;
             let virtual_size: usize = section.virtual_size.get(LE) as usize;
             let raw_size: usize = section.size_of_raw_data.get(LE) as usize;
-            let mapped_size =
-                page_align_up(cmp::max(virtual_size, raw_size)).ok_or(PeLoadError::InvalidImage)?;
+            let mapped_size = checked_next_multiple_of!(
+                cmp::max(virtual_size, raw_size),
+                PAGE_SIZE,
+                PeLoadError::InvalidImage
+            )?;
             if mapped_size == 0 {
                 continue;
             }
 
-            let protect_start = page_align_down(
-                base_addr
-                    .checked_add(section_rva)
-                    .ok_or(PeLoadError::InvalidImage)?,
-            );
-            let protect_end = page_align_up(
+            let protect_start = page_align_down(checked_add_invalid!(base_addr, section_rva)?);
+            let protect_end = checked_next_multiple_of!(
                 base_addr
                     .checked_add(section_rva)
                     .and_then(|address| address.checked_add(mapped_size))
                     .ok_or(PeLoadError::InvalidImage)?,
-            )
-            .ok_or(PeLoadError::InvalidImage)?;
-            if protect_end > image_end || protect_end < protect_start {
+                PAGE_SIZE,
+                PeLoadError::InvalidImage
+            )?;
+            if protect_end > image_end {
                 return Err(PeLoadError::InvalidImage);
             }
 
@@ -306,9 +246,11 @@ impl PeParsedFile {
                 .map_err(PeLoadError::Map)?;
         }
 
-        let entry_point = base_addr
-            .checked_add(self.image.entry_point_rva)
-            .ok_or(PeLoadError::InvalidImage)?;
+        let entry_point = checked_add!(
+            base_addr,
+            self.image.entry_point_rva,
+            PeLoadError::InvalidImage
+        )?;
 
         Ok(MappingInfo {
             base_addr,
@@ -326,136 +268,305 @@ impl PeParsedFile {
         if delta == 0 {
             return Ok(());
         }
-        if self.relocations.is_empty() {
-            return Err(PeLoadError::RelocationRequired);
-        }
 
-        let image_end = base_addr
-            .checked_add(self.image.size_of_image)
-            .ok_or(PeLoadError::InvalidImage)?;
+        // The `.reloc` directory is already mapped (the containing section was made RW above).
+        let reloc_dir = self
+            .data_directories
+            .get(pe::IMAGE_DIRECTORY_ENTRY_BASERELOC)
+            .filter(|d| d.size != 0)
+            .ok_or(PeLoadError::RelocationRequired)?;
 
-        for relocation in &self.relocations {
-            match relocation.typ {
-                pe::IMAGE_REL_BASED_ABSOLUTE => {}
-                pe::IMAGE_REL_BASED_DIR64 => {
-                    // patch a 64-bit absolute address
-                    let relocation_rva = relocation.virtual_address as usize;
-                    let relocation_address = base_addr
-                        .checked_add(relocation_rva)
-                        .ok_or(PeLoadError::InvalidImage)?;
-                    let relocation_end = relocation_address
-                        .checked_add(size_of::<u64>())
-                        .ok_or(PeLoadError::InvalidImage)?;
-                    if relocation_end > image_end {
-                        return Err(PeLoadError::InvalidImage);
-                    }
+        let image_end = checked_add_invalid!(base_addr, self.image.size_of_image)?;
+        let dir_addr = checked_add_invalid!(base_addr, reloc_dir.virtual_address as usize)?;
+        let dir_end = checked_add_invalid!(dir_addr, reloc_dir.size as usize)?;
 
-                    let mut value = [0; size_of::<u64>()];
-                    mem.read(relocation_address, &mut value)?;
-                    let delta: u64 = delta.try_into().map_err(|_| PeLoadError::InvalidImage)?;
-                    let relocated = u64::from_le_bytes(value).wrapping_add(delta);
-                    mem.write(relocation_address, &relocated.to_le_bytes())?;
-                }
-                typ => return Err(PeLoadError::UnsupportedRelocation(typ)),
+        // `delta` represents a possibly-negative offset via two's-complement
+        // wrap in `usize`; the signed cast preserves the sign for `wrapping_add_signed`.
+        let delta_i64: i64 = delta.cast_signed() as i64;
+
+        let mut cursor = dir_addr;
+        while cursor < dir_end {
+            let mut header_bytes = [0u8; size_of::<pe::ImageBaseRelocation>()];
+            mem.read(cursor, &mut header_bytes)?;
+            let (header, _) = object::pod::from_bytes::<pe::ImageBaseRelocation>(&header_bytes)
+                .map_err(|()| PeLoadError::InvalidImage)?;
+            let page_rva = header.virtual_address.get(LE);
+            let block_size = header.size_of_block.get(LE) as usize;
+            if block_size < size_of::<pe::ImageBaseRelocation>() || !block_size.is_multiple_of(2) {
+                return Err(PeLoadError::InvalidImage);
             }
+            let block_end = checked_add_invalid!(cursor, block_size)?;
+            if block_end > dir_end {
+                return Err(PeLoadError::InvalidImage);
+            }
+
+            let mut entry_addr =
+                checked_add_invalid!(cursor, size_of::<pe::ImageBaseRelocation>())?;
+            while entry_addr < block_end {
+                let entry = mem_read_u16(mem, entry_addr)?;
+                let typ = entry >> 12;
+                let entry_offset = u32::from(entry & 0x0fff);
+                match typ {
+                    pe::IMAGE_REL_BASED_ABSOLUTE => {}
+                    pe::IMAGE_REL_BASED_DIR64 => {
+                        let relocation_rva = checked_add_invalid!(page_rva, entry_offset)? as usize;
+                        let relocation_address = checked_add_invalid!(base_addr, relocation_rva)?;
+                        let relocation_end =
+                            checked_add_invalid!(relocation_address, size_of::<u64>())?;
+                        if relocation_end > image_end {
+                            return Err(PeLoadError::InvalidImage);
+                        }
+                        let value = mem_read_u64(mem, relocation_address)?;
+                        let relocated = value.wrapping_add_signed(delta_i64);
+                        mem.write(relocation_address, &relocated.to_le_bytes())?;
+                    }
+                    typ => return Err(PeLoadError::UnsupportedRelocation(typ)),
+                }
+                entry_addr = checked_add_invalid!(entry_addr, size_of::<u16>())?;
+            }
+            cursor = block_end;
         }
 
         Ok(())
     }
 }
 
-fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
-    let pe = PeFile64::parse(data)?;
-    let nt_headers = pe.nt_headers();
-    let file_header = nt_headers.file_header();
-    let optional_header = nt_headers.optional_header();
-    let machine = file_header.machine.get(LE);
+fn mem_read_u16<E>(mem: &mut impl AccessMemory, address: usize) -> Result<u16, PeLoadError<E>> {
+    let mut buf = [0u8; size_of::<u16>()];
+    mem.read(address, &mut buf)?;
+    Ok(u16::from_le_bytes(buf))
+}
 
-    if machine != pe::IMAGE_FILE_MACHINE_AMD64 || pe.kind() != object::ObjectKind::Executable {
+fn mem_read_u64<E>(mem: &mut impl AccessMemory, address: usize) -> Result<u64, PeLoadError<E>> {
+    let mut buf = [0u8; size_of::<u64>()];
+    mem.read(address, &mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+type ParsedHeaders = (
+    PeImageInfo,
+    Vec<pe::ImageSectionHeader>,
+    Vec<PeDataDirectory>,
+);
+
+/// Read a POD struct of type `T` from `file` at `offset`.
+///
+/// All `object::pe` structs have alignment 1 (their fields are
+/// `#[repr(transparent)]` byte-array wrappers), so the byte buffer's alignment
+/// trivially satisfies `from_bytes`'s check and the transmute happens inside
+/// `object::pod` rather than here.
+fn read_pod<F: ReadAt, T: Pod>(file: &mut F, offset: u64) -> Result<T, PeParseError<F::Error>> {
+    let mut buf = alloc::vec![0u8; size_of::<T>()];
+    file.read_at(offset, &mut buf).map_err(PeParseError::Io)?;
+    let (val, _) =
+        object::pod::from_bytes::<T>(&buf).map_err(|()| PeParseError::UnsupportedImage)?;
+    Ok(*val)
+}
+
+/// Read `count` POD structs of type `T` from `file` starting at `offset`.
+fn read_pod_vec<F: ReadAt, T: Pod>(
+    file: &mut F,
+    offset: u64,
+    count: usize,
+) -> Result<Vec<T>, PeParseError<F::Error>> {
+    let bytes_len = count
+        .checked_mul(size_of::<T>())
+        .ok_or(PeParseError::Overflow)?;
+    let mut buf = alloc::vec![0u8; bytes_len];
+    file.read_at(offset, &mut buf).map_err(PeParseError::Io)?;
+    let (slice, _) = object::pod::slice_from_bytes::<T>(&buf, count)
+        .map_err(|()| PeParseError::UnsupportedImage)?;
+    Ok(slice.to_vec())
+}
+
+fn parse_headers<F: ReadAt>(
+    file: &mut F,
+    file_size: usize,
+) -> Result<ParsedHeaders, PeParseError<F::Error>> {
+    // DOS header.
+    if file_size < size_of::<pe::ImageDosHeader>() {
+        return Err(PeParseError::UnsupportedImage);
+    }
+    let dos: pe::ImageDosHeader = read_pod(file, 0)?;
+    if dos.e_magic.get(LE) != pe::IMAGE_DOS_SIGNATURE {
+        return Err(PeParseError::UnsupportedImage);
+    }
+    let nt_offset = u64::from(dos.e_lfanew.get(LE));
+
+    // NT headers (signature + COFF file header + 64-bit optional header).
+    let nt_end = checked_add_overflow!(nt_offset, size_of::<pe::ImageNtHeaders64>() as u64)?;
+    if nt_end > file_size as u64 {
+        return Err(PeParseError::UnsupportedImage);
+    }
+    let nt: pe::ImageNtHeaders64 = read_pod(file, nt_offset)?;
+    if nt.signature.get(LE) != pe::IMAGE_NT_SIGNATURE {
+        return Err(PeParseError::UnsupportedImage);
+    }
+    if nt.optional_header.magic.get(LE) != pe::IMAGE_NT_OPTIONAL_HDR64_MAGIC {
         return Err(PeParseError::UnsupportedImage);
     }
 
-    let image_base = usize_from_u64(optional_header.image_base())?;
-    let entry_point_rva = usize_from_u32(optional_header.address_of_entry_point())?;
+    let machine = nt.file_header.machine.get(LE);
+    let characteristics = nt.file_header.characteristics.get(LE);
+    if machine != pe::IMAGE_FILE_MACHINE_AMD64
+        || characteristics & pe::IMAGE_FILE_EXECUTABLE_IMAGE == 0
+    {
+        return Err(PeParseError::UnsupportedImage);
+    }
+
+    let opt = &nt.optional_header;
+    // Sub-page section alignment would let consecutive sections share a page,
+    // so the page-aligned protect range of one section could overwrite another's
+    // (e.g. RW `.data` downgrading the last page of RX `.text`).
+    if (opt.section_alignment.get(LE) as usize) < PAGE_SIZE {
+        return Err(PeParseError::UnsupportedImage);
+    }
+
+    let image_base = usize_from_u64(opt.image_base.get(LE))?;
+    let entry_point_rva = opt.address_of_entry_point.get(LE) as usize;
     let image = PeImageInfo {
         machine,
-        characteristics: file_header.characteristics.get(LE),
+        characteristics,
         image_base,
         entry_point_rva,
-        entry_point: image_base
-            .checked_add(entry_point_rva)
-            .ok_or(PeParseError::Overflow)?,
-        size_of_image: usize_from_u32(optional_header.size_of_image())?,
-        size_of_headers: usize_from_u32(optional_header.size_of_headers())?,
-        section_alignment: usize_from_u32(optional_header.section_alignment())?,
-        file_alignment: usize_from_u32(optional_header.file_alignment())?,
-        subsystem: optional_header.subsystem(),
-        dll_characteristics: optional_header.dll_characteristics(),
-        size_of_stack_reserve: usize_from_u64(optional_header.size_of_stack_reserve())?,
-        size_of_stack_commit: usize_from_u64(optional_header.size_of_stack_commit())?,
-        size_of_heap_reserve: usize_from_u64(optional_header.size_of_heap_reserve())?,
-        size_of_heap_commit: usize_from_u64(optional_header.size_of_heap_commit())?,
+        size_of_image: opt.size_of_image.get(LE) as usize,
+        size_of_headers: opt.size_of_headers.get(LE) as usize,
+        section_alignment: opt.section_alignment.get(LE) as usize,
+        file_alignment: opt.file_alignment.get(LE) as usize,
+        subsystem: opt.subsystem.get(LE),
+        dll_characteristics: opt.dll_characteristics.get(LE),
+        size_of_heap_reserve: usize_from_u64(opt.size_of_heap_reserve.get(LE))?,
+        size_of_heap_commit: usize_from_u64(opt.size_of_heap_commit.get(LE))?,
     };
+    if image.size_of_headers > file_size {
+        return Err(PeParseError::UnsupportedImage);
+    }
+    if entry_point_rva >= image.size_of_image {
+        return Err(PeParseError::UnsupportedImage);
+    }
 
-    let sections = pe.section_table().iter().copied().collect();
-
-    let data_directories = pe
-        .data_directories()
-        .enumerate()
-        .filter_map(|(index, directory)| {
-            let virtual_address = directory.virtual_address.get(LE);
-            let size = directory.size.get(LE);
-            (virtual_address != 0).then_some(PeDataDirectory {
-                index,
+    // Data directories sit immediately after the optional header. `ImageNtHeaders64`
+    // already covers signature + file header + 64-bit optional header, so the
+    // directory array starts at `nt_offset + size_of::<ImageNtHeaders64>()`.
+    let num_rva_and_sizes = opt.number_of_rva_and_sizes.get(LE) as usize;
+    if num_rva_and_sizes > pe::IMAGE_NUMBEROF_DIRECTORY_ENTRIES {
+        return Err(PeParseError::UnsupportedImage);
+    }
+    let raw_dirs: Vec<pe::ImageDataDirectory> = read_pod_vec(file, nt_end, num_rva_and_sizes)?;
+    let data_directories: Vec<_> = raw_dirs
+        .iter()
+        .map(|dir| {
+            let virtual_address = dir.virtual_address.get(LE);
+            let size = dir.size.get(LE);
+            PeDataDirectory {
                 virtual_address,
                 size,
-            })
+            }
         })
         .collect();
+    for dir in &data_directories {
+        let end = checked_add!(dir.virtual_address, dir.size, PeParseError::Overflow)?;
+        if (end as usize) > image.size_of_image {
+            return Err(PeParseError::UnsupportedImage);
+        }
+    }
 
-    let imports = parse_imports(&pe)?;
-    let relocations = parse_relocations(&pe)?;
+    // Section headers sit at `nt_offset + 4 (signature) + size_of::<ImageFileHeader>() + size_of_optional_header`.
+    let num_sections = nt.file_header.number_of_sections.get(LE) as usize;
+    if num_sections > MAX_SECTIONS {
+        return Err(PeParseError::UnsupportedImage);
+    }
+    let size_of_optional_header = u64::from(nt.file_header.size_of_optional_header.get(LE));
+    let sections_offset = nt_offset
+        .checked_add(4 + size_of::<pe::ImageFileHeader>() as u64)
+        .and_then(|n| n.checked_add(size_of_optional_header))
+        .ok_or(PeParseError::Overflow)?;
+    let sections_end = checked_add_overflow!(
+        sections_offset,
+        (num_sections * size_of::<pe::ImageSectionHeader>()) as u64
+    )?;
+    if sections_end > file_size as u64 {
+        return Err(PeParseError::UnsupportedImage);
+    }
+    let sections: Vec<pe::ImageSectionHeader> = read_pod_vec(file, sections_offset, num_sections)?;
+    validate_sections(&image, &sections, file_size)?;
 
-    Ok(PeParsedFile {
-        image,
-        sections,
-        data_directories,
-        imports,
-        relocations,
-    })
+    Ok((image, sections, data_directories))
 }
 
-fn usize_from_u32<E>(value: u32) -> Result<usize, PeParseError<E>> {
-    value.try_into().map_err(|_| PeParseError::Overflow)
+/// Verify section invariants that the loader's mapping arithmetic depends on.
+///
+/// The mapping pass page-aligns each section's protect range; if a hostile PE
+/// places a section at a sub-`section_alignment` RVA, has sections overlap each
+/// other, or has a section overlap the headers, the page-aligned protect range
+/// of a later section could downgrade earlier protections (e.g. RW `.data`
+/// silently making RX `.text` writable). Reject all such images at parse time.
+fn validate_sections<E>(
+    image: &PeImageInfo,
+    sections: &[pe::ImageSectionHeader],
+    file_size: usize,
+) -> Result<(), PeParseError<E>> {
+    let headers_end =
+        checked_next_multiple_of!(image.size_of_headers, PAGE_SIZE, PeParseError::Overflow)?;
+    let mut prev_end_rva: usize = 0;
+    for section in sections {
+        let section_rva = section.virtual_address.get(LE) as usize;
+        let virtual_size = section.virtual_size.get(LE) as usize;
+        let raw_size = section.size_of_raw_data.get(LE) as usize;
+        let raw_offset = section.pointer_to_raw_data.get(LE) as usize;
+
+        if !section_rva.is_multiple_of(image.section_alignment) {
+            return Err(PeParseError::UnsupportedImage);
+        }
+        if section_rva < headers_end && (virtual_size != 0 || raw_size != 0) {
+            return Err(PeParseError::UnsupportedImage);
+        }
+        if section_rva < prev_end_rva {
+            return Err(PeParseError::UnsupportedImage);
+        }
+        let mapped_size = checked_next_multiple_of!(
+            cmp::max(virtual_size, raw_size),
+            PAGE_SIZE,
+            PeParseError::Overflow
+        )?;
+        let section_end_rva = checked_add_overflow!(section_rva, mapped_size)?;
+        if section_end_rva > image.size_of_image {
+            return Err(PeParseError::UnsupportedImage);
+        }
+
+        if raw_size != 0 {
+            let raw_end = checked_add_overflow!(raw_offset, raw_size)?;
+            if raw_end > file_size {
+                return Err(PeParseError::UnsupportedImage);
+            }
+        }
+
+        prev_end_rva = section_end_rva;
+    }
+    Ok(())
 }
 
 fn usize_from_u64<E>(value: u64) -> Result<usize, PeParseError<E>> {
     value.try_into().map_err(|_| PeParseError::Overflow)
 }
 
-fn page_align_down(address: usize) -> usize {
+/// Round `address` down to the nearest [`PAGE_SIZE`] multiple.
+pub fn page_align_down(address: usize) -> usize {
     address & !(PAGE_SIZE - 1)
-}
-
-fn page_align_up(len: usize) -> Option<usize> {
-    len.checked_add(PAGE_SIZE - 1).map(page_align_down)
 }
 
 /// Trait for reading PE binary data at specific offsets.
 pub trait ReadAt {
-    /// The error type for read operations.
     type Error;
 
-    /// Read data at the specified offset into the provided buffer.
+    /// Read `buf.len()` bytes at `offset`. Short reads are not permitted.
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error>;
 
-    /// Get the length of the PE file.
     fn size(&mut self) -> Result<u64, Self::Error>;
 }
 
 /// Trait for reserving, mapping, and protecting PE image memory.
 pub trait MapMemory {
-    /// The error type for mapping operations.
     type Error;
 
     /// Reserve a region of memory for the image, preferably at `preferred_base`.
@@ -493,21 +604,17 @@ pub trait MapMemory {
         prot: &Protection,
     ) -> Result<(), Self::Error>;
 
-    /// Change protections of a memory region.
     fn protect(&mut self, address: usize, len: usize, prot: &Protection)
     -> Result<(), Self::Error>;
 }
 
 /// Trait for reading and writing memory that has been mapped via [`MapMemory`].
 pub trait AccessMemory {
-    /// Read from memory.
     fn read(&mut self, address: usize, buf: &mut [u8]) -> Result<(), Fault>;
 
-    /// Write to memory.
     fn write(&mut self, address: usize, data: &[u8]) -> Result<(), Fault>;
 }
 
-/// An error indicating a memory access fault.
 #[derive(Debug, Error)]
 #[error("memory access fault")]
 pub struct Fault;
@@ -515,15 +622,26 @@ pub struct Fault;
 /// Memory protection flags.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Protection {
-    /// Read permission.
     pub read: bool,
-    /// Write permission.
     pub write: bool,
-    /// Execute permission.
     pub execute: bool,
 }
 
 impl Protection {
+    /// Read-write, no-execute.
+    pub(crate) const RW: Self = Self {
+        read: true,
+        write: true,
+        execute: false,
+    };
+
+    /// Read-only.
+    pub(crate) const R: Self = Self {
+        read: true,
+        write: false,
+        execute: false,
+    };
+
     fn from_section_characteristics(characteristics: u32) -> Self {
         Self {
             read: characteristics & pe::IMAGE_SCN_MEM_READ != 0,
@@ -531,57 +649,4 @@ impl Protection {
             execute: characteristics & pe::IMAGE_SCN_MEM_EXECUTE != 0,
         }
     }
-}
-
-fn parse_imports(pe: &PeFile64<'_>) -> Result<Vec<PeImport>, object::read::Error> {
-    let Some(import_table) = pe.import_table()? else {
-        return Ok(Vec::new());
-    };
-
-    let mut imports = Vec::new();
-    let mut descriptors = import_table.descriptors()?;
-    while let Some(descriptor) = descriptors.next()? {
-        let library = import_table.name(descriptor.name.get(LE))?.to_vec();
-        let lookup_table_rva = match descriptor.original_first_thunk.get(LE) {
-            0 => descriptor.first_thunk.get(LE),
-            rva => rva,
-        };
-        let iat_rva = descriptor.first_thunk.get(LE);
-        let mut thunks = import_table.thunks(lookup_table_rva)?;
-        let mut index = 0u32;
-        while let Some(thunk) = thunks.next::<ImageNtHeaders64>()? {
-            let target = match import_table.import::<ImageNtHeaders64>(thunk)? {
-                object::read::pe::Import::Ordinal(ordinal) => PeImportTarget::Ordinal(ordinal),
-                object::read::pe::Import::Name(hint, name) => PeImportTarget::Name {
-                    hint,
-                    name: name.to_vec(),
-                },
-            };
-            imports.push(PeImport {
-                library: library.clone(),
-                lookup_rva: lookup_table_rva + index * 8,
-                iat_rva: iat_rva + index * 8,
-                target,
-            });
-            index += 1;
-        }
-    }
-
-    Ok(imports)
-}
-
-fn parse_relocations(pe: &PeFile64<'_>) -> Result<Vec<Relocation>, object::read::Error> {
-    let Some(mut blocks) = pe
-        .data_directories()
-        .relocation_blocks(pe.data(), &pe.section_table())?
-    else {
-        return Ok(Vec::new());
-    };
-
-    let mut relocations = Vec::new();
-    while let Some(block) = blocks.next()? {
-        relocations.extend(block);
-    }
-
-    Ok(relocations)
 }
