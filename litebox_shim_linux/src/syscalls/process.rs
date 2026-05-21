@@ -6803,27 +6803,41 @@ impl<FS: ShimFS> Task<FS> {
                 subsystem_class
             };
 
-            // Accept stdio, pipes, terminal filesystem fds, and connected Unix sockets on stdio slots.
+            // Decide which fd classes are migratable across delayed-fork
+            // commit. Each variant of `FdClass` MUST be explicitly handled
+            // — Rust enforces this via the exhaustive `match` (no `_` arm).
+            // Adding a new `FdClass` variant will fail to compile here,
+            // forcing the author to make an explicit accept/reject decision.
+            //
+            // Accepting a class means: the snapshot mechanism can serialize
+            // the fd and the restore path on the new worker can reconstruct
+            // an equivalent fd. Reject means the parent will keep blocking
+            // on VforkDone until the child execs or exits — surface this
+            // via `ForkRejectReason::UnsupportedFdClass`.
             match class {
+                // Accepted:
                 FdClass::StdioFd | FdClass::Pipe => {}
-                FdClass::FilesystemFd if terminal_meta.is_some() => {}
-                // Non-terminal filesystem fds (including /dev/null on stdio
-                // after posix_spawn-style setup) are restored by reopening
-                // their captured path, with /dev/null as a safe fallback.
+                // Filesystem fds: reopen by captured path during restore;
+                // terminal-meta variant is reattached via the same path.
                 FdClass::FilesystemFd => {}
                 // Unconnected Unix sockets can be recreated during restore;
                 // connected/socketpair fds are recreated first, then replaced
                 // by fork-bridge host fds when needed.
                 FdClass::UnixSocket => {}
-                // Phase B-Step12 candidate fix: accept EventFds across
-                // fork-snapshot. For local eventfds the restore path
-                // creates a fresh one (state not preserved — matches
-                // Linux fork semantics: child has independent counter);
-                // for BrokerBacked the restore path reattaches to the
-                // same broker handle (state IS preserved because the
-                // broker owns it).
+                // Phase B-Step12: local eventfds get a fresh counter (matches
+                // Linux fork semantics); broker-backed reattaches the same
+                // broker handle.
                 FdClass::EventFd | FdClass::Signalfd => {}
-                _ => {
+                // Rejected (fd class not yet migratable across worker hosts).
+                // Each variant called out explicitly so adding a new
+                // FdClass forces the developer to decide accept vs reject.
+                FdClass::NetworkSocket
+                | FdClass::Epoll
+                | FdClass::TimerFd
+                | FdClass::PidFd
+                | FdClass::AnonSpecialFd
+                | FdClass::Inotify
+                | FdClass::Other => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
             }
