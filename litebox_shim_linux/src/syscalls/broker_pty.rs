@@ -4,7 +4,7 @@
 //! Broker-backed pseudo-terminal file descriptors.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use litebox::{
     event::{Events, IOPollable, observer::Observer, polling::Pollee, wait::WaitContext},
@@ -42,6 +42,15 @@ pub(crate) struct BrokerPtyFd<P: RawSyncPrimitivesProvider + litebox::platform::
     slave_anchor_handle: Option<u64>,
     status: AtomicU32,
     pollee: Arc<Pollee<P>>,
+    /// Stage B invariant: per-slot balance. Starts at 1 (the slot the
+    /// caller of `new` is about to install into). `on_dup` increments
+    /// (each new fd-table slot sharing this Arc), `on_close` decrements.
+    /// Going negative indicates an over-release: more `on_close` calls
+    /// than slots, which is the shape of the IO-Safety abort we hit when
+    /// Stage B deleted the legacy relay. The first negative observation
+    /// panics with all the context (pty_id, handle, role) that a tokio
+    /// IO-Safety abort lacks.
+    slot_count: AtomicI32,
 }
 
 impl<P> BrokerPtyFd<P>
@@ -71,6 +80,7 @@ where
             slave_anchor_handle,
             status: AtomicU32::new((access | (flags & OFlags::STATUS_FLAGS_MASK)).bits()),
             pollee: Arc::new(Pollee::new()),
+            slot_count: AtomicI32::new(1),
         }
     }
 
@@ -259,6 +269,7 @@ impl IOPollable for BrokerPtyFd<Platform> {
 
 impl FdEnabledSubsystemEntry for BrokerPtyFd<Platform> {
     fn on_dup(&self) {
+        self.slot_count.fetch_add(1, Ordering::SeqCst);
         let _ = self.provider.dup_handle(self.handle());
         if let Some(handle) = self.slave_anchor_handle {
             let _ = self.provider.dup_handle(handle);
@@ -266,6 +277,21 @@ impl FdEnabledSubsystemEntry for BrokerPtyFd<Platform> {
     }
 
     fn on_close(&self) {
+        // Stage B invariant: catch over-release at the source rather than
+        // letting the downstream broker double-free corrupt host-fd
+        // accounting (which surfaces as a tokio IO-Safety abort on a
+        // recycled fd with no useful backtrace).
+        let prev = self.slot_count.fetch_sub(1, Ordering::SeqCst);
+        assert!(
+            prev > 0,
+            "BrokerPtyFd over-release: on_close called with slot_count={} \
+             (pty_id={}, is_master={}, handle={}, anchor={:?})",
+            prev,
+            self.pty_id,
+            self.is_master,
+            self.common.handle(),
+            self.slave_anchor_handle,
+        );
         self.provider.release(self.handle());
         if let Some(handle) = self.slave_anchor_handle {
             self.provider.release(handle);
