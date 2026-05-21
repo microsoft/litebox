@@ -232,6 +232,12 @@ pub struct CliArgs {
     #[arg(long = "broker-fd-bridge", hide = true)]
     pub broker_fd_bridge: Vec<String>,
 
+    /// Internal: the controlling PTY pty_id, if the parent had one at
+    /// exec time. Forwarded by the parent shim's exec path so the new
+    /// worker's `open("/dev/tty")` resolves to the same broker PTY pair.
+    #[arg(long = "controlling-pty", hide = true)]
+    pub controlling_pty: Option<u32>,
+
     /// Internal: inherited socketpair fd for the stream multiplexer.
     #[arg(long = "mux-fd", hide = true, requires = "fork_restore")]
     pub mux_fd: Option<i32>,
@@ -277,6 +283,7 @@ type BrokerFdBridgeParsed = (
     Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
     Option<litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint>,
     Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
+    Option<u32>,
 );
 
 /// Parses a `--broker-fd-bridge` spec string of the form
@@ -289,7 +296,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
     use litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind;
     let parts: Vec<&str> = spec.split(':').collect();
-    if !(parts.len() == 3 || parts.len() == 4) {
+    if !(parts.len() == 3 || parts.len() == 4 || parts.len() == 5) {
         anyhow::bail!("broker-fd-bridge: bad spec {spec:?}");
     }
     let guest_fd: usize = parts[0]
@@ -350,7 +357,23 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         }
         (_, None) => (None, None, None),
     };
-    Ok((guest_fd, kind, handle_id, direction, endpoint, pty_role))
+    let pty_id = if kind == BrokerHandleKind::Pty {
+        match parts.get(4) {
+            Some(raw) => Some(
+                raw.parse()
+                    .map_err(|e| anyhow!("broker-fd-bridge: bad pty id {raw:?}: {e}"))?,
+            ),
+            None => None,
+        }
+    } else {
+        if parts.len() == 5 {
+            anyhow::bail!("broker-fd-bridge: pty id is only valid for pty specs");
+        }
+        None
+    };
+    Ok((
+        guest_fd, kind, handle_id, direction, endpoint, pty_role, pty_id,
+    ))
 }
 
 fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
@@ -1091,7 +1114,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role) =
+            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
                 parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
@@ -1102,8 +1125,13 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                     pipe_direction,
                     socketpair_endpoint,
                     pty_role,
+                    pty_id,
                 )
                 .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+        }
+
+        if let Some(pty_id) = cli_args.controlling_pty {
+            program.entrypoints.set_controlling_pty(pty_id);
         }
 
         run_program(program, shutdown, net_worker, worker_result_fd, None);
@@ -1195,7 +1223,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // extended in Phase C.3 to handle pipe).
     let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
     for spec in &cli_args.broker_fd_bridge {
-        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role) =
+        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
             parse_broker_fd_bridge_spec(spec)?;
         program
             .entrypoints
@@ -1206,8 +1234,13 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                 pipe_direction,
                 socketpair_endpoint,
                 pty_role,
+                pty_id,
             )
             .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+    }
+
+    if let Some(pty_id) = cli_args.controlling_pty {
+        program.entrypoints.set_controlling_pty(pty_id);
     }
 
     run_program(program, shutdown, net_worker, worker_result_fd, None);
@@ -2498,7 +2531,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(guest_task);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role) =
+            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
                 parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
@@ -2509,8 +2542,16 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
                     pipe_direction,
                     socketpair_endpoint,
                     pty_role,
+                    pty_id,
                 )
                 .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+        }
+
+        // Stage B: restore parent's controlling PTY so /dev/tty resolves
+        // in the new worker. Without this, cross-binary-type exec into a
+        // process that holds a slave with TIOCSCTTY set loses ctty state.
+        if let Some(pty_id) = cli_args.controlling_pty {
+            program.entrypoints.set_controlling_pty(pty_id);
         }
 
         run_program(
@@ -2533,6 +2574,8 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     worker_result_fd: Option<i32>,
     mux_handle: Option<std::thread::JoinHandle<()>>,
 ) -> ! {
+    let local_process_count = program.entrypoints.local_process_count_fn();
+
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
 
@@ -2576,6 +2619,23 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
         net_worker.join().unwrap();
     }
     let wait_status = program.process.wait();
+    // Stage B: keep this worker host alive while forked guest processes
+    // are still running locally. Without this, std::process::exit at the
+    // end of run_program tears down the host process — taking any
+    // forked-child task threads with it. The
+    // PTY.parent_exit_then_child_io.dpg1 test exercises exactly this
+    // pattern (shim-aware parent _exit(0)s while a forked child
+    // continues to write to a PTY).
+    {
+        let poll_interval = std::time::Duration::from_millis(50);
+        loop {
+            let count = local_process_count();
+            if count == 0 {
+                break;
+            }
+            std::thread::sleep(poll_interval);
+        }
+    }
     #[cfg(feature = "trace_syscalls")]
     eprintln!(
         "[WORKER] child exited with wait_status={}{}",

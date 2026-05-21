@@ -1304,6 +1304,7 @@ impl LinuxUserland {
         direct_pipe_io: bool,
         extra_fds: &[(usize, i32)],
         broker_eventfd_specs: &[alloc::string::String],
+        controlling_pty: Option<u32>,
     ) -> Result<WorkerExecSpawnResult, i32>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -1463,6 +1464,11 @@ impl LinuxUserland {
         for spec in broker_eventfd_specs {
             spawn_argv.push(CString::new("--broker-fd-bridge").unwrap());
             spawn_argv.push(CString::new(spec.as_bytes()).map_err(|_| -1_i32)?);
+        }
+
+        if let Some(pty_id) = controlling_pty {
+            spawn_argv.push(CString::new("--controlling-pty").unwrap());
+            spawn_argv.push(CString::new(pty_id.to_string()).map_err(|_| -1_i32)?);
         }
 
         spawn_argv.push(CString::new("--").unwrap());

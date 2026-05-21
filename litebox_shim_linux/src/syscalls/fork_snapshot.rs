@@ -224,13 +224,6 @@ pub struct FdMetadataSnapshot {
     pub is_host_tty_alias: bool,
     /// Whether this fd is a host PTY device.
     pub is_host_pty_device: bool,
-    /// Whether this fd is a sandbox PTY slave (userspace-emulated, major >= 136).
-    /// These fds need special bridging during delayed fork — the mux relays
-    /// data between the parent's PtyPair ring buffers and the child's OS pipes.
-    pub is_sandbox_pty_slave: bool,
-    /// The PTY pair index for sandbox PTY slave fds (index into PtyManager).
-    /// Only meaningful when `is_sandbox_pty_slave` is true.
-    pub sandbox_pty_index: Option<u32>,
     /// Anonymous inode number for special fds.
     pub anon_ino: Option<u64>,
     /// Directory stream continuation offset for `getdents64`.
@@ -286,6 +279,10 @@ pub struct BrokerHandleSnapshot {
     /// `BrokerSocketPairEndpoint` capability to reconstruct.
     pub socketpair_endpoint:
         Option<litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint>,
+    /// For `BrokerHandleKind::Pty`, whether this handle is the master or slave side.
+    pub pty_role: Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
+    /// For `BrokerHandleKind::Pty`, the PTY number used to reopen slave handles.
+    pub pty_id: Option<u32>,
 }
 
 /// Kind tag for [`BrokerHandleSnapshot`]. Mirrors a subset of
@@ -1153,8 +1150,6 @@ impl FdMetadataSnapshot {
         w.write_option_i32(self.host_stdio_source_fd);
         w.write_bool(self.is_host_tty_alias);
         w.write_bool(self.is_host_pty_device);
-        w.write_bool(self.is_sandbox_pty_slave);
-        w.write_option_u64(self.sandbox_pty_index.map(u64::from));
         w.write_option_u64(self.anon_ino);
         w.write_option_u64(self.diroff);
         match &self.broker_handle {
@@ -1179,6 +1174,13 @@ impl FdMetadataSnapshot {
                     Some(litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::B) => 2,
                 };
                 w.write_u8(endpoint_byte);
+                let pty_role_byte: u8 = match bh.pty_role {
+                    None => 0,
+                    Some(litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master) => 1,
+                    Some(litebox_common_linux::broker_pty_provider::BrokerPtyRole::Slave) => 2,
+                };
+                w.write_u8(pty_role_byte);
+                w.write_option_u64(bh.pty_id.map(u64::from));
             }
             None => {
                 w.write_u8(0);
@@ -1204,8 +1206,6 @@ impl FdMetadataSnapshot {
         let host_stdio_source_fd = r.read_option_i32()?;
         let is_host_tty_alias = r.read_bool()?;
         let is_host_pty_device = r.read_bool()?;
-        let is_sandbox_pty_slave = r.read_bool()?;
-        let sandbox_pty_index = r.read_option_u64()?.map(|v| v as u32);
         let anon_ino = r.read_option_u64()?;
         let diroff = r.read_option_u64()?;
         let broker_handle = match r.read_u8()? {
@@ -1240,11 +1240,26 @@ impl FdMetadataSnapshot {
                         ));
                     }
                 };
+                let pty_role_byte = r.read_u8()?;
+                let pty_role = match pty_role_byte {
+                    0 => None,
+                    1 => Some(litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master),
+                    2 => Some(litebox_common_linux::broker_pty_provider::BrokerPtyRole::Slave),
+                    other => {
+                        return Err(SnapshotDeserializeError::InvalidEnum(
+                            "BrokerHandleSnapshot::pty_role",
+                            other,
+                        ));
+                    }
+                };
+                let pty_id = r.read_option_u64()?.map(|id| id as u32);
                 Some(BrokerHandleSnapshot {
                     kind,
                     handle_id,
                     pipe_direction,
                     socketpair_endpoint,
+                    pty_role,
+                    pty_id,
                 })
             }
             other => {
@@ -1287,8 +1302,6 @@ impl FdMetadataSnapshot {
             host_stdio_source_fd,
             is_host_tty_alias,
             is_host_pty_device,
-            is_sandbox_pty_slave,
-            sandbox_pty_index,
             anon_ino,
             diroff,
             broker_handle,
@@ -1619,8 +1632,6 @@ mod tests {
                             host_stdio_source_fd: Some(0),
                             is_host_tty_alias: false,
                             is_host_pty_device: false,
-                            is_sandbox_pty_slave: false,
-                            sandbox_pty_index: None,
                             anon_ino: None,
                             diroff: None,
                             broker_handle: None,
@@ -1637,8 +1648,6 @@ mod tests {
                             host_stdio_source_fd: Some(1),
                             is_host_tty_alias: false,
                             is_host_pty_device: false,
-                            is_sandbox_pty_slave: false,
-                            sandbox_pty_index: None,
                             anon_ino: None,
                             diroff: None,
                             broker_handle: None,
@@ -1655,8 +1664,6 @@ mod tests {
                             host_stdio_source_fd: None,
                             is_host_tty_alias: false,
                             is_host_pty_device: false,
-                            is_sandbox_pty_slave: false,
-                            sandbox_pty_index: None,
                             anon_ino: Some(12345),
                             diroff: Some(42),
                             broker_handle: None,
@@ -1674,8 +1681,6 @@ mod tests {
                             host_stdio_source_fd: None,
                             is_host_tty_alias: true,
                             is_host_pty_device: true,
-                            is_sandbox_pty_slave: false,
-                            sandbox_pty_index: None,
                             anon_ino: None,
                             diroff: None,
                             broker_handle: None,
@@ -2142,13 +2147,17 @@ mod tests {
 
     #[test]
     fn fd_metadata_snapshot_broker_handle_round_trip_some_pidfd() {
-        let mut meta = FdMetadataSnapshot::default();
-        meta.broker_handle = Some(BrokerHandleSnapshot {
-            kind: BrokerHandleKind::Pidfd,
-            handle_id: 0x1234_5678_9ABC_DEF0,
-            pipe_direction: None,
-            socketpair_endpoint: None,
-        });
+        let meta = FdMetadataSnapshot {
+            broker_handle: Some(BrokerHandleSnapshot {
+                kind: BrokerHandleKind::Pidfd,
+                handle_id: 0x1234_5678_9ABC_DEF0,
+                pipe_direction: None,
+                socketpair_endpoint: None,
+                pty_role: None,
+                pty_id: None,
+            }),
+            ..Default::default()
+        };
         let mut w = SnapshotWriter::new();
         meta.write(&mut w);
         let bytes = w.into_bytes();
@@ -2201,8 +2210,7 @@ mod tests {
             let dirs = alloc::vec![None, Some(BrokerPipeEnd::Read), Some(BrokerPipeEnd::Write)];
             for d in &dirs {
                 match d {
-                    None => {}
-                    Some(BrokerPipeEnd::Read) | Some(BrokerPipeEnd::Write) => {}
+                    None | Some(BrokerPipeEnd::Read) | Some(BrokerPipeEnd::Write) => {}
                 }
             }
             dirs
@@ -2215,8 +2223,9 @@ mod tests {
             ];
             for e in &eps {
                 match e {
-                    None => {}
-                    Some(BrokerSocketPairEndpoint::A) | Some(BrokerSocketPairEndpoint::B) => {}
+                    None
+                    | Some(BrokerSocketPairEndpoint::A)
+                    | Some(BrokerSocketPairEndpoint::B) => {}
                 }
             }
             eps
@@ -2244,9 +2253,13 @@ mod tests {
                             handle_id: id,
                             pipe_direction: *dir,
                             socketpair_endpoint: *endpoint,
+                            pty_role: None,
+                            pty_id: None,
                         };
-                        let mut meta = FdMetadataSnapshot::default();
-                        meta.broker_handle = Some(original);
+                        let meta = FdMetadataSnapshot {
+                            broker_handle: Some(original),
+                            ..Default::default()
+                        };
                         let mut w = SnapshotWriter::new();
                         meta.write(&mut w);
                         let bytes = w.into_bytes();
@@ -2282,13 +2295,17 @@ mod tests {
             BrokerHandleKind::Pty,
             BrokerHandleKind::UnixSocket,
         ] {
-            let mut meta = FdMetadataSnapshot::default();
-            meta.broker_handle = Some(BrokerHandleSnapshot {
-                kind,
-                handle_id: 42,
-                pipe_direction: None,
-                socketpair_endpoint: None,
-            });
+            let meta = FdMetadataSnapshot {
+                broker_handle: Some(BrokerHandleSnapshot {
+                    kind,
+                    handle_id: 42,
+                    pipe_direction: None,
+                    socketpair_endpoint: None,
+                    pty_role: None,
+                    pty_id: None,
+                }),
+                ..Default::default()
+            };
             let mut w = SnapshotWriter::new();
             meta.write(&mut w);
             let bytes = w.into_bytes();

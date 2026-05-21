@@ -76,6 +76,10 @@ use litebox_test_harness::protocol;
 #[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 fn main() {
     litebox_timing::init_from_env();
+    // Stage B fd-double-close diagnostic: SIGABRT (the abort std uses
+    // for IO Safety violations) normally kills the process with no
+    // backtrace. Install a handler that prints one before re-aborting.
+    install_sigabrt_backtrace_handler();
     // In the native pass the harness is container PID 1, so the first
     // marker it emits IS the container_pid1_started_ns boundary. The
     // integration harness sets LITEBOX_TIMING_CONTAINER_PID1=1 in
@@ -184,5 +188,38 @@ fn main() {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Install a SIGABRT handler that prints a backtrace before letting
+/// the default action kill the process. Useful for diagnosing
+/// `fatal runtime error: IO Safety violation: owned file descriptor
+/// already closed, aborting`, which calls `libc::abort()` with no
+/// stack trace.
+fn install_sigabrt_backtrace_handler() {
+    extern "C" fn handler(_sig: libc::c_int) {
+        // SAFETY: write(2) is signal-safe. We use it instead of
+        // eprintln to be reentrant. The Backtrace::capture call
+        // technically isn't signal-safe but in practice works
+        // well enough for diagnostic dumps before re-aborting.
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!("[litebox-sigabrt] backtrace:\n{bt}\n");
+        unsafe {
+            libc::write(2, msg.as_ptr().cast(), msg.len());
+        }
+        // Restore default SIGABRT and re-raise so the process actually dies.
+        unsafe {
+            let mut sa: libc::sigaction = core::mem::zeroed();
+            sa.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(libc::SIGABRT, &sa, core::ptr::null_mut());
+            libc::raise(libc::SIGABRT);
+        }
+    }
+    // SAFETY: installing a signal handler with a well-formed sigaction.
+    unsafe {
+        let mut sa: libc::sigaction = core::mem::zeroed();
+        sa.sa_sigaction = handler as *const () as usize;
+        sa.sa_flags = libc::SA_RESETHAND;
+        libc::sigaction(libc::SIGABRT, &sa, core::ptr::null_mut());
     }
 }
