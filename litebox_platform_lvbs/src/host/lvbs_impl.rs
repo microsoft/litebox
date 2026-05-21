@@ -232,7 +232,7 @@ fn rdrand_seed() -> Option<CrngSeed> {
         if !ok {
             return None;
         }
-        chunk.copy_from_slice(&word.to_ne_bytes()[..chunk.len()]);
+        chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]);
     }
     Some(seed)
 }
@@ -307,5 +307,33 @@ impl HostInterface for HostLvbsInterface {
 
     fn switch(_result: u64) -> ! {
         unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    const TEST_PRK: [u8; PRK_LEN] = [0x42; PRK_LEN];
+    const INIT_SEED: CrngSeed = [0xA5; 32];
+    const RESEED_SEED: CrngSeed = [0x5A; 32];
+
+    #[test]
+    fn crosses_reseed_boundary_twice_with_accurate_budget() {
+        let mut crng = LvbsCrng::new(&TEST_PRK, INIT_SEED);
+        let mut buf = vec![0u8; CRNG_RESEED_INTERVAL_BYTES * 2 + 7];
+        crng.fill_bytes(&mut buf, || Some(RESEED_SEED));
+        assert_eq!(crng.reseed_counter, 2);
+        assert_eq!(crng.bytes_until_reseed, CRNG_RESEED_INTERVAL_BYTES - 7);
+    }
+
+    #[test]
+    fn rdrand_failure_engages_backoff_without_reseed() {
+        let mut crng = LvbsCrng::new(&TEST_PRK, INIT_SEED);
+        let mut buf = vec![0u8; CRNG_RESEED_INTERVAL_BYTES];
+        crng.fill_bytes(&mut buf, || None);
+        assert_eq!(crng.reseed_counter, 0);
+        assert_eq!(crng.bytes_until_reseed, CRNG_RESEED_BACKOFF_BYTES);
     }
 }
