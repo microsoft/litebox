@@ -20,7 +20,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
 use hashbrown::HashMap;
 use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer, utils::TruncateExt};
-use litebox_common_linux::vmap::{PhysPageAddr, PhysPointerError};
+use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,
     OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeSecureWorldCapabilities,
@@ -237,7 +237,7 @@ pub fn handle_optee_smc_args(
                 + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.truncate());
 
             let mut blob = alloc::vec![0u8; copy_size];
-            read_data_from_shm_with_offset(&shm_info, offset, &mut blob)?;
+            shm_info.read_at(offset, &mut blob)?;
             let (msg_args, rpc_args) = parse_optee_msg_args(&blob, true)?;
 
             // Compute the physical address of `OpteeMsgArgs`
@@ -514,7 +514,7 @@ fn build_memref_input(
     data_size: usize,
 ) -> Result<UteeParamOwned, OpteeSmcReturnCode> {
     let mut data = alloc::vec![0u8; data_size];
-    read_data_from_shm(shm_info, &mut data)?;
+    shm_info.read_at(0, &mut data)?;
     Ok(UteeParamOwned::MemrefInput { data: data.into() })
 }
 
@@ -524,7 +524,7 @@ fn build_memref_inout(
     buffer_size: usize,
 ) -> Result<UteeParamOwned, OpteeSmcReturnCode> {
     let mut buffer = alloc::vec![0u8; buffer_size];
-    read_data_from_shm(shm_info, &mut buffer)?;
+    shm_info.read_at(0, &mut buffer)?;
     Ok(UteeParamOwned::MemrefInout {
         data: buffer.into(),
         buffer_size,
@@ -604,7 +604,7 @@ pub fn update_optee_msg_args(
                     if slice.is_empty() {
                         continue;
                     }
-                    write_data_to_shm(out_shm_info, slice.as_ref())?;
+                    out_shm_info.write(slice.as_ref())?;
                 }
             }
             _ => {}
@@ -671,24 +671,38 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
     fn len(&self) -> usize {
         self.len
     }
-}
 
-/// Conversion from `ShmInfo` to `NormalWorldConstPtr` and `NormalWorldMutPtr`.
-///
-/// OP-TEE shared memory regions are untyped, so we use `u8` as the base type.
-impl<const ALIGN: usize> TryFrom<ShmInfo<ALIGN>> for NormalWorldConstPtr<u8, ALIGN> {
-    type Error = PhysPointerError;
-
-    fn try_from(shm_info: ShmInfo<ALIGN>) -> Result<Self, Self::Error> {
-        NormalWorldConstPtr::new(&shm_info.page_addrs, shm_info.page_offset)
+    /// Read into `buffer` from the normal-world shared memory pages referenced by `self`,
+    /// starting at byte `offset` within the view.
+    /// Returns `EBadAddr` if the requested range is not entirely within the view.
+    fn read_at(&self, offset: usize, buffer: &mut [u8]) -> Result<(), OpteeSmcReturnCode> {
+        if offset
+            .checked_add(buffer.len())
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(OpteeSmcReturnCode::EBadAddr);
+        }
+        let mut ptr = NormalWorldConstPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
+        // SAFETY: bounds validated above; copy lands in a buffer owned by LiteBox to avoid TOCTOU issues.
+        unsafe {
+            ptr.read_slice_at_offset(offset, buffer)?;
+        }
+        Ok(())
     }
-}
 
-impl<const ALIGN: usize> TryFrom<ShmInfo<ALIGN>> for NormalWorldMutPtr<u8, ALIGN> {
-    type Error = PhysPointerError;
-
-    fn try_from(shm_info: ShmInfo<ALIGN>) -> Result<Self, Self::Error> {
-        NormalWorldMutPtr::new(&shm_info.page_addrs, shm_info.page_offset)
+    /// Write `buffer` to the normal-world shared memory pages referenced by `self`,
+    /// starting at the beginning of the view.
+    /// Returns `EBadAddr` if `buffer` does not fit within the view.
+    fn write(&self, buffer: &[u8]) -> Result<(), OpteeSmcReturnCode> {
+        if buffer.len() > self.len {
+            return Err(OpteeSmcReturnCode::EBadAddr);
+        }
+        let mut ptr = NormalWorldMutPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
+        // SAFETY: bounds validated above; data comes from a buffer owned by LiteBox.
+        unsafe {
+            ptr.write_slice_at_offset(0, buffer)?;
+        }
+        Ok(())
     }
 }
 
@@ -734,7 +748,11 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
     /// `shm_ref_pages_data_phys_addr` to create a slice of the shared physical page addresses
     /// and registers the slice with `shm_ref` as its identifier. `page_offset` indicates
     /// the page offset of the first page (i.e., `pages_list[0]` of the first [`ShmRefPagesData`]).
-    /// `aligned_size` indicates the page-aligned size of the shared memory region to register.
+    /// `size` is the user-visible byte length of the shared memory view starting at `page_offset`;
+    /// this is the bound enforced on subsequent reads/writes via the registered [`ShmInfo`].
+    /// `aligned_size` indicates the page-aligned size of the shared memory region to register
+    /// (i.e., `page_align_up(page_offset + size)`) and determines how many physical pages are
+    /// walked from the [`ShmRefPagesData`] list.
     pub fn register_shm(
         &self,
         shm_ref_pages_data_phys_addr: u64,
@@ -820,12 +838,17 @@ fn get_shm_info_from_optee_msg_param_tmem(
     let aligned_addr = phys_addr - page_offset as u64;
 
     // Calculate number of pages needed
-    let num_pages = (page_offset + size).div_ceil(PAGE_SIZE);
+    let num_pages = page_offset
+        .checked_add(size)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?
+        .div_ceil(PAGE_SIZE);
 
     // Build page address list
     let mut page_addrs = Vec::with_capacity(num_pages);
     for i in 0..num_pages {
-        let page_addr = aligned_addr + (i * PAGE_SIZE) as u64;
+        let page_addr = aligned_addr
+            .checked_add((i * PAGE_SIZE) as u64)
+            .ok_or(OpteeSmcReturnCode::EBadAddr)?;
         page_addrs
             .push(PhysPageAddr::new(page_addr.truncate()).ok_or(OpteeSmcReturnCode::EBadAddr)?);
     }
@@ -869,49 +892,4 @@ fn get_shm_info_from_optee_msg_param_rmem(
         start % PAGE_SIZE,
         rmem.size.truncate(),
     )
-}
-
-/// Read data from the normal world shared memory pages whose physical addresses are given in
-/// `shm_info` into `buffer`. The size of `buffer` indicates the number of bytes to read.
-fn read_data_from_shm<const ALIGN: usize>(
-    shm_info: &ShmInfo<ALIGN>,
-    buffer: &mut [u8],
-) -> Result<(), OpteeSmcReturnCode> {
-    read_data_from_shm_with_offset(shm_info, 0, buffer)
-}
-
-fn read_data_from_shm_with_offset<const ALIGN: usize>(
-    shm_info: &ShmInfo<ALIGN>,
-    offset: usize,
-    buffer: &mut [u8],
-) -> Result<(), OpteeSmcReturnCode> {
-    if offset
-        .checked_add(buffer.len())
-        .is_none_or(|end| end > shm_info.len())
-    {
-        return Err(OpteeSmcReturnCode::EBadAddr);
-    }
-    let mut ptr: NormalWorldConstPtr<u8, ALIGN> = shm_info.clone().try_into()?;
-    // SAFETY: The data is copied into a buffer owned by LiteBox to avoid TOCTOU issues.
-    unsafe {
-        ptr.read_slice_at_offset(offset, buffer)?;
-    }
-    Ok(())
-}
-
-/// Write data in `buffer` to the normal world shared memory pages whose physical addresses are given
-/// in `shm_info`. The size of `buffer` indicates the number of bytes to write.
-fn write_data_to_shm<const ALIGN: usize>(
-    shm_info: &ShmInfo<ALIGN>,
-    buffer: &[u8],
-) -> Result<(), OpteeSmcReturnCode> {
-    if buffer.len() > shm_info.len() {
-        return Err(OpteeSmcReturnCode::EBadAddr);
-    }
-    let mut ptr: NormalWorldMutPtr<u8, ALIGN> = shm_info.clone().try_into()?;
-    // SAFETY: The data is written from a buffer owned by LiteBox.
-    unsafe {
-        ptr.write_slice_at_offset(0, buffer)?;
-    }
-    Ok(())
 }
