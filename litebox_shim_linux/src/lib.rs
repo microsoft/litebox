@@ -103,6 +103,16 @@ pub struct LinuxShimEntrypoints<FS: ShimFS> {
 }
 
 impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
+    /// Set the controlling PTY for the restored/exec'd task. Called by
+    /// the runner during worker-exec startup if the parent process's
+    /// `controlling_pty` was non-None at exec time, so that
+    /// `open("/dev/tty")` in the new worker resolves correctly. Without
+    /// this, the new ProcessState starts with `controlling_pty = None`
+    /// and `/dev/tty` resolution fails.
+    pub fn set_controlling_pty(&self, pty_id: u32) {
+        *self.task.process_state.borrow().controlling_pty.lock() = Some(pty_id);
+    }
+
     /// Install a host-backed pipe FD into the restored child's descriptor table.
     ///
     /// Called by the runner after `restore_process` to replace virtual pipe

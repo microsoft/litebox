@@ -9291,6 +9291,7 @@ impl<FS: ShimFS> Task<FS> {
                 use_direct_stdio,
                 &extra_fds,
                 &broker_eventfd_specs,
+                *self.process_state.borrow().controlling_pty.lock(),
             )
             .map_err(|_err| {
                 #[cfg(feature = "trace_syscalls")]

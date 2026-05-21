@@ -232,6 +232,12 @@ pub struct CliArgs {
     #[arg(long = "broker-fd-bridge", hide = true)]
     pub broker_fd_bridge: Vec<String>,
 
+    /// Internal: the controlling PTY pty_id, if the parent had one at
+    /// exec time. Forwarded by the parent shim's exec path so the new
+    /// worker's `open("/dev/tty")` resolves to the same broker PTY pair.
+    #[arg(long = "controlling-pty", hide = true)]
+    pub controlling_pty: Option<u32>,
+
     /// Internal: inherited socketpair fd for the stream multiplexer.
     #[arg(long = "mux-fd", hide = true, requires = "fork_restore")]
     pub mux_fd: Option<i32>,
@@ -1124,6 +1130,10 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                 .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
         }
 
+        if let Some(pty_id) = cli_args.controlling_pty {
+            program.entrypoints.set_controlling_pty(pty_id);
+        }
+
         run_program(program, shutdown, net_worker, worker_result_fd, None);
     }
 
@@ -1227,6 +1237,10 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                 pty_id,
             )
             .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+    }
+
+    if let Some(pty_id) = cli_args.controlling_pty {
+        program.entrypoints.set_controlling_pty(pty_id);
     }
 
     run_program(program, shutdown, net_worker, worker_result_fd, None);
@@ -2531,6 +2545,13 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
                     pty_id,
                 )
                 .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+        }
+
+        // Stage B: restore parent's controlling PTY so /dev/tty resolves
+        // in the new worker. Without this, cross-binary-type exec into a
+        // process that holds a slave with TIOCSCTTY set loses ctty state.
+        if let Some(pty_id) = cli_args.controlling_pty {
+            program.entrypoints.set_controlling_pty(pty_id);
         }
 
         run_program(
