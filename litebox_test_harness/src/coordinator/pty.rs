@@ -49,6 +49,22 @@ enum ScenarioKind {
     /// stdout bytes from a non-PIE binary reach the parent across
     /// `exec_on_remote_host`'s worker handoff.
     StdoutRoundtrip,
+    /// PTYR.stdout_post_sleep — child writes 5 lines, sleeps briefly,
+    /// writes 5 more lines, then exits (slave closes). Parent reads
+    /// the master and verifies all 10 lines arrive.
+    ///
+    /// This is the dropbear-under-litebox failure signature: the
+    /// post-sleep lines were lost because the broker PTY's slave→master
+    /// data-plane propagation has a race when the slave closes shortly
+    /// after writing. dropbear's session loop saw EAGAIN after the
+    /// sleep, concluded the channel was empty, sent exit-status, and
+    /// closed the SSH channel before the broker delivered the buffered
+    /// post-sleep bytes.
+    ///
+    /// Self-contained reproducer for the Phase H "copilot -p prints
+    /// nothing" symptom — no Copilot, no dropbear, no Docker stack
+    /// needed.
+    StdoutPostSleep,
     /// PTYR.isatty — child calls `isatty(0/1/2)` post-exec and prints
     /// `isatty: 0=Y 1=Y 2=Y`. Confirms all three stdio fds are TTYs in
     /// the new worker after a non-PIE execve.
@@ -131,6 +147,11 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "stdout_post_sleep",
+        kind: ScenarioKind::StdoutPostSleep,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "isatty",
         kind: ScenarioKind::Isatty,
         per_binary_type: true,
@@ -168,6 +189,8 @@ const LDISC_CANON_BASIC: HandlerToken<TargetArgs, PtyOut> =
 // PTYR.* tokens — regression coverage for non-PIE worker-handoff stdio.
 const PTYR_STDOUT_ROUNDTRIP: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.stdout_roundtrip");
+const PTYR_STDOUT_POST_SLEEP: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.stdout_post_sleep");
 const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
 const PARENT_EXIT_THEN_CHILD_IO: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.parent_exit_then_child_io");
@@ -356,6 +379,24 @@ async fn handle_ptyr_stdout_roundtrip(
     Ok(PtyOut { detail })
 }
 
+async fn handle_ptyr_stdout_post_sleep(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-stdout-post-sleep".into()], true)?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    // PTY OPOST: lone \n → \r\n. Child writes 10 lines L01..L10.
+    let mut expected = String::new();
+    for i in 1..=10 {
+        expected.push_str(&format!("L{i:02}\r\n"));
+    }
+    let detail = exact(&data, &expected)?;
+    Ok(PtyOut { detail })
+}
+
 async fn handle_ptyr_isatty(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -440,6 +481,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(LDISC_CANON_BASIC, handle_ldisc_canon_basic);
     register_handler!(EXEC_SHELL_SESSION, handle_exec_shell_session);
     register_handler!(PTYR_STDOUT_ROUNDTRIP, handle_ptyr_stdout_roundtrip);
+    register_handler!(PTYR_STDOUT_POST_SLEEP, handle_ptyr_stdout_post_sleep);
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
     register_handler!(PARENT_EXIT_THEN_CHILD_IO, handle_parent_exit_then_child_io);
 
@@ -454,6 +496,10 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!("pty-ldisc-signal", leaf_subcmd::subcmd_pty_ldisc_signal);
     crate::register_leaf_subcommand!("pty-ldisc-canon", leaf_subcmd::subcmd_pty_ldisc_canon);
     crate::register_leaf_subcommand!("pty-stdout-print", leaf_subcmd::subcmd_pty_stdout_print);
+    crate::register_leaf_subcommand!(
+        "pty-stdout-post-sleep",
+        leaf_subcmd::subcmd_pty_stdout_post_sleep
+    );
     crate::register_leaf_subcommand!("pty-isatty-check", leaf_subcmd::subcmd_pty_isatty_check);
     crate::register_leaf_subcommand!(
         "pty-parent-exit-driver",
@@ -590,6 +636,10 @@ async fn drive_target(
         }
         ScenarioKind::StdoutRoundtrip => {
             run.send_named_typed(handle, &PTYR_STDOUT_ROUNDTRIP, args)
+                .await?
+        }
+        ScenarioKind::StdoutPostSleep => {
+            run.send_named_typed(handle, &PTYR_STDOUT_POST_SLEEP, args)
                 .await?
         }
         ScenarioKind::Isatty => run.send_named_typed(handle, &PTYR_ISATTY, args).await?,
@@ -942,6 +992,38 @@ mod leaf_subcmd {
     pub(super) fn subcmd_pty_stdout_print(_args: &[String]) -> i32 {
         println!("PTYR_STDOUT_OK");
         let _ = std::io::stdout().flush();
+        0
+    }
+
+    /// PTYR.stdout_post_sleep: write 5 lines, sleep 200ms, write 5 more
+    /// lines, exit. Parent reads from master and expects all 10 lines.
+    ///
+    /// Self-contained reproducer for the broker-PTY slave→master
+    /// data-plane race observed under dropbear in Phase H: the child's
+    /// post-sleep writes are buffered by the broker but the master
+    /// reader's poll may have already concluded "no more data" by the
+    /// time bash/dropbear's session loop checks. The slave close on
+    /// child exit should make the buffered bytes immediately readable
+    /// from the master.
+    pub(super) fn subcmd_pty_stdout_post_sleep(_args: &[String]) -> i32 {
+        let mut stdout = std::io::stdout();
+        for i in 1..=5 {
+            if writeln!(stdout, "L{i:02}").is_err() {
+                return 1;
+            }
+        }
+        if stdout.flush().is_err() {
+            return 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for i in 6..=10 {
+            if writeln!(stdout, "L{i:02}").is_err() {
+                return 1;
+            }
+        }
+        if stdout.flush().is_err() {
+            return 1;
+        }
         0
     }
 
