@@ -4451,6 +4451,14 @@ impl<FS: ShimFS> Task<FS> {
             self.pid
         );
         if !reject.is_empty() {
+            // Stage B diag: log rejection reasons unconditionally so we can
+            // debug commit_delayed_fork failures.
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "[DELAYED-FORK-DIAG] pid={} REJECTED: {}\n",
+                self.pid,
+                reject,
+            ));
             #[cfg(feature = "trace_syscalls")]
             litebox::log_println!(
                 self.global.platform,
