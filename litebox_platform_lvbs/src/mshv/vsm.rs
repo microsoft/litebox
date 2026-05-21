@@ -1389,8 +1389,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
             return None;
         }
         let mut ptr =
-            Vtl0PhysConstPtr::<HekiPage, PAGE_SIZE>::with_usize(next_pa.as_u64().trunc())
-                .ok()?;
+            Vtl0PhysConstPtr::<HekiPage, PAGE_SIZE>::with_usize(cur_pa.as_u64().trunc()).ok()?;
         let heki_page = unsafe { ptr.read_at_offset(0) }.ok()?;
         if !heki_page.is_valid() {
             return None;
