@@ -896,6 +896,14 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
     if heki_patch_pa_1.is_null()
         || (heki_patch_pa_0.align_up(Size4KiB::SIZE) == heki_patch_pa_1.align_down(Size4KiB::SIZE))
     {
+        // Single contiguous span: either fits in one page (pa_1 null) or pa_1 is the
+        // adjacent next page. `HekiPatch::is_valid` enforces this; assert in debug builds.
+        debug_assert!(
+            !heki_patch_pa_1.is_null()
+                || heki_patch_pa_0.as_u64() + patch.len() as u64
+                    <= heki_patch_pa_0.align_down(Size4KiB::SIZE).as_u64() + Size4KiB::SIZE,
+            "patch crosses page boundary but pa_1 is null"
+        );
         let mut ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
             heki_patch_pa_0.as_u64().trunc(),
             patch.len(),
