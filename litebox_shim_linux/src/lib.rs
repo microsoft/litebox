@@ -703,6 +703,13 @@ impl<FS: ShimFS> Task<FS> {
                 addrlen,
             } => self.sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
             SyscallRequest::Recvmsg { sockfd, msg, flags } => self.sys_recvmsg(sockfd, msg, flags),
+            SyscallRequest::Recvmmsg {
+                sockfd,
+                msgvec,
+                vlen,
+                flags,
+                timeout,
+            } => self.sys_recvmmsg(sockfd, msgvec, vlen, flags, timeout),
             SyscallRequest::Shutdown { sockfd, how } => syscall!(sys_shutdown(sockfd, how)),
             SyscallRequest::Bind {
                 sockfd,

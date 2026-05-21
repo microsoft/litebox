@@ -1799,6 +1799,9 @@ bitflags::bitflags! {
         const TRUNC = 0x20;
         /// `MSG_WAITALL`: wait for the full amount of data
         const WAITALL = 0x100;
+        /// `MSG_WAITFORONE`: `recvmmsg` only — turn on `MSG_DONTWAIT` after the
+        /// first message has been received.
+        const WAITFORONE = 0x10000;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
@@ -1878,7 +1881,9 @@ impl<Platform: litebox::platform::RawPointerProvider> Copy for UserMsgHdr<Platfo
 #[derive(Debug, FromBytes, IntoBytes)]
 #[repr(C, packed)]
 pub struct UserMmsgHdr<Platform: litebox::platform::RawPointerProvider> {
+    /// the per-message `msghdr`
     pub msg_hdr: UserMsgHdr<Platform>,
+    /// bytes transmitted for this entry, written back by the kernel
     pub msg_len: u32,
     #[cfg(target_pointer_width = "64")]
     _pad: u32,
@@ -2139,6 +2144,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sockfd: i32,
         msg: Platform::RawMutPointer<UserMsgHdr<Platform>>,
         flags: ReceiveFlags,
+    },
+    Recvmmsg {
+        sockfd: i32,
+        msgvec: Platform::RawMutPointer<UserMmsgHdr<Platform>>,
+        vlen: u32,
+        flags: ReceiveFlags,
+        timeout: TimeParam<Platform>,
     },
     Shutdown {
         sockfd: i32,
@@ -2605,6 +2617,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::sendmmsg => sys_req!(Sendmmsg { sockfd, msgvec:*, vlen, flags }),
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::recvmsg => sys_req!(Recvmsg { sockfd, msg:*, flags }),
+            Sysno::recvmmsg => sys_req!(Recvmmsg {
+                sockfd,
+                msgvec:*,
+                vlen,
+                flags,
+                timeout: { =*> TimeParam::timespec_old }
+            }),
             Sysno::shutdown => sys_req!(Shutdown { sockfd, how }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),

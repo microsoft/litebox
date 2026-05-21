@@ -23,7 +23,7 @@ use litebox::{
         errors::AcceptError,
         socket_channel::{NetworkProxy, SocketState},
     },
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
@@ -1642,6 +1642,14 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
+        self.do_recvmsg(sockfd, msg_ptr, flags)
+    }
+    fn do_recvmsg(
+        &self,
+        sockfd: u32,
+        msg_ptr: MutPtr<litebox_common_linux::UserMsgHdr<Platform>>,
+        flags: ReceiveFlags,
+    ) -> Result<usize, Errno> {
         let msg = msg_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
 
         // Copy fields out of the packed struct to avoid unaligned references.
@@ -1747,6 +1755,104 @@ impl<FS: ShimFS> Task<FS> {
             .ok_or(Errno::EFAULT)?;
 
         Ok(total_received)
+    }
+
+    /// Handle syscall `recvmmsg`
+    pub(crate) fn sys_recvmmsg(
+        &self,
+        fd: i32,
+        msgvec: MutPtr<litebox_common_linux::UserMmsgHdr<Platform>>,
+        vlen: u32,
+        flags: ReceiveFlags,
+        timeout: litebox_common_linux::TimeParam<Platform>,
+    ) -> Result<usize, Errno> {
+        let supported_flags =
+            ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC | ReceiveFlags::WAITFORONE;
+        if flags.intersects(supported_flags.complement()) {
+            log_unsupported!("Unsupported recvmmsg flags: {:?}", flags);
+            return Err(Errno::EINVAL);
+        }
+
+        // Linux's `do_recvmmsg` validates the timespec before looking up the fd,
+        // so a bad timeout takes precedence over EBADF.
+        let timeout_duration = timeout.read()?;
+
+        let Ok(sockfd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let vlen = (vlen as usize).min(UIO_MAXIOV);
+
+        // Linux looks up the fd before touching vlen/msgvec, so a bogus fd
+        // takes priority over a bogus msgvec pointer or vlen == 0.
+        self.files.borrow().with_socket(
+            &self.global,
+            sockfd,
+            |_| Ok::<(), Errno>(()),
+            |_| Ok::<(), Errno>(()),
+        )?;
+
+        if vlen == 0 {
+            return Ok(0);
+        }
+
+        // A `None` deadline means either no user-supplied timeout or a saturating overflow
+        // — both are treated as "no deadline".
+        let deadline = timeout_duration.and_then(|d| self.global.platform.now().checked_add(d));
+
+        let stride = core::mem::size_of::<litebox_common_linux::UserMmsgHdr<Platform>>();
+        let msg_len_off =
+            core::mem::offset_of!(litebox_common_linux::UserMmsgHdr<Platform>, msg_len);
+
+        // WAITFORONE is mmsg-only; the inner recvmsg doesn't recognize it.
+        let waitforone = flags.contains(ReceiveFlags::WAITFORONE);
+        let mut iter_flags = flags.difference(ReceiveFlags::WAITFORONE);
+        let mut received: usize = 0;
+        let mut last_err: Option<Errno> = None;
+        for i in 0..vlen {
+            let base = msgvec.as_usize() + i * stride;
+            let inner_ptr = MutPtr::<litebox_common_linux::UserMsgHdr<Platform>>::from_usize(base);
+            let n = match self.do_recvmsg(sockfd, inner_ptr, iter_flags) {
+                Ok(n) => n,
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            };
+            let msg_len_ptr = MutPtr::<u32>::from_usize(base + msg_len_off);
+            if msg_len_ptr.write_at_offset(0, n.truncate()).is_none() {
+                last_err = Some(Errno::EFAULT);
+                break;
+            }
+            received += 1;
+            if waitforone {
+                iter_flags.insert(ReceiveFlags::DONTWAIT);
+            }
+
+            // Per the man page, the timeout is checked only after the receipt of each datagram.
+            if let Some(deadline) = deadline
+                && self.global.platform.now() >= deadline
+            {
+                break;
+            }
+        }
+
+        if received == 0 {
+            // The only way to exit the loop with received=0 is via an inner
+            // recvmsg error; EAGAIN is the conservative fallback for the
+            // structurally unreachable case.
+            return Err(last_err.unwrap_or(Errno::EAGAIN));
+        }
+
+        // Match Linux's `__sys_recvmmsg`: the remaining timespec is only
+        // written back when at least one datagram was received. A write
+        // EFAULT here overrides the success return, mirroring Linux.
+        let remaining = deadline
+            .and_then(|d| d.checked_duration_since(&self.global.platform.now()))
+            .unwrap_or(core::time::Duration::ZERO);
+        timeout.write(remaining)?;
+
+        Ok(received)
     }
 
     pub(crate) fn sys_setsockopt(
