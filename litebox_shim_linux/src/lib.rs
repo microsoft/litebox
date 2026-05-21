@@ -103,6 +103,25 @@ pub struct LinuxShimEntrypoints<FS: ShimFS> {
 }
 
 impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
+    /// Returns the number of guest processes still running on this worker
+    /// host. After the initial program exits, callers should keep the
+    /// worker alive while this is > 0 (forked children outliving the
+    /// initial parent).
+    pub fn local_running_process_count(&self) -> usize {
+        self.task.global.control_plane.local_running_process_count()
+    }
+
+    /// Returns a closure that snapshots `local_running_process_count()`
+    /// when called. Allows callers to keep a count handle alive after
+    /// `self` is moved (e.g. into `run_thread`).
+    pub fn local_process_count_fn(&self) -> alloc::boxed::Box<dyn Fn() -> usize + Send + Sync>
+    where
+        FS: Send + Sync + 'static,
+    {
+        let global = self.task.global.clone();
+        alloc::boxed::Box::new(move || global.control_plane.local_running_process_count())
+    }
+
     /// Set the controlling PTY for the restored/exec'd task. Called by
     /// the runner during worker-exec startup if the parent process's
     /// `controlling_pty` was non-None at exec time, so that

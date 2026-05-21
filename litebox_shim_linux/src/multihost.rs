@@ -474,6 +474,20 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
         );
     }
 
+    /// Returns the number of guest processes still running on the local host.
+    /// Used by run_program to keep the worker host alive while forked
+    /// guest processes outlive their initial parent (e.g. shim-aware
+    /// parent _exit(0)s while a forked child continues to write to a PTY).
+    pub fn local_running_process_count(&self) -> usize {
+        let state = self.state.lock();
+        let local = self.local_host;
+        state
+            .running_process_owners
+            .values()
+            .filter(|&&owner| owner == local)
+            .count()
+    }
+
     /// Return the current owner host for a running guest process.
     pub(crate) fn owner_of_running_process(&self, process_id: ProcessId) -> Option<HostId> {
         self.state

@@ -2574,6 +2574,8 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     worker_result_fd: Option<i32>,
     mux_handle: Option<std::thread::JoinHandle<()>>,
 ) -> ! {
+    let local_process_count = program.entrypoints.local_process_count_fn();
+
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
 
@@ -2617,6 +2619,23 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
         net_worker.join().unwrap();
     }
     let wait_status = program.process.wait();
+    // Stage B: keep this worker host alive while forked guest processes
+    // are still running locally. Without this, std::process::exit at the
+    // end of run_program tears down the host process — taking any
+    // forked-child task threads with it. The
+    // PTY.parent_exit_then_child_io.dpg1 test exercises exactly this
+    // pattern (shim-aware parent _exit(0)s while a forked child
+    // continues to write to a PTY).
+    {
+        let poll_interval = std::time::Duration::from_millis(50);
+        loop {
+            let count = local_process_count();
+            if count == 0 {
+                break;
+            }
+            std::thread::sleep(poll_interval);
+        }
+    }
     #[cfg(feature = "trace_syscalls")]
     eprintln!(
         "[WORKER] child exited with wait_status={}{}",
