@@ -292,6 +292,14 @@ impl FdEnabledSubsystemEntry for BrokerPtyFd<Platform> {
             self.common.handle(),
             self.slave_anchor_handle,
         );
+        // When the last shim slot is closing, force-unsubscribe BEFORE
+        // the final Release so the broker-side PtyState (whose Drop
+        // strictly asserts subscription list is empty) doesn't see a
+        // dangling subscription. Without this, on_close's Release racing
+        // BrokerBackedCommon::Drop's Unsubscribe trips PE.9 invariant.
+        if prev == 1 {
+            self.common.force_unsubscribe();
+        }
         self.provider.release(self.handle());
         if let Some(handle) = self.slave_anchor_handle {
             self.provider.release(handle);

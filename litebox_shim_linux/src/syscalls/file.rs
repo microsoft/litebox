@@ -2679,13 +2679,6 @@ impl<FS: ShimFS> Task<FS> {
             if !rds.is_alive(raw_fd) && files.closed_broker_pty_fds.lock().remove(&raw_fd) {
                 return Ok(());
             }
-            if self.fork_context.borrow().is_some()
-                && rds
-                    .fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
-                    .is_ok()
-            {
-                return Ok(());
-            }
         }
 
         let mut rds = files.raw_descriptor_store.write();

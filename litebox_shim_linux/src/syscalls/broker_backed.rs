@@ -146,6 +146,19 @@ where
         self.release_on_drop.store(false, Ordering::Release);
     }
 
+    /// Eagerly tears down the broker subscription, if any. Idempotent.
+    /// Used by per-slot `on_close` paths whose last release decrements
+    /// the broker StateObject refcount to 0; sending Unsubscribe BEFORE
+    /// that final Release ensures the StateObject's SubscriptionList is
+    /// empty by the time it drops (strict-assertion subsystems like
+    /// PTY/pidfd/process require this — without it, the
+    /// "dropped with N live subscription(s)" invariant fires).
+    pub(crate) fn force_unsubscribe(&self) {
+        if let Some(sub) = self.sub.lock().take() {
+            sub.provider.unsubscribe(sub.handle, sub.subscription_id);
+        }
+    }
+
     /// Returns the canonical broker handle id.
     #[inline]
     pub(crate) fn handle(&self) -> u64 {
