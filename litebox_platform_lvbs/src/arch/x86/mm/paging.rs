@@ -154,6 +154,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// Set `clean_up_page_tables` to `true` to free intermediate page-table frames
     /// (P1/P2/P3) that become empty after unmapping. Skip this when the VA range
     /// will be reused soon, as the intermediate frames would just be re-allocated.
+    ///
+    /// # Safety
+    ///
+    /// calling this function with `dealloc_frames = true` and `flush_tlb = false` is
+    /// subject to cross-core use-after-unmap. The caller should ensure no remote core
+    /// actively uses the pages it attempts to unmap.
     pub(crate) unsafe fn unmap_pages(
         &self,
         range: PageRange<ALIGN>,
