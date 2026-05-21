@@ -14,6 +14,13 @@ use crate::cwfd::fd_token_protocol::PtyIoctlOp;
 #[doc(inline)]
 pub use crate::cwfd::broker_subscribable::{BrokerEventCallback, BrokerOpError};
 
+/// Role of a broker-hosted PTY endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerPtyRole {
+    Master,
+    Slave,
+}
+
 /// Result of creating a broker-owned PTY pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrokerPtyPair {

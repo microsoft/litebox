@@ -7,6 +7,7 @@
 //! pty, forks the child, performs all pty I/O, waits, and closes the
 //! master inside one straight-line handler body.
 
+use std::io::Read as _;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -168,6 +169,8 @@ const LDISC_CANON_BASIC: HandlerToken<TargetArgs, PtyOut> =
 const PTYR_STDOUT_ROUNDTRIP: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.stdout_roundtrip");
 const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
+const PARENT_EXIT_THEN_CHILD_IO: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.parent_exit_then_child_io");
 
 // ─── Handlers ────────────────────────────────────────────────────────
 
@@ -366,6 +369,62 @@ async fn handle_ptyr_isatty(
     Ok(PtyOut { detail })
 }
 
+async fn handle_parent_exit_then_child_io(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let socket_path = format!(
+        "/run/litebox-pty-parent-exit-{}-{}.sock",
+        std::process::id(),
+        monotonic_suffix()
+    );
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .map_err(|e| format!("bind {socket_path}: {e}"))?;
+
+    let parent_exe =
+        std::env::current_exe().map_err(|e| format!("current_exe for parent leaf: {e}"))?;
+    let mut parent = match std::process::Command::new(parent_exe)
+        .arg("pty-parent-exit-driver")
+        .arg(args.target)
+        .arg(&socket_path)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = std::fs::remove_file(&socket_path);
+            return Err(format!("spawn parent leaf: {err}").into());
+        }
+    };
+
+    let (mut stream, _) = listener
+        .accept()
+        .map_err(|e| format!("accept {socket_path}: {e}"))?;
+    let _ = std::fs::remove_file(&socket_path);
+
+    let parent_status = parent
+        .wait()
+        .map_err(|e| format!("wait parent leaf: {e}"))?;
+    if !parent_status.success() {
+        return Err(format!("parent leaf exited with {parent_status}").into());
+    }
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .map_err(|e| format!("set monitor read timeout: {e}"))?;
+    let mut result = String::new();
+    stream
+        .read_to_string(&mut result)
+        .map_err(|e| format!("read monitor result: {e}"))?;
+    if let Some(detail) = result.strip_prefix("OK ") {
+        Ok(PtyOut {
+            detail: format!("parent exited; {detail}"),
+        })
+    } else {
+        Err(format!("monitor reported {result:?}").into())
+    }
+}
+
 // ─── Registration ────────────────────────────────────────────────────
 
 pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
@@ -382,6 +441,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(EXEC_SHELL_SESSION, handle_exec_shell_session);
     register_handler!(PTYR_STDOUT_ROUNDTRIP, handle_ptyr_stdout_roundtrip);
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
+    register_handler!(PARENT_EXIT_THEN_CHILD_IO, handle_parent_exit_then_child_io);
 
     crate::register_leaf_subcommand!("pty-tiocgpgrp", leaf_subcmd::subcmd_pty_tiocgpgrp);
     crate::register_leaf_subcommand!("pty-tiocspgrp", leaf_subcmd::subcmd_pty_tiocspgrp);
@@ -395,6 +455,16 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!("pty-ldisc-canon", leaf_subcmd::subcmd_pty_ldisc_canon);
     crate::register_leaf_subcommand!("pty-stdout-print", leaf_subcmd::subcmd_pty_stdout_print);
     crate::register_leaf_subcommand!("pty-isatty-check", leaf_subcmd::subcmd_pty_isatty_check);
+    crate::register_leaf_subcommand!(
+        "pty-parent-exit-driver",
+        leaf_subcmd::subcmd_pty_parent_exit_driver
+    );
+    crate::register_leaf_subcommand!(
+        "pty-parent-exit-then-child-io",
+        leaf_subcmd::subcmd_pty_parent_exit_then_child_io
+    );
+
+    register_parent_exit_then_child_io(reg);
 
     for &agent in PTY_AGENTS {
         for def in PTY_SCENARIOS {
@@ -441,6 +511,27 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
             }
         }
     }
+}
+
+fn register_parent_exit_then_child_io(reg: &mut Registry<'_>) {
+    reg.test("vscode", "pty", "PTY.parent_exit_then_child_io.dpg1")
+        .timeout(30)
+        .build(|cx| {
+            let handle = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let target = crate::binary_path(crate::BinaryType::NonPieGlibc, run.self_exe());
+                    let args = TargetArgs { target };
+                    let result = run
+                        .send_named_typed(&handle, &PARENT_EXIT_THEN_CHILD_IO, args)
+                        .await;
+                    match result {
+                        Ok(out) => TestOutcome::new("dpg1", true, out.detail),
+                        Err(detail) => TestOutcome::new("dpg1", false, detail),
+                    }
+                })
+            })
+        });
 }
 
 fn register_target_test(
@@ -573,6 +664,72 @@ fn check_detail(out: &PtyOut) -> Result<String, String> {
     } else {
         Ok(out.detail.clone())
     }
+}
+
+fn monotonic_suffix() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn close_fd(fd: i32) {
+    // SAFETY: best-effort close of an fd this process owns or inherited.
+    let _ = unsafe { libc::close(fd) };
+}
+
+fn read_until_ordered_fd(
+    fd: i32,
+    first: &str,
+    second: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut data = String::new();
+    while std::time::Instant::now() < deadline {
+        let first_pos = data.find(first);
+        if let Some(first_pos) = first_pos {
+            if data[first_pos + first.len()..].contains(second) {
+                return Ok(data);
+            }
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        // SAFETY: pollfd points to one valid pollfd entry for this call.
+        let ready = unsafe { libc::poll(std::ptr::addr_of_mut!(pollfd), 1, 100) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("pty poll fd {fd}: {err}; got {data:?}"));
+        }
+        if ready == 0 {
+            continue;
+        }
+        let mut byte = [0u8; 1];
+        // SAFETY: byte is valid writable memory and fd is a live pty master.
+        let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), byte.len()) };
+        if n > 0 {
+            data.push_str(&String::from_utf8_lossy(&byte[..n.cast_unsigned()]));
+            continue;
+        }
+        if n == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR | libc::EAGAIN) {
+            continue;
+        }
+        return Err(format!(
+            "while waiting for {first:?} then {second:?}: pty read fd {fd}: {err}; got {data:?}"
+        ));
+    }
+    Err(format!(
+        "timed out waiting for {first:?} then {second:?}; got {data:?}"
+    ))
 }
 
 /// Argv-dispatched leaf programs invoked by the PTY tests via `EXEC_BIN { argv: [bt, "pty-…"] }`.
@@ -804,6 +961,115 @@ mod leaf_subcmd {
         };
         println!("isatty: 0={} 1={} 2={}", label(0), label(1), label(2));
         let _ = std::io::stdout().flush();
+        0
+    }
+
+    /// Shim-aware parent half for PTY.parent_exit_then_child_io. It owns the PTY,
+    /// forks a monitor holding the master, forks the un-shim child on the slave,
+    /// then exits via _exit(0) before the child writes.
+    pub(super) fn subcmd_pty_parent_exit_driver(args: &[String]) -> i32 {
+        let code = run_pty_parent_exit_driver(args);
+        // SAFETY: this leaf is specifically validating _exit semantics; bypass
+        // Rust atexit handlers rather than returning through main.
+        unsafe { libc::_exit(code) }
+    }
+
+    fn run_pty_parent_exit_driver(args: &[String]) -> i32 {
+        let Some(child_target) = args.get(2) else {
+            return 2;
+        };
+        let Some(socket_path) = args.get(3) else {
+            return 2;
+        };
+        let pty = match crate::os::pty::Pty::open() {
+            Ok(pty) => pty,
+            Err(_) => return 126,
+        };
+        let slave_path = match std::ffi::CString::new(pty.slave_path()) {
+            Ok(path) => path,
+            Err(_) => return 2,
+        };
+        let child_target = match std::ffi::CString::new(child_target.as_str()) {
+            Ok(path) => path,
+            Err(_) => return 2,
+        };
+        let child_leaf = std::ffi::CString::new("pty-parent-exit-then-child-io")
+            .expect("static child leaf name");
+        let child_argv = [child_target.as_ptr(), child_leaf.as_ptr(), std::ptr::null()];
+
+        // SAFETY: fork creates a monitor sibling that holds the PTY master after
+        // this shim-aware parent exits.
+        let monitor_pid = unsafe { libc::fork() };
+        if monitor_pid == 0 {
+            let mut stream = match std::os::unix::net::UnixStream::connect(socket_path) {
+                Ok(stream) => stream,
+                Err(_) => unsafe { libc::_exit(125) },
+            };
+            let result = super::read_until_ordered_fd(
+                pty.as_raw_fd(),
+                "first\r\n",
+                "second\r\n",
+                std::time::Duration::from_secs(10),
+            );
+            let msg = match result {
+                Ok(data) => format!("OK child output observed: {data:?}"),
+                Err(err) => format!("ERR {err}"),
+            };
+            let _ = stream.write_all(msg.as_bytes());
+            let _ = stream.flush();
+            // SAFETY: monitor is done; exit without running inherited harness cleanup.
+            unsafe { libc::_exit(i32::from(!msg.starts_with("OK "))) }
+        }
+        if monitor_pid < 0 {
+            return 126;
+        }
+
+        // SAFETY: open reads a valid nul-terminated slave path.
+        let slave_fd = unsafe { libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        if slave_fd < 0 {
+            return 126;
+        }
+
+        // SAFETY: fork creates the un-shim exec child from this shim-aware parent.
+        let child_pid = unsafe { libc::fork() };
+        if child_pid == 0 {
+            // SAFETY: child process setup before exec; every failure exits immediately.
+            unsafe {
+                if libc::setsid() < 0 {
+                    libc::_exit(126);
+                }
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                    libc::_exit(126);
+                }
+                for target_fd in 0..=2 {
+                    if slave_fd != target_fd && libc::dup3(slave_fd, target_fd, 0) < 0 {
+                        libc::_exit(126);
+                    }
+                }
+                if slave_fd > 2 {
+                    libc::close(slave_fd);
+                }
+                libc::execv(child_target.as_ptr(), child_argv.as_ptr());
+                libc::_exit(127);
+            }
+        }
+
+        super::close_fd(slave_fd);
+        if child_pid < 0 { 126 } else { 0 }
+    }
+
+    /// PTY.parent_exit_then_child_io: after the shim-aware parent has
+    /// _exit(0)'d, keep writing to stdout through the inherited PTY slave.
+    pub(super) fn subcmd_pty_parent_exit_then_child_io(_args: &[String]) -> i32 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut out = std::io::stdout();
+        if out.write_all(b"first\n").is_err() || out.flush().is_err() {
+            return 1;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if out.write_all(b"second\n").is_err() || out.flush().is_err() {
+            return 1;
+        }
         0
     }
 }

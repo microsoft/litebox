@@ -232,6 +232,12 @@ pub struct CliArgs {
     #[arg(long = "broker-fd-bridge", hide = true)]
     pub broker_fd_bridge: Vec<String>,
 
+    /// Internal: the controlling PTY pty_id, if the parent had one at
+    /// exec time. Forwarded by the parent shim's exec path so the new
+    /// worker's `open("/dev/tty")` resolves to the same broker PTY pair.
+    #[arg(long = "controlling-pty", hide = true)]
+    pub controlling_pty: Option<u32>,
+
     /// Internal: inherited socketpair fd for the stream multiplexer.
     #[arg(long = "mux-fd", hide = true, requires = "fork_restore")]
     pub mux_fd: Option<i32>,
@@ -270,24 +276,27 @@ struct MmappedFile {
     abs_path: PathBuf,
 }
 
-/// Parses a `--broker-fd-bridge` spec string of the form
-/// `fd:kind:handle_id[:direction]` and returns the components.
-///
-/// `direction` is required when `kind == Pipe` and rejected otherwise.
-fn parse_broker_fd_bridge_spec(
-    spec: &str,
-) -> Result<(
+type BrokerFdBridgeParsed = (
     usize,
     litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind,
     u64,
     Option<litebox_common_linux::broker_pipe_provider::BrokerPipeEnd>,
     Option<litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint>,
-)> {
+    Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
+    Option<u32>,
+);
+
+/// Parses a `--broker-fd-bridge` spec string of the form
+/// `fd:kind:handle_id[:subkind]` and returns the components.
+///
+/// `subkind` is required for pipe direction, unix socketpair endpoint, and PTY role.
+fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
+    use litebox_common_linux::broker_pty_provider::BrokerPtyRole;
     use litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint;
     use litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind;
     let parts: Vec<&str> = spec.split(':').collect();
-    if !(parts.len() == 3 || parts.len() == 4) {
+    if !(parts.len() == 3 || parts.len() == 4 || parts.len() == 5) {
         anyhow::bail!("broker-fd-bridge: bad spec {spec:?}");
     }
     let guest_fd: usize = parts[0]
@@ -305,9 +314,9 @@ fn parse_broker_fd_bridge_spec(
     let handle_id: u64 = parts[2]
         .parse()
         .map_err(|e| anyhow!("broker-fd-bridge: bad handle {:?}: {e}", parts[2]))?;
-    let (direction, endpoint) = match (kind, parts.get(3)) {
-        (BrokerHandleKind::Pipe, Some(&"r")) => (Some(BrokerPipeEnd::Read), None),
-        (BrokerHandleKind::Pipe, Some(&"w")) => (Some(BrokerPipeEnd::Write), None),
+    let (direction, endpoint, pty_role) = match (kind, parts.get(3)) {
+        (BrokerHandleKind::Pipe, Some(&"r")) => (Some(BrokerPipeEnd::Read), None, None),
+        (BrokerHandleKind::Pipe, Some(&"w")) => (Some(BrokerPipeEnd::Write), None, None),
         (BrokerHandleKind::Pipe, Some(other)) => {
             anyhow::bail!("broker-fd-bridge: pipe direction must be 'r' or 'w', got {other:?}")
         }
@@ -316,8 +325,12 @@ fn parse_broker_fd_bridge_spec(
                 "broker-fd-bridge: pipe kind requires :r or :w direction suffix (spec {spec:?})"
             )
         }
-        (BrokerHandleKind::UnixSocket, Some(&"a")) => (None, Some(BrokerSocketPairEndpoint::A)),
-        (BrokerHandleKind::UnixSocket, Some(&"b")) => (None, Some(BrokerSocketPairEndpoint::B)),
+        (BrokerHandleKind::UnixSocket, Some(&"a")) => {
+            (None, Some(BrokerSocketPairEndpoint::A), None)
+        }
+        (BrokerHandleKind::UnixSocket, Some(&"b")) => {
+            (None, Some(BrokerSocketPairEndpoint::B), None)
+        }
         (BrokerHandleKind::UnixSocket, Some(other)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unix_socket endpoint must be 'a' or 'b', got {other:?}"
@@ -328,15 +341,39 @@ fn parse_broker_fd_bridge_spec(
                 "broker-fd-bridge: unix_socket kind requires :a or :b endpoint suffix (spec {spec:?})"
             )
         }
+        (BrokerHandleKind::Pty, Some(&"m")) => (None, None, Some(BrokerPtyRole::Master)),
+        (BrokerHandleKind::Pty, Some(&"s")) => (None, None, Some(BrokerPtyRole::Slave)),
+        (BrokerHandleKind::Pty, Some(other)) => {
+            anyhow::bail!("broker-fd-bridge: pty role must be 'm' or 's', got {other:?}")
+        }
+        (BrokerHandleKind::Pty, None) => {
+            anyhow::bail!("broker-fd-bridge: pty kind requires :m or :s suffix (spec {spec:?})")
+        }
         (_, Some(extra)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
                 parts[1]
             )
         }
-        (_, None) => (None, None),
+        (_, None) => (None, None, None),
     };
-    Ok((guest_fd, kind, handle_id, direction, endpoint))
+    let pty_id = if kind == BrokerHandleKind::Pty {
+        match parts.get(4) {
+            Some(raw) => Some(
+                raw.parse()
+                    .map_err(|e| anyhow!("broker-fd-bridge: bad pty id {raw:?}: {e}"))?,
+            ),
+            None => None,
+        }
+    } else {
+        if parts.len() == 5 {
+            anyhow::bail!("broker-fd-bridge: pty id is only valid for pty specs");
+        }
+        None
+    };
+    Ok((
+        guest_fd, kind, handle_id, direction, endpoint, pty_role, pty_id,
+    ))
 }
 
 fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
@@ -1077,7 +1114,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
+            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
                 parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
@@ -1087,8 +1124,14 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                     handle_id,
                     pipe_direction,
                     socketpair_endpoint,
+                    pty_role,
+                    pty_id,
                 )
                 .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+        }
+
+        if let Some(pty_id) = cli_args.controlling_pty {
+            program.entrypoints.set_controlling_pty(pty_id);
         }
 
         run_program(program, shutdown, net_worker, worker_result_fd, None);
@@ -1180,7 +1223,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // extended in Phase C.3 to handle pipe).
     let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
     for spec in &cli_args.broker_fd_bridge {
-        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
+        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
             parse_broker_fd_bridge_spec(spec)?;
         program
             .entrypoints
@@ -1190,8 +1233,14 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                 handle_id,
                 pipe_direction,
                 socketpair_endpoint,
+                pty_role,
+                pty_id,
             )
             .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+    }
+
+    if let Some(pty_id) = cli_args.controlling_pty {
+        program.entrypoints.set_controlling_pty(pty_id);
     }
 
     run_program(program, shutdown, net_worker, worker_result_fd, None);
@@ -2482,7 +2531,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(guest_task);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint) =
+            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
                 parse_broker_fd_bridge_spec(spec)?;
             program
                 .entrypoints
@@ -2492,8 +2541,17 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
                     handle_id,
                     pipe_direction,
                     socketpair_endpoint,
+                    pty_role,
+                    pty_id,
                 )
                 .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+        }
+
+        // Stage B: restore parent's controlling PTY so /dev/tty resolves
+        // in the new worker. Without this, cross-binary-type exec into a
+        // process that holds a slave with TIOCSCTTY set loses ctty state.
+        if let Some(pty_id) = cli_args.controlling_pty {
+            program.entrypoints.set_controlling_pty(pty_id);
         }
 
         run_program(
@@ -2516,6 +2574,8 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     worker_result_fd: Option<i32>,
     mux_handle: Option<std::thread::JoinHandle<()>>,
 ) -> ! {
+    let local_process_count = program.entrypoints.local_process_count_fn();
+
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
 
@@ -2559,6 +2619,23 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
         net_worker.join().unwrap();
     }
     let wait_status = program.process.wait();
+    // Stage B: keep this worker host alive while forked guest processes
+    // are still running locally. Without this, std::process::exit at the
+    // end of run_program tears down the host process — taking any
+    // forked-child task threads with it. The
+    // PTY.parent_exit_then_child_io.dpg1 test exercises exactly this
+    // pattern (shim-aware parent _exit(0)s while a forked child
+    // continues to write to a PTY).
+    {
+        let poll_interval = std::time::Duration::from_millis(50);
+        loop {
+            let count = local_process_count();
+            if count == 0 {
+                break;
+            }
+            std::thread::sleep(poll_interval);
+        }
+    }
     #[cfg(feature = "trace_syscalls")]
     eprintln!(
         "[WORKER] child exited with wait_status={}{}",

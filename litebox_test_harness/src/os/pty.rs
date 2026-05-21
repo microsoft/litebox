@@ -68,6 +68,12 @@ impl Pty {
         &self.slave_path
     }
 
+    /// Return the raw master fd without transferring ownership.
+    #[must_use]
+    pub fn as_raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
     /// Fork and exec `args`, wiring fd 0/1/2 to the pty slave. If
     /// `ctrl_tty` is true, make the slave the child session's controlling tty.
     ///
