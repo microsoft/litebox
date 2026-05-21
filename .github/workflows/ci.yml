@@ -242,6 +242,10 @@ jobs:
           #   since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
           #
+          # - `litebox_runner_windows_userland` is allowed to have `std` access
+          #   since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
           # - `litebox_runner_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
@@ -257,6 +261,9 @@ jobs:
           #   `litebox_platform_lvbs` (`no_std`) and
           #   `litebox_platform_linux_userland` (for debugging) which
           #   depends on `litebox_platform_multiplex`.
+          #
+          # - `litebox_shim_windows` itself is `no_std` but depends on
+          #   `litebox_platform_multiplex`.
           #
           # - `litebox_syscall_rewriter` is allowed to have `std` access since
           #   it is a helper binary that runs in userland to AOT "compile" ELFs.
@@ -279,10 +286,12 @@ jobs:
             -not -path './litebox_platform_lvbs/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
+            -not -path './litebox_runner_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
             -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
             -not -path './litebox_shim_linux/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
+            -not -path './litebox_shim_windows/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \

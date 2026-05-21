@@ -8,7 +8,6 @@
 //! will be filled in piece by piece.
 
 #![no_std]
-#![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
 extern crate alloc;
 
