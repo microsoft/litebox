@@ -266,6 +266,31 @@ impl Pty {
         }
     }
 
+    /// Single `poll(2)` call with 0ms timeout — non-blocking probe of
+    /// fd readiness. Returns the `revents` bits that were set.
+    ///
+    /// Used to test the kernel-PTY invariant: after the child has
+    /// exited (parent already reaped), `poll(POLLIN, 0)` on master
+    /// MUST immediately return POLLIN if the child wrote data. This
+    /// is dropbear's session-end pattern.
+    pub fn poll_now(&self, events: i16) -> Result<i16, String> {
+        let fd = self.fd.as_raw_fd();
+        let mut pollfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: pollfd points to one valid pollfd entry for this call.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pollfd), 1, 0) };
+        if rc < 0 {
+            return Err(format!(
+                "pty poll fd {fd}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(pollfd.revents)
+    }
+
     /// Resize the pty window.
     ///
     /// # Errors

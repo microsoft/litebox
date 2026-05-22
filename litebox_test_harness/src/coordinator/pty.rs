@@ -79,6 +79,19 @@ enum ScenarioKind {
     /// the read returns EAGAIN — and any consumer that doesn't
     /// re-poll (like dropbear's session-end loop) loses the data.
     SlaveWriteAtomicity,
+    /// PTYR.poll_after_exit — same shape as SlaveWriteAtomicity but
+    /// probes via `poll(POLLIN, 0ms)` instead of `read(2)`. This is
+    /// dropbear's EXACT pattern: poll the master fd with 0 timeout
+    /// at session-end teardown; if POLLIN is set, drain it. The
+    /// invariant: after `waitpid` returns the child's exit status,
+    /// `poll(master, POLLIN, 0)` MUST report POLLIN if the child
+    /// wrote any data.
+    PollAfterExit,
+    /// PTYR.slave_close_hup — child writes nothing, just exits.
+    /// Parent reaps, then polls master with `POLLHUP`. POLLHUP MUST
+    /// be set immediately — dropbear and any TTY-aware consumer
+    /// uses POLLHUP to detect peer-closed.
+    SlaveCloseHup,
     /// PTYR.isatty — child calls `isatty(0/1/2)` post-exec and prints
     /// `isatty: 0=Y 1=Y 2=Y`. Confirms all three stdio fds are TTYs in
     /// the new worker after a non-PIE execve.
@@ -171,6 +184,16 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "poll_after_exit",
+        kind: ScenarioKind::PollAfterExit,
+        per_binary_type: true,
+    },
+    ScenarioDef {
+        name: "slave_close_hup",
+        kind: ScenarioKind::SlaveCloseHup,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "isatty",
         kind: ScenarioKind::Isatty,
         per_binary_type: true,
@@ -212,6 +235,10 @@ const PTYR_STDOUT_POST_SLEEP: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.stdout_post_sleep");
 const PTYR_SLAVE_WRITE_ATOMICITY: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.slave_write_atomicity");
+const PTYR_POLL_AFTER_EXIT: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.poll_after_exit");
+const PTYR_SLAVE_CLOSE_HUP: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.slave_close_hup");
 const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
 const PARENT_EXIT_THEN_CHILD_IO: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.parent_exit_then_child_io");
@@ -438,6 +465,60 @@ async fn handle_ptyr_slave_write_atomicity(
     Ok(PtyOut { detail })
 }
 
+async fn handle_ptyr_poll_after_exit(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-slave-write-atomicity".into()], true)?;
+    expect_exit_zero(pid)?;
+    // Dropbear's exact session-end pattern: poll(master, POLLIN, 0).
+    // Must return POLLIN immediately for the child's writes to be
+    // captured before the session loop closes the channel.
+    let revents = pty.poll_now(libc::POLLIN)?;
+    if revents & libc::POLLIN == 0 {
+        return Err(format!(
+            "post-reap poll(POLLIN, 0) returned revents={revents:#x} — POLLIN not set; \
+             broker PTY does not synchronously expose slave-write data on master \
+             before the master worker's notification-ring dispatcher catches up. \
+             dropbear/sshd's session-end loop sees the same EAGAIN and closes."
+        )
+        .into());
+    }
+    // Now drain to confirm bytes are there.
+    let bytes = pty.try_read_now(4096)?.ok_or_else(|| {
+        "POLLIN reported but try_read_now returned None (inconsistent)".to_string()
+    })?;
+    let s = String::from_utf8_lossy(&bytes).to_string();
+    let detail = exact(&s, "WRITE_ATOMIC_OK\r\n")?;
+    Ok(PtyOut { detail })
+}
+
+async fn handle_ptyr_slave_close_hup(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-slave-close-immediate".into()], true)?;
+    expect_exit_zero(pid)?;
+    // Child wrote nothing; slave is closed. POLLHUP must be set
+    // immediately so consumers can detect peer-close (dropbear,
+    // tokio's signal_unix wait, etc.).
+    let revents = pty.poll_now(libc::POLLIN | libc::POLLHUP)?;
+    if revents & libc::POLLHUP == 0 {
+        return Err(format!(
+            "post-reap poll(POLLIN|POLLHUP, 0) returned revents={revents:#x} — \
+             POLLHUP not set after child exit closed slave"
+        )
+        .into());
+    }
+    Ok(PtyOut {
+        detail: format!("revents={revents:#x}"),
+    })
+}
+
 async fn handle_ptyr_isatty(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -527,6 +608,8 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         PTYR_SLAVE_WRITE_ATOMICITY,
         handle_ptyr_slave_write_atomicity
     );
+    register_handler!(PTYR_POLL_AFTER_EXIT, handle_ptyr_poll_after_exit);
+    register_handler!(PTYR_SLAVE_CLOSE_HUP, handle_ptyr_slave_close_hup);
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
     register_handler!(PARENT_EXIT_THEN_CHILD_IO, handle_parent_exit_then_child_io);
 
@@ -548,6 +631,10 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!(
         "pty-slave-write-atomicity",
         leaf_subcmd::subcmd_pty_slave_write_atomicity
+    );
+    crate::register_leaf_subcommand!(
+        "pty-slave-close-immediate",
+        leaf_subcmd::subcmd_pty_slave_close_immediate
     );
     crate::register_leaf_subcommand!("pty-isatty-check", leaf_subcmd::subcmd_pty_isatty_check);
     crate::register_leaf_subcommand!(
@@ -693,6 +780,14 @@ async fn drive_target(
         }
         ScenarioKind::SlaveWriteAtomicity => {
             run.send_named_typed(handle, &PTYR_SLAVE_WRITE_ATOMICITY, args)
+                .await?
+        }
+        ScenarioKind::PollAfterExit => {
+            run.send_named_typed(handle, &PTYR_POLL_AFTER_EXIT, args)
+                .await?
+        }
+        ScenarioKind::SlaveCloseHup => {
+            run.send_named_typed(handle, &PTYR_SLAVE_CLOSE_HUP, args)
                 .await?
         }
         ScenarioKind::Isatty => run.send_named_typed(handle, &PTYR_ISATTY, args).await?,
@@ -1093,6 +1188,12 @@ mod leaf_subcmd {
         if stdout.flush().is_err() {
             return 1;
         }
+        0
+    }
+
+    /// PTYR.slave_close_immediate: write nothing and exit. Parent
+    /// verifies POLLHUP is set immediately on master.
+    pub(super) fn subcmd_pty_slave_close_immediate(_args: &[String]) -> i32 {
         0
     }
 
