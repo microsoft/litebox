@@ -644,6 +644,18 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Brk { addr } => self.sys_brk(addr),
             SyscallRequest::Readv { fd, iovec, iovcnt } => self.sys_readv(fd, iovec, iovcnt),
             SyscallRequest::Writev { fd, iovec, iovcnt } => self.sys_writev(fd, iovec, iovcnt),
+            SyscallRequest::Preadv {
+                fd,
+                iovec,
+                iovcnt,
+                offset,
+            } => self.sys_preadv(fd, iovec, iovcnt, offset),
+            SyscallRequest::Pwritev {
+                fd,
+                iovec,
+                iovcnt,
+                offset,
+            } => self.sys_pwritev(fd, iovec, iovcnt, offset),
             SyscallRequest::Access { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),

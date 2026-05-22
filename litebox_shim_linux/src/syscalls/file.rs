@@ -709,93 +709,159 @@ impl<FS: ShimFS> Task<FS> {
         self.do_close(raw_fd)
     }
 
+    /// Handle syscall `preadv`
+    pub(crate) fn sys_preadv(
+        &self,
+        fd: i32,
+        iovec: ConstPtr<IoReadVec<MutPtr<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+    ) -> Result<usize, Errno> {
+        check_iovcnt(iovcnt)?;
+        let base_offset = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
+        let mut kernel_buffer = vec![0u8; iovec_kernel_buffer_size(iovs)];
+        read_from_iovec(
+            iovs.iter().map(|i| (i.iov_base, i.iov_len)),
+            &mut kernel_buffer,
+            |buf, total| {
+                let cur_offset = base_offset.checked_add(total).ok_or(Errno::EOVERFLOW)?;
+                self.sys_read(fd, buf, Some(cur_offset))
+            },
+        )
+    }
+
+    /// Handle syscall `pwritev`
+    pub(crate) fn sys_pwritev(
+        &self,
+        fd: i32,
+        iovec: ConstPtr<IoWriteVec<ConstPtr<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+    ) -> Result<usize, Errno> {
+        check_iovcnt(iovcnt)?;
+        let base_offset = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        let iovs: &[IoWriteVec<ConstPtr<u8>>] =
+            &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
+        write_to_iovec(
+            iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
+            |buf, total| {
+                let cur_offset = base_offset.checked_add(total).ok_or(Errno::EOVERFLOW)?;
+                self.sys_write(fd, buf, Some(cur_offset))
+            },
+        )
+    }
+
     /// Handle syscall `readv`
-    pub fn sys_readv(
+    pub(crate) fn sys_readv(
         &self,
         fd: i32,
         iovec: ConstPtr<IoReadVec<MutPtr<u8>>>,
         iovcnt: usize,
     ) -> Result<usize, Errno> {
-        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
-            return Err(Errno::EBADF);
-        };
+        check_iovcnt(iovcnt)?;
         let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
-        let files = self.files.borrow();
-        let mut total_read = 0;
-        let mut kernel_buffer = vec![
-            0u8;
-            iovs.iter()
-                .map(|i| i.iov_len)
-                .max()
-                .unwrap_or_default()
-                .min(super::super::MAX_KERNEL_BUF_SIZE)
-        ];
-        for iov in iovs {
-            if iov.iov_len == 0 {
-                continue;
-            }
-            let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
-                return Err(Errno::EINVAL);
-            };
-            // TODO: The data transfers performed by readv() and writev() are atomic: the data
-            // written by writev() is written as a single block that is not intermingled with
-            // output from writes in other processes
-            let size = files
-                .run_on_raw_fd(
-                    raw_fd,
-                    |fd| {
-                        files
-                            .fs
-                            .read(fd, &mut kernel_buffer, None)
-                            .map_err(Errno::from)
-                    },
-                    |_fd| todo!("net"),
-                    |_fd| todo!("pipes"),
-                    |_fd| todo!("eventfd"),
-                    |_fd| Err(Errno::EINVAL),
-                    |_fd| todo!("unix"),
-                )
-                .flatten()?;
-            iov.iov_base
-                .copy_from_slice(0, &kernel_buffer[..size])
-                .ok_or(Errno::EFAULT)?;
-            total_read += size;
-            if size < iov.iov_len {
-                // Okay to transfer fewer bytes than requested
-                break;
-            }
-        }
-        Ok(total_read)
+        let mut kernel_buffer = vec![0u8; iovec_kernel_buffer_size(iovs)];
+        // TODO: The data transfers performed by readv() and writev() are atomic: the data
+        // written by writev() is written as a single block that is not intermingled with
+        // output from writes in other processes
+        read_from_iovec(
+            iovs.iter().map(|i| (i.iov_base, i.iov_len)),
+            &mut kernel_buffer,
+            |buf, _total| self.sys_read(fd, buf, None),
+        )
     }
 }
 
-pub(super) fn write_to_iovec<P, I, F>(iovs: I, write_fn: F) -> Result<usize, Errno>
+fn iovec_kernel_buffer_size<P: RawMutPointer<u8>>(iovs: &[IoReadVec<P>]) -> usize {
+    iovs.iter()
+        .map(|i| i.iov_len)
+        .max()
+        .unwrap_or_default()
+        .min(super::super::MAX_KERNEL_BUF_SIZE)
+}
+
+/// Linux's `IOV_MAX` / `UIO_MAXIOV`: the kernel rejects iovec counts above this
+/// with `EINVAL` for `readv`/`writev`/`preadv`/`pwritev`.
+const IOV_MAX: usize = 1024;
+
+fn check_iovcnt(iovcnt: usize) -> Result<(), Errno> {
+    if iovcnt > IOV_MAX {
+        Err(Errno::EINVAL)
+    } else {
+        Ok(())
+    }
+}
+
+/// Drain reads into a sequence of user iovecs.
+fn read_from_iovec<P, I, F>(
+    iovs: I,
+    kernel_buffer: &mut [u8],
+    mut read_fn: F,
+) -> Result<usize, Errno>
+where
+    P: RawMutPointer<u8>,
+    I: IntoIterator<Item = (P, usize)>,
+    F: FnMut(&mut [u8], usize) -> Result<usize, Errno>,
+{
+    let bail = |total: usize, e: Errno| if total > 0 { Ok(total) } else { Err(e) };
+    let mut total_read = 0;
+    'outer: for (iov_base, iov_len) in iovs {
+        if iov_len == 0 {
+            continue;
+        }
+        if isize::try_from(iov_len).is_err() {
+            return bail(total_read, Errno::EINVAL);
+        }
+        let mut iov_filled = 0;
+        while iov_filled < iov_len {
+            let to_read = (iov_len - iov_filled).min(kernel_buffer.len());
+            let size = match read_fn(&mut kernel_buffer[..to_read], total_read) {
+                Ok(0) => break 'outer,
+                Ok(s) => s,
+                Err(e) => return bail(total_read, e),
+            };
+            if iov_base
+                .copy_from_slice(iov_filled, &kernel_buffer[..size])
+                .is_none()
+            {
+                return bail(total_read, Errno::EFAULT);
+            }
+            iov_filled += size;
+            total_read += size;
+            if size < to_read {
+                // Short read from the source — treat as EOF for the remaining iovecs.
+                break 'outer;
+            }
+        }
+    }
+    Ok(total_read)
+}
+
+/// Drain writes from a sequence of user iovecs.
+///
+/// `write_fn` receives the contents of each iovec along with the total number of
+/// bytes already written from earlier iovecs.
+pub(super) fn write_to_iovec<P, I, F>(iovs: I, mut write_fn: F) -> Result<usize, Errno>
 where
     P: RawConstPointer<u8>,
     I: IntoIterator<Item = (P, usize)>,
-    F: Fn(&[u8]) -> Result<usize, Errno>,
+    F: FnMut(&[u8], usize) -> Result<usize, Errno>,
 {
+    // If any bytes have already been delivered from earlier iovecs, an error
+    // collapses to `Ok(total)` so partial progress is reported to user space.
+    let bail = |total: usize, e: Errno| if total > 0 { Ok(total) } else { Err(e) };
     let mut total_written = 0;
     for (iov_base, iov_len) in iovs {
         if iov_len == 0 {
             continue;
         }
         let Some(slice) = iov_base.to_owned_slice(iov_len) else {
-            return if total_written > 0 {
-                Ok(total_written)
-            } else {
-                Err(Errno::EFAULT)
-            };
+            return bail(total_written, Errno::EFAULT);
         };
-        let size = match write_fn(&slice) {
+        let size = match write_fn(&slice, total_written) {
             Ok(size) => size,
-            Err(err) => {
-                return if total_written > 0 {
-                    Ok(total_written)
-                } else {
-                    Err(err)
-                };
-            }
+            Err(err) => return bail(total_written, err),
         };
         total_written += size;
         if size < iov_len {
@@ -808,50 +874,22 @@ where
 
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `writev`
-    pub fn sys_writev(
+    pub(crate) fn sys_writev(
         &self,
         fd: i32,
         iovec: ConstPtr<IoWriteVec<ConstPtr<u8>>>,
         iovcnt: usize,
     ) -> Result<usize, Errno> {
-        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
-            return Err(Errno::EBADF);
-        };
+        check_iovcnt(iovcnt)?;
         let iovs: &[IoWriteVec<ConstPtr<u8>>] =
             &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
-        let files = self.files.borrow();
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        let res = files
-            .run_on_raw_fd(
-                raw_fd,
-                |fd| {
-                    write_to_iovec(iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)), |buf| {
-                        files.fs.write(fd, buf, None).map_err(Errno::from)
-                    })
-                },
-                |fd| {
-                    write_to_iovec(iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)), |buf| {
-                        self.global.sendto(
-                            &self.wait_cx(),
-                            fd,
-                            buf,
-                            litebox_common_linux::SendFlags::empty(),
-                            None,
-                        )
-                    })
-                },
-                |_fd| todo!("pipes"),
-                |_fd| todo!("eventfd"),
-                |_fd| Err(Errno::EINVAL),
-                |_fd| todo!("unix"),
-            )
-            .flatten();
-        if let Err(Errno::EPIPE) = res {
-            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
-        }
-        res
+        write_to_iovec(
+            iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
+            |buf, _total| self.sys_write(fd, buf, None),
+        )
     }
 
     /// Handle syscall `access`
@@ -2279,20 +2317,132 @@ mod tests {
         ];
         let calls = Cell::new(0);
 
-        let result = write_to_iovec(iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)), |buf| {
-            let call = calls.get();
-            calls.set(call + 1);
-            if call == 0 {
-                assert_eq!(buf, first);
-                Ok(buf.len())
-            } else {
-                assert_eq!(buf, second);
-                Err(Errno::EPIPE)
-            }
-        });
+        let result = write_to_iovec(
+            iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
+            |buf, total| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    assert_eq!(buf, first);
+                    assert_eq!(total, 0);
+                    Ok(buf.len())
+                } else {
+                    assert_eq!(buf, second);
+                    assert_eq!(total, first.len());
+                    Err(Errno::EPIPE)
+                }
+            },
+        );
 
         assert_eq!(result, Ok(first.len()));
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn read_from_iovec_breaks_on_eof() {
+        let mut first = [0u8; 4];
+        let mut second = [0u8; 4];
+        let iovs = [
+            IoReadVec {
+                iov_base: MutPtr::from_usize(first.as_mut_ptr().expose_provenance()),
+                iov_len: first.len(),
+            },
+            IoReadVec {
+                iov_base: MutPtr::from_usize(second.as_mut_ptr().expose_provenance()),
+                iov_len: second.len(),
+            },
+        ];
+        let mut kernel_buffer = [0u8; 8];
+        let calls = Cell::new(0);
+
+        let result = read_from_iovec(
+            iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
+            &mut kernel_buffer,
+            |buf, total| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    assert_eq!(total, 0);
+                    buf.fill(b'a');
+                    Ok(buf.len())
+                } else {
+                    assert_eq!(total, 4);
+                    Ok(0)
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(4));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(&first, b"aaaa");
+        assert_eq!(&second, &[0u8; 4]);
+    }
+
+    #[test]
+    fn read_from_iovec_chunks_iov_larger_than_kernel_buffer() {
+        let mut dest = [0u8; 12];
+        let iovs = [IoReadVec {
+            iov_base: MutPtr::from_usize(dest.as_mut_ptr().expose_provenance()),
+            iov_len: dest.len(),
+        }];
+        let mut kernel_buffer = [0u8; 4];
+        let calls = Cell::new(0);
+
+        let result = read_from_iovec(
+            iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
+            &mut kernel_buffer,
+            |buf, total| {
+                assert_eq!(buf.len(), 4);
+                assert_eq!(total, calls.get() * 4);
+                let marker = b'a' + u8::try_from(calls.get()).unwrap();
+                buf.fill(marker);
+                calls.set(calls.get() + 1);
+                Ok(buf.len())
+            },
+        );
+
+        assert_eq!(result, Ok(12));
+        assert_eq!(calls.get(), 3);
+        assert_eq!(&dest, b"aaaabbbbcccc");
+    }
+
+    #[test]
+    fn read_from_iovec_returns_partial_after_later_error() {
+        let mut first = [0u8; 4];
+        let mut second = [0u8; 4];
+        let iovs = [
+            IoReadVec {
+                iov_base: MutPtr::from_usize(first.as_mut_ptr().expose_provenance()),
+                iov_len: first.len(),
+            },
+            IoReadVec {
+                iov_base: MutPtr::from_usize(second.as_mut_ptr().expose_provenance()),
+                iov_len: second.len(),
+            },
+        ];
+        let mut kernel_buffer = [0u8; 4];
+        let calls = Cell::new(0);
+
+        let result = read_from_iovec(
+            iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
+            &mut kernel_buffer,
+            |buf, total| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    assert_eq!(total, 0);
+                    buf.fill(b'x');
+                    Ok(buf.len())
+                } else {
+                    assert_eq!(total, 4);
+                    Err(Errno::EIO)
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(4));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(&first, b"xxxx");
     }
 
     #[test]

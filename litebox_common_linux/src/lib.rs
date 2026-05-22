@@ -2077,6 +2077,18 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         iovec: Platform::RawConstPointer<IoWriteVec<Platform::RawConstPointer<u8>>>,
         iovcnt: usize,
     },
+    Preadv {
+        fd: i32,
+        iovec: Platform::RawConstPointer<IoReadVec<Platform::RawMutPointer<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+    },
+    Pwritev {
+        fd: i32,
+        iovec: Platform::RawConstPointer<IoWriteVec<Platform::RawConstPointer<u8>>>,
+        iovcnt: usize,
+        offset: i64,
+    },
     Access {
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
@@ -2573,6 +2585,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }),
             Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
+            Sysno::preadv => sys_req!(Preadv { fd, iovec:*, iovcnt, offset }),
+            Sysno::pwritev => sys_req!(Pwritev { fd, iovec:*, iovcnt, offset }),
             Sysno::access => sys_req!(Access { pathname:*, mode }),
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),

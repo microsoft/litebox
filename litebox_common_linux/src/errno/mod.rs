@@ -198,7 +198,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
     fn from(value: litebox::fs::errors::WriteError) -> Self {
         match value {
             litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
-            litebox::fs::errors::WriteError::NotForWriting => Errno::EACCES,
+            litebox::fs::errors::WriteError::NotForWriting => Errno::EBADF,
             litebox::fs::errors::WriteError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
