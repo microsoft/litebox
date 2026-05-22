@@ -2781,11 +2781,22 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd) {
             drop(rds);
-            self.global
-                .litebox
-                .descriptor_table_mut()
-                .remove(&fd)
-                .unwrap();
+            // Drop the descriptor-table entry if it's still present.
+            // `fd_consume_raw_integer` may have already consumed the
+            // slot; either way the close should succeed silently
+            // (matches eventfd handling above, file.rs:2774-2780).
+            // Previously this used `.unwrap()` which panicked the
+            // shim when called with a signalfd whose slot was
+            // already detached (e.g., `OwnedFd::drop` from a
+            // signalfd created with `signalfd(-1, mask, SFD_CLOEXEC)`
+            // and then closed when the OwnedFd is dropped). The
+            // panic killed the entire worker, which under sshd-in-
+            // litebox manifests as "Connection closed" mid-session.
+            let entry = {
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                dt.remove(&fd)
+            };
+            drop(entry);
             return Ok(());
         }
 
@@ -4368,6 +4379,22 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
             .descriptor_table()
             .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
             .unwrap_or(FileDescriptorFlags::empty())
+    }
+
+    // Signalfd is not in run_on_raw_fd's subsystem list; check it
+    // first. Without this, Rust libstd's IoSafety check (which calls
+    // fcntl(fd, F_GETFD) on every OwnedFd drop) aborts the worker
+    // when the guest closes a signalfd, since the shim's fcntl path
+    // returns EBADF for unknown subsystems. That abort surfaces as
+    // sshd-in-litebox "Connection closed" mid-session whenever a
+    // signal-aware consumer (dropbear, tokio's signal_unix, etc.)
+    // tears down its signalfd. Captured by `PTY.dropbear_emul`.
+    {
+        let rds = files.raw_descriptor_store.read();
+        if let Ok(fd) = rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd) {
+            drop(rds);
+            return Ok(get_flags(global, &fd));
+        }
     }
 
     files.run_on_raw_fd(

@@ -92,24 +92,22 @@ enum ScenarioKind {
     /// be set immediately — dropbear and any TTY-aware consumer
     /// uses POLLHUP to detect peer-closed.
     SlaveCloseHup,
-    /// PTYR.poll_loop_post_sleep — exactly mimics dropbear's session
-    /// loop pattern. Parent polls master with a short (50ms) timeout
-    /// in a loop, reads on POLLIN, exits loop on POLLHUP. Child
-    /// writes 2 lines, sleeps 200ms, writes 3 more lines, exits.
-    ///
-    /// Distinct from `stdout_post_sleep`: that test reaps the child
-    /// FIRST then reads. This test reads CONCURRENTLY with the child
-    /// being alive — captures the case where dropbear sees POLLIN on
-    /// the first 2 lines, EAGAIN during the sleep, then needs to see
-    /// POLLIN again when the child resumes writing. If the broker
-    /// PTY's POLLIN notification only fires once per subscription
-    /// (or gets unsubscribed after first drain), the post-sleep
-    /// writes are lost.
-    ///
-    /// This is the actual Phase H "copilot -p prints nothing"
-    /// failure mode — the scripted bash test over ssh-into-litebox
-    /// captures only "L1, L2" and the channel closes mid-sleep.
+    /// PTYR.poll_loop_post_sleep — poll([master], short timeout) loop.
+    /// Captures the basic "drain master while child sleeps" invariant.
     PollLoopPostSleep,
+    /// PTYR.dropbear_emul — faithful dropbear session-loop emulation.
+    /// Parent polls `[master, signalfd(SIGCHLD)]` simultaneously,
+    /// reads master on POLLIN, drains and exits when SIGCHLD says the
+    /// child reaped AND a final non-blocking master drain returns
+    /// EOF/empty. Child exec's `/bin/sh -c 'echo;echo;sleep 1;echo;
+    /// echo;echo'` — the exact bash workload that drops L03..L05 under
+    /// dropbear-in-litebox.
+    ///
+    /// If `poll_loop_post_sleep` passes but this fails, the bug is
+    /// in the interaction between multiple readiness sources (the
+    /// signalfd SIGCHLD firing during the sleep changes the poll
+    /// wakeup pattern relative to master's POLLIN delivery).
+    DropbearEmul,
     /// PTYR.isatty — child calls `isatty(0/1/2)` post-exec and prints
     /// `isatty: 0=Y 1=Y 2=Y`. Confirms all three stdio fds are TTYs in
     /// the new worker after a non-PIE execve.
@@ -217,6 +215,11 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "dropbear_emul",
+        kind: ScenarioKind::DropbearEmul,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "isatty",
         kind: ScenarioKind::Isatty,
         per_binary_type: true,
@@ -264,6 +267,8 @@ const PTYR_SLAVE_CLOSE_HUP: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.slave_close_hup");
 const PTYR_POLL_LOOP_POST_SLEEP: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.poll_loop_post_sleep");
+const PTYR_DROPBEAR_EMUL: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.dropbear_emul");
 const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
 const PARENT_EXIT_THEN_CHILD_IO: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.parent_exit_then_child_io");
@@ -551,10 +556,6 @@ async fn handle_ptyr_poll_loop_post_sleep(
     let pty = Pty::open()?;
     ensure_slave_path(&pty)?;
     let pid = pty.fork_exec(&[args.target, "pty-poll-loop-post-sleep".into()], true)?;
-    // Dropbear-style session loop: poll(master, POLLIN|POLLHUP,
-    // 50ms) repeatedly; read on POLLIN; exit on POLLHUP. Do NOT reap
-    // child before draining — child is alive during the sleep
-    // between writes.
     let mut buf = Vec::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -575,7 +576,6 @@ async fn handle_ptyr_poll_loop_post_sleep(
             buf.extend_from_slice(&bytes);
         }
         if revents & libc::POLLHUP != 0 {
-            // Drain any remaining bytes the kernel has buffered.
             while let Some(bytes) = pty.try_read_now(4096)? {
                 if bytes.is_empty() {
                     break;
@@ -587,11 +587,148 @@ async fn handle_ptyr_poll_loop_post_sleep(
     }
     expect_exit_zero(pid)?;
     let s = String::from_utf8_lossy(&buf).to_string();
-    // Child writes L01..L05 with a sleep between L02 and L03. PTY
-    // OPOST: \n → \r\n.
     let expected = "L01\r\nL02\r\nL03\r\nL04\r\nL05\r\n";
     let detail = exact(&s, expected)?;
     Ok(PtyOut { detail })
+}
+
+async fn handle_ptyr_dropbear_emul(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // Block SIGCHLD so it's delivered via signalfd rather than as
+    // a signal handler — dropbear's exact pattern.
+    // SAFETY: sigfillset on a local sigset_t; sigprocmask is safe.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGCHLD);
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
+            return Err(format!(
+                "pthread_sigmask SIG_BLOCK SIGCHLD: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+    }
+    // SAFETY: signalfd creates a new fd from the mask; SFD_CLOEXEC|SFD_NONBLOCK make it safe to leak.
+    let sigfd_raw = unsafe { libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
+    if sigfd_raw < 0 {
+        return Err(format!("signalfd: {}", std::io::Error::last_os_error()).into());
+    }
+    // SAFETY: signalfd returned a valid fd we own.
+    let sigfd: OwnedFd = unsafe { OwnedFd::from_raw_fd(sigfd_raw) };
+
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-poll-loop-post-sleep".into()], true)?;
+
+    let mut buf = Vec::new();
+    let mut child_reaped: Option<i32> = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "dropbear-emul: timeout; reaped={child_reaped:?}; captured={:?}",
+                String::from_utf8_lossy(&buf)
+            )
+            .into());
+        }
+        let mut pollfds = [
+            libc::pollfd {
+                fd: pty.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: sigfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: pollfds is a valid array of 2 pollfd entries.
+        let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, 50) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("poll: {err}").into());
+        }
+        let m_revents = pollfds[0].revents;
+        let s_revents = pollfds[1].revents;
+        if m_revents & libc::POLLIN != 0
+            && let Some(bytes) = pty.try_read_now(4096)?
+        {
+            if !bytes.is_empty() {
+                buf.extend_from_slice(&bytes);
+            }
+        }
+        if s_revents & libc::POLLIN != 0 {
+            // Drain signalfd buffer.
+            let mut siginfo = [0u8; 128];
+            // SAFETY: signalfd_siginfo is 128 bytes; reading drains one entry.
+            let _ = unsafe {
+                libc::read(
+                    sigfd.as_raw_fd(),
+                    siginfo.as_mut_ptr().cast(),
+                    siginfo.len(),
+                )
+            };
+            // waitpid(WNOHANG) for any descendant; if our direct
+            // child is reaped, remember it but keep draining master.
+            loop {
+                let mut status: i32 = 0;
+                // SAFETY: waitpid is safe; WNOHANG won't block.
+                let w = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+                if w <= 0 {
+                    break;
+                }
+                if w == pid {
+                    child_reaped = Some(status);
+                }
+            }
+        }
+        if m_revents & libc::POLLHUP != 0 {
+            while let Some(bytes) = pty.try_read_now(4096)? {
+                if bytes.is_empty() {
+                    break;
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            break;
+        }
+        if child_reaped.is_some() {
+            // Child gone — do a final non-blocking master drain then exit.
+            while let Some(bytes) = pty.try_read_now(4096)? {
+                if bytes.is_empty() {
+                    break;
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            // One more poll(0) to see if any bytes are still queued.
+            let final_re = pty.poll_now_timeout(libc::POLLIN | libc::POLLHUP, 0)?;
+            if final_re & libc::POLLIN == 0 {
+                break;
+            }
+        }
+    }
+    // Restore signal mask.
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
+    }
+    let s = String::from_utf8_lossy(&buf).to_string();
+    let expected = "L01\r\nL02\r\nL03\r\nL04\r\nL05\r\n";
+    let detail = exact(&s, expected)?;
+    Ok(PtyOut {
+        detail: format!(
+            "{detail} reaped={}",
+            child_reaped
+                .map(|s| format!("{s:#x}"))
+                .unwrap_or_else(|| "none".to_string())
+        ),
+    })
 }
 
 async fn handle_ptyr_isatty(
@@ -686,6 +823,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(PTYR_POLL_AFTER_EXIT, handle_ptyr_poll_after_exit);
     register_handler!(PTYR_SLAVE_CLOSE_HUP, handle_ptyr_slave_close_hup);
     register_handler!(PTYR_POLL_LOOP_POST_SLEEP, handle_ptyr_poll_loop_post_sleep);
+    register_handler!(PTYR_DROPBEAR_EMUL, handle_ptyr_dropbear_emul);
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
     register_handler!(PARENT_EXIT_THEN_CHILD_IO, handle_parent_exit_then_child_io);
 
@@ -872,6 +1010,10 @@ async fn drive_target(
         }
         ScenarioKind::PollLoopPostSleep => {
             run.send_named_typed(handle, &PTYR_POLL_LOOP_POST_SLEEP, args)
+                .await?
+        }
+        ScenarioKind::DropbearEmul => {
+            run.send_named_typed(handle, &PTYR_DROPBEAR_EMUL, args)
                 .await?
         }
         ScenarioKind::Isatty => run.send_named_typed(handle, &PTYR_ISATTY, args).await?,
