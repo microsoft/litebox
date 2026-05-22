@@ -213,7 +213,7 @@ fn identify_direct_relocations(
                     R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => 4,
                     _ => {
                         #[cfg(debug_assertions)]
-                        panic!("Unsupported relocation type {:?}", rela.r_type);
+                        todo!("Unsupported relocation type {:?}", rela.r_type);
                         #[cfg(not(debug_assertions))]
                         {
                             crate::serial_println!("Unsupported relocation type {:?}", rela.r_type);
@@ -307,7 +307,7 @@ fn identify_indirect_relocations(
                     R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => 4,
                     _ => {
                         #[cfg(debug_assertions)]
-                        panic!("Unsupported relocation type {:?}", rela.r_type);
+                        todo!("Unsupported relocation type {:?}", rela.r_type);
                         #[cfg(not(debug_assertions))]
                         {
                             crate::serial_println!("Unsupported relocation type {:?}", rela.r_type);
@@ -401,9 +401,10 @@ pub fn verify_kernel_module_signature(
     #[allow(clippy::manual_assert)]
     if (digest_alg != ID_SHA_256 && digest_alg != ID_SHA_512) || (signature_alg != RSA_ENCRYPTION) {
         #[cfg(debug_assertions)]
-        panic!(
+        todo!(
             "Unsupported digest or signature algorithm: {:?}, {:?}",
-            digest_alg, signature_alg
+            digest_alg,
+            signature_alg
         );
         #[cfg(not(debug_assertions))]
         {
@@ -555,7 +556,7 @@ pub fn verify_kernel_pe_signature(
     #[allow(clippy::manual_assert)]
     if digest_algorithm_oid != ID_SHA_256 && digest_algorithm_oid != ID_SHA_512 {
         #[cfg(debug_assertions)]
-        panic!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
+        todo!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
         #[cfg(not(debug_assertions))]
         {
             crate::serial_println!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);

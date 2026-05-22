@@ -3,8 +3,6 @@
 
 //! Common implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
-#[cfg(not(debug_assertions))]
-use litebox::mm::linux::VmemProtectError;
 use litebox::{
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
@@ -149,7 +147,7 @@ pub fn sys_mprotect<
             #[cfg(debug_assertions)]
             todo!("Unsupported prot flags {:?}", prot);
             #[cfg(not(debug_assertions))]
-            return Err(Errno::EACCES);
+            return Err(Errno::EINVAL);
         }
     }
     .map_err(Errno::from)
@@ -204,7 +202,7 @@ pub fn sys_mremap<
         #[cfg(debug_assertions)]
         todo!("Unsupported flags {:?}", flags);
         #[cfg(not(debug_assertions))]
-        return Err(Errno::EACCES);
+        return Err(Errno::EINVAL);
     }
 
     unsafe {

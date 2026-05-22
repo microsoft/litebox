@@ -522,7 +522,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                         crate::serial_println!(
                             "BUG: {page:?} already mapped to {frame:?} instead of {target_frame:?}"
                         );
-                        return Err(MapToError::FrameAllocationFailed);
+                        return Err(MapToError::PageAlreadyMapped(
+                            PhysFrame::<Size4KiB>::containing_address(frame.start_address()),
+                        ));
                     }
                     continue;
                 }
