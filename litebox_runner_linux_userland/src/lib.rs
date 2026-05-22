@@ -3333,6 +3333,7 @@ mod tests {
             guest_euid: None,
             guest_gid: None,
             guest_egid: None,
+            controlling_pty: None,
             fork_restore: false,
             fork_restore_fd: None,
             fork_restore_ack_fd: None,

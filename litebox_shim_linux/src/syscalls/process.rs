@@ -9003,10 +9003,18 @@ impl<FS: ShimFS> Task<FS> {
         // Phase F.9 (2026-05-18): separate list for pipe-specific
         // transit releases. Drained after wait_worker_host returns
         // (worker B has exited) so the broker rc can reach 0 for the
-        // writer end and the reader gets HUP/EOF. Eventfd/signalfd/
-        // pty transit refs use the OTHER list and are NOT post-wait
-        // drained — they're cleaned up via worker-conn cleanup.
+        // writer end and the reader gets HUP/EOF.
         let mut broker_pipe_transit_release: alloc::vec::Vec<(
+            alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            >,
+            u64,
+        )> = alloc::vec::Vec::new();
+        // Broker PTY slave-close HUP has the same lifetime requirement as
+        // pipes: the emit-side transit ref must survive until the remote
+        // worker adopts the fd, but must be released after that worker exits
+        // so the broker can observe last-slave-close and notify the master.
+        let mut broker_pty_transit_release: alloc::vec::Vec<(
             alloc::sync::Arc<
                 dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
             >,
@@ -9200,6 +9208,7 @@ impl<FS: ShimFS> Task<FS> {
                     if releaser.dup_handle(handle_id).is_err() {
                         continue;
                     }
+                    broker_pty_transit_release.push((releaser, handle_id));
                     let role_char = match role {
                         litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master => 'm',
                         litebox_common_linux::broker_pty_provider::BrokerPtyRole::Slave => 's',
@@ -9335,6 +9344,9 @@ impl<FS: ShimFS> Task<FS> {
                 for (releaser, handle_id) in &broker_pipe_transit_release {
                     releaser.release(*handle_id);
                 }
+                for (releaser, handle_id) in &broker_pty_transit_release {
+                    releaser.release(*handle_id);
+                }
                 signal_on_error(&vfork_info);
                 Errno::ENOMEM
             })?;
@@ -9387,10 +9399,9 @@ impl<FS: ShimFS> Task<FS> {
 
         // Phase 2.F follow-up: the placeholder is a stub that just waits
         // for the remote worker — it has no further use for any inherited
-        // fds. Close every non-stdio fd in the placeholder so OFD refcounts
-        // drop. This lets the parent's read on the spawn-helper pipe (or
-        // any other pipe whose write end was shared via the fork-copy)
-        // observe EOF.
+        // fds. Close every fd in the placeholder so OFD/broker refcounts
+        // drop. This lets parent-side readers observe EOF/HUP, including
+        // PTY masters waiting for the migrated child's stdio slave to close.
         //
         // Some FD_CLOEXEC flags can fail to propagate through
         // `duplicate_raw_fd`'s metadata copy (observed: stderr pipe ends
@@ -9404,9 +9415,6 @@ impl<FS: ShimFS> Task<FS> {
             let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
             drop(files);
             for raw_fd in alive_fds {
-                if raw_fd <= 2 {
-                    continue;
-                }
                 let _ = self.do_close(raw_fd);
             }
         }
@@ -9434,12 +9442,14 @@ impl<FS: ShimFS> Task<FS> {
         // worker itself exits — which is too late, the parent's
         // reader times out.
         //
-        // Only pipe transit refs are drained here. Eventfd/signalfd/
-        // pty transit refs stay alive (they're cleaned via worker-
-        // conn cleanup); releasing them here breaks PIDF tests where
-        // the pidfd subscription needs the broker state alive past
-        // exec.
+        // Pipe and PTY transit refs are drained here. Eventfd/signalfd
+        // refs stay alive (they're cleaned via worker-conn cleanup);
+        // releasing them here breaks PIDF tests where the pidfd subscription
+        // needs the broker state alive past exec.
         for (releaser, handle_id) in broker_pipe_transit_release.drain(..) {
+            releaser.release(handle_id);
+        }
+        for (releaser, handle_id) in broker_pty_transit_release.drain(..) {
             releaser.release(handle_id);
         }
 
