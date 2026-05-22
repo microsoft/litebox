@@ -13,6 +13,7 @@ unsafe extern "system" {
 #[test]
 fn loads_minimal_pe_without_imports() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no_import");
+    let _ = std::fs::remove_dir_all(&test_dir);
     std::fs::create_dir_all(&test_dir).unwrap();
     let pe_path = build_no_import_pe(&test_dir);
     println!(
@@ -26,11 +27,19 @@ fn loads_minimal_pe_without_imports() {
             dll_path.display()
         );
     }
+    // ntdll's NLS init opens these locale tables before reaching the test's
+    // `NtTerminateProcess` syscall; copy them verbatim from the host.
+    for nls_name in ["c_1252.nls", "c_437.nls", "c_10000.nls", "locale.nls"] {
+        let nls_path = copy_host_system32_file(&test_dir, nls_name);
+        println!("Copied {nls_name} fixture at `{}`", nls_path.display());
+    }
     let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no_import.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
     let mut command =
         std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    // Verbose log for failure triage; not load-bearing for any assertion.
+    command.env("LITEBOX_LOG", "debug");
     command.args([
         "--initial-files",
         tar_path.to_str().unwrap(),
@@ -161,10 +170,8 @@ fn nt_terminate_process_syscall_number() -> u32 {
 }
 
 fn build_rewritten_system_dll(test_dir: &std::path::Path, dll_name: &str) -> std::path::PathBuf {
-    let system32_dir = test_dir.join("Windows").join("System32");
-    std::fs::create_dir_all(&system32_dir).unwrap();
-    let dll_path = system32_dir.join(dll_name);
-    let host_dll = std::fs::read(host_system32_dll_path(dll_name))
+    let dll_path = fixture_system32_path(test_dir, dll_name);
+    let host_dll = std::fs::read(host_system32_file_path(dll_name))
         .unwrap_or_else(|error| panic!("failed to read host {dll_name}: {error}"));
     let rewritten = match litebox_syscall_rewriter::rewrite_binary(&host_dll, None) {
         Ok(rewritten) => rewritten,
@@ -177,14 +184,27 @@ fn build_rewritten_system_dll(test_dir: &std::path::Path, dll_name: &str) -> std
     dll_path
 }
 
-fn host_system32_dll_path(dll_name: &str) -> std::path::PathBuf {
+fn copy_host_system32_file(test_dir: &std::path::Path, file_name: &str) -> std::path::PathBuf {
+    let fixture_path = fixture_system32_path(test_dir, file_name);
+    std::fs::copy(host_system32_file_path(file_name), &fixture_path)
+        .unwrap_or_else(|error| panic!("failed to copy host {file_name}: {error}"));
+    fixture_path
+}
+
+fn fixture_system32_path(test_dir: &std::path::Path, file_name: &str) -> std::path::PathBuf {
+    let system32_dir = test_dir.join("Windows").join("System32");
+    std::fs::create_dir_all(&system32_dir).unwrap();
+    system32_dir.join(file_name)
+}
+
+fn host_system32_file_path(file_name: &str) -> std::path::PathBuf {
     std::env::var_os("SystemRoot")
         .map_or_else(
             || std::path::PathBuf::from(r"C:\Windows"),
             std::path::PathBuf::from,
         )
         .join("System32")
-        .join(dll_name)
+        .join(file_name)
 }
 
 fn create_tar_with_dir(test_dir: &std::path::Path, tar_path: &std::path::Path) {

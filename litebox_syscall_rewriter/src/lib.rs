@@ -271,6 +271,16 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
     }
 
     let mut trampoline_data = Vec::from(trampoline.unwrap_or(0).to_le_bytes());
+    // Windows ntdll packs some syscall stubs too tightly for the generic
+    // five-byte jump patcher; keep that PE-specific shape out of the generic path.
+    let patched_dense_windows_stubs = patch_dense_windows_syscall_stubs_in_sections(
+        Arch::X86_64,
+        buf,
+        &text_sections,
+        trampoline_base_addr,
+        trampoline_base_addr,
+        &mut trampoline_data,
+    )?;
     let patch_result = patch_syscalls_in_sections(
         Arch::X86_64,
         buf,
@@ -280,7 +290,7 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
         &mut trampoline_data,
     )?;
 
-    if !patch_result.found_syscall {
+    if !patched_dense_windows_stubs && !patch_result.found_syscall {
         return Ok(buf.to_vec());
     }
 
@@ -402,6 +412,41 @@ fn patch_syscalls_in_sections(
         found_syscall,
         skipped_addrs,
     })
+}
+
+fn patch_dense_windows_syscall_stubs_in_sections(
+    arch: Arch,
+    buf: &mut [u8],
+    text_sections: &[TextSectionInfo],
+    trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+) -> Result<bool> {
+    let control_transfer_targets = get_control_transfer_targets(arch, &*buf, text_sections)?;
+    let mut patched_any = false;
+
+    for section in text_sections {
+        let section_data = section_slice_mut(buf, section)?;
+        let instructions = decode_section_instructions(arch, section_data, section.vaddr)?;
+        for (i, inst) in instructions.iter().enumerate() {
+            if inst.code() != iced_x86::Code::Syscall {
+                continue;
+            }
+
+            patched_any |= patch_dense_windows_syscall_stub(
+                &control_transfer_targets,
+                section.vaddr,
+                section_data,
+                trampoline_base_addr,
+                syscall_entry_addr,
+                trampoline_data,
+                &instructions,
+                i,
+            )?;
+        }
+    }
+
+    Ok(patched_any)
 }
 
 fn append_trampoline_footer(
@@ -571,18 +616,6 @@ fn hook_syscalls_in_section(
             ) {
                 Ok(()) => {}
                 Err(InternalError::InsufficientBytesBeforeOrAfter) => {
-                    if hook_dense_windows_syscall_stub(
-                        control_transfer_targets,
-                        section_base_addr,
-                        section_data,
-                        trampoline_base_addr,
-                        syscall_entry_addr,
-                        trampoline_data,
-                        &instructions,
-                        i,
-                    )? {
-                        continue;
-                    }
                     // Replace the unpatchable syscall with ICEBP;HLT so it
                     // traps instead of escaping to the host kernel.
                     replace_with_trap(section_data, section_base_addr, inst);
@@ -830,7 +863,7 @@ fn replace_with_trap(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn hook_dense_windows_syscall_stub(
+fn patch_dense_windows_syscall_stub(
     control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
@@ -839,7 +872,7 @@ fn hook_dense_windows_syscall_stub(
     trampoline_data: &mut Vec<u8>,
     instructions: &[iced_x86::Instruction],
     inst_index: usize,
-) -> core::result::Result<bool, InternalError> {
+) -> Result<bool> {
     if inst_index < 2 {
         return Ok(false);
     }

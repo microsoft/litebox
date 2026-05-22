@@ -636,12 +636,6 @@ fn parse_headers<F: ReadAt>(
             }
         })
         .collect();
-    for dir in &data_directories {
-        let end = checked_add!(dir.virtual_address, dir.size, PeParseError::Overflow)?;
-        if (end as usize) > image.size_of_image {
-            return Err(PeParseError::UnsupportedImage);
-        }
-    }
 
     // Section headers sit at `nt_offset + 4 (signature) + size_of::<ImageFileHeader>() + size_of_optional_header`.
     let num_sections = nt.file_header.number_of_sections.get(LE) as usize;
