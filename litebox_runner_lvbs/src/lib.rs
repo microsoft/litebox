@@ -44,8 +44,8 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{
-    CreationReservation, SessionIdGuard, SessionManager, SessionTarget, TaInstance,
-    allocate_session_id,
+    ActiveSessionGuard, CreationReservation, SessionEntry, SessionIdGuard, SessionManager,
+    SessionTarget, TaInstance, allocate_session_id,
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
@@ -359,31 +359,23 @@ unsafe fn delete_task_page_table(task_pt_id: usize) -> Result<(), OpteeSmcReturn
 }
 
 /// Guard that restores the base page table when leaving a TA page table scope.
-struct TaskPageTableGuard {
-    active: bool,
-}
+///
+/// `switch_to_base_page_table` is an idempotent CR3 write, so it is fine if
+/// teardown paths (which switch to base internally before deleting the task
+/// page table) run before this guard's `Drop` — the redundant write at drop
+/// time is benign.
+struct TaskPageTableGuard;
 
 impl TaskPageTableGuard {
     fn enter(task_pt_id: usize) -> Result<Self, OpteeSmcReturnCode> {
         unsafe { switch_to_task_page_table(task_pt_id)? };
-        Ok(Self { active: true })
-    }
-
-    fn leave(mut self) {
-        unsafe { switch_to_base_page_table() };
-        self.active = false;
-    }
-
-    fn deactivate(&mut self) {
-        self.active = false;
+        Ok(Self)
     }
 }
 
 impl Drop for TaskPageTableGuard {
     fn drop(&mut self) {
-        if self.active {
-            unsafe { switch_to_base_page_table() };
-        }
+        unsafe { switch_to_base_page_table() };
     }
 }
 
@@ -407,15 +399,6 @@ unsafe fn teardown_ta_page_table(shim: &litebox_shim_optee::OpteeShim, task_pt_i
         // Now delete the TA's page table without memory leak.
         let _ = delete_task_page_table(task_pt_id);
     }
-}
-
-unsafe fn teardown_active_ta_page_table(
-    guard: &mut TaskPageTableGuard,
-    shim: &litebox_shim_optee::OpteeShim,
-    task_pt_id: usize,
-) {
-    guard.deactivate();
-    unsafe { teardown_ta_page_table(shim, task_pt_id) };
 }
 
 /// Handler for OP-TEE SMC calls.
@@ -574,15 +557,13 @@ fn handle_open_session(
         Err(e) => Err(e),
     };
 
-    // If we conservatively held the per-UUID lock for an unknown TA that
-    // turned out to be multi-instance, evict the lock entry we created.
-    // Subsequent OpenSessions for this UUID skip the lock entirely (their
-    // `get_known_flags` will now return the multi-instance flags), so the
-    // entry would otherwise leak.
-    if single_instance_lock.is_some()
-        && let Some(actual_flags) = session_manager().get_known_flags(&ta_uuid)
-        && !actual_flags.is_single_instance()
-    {
+    // If we conservatively held the per-UUID lock but no single-instance TA
+    // ended up cached under this UUID, evict the lock entry we just inserted.
+    // This covers (a) the TA turned out to be multi-instance and (b) load
+    // failed entirely. The helper's cache-empty check is the safety guard:
+    // if a single-instance TA is now cached for this UUID, the entry is in
+    // legitimate use and `evict_single_instance_lock_if_unused` is a no-op.
+    if single_instance_lock.is_some() {
         session_manager().evict_single_instance_lock_if_unused(&ta_uuid);
     }
 
@@ -621,7 +602,7 @@ fn open_session_single_instance(
 
     let ta_flags = instance_arc.loaded_program.ta_flags;
 
-    let mut task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
+    let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
 
     // Load TA context with parameters for OpenSession - pass actual session_id
     instance_arc
@@ -697,7 +678,7 @@ fn open_session_single_instance(
             // Safety: We are about to tear down this TA instance;
             // no references to user-space memory will be held afterwards.
             unsafe {
-                teardown_active_ta_page_table(&mut task_pt_guard, &instance_arc.shim, task_pt_id)
+                teardown_ta_page_table(&instance_arc.shim, task_pt_id);
             };
 
             // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
@@ -739,7 +720,7 @@ fn open_session_single_instance(
             // Safety: We are about to tear down this TA instance;
             // no references to user-space memory will be held afterwards.
             unsafe {
-                teardown_active_ta_page_table(&mut task_pt_guard, &instance_arc.shim, task_pt_id)
+                teardown_ta_page_table(&instance_arc.shim, task_pt_id);
             };
         } else {
             let _ = session_id_guard.disarm();
@@ -781,7 +762,7 @@ fn open_session_new_instance(
 
     debug_serial_println!("Created task page table ID: {}", task_pt_id);
 
-    let mut task_pt_guard = TaskPageTableGuard::enter(task_pt_id).inspect_err(|_| {
+    let task_pt_guard = TaskPageTableGuard::enter(task_pt_id).inspect_err(|_| {
         // Safety: switch_to_task_page_table failed, so task page table is not active.
         let _ = unsafe { delete_task_page_table(task_pt_id) };
     })?;
@@ -790,7 +771,7 @@ fn open_session_new_instance(
     // Use SessionIdGuard to ensure the ID is recycled on any error path
     // (before it is registered with the session manager).
     let Some(session_id) = allocate_session_id() else {
-        task_pt_guard.leave();
+        drop(task_pt_guard);
         let _ = unsafe { delete_task_page_table(task_pt_id) };
         return Err(OpteeSmcReturnCode::EBusy);
     };
@@ -811,7 +792,7 @@ fn open_session_new_instance(
         .map_err(|_| {
             // Safety: We are about to tear down this TA instance;
             // no references to user-space memory will be held afterwards.
-            unsafe { teardown_active_ta_page_table(&mut task_pt_guard, &shim, task_pt_id) };
+            unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::ENomem
         })?,
     );
@@ -855,7 +836,7 @@ fn open_session_new_instance(
 
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
-        unsafe { teardown_active_ta_page_table(&mut task_pt_guard, &shim, task_pt_id) };
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         write_result?;
         return Ok(());
@@ -865,7 +846,7 @@ fn open_session_new_instance(
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
-        unsafe { teardown_active_ta_page_table(&mut task_pt_guard, &shim, task_pt_id) };
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::EBadCmd
     })?;
     loaded_program
@@ -881,7 +862,7 @@ fn open_session_new_instance(
         .map_err(|_| {
             // Safety: We are about to tear down this TA instance;
             // no references to user-space memory will be held afterwards.
-            unsafe { teardown_active_ta_page_table(&mut task_pt_guard, &shim, task_pt_id) };
+            unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::EBadCmd
         })?;
 
@@ -898,7 +879,7 @@ fn open_session_new_instance(
     let params_address = loaded_program.params_address.ok_or_else(|| {
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
-        unsafe { teardown_active_ta_page_table(&mut task_pt_guard, &shim, task_pt_id) };
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::EBadAddr
     })?;
     let ta_params = UserConstPtr::<UteeParams>::from_usize(params_address)
@@ -906,7 +887,7 @@ fn open_session_new_instance(
         .ok_or_else(|| {
             // Safety: We are about to tear down this TA instance;
             // no references to user-space memory will be held afterwards.
-            unsafe { teardown_active_ta_page_table(&mut task_pt_guard, &shim, task_pt_id) };
+            unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::EBadAddr
         })?;
 
@@ -934,7 +915,7 @@ fn open_session_new_instance(
 
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
-        unsafe { teardown_active_ta_page_table(&mut task_pt_guard, &shim, task_pt_id) };
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         write_result?;
         return Ok(());
@@ -956,7 +937,7 @@ fn open_session_new_instance(
     .inspect_err(|_| {
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
-        unsafe { teardown_active_ta_page_table(&mut task_pt_guard, &shim, task_pt_id) };
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
     })?;
 
     // Success: create TA instance - loaded_program is already boxed, no move happens
@@ -981,6 +962,37 @@ fn open_session_new_instance(
         ta_flags.is_single_instance()
     );
 
+    Ok(())
+}
+
+/// Tear down a `Dead` session entry observed at Invoke/Close handler entry.
+///
+/// Consumes `active_guard` so it is dropped immediately after `unregister_session`
+/// recycles the id — the ordering matters: subsequent SMCs for `session_id` then
+/// see the new session (or `None`), neither of which depends on our guard.
+///
+/// The caller's per-UUID lock guard (if any) stays in its own scope, so the
+/// lock remains held across `evict_single_instance_lock_if_unused`.
+fn finalize_dead_session(
+    session_id: u32,
+    session_entry: &SessionEntry,
+    active_guard: ActiveSessionGuard<'_>,
+    msg_args: &mut OpteeMsgArgs,
+    msg_args_phys_addr: u64,
+    return_code: TeeResult,
+    log_prefix: &str,
+) -> Result<(), OpteeSmcReturnCode> {
+    session_manager().unregister_session(session_id);
+    drop(active_guard);
+    session_manager().evict_single_instance_lock_if_unused(&session_entry.ta_uuid);
+    msg_args.ret = return_code;
+    msg_args.ret_origin = TeeOrigin::Tee;
+    write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
+    debug_serial_println!(
+        "{}: session_id={} on dead TA session",
+        log_prefix,
+        session_id
+    );
     Ok(())
 }
 
@@ -1028,26 +1040,19 @@ fn handle_invoke_command(
         .get_session_entry(session_id)
         .ok_or(OpteeSmcReturnCode::EBadCmd)?;
     let SessionTarget::Live(instance_arc) = session_entry.target.clone() else {
-        session_manager().unregister_session(session_id);
-        // Release the active-session slot before the recycled id can race a
-        // new OpenSession; subsequent SMCs for `session_id` see the new
-        // session (or `None`), neither of which depends on our guard.
-        drop(active_guard);
-        // We may have just resurrected the per-UUID lock entry via
-        // `single_instance_lock()`. If the cached TA is already gone, drop it.
-        session_manager().evict_single_instance_lock_if_unused(&session_entry.ta_uuid);
-        msg_args.ret = TeeResult::TargetDead;
-        msg_args.ret_origin = TeeOrigin::Tee;
-        write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
-        debug_serial_println!(
-            "InvokeCommand: session_id={} on dead TA session",
-            session_id
+        return finalize_dead_session(
+            session_id,
+            &session_entry,
+            active_guard,
+            msg_args,
+            msg_args_phys_addr,
+            TeeResult::TargetDead,
+            "InvokeCommand",
         );
-        return Ok(());
     };
     let task_pt_id = instance_arc.task_page_table_id;
 
-    let mut task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
+    let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
 
     debug_serial_println!(
         "InvokeCommand: session_id={}, task_pt_id={}, cmd_id={}",
@@ -1133,7 +1138,7 @@ fn handle_invoke_command(
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
         unsafe {
-            teardown_active_ta_page_table(&mut task_pt_guard, &instance_arc.shim, task_pt_id)
+            teardown_ta_page_table(&instance_arc.shim, task_pt_id);
         };
 
         debug_serial_println!(
@@ -1190,26 +1195,19 @@ fn handle_close_session(
         .get_session_entry(session_id)
         .ok_or(OpteeSmcReturnCode::EBadCmd)?;
     let SessionTarget::Live(instance_arc) = session_entry.target.clone() else {
-        session_manager().unregister_session(session_id);
-        // Release the active-session slot before the recycled id can race a
-        // new OpenSession; subsequent SMCs for `session_id` see the new
-        // session (or `None`), neither of which depends on our guard.
-        drop(active_guard);
-        // We may have just resurrected the per-UUID lock entry via
-        // `single_instance_lock()`. If the cached TA is already gone, drop it.
-        session_manager().evict_single_instance_lock_if_unused(&session_entry.ta_uuid);
-        msg_args.ret = TeeResult::Success;
-        msg_args.ret_origin = TeeOrigin::Tee;
-        write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
-        debug_serial_println!(
-            "CloseSession complete: session_id={}, dead TA session",
-            session_id
+        return finalize_dead_session(
+            session_id,
+            &session_entry,
+            active_guard,
+            msg_args,
+            msg_args_phys_addr,
+            TeeResult::Success,
+            "CloseSession",
         );
-        return Ok(());
     };
     let task_pt_id = instance_arc.task_page_table_id;
 
-    let mut task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
+    let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
 
     // Load TA context for CloseSession (no params, no cmd_id) - pass actual session_id
     instance_arc
@@ -1280,7 +1278,7 @@ fn handle_close_session(
             // Safety: We are about to tear down this TA instance;
             // no references to user-space memory will be held afterwards.
             unsafe {
-                teardown_active_ta_page_table(&mut task_pt_guard, &instance_arc.shim, task_pt_id)
+                teardown_ta_page_table(&instance_arc.shim, task_pt_id);
             };
 
             debug_serial_println!(
