@@ -2623,8 +2623,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
-            Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
             Sysno::pause => SyscallRequest::Pause,
+            Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

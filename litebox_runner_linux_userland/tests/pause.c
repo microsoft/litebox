@@ -158,69 +158,6 @@ int test_pause_ignores_ignored_signal(void) {
     return 0;
 }
 
-static volatile sig_atomic_t usr1_count = 0;
-
-static void usr1_handler(int sig) {
-    (void)sig;
-    usr1_count++;
-}
-
-// A signal that is *already* pending when pause() is entered must still
-// wake it. We block SIGUSR1, raise it (queued, undelivered), install a
-// catching handler, then unblock immediately before pause(). pause() must
-// observe the still-pending signal and return -1/EINTR.
-int test_pause_wakes_on_already_pending_signal(void) {
-    struct sigaction sa;
-    sa.sa_handler = usr1_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    TEST_ASSERT(sigaction(SIGUSR1, &sa, NULL) == 0, "sigaction(SIGUSR1) failed");
-
-    sigset_t block_set, old_set;
-    sigemptyset(&block_set);
-    sigaddset(&block_set, SIGUSR1);
-    TEST_ASSERT(sigprocmask(SIG_BLOCK, &block_set, &old_set) == 0,
-                "sigprocmask(BLOCK) failed");
-
-    usr1_count = 0;
-    TEST_ASSERT(raise(SIGUSR1) == 0, "raise(SIGUSR1) failed");
-    TEST_ASSERT(usr1_count == 0, "SIGUSR1 should still be blocked, not delivered");
-
-    // Unblock — the still-pending signal becomes deliverable. The next
-    // pause() must see it and return.
-    TEST_ASSERT(sigprocmask(SIG_SETMASK, &old_set, NULL) == 0,
-                "sigprocmask(RESTORE) failed");
-    // The handler may run during the sigprocmask call itself, before
-    // pause is entered. Either way pause must not block indefinitely:
-    // if the signal already ran, pause sees no pending signal and would
-    // normally block forever, so arm an alarm as a safety net to bound
-    // the test.
-    struct sigaction sa_alrm;
-    sa_alrm.sa_handler = alarm_handler;
-    sigemptyset(&sa_alrm.sa_mask);
-    sa_alrm.sa_flags = 0;
-    TEST_ASSERT(sigaction(SIGALRM, &sa_alrm, NULL) == 0, "sigaction(SIGALRM) failed");
-    alarm_count = 0;
-    alarm(2);
-
-    errno = 0;
-    int ret = pause();
-    int saved_errno = errno;
-    alarm(0);
-
-    TEST_ASSERT(ret == -1, "pause() must return -1");
-    TEST_ASSERT(saved_errno == EINTR, "pause() must set errno to EINTR");
-    TEST_ASSERT(usr1_count == 1, "SIGUSR1 handler must have run exactly once");
-
-    sa.sa_handler = SIG_DFL;
-    sigaction(SIGUSR1, &sa, NULL);
-    sa_alrm.sa_handler = SIG_DFL;
-    sigaction(SIGALRM, &sa_alrm, NULL);
-
-    printf("pause_wakes_on_already_pending_signal: PASS\n");
-    return 0;
-}
-
 int main(void) {
     printf("Starting pause tests...\n");
 
@@ -228,7 +165,6 @@ int main(void) {
     if (test_pause_raw_syscall() != 0) return 1;
     if (test_pause_not_restarted_under_sa_restart() != 0) return 1;
     if (test_pause_ignores_ignored_signal() != 0) return 1;
-    if (test_pause_wakes_on_already_pending_signal() != 0) return 1;
 
     printf("All pause tests passed!\n");
     return 0;

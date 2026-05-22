@@ -1852,6 +1852,54 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_pause_wakes_on_pending_signal() {
+        use litebox_common_linux::{
+            PtRegs,
+            errno::Errno,
+            signal::{SigSet, SigmaskHow, Signal},
+        };
+
+        let task = crate::syscalls::tests::init_platform(None);
+        <litebox_platform_multiplex::Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            let block_set = SigSet::empty().with(Signal::SIGUSR1);
+            task.sys_rt_sigprocmask(
+                SigmaskHow::SIG_BLOCK,
+                Some(crate::ConstPtr::from_ptr(&raw const block_set)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .expect("block SIGUSR1 failed");
+
+            assert_eq!(task.sys_alarm(1).unwrap(), 0);
+            task.sys_tkill(task.tid, Signal::SIGUSR1.as_i32())
+                .expect("tkill failed");
+            assert!(!task.has_pending_signals(), "blocked SIGUSR1 should not be deliverable");
+
+            let mut regs = PtRegs::default();
+            task.process_signals(&mut regs);
+            assert!(!task.has_pending_signals(), "blocked SIGUSR1 should remain undeliverable");
+
+            task.sys_rt_sigprocmask(
+                SigmaskHow::SIG_UNBLOCK,
+                Some(crate::ConstPtr::from_ptr(&raw const block_set)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .expect("unblock SIGUSR1 failed");
+
+            assert_eq!(task.sys_pause(), Err(Errno::EINTR));
+            task.sys_alarm(0).unwrap();
+
+            let pending = task.pending_signal_set();
+            assert!(pending.contains(Signal::SIGUSR1), "expected SIGUSR1 pending");
+            assert!(
+                !pending.contains(Signal::SIGALRM),
+                "SIGALRM must not be what woke pause()"
+            );
+        });
+    }
+
     /// Setting alarm with SIG_IGN for SIGALRM: a blocking operation is still
     /// interrupted, but `process_signals` discards the signal.
     #[test]
