@@ -510,8 +510,7 @@ impl SessionManager {
     }
 
     /// Remove a single-instance TA from the cache only if the currently
-    /// cached `Arc` is the same as `expected`, and evict the per-UUID
-    /// serialization lock so its memory is reclaimed.
+    /// cached `Arc` is the same as `expected`.
     ///
     /// Callers tearing down on TA panic must have already called
     /// [`SessionMap::mark_sessions_dead_for_instance`] before invoking this,
@@ -524,37 +523,17 @@ impl SessionManager {
         uuid: &TeeUuid,
         expected: &Arc<TaInstance>,
     ) -> bool {
-        let removed = self.single_instance_cache.remove_if_same(uuid, expected);
-        if removed {
-            self.single_instance_locks.lock().remove(uuid);
-        }
-        removed
+        self.single_instance_cache.remove_if_same(uuid, expected)
     }
 
-    /// Evict the per-UUID serialization lock entry if no single-instance TA is
-    /// currently cached under that UUID.
+    /// Keep per-UUID locks for the lifetime of the manager.
     ///
-    /// Two cleanup scenarios use this:
-    ///
-    /// 1. **Late stale Invoke/Close on a `Dead` session.** The cached instance
-    ///    was torn down earlier (which evicted the lock entry), but our call
-    ///    to [`Self::single_instance_lock`] resurrected the entry via
-    ///    `or_insert_with`. Evicting it on the way out keeps the lock map
-    ///    bounded.
-    ///
-    /// 2. **First OpenSession of a previously-unknown TA that turns out to be
-    ///    multi-instance.** The OpenSession handler conservatively assumes
-    ///    single-instance when flags are unknown and grabs the per-UUID lock.
-    ///    Once the TA loads and we learn it's actually multi-instance, the
-    ///    entry serves no future purpose and would otherwise leak.
-    ///
-    /// The cache emptiness check is the safety guard: if the cache still has
-    /// an instance for this UUID, the entry is in legitimate use and we leave
-    /// it alone.
+    /// Replacing a lock while another core still holds the old one would let a
+    /// racing Open/Invoke/Close path bypass serialization for the same UUID.
+    /// This is intentionally a no-op, matching `known_flags` as per-UUID
+    /// lifecycle metadata retained for observed TAs.
     pub fn evict_single_instance_lock_if_unused(&self, uuid: &TeeUuid) {
-        if self.single_instance_cache.get(uuid).is_none() {
-            self.single_instance_locks.lock().remove(uuid);
-        }
+        let _ = uuid;
     }
 
     /// Get the total count of unique TA instances (for limit checking).
