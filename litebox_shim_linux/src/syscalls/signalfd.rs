@@ -131,6 +131,14 @@ impl SignalfdFile {
     pub(crate) fn get_status(&self) -> OFlags {
         OFlags::from_bits(self.status.load(Ordering::Relaxed)).unwrap() & OFlags::STATUS_FLAGS_MASK
     }
+
+    pub(crate) fn set_status(&self, flags: OFlags) {
+        let access = self.get_status() & (OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR);
+        self.status.store(
+            (access | (flags & OFlags::STATUS_FLAGS_MASK)).bits(),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 impl IOPollable for SignalfdFile {

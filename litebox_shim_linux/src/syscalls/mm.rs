@@ -226,9 +226,8 @@ impl<FS: ShimFS> Task<FS> {
         let raw_fd = usize::try_from(u32::try_from(fd).map_err(|_| Errno::EBADF)?)
             .map_err(|_| Errno::EBADF)?;
         let files = self.files.borrow();
-        files.run_on_raw_fd(
-            raw_fd,
-            |typed_fd| {
+        files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(typed_fd) => {
                 let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
                 if status.file_type != litebox::fs::FileType::RegularFile {
                     return Err(Errno::ENODEV);
@@ -239,17 +238,18 @@ impl<FS: ShimFS> Task<FS> {
                     .read(typed_fd, &mut probe, Some(0))
                     .map_err(Errno::from)?;
                 Ok(())
-            },
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-        )?
+            }
+            crate::RawFdRef::Net(_) => Err(Errno::ENODEV),
+            crate::RawFdRef::Pipes(_) => Err(Errno::ENODEV),
+            crate::RawFdRef::Eventfd(_) => Err(Errno::ENODEV),
+            crate::RawFdRef::Epoll(_) => Err(Errno::ENODEV),
+            crate::RawFdRef::Unix(_) => Err(Errno::ENODEV),
+            crate::RawFdRef::HostPipe(_) => Err(Errno::ENODEV),
+            crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENODEV),
+            crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENODEV),
+            crate::RawFdRef::BrokerPty(_) => Err(Errno::ENODEV),
+            crate::RawFdRef::Signalfd(_) => Err(Errno::ENODEV),
+        })?
     }
 
     // ── End of internal fd helpers ─────────────────────────────────────
@@ -261,19 +261,19 @@ impl<FS: ShimFS> Task<FS> {
         };
         let files = self.files.borrow();
         files
-            .run_on_raw_fd(
-                raw_fd,
-                |typed_fd| files.fs.fd_path(typed_fd),
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-            )
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(typed_fd) => files.fs.fd_path(typed_fd),
+                crate::RawFdRef::Net(_) => None,
+                crate::RawFdRef::Pipes(_) => None,
+                crate::RawFdRef::Eventfd(_) => None,
+                crate::RawFdRef::Epoll(_) => None,
+                crate::RawFdRef::Unix(_) => None,
+                crate::RawFdRef::HostPipe(_) => None,
+                crate::RawFdRef::BrokerPipe(_) => None,
+                crate::RawFdRef::BrokerSocketPair(_) => None,
+                crate::RawFdRef::BrokerPty(_) => None,
+                crate::RawFdRef::Signalfd(_) => None,
+            })
             .ok()
             .flatten()
     }
@@ -921,19 +921,19 @@ impl<FS: ShimFS> Task<FS> {
         let raw_fd = fd;
 
         let static_data = files
-            .run_on_raw_fd(
-                raw_fd,
-                |typed_fd| files.fs.get_static_backing_data(typed_fd),
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-            )
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(typed_fd) => files.fs.get_static_backing_data(typed_fd),
+                crate::RawFdRef::Net(_) => None,
+                crate::RawFdRef::Pipes(_) => None,
+                crate::RawFdRef::Eventfd(_) => None,
+                crate::RawFdRef::Epoll(_) => None,
+                crate::RawFdRef::Unix(_) => None,
+                crate::RawFdRef::HostPipe(_) => None,
+                crate::RawFdRef::BrokerPipe(_) => None,
+                crate::RawFdRef::BrokerSocketPair(_) => None,
+                crate::RawFdRef::BrokerPty(_) => None,
+                crate::RawFdRef::Signalfd(_) => None,
+            })
             .ok()??;
 
         if offset > static_data.len() {
