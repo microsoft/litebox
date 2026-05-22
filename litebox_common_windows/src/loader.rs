@@ -25,11 +25,11 @@ const MAX_SECTIONS: usize = 96;
 #[derive(Debug)]
 pub struct PeParsedFile {
     /// Basic image metadata from the PE optional and COFF headers.
-    image: PeImageInfo,
+    pub image: PeImageInfo,
     /// Raw PE section headers in file order.
     sections: Vec<pe::ImageSectionHeader>,
     /// Data directory entries indexed by `IMAGE_DIRECTORY_ENTRY_*`.
-    data_directories: Vec<PeDataDirectory>,
+    pub data_directories: Vec<PeDataDirectory>,
     trampoline: Option<PeTrampolineInfo>,
 }
 
@@ -167,6 +167,12 @@ impl PeParsedFile {
         })
     }
 
+    /// Returns whether the image has a parsed LiteBox syscall trampoline.
+    #[must_use]
+    pub fn has_trampoline(&self) -> bool {
+        self.trampoline.is_some()
+    }
+
     /// Load the PE image into memory.
     ///
     /// This maps PE headers and sections into their image locations,
@@ -177,6 +183,18 @@ impl PeParsedFile {
         &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
+    ) -> Result<MappingInfo, PeLoadError<M::Error>> {
+        self.load_with_writable_sections(mapper, mem, &[])
+    }
+
+    /// Load the PE image into memory, keeping selected sections writable.
+    ///
+    /// This is intended for target-specific loader data such as ntdll's `.mrdata`.
+    pub fn load_with_writable_sections<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        writable_section_names: &[&[u8]],
     ) -> Result<MappingInfo, PeLoadError<M::Error>> {
         let preferred_base = self.image.image_base;
         let image_size = checked_next_multiple_of!(
@@ -271,7 +289,7 @@ impl PeParsedFile {
                 .protect(
                     protect_start,
                     protect_end - protect_start,
-                    &Protection::from_section_characteristics(section.characteristics.get(LE)),
+                    &Protection::from_section(section, writable_section_names),
                 )
                 .map_err(PeLoadError::Map)?;
         }
@@ -298,10 +316,6 @@ impl PeParsedFile {
     /// The trampoline RVA is relative to the image base. The first pointer-sized
     /// word of the mapped trampoline is patched with `syscall_entry_point` when
     /// the image is loaded.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "cannot panic: array slices are always the correct size"
-    )]
     pub fn parse_trampoline<F: ReadAt>(
         &mut self,
         file: &mut F,
@@ -768,8 +782,10 @@ pub trait MapMemory {
 
 /// Trait for reading and writing memory that has been mapped via [`MapMemory`].
 pub trait AccessMemory {
+    /// Read from memory.
     fn read(&mut self, address: usize, buf: &mut [u8]) -> Result<(), Fault>;
 
+    /// Write to memory.
     fn write(&mut self, address: usize, data: &[u8]) -> Result<(), Fault>;
 }
 
@@ -800,11 +816,29 @@ impl Protection {
         execute: false,
     };
 
-    fn from_section_characteristics(characteristics: u32) -> Self {
-        Self {
-            read: characteristics & pe::IMAGE_SCN_MEM_READ != 0,
-            write: characteristics & pe::IMAGE_SCN_MEM_WRITE != 0,
-            execute: characteristics & pe::IMAGE_SCN_MEM_EXECUTE != 0,
+    fn from_section(section: &pe::ImageSectionHeader, writable_section_names: &[&[u8]]) -> Self {
+        let characteristics = section.characteristics.get(LE);
+        let mut protection = Self {
+            read: characteristics & object::pe::IMAGE_SCN_MEM_READ != 0,
+            write: characteristics & object::pe::IMAGE_SCN_MEM_WRITE != 0,
+            execute: characteristics & object::pe::IMAGE_SCN_MEM_EXECUTE != 0,
+        };
+        if writable_section_names
+            .iter()
+            .any(|name| section_name_eq(section, name))
+        {
+            protection.write = true;
         }
+
+        protection
     }
+}
+
+fn section_name_eq(section: &pe::ImageSectionHeader, name: &[u8]) -> bool {
+    let end = section
+        .name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(section.name.len());
+    &section.name[..end] == name
 }
