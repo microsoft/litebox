@@ -677,13 +677,20 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn broker_pty_stat(pty_id: u32, uid: u32, gid: u32) -> FileStat {
+        // S_IFCHR (0o020000) MUST be set in st_mode so glibc's
+        // `is_mytty()` (called from ttyname()) recognizes the fd as a
+        // character device. Without the file-type bits, ttyname falls
+        // back to a /dev/pts/ getdents scan which fails (dropbear:
+        // "ttyname fails for openpty device" → no PTY for SSH session).
+        const S_IFCHR: u32 = 0o020000;
+        let mode_bits: u32 = (Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP)
+            .bits()
+            .truncate();
         FileStat {
             st_dev: 5,
             st_ino: (pty_id + 3).into(),
             st_nlink: 1,
-            st_mode: (Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP)
-                .bits()
-                .truncate(),
+            st_mode: mode_bits | S_IFCHR,
             st_uid: uid,
             st_gid: gid,
             st_rdev: u64::try_from(Self::broker_pty_rdev(pty_id)).unwrap_or(u64::MAX),
@@ -3841,6 +3848,26 @@ impl<FS: ShimFS> Task<FS> {
                 let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
                 let files = self.files.borrow();
                 let rds = files.raw_descriptor_store.read();
+                // BrokerPty: synthesize /dev/pts/<pty_id> path so
+                // ttyname() works. Mirrors what /dev/pts/N open would
+                // return; necessary for sshd/dropbear's openpty path,
+                // which calls readlink(/proc/self/fd/N) then opens the
+                // resulting path. (Stage B: same pattern as the
+                // F_GETFD bug — see also FilesState::run_on_raw_fd.)
+                if let Ok(typed_pty) =
+                    rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
+                {
+                    let pty_id = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_entry(
+                            &typed_pty,
+                            |pty_fd: &super::broker_pty::BrokerPtyFd<Platform>| pty_fd.pty_id(),
+                        )
+                        .ok_or(Errno::EBADF)?;
+                    return Ok(alloc::format!("/dev/pts/{pty_id}"));
+                }
                 if let Ok(typed_fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
                     let dt = self.global.litebox.descriptor_table();
                     if dt
@@ -3980,21 +4007,42 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
     let uid = task.credentials.euid.truncate();
     let gid = task.credentials.egid.truncate();
 
-    let files_borrow = task.files.borrow();
-    if let Ok(fd) = files_borrow
-        .raw_descriptor_store
-        .read()
-        .fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
-    {
-        let handle = task
-            .global
-            .litebox
-            .descriptor_table()
-            .entry_handle(&fd)
-            .ok_or(Errno::EBADF)?;
-        return Ok(handle.with_entry(|pty| Task::<FS>::broker_pty_stat(pty.pty_id(), uid, gid)));
+    // Probe BrokerPty separately so we can release files_borrow before
+    // calling fs.file_status (which re-borrows files internally).
+    let pty_id_opt: Option<u32> = {
+        let files_borrow = task.files.borrow();
+        let pty_opt = files_borrow
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
+            .ok();
+        pty_opt.and_then(|fd| {
+            let handle = task.global.litebox.descriptor_table().entry_handle(&fd)?;
+            Some(handle.with_entry(|pty| pty.pty_id()))
+        })
+    };
+    if let Some(pty_id) = pty_id_opt {
+        // Route via fs.file_status(/dev/pts/N) so the layered FS's
+        // node_info rewriter gives identical st_dev/st_ino to
+        // stat("/dev/pts/N"). Without this, glibc ttyname's is_mytty()
+        // compares fstat(slave) vs stat("/dev/pts/N") and they mismatch
+        // — dropbear then exits with "ttyname fails for openpty device".
+        let authoritative = Task::<FS>::broker_pty_stat(pty_id, uid, gid);
+        let path = alloc::format!("/dev/pts/{pty_id}");
+        let fs_status = task.files.borrow().fs.file_status(path.as_str());
+        if let Ok(status) = fs_status {
+            let mut stat = FileStat::from(status);
+            stat.st_mode = authoritative.st_mode;
+            stat.st_uid = authoritative.st_uid;
+            stat.st_gid = authoritative.st_gid;
+            stat.st_rdev = authoritative.st_rdev;
+            stat.st_nlink = authoritative.st_nlink;
+            stat.st_size = authoritative.st_size;
+            stat.st_blksize = authoritative.st_blksize;
+            return Ok(stat);
+        }
+        return Ok(authoritative);
     }
-    drop(files_borrow);
 
     let mut fstat = task
         .files
@@ -4488,7 +4536,7 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             normalized_path
         };
-        let status = self.files.borrow().fs.file_status(path)?;
+        let status = self.files.borrow().fs.file_status(&path)?;
         let mut result = FileStat::from(status);
 
         // Override st_dev/st_ino/st_rdev for the host PTY path so that

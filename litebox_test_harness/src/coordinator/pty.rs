@@ -49,6 +49,49 @@ enum ScenarioKind {
     /// stdout bytes from a non-PIE binary reach the parent across
     /// `exec_on_remote_host`'s worker handoff.
     StdoutRoundtrip,
+    /// PTYR.stdout_post_sleep — child writes 5 lines, sleeps briefly,
+    /// writes 5 more lines, then exits (slave closes). Parent reads
+    /// the master and verifies all 10 lines arrive.
+    ///
+    /// This is the dropbear-under-litebox failure signature: the
+    /// post-sleep lines were lost because the broker PTY's slave→master
+    /// data-plane propagation has a race when the slave closes shortly
+    /// after writing. dropbear's session loop saw EAGAIN after the
+    /// sleep, concluded the channel was empty, sent exit-status, and
+    /// closed the SSH channel before the broker delivered the buffered
+    /// post-sleep bytes.
+    ///
+    /// Self-contained reproducer for the Phase H "copilot -p prints
+    /// nothing" symptom — no Copilot, no dropbear, no Docker stack
+    /// needed.
+    StdoutPostSleep,
+    /// PTYR.slave_write_atomicity — child writes to slave then exits.
+    /// Parent reaps the child (`waitpid`), THEN does a single
+    /// non-blocking `read(2)` on the master without any poll/sleep.
+    ///
+    /// Invariant: by the time `waitpid` returns the child's exit
+    /// status, every byte the child wrote to its slave fd must be
+    /// IMMEDIATELY readable from the master. Real Linux PTY satisfies
+    /// this because the kernel updates the master buffer atomically
+    /// with the slave write. If the broker PTY's slave→master
+    /// notification is asynchronous (e.g., the master subscriber
+    /// wake travels via a notification ring with non-zero latency),
+    /// the read returns EAGAIN — and any consumer that doesn't
+    /// re-poll (like dropbear's session-end loop) loses the data.
+    SlaveWriteAtomicity,
+    /// PTYR.poll_after_exit — same shape as SlaveWriteAtomicity but
+    /// probes via `poll(POLLIN, 0ms)` instead of `read(2)`. This is
+    /// dropbear's EXACT pattern: poll the master fd with 0 timeout
+    /// at session-end teardown; if POLLIN is set, drain it. The
+    /// invariant: after `waitpid` returns the child's exit status,
+    /// `poll(master, POLLIN, 0)` MUST report POLLIN if the child
+    /// wrote any data.
+    PollAfterExit,
+    /// PTYR.slave_close_hup — child writes nothing, just exits.
+    /// Parent reaps, then polls master with `POLLHUP`. POLLHUP MUST
+    /// be set immediately — dropbear and any TTY-aware consumer
+    /// uses POLLHUP to detect peer-closed.
+    SlaveCloseHup,
     /// PTYR.isatty — child calls `isatty(0/1/2)` post-exec and prints
     /// `isatty: 0=Y 1=Y 2=Y`. Confirms all three stdio fds are TTYs in
     /// the new worker after a non-PIE execve.
@@ -131,6 +174,26 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "stdout_post_sleep",
+        kind: ScenarioKind::StdoutPostSleep,
+        per_binary_type: true,
+    },
+    ScenarioDef {
+        name: "slave_write_atomicity",
+        kind: ScenarioKind::SlaveWriteAtomicity,
+        per_binary_type: true,
+    },
+    ScenarioDef {
+        name: "poll_after_exit",
+        kind: ScenarioKind::PollAfterExit,
+        per_binary_type: true,
+    },
+    ScenarioDef {
+        name: "slave_close_hup",
+        kind: ScenarioKind::SlaveCloseHup,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "isatty",
         kind: ScenarioKind::Isatty,
         per_binary_type: true,
@@ -168,6 +231,14 @@ const LDISC_CANON_BASIC: HandlerToken<TargetArgs, PtyOut> =
 // PTYR.* tokens — regression coverage for non-PIE worker-handoff stdio.
 const PTYR_STDOUT_ROUNDTRIP: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.stdout_roundtrip");
+const PTYR_STDOUT_POST_SLEEP: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.stdout_post_sleep");
+const PTYR_SLAVE_WRITE_ATOMICITY: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.slave_write_atomicity");
+const PTYR_POLL_AFTER_EXIT: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.poll_after_exit");
+const PTYR_SLAVE_CLOSE_HUP: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.slave_close_hup");
 const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
 const PARENT_EXIT_THEN_CHILD_IO: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.parent_exit_then_child_io");
@@ -356,6 +427,98 @@ async fn handle_ptyr_stdout_roundtrip(
     Ok(PtyOut { detail })
 }
 
+async fn handle_ptyr_stdout_post_sleep(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-stdout-post-sleep".into()], true)?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    // PTY OPOST: lone \n → \r\n. Child writes 10 lines L01..L10.
+    let mut expected = String::new();
+    for i in 1..=10 {
+        expected.push_str(&format!("L{i:02}\r\n"));
+    }
+    let detail = exact(&data, &expected)?;
+    Ok(PtyOut { detail })
+}
+
+async fn handle_ptyr_slave_write_atomicity(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-slave-write-atomicity".into()], true)?;
+    // Reap child FIRST. After waitpid returns the child's exit
+    // status, every byte the child wrote to its slave must be
+    // IMMEDIATELY readable from the master without poll/wait.
+    expect_exit_zero(pid)?;
+    let observed = pty.try_read_now(4096)?;
+    let bytes = observed
+        .ok_or_else(|| "post-reap try_read_now returned EAGAIN — broker PTY slave→master propagation is not synchronous with child exit (dropbear / sshd will lose this data)".to_string())?;
+    let s = String::from_utf8_lossy(&bytes).to_string();
+    // Expect: "WRITE_ATOMIC_OK\r\n" — single-line marker.
+    let detail = exact(&s, "WRITE_ATOMIC_OK\r\n")?;
+    Ok(PtyOut { detail })
+}
+
+async fn handle_ptyr_poll_after_exit(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-slave-write-atomicity".into()], true)?;
+    expect_exit_zero(pid)?;
+    // Dropbear's exact session-end pattern: poll(master, POLLIN, 0).
+    // Must return POLLIN immediately for the child's writes to be
+    // captured before the session loop closes the channel.
+    let revents = pty.poll_now(libc::POLLIN)?;
+    if revents & libc::POLLIN == 0 {
+        return Err(format!(
+            "post-reap poll(POLLIN, 0) returned revents={revents:#x} — POLLIN not set; \
+             broker PTY does not synchronously expose slave-write data on master \
+             before the master worker's notification-ring dispatcher catches up. \
+             dropbear/sshd's session-end loop sees the same EAGAIN and closes."
+        )
+        .into());
+    }
+    // Now drain to confirm bytes are there.
+    let bytes = pty.try_read_now(4096)?.ok_or_else(|| {
+        "POLLIN reported but try_read_now returned None (inconsistent)".to_string()
+    })?;
+    let s = String::from_utf8_lossy(&bytes).to_string();
+    let detail = exact(&s, "WRITE_ATOMIC_OK\r\n")?;
+    Ok(PtyOut { detail })
+}
+
+async fn handle_ptyr_slave_close_hup(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-slave-close-immediate".into()], true)?;
+    expect_exit_zero(pid)?;
+    // Child wrote nothing; slave is closed. POLLHUP must be set
+    // immediately so consumers can detect peer-close (dropbear,
+    // tokio's signal_unix wait, etc.).
+    let revents = pty.poll_now(libc::POLLIN | libc::POLLHUP)?;
+    if revents & libc::POLLHUP == 0 {
+        return Err(format!(
+            "post-reap poll(POLLIN|POLLHUP, 0) returned revents={revents:#x} — \
+             POLLHUP not set after child exit closed slave"
+        )
+        .into());
+    }
+    Ok(PtyOut {
+        detail: format!("revents={revents:#x}"),
+    })
+}
+
 async fn handle_ptyr_isatty(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -440,6 +603,13 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(LDISC_CANON_BASIC, handle_ldisc_canon_basic);
     register_handler!(EXEC_SHELL_SESSION, handle_exec_shell_session);
     register_handler!(PTYR_STDOUT_ROUNDTRIP, handle_ptyr_stdout_roundtrip);
+    register_handler!(PTYR_STDOUT_POST_SLEEP, handle_ptyr_stdout_post_sleep);
+    register_handler!(
+        PTYR_SLAVE_WRITE_ATOMICITY,
+        handle_ptyr_slave_write_atomicity
+    );
+    register_handler!(PTYR_POLL_AFTER_EXIT, handle_ptyr_poll_after_exit);
+    register_handler!(PTYR_SLAVE_CLOSE_HUP, handle_ptyr_slave_close_hup);
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
     register_handler!(PARENT_EXIT_THEN_CHILD_IO, handle_parent_exit_then_child_io);
 
@@ -454,6 +624,18 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!("pty-ldisc-signal", leaf_subcmd::subcmd_pty_ldisc_signal);
     crate::register_leaf_subcommand!("pty-ldisc-canon", leaf_subcmd::subcmd_pty_ldisc_canon);
     crate::register_leaf_subcommand!("pty-stdout-print", leaf_subcmd::subcmd_pty_stdout_print);
+    crate::register_leaf_subcommand!(
+        "pty-stdout-post-sleep",
+        leaf_subcmd::subcmd_pty_stdout_post_sleep
+    );
+    crate::register_leaf_subcommand!(
+        "pty-slave-write-atomicity",
+        leaf_subcmd::subcmd_pty_slave_write_atomicity
+    );
+    crate::register_leaf_subcommand!(
+        "pty-slave-close-immediate",
+        leaf_subcmd::subcmd_pty_slave_close_immediate
+    );
     crate::register_leaf_subcommand!("pty-isatty-check", leaf_subcmd::subcmd_pty_isatty_check);
     crate::register_leaf_subcommand!(
         "pty-parent-exit-driver",
@@ -590,6 +772,22 @@ async fn drive_target(
         }
         ScenarioKind::StdoutRoundtrip => {
             run.send_named_typed(handle, &PTYR_STDOUT_ROUNDTRIP, args)
+                .await?
+        }
+        ScenarioKind::StdoutPostSleep => {
+            run.send_named_typed(handle, &PTYR_STDOUT_POST_SLEEP, args)
+                .await?
+        }
+        ScenarioKind::SlaveWriteAtomicity => {
+            run.send_named_typed(handle, &PTYR_SLAVE_WRITE_ATOMICITY, args)
+                .await?
+        }
+        ScenarioKind::PollAfterExit => {
+            run.send_named_typed(handle, &PTYR_POLL_AFTER_EXIT, args)
+                .await?
+        }
+        ScenarioKind::SlaveCloseHup => {
+            run.send_named_typed(handle, &PTYR_SLAVE_CLOSE_HUP, args)
                 .await?
         }
         ScenarioKind::Isatty => run.send_named_typed(handle, &PTYR_ISATTY, args).await?,
@@ -942,6 +1140,60 @@ mod leaf_subcmd {
     pub(super) fn subcmd_pty_stdout_print(_args: &[String]) -> i32 {
         println!("PTYR_STDOUT_OK");
         let _ = std::io::stdout().flush();
+        0
+    }
+
+    /// PTYR.stdout_post_sleep: write 5 lines, sleep 200ms, write 5 more
+    /// lines, exit. Parent reads from master and expects all 10 lines.
+    ///
+    /// Self-contained reproducer for the broker-PTY slave→master
+    /// data-plane race observed under dropbear in Phase H: the child's
+    /// post-sleep writes are buffered by the broker but the master
+    /// reader's poll may have already concluded "no more data" by the
+    /// time bash/dropbear's session loop checks. The slave close on
+    /// child exit should make the buffered bytes immediately readable
+    /// from the master.
+    pub(super) fn subcmd_pty_stdout_post_sleep(_args: &[String]) -> i32 {
+        let mut stdout = std::io::stdout();
+        for i in 1..=5 {
+            if writeln!(stdout, "L{i:02}").is_err() {
+                return 1;
+            }
+        }
+        if stdout.flush().is_err() {
+            return 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for i in 6..=10 {
+            if writeln!(stdout, "L{i:02}").is_err() {
+                return 1;
+            }
+        }
+        if stdout.flush().is_err() {
+            return 1;
+        }
+        0
+    }
+
+    /// PTYR.slave_write_atomicity: write one short marker line and
+    /// exit immediately. Parent waits for child exit, then does a
+    /// SINGLE non-blocking read on master. The marker MUST be
+    /// readable without any poll/wait — that's the kernel-PTY
+    /// guarantee dropbear's session loop depends on.
+    pub(super) fn subcmd_pty_slave_write_atomicity(_args: &[String]) -> i32 {
+        let mut stdout = std::io::stdout();
+        if writeln!(stdout, "WRITE_ATOMIC_OK").is_err() {
+            return 1;
+        }
+        if stdout.flush().is_err() {
+            return 1;
+        }
+        0
+    }
+
+    /// PTYR.slave_close_immediate: write nothing and exit. Parent
+    /// verifies POLLHUP is set immediately on master.
+    pub(super) fn subcmd_pty_slave_close_immediate(_args: &[String]) -> i32 {
         0
     }
 
