@@ -20,12 +20,28 @@
 //!   acquired non-blockingly at handler entry.
 //!
 //! - **Multi-instance TAs** have one [`TaInstance`] per session. Invoke/Close
-//!   serialize on a per-`session_id` entry in [`SessionManager::active_sessions`],
-//!   also acquired non-blockingly. Different sessions run in parallel on their
-//!   own instances.
+//!   serialize on a per-`session_id` entry acquired via
+//!   [`SessionManager::try_activate_session`], also acquired non-blockingly.
+//!   Different sessions run in parallel on their own instances.
 //!
-//! Contention on either primitive returns `OPTEE_SMC_RETURN_ETHREAD_LIMIT`; the
-//! Linux OP-TEE driver waits on its completion queue and retries the SMC.
+//! ### Difference from OP-TEE OS
+//!
+//! OP-TEE OS uses RPC-based waiting: when a TA is busy, it returns to normal world
+//! via `mutex_lock()` issuing an RPC, allowing the Linux kernel to schedule other
+//! work while waiting. This is efficient but fundamentally insecure because normal
+//! world is untrusted.
+//!
+//! ### LiteBox Behavior
+//!
+//! We return `OPTEE_SMC_RETURN_ETHREAD_LIMIT` at the SMC level instead of RPC-waiting.
+//! The Linux OP-TEE driver handles this by:
+//! 1. Adding the caller to a wait queue (`optee_cq_wait_for_completion`)
+//! 2. Sleeping until another call completes (`optee_cq_wait_final` wakes waiters)
+//! 3. Automatically retrying the SMC
+//!
+//! This provides transparent retry behavior for client applications while keeping
+//! the waiting logic in normal world (where scheduling is appropriate), without
+//! requiring RPCs that would give untrusted code control over secure world execution.
 //!
 //! On panic teardown or last-session close, sibling sessions of a single-instance
 //! TA are flipped to [`SessionTarget::Dead`] *before* the per-UUID lock entry is
@@ -522,12 +538,12 @@ impl SessionManager {
     ///
     /// 1. **Late stale Invoke/Close on a `Dead` session.** The cached instance
     ///    was torn down earlier (which evicted the lock entry), but our call
-    ///    to [`single_instance_lock`] resurrected the entry via
+    ///    to [`Self::single_instance_lock`] resurrected the entry via
     ///    `or_insert_with`. Evicting it on the way out keeps the lock map
     ///    bounded.
     ///
     /// 2. **First OpenSession of a previously-unknown TA that turns out to be
-    ///    multi-instance.** [`handle_open_session`] conservatively assumes
+    ///    multi-instance.** The OpenSession handler conservatively assumes
     ///    single-instance when flags are unknown and grabs the per-UUID lock.
     ///    Once the TA loads and we learn it's actually multi-instance, the
     ///    entry serves no future purpose and would otherwise leak.
