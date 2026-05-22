@@ -715,23 +715,23 @@ impl<FS: ShimFS> Task<FS> {
             );
         }
         files
-            .run_on_raw_fd(
-                raw_fd,
-                |fd| {
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(fd) => {
                     let status = files.fs.fd_file_status(fd).ok()?;
                     let rdev = status.node_info.rdev?.get();
                     ((rdev >> 8) == 136).then_some(rdev)
-                },
-                |_fd| None,
-                |_fd| None,
-                |_fd| None,
-                |_fd| None,
-                |_fd| None,
-                |_fd| None,
-                |_fd| None,
-                |_fd| None,
-                |_fd| None,
-            )
+                }
+                crate::RawFdRef::Net(_fd) => None, // non-PTY descriptor has no PTY rdev
+                crate::RawFdRef::Pipes(_fd) => None, // non-PTY descriptor has no PTY rdev
+                crate::RawFdRef::Eventfd(_fd) => None, // non-PTY descriptor has no PTY rdev
+                crate::RawFdRef::Epoll(_fd) => None, // non-PTY descriptor has no PTY rdev
+                crate::RawFdRef::Unix(_fd) => None, // non-PTY descriptor has no PTY rdev
+                crate::RawFdRef::HostPipe(_fd) => None, // non-PTY descriptor has no PTY rdev
+                crate::RawFdRef::BrokerPipe(_fd) => None, // non-PTY descriptor has no PTY rdev
+                crate::RawFdRef::BrokerSocketPair(_fd) => None, // non-PTY descriptor has no PTY rdev
+                crate::RawFdRef::BrokerPty(_fd) => None, // direct BrokerPty lookup is handled above
+                crate::RawFdRef::Signalfd(_fd) => None,  // non-PTY descriptor has no PTY rdev,
+            })
             .ok()
             .flatten()
     }
@@ -1389,24 +1389,22 @@ impl<FS: ShimFS> Task<FS> {
 
                 let abs_path = self.resolve_dirfd_path(fd, &path).ok();
                 let files = self.files.borrow();
-                let file = files.run_on_raw_fd(
-                    raw_fd,
-                    |dirfd| {
-                        files
-                            .fs
-                            .open_at(dirfd, path, flags - OFlags::CLOEXEC, mode)
-                            .map_err(Errno::from)
-                    },
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                )?;
+                let file = files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(dirfd) => files
+                        .fs
+                        .open_at(dirfd, path, flags - OFlags::CLOEXEC, mode)
+                        .map_err(Errno::from),
+                    crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Pipes(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                })?;
                 let file = file?;
                 {
                     let mut dt = self.global.litebox.descriptor_table_mut();
@@ -1479,19 +1477,21 @@ impl<FS: ShimFS> Task<FS> {
         };
         let files = self.files.borrow();
         files
-            .run_on_raw_fd(
-                raw_fd,
-                |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
-                |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL),
-                |_fd| Err(Errno::EINVAL),
-            )
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(fd) => {
+                    files.fs.truncate(fd, length, false).map_err(Errno::from)
+                }
+                crate::RawFdRef::Net(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Pipes(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Eventfd(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Epoll(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Unix(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::HostPipe(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::BrokerPipe(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::BrokerSocketPair(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::BrokerPty(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Signalfd(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+            })
             .flatten()
     }
 
@@ -1545,9 +1545,8 @@ impl<FS: ShimFS> Task<FS> {
                 let is_rmdir = flags.contains(AtFlags::AT_REMOVEDIR);
 
                 let files = self.files.borrow();
-                files.run_on_raw_fd(
-                    raw_fd,
-                    |dirfd| {
+                files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(dirfd) => {
                         if is_rmdir {
                             // rmdir doesn't have an _at variant yet; resolve manually.
                             // Verify dirfd refers to a directory.
@@ -1568,17 +1567,18 @@ impl<FS: ShimFS> Task<FS> {
                         } else {
                             files.fs.unlink_at(dirfd, path).map_err(Errno::from)
                         }
-                    },
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                )?
+                    }
+                    crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Pipes(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                })?
             }
         }
     }
@@ -1617,9 +1617,8 @@ impl<FS: ShimFS> Task<FS> {
                     };
 
                     let files = self.files.borrow();
-                    files.run_on_raw_fd(
-                        raw_fd,
-                        |dirfd| {
+                    files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                        crate::RawFdRef::Fs(dirfd) => {
                             // Verify dirfd refers to a directory.
                             let status = files.fs.fd_file_status(dirfd).map_err(Errno::from)?;
                             if !matches!(status.file_type, litebox::fs::FileType::Directory) {
@@ -1639,17 +1638,18 @@ impl<FS: ShimFS> Task<FS> {
                                 alloc::format!("{dir_path}/{rel}")
                             };
                             CString::new(abs).map_err(|_| Errno::EINVAL)
-                        },
-                        |_| Err(Errno::ENOTDIR),
-                        |_| Err(Errno::ENOTDIR),
-                        |_| Err(Errno::ENOTDIR),
-                        |_| Err(Errno::ENOTDIR),
-                        |_| Err(Errno::ENOTDIR),
-                        |_| Err(Errno::ENOTDIR),
-                        |_| Err(Errno::ENOTDIR),
-                        |_| Err(Errno::ENOTDIR),
-                        |_| Err(Errno::ENOTDIR),
-                    )?
+                        }
+                        crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::Pipes(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    })?
                 }
             }
         };
@@ -1787,9 +1787,8 @@ impl<FS: ShimFS> Task<FS> {
         // closures are mutually exclusive.
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
         files
-            .run_on_raw_fd(
-                raw_fd,
-                |fd| {
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(fd) => {
                     let _position_guard = if offset.is_none()
                         && matches!(
                             files.fs.fd_file_status(fd),
@@ -1845,17 +1844,15 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     }
                     result
-                },
-                |fd| {
-                    self.global.receive(
-                        &self.wait_cx(),
-                        fd,
-                        &mut buf.borrow_mut(),
-                        litebox_common_linux::ReceiveFlags::empty(),
-                        None,
-                    )
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Net(fd) => self.global.receive(
+                    &self.wait_cx(),
+                    fd,
+                    &mut buf.borrow_mut(),
+                    litebox_common_linux::ReceiveFlags::empty(),
+                    None,
+                ),
+                crate::RawFdRef::Pipes(fd) => {
                     if !buf.borrow().is_empty()
                         && matches!(
                             self.global.pipes.half_pipe_type(fd),
@@ -1891,8 +1888,8 @@ impl<FS: ShimFS> Task<FS> {
                             is_vfork_child,
                         )
                         .map_err(Errno::from)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Eventfd(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -1908,9 +1905,9 @@ impl<FS: ShimFS> Task<FS> {
                         buf[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
                         Ok(size_of::<u64>())
                     })
-                },
-                |_fd| Err(Errno::EINVAL),
-                |fd| {
+                }
+                crate::RawFdRef::Epoll(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Unix(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -1927,8 +1924,8 @@ impl<FS: ShimFS> Task<FS> {
                             &mut Vec::new(),
                         )
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::HostPipe(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -1942,8 +1939,8 @@ impl<FS: ShimFS> Task<FS> {
                             &mut buf.borrow_mut(),
                         )
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPipe(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -1951,8 +1948,8 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut buf.borrow_mut()))
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerSocketPair(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -1960,8 +1957,8 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut buf.borrow_mut()))
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPty(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -1969,8 +1966,17 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut buf.borrow_mut()))
-                },
-            )
+                }
+                crate::RawFdRef::Signalfd(fd) => {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry| entry.read(&mut buf.borrow_mut()))
+                }
+            })
             .flatten()
     }
 
@@ -2022,9 +2028,8 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let res = files
-            .run_on_raw_fd(
-                raw_fd,
-                |fd| {
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(fd) => {
                     #[cfg(feature = "trace_syscalls")]
                     if raw_fd <= 2 {
                         litebox::log_println!(
@@ -2051,23 +2056,20 @@ impl<FS: ShimFS> Task<FS> {
                         self.notify_inotify_path(&path, IN_MODIFY, 0);
                     }
                     result
-                },
-                |fd| {
-                    self.global.sendto(
-                        &self.wait_cx(),
-                        fd,
-                        buf,
-                        litebox_common_linux::SendFlags::empty(),
-                        None,
-                    )
-                },
-                |fd| {
-                    self.global
-                        .pipes
-                        .write(&self.wait_cx(), fd, buf)
-                        .map_err(Errno::from)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Net(fd) => self.global.sendto(
+                    &self.wait_cx(),
+                    fd,
+                    buf,
+                    litebox_common_linux::SendFlags::empty(),
+                    None,
+                ),
+                crate::RawFdRef::Pipes(fd) => self
+                    .global
+                    .pipes
+                    .write(&self.wait_cx(), fd, buf)
+                    .map_err(Errno::from),
+                crate::RawFdRef::Eventfd(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -2082,9 +2084,9 @@ impl<FS: ShimFS> Task<FS> {
                         );
                         file.write(&self.wait_cx(), value)
                     })
-                },
-                |_fd| Err(Errno::EINVAL),
-                |fd| {
+                }
+                crate::RawFdRef::Epoll(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Unix(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -2101,8 +2103,8 @@ impl<FS: ShimFS> Task<FS> {
                             Vec::new(),
                         )
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::HostPipe(fd) => {
                     #[cfg(feature = "trace_syscalls")]
                     if raw_fd <= 2 {
                         litebox::log_println!(
@@ -2122,8 +2124,8 @@ impl<FS: ShimFS> Task<FS> {
                     handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
                         super::host_pipe::write_host_pipe(self.global.platform, entry, buf)
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPipe(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -2131,8 +2133,8 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerSocketPair(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -2140,8 +2142,8 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPty(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -2149,8 +2151,9 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
-                },
-            )
+                }
+                crate::RawFdRef::Signalfd(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+            })
             .flatten();
         if let Err(Errno::EPIPE) = res {
             self.send_signal(
@@ -2427,9 +2430,8 @@ impl<FS: ShimFS> Task<FS> {
         };
         let files = self.files.borrow();
         files
-            .run_on_raw_fd(
-                raw_fd,
-                |fd| {
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(fd) => {
                     let _position_guard = if matches!(
                         files.fs.fd_file_status(fd),
                         Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
@@ -2439,17 +2441,18 @@ impl<FS: ShimFS> Task<FS> {
                         None
                     };
                     files.fs.seek(fd, offset, whence).map_err(Errno::from)
-                },
-                |_| Err(Errno::ESPIPE),
-                |_| Err(Errno::ESPIPE),
-                |_| Err(Errno::ESPIPE),
-                |_| Err(Errno::ESPIPE),
-                |_| Err(Errno::ESPIPE),
-                |_| Err(Errno::ESPIPE),
-                |_| Err(Errno::ESPIPE),
-                |_| Err(Errno::ESPIPE),
-                |_| Err(Errno::ESPIPE),
-            )
+                }
+                crate::RawFdRef::Net(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::Pipes(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::Eventfd(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::Epoll(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::Unix(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::HostPipe(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::BrokerPipe(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::BrokerPty(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::Signalfd(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+            })
             .flatten()
     }
 
@@ -2492,19 +2495,21 @@ impl<FS: ShimFS> Task<FS> {
                     return Err(Errno::EBADF);
                 };
                 let files = self.files.borrow();
-                files.run_on_raw_fd(
-                    raw_fd,
-                    |dirfd| files.fs.mkdir_at(dirfd, path, mode).map_err(Errno::from),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                )?
+                files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(dirfd) => {
+                        files.fs.mkdir_at(dirfd, path, mode).map_err(Errno::from)
+                    }
+                    crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Pipes(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                })?
             }
         }
     }
@@ -2515,19 +2520,19 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
-        files.run_on_raw_fd(
-            raw_fd,
-            |_| (),
-            |_| (),
-            |_| (),
-            |_| (),
-            |_| (),
-            |_| (),
-            |_| (),
-            |_| (),
-            |_| (),
-            |_| (),
-        )?;
+        files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(_) => (),
+            crate::RawFdRef::Net(_) => (),
+            crate::RawFdRef::Pipes(_) => (),
+            crate::RawFdRef::Eventfd(_) => (),
+            crate::RawFdRef::Epoll(_) => (),
+            crate::RawFdRef::Unix(_) => (),
+            crate::RawFdRef::HostPipe(_) => (),
+            crate::RawFdRef::BrokerPipe(_) => (),
+            crate::RawFdRef::BrokerSocketPair(_) => (),
+            crate::RawFdRef::BrokerPty(_) => (),
+            crate::RawFdRef::Signalfd(_) => (),
+        })?;
         Ok(())
     }
 
@@ -2578,9 +2583,8 @@ impl<FS: ShimFS> Task<FS> {
     fn resolve_dirfd_path(&self, fd: u32, rel_path: &CString) -> Result<String, Errno> {
         let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
         let files = self.files.borrow();
-        files.run_on_raw_fd(
-            raw_fd,
-            |dirfd| {
+        files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(dirfd) => {
                 let status = files.fs.fd_file_status(dirfd).map_err(Errno::from)?;
                 if !matches!(status.file_type, litebox::fs::FileType::Directory) {
                     return Err(Errno::ENOTDIR);
@@ -2596,17 +2600,18 @@ impl<FS: ShimFS> Task<FS> {
                 } else {
                     alloc::format!("{dir_path}/{rel}")
                 })
-            },
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-        )?
+            }
+            crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Pipes(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+        })?
     }
 
     /// Handle `symlinkat` — create a symbolic link.
@@ -2781,11 +2786,22 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd) {
             drop(rds);
-            self.global
-                .litebox
-                .descriptor_table_mut()
-                .remove(&fd)
-                .unwrap();
+            // Drop the descriptor-table entry if it's still present.
+            // `fd_consume_raw_integer` may have already consumed the
+            // slot; either way the close should succeed silently
+            // (matches eventfd handling above, file.rs:2774-2780).
+            // Previously this used `.unwrap()` which panicked the
+            // shim when called with a signalfd whose slot was
+            // already detached (e.g., `OwnedFd::drop` from a
+            // signalfd created with `signalfd(-1, mask, SFD_CLOEXEC)`
+            // and then closed when the OwnedFd is dropped). The
+            // panic killed the entire worker, which under sshd-in-
+            // litebox manifests as "Connection closed" mid-session.
+            let entry = {
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                dt.remove(&fd)
+            };
+            drop(entry);
             return Ok(());
         }
 
@@ -2902,79 +2918,85 @@ impl<FS: ShimFS> Task<FS> {
 
     fn set_close_on_exec(&self, raw_fd: usize) -> Result<(), Errno> {
         let files = self.files.borrow();
-        files.run_on_raw_fd(
-            raw_fd,
-            |fd| {
+        files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(fd) => {
                 let _old = self
                     .global
                     .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-            },
-            |fd| {
+            }
+            crate::RawFdRef::Net(fd) => {
                 let _old = self
                     .global
                     .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-            },
-            |fd| {
+            }
+            crate::RawFdRef::Pipes(fd) => {
                 let _old = self
                     .global
                     .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-            },
-            |fd| {
+            }
+            crate::RawFdRef::Eventfd(fd) => {
                 let _old = self
                     .global
                     .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-            },
-            |fd| {
+            }
+            crate::RawFdRef::Epoll(fd) => {
                 let _old = self
                     .global
                     .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-            },
-            |fd| {
+            }
+            crate::RawFdRef::Unix(fd) => {
                 let _old = self
                     .global
                     .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-            },
-            |fd| {
+            }
+            crate::RawFdRef::HostPipe(fd) => {
                 let _old = self
                     .global
                     .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-            },
-            |fd| {
+            }
+            crate::RawFdRef::BrokerPipe(fd) => {
                 let _old = self
                     .global
                     .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-            },
-            |fd| {
+            }
+            crate::RawFdRef::BrokerSocketPair(fd) => {
                 let _old = self
                     .global
                     .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-            },
-            |fd| {
+            }
+            crate::RawFdRef::BrokerPty(fd) => {
                 let _old = self
                     .global
                     .litebox
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
-            },
-        )
+            }
+            crate::RawFdRef::Signalfd(fd) => {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            }
+        })
     }
 
     pub(crate) fn sys_close_range(
@@ -3029,9 +3051,8 @@ impl<FS: ShimFS> Task<FS> {
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         files
-            .run_on_raw_fd(
-                raw_fd,
-                |fd| {
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(fd) => {
                     let needs_position_lock = matches!(
                         files.fs.fd_file_status(fd),
                         Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
@@ -3075,23 +3096,21 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     }
                     Ok(total_read)
-                },
-                |fd| {
-                    read_once_to_iovecs(
-                        iovs,
-                        || self.park_if_deferred(),
-                        |buf| {
-                            self.global.receive(
-                                &self.wait_cx(),
-                                fd,
-                                buf,
-                                litebox_common_linux::ReceiveFlags::empty(),
-                                None,
-                            )
-                        },
-                    )
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Net(fd) => read_once_to_iovecs(
+                    iovs,
+                    || self.park_if_deferred(),
+                    |buf| {
+                        self.global.receive(
+                            &self.wait_cx(),
+                            fd,
+                            buf,
+                            litebox_common_linux::ReceiveFlags::empty(),
+                            None,
+                        )
+                    },
+                ),
+                crate::RawFdRef::Pipes(fd) => {
                     let is_vfork_child = self.fork_context.borrow().is_some();
                     read_once_to_iovecs(
                         iovs,
@@ -3103,8 +3122,8 @@ impl<FS: ShimFS> Task<FS> {
                                 .map_err(Errno::from)
                         },
                     )
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Eventfd(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3123,9 +3142,9 @@ impl<FS: ShimFS> Task<FS> {
                         self.park_if_deferred();
                         scatter_bytes_to_iovecs(iovs, &bytes)
                     })
-                },
-                |_fd| Err(Errno::EINVAL),
-                |fd| {
+                }
+                crate::RawFdRef::Epoll(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Unix(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3148,8 +3167,8 @@ impl<FS: ShimFS> Task<FS> {
                             },
                         )
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::HostPipe(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3165,8 +3184,8 @@ impl<FS: ShimFS> Task<FS> {
                             },
                         )
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPipe(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3180,8 +3199,8 @@ impl<FS: ShimFS> Task<FS> {
                             |buf| entry.read(&self.wait_cx(), buf),
                         )
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerSocketPair(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3195,8 +3214,8 @@ impl<FS: ShimFS> Task<FS> {
                             |buf| entry.read(&self.wait_cx(), buf),
                         )
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPty(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3210,8 +3229,19 @@ impl<FS: ShimFS> Task<FS> {
                             |buf| entry.read(&self.wait_cx(), buf),
                         )
                     })
-                },
-            )
+                }
+                crate::RawFdRef::Signalfd(fd) => {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|entry| {
+                        read_once_to_iovecs(iovs, || self.park_if_deferred(), |buf| entry.read(buf))
+                    })
+                }
+            })
             .flatten()
     }
 }
@@ -3294,19 +3324,21 @@ fn fcntl_status_flags<FS: ShimFS>(
         return handle.with_entry(|file| Ok(file.get_status() & OFlags::STATUS_FLAGS_MASK));
     }
     files
-        .run_on_raw_fd(
-            desc,
-            |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
-            |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
-            |fd| getfl_from_metadata!(fd, crate::PipeStatusFlags),
-            |fd| getfl_from_handle!(fd),
-            |fd| getfl_from_handle!(fd),
-            |fd| getfl_from_handle!(fd),
-            |fd| getfl_from_handle!(fd),
-            |fd| getfl_from_handle!(fd),
-            |fd| getfl_from_handle!(fd),
-            |fd| getfl_from_handle!(fd),
-        )
+        .run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(fd) => getfl_from_metadata!(fd, crate::StdioStatusFlags),
+            crate::RawFdRef::Net(fd) => {
+                getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags)
+            }
+            crate::RawFdRef::Pipes(fd) => getfl_from_metadata!(fd, crate::PipeStatusFlags),
+            crate::RawFdRef::Eventfd(fd) => getfl_from_handle!(fd),
+            crate::RawFdRef::Epoll(fd) => getfl_from_handle!(fd),
+            crate::RawFdRef::Unix(fd) => getfl_from_handle!(fd),
+            crate::RawFdRef::HostPipe(fd) => getfl_from_handle!(fd),
+            crate::RawFdRef::BrokerPipe(fd) => getfl_from_handle!(fd),
+            crate::RawFdRef::BrokerSocketPair(fd) => getfl_from_handle!(fd),
+            crate::RawFdRef::BrokerPty(fd) => getfl_from_handle!(fd),
+            crate::RawFdRef::Signalfd(fd) => getfl_from_handle!(fd),
+        })
         .flatten()
         .map(|flags| flags & OFlags::STATUS_FLAGS_MASK)
 }
@@ -3468,9 +3500,8 @@ impl<FS: ShimFS> Task<FS> {
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
         let res = files
-            .run_on_raw_fd(
-                raw_fd,
-                |fd| {
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(fd) => {
                     let _position_guard = if matches!(
                         files.fs.fd_file_status(fd),
                         Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
@@ -3482,27 +3513,23 @@ impl<FS: ShimFS> Task<FS> {
                     write_to_iovec(iovs, |buf: &[u8]| {
                         files.fs.write(fd, buf, None).map_err(Errno::from)
                     })
-                },
-                |fd| {
-                    write_once_from_iovecs(iovs, |buf| {
-                        self.global.sendto(
-                            &self.wait_cx(),
-                            fd,
-                            buf,
-                            litebox_common_linux::SendFlags::empty(),
-                            None,
-                        )
-                    })
-                },
-                |fd| {
-                    write_once_from_iovecs(iovs, |buf| {
-                        self.global
-                            .pipes
-                            .write(&self.wait_cx(), fd, buf)
-                            .map_err(Errno::from)
-                    })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Net(fd) => write_once_from_iovecs(iovs, |buf| {
+                    self.global.sendto(
+                        &self.wait_cx(),
+                        fd,
+                        buf,
+                        litebox_common_linux::SendFlags::empty(),
+                        None,
+                    )
+                }),
+                crate::RawFdRef::Pipes(fd) => write_once_from_iovecs(iovs, |buf| {
+                    self.global
+                        .pipes
+                        .write(&self.wait_cx(), fd, buf)
+                        .map_err(Errno::from)
+                }),
+                crate::RawFdRef::Eventfd(fd) => {
                     let total_len = total_writev_len(iovs)?;
                     if total_len == 0 {
                         return Ok(0);
@@ -3526,9 +3553,9 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|file| file.write(&self.wait_cx(), value))
-                },
-                |_fd| Err(Errno::EINVAL),
-                |fd| {
+                }
+                crate::RawFdRef::Epoll(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Unix(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3547,8 +3574,8 @@ impl<FS: ShimFS> Task<FS> {
                             )
                         })
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::HostPipe(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3560,8 +3587,8 @@ impl<FS: ShimFS> Task<FS> {
                             super::host_pipe::write_host_pipe(self.global.platform, entry, buf)
                         })
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPipe(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3571,8 +3598,8 @@ impl<FS: ShimFS> Task<FS> {
                     handle.with_entry(|entry| {
                         write_once_from_iovecs(iovs, |buf| entry.write(&self.wait_cx(), buf))
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerSocketPair(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3582,8 +3609,8 @@ impl<FS: ShimFS> Task<FS> {
                     handle.with_entry(|entry| {
                         write_once_from_iovecs(iovs, |buf| entry.write(&self.wait_cx(), buf))
                     })
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPty(fd) => {
                     let handle = self
                         .global
                         .litebox
@@ -3593,8 +3620,9 @@ impl<FS: ShimFS> Task<FS> {
                     handle.with_entry(|entry| {
                         write_once_from_iovecs(iovs, |buf| entry.write(&self.wait_cx(), buf))
                     })
-                },
-            )
+                }
+                crate::RawFdRef::Signalfd(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+            })
             .flatten();
         if let Err(Errno::EPIPE) = res {
             self.send_signal(
@@ -3655,45 +3683,45 @@ impl<FS: ShimFS> Task<FS> {
                 // (network, pipes, etc.), the fd is valid so F_OK succeeds
                 // and we don't model fine-grained permissions.
                 let raw = usize::try_from(raw).map_err(|_| Errno::EBADF)?;
-                return files.run_on_raw_fd(
-                    raw,
-                    |fd| {
+                return files.run_on_raw_fd(raw, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(fd) => {
                         let s = files.fs.fd_file_status(fd).map_err(Errno::from)?;
                         Self::check_access_mode(&s, mode)
-                    },
-                    |_| Ok(()),
-                    |_| Ok(()),
-                    |_| Ok(()),
-                    |_| Ok(()),
-                    |_| Ok(()),
-                    |_| Ok(()),
-                    |_| Ok(()),
-                    |_| Ok(()),
-                    |_| Ok(()),
-                )?;
+                    }
+                    crate::RawFdRef::Net(_) => Ok(()),
+                    crate::RawFdRef::Pipes(_) => Ok(()),
+                    crate::RawFdRef::Eventfd(_) => Ok(()),
+                    crate::RawFdRef::Epoll(_) => Ok(()),
+                    crate::RawFdRef::Unix(_) => Ok(()),
+                    crate::RawFdRef::HostPipe(_) => Ok(()),
+                    crate::RawFdRef::BrokerPipe(_) => Ok(()),
+                    crate::RawFdRef::BrokerSocketPair(_) => Ok(()),
+                    crate::RawFdRef::BrokerPty(_) => Ok(()),
+                    crate::RawFdRef::Signalfd(_) => Ok(()),
+                })?;
             }
             FsPath::FdRelative { fd, path } => {
                 // Use stat_at which handles follow_symlinks properly.
                 let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
-                return files.run_on_raw_fd(
-                    raw,
-                    |dirfd| {
+                return files.run_on_raw_fd(raw, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(dirfd) => {
                         let s = files
                             .fs
                             .stat_at(dirfd, path, follow_symlinks)
                             .map_err(Errno::from)?;
                         Self::check_access_mode(&s, mode)
-                    },
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                )?;
+                    }
+                    crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Pipes(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                })?;
             }
         };
 
@@ -3939,19 +3967,19 @@ impl<FS: ShimFS> Task<FS> {
             FsPath::Fd(fd) => {
                 let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
                 let files = self.files.borrow();
-                files.run_on_raw_fd(
-                    raw_fd,
-                    |_| (),
-                    |_| (),
-                    |_| (),
-                    |_| (),
-                    |_| (),
-                    |_| (),
-                    |_| (),
-                    |_| (),
-                    |_| (),
-                    |_| (),
-                )?;
+                files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(_) => (),
+                    crate::RawFdRef::Net(_) => (),
+                    crate::RawFdRef::Pipes(_) => (),
+                    crate::RawFdRef::Eventfd(_) => (),
+                    crate::RawFdRef::Epoll(_) => (),
+                    crate::RawFdRef::Unix(_) => (),
+                    crate::RawFdRef::HostPipe(_) => (),
+                    crate::RawFdRef::BrokerPipe(_) => (),
+                    crate::RawFdRef::BrokerSocketPair(_) => (),
+                    crate::RawFdRef::BrokerPty(_) => (),
+                    crate::RawFdRef::Signalfd(_) => (),
+                })?;
                 Err(Errno::ENOENT)
             }
             FsPath::FdRelative { fd, path } => {
@@ -3960,9 +3988,8 @@ impl<FS: ShimFS> Task<FS> {
                 };
 
                 let files = self.files.borrow();
-                files.run_on_raw_fd(
-                    raw_fd,
-                    |dirfd| {
+                files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(dirfd) => {
                         files.fs.readlink_at(dirfd, path).map_err(|e| match e {
                             litebox::fs::errors::ReadLinkError::NotASymlink
                             | litebox::fs::errors::ReadLinkError::NotSupported => Errno::EINVAL,
@@ -3971,17 +3998,18 @@ impl<FS: ShimFS> Task<FS> {
                             litebox::fs::errors::ReadLinkError::PathError(pe) => Errno::from(pe),
                             _ => Errno::EIO,
                         })
-                    },
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                )?
+                    }
+                    crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Pipes(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                })?
             }
         }?;
         let bytes = path.as_bytes();
@@ -4053,17 +4081,15 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
     let mut fstat = task
         .files
         .borrow()
-        .run_on_raw_fd(
-            raw_fd,
-            |fd| {
-                task.files
-                    .borrow()
-                    .fs
-                    .fd_file_status(fd)
-                    .map(FileStat::from)
-                    .map_err(Errno::from)
-            },
-            |fd| {
+        .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(fd) => task
+                .files
+                .borrow()
+                .fs
+                .fd_file_status(fd)
+                .map(FileStat::from)
+                .map_err(Errno::from),
+            crate::RawFdRef::Net(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
                     st_dev: SOCKFS_DEV.truncate(),
@@ -4080,8 +4106,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     st_blocks: 0,
                     ..Default::default()
                 })
-            },
-            |fd| {
+            }
+            crate::RawFdRef::Pipes(fd) => {
                 let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
                 let read_write_mode = match half_pipe_type {
                     litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
@@ -4103,8 +4129,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     st_blocks: 0,
                     ..Default::default()
                 })
-            },
-            |fd| {
+            }
+            crate::RawFdRef::Eventfd(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
                     st_dev: ANON_INODE_DEV.truncate(),
@@ -4119,8 +4145,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     st_blocks: 0,
                     ..Default::default()
                 })
-            },
-            |fd| {
+            }
+            crate::RawFdRef::Epoll(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
                     st_dev: ANON_INODE_DEV.truncate(),
@@ -4135,8 +4161,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     st_blocks: 0,
                     ..Default::default()
                 })
-            },
-            |fd| {
+            }
+            crate::RawFdRef::Unix(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
                     st_dev: SOCKFS_DEV.truncate(),
@@ -4153,8 +4179,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     st_blocks: 0,
                     ..Default::default()
                 })
-            },
-            |fd| {
+            }
+            crate::RawFdRef::HostPipe(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 let dir = task
                     .global
@@ -4184,8 +4210,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     st_blocks: 0,
                     ..Default::default()
                 })
-            },
-            |fd| {
+            }
+            crate::RawFdRef::BrokerPipe(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 let dir = task
                     .global
@@ -4215,8 +4241,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     st_blocks: 0,
                     ..Default::default()
                 })
-            },
-            |fd| {
+            }
+            crate::RawFdRef::BrokerSocketPair(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 // Phase F: broker-backed socketpair endpoint. Reports
                 // as AF_UNIX socket (S_IFSOCK) with RDWR mode. No
@@ -4237,8 +4263,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     st_blocks: 0,
                     ..Default::default()
                 })
-            },
-            |fd| {
+            }
+            crate::RawFdRef::BrokerPty(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 // Phase F: broker-backed socketpair endpoint. Reports
                 // as AF_UNIX socket (S_IFSOCK) with RDWR mode. No
@@ -4259,8 +4285,30 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     st_blocks: 0,
                     ..Default::default()
                 })
-            },
-        )
+            }
+            crate::RawFdRef::Signalfd(fd) => {
+                let ino = get_or_assign_anon_ino(task, fd);
+                // Phase F: broker-backed socketpair endpoint. Reports
+                // as AF_UNIX socket (S_IFSOCK) with RDWR mode. No
+                // direction byte — both endpoints are bidirectional.
+                let read_write_mode = Mode::RUSR | Mode::WUSR;
+                Ok(FileStat {
+                    st_dev: PIPEFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
+                    st_nlink: 1,
+                    st_mode: (read_write_mode.bits()
+                        | litebox_common_linux::InodeType::Socket as u32)
+                        .truncate(),
+                    st_uid: uid,
+                    st_gid: gid,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            }
+        })
         .flatten()?;
 
     // Override st_dev/st_ino/st_rdev for fds that should report the host PTY
@@ -4272,9 +4320,8 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
     // what the guest sees via fstat/statx.
     if let Some(info) = task.global.platform.host_stdin_tty_device_info() {
         let files = task.files.borrow();
-        let should_override = files.run_on_raw_fd(
-            raw_fd,
-            |fd| {
+        let should_override = files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(fd) => {
                 let table = task.global.litebox.descriptor_table();
                 // Check for HostPtyDeviceFd marker (reopened via /dev/pts/N)
                 if table.with_metadata(fd, |_: &HostPtyDeviceFd| ()).is_ok() {
@@ -4304,17 +4351,18 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                 table
                     .with_metadata(fd, |_: &crate::HostTtyAlias| ())
                     .is_ok()
-            },
-            |_| false,
-            |_| false,
-            |_| false,
-            |_| false,
-            |_| false,
-            |_| false,
-            |_| false,
-            |_| false,
-            |_| false,
-        )?;
+            }
+            crate::RawFdRef::Net(_) => false, // host-PTY stat override only applies to FS aliases
+            crate::RawFdRef::Pipes(_) => false, // host-PTY stat override only applies to FS aliases
+            crate::RawFdRef::Eventfd(_) => false, // host-PTY stat override only applies to FS aliases
+            crate::RawFdRef::Epoll(_) => false, // host-PTY stat override only applies to FS aliases
+            crate::RawFdRef::Unix(_) => false,  // host-PTY stat override only applies to FS aliases
+            crate::RawFdRef::HostPipe(_) => false, // host-PTY stat override only applies to FS aliases
+            crate::RawFdRef::BrokerPipe(_) => false, // host-PTY stat override only applies to FS aliases
+            crate::RawFdRef::BrokerSocketPair(_) => false, // host-PTY stat override only applies to FS aliases
+            crate::RawFdRef::BrokerPty(_) => false, // broker PTYs report their own synthetic stat
+            crate::RawFdRef::Signalfd(_) => false, // host-PTY stat override only applies to FS aliases,
+        })?;
         if should_override {
             fstat.st_dev = info.dev.truncate();
             fstat.st_ino = info.ino.truncate();
@@ -4370,19 +4418,19 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
             .unwrap_or(FileDescriptorFlags::empty())
     }
 
-    files.run_on_raw_fd(
-        raw_fd,
-        |fd| get_flags(global, fd),
-        |fd| get_flags(global, fd),
-        |fd| get_flags(global, fd),
-        |fd| get_flags(global, fd),
-        |fd| get_flags(global, fd),
-        |fd| get_flags(global, fd),
-        |fd| get_flags(global, fd),
-        |fd| get_flags(global, fd),
-        |fd| get_flags(global, fd),
-        |fd| get_flags(global, fd),
-    )
+    files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+        crate::RawFdRef::Fs(fd) => get_flags(global, fd),
+        crate::RawFdRef::Net(fd) => get_flags(global, fd),
+        crate::RawFdRef::Pipes(fd) => get_flags(global, fd),
+        crate::RawFdRef::Eventfd(fd) => get_flags(global, fd),
+        crate::RawFdRef::Epoll(fd) => get_flags(global, fd),
+        crate::RawFdRef::Unix(fd) => get_flags(global, fd),
+        crate::RawFdRef::HostPipe(fd) => get_flags(global, fd),
+        crate::RawFdRef::BrokerPipe(fd) => get_flags(global, fd),
+        crate::RawFdRef::BrokerSocketPair(fd) => get_flags(global, fd),
+        crate::RawFdRef::BrokerPty(fd) => get_flags(global, fd),
+        crate::RawFdRef::Signalfd(fd) => get_flags(global, fd),
+    })
 }
 
 fn set_file_descriptor_flags<FS: ShimFS>(
@@ -4402,19 +4450,19 @@ fn set_file_descriptor_flags<FS: ShimFS>(
             .set_fd_metadata(fd, flags);
     }
 
-    files.run_on_raw_fd(
-        raw_fd,
-        |fd| set_flags(global, fd, flags),
-        |fd| set_flags(global, fd, flags),
-        |fd| set_flags(global, fd, flags),
-        |fd| set_flags(global, fd, flags),
-        |fd| set_flags(global, fd, flags),
-        |fd| set_flags(global, fd, flags),
-        |fd| set_flags(global, fd, flags),
-        |fd| set_flags(global, fd, flags),
-        |fd| set_flags(global, fd, flags),
-        |fd| set_flags(global, fd, flags),
-    )?;
+    files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+        crate::RawFdRef::Fs(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::Net(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::Pipes(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::Eventfd(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::Epoll(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::Unix(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::HostPipe(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::BrokerPipe(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::BrokerSocketPair(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::BrokerPty(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::Signalfd(fd) => set_flags(global, fd, flags),
+    })?;
     Ok(())
 }
 
@@ -4653,25 +4701,23 @@ impl<FS: ShimFS> Task<FS> {
                     }
                 }
 
-                files.run_on_raw_fd(
-                    raw_fd,
-                    |dirfd| {
-                        files
-                            .fs
-                            .stat_at(dirfd, path, follow_symlinks)
-                            .map(FileStat::from)
-                            .map_err(Errno::from)
-                    },
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                    |_| Err(Errno::ENOTDIR),
-                )??
+                files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(dirfd) => files
+                        .fs
+                        .stat_at(dirfd, path, follow_symlinks)
+                        .map(FileStat::from)
+                        .map_err(Errno::from),
+                    crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Pipes(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                })??
             }
         };
         Ok(fstat)
@@ -4890,9 +4936,8 @@ impl<FS: ShimFS> Task<FS> {
                     });
                     return Ok(0);
                 }
-                files.run_on_raw_fd(
-                    desc,
-                    |fd| {
+                files.run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(fd) => {
                         let new_flags = self
                             .global
                             .litebox
@@ -4916,15 +4961,15 @@ impl<FS: ShimFS> Task<FS> {
                             .fs
                             .set_open_status_flags(fd, new_flags)
                             .map_err(|_| Errno::EBADF)
-                    },
-                    |fd| {
+                    }
+                    crate::RawFdRef::Net(fd) => {
                         setfl_in_metadata!(
                             fd,
                             crate::syscalls::net::SocketOFlags,
                             unreachable!("all sockets have SocketOFlags when created")
                         )
-                    },
-                    |fd| {
+                    }
+                    crate::RawFdRef::Pipes(fd) => {
                         let nonblocking = flags.intersects(OFlags::NONBLOCK);
                         let receiver = matches!(
                             self.global.pipes.half_pipe_type(fd),
@@ -4969,20 +5014,20 @@ impl<FS: ShimFS> Task<FS> {
                             log_unsupported!("pipe F_SETFL: missing PipeStatusFlags metadata");
                         }
                         Ok(())
-                    },
-                    |fd| {
+                    }
+                    crate::RawFdRef::Eventfd(fd) => {
                         toggle_flags!(fd);
                         Ok(())
-                    },
-                    |fd| {
+                    }
+                    crate::RawFdRef::Epoll(fd) => {
                         toggle_flags!(fd);
                         Ok(())
-                    },
-                    |fd| {
+                    }
+                    crate::RawFdRef::Unix(fd) => {
                         toggle_flags!(fd);
                         Ok(())
-                    },
-                    |fd| {
+                    }
+                    crate::RawFdRef::HostPipe(fd) => {
                         let handle = self
                             .global
                             .litebox
@@ -5003,8 +5048,8 @@ impl<FS: ShimFS> Task<FS> {
                             file.set_status(flags);
                             Ok(())
                         })
-                    },
-                    |fd| {
+                    }
+                    crate::RawFdRef::BrokerPipe(fd) => {
                         let handle = self
                             .global
                             .litebox
@@ -5019,8 +5064,8 @@ impl<FS: ShimFS> Task<FS> {
                             file.set_status(flags);
                             Ok(())
                         })
-                    },
-                    |fd| {
+                    }
+                    crate::RawFdRef::BrokerSocketPair(fd) => {
                         let handle = self
                             .global
                             .litebox
@@ -5035,8 +5080,8 @@ impl<FS: ShimFS> Task<FS> {
                             file.set_status(flags);
                             Ok(())
                         })
-                    },
-                    |fd| {
+                    }
+                    crate::RawFdRef::BrokerPty(fd) => {
                         let handle = self
                             .global
                             .litebox
@@ -5051,8 +5096,24 @@ impl<FS: ShimFS> Task<FS> {
                             file.set_status(flags);
                             Ok(())
                         })
-                    },
-                )??;
+                    }
+                    crate::RawFdRef::Signalfd(fd) => {
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| {
+                            let diff = (file.get_status() & setfl_mask) ^ flags;
+                            if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                                log_unsupported!("unsupported flags");
+                            }
+                            file.set_status(flags);
+                            Ok(())
+                        })
+                    }
+                })??;
                 Ok(0)
             }
             FcntlArg::GETLK(lock) => {
@@ -5150,25 +5211,25 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
 
         // Get the path and verify it's a directory.
-        let dir_path = files.run_on_raw_fd(
-            raw,
-            |typed_fd| {
+        let dir_path = files.run_on_raw_fd(raw, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(typed_fd) => {
                 let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
                 if status.file_type != FileType::Directory {
                     return Err(Errno::ENOTDIR);
                 }
                 files.fs.fd_path(typed_fd).ok_or(Errno::EBADF)
-            },
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-            |_| Err(Errno::ENOTDIR),
-        )??;
+            }
+            crate::RawFdRef::Net(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Pipes(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+        })??;
 
         let mut new_cwd = dir_path;
         if !new_cwd.ends_with('/') {
@@ -6114,9 +6175,8 @@ impl<FS: ShimFS> Task<FS> {
             IoctlArg::FIONREAD(out) => {
                 // Return the number of bytes available to read.
                 files
-                    .run_on_raw_fd(
-                        desc,
-                        |file_fd| {
+                    .run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
+                        crate::RawFdRef::Fs(file_fd) => {
                             let available = match self.classify_terminal(&files.fs, file_fd)? {
                                 TerminalKind::HostStdio => self
                                     .global
@@ -6140,15 +6200,15 @@ impl<FS: ShimFS> Task<FS> {
                             let available = i32::try_from(available).unwrap_or(i32::MAX);
                             out.write_at_offset(0, available).ok_or(Errno::EFAULT)?;
                             Ok(0u32)
-                        },
-                        |socket_fd| {
+                        }
+                        crate::RawFdRef::Net(socket_fd) => {
                             let proxy = self.global.get_proxy(socket_fd)?;
                             let n = proxy.pending_rx_bytes();
                             let n = i32::try_from(n).unwrap_or(i32::MAX);
                             out.write_at_offset(0, n).ok_or(Errno::EFAULT)?;
                             Ok(0u32)
-                        },
-                        |pipe_fd| {
+                        }
+                        crate::RawFdRef::Pipes(pipe_fd) => {
                             // Pipes: return actual buffered byte count.
                             let n = self
                                 .global
@@ -6158,24 +6218,38 @@ impl<FS: ShimFS> Task<FS> {
                             let n = i32::try_from(n).unwrap_or(i32::MAX);
                             out.write_at_offset(0, n).ok_or(Errno::EFAULT)?;
                             Ok(0u32)
+                        }
+                        crate::RawFdRef::Eventfd(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                        crate::RawFdRef::Epoll(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                        crate::RawFdRef::Unix(_fd) => {
+                            todo!("FIONREAD on Unix socket: real Linux returns queued readable byte count")
+                        }
+                        crate::RawFdRef::HostPipe(_fd) => {
+                            todo!("FIONREAD on host pipe: real Linux returns queued readable byte count")
+                        }
+                        crate::RawFdRef::BrokerPipe(_fd) => {
+                            todo!("FIONREAD on broker pipe: real Linux returns queued readable byte count")
+                        }
+                        crate::RawFdRef::BrokerSocketPair(_fd) => {
+                            todo!(
+                                "FIONREAD on broker socketpair: real Linux returns queued readable byte count"
+                            )
+                        }
+                        crate::RawFdRef::BrokerPty(_fd) => {
+                            todo!("FIONREAD on broker PTY: real Linux returns queued terminal input byte count")
+                        }
+                        crate::RawFdRef::Signalfd(_fd) => {
+                            Err(Errno::ENOTTY) // real Linux: ENOTTY for FIONREAD on signalfd
                         },
-                        |_fd| Err(Errno::ENOTTY),
-                        |_fd| Err(Errno::ENOTTY),
-                        |_fd| Err(Errno::ENOTTY),
-                        |_fd| Err(Errno::ENOTTY),
-                        |_fd| Err(Errno::ENOTTY),
-                        |_fd| Err(Errno::ENOTTY),
-                        |_fd| Err(Errno::ENOTTY),
-                    )
+                    })
                     .flatten()
             }
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 let files = self.files.borrow();
                 files
-                    .run_on_raw_fd(
-                        desc,
-                        |file_fd| {
+                    .run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
+                        crate::RawFdRef::Fs(file_fd) => {
                             let result = self
                                 .global
                                 .litebox
@@ -6196,8 +6270,8 @@ impl<FS: ShimFS> Task<FS> {
                                 }
                             }
                             Ok(())
-                        },
-                        |socket_fd| {
+                        }
+                        crate::RawFdRef::Net(socket_fd) => {
                             if let Err(e) = self
                                 .global
                                 .litebox
@@ -6215,14 +6289,13 @@ impl<FS: ShimFS> Task<FS> {
                                 }
                             }
                             Ok(())
-                        },
-                        |fd| {
-                            self.global
-                                .pipes
-                                .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
-                                .map_err(Errno::from)
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::Pipes(fd) => self
+                            .global
+                            .pipes
+                            .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
+                            .map_err(Errno::from),
+                        crate::RawFdRef::Eventfd(fd) => {
                             let handle = self
                                 .global
                                 .litebox
@@ -6233,8 +6306,8 @@ impl<FS: ShimFS> Task<FS> {
                                 file.set_status(OFlags::NONBLOCK, val != 0);
                             });
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::Epoll(fd) => {
                             let handle = self
                                 .global
                                 .litebox
@@ -6245,8 +6318,8 @@ impl<FS: ShimFS> Task<FS> {
                                 file.set_status(OFlags::NONBLOCK, val != 0);
                             });
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::Unix(fd) => {
                             let handle = self
                                 .global
                                 .litebox
@@ -6257,8 +6330,8 @@ impl<FS: ShimFS> Task<FS> {
                                 file.set_status(OFlags::NONBLOCK, val != 0);
                             });
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::HostPipe(fd) => {
                             let handle = self
                                 .global
                                 .litebox
@@ -6274,8 +6347,8 @@ impl<FS: ShimFS> Task<FS> {
                                 file.set_status(flags);
                                 Ok::<(), Errno>(())
                             })
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::BrokerPipe(fd) => {
                             // BrokerPipeFd: O_NONBLOCK lives in the shim-side
                             // `status` AtomicU32; read/write paths consult
                             // `get_status().contains(NONBLOCK)` before issuing
@@ -6292,8 +6365,8 @@ impl<FS: ShimFS> Task<FS> {
                                 file.set_status(flags);
                             });
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::BrokerSocketPair(fd) => {
                             // BrokerPipeFd: O_NONBLOCK lives in the shim-side
                             // `status` AtomicU32; read/write paths consult
                             // `get_status().contains(NONBLOCK)` before issuing
@@ -6310,8 +6383,8 @@ impl<FS: ShimFS> Task<FS> {
                                 file.set_status(flags);
                             });
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::BrokerPty(fd) => {
                             // BrokerPipeFd: O_NONBLOCK lives in the shim-side
                             // `status` AtomicU32; read/write paths consult
                             // `get_status().contains(NONBLOCK)` before issuing
@@ -6328,183 +6401,214 @@ impl<FS: ShimFS> Task<FS> {
                                 file.set_status(flags);
                             });
                             Ok(())
-                        },
-                    )
+                        }
+                        crate::RawFdRef::Signalfd(fd) => {
+                            // Signalfd: O_NONBLOCK lives in the shim-side
+                            // `status` AtomicU32; read paths consult
+                            // `get_status().contains(NONBLOCK)` before issuing
+                            // broker RPCs. No host fd to toggle.
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                let mut flags = file.get_status();
+                                flags.set(OFlags::NONBLOCK, val != 0);
+                                file.set_status(flags);
+                            });
+                            Ok(())
+                        }
+                    })
                     .flatten()?;
                 Ok(0)
             }
-            IoctlArg::FIOCLEX => files.run_on_raw_fd(
-                desc,
-                |fd| {
+            IoctlArg::FIOCLEX => files.run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Net(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Pipes(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Eventfd(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Epoll(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Unix(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::HostPipe(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPipe(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerSocketPair(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPty(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
-                },
-            )?,
-            IoctlArg::FIONCLEX => files.run_on_raw_fd(
-                desc,
-                |fd| {
+                }
+                crate::RawFdRef::Signalfd(fd) => {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                }
+            })?,
+            IoctlArg::FIONCLEX => files.run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Net(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Pipes(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Eventfd(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Epoll(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::Unix(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::HostPipe(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPipe(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerSocketPair(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
-                },
-                |fd| {
+                }
+                crate::RawFdRef::BrokerPty(fd) => {
                     let _old = self
                         .global
                         .litebox
                         .descriptor_table_mut()
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
-                },
-            )?,
+                }
+                crate::RawFdRef::Signalfd(fd) => {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                }
+            })?,
             IoctlArg::TIOCGPTPEER(open_flags) => {
                 // TIOCGPTPEER: open the slave side of a PTY master, returning a new fd.
                 // The argument contains O_RDWR|O_NOCTTY or similar open flags.
-                let pty_idx = files.run_on_raw_fd(
-                    desc,
-                    |file_fd| {
+                let pty_idx = files.run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(file_fd) => {
                         // Check the fd is a PTY master (major 136).
                         let status = files.fs.fd_file_status(file_fd).map_err(|_| Errno::EBADF)?;
                         let rdev = status.node_info.rdev.ok_or(Errno::ENOTTY)?;
@@ -6513,17 +6617,24 @@ impl<FS: ShimFS> Task<FS> {
                             return Err(Errno::ENOTTY);
                         }
                         Ok(rdev.get() & 0xFF)
+                    }
+                    crate::RawFdRef::Net(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::Pipes(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::Epoll(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::Unix(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::BrokerPty(_) => {
+                        unreachable!(
+                            "BrokerPty descriptors are handled by the direct TIOCGPTPEER branch before run_on_raw_fd"
+                        )
+                    }
+                    crate::RawFdRef::Signalfd(_) => {
+                        Err(Errno::ENOTTY) // real Linux: ENOTTY for TIOCGPTPEER on signalfd
                     },
-                    |_| Err(Errno::ENOTTY),
-                    |_| Err(Errno::ENOTTY),
-                    |_| Err(Errno::ENOTTY),
-                    |_| Err(Errno::ENOTTY),
-                    |_| Err(Errno::ENOTTY),
-                    |_| Err(Errno::ENOTTY),
-                    |_| Err(Errno::ENOTTY),
-                    |_| Err(Errno::ENOTTY),
-                    |_| Err(Errno::ENOTTY),
-                )??;
+                })??;
                 // Drop borrows before opening (which needs write access).
                 drop(files);
                 // Open the slave via the normal open path.
@@ -6543,75 +6654,85 @@ impl<FS: ShimFS> Task<FS> {
             | IoctlArg::TIOCGPGRP(..)
             | IoctlArg::TIOCSPGRP(..)
             | IoctlArg::TIOCGWINSZ(..)
-            | IoctlArg::TIOCSWINSZ(..) => files.run_on_raw_fd(
-                desc,
-                |term_fd| match self.classify_terminal(&files.fs, term_fd)? {
-                    TerminalKind::HostStdio => self.host_stdio_ioctl(&files.fs, term_fd, &arg),
-                    TerminalKind::NotTerminal => Err(Errno::ENOTTY),
-                },
-                |_fd| Err(Errno::ENOTTY),
-                |pipe_fd| {
-                    let is_mux_pty = self
-                        .global
-                        .litebox
-                        .descriptor_table()
-                        .with_metadata(pipe_fd, |_: &crate::MuxPtySlaveFd| ())
-                        .is_ok();
-                    if !is_mux_pty {
-                        return Err(Errno::ENOTTY);
-                    }
+            | IoctlArg::TIOCSWINSZ(..) => {
+                files.run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
+                    crate::RawFdRef::Fs(term_fd) => match self
+                        .classify_terminal(&files.fs, term_fd)?
+                    {
+                        TerminalKind::HostStdio => self.host_stdio_ioctl(&files.fs, term_fd, &arg),
+                        TerminalKind::NotTerminal => Err(Errno::ENOTTY),
+                    },
+                    crate::RawFdRef::Net(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::Pipes(pipe_fd) => {
+                        let is_mux_pty = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(pipe_fd, |_: &crate::MuxPtySlaveFd| ())
+                            .is_ok();
+                        if !is_mux_pty {
+                            return Err(Errno::ENOTTY);
+                        }
 
-                    match arg {
-                        IoctlArg::TIOCGPGRP(pgrp) => {
-                            pgrp.write_at_offset(0, self.pid).ok_or(Errno::EFAULT)?;
-                            Ok(0)
-                        }
-                        IoctlArg::TIOCSPGRP(pgrp) => {
-                            let pgrp: i32 = pgrp.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                            if pgrp <= 0 {
-                                return Err(Errno::EINVAL);
+                        match arg {
+                            IoctlArg::TIOCGPGRP(pgrp) => {
+                                pgrp.write_at_offset(0, self.pid).ok_or(Errno::EFAULT)?;
+                                Ok(0)
                             }
-                            if let Ok(pgid) = u32::try_from(pgrp) {
-                                self.global.ensure_pgrp_signal_subscription(pgid);
+                            IoctlArg::TIOCSPGRP(pgrp) => {
+                                let pgrp: i32 = pgrp.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                                if pgrp <= 0 {
+                                    return Err(Errno::EINVAL);
+                                }
+                                if let Ok(pgid) = u32::try_from(pgrp) {
+                                    self.global.ensure_pgrp_signal_subscription(pgid);
+                                }
+                                Ok(0)
                             }
-                            Ok(0)
-                        }
-                        IoctlArg::TIOCSCTTY => {
-                            if let Some(pgid) = self
-                                .global
-                                .litebox
-                                .process_registry()
-                                .get_pgid(self.process_id)
-                            {
-                                self.global.ensure_pgrp_signal_subscription(pgid.0);
+                            IoctlArg::TIOCSCTTY => {
+                                if let Some(pgid) = self
+                                    .global
+                                    .litebox
+                                    .process_registry()
+                                    .get_pgid(self.process_id)
+                                {
+                                    self.global.ensure_pgrp_signal_subscription(pgid.0);
+                                }
+                                Ok(0)
                             }
-                            Ok(0)
+                            IoctlArg::TIOCGWINSZ(ws) => {
+                                ws.write_at_offset(
+                                    0,
+                                    litebox_common_linux::Winsize {
+                                        row: 41,
+                                        col: 132,
+                                        xpixel: 0,
+                                        ypixel: 0,
+                                    },
+                                )
+                                .ok_or(Errno::EFAULT)?;
+                                Ok(0)
+                            }
+                            IoctlArg::TIOCSWINSZ(_) => Ok(0),
+                            _ => Err(Errno::ENOTTY),
                         }
-                        IoctlArg::TIOCGWINSZ(ws) => {
-                            ws.write_at_offset(
-                                0,
-                                litebox_common_linux::Winsize {
-                                    row: 41,
-                                    col: 132,
-                                    xpixel: 0,
-                                    ypixel: 0,
-                                },
-                            )
-                            .ok_or(Errno::EFAULT)?;
-                            Ok(0)
-                        }
-                        IoctlArg::TIOCSWINSZ(_) => Ok(0),
-                        _ => Err(Errno::ENOTTY),
                     }
-                },
-                |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY),
-            )?,
+                    crate::RawFdRef::Eventfd(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::Epoll(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::Unix(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::HostPipe(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::BrokerPipe(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::BrokerSocketPair(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::BrokerPty(_fd) => {
+                        unreachable!(
+                            "BrokerPty descriptors are handled by the direct terminal-ioctl branch before run_on_raw_fd"
+                        )
+                    }
+                    crate::RawFdRef::Signalfd(_fd) => {
+                        Err(Errno::ENOTTY) // real Linux: ENOTTY for terminal ioctls on signalfd
+                    },
+                })?
+            }
             _ => {
                 // Return ENOTTY for unsupported ioctls rather than panicking.
                 // Complex programs (e.g., bash) probe terminal capabilities and
@@ -7205,129 +7326,118 @@ impl<FS: ShimFS> Task<FS> {
             )?;
             return Ok(new_fd);
         }
-        let new_fd = files.run_on_raw_fd(
-            file,
-            |fd| {
-                dup(
-                    &self.global,
-                    &files,
-                    fd,
-                    self.pid,
-                    file,
-                    close_on_exec,
-                    target,
-                    min_fd,
-                )
-            },
-            |fd| {
-                dup(
-                    &self.global,
-                    &files,
-                    fd,
-                    self.pid,
-                    file,
-                    close_on_exec,
-                    target,
-                    min_fd,
-                )
-            },
-            |fd| {
-                dup(
-                    &self.global,
-                    &files,
-                    fd,
-                    self.pid,
-                    file,
-                    close_on_exec,
-                    target,
-                    min_fd,
-                )
-            },
-            |fd| {
-                dup(
-                    &self.global,
-                    &files,
-                    fd,
-                    self.pid,
-                    file,
-                    close_on_exec,
-                    target,
-                    min_fd,
-                )
-            },
-            |fd| {
-                dup(
-                    &self.global,
-                    &files,
-                    fd,
-                    self.pid,
-                    file,
-                    close_on_exec,
-                    target,
-                    min_fd,
-                )
-            },
-            |fd| {
-                dup(
-                    &self.global,
-                    &files,
-                    fd,
-                    self.pid,
-                    file,
-                    close_on_exec,
-                    target,
-                    min_fd,
-                )
-            },
-            |fd| {
-                dup(
-                    &self.global,
-                    &files,
-                    fd,
-                    self.pid,
-                    file,
-                    close_on_exec,
-                    target,
-                    min_fd,
-                )
-            },
-            |fd| {
-                dup(
-                    &self.global,
-                    &files,
-                    fd,
-                    self.pid,
-                    file,
-                    close_on_exec,
-                    target,
-                    min_fd,
-                )
-            },
-            |fd| {
-                dup(
-                    &self.global,
-                    &files,
-                    fd,
-                    self.pid,
-                    file,
-                    close_on_exec,
-                    target,
-                    min_fd,
-                )
-            },
-            |fd| {
-                dup(
-                    &self.global,
-                    &files,
-                    fd,
-                    self.pid,
-                    file,
-                    close_on_exec,
-                    target,
-                    min_fd,
-                )
-            },
-        );
+        let new_fd = files.run_on_raw_fd(file, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+            crate::RawFdRef::Net(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+            crate::RawFdRef::Pipes(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+            crate::RawFdRef::Eventfd(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+            crate::RawFdRef::Epoll(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+            crate::RawFdRef::Unix(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+            crate::RawFdRef::HostPipe(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+            crate::RawFdRef::BrokerPipe(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+            crate::RawFdRef::BrokerSocketPair(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+            crate::RawFdRef::BrokerPty(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+            crate::RawFdRef::Signalfd(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
+        });
         let new_fd = match new_fd {
             Ok(Ok(fd)) => fd,
             Ok(Err(e)) | Err(e) => return Err(e),
@@ -7401,79 +7511,85 @@ impl<FS: ShimFS> Task<FS> {
                     return Ok(oldfd);
                 }
                 files
-                    .run_on_raw_fd(
-                        oldfd_usize,
-                        |fd| {
+                    .run_on_raw_fd(oldfd_usize, |raw_fd_ref| match raw_fd_ref {
+                        crate::RawFdRef::Fs(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::Net(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::Pipes(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::Eventfd(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::Epoll(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::Unix(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::HostPipe(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::BrokerPipe(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::BrokerSocketPair(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
-                        },
-                        |fd| {
+                        }
+                        crate::RawFdRef::BrokerPty(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
-                        },
-                    )
+                        }
+                        crate::RawFdRef::Signalfd(fd) => {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        }
+                    })
                     .flatten()?;
                 return Ok(oldfd);
             }
@@ -7516,9 +7632,8 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
-        files.run_on_raw_fd(
-            fd,
-            |file| {
+        files.run_on_raw_fd(fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(file) => {
                 let dir_off: Diroff = self
                     .global
                     .litebox
@@ -7599,17 +7714,18 @@ impl<FS: ShimFS> Task<FS> {
                     .descriptor_table_mut()
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
-            },
-            |_fd| Err(Errno::ENOTDIR),
-            |_fd| Err(Errno::ENOTDIR),
-            |_fd| Err(Errno::ENOTDIR),
-            |_fd| Err(Errno::ENOTDIR),
-            |_fd| Err(Errno::ENOTDIR),
-            |_fd| Err(Errno::ENOTDIR),
-            |_fd| Err(Errno::ENOTDIR),
-            |_fd| Err(Errno::ENOTDIR),
-            |_fd| Err(Errno::ENOTDIR),
-        )?
+            }
+            crate::RawFdRef::Net(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Pipes(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Eventfd(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Epoll(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Unix(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::HostPipe(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::BrokerPipe(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::BrokerSocketPair(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::BrokerPty(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Signalfd(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+        })?
     }
 }
 

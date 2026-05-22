@@ -226,9 +226,8 @@ impl<FS: ShimFS> Task<FS> {
         let raw_fd = usize::try_from(u32::try_from(fd).map_err(|_| Errno::EBADF)?)
             .map_err(|_| Errno::EBADF)?;
         let files = self.files.borrow();
-        files.run_on_raw_fd(
-            raw_fd,
-            |typed_fd| {
+        files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(typed_fd) => {
                 let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
                 if status.file_type != litebox::fs::FileType::RegularFile {
                     return Err(Errno::ENODEV);
@@ -239,17 +238,18 @@ impl<FS: ShimFS> Task<FS> {
                     .read(typed_fd, &mut probe, Some(0))
                     .map_err(Errno::from)?;
                 Ok(())
-            },
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-            |_| Err(Errno::ENODEV),
-        )?
+            }
+            crate::RawFdRef::Net(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::Pipes(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::Eventfd(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::Epoll(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::Unix(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::HostPipe(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::BrokerPty(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::Signalfd(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+        })?
     }
 
     // ── End of internal fd helpers ─────────────────────────────────────
@@ -261,19 +261,19 @@ impl<FS: ShimFS> Task<FS> {
         };
         let files = self.files.borrow();
         files
-            .run_on_raw_fd(
-                raw_fd,
-                |typed_fd| files.fs.fd_path(typed_fd),
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-            )
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(typed_fd) => files.fs.fd_path(typed_fd),
+                crate::RawFdRef::Net(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::Pipes(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::Eventfd(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::Epoll(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::Unix(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::HostPipe(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::BrokerPipe(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::BrokerSocketPair(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::BrokerPty(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::Signalfd(_) => None,  // non-FS descriptor has no filesystem path,
+            })
             .ok()
             .flatten()
     }
@@ -921,19 +921,19 @@ impl<FS: ShimFS> Task<FS> {
         let raw_fd = fd;
 
         let static_data = files
-            .run_on_raw_fd(
-                raw_fd,
-                |typed_fd| files.fs.get_static_backing_data(typed_fd),
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-            )
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(typed_fd) => files.fs.get_static_backing_data(typed_fd),
+                crate::RawFdRef::Net(_) => None, // CoW fast path only supports FS static backing
+                crate::RawFdRef::Pipes(_) => None, // CoW fast path only supports FS static backing
+                crate::RawFdRef::Eventfd(_) => None, // CoW fast path only supports FS static backing
+                crate::RawFdRef::Epoll(_) => None, // CoW fast path only supports FS static backing
+                crate::RawFdRef::Unix(_) => None,  // CoW fast path only supports FS static backing
+                crate::RawFdRef::HostPipe(_) => None, // CoW fast path only supports FS static backing
+                crate::RawFdRef::BrokerPipe(_) => None, // CoW fast path only supports FS static backing
+                crate::RawFdRef::BrokerSocketPair(_) => None, // CoW fast path only supports FS static backing
+                crate::RawFdRef::BrokerPty(_) => None, // CoW fast path only supports FS static backing
+                crate::RawFdRef::Signalfd(_) => None, // CoW fast path only supports FS static backing,
+            })
             .ok()??;
 
         if offset > static_data.len() {

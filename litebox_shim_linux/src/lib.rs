@@ -2433,66 +2433,91 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     /// arms that need an owned `Arc<TypedFd<X>>` (e.g., to embed in
     /// a binding type that outlives the closure) can clone it. Most
     /// call sites use it as `&TypedFd<X>` and rely on `Arc::deref`.
-    #[expect(clippy::too_many_arguments)]
+    /// Dispatch a raw fd integer to the subsystem that owns it.
+    ///
+    /// The closure receives a `RawFdRef<'_, FS>` enum and must match
+    /// exhaustively — adding a new subsystem requires updating every
+    /// caller, which is the property we want. (Previous positional-
+    /// closure shapes silently let new subsystems be missed; that
+    /// class of bug surfaced as silent `EBADF` returns for the
+    /// missing subsystem — see e.g. the signalfd story captured by
+    /// `PTY.dropbear_emul`.)
+    ///
+    /// **Variants receive `&Arc<TypedFd<X>>`**, not `&TypedFd<X>`, so
+    /// arms that need an owned `Arc<TypedFd<X>>` can clone it. Most
+    /// call sites use it as `&TypedFd<X>` and rely on `Arc::deref`.
     pub(crate) fn run_on_raw_fd<R>(
         &self,
         fd: usize,
-        fs: impl FnOnce(&Arc<TypedFd<FS>>) -> R,
-        net: impl FnOnce(&Arc<TypedFd<Network<Platform>>>) -> R,
-        pipes: impl FnOnce(&Arc<TypedFd<Pipes<Platform>>>) -> R,
-        eventfd: impl FnOnce(&Arc<TypedFd<syscalls::eventfd::EventfdSubsystem>>) -> R,
-        epoll: impl FnOnce(&Arc<TypedFd<syscalls::epoll::EpollSubsystem<FS>>>) -> R,
-        unix: impl FnOnce(&Arc<TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>>) -> R,
-        host_pipe: impl FnOnce(&Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>) -> R,
-        broker_pipe: impl FnOnce(&Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>) -> R,
-        broker_socketpair: impl FnOnce(
-            &Arc<TypedFd<syscalls::broker_socketpair::BrokerSocketPairSubsystem>>,
-        ) -> R,
-        broker_pty: impl FnOnce(&Arc<TypedFd<syscalls::broker_pty::BrokerPtySubsystem>>) -> R,
+        f: impl FnOnce(RawFdRef<'_, FS>) -> R,
     ) -> Result<R, Errno> {
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(fs(&fd));
+            return Ok(f(RawFdRef::Fs(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(net(&fd));
+            return Ok(f(RawFdRef::Net(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(pipes(&fd));
+            return Ok(f(RawFdRef::Pipes(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(eventfd(&fd));
+            return Ok(f(RawFdRef::Eventfd(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(epoll(&fd));
+            return Ok(f(RawFdRef::Epoll(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(unix(&fd));
+            return Ok(f(RawFdRef::Unix(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(host_pipe(&fd));
+            return Ok(f(RawFdRef::HostPipe(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(broker_pipe(&fd));
+            return Ok(f(RawFdRef::BrokerPipe(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(broker_socketpair(&fd));
+            return Ok(f(RawFdRef::BrokerSocketPair(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(broker_pty(&fd));
+            return Ok(f(RawFdRef::BrokerPty(&fd)));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(f(RawFdRef::Signalfd(&fd)));
         }
         Err(Errno::EBADF)
     }
+}
+
+/// Subsystem-tagged reference to a raw fd's owning typed fd.
+///
+/// Returned (via callback) by `FilesState::run_on_raw_fd`. Matching
+/// on this enum is exhaustive: adding a new subsystem variant
+/// produces compile errors at every call site, which is the
+/// invariant the dispatcher exists to enforce.
+pub(crate) enum RawFdRef<'a, FS: ShimFS> {
+    Fs(&'a Arc<TypedFd<FS>>),
+    Net(&'a Arc<TypedFd<Network<Platform>>>),
+    Pipes(&'a Arc<TypedFd<Pipes<Platform>>>),
+    Eventfd(&'a Arc<TypedFd<syscalls::eventfd::EventfdSubsystem>>),
+    Epoll(&'a Arc<TypedFd<syscalls::epoll::EpollSubsystem<FS>>>),
+    Unix(&'a Arc<TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>>),
+    HostPipe(&'a Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>),
+    BrokerPipe(&'a Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>),
+    BrokerSocketPair(&'a Arc<TypedFd<syscalls::broker_socketpair::BrokerSocketPairSubsystem>>),
+    BrokerPty(&'a Arc<TypedFd<syscalls::broker_pty::BrokerPtySubsystem>>),
+    Signalfd(&'a Arc<TypedFd<syscalls::signalfd::SignalfdSubsystem>>),
 }
 
 // This places size limits on maximum read/write sizes that might occur; it exists primarily to
@@ -2713,9 +2738,8 @@ impl<FS: ShimFS> Task<FS> {
 
         let files = self.files.borrow();
         files
-            .run_on_raw_fd(
-                raw_fd,
-                |file_fd| {
+            .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+                crate::RawFdRef::Fs(file_fd) => {
                     let status = files.fs.fd_file_status(file_fd).ok();
                     match status
                         .and_then(|status| status.node_info.rdev.map(core::num::NonZero::get))
@@ -2725,17 +2749,20 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         None => alloc::format!("raw={raw_fd} fs"),
                     }
-                },
-                |_fd| alloc::format!("raw={raw_fd} net"),
-                |_fd| alloc::format!("raw={raw_fd} pipes"),
-                |_fd| alloc::format!("raw={raw_fd} eventfd"),
-                |_fd| alloc::format!("raw={raw_fd} epoll"),
-                |_fd| alloc::format!("raw={raw_fd} unix"),
-                |_fd| alloc::format!("raw={raw_fd} host_pipe"),
-                |_fd| alloc::format!("raw={raw_fd} broker_pipe"),
-                |_fd| alloc::format!("raw={raw_fd} broker_pipe"),
-                |_fd| alloc::format!("raw={raw_fd} broker_pipe"),
-            )
+                }
+                crate::RawFdRef::Net(_fd) => alloc::format!("raw={raw_fd} net"),
+                crate::RawFdRef::Pipes(_fd) => alloc::format!("raw={raw_fd} pipes"),
+                crate::RawFdRef::Eventfd(_fd) => alloc::format!("raw={raw_fd} eventfd"),
+                crate::RawFdRef::Epoll(_fd) => alloc::format!("raw={raw_fd} epoll"),
+                crate::RawFdRef::Unix(_fd) => alloc::format!("raw={raw_fd} unix"),
+                crate::RawFdRef::HostPipe(_fd) => alloc::format!("raw={raw_fd} host_pipe"),
+                crate::RawFdRef::BrokerPipe(_fd) => alloc::format!("raw={raw_fd} broker_pipe"),
+                crate::RawFdRef::BrokerSocketPair(_fd) => {
+                    alloc::format!("raw={raw_fd} broker_pipe")
+                }
+                crate::RawFdRef::BrokerPty(_fd) => alloc::format!("raw={raw_fd} broker_pipe"),
+                crate::RawFdRef::Signalfd(_fd) => alloc::format!("raw={raw_fd} signalfd"),
+            })
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))
     }
 

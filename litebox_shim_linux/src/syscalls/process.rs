@@ -10190,9 +10190,8 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
         return false;
     }
     files
-        .run_on_raw_fd(
-            raw_fd,
-            |fd| {
+        .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+    crate::RawFdRef::Fs(fd) => {
                 let status = files.fs.fd_file_status(fd).ok();
                 let open_flags = global
                     .litebox
@@ -10249,11 +10248,11 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 // with a HostStdio binding.
                 false
             },
-            |_net| {
+    crate::RawFdRef::Net(_net) => {
                 log_worker_exec_stdio_unsupported(global, raw_fd, "network socket-backed stdio");
                 true
             },
-            |fd| {
+    crate::RawFdRef::Pipes(fd) => {
                 let nonblocking = global
                     .pipes
                     .get_flags(fd)
@@ -10287,7 +10286,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                     },
                 )
             },
-            |fd| {
+    crate::RawFdRef::Eventfd(fd) => {
                 let nonblocking = global
                     .litebox
                     .descriptor_table()
@@ -10306,11 +10305,11 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 );
                 true
             },
-            |_epoll| {
+    crate::RawFdRef::Epoll(_epoll) => {
                 log_worker_exec_stdio_unsupported(global, raw_fd, "epoll-backed stdio");
                 true
             },
-            |fd| {
+    crate::RawFdRef::Unix(fd) => {
                 let (nonblocking, is_stream, is_connected, has_timeouts) = global
                     .litebox
                     .descriptor_table()
@@ -10360,23 +10359,19 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 // Blocking SOCK_STREAM unix sockets are supported via stream bridging.
                 false
             },
-            // HostPipeFd: pipe bridge fds from a prior delayed fork.  They
-            // already wrap a host OS fd, so the worker can inherit them
-            // directly via posix_spawn dup2 — always supported.
-            |_host_pipe| false,
-            // BrokerPipeSubsystem (Phase C.3): supported. The
-            // --broker-fd-bridge install path wires the broker-pipe fd in
-            // the worker after spawn; the spawn binding itself is Close.
-            |_broker_pipe| false,
-            // BrokerPipeSubsystem (Phase C.3): supported. The
-            // --broker-fd-bridge install path wires the broker-pipe fd in
-            // the worker after spawn; the spawn binding itself is Close.
-            |_broker_pipe| false,
-            // BrokerPipeSubsystem (Phase C.3): supported. The
-            // --broker-fd-bridge install path wires the broker-pipe fd in
-            // the worker after spawn; the spawn binding itself is Close.
-            |_broker_pipe| false,
-        )
+
+                // HostPipeFd: pipe bridge fds from a prior delayed fork.  They
+                // already wrap a host OS fd, so the worker can inherit them
+                // directly via posix_spawn dup2 — always supported.
+                crate::RawFdRef::HostPipe(_host_pipe) => false,
+
+                // Broker-backed fds are supported here; exec binding handles
+                // the actual inherited/closed stdio behavior later.
+                crate::RawFdRef::BrokerPipe(_broker_pipe) => false,
+                crate::RawFdRef::BrokerSocketPair(_broker_socketpair) => false,
+                crate::RawFdRef::BrokerPty(_broker_pty) => false,
+                crate::RawFdRef::Signalfd(_signalfd) => false,
+            })
         .unwrap_or_else(|_| {
             log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
             true
@@ -10451,9 +10446,8 @@ fn worker_exec_input_binding<FS: ShimFS>(
         return WorkerExecInputBinding::Inherit;
     }
     files
-        .run_on_raw_fd(
-            raw_fd,
-            |fd| {
+        .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(fd) => {
                 let open_flags = global
                     .litebox
                     .descriptor_table()
@@ -10478,21 +10472,24 @@ fn worker_exec_input_binding<FS: ShimFS>(
                     fs: files.fs.clone(),
                     fd: fd.clone(),
                 }
-            },
+            }
+
             // Network sockets: not supported across worker exec.
-            |_net| WorkerExecInputBinding::Close,
-            |fd| match global.pipes.half_pipe_type(fd) {
+            crate::RawFdRef::Net(_net) => WorkerExecInputBinding::Close,
+            crate::RawFdRef::Pipes(fd) => match global.pipes.half_pipe_type(fd) {
                 Ok(HalfPipeType::ReceiverHalf) => WorkerExecInputBinding::Pipe {
                     pipes: global.pipes.clone(),
                     fd: fd.clone(),
                 },
                 Ok(HalfPipeType::SenderHalf) | Err(_) => WorkerExecInputBinding::Close,
             },
+
             // eventfd: not bridgeable as stdin.
-            |_eventfd| WorkerExecInputBinding::Close,
+            crate::RawFdRef::Eventfd(_eventfd) => WorkerExecInputBinding::Close,
+
             // epoll: not bridgeable as stdin.
-            |_epoll| WorkerExecInputBinding::Close,
-            |fd| {
+            crate::RawFdRef::Epoll(_epoll) => WorkerExecInputBinding::Close,
+            crate::RawFdRef::Unix(fd) => {
                 if let Some(handle) = global.litebox.descriptor_table().entry_handle(fd) {
                     return WorkerExecInputBinding::Stream(Arc::new(UnixSocketStreamReader {
                         platform: global.platform,
@@ -10500,12 +10497,13 @@ fn worker_exec_input_binding<FS: ShimFS>(
                     }));
                 }
                 WorkerExecInputBinding::Close
-            },
+            }
+
             // HostPipeFd: the worker needs this fd dup2'd onto its stdio slot.
             // The pipe bridge mechanism (--pipe-bridge) only applies to
             // fork-restore, not exec.  For exec, we use posix_spawn file actions
             // to dup2 the host fd onto the target stdio slot.
-            |hp_fd| {
+            crate::RawFdRef::HostPipe(hp_fd) => {
                 let dt = global.litebox.descriptor_table();
                 if let Some(host_fd) =
                     dt.with_entry(hp_fd, |e: &super::host_pipe::HostPipeFd| e.raw_fd())
@@ -10514,20 +10512,28 @@ fn worker_exec_input_binding<FS: ShimFS>(
                     return WorkerExecInputBinding::HostPipe { fd: host_fd };
                 }
                 WorkerExecInputBinding::Close
-            },
+            }
+
             // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
-            |_broker_pipe| WorkerExecInputBinding::Close,
+            crate::RawFdRef::BrokerPipe(_broker_pipe) => WorkerExecInputBinding::Close,
+
             // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
-            |_broker_pipe| WorkerExecInputBinding::Close,
+            crate::RawFdRef::BrokerSocketPair(_broker_pipe) => WorkerExecInputBinding::Close,
+
             // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
-            |_broker_pipe| WorkerExecInputBinding::Close,
-        )
+            crate::RawFdRef::BrokerPty(_broker_pipe) => WorkerExecInputBinding::Close,
+
+            // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
+            // before exec; the --broker-fd-bridge install path will install
+            // the broker pipe fd at the same slot during worker startup.
+            crate::RawFdRef::Signalfd(_broker_pipe) => WorkerExecInputBinding::Close,
+        })
         .unwrap_or(WorkerExecInputBinding::Close)
 }
 
@@ -10595,9 +10601,8 @@ fn worker_exec_output_binding<FS: ShimFS>(
         return WorkerExecOutputBinding::Inherit;
     }
     files
-        .run_on_raw_fd(
-            raw_fd,
-            |fd| {
+        .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(fd) => {
                 let open_flags = global
                     .litebox
                     .descriptor_table()
@@ -10622,21 +10627,24 @@ fn worker_exec_output_binding<FS: ShimFS>(
                     fs: files.fs.clone(),
                     fd: fd.clone(),
                 }
-            },
+            }
+
             // Network sockets: not supported as stdout/stderr across worker exec.
-            |_net| WorkerExecOutputBinding::Close,
-            |fd| match global.pipes.half_pipe_type(fd) {
+            crate::RawFdRef::Net(_net) => WorkerExecOutputBinding::Close,
+            crate::RawFdRef::Pipes(fd) => match global.pipes.half_pipe_type(fd) {
                 Ok(HalfPipeType::SenderHalf) => WorkerExecOutputBinding::Pipe {
                     pipes: global.pipes.clone(),
                     fd: fd.clone(),
                 },
                 Ok(HalfPipeType::ReceiverHalf) | Err(_) => WorkerExecOutputBinding::Close,
             },
+
             // eventfd: not bridgeable as stdout/stderr.
-            |_eventfd| WorkerExecOutputBinding::Close,
+            crate::RawFdRef::Eventfd(_eventfd) => WorkerExecOutputBinding::Close,
+
             // epoll: not bridgeable as stdout/stderr.
-            |_epoll| WorkerExecOutputBinding::Close,
-            |fd| {
+            crate::RawFdRef::Epoll(_epoll) => WorkerExecOutputBinding::Close,
+            crate::RawFdRef::Unix(fd) => {
                 if let Some(handle) = global.litebox.descriptor_table().entry_handle(fd) {
                     return WorkerExecOutputBinding::Stream(Arc::new(UnixSocketStreamWriter {
                         platform: global.platform,
@@ -10644,9 +10652,10 @@ fn worker_exec_output_binding<FS: ShimFS>(
                     }));
                 }
                 WorkerExecOutputBinding::Close
-            },
+            }
+
             // HostPipeFd: dup2 onto the target stdio slot via posix_spawn.
-            |hp_fd| {
+            crate::RawFdRef::HostPipe(hp_fd) => {
                 let dt = global.litebox.descriptor_table();
                 if let Some(host_fd) =
                     dt.with_entry(hp_fd, |e: &super::host_pipe::HostPipeFd| e.raw_fd())
@@ -10655,20 +10664,28 @@ fn worker_exec_output_binding<FS: ShimFS>(
                     return WorkerExecOutputBinding::HostPipe { fd: host_fd };
                 }
                 WorkerExecOutputBinding::Close
-            },
+            }
+
             // BrokerPipeSubsystem (Phase C.3): close the worker's output slot
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
-            |_broker_pipe| WorkerExecOutputBinding::Close,
+            crate::RawFdRef::BrokerPipe(_broker_pipe) => WorkerExecOutputBinding::Close,
+
             // BrokerPipeSubsystem (Phase C.3): close the worker's output slot
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
-            |_broker_pipe| WorkerExecOutputBinding::Close,
+            crate::RawFdRef::BrokerSocketPair(_broker_pipe) => WorkerExecOutputBinding::Close,
+
             // BrokerPipeSubsystem (Phase C.3): close the worker's output slot
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
-            |_broker_pipe| WorkerExecOutputBinding::Close,
-        )
+            crate::RawFdRef::BrokerPty(_broker_pipe) => WorkerExecOutputBinding::Close,
+
+            // BrokerPipeSubsystem (Phase C.3): close the worker's output slot
+            // before exec; the --broker-fd-bridge install path will install
+            // the broker pipe fd at the same slot during worker startup.
+            crate::RawFdRef::Signalfd(_broker_pipe) => WorkerExecOutputBinding::Close,
+        })
         .unwrap_or(WorkerExecOutputBinding::Close)
 }
 

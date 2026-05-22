@@ -274,6 +274,13 @@ impl Pty {
     /// MUST immediately return POLLIN if the child wrote data. This
     /// is dropbear's session-end pattern.
     pub fn poll_now(&self, events: i16) -> Result<i16, String> {
+        self.poll_now_timeout(events, 0)
+    }
+
+    /// Like `poll_now` but with a caller-supplied timeout (ms).
+    /// Used by `PTYR.poll_loop_post_sleep` to emulate dropbear's
+    /// session loop: short-timeout poll iterated indefinitely.
+    pub fn poll_now_timeout(&self, events: i16, timeout_ms: i32) -> Result<i16, String> {
         let fd = self.fd.as_raw_fd();
         let mut pollfd = libc::pollfd {
             fd,
@@ -281,12 +288,13 @@ impl Pty {
             revents: 0,
         };
         // SAFETY: pollfd points to one valid pollfd entry for this call.
-        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pollfd), 1, 0) };
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pollfd), 1, timeout_ms) };
         if rc < 0 {
-            return Err(format!(
-                "pty poll fd {fd}: {}",
-                std::io::Error::last_os_error()
-            ));
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                return Ok(0);
+            }
+            return Err(format!("pty poll fd {fd}: {err}"));
         }
         Ok(pollfd.revents)
     }
