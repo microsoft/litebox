@@ -92,6 +92,24 @@ enum ScenarioKind {
     /// be set immediately — dropbear and any TTY-aware consumer
     /// uses POLLHUP to detect peer-closed.
     SlaveCloseHup,
+    /// PTYR.poll_loop_post_sleep — exactly mimics dropbear's session
+    /// loop pattern. Parent polls master with a short (50ms) timeout
+    /// in a loop, reads on POLLIN, exits loop on POLLHUP. Child
+    /// writes 2 lines, sleeps 200ms, writes 3 more lines, exits.
+    ///
+    /// Distinct from `stdout_post_sleep`: that test reaps the child
+    /// FIRST then reads. This test reads CONCURRENTLY with the child
+    /// being alive — captures the case where dropbear sees POLLIN on
+    /// the first 2 lines, EAGAIN during the sleep, then needs to see
+    /// POLLIN again when the child resumes writing. If the broker
+    /// PTY's POLLIN notification only fires once per subscription
+    /// (or gets unsubscribed after first drain), the post-sleep
+    /// writes are lost.
+    ///
+    /// This is the actual Phase H "copilot -p prints nothing"
+    /// failure mode — the scripted bash test over ssh-into-litebox
+    /// captures only "L1, L2" and the channel closes mid-sleep.
+    PollLoopPostSleep,
     /// PTYR.isatty — child calls `isatty(0/1/2)` post-exec and prints
     /// `isatty: 0=Y 1=Y 2=Y`. Confirms all three stdio fds are TTYs in
     /// the new worker after a non-PIE execve.
@@ -194,6 +212,11 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "poll_loop_post_sleep",
+        kind: ScenarioKind::PollLoopPostSleep,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "isatty",
         kind: ScenarioKind::Isatty,
         per_binary_type: true,
@@ -239,6 +262,8 @@ const PTYR_POLL_AFTER_EXIT: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.poll_after_exit");
 const PTYR_SLAVE_CLOSE_HUP: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.slave_close_hup");
+const PTYR_POLL_LOOP_POST_SLEEP: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.poll_loop_post_sleep");
 const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
 const PARENT_EXIT_THEN_CHILD_IO: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.parent_exit_then_child_io");
@@ -519,6 +544,56 @@ async fn handle_ptyr_slave_close_hup(
     })
 }
 
+async fn handle_ptyr_poll_loop_post_sleep(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-poll-loop-post-sleep".into()], true)?;
+    // Dropbear-style session loop: poll(master, POLLIN|POLLHUP,
+    // 50ms) repeatedly; read on POLLIN; exit on POLLHUP. Do NOT reap
+    // child before draining — child is alive during the sleep
+    // between writes.
+    let mut buf = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timeout draining master; captured={:?}",
+                String::from_utf8_lossy(&buf)
+            )
+            .into());
+        }
+        let revents = pty.poll_now_timeout(libc::POLLIN | libc::POLLHUP, 50)?;
+        if revents & libc::POLLIN != 0
+            && let Some(bytes) = pty.try_read_now(4096)?
+        {
+            if bytes.is_empty() {
+                break;
+            }
+            buf.extend_from_slice(&bytes);
+        }
+        if revents & libc::POLLHUP != 0 {
+            // Drain any remaining bytes the kernel has buffered.
+            while let Some(bytes) = pty.try_read_now(4096)? {
+                if bytes.is_empty() {
+                    break;
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            break;
+        }
+    }
+    expect_exit_zero(pid)?;
+    let s = String::from_utf8_lossy(&buf).to_string();
+    // Child writes L01..L05 with a sleep between L02 and L03. PTY
+    // OPOST: \n → \r\n.
+    let expected = "L01\r\nL02\r\nL03\r\nL04\r\nL05\r\n";
+    let detail = exact(&s, expected)?;
+    Ok(PtyOut { detail })
+}
+
 async fn handle_ptyr_isatty(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -610,6 +685,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     );
     register_handler!(PTYR_POLL_AFTER_EXIT, handle_ptyr_poll_after_exit);
     register_handler!(PTYR_SLAVE_CLOSE_HUP, handle_ptyr_slave_close_hup);
+    register_handler!(PTYR_POLL_LOOP_POST_SLEEP, handle_ptyr_poll_loop_post_sleep);
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
     register_handler!(PARENT_EXIT_THEN_CHILD_IO, handle_parent_exit_then_child_io);
 
@@ -635,6 +711,10 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!(
         "pty-slave-close-immediate",
         leaf_subcmd::subcmd_pty_slave_close_immediate
+    );
+    crate::register_leaf_subcommand!(
+        "pty-poll-loop-post-sleep",
+        leaf_subcmd::subcmd_pty_poll_loop_post_sleep
     );
     crate::register_leaf_subcommand!("pty-isatty-check", leaf_subcmd::subcmd_pty_isatty_check);
     crate::register_leaf_subcommand!(
@@ -788,6 +868,10 @@ async fn drive_target(
         }
         ScenarioKind::SlaveCloseHup => {
             run.send_named_typed(handle, &PTYR_SLAVE_CLOSE_HUP, args)
+                .await?
+        }
+        ScenarioKind::PollLoopPostSleep => {
+            run.send_named_typed(handle, &PTYR_POLL_LOOP_POST_SLEEP, args)
                 .await?
         }
         ScenarioKind::Isatty => run.send_named_typed(handle, &PTYR_ISATTY, args).await?,
@@ -1195,6 +1279,23 @@ mod leaf_subcmd {
     /// verifies POLLHUP is set immediately on master.
     pub(super) fn subcmd_pty_slave_close_immediate(_args: &[String]) -> i32 {
         0
+    }
+
+    /// PTYR.poll_loop_post_sleep: spawn `/bin/sh -c` running the
+    /// exact bash workload that breaks under dropbear (echo, echo,
+    /// sleep external, echo, echo, echo, exit). Captures the case
+    /// where the slave-side process tree forks an external program
+    /// during the quiet period and resumes writes afterwards.
+    pub(super) fn subcmd_pty_poll_loop_post_sleep(_args: &[String]) -> i32 {
+        use std::process::Command;
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("echo L01; echo L02; sleep 1; echo L03; echo L04; echo L05")
+            .status();
+        match status {
+            Ok(s) if s.success() => 0,
+            _ => 1,
+        }
     }
 
     /// PTYR.isatty: probe `isatty(0)/isatty(1)/isatty(2)` after exec
