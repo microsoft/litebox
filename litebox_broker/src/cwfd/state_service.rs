@@ -31,6 +31,7 @@ use crate::signalfd_state::SignalfdState;
 use crate::socketpair_state::{SocketPairEnd, SocketPairError};
 use crate::state_registry::{BrokerStateRegistry, StateHandle, StateObject, StateRegistryError};
 use crate::subscription_list::{SubscribeError, UnsubscribeError};
+use litebox_common_linux::fd_token_protocol::PtyEndpoint;
 use litebox_common_linux::fd_token_protocol::{
     Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
     build_create_pidfd_response_ok, build_create_pipe_response_ok, build_create_pty_response_ok,
@@ -1364,11 +1365,30 @@ fn handle_release_state(
         Ok(id) => id,
         Err(_) => return protocol_err(Opcode::ReleaseResponse),
     };
+    // Before release, peek at the handle's PtyState (if any) so we
+    // can apply endpoint-specific post-release semantics.
+    // Specifically: when a slave handle's refcount drops to 1, only
+    // the master's anchor remains — no user-space slave fd-holders.
+    // Notify master with POLLHUP+POLLIN (kernel-PTY semantic).
+    let pty_state: Option<Arc<dyn StateObject + Send + Sync>> = registry
+        .resolve(StateHandle::from_id(handle_id), SubsystemTag::Pty)
+        .ok();
     match registry.release(StateHandle::from_id(handle_id)) {
-        Ok(()) => HandlerResult {
-            frame: build_release_response_ok(),
-            out_fd: None,
-        },
+        Ok(new_rc) => {
+            if let Some(state) = pty_state
+                && let Some(pty) = state.as_any().downcast_ref::<PtyState>()
+                && pty.endpoint() == PtyEndpoint::Slave
+                && new_rc == 1
+            {
+                // Last user-space slave fd-holder released; only the
+                // master's anchor remains. Notify master with HUP+IN.
+                pty.notify_slave_close_to_master();
+            }
+            HandlerResult {
+                frame: build_release_response_ok(),
+                out_fd: None,
+            }
+        }
         Err(StateRegistryError::UnknownHandle(_)) => {
             status_err(Opcode::ReleaseResponse, StatusCode::UnknownHandle)
         }

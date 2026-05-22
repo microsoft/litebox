@@ -48,6 +48,51 @@ impl Drop for PtyState {
             self.endpoint,
             sublist.len()
         );
+
+        // Phase H: PtyState::Drop fires when this endpoint's broker
+        // registry refcount reaches 0 — i.e., no fd-holders remain
+        // for this side of the pty pair. Update the peer-visible
+        // `{master,slave}_open_count` to 0 and notify the peer's
+        // subscribers so the peer's POLLHUP and EOF semantics fire.
+        //
+        // Without this, the open_count fields stay at their initial 1
+        // forever (they aren't incremented on dup_handle or
+        // open_pty_slave, so 1 is the right initial-state model:
+        // "registry rc > 0" ⇔ "1 open"). When the last fd-holder on
+        // a side releases, this Drop is the only place the peer can
+        // observe that close transition.
+        //
+        // Captured by PTYR.slave_close_hup (0/25 on litebox without
+        // this fix; 25/25 on native).
+        let mut inner = self.pair.inner.lock().expect("PtyState poisoned");
+        let (notify_event, notify_peer): (u32, &SubscriptionList) = match self.endpoint {
+            PtyEndpoint::Slave => {
+                let was_open = inner.slave_open_count > 0;
+                inner.slave_open_count = 0;
+                if !was_open {
+                    return;
+                }
+                // Notify master that all slaves have closed: POLLHUP
+                // (peer-close) plus POLLIN (so a master read returns
+                // 0/EOF rather than blocking).
+                (
+                    NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN,
+                    &self.pair.master_subject,
+                )
+            }
+            PtyEndpoint::Master => {
+                let was_open = inner.master_open_count > 0;
+                inner.master_open_count = 0;
+                if !was_open {
+                    return;
+                }
+                // Notify slave: POLLHUP (and slave reads return EIO
+                // per Linux PTY semantics — handled at the read path).
+                (NOTIFY_EVENT_HUP, &self.pair.slave_subject)
+            }
+        };
+        drop(inner);
+        notify_peer.notify(notify_event);
     }
 }
 
@@ -382,6 +427,24 @@ impl PtyState {
             PtyEndpoint::Master => self.pair.master_subject.remove(subscription_id),
             PtyEndpoint::Slave => self.pair.slave_subject.remove(subscription_id),
         }
+    }
+
+    /// Mark the slave side as fully closed and notify master
+    /// subscribers with `POLLHUP | POLLIN`. Called from
+    /// `handle_release_state` when a Slave handle's registry refcount
+    /// drops to 1 — i.e., only the master's anchor reference remains
+    /// and no user-space slave fd-holders. Kernel-PTY semantic:
+    /// master's `poll()` MUST report POLLHUP and `read()` MUST return
+    /// 0 (EOF) once all slaves are closed.
+    pub fn notify_slave_close_to_master(&self) {
+        debug_assert!(matches!(self.endpoint, PtyEndpoint::Slave));
+        {
+            let mut inner = self.pair.inner.lock().expect("PtyState poisoned");
+            inner.slave_open_count = 0;
+        }
+        self.pair
+            .master_subject
+            .notify(NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN);
     }
 }
 

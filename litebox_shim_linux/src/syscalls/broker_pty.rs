@@ -175,6 +175,19 @@ impl BrokerPtyProviderReacquireExt for Arc<dyn BrokerPtyProvider> {
 }
 
 impl BrokerPtyFd<Platform> {
+    /// Eagerly install the broker subscription. Called from
+    /// `open_broker_pty_path` after constructing the BrokerPtyFd so
+    /// that `poll(fd, POLLIN|POLLHUP, 0)` returns current state
+    /// without requiring a prior read/write to trigger lazy
+    /// subscription. Especially important for the master fd:
+    /// dropbear's session-end loop polls the master without first
+    /// reading; without eager subscription, the broker's HUP
+    /// notification (set when the slave closes) never reaches the
+    /// shim's pollee.
+    pub(crate) fn ensure_subscribed_eager(&self) {
+        self.common.ensure_subscribed(&self.pollee);
+    }
+
     pub(crate) fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
