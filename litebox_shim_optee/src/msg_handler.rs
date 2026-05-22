@@ -356,7 +356,13 @@ pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcRetu
         | OpteeMessageCommand::InvokeCommand
         | OpteeMessageCommand::CloseSession => return Err(OpteeSmcReturnCode::Ok),
         _ => {
+            #[cfg(debug_assertions)]
             todo!("Unimplemented OpteeMessageCommand: {:?}", msg_args.cmd);
+            #[cfg(not(debug_assertions))]
+            {
+                litebox_util_log::debug!(cmd:? = msg_args.cmd; "Unimplemented OpteeMessageCommand");
+                return Err(OpteeSmcReturnCode::EBadCmd);
+            }
         }
     }
     Ok(())

@@ -71,7 +71,16 @@ pub fn do_mmap<
         ProtFlags::PROT_NONE => unsafe {
             pm.create_inaccessible_pages(suggested_addr, length, flags, op)
         },
-        _ => todo!("Unsupported prot flags {:?}", prot),
+        _ => {
+            #[cfg(debug_assertions)]
+            todo!("Unsupported prot flags {:?}", prot);
+            // TODO: create inaccessible pages for now. Creating mapping
+            // for both executable and writable might be needed for JIT.
+            #[cfg(not(debug_assertions))]
+            unsafe {
+                pm.create_inaccessible_pages(suggested_addr, length, flags, op)
+            }
+        }
     }
 }
 
@@ -134,7 +143,12 @@ pub fn sys_mprotect<
         ProtFlags::PROT_READ => unsafe { pm.make_pages_readable(addr, len) },
         ProtFlags::PROT_NONE => unsafe { pm.make_pages_inaccessible(addr, len) },
         ProtFlags::PROT_READ_WRITE_EXEC => unsafe { pm.make_pages_rwx(addr, len) },
-        _ => todo!("Unsupported prot flags {:?}", prot),
+        _ => {
+            #[cfg(debug_assertions)]
+            todo!("Unsupported prot flags {:?}", prot);
+            #[cfg(not(debug_assertions))]
+            return Err(Errno::EINVAL);
+        }
     }
     .map_err(Errno::from)
 }
@@ -185,7 +199,10 @@ pub fn sys_mremap<
     }
 
     if flags.intersects(MRemapFlags::MREMAP_FIXED | MRemapFlags::MREMAP_DONTUNMAP) {
+        #[cfg(debug_assertions)]
         todo!("Unsupported flags {:?}", flags);
+        #[cfg(not(debug_assertions))]
+        return Err(Errno::EINVAL);
     }
 
     unsafe {

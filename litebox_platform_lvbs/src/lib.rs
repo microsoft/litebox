@@ -1041,38 +1041,24 @@ impl<Host: HostInterface> RawMutex<Host> {
         val: u32,
         timeout: Option<core::time::Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        loop {
-            // No need to wait if the value already changed.
-            if self
-                .underlying_atomic()
-                .load(core::sync::atomic::Ordering::Relaxed)
-                != val
-            {
-                return Err(ImmediatelyWokenUp);
-            }
+        // No need to wait if the value already changed.
+        if self
+            .underlying_atomic()
+            .load(core::sync::atomic::Ordering::Relaxed)
+            != val
+        {
+            return Err(ImmediatelyWokenUp);
+        }
 
-            let ret = Host::block_or_maybe_timeout(&self.inner, val, timeout);
-
-            match ret {
-                Ok(()) => {
-                    return Ok(UnblockedOrTimedOut::Unblocked);
-                }
-                Err(Errno::EAGAIN) => {
-                    // If the futex value does not match val, then the call fails
-                    // immediately with the error EAGAIN.
-                    return Err(ImmediatelyWokenUp);
-                }
-                Err(Errno::EINTR) => {
-                    // return Err(ImmediatelyWokenUp);
-                    todo!("EINTR");
-                }
-                Err(Errno::ETIMEDOUT) => {
-                    return Ok(UnblockedOrTimedOut::TimedOut);
-                }
-                Err(e) => {
-                    panic!("Error: {e:?}");
-                }
-            }
+        #[allow(clippy::match_same_arms)]
+        match Host::block_or_maybe_timeout(&self.inner, val, timeout) {
+            Ok(()) => Ok(UnblockedOrTimedOut::Unblocked),
+            // If the futex value does not match val, then the call fails
+            // immediately with the error EAGAIN.
+            Err(Errno::EAGAIN) => Err(ImmediatelyWokenUp),
+            Err(Errno::EINTR) => Ok(UnblockedOrTimedOut::Unblocked),
+            Err(Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
+            Err(e) => panic!("Error: {e:?}"),
         }
     }
 }

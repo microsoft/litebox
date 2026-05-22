@@ -96,7 +96,10 @@ impl litebox::shim::EnterShim for OpteeShimEntrypoints {
     }
 
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        todo!("Handle interrupt in OP-TEE shim");
+        #[cfg(debug_assertions)]
+        todo!("OP-TEE shim doesn't support interrupt");
+        #[cfg(not(debug_assertions))]
+        ContinueOperation::Terminate
     }
 }
 

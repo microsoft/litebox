@@ -317,38 +317,123 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     frame: _,
                     offset: _,
                     flags,
-                } => match inner.unmap(start) {
-                    Ok((frame, _)) => {
-                        match unsafe { inner.map_to(new_start, frame, flags, &mut allocator) } {
-                            Ok(_) => {}
-                            Err(e) => match e {
-                                MapToError::PageAlreadyMapped(_) => {
-                                    return Err(page_mgmt::RemapError::AlreadyAllocated);
-                                }
-                                MapToError::ParentEntryHugePage => {
-                                    todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
-                                }
-                                MapToError::FrameAllocationFailed => {
+                } => {
+                    // Pre-check the destination so we never destroy the old PTE for a remap
+                    // that can't complete. `translate(new_start)` reports `Mapped` for both
+                    // present leaves and parent huge-page coverage, ruling out both
+                    // `MapToError::PageAlreadyMapped` and `MapToError::ParentEntryHugePage`
+                    // from the subsequent `map_to`.
+                    match inner.translate(new_start.start_address()) {
+                        TranslateResult::Mapped { .. } => {
+                            return Err(page_mgmt::RemapError::AlreadyAllocated);
+                        }
+                        TranslateResult::InvalidFrameAddress(pa) => {
+                            #[cfg(debug_assertions)]
+                            todo!("Invalid frame address at remap destination: {:#x}", pa);
+                            #[cfg(not(debug_assertions))]
+                            {
+                                crate::serial_println!(
+                                    "Invalid frame address at remap destination: {:#x}",
+                                    pa
+                                );
+                                return Err(page_mgmt::RemapError::Unaligned);
+                            }
+                        }
+                        TranslateResult::NotMapped => {}
+                    }
+                    match inner.unmap(start) {
+                        Ok((frame, _)) => {
+                            match unsafe { inner.map_to(new_start, frame, flags, &mut allocator) } {
+                                Ok(_) => {}
+                                Err(MapToError::FrameAllocationFailed) => {
+                                    // Best-effort: restore the page we just unmapped before
+                                    // bailing out. Earlier iterations of the loop have already
+                                    // migrated their pages and are NOT unwound here, so the
+                                    // caller may still observe a partial move on this error.
+                                    // `unmap` leaves the parent tables for `start` in place, so
+                                    // restoring the old mapping does not require allocation.
+                                    if let Err(rollback_err) =
+                                        unsafe { inner.map_to(start, frame, flags, &mut allocator) }
+                                    {
+                                        crate::serial_println!(
+                                            "BUG: remap rollback failed: {:?}",
+                                            rollback_err
+                                        );
+                                    }
                                     return Err(page_mgmt::RemapError::OutOfMemory);
                                 }
-                            },
+                                // Ruled out by the pre-check above; if the destination
+                                // state drifts from what `translate` reported, fall back
+                                // to a structured error rather than panicking the kernel.
+                                Err(MapToError::PageAlreadyMapped(_)) => {
+                                    debug_assert!(
+                                        false,
+                                        "BUG: map_to reported PageAlreadyMapped after pre-check at {:#x}",
+                                        new_start.start_address()
+                                    );
+                                    crate::serial_println!(
+                                        "BUG: map_to reported PageAlreadyMapped after pre-check at {:#x}",
+                                        new_start.start_address()
+                                    );
+                                    return Err(page_mgmt::RemapError::AlreadyAllocated);
+                                }
+                                Err(MapToError::ParentEntryHugePage) => {
+                                    debug_assert!(
+                                        false,
+                                        "BUG: map_to reported ParentEntryHugePage after pre-check at {:#x}",
+                                        new_start.start_address()
+                                    );
+                                    crate::serial_println!(
+                                        "BUG: map_to reported ParentEntryHugePage after pre-check at {:#x}",
+                                        new_start.start_address()
+                                    );
+                                    return Err(page_mgmt::RemapError::AlreadyAllocated);
+                                }
+                            }
+                        }
+                        Err(X64UnmapError::PageNotMapped) => {
+                            debug_assert!(
+                                false,
+                                "BUG: unmap reported PageNotMapped after translate said Mapped at {:#x}",
+                                start.start_address()
+                            );
+                            crate::serial_println!(
+                                "BUG: unmap reported PageNotMapped after translate said Mapped at {:#x}",
+                                start.start_address()
+                            );
+                            return Err(page_mgmt::RemapError::Unaligned);
+                        }
+                        Err(X64UnmapError::ParentEntryHugePage) => {
+                            #[cfg(debug_assertions)]
+                            todo!("return Err(page_mgmt::RemapError::RemapToHugePage);");
+                            #[cfg(not(debug_assertions))]
+                            {
+                                crate::serial_println!("BUG: attempt to unmap a huge page");
+                                return Err(page_mgmt::RemapError::Unaligned);
+                            }
+                        }
+                        Err(X64UnmapError::InvalidFrameAddress(pa)) => {
+                            // TODO: `panic!()` -> `todo!()` because user-driven interrupts or exceptions must not halt the kernel.
+                            // We should handle this exception carefully (i.e., clean up the context and data structures belonging to an erroneous process).
+                            #[cfg(debug_assertions)]
+                            todo!("Invalid frame address: {:#x}", pa);
+                            #[cfg(not(debug_assertions))]
+                            {
+                                crate::serial_println!("Invalid frame address: {:#x}", pa);
+                                return Err(page_mgmt::RemapError::Unaligned);
+                            }
                         }
                     }
-                    Err(X64UnmapError::PageNotMapped) => {
-                        unreachable!()
-                    }
-                    Err(X64UnmapError::ParentEntryHugePage) => {
-                        todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
-                    }
-                    Err(X64UnmapError::InvalidFrameAddress(pa)) => {
-                        // TODO: `panic!()` -> `todo!()` because user-driven interrupts or exceptions must not halt the kernel.
-                        // We should handle this exception carefully (i.e., clean up the context and data structures belonging to an errorneous process).
-                        todo!("Invalid frame address: {:#x}", pa);
-                    }
-                },
+                }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
+                    #[cfg(debug_assertions)]
                     todo!("Invalid frame address: {:#x}", pa);
+                    #[cfg(not(debug_assertions))]
+                    {
+                        crate::serial_println!("Invalid frame address: {:#x}", pa);
+                        return Err(page_mgmt::RemapError::Unaligned);
+                    }
                 }
             }
             start += 1;
@@ -386,14 +471,11 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     offset: _,
                     flags,
                 } => {
-                    // If it is changed to writable, we leave it to page fault handler (COW)
-                    let change_to_write = new_flags.contains(PageTableFlags::WRITABLE)
-                        && !flags.contains(PageTableFlags::WRITABLE);
-                    let new_flags = if change_to_write {
-                        new_flags - PageTableFlags::WRITABLE
-                    } else {
-                        new_flags
-                    };
+                    // COW lazy-enable was unimplemented, so granting WRITABLE via a later
+                    // fault would land in the unimplemented COW path and kill the task.
+                    // Install the writable PTE directly until COW (and shared frames) land.
+                    // FIXME: when COW is implemented, restore the lazy-enable masking that
+                    // was removed here so a R->RW mprotect defers WRITABLE to the fault path.
                     if flags != new_flags {
                         match unsafe {
                             inner.update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
@@ -402,7 +484,15 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                             Err(e) => match e {
                                 FlagUpdateError::PageNotMapped => unreachable!(),
                                 FlagUpdateError::ParentEntryHugePage => {
-                                    todo!("return Err(ProtectError::ProtectHugePage);")
+                                    #[cfg(debug_assertions)]
+                                    todo!("BUG: attempt to protect a huge page");
+                                    #[cfg(not(debug_assertions))]
+                                    {
+                                        crate::serial_println!(
+                                            "BUG: attempt to protect a huge page"
+                                        );
+                                        return Err(page_mgmt::PermissionUpdateError::Unaligned);
+                                    }
                                 }
                             },
                         }
@@ -410,7 +500,13 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
+                    #[cfg(debug_assertions)]
                     todo!("Invalid frame address: {:#x}", pa);
+                    #[cfg(not(debug_assertions))]
+                    {
+                        crate::serial_println!("Invalid frame address: {:#x}", pa);
+                        return Err(page_mgmt::PermissionUpdateError::Unaligned);
+                    }
                 }
             }
         }
@@ -480,16 +576,25 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     offset: _,
                     flags: _,
                 } => {
-                    assert!(
-                        target_frame.start_address() == frame.start_address(),
-                        "{page:?} is already mapped to {frame:?} instead of {target_frame:?}"
-                    );
-
+                    if target_frame.start_address() != frame.start_address() {
+                        crate::serial_println!(
+                            "BUG: {page:?} already mapped to {frame:?} instead of {target_frame:?}"
+                        );
+                        return Err(MapToError::PageAlreadyMapped(
+                            PhysFrame::<Size4KiB>::containing_address(frame.start_address()),
+                        ));
+                    }
                     continue;
                 }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
+                    #[cfg(debug_assertions)]
                     todo!("Invalid frame address: {:#x}", pa);
+                    #[cfg(not(debug_assertions))]
+                    {
+                        crate::serial_println!("Invalid frame address: {:#x}", pa);
+                        return Err(MapToError::FrameAllocationFailed);
+                    }
                 }
             }
 
@@ -781,7 +886,13 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                         return Ok(());
                     } else {
                         // Copy-on-Write
+                        #[cfg(debug_assertions)]
                         todo!("COW");
+                        #[cfg(not(debug_assertions))]
+                        {
+                            crate::serial_println!("BUG: Copy-on-Write not implemented");
+                            return Err(PageFaultError::AllocationFailed);
+                        }
                     }
                 }
 
@@ -790,7 +901,16 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                     return Ok(());
                 }
 
+                #[cfg(debug_assertions)]
                 todo!("Page fault on present page: {:#x}", page.start_address());
+                #[cfg(not(debug_assertions))]
+                {
+                    crate::serial_println!(
+                        "Page fault on present page: {:#x}",
+                        page.start_address()
+                    );
+                    return Err(PageFaultError::AccessError("Page fault on present page"));
+                }
             }
             TranslateResult::NotMapped => {
                 let mut allocator = PageTableAllocator::<M>::new();
@@ -826,7 +946,13 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 }
             }
             TranslateResult::InvalidFrameAddress(pa) => {
+                #[cfg(debug_assertions)]
                 todo!("Invalid frame address: {:#x}", pa);
+                #[cfg(not(debug_assertions))]
+                {
+                    crate::serial_println!("Invalid frame address: {:#x}", pa);
+                    return Err(PageFaultError::AccessError("Invalid frame address"));
+                }
             }
         }
         Ok(())

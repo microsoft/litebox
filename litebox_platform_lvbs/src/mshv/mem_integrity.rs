@@ -212,7 +212,13 @@ fn identify_direct_relocations(
                     R_X86_64_64 => 8,
                     R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => 4,
                     _ => {
+                        #[cfg(debug_assertions)]
                         todo!("Unsupported relocation type {:?}", rela.r_type);
+                        #[cfg(not(debug_assertions))]
+                        {
+                            crate::serial_println!("Unsupported relocation type {:?}", rela.r_type);
+                            return Err(KernelElfError::UnsupportedRelocation);
+                        }
                     }
                 };
                 let start = r_offset;
@@ -300,7 +306,13 @@ fn identify_indirect_relocations(
                     R_X86_64_64 => 8,
                     R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => 4,
                     _ => {
+                        #[cfg(debug_assertions)]
                         todo!("Unsupported relocation type {:?}", rela.r_type);
+                        #[cfg(not(debug_assertions))]
+                        {
+                            crate::serial_println!("Unsupported relocation type {:?}", rela.r_type);
+                            return Err(KernelElfError::UnsupportedRelocation);
+                        }
                     }
                 };
 
@@ -386,12 +398,23 @@ pub fn verify_kernel_module_signature(
     let (signature, digest_alg, signature_alg) = decode_signature(signature_der)?;
 
     // We only support RSA with SHA-256 or SHA-512 for now as most Linux distributions use this combination.
+    #[allow(clippy::manual_assert)]
     if (digest_alg != ID_SHA_256 && digest_alg != ID_SHA_512) || (signature_alg != RSA_ENCRYPTION) {
+        #[cfg(debug_assertions)]
         todo!(
             "Unsupported digest or signature algorithm: {:?}, {:?}",
             digest_alg,
             signature_alg
         );
+        #[cfg(not(debug_assertions))]
+        {
+            crate::serial_println!(
+                "Unsupported digest or signature algorithm: {:?}, {:?}",
+                digest_alg,
+                signature_alg
+            );
+            return Err(VerificationError::Unsupported);
+        }
     }
     for cert in certs {
         let key_info = &cert.tbs_certificate.subject_public_key_info;
@@ -530,8 +553,15 @@ pub fn verify_kernel_pe_signature(
         .to_der()
         .map_err(|_| VerificationError::InvalidSignature)?;
     let digest_algorithm_oid = authenticode_signature.signer_info().digest_alg.oid;
+    #[allow(clippy::manual_assert)]
     if digest_algorithm_oid != ID_SHA_256 && digest_algorithm_oid != ID_SHA_512 {
+        #[cfg(debug_assertions)]
         todo!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
+        #[cfg(not(debug_assertions))]
+        {
+            crate::serial_println!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
+            return Err(VerificationError::Unsupported);
+        }
     }
     let mut signature_verified = false;
 
@@ -732,6 +762,9 @@ pub enum KernelElfError {
     ElfParseFailed,
     #[error("required section not found")]
     SectionNotFound,
+    #[cfg_attr(debug_assertions, allow(dead_code))]
+    #[error("unsupported relocation type")]
+    UnsupportedRelocation,
 }
 
 /// Errors for module signature verification.
