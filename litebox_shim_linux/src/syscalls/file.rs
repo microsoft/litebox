@@ -800,6 +800,12 @@ impl<FS: ShimFS> Task<FS> {
             slave_anchor,
             status,
         );
+        // Eagerly install the broker subscription so a subsequent
+        // `poll(fd, POLLIN|POLLHUP, 0)` returns current state
+        // without requiring a prior read/write to trigger lazy
+        // subscription (e.g., dropbear's session-end probe on the
+        // master fd).
+        pty_fd.ensure_subscribed_eager();
         let typed = self
             .global
             .litebox

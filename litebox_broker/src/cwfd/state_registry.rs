@@ -323,7 +323,13 @@ impl BrokerStateRegistry {
     /// reference count reaches zero or its `Drop` runs depending on
     /// whether anyone else still holds it externally — by convention
     /// the broker is the sole owner of registered states).
-    pub fn release(&self, handle: StateHandle) -> Result<(), StateRegistryError> {
+    ///
+    /// Returns the new refcount after this release. 0 means the
+    /// state was dropped; >0 means other holders remain. Subsystems
+    /// can use this to fire endpoint-specific close semantics
+    /// (e.g., PTY master HUP when the last slave fd-holder releases
+    /// but the master still anchors the slave registry slot).
+    pub fn release(&self, handle: StateHandle) -> Result<u32, StateRegistryError> {
         let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
         let entry = s
             .table
@@ -358,7 +364,7 @@ impl BrokerStateRegistry {
             }
         }
         tracing::debug!(handle = handle.0, new_rc, ?tag, "REG-REL");
-        Ok(())
+        Ok(new_rc)
     }
 
     /// Resolves a handle to its underlying state object without
