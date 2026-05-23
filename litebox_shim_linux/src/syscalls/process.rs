@@ -6589,7 +6589,7 @@ impl<FS: ShimFS> Task<FS> {
             } else if let Ok(fd) =
                 rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
             {
-                // Phase C.3: eager-broker pipe. Classify as Pipe so the
+                // Broker-backed pipe. Classify as Pipe so the
                 // broker-handle metadata is emitted below and the restored
                 // worker can re-attach to the same broker `PipeState`.
                 (FdClass::Pipe, Some(fd.object_id()), None, None)
