@@ -132,141 +132,19 @@ cargo rustc -p litebox_test_harness --bin litebox_test_harness --target-dir targ
 
 ### Running tests
 
-Use the integration test harness via `cargo test`:
+Integration test invocation patterns, tuning knobs (`LITEBOX_TEST_JOBS`
+etc.), per-test timing telemetry, the `LITEBOX_HARNESS_PAUSE`
+soft-breakpoint pattern for debugging a specific failing test, manual
+`docker run` invocations, and audit-log analysis with
+`litebox_audit_query` all live in
+**[`litebox_test_harness/CLAUDE.md`](litebox_test_harness/CLAUDE.md)**
+(the "Integration test" section under "Enforcement").
 
-```bash
-# Full suite (both native and litebox passes):
-cargo test -p litebox_test_harness --test integration
-
-# Single test (one trial per pass):
-cargo test -p litebox_test_harness --test integration -- 'litebox::PN.B.eof' --exact
-
-# Tune concurrency (default: clamp(num_cpus / 1.5, 2, 10) — e.g., 10 on a 16-core host):
-LITEBOX_TEST_JOBS=8 cargo test -p litebox_test_harness --test integration
-
-# Only native or only litebox:
-cargo test -p litebox_test_harness --test integration -- 'native::'
-cargo test -p litebox_test_harness --test integration -- 'litebox::'
-
-# Multiple disjoint filters in one invocation (OR'd, like stock libtest).
-# Prefer this over a bash for-loop: one process means one amortized
-# setup() and a single LITEBOX_TEST_JOBS pool spanning all prefixes,
-# so the tail of one filter overlaps with the head of the next.
-cargo test -p litebox_test_harness --test integration -- \
-  'litebox::PB' 'litebox::PXEOF' 'litebox::EPIPE' 'litebox::PXP'
-```
-
-Each Trial spawns its own `docker run` (`litebox-test` image), gets a
-fresh `litebox_tool_executor` + broker + runner + agent matrix, and
-writes per-Trial logs to
-`target/test-logs/<pass>-<sanitized_id>.{stdout,stderr}.log`.
-
-#### Why `cargo test` and not `cargo nextest`
-
-The repo otherwise uses `cargo nextest` (see `.config/nextest.toml`
-and the CI workflow). This integration test is the deliberate
-exception:
-
-- nextest spawns a **fresh test-binary process per test** (its
-  isolation model).
-- Our `setup()` in `tests/integration.rs` (build the 5 binary
-  variants + ensure the docker image) is amortized via `OnceLock`
-  to once per cargo-test invocation.
-- With nextest's process-per-test, every one of ~5500 tests would
-  re-enter `setup()` and re-invoke `cargo build`. Even a no-op
-  cargo build costs ~1 s; that's ~90 minutes of pure overhead.
-- There's a workable migration (nextest's `[scripts.setup-X]`
-  with a flock to serialize the build), but that's significant
-  infrastructure for a marginal benefit — what we'd gain from
-  nextest (per-test JUnit timing, per-test timeout overrides,
-  test-group concurrency, retries) we already do in-tree via
-  the per-test timing JSONL (below), the `LITEBOX_TEST_JOBS`
-  semaphore, and harness-side `.timeout(N)`.
-
-Don't run multiple `cargo test` invocations against the same target
-dir simultaneously — the build cache will thrash.
-
-#### Tuning knobs
-
-| Env var                   | Default                       | Effect                                                          |
-|---------------------------|-------------------------------|-----------------------------------------------------------------|
-| `LITEBOX_TEST_JOBS`       | `clamp(num_cpus / 1.5, 2, 10)`| Max concurrent `docker run` invocations (the real test parallelism cap). |
-| `LITEBOX_DRAIN_BACKLOG`   | `4 * LITEBOX_TEST_JOBS`       | Max in-flight post-result drain threads.                        |
-| `LITEBOX_TEST_MEMORY`     | `8g`                          | Per-container `--memory` and `--memory-swap` (safety bound — OOM-kill on excess; no swap thrash). |
-| `LITEBOX_TEST_PIDS`       | `8192`                        | Per-container `--pids-limit` (safety bound).                    |
-| `LITEBOX_TEST_CPUS`       | (unset → no CPU cap)          | Per-container `--cpus` (opt-in only — capping CPU often regresses fork-heavy tests). |
-| `LITEBOX_DRAIN_TIMEOUT_SECS` | `30`                       | Watchdog timeout on the post-result drain phase.                |
-| `LITEBOX_KEEP_CONTAINER`  | (unset)                       | If set, omit `--rm` so containers persist for `docker ps` inspection. |
-
-The litebox-pass outer timeout (`timeout --signal=KILL <N>`) is
-per-test, derived from the harness's `.timeout(N)` setting + 15 s
-grace, so failing fast-tests fail in (their budget) + 15 s rather
-than the previous blanket 120 s.
-
-#### Per-test timing telemetry
-
-Each run produces `target/test-logs/per-test-timing.jsonl` with one
-or two JSONL lines per test:
-
-```json
-{"test":"PB.c2p.pie-glibc.dpg1","pass":"native","t_acquire_ms":12,
- "t_docker_start_ms":810,"t_useful_ms":340,"verdict":"pass","jobs":10}
-{"test":"PB.c2p.pie-glibc.dpg1","pass":"native","t_drain_ms":4500}
-```
-
-`litebox_test_harness/scripts/analyze-test-timing.py` summarizes a
-single run or diffs two runs (e.g., before/after a perf change).
-
-#### Debugging a specific failing test
-
-The harness supports `LITEBOX_HARNESS_PAUSE` "soft breakpoints" — at
-the matching site the process `raise(SIGSTOP)`s itself and waits for
-`SIGCONT`. This is more reliable than gdb breakpoints under litebox's
-multi-process protocol (which can deadlock when one inferior stops).
-Pair with `litebox_tool_executor --debug PORT` (gdbserver) and
-`dev_tools/gdb-connect-batch.sh` for a non-interactive, transcript-
-based debugging round-trip. See
-`litebox_test_harness/FIX_AGENT_PLAYBOOK.md` "gdbserver via `--debug`"
-and `dev_tools/gdb-example-session.md` for the full pattern.
-
-```bash
-# Pause the harness before a single failing test runs:
-LITEBOX_HARNESS_PAUSE='harness:test-start=PB.c2p.nonpie-glibc.dpg2' \
-  cargo test -p litebox_test_harness --test integration \
-  -- 'litebox::PB.c2p.nonpie-glibc.dpg2' --exact
-```
-
-To run a docker invocation by hand for debugging:
-
-```bash
-# Native (gold standard — real kernel):
-docker run --rm --cap-add SYS_PTRACE \
-  -v $(pwd)/target/debug:/opt/litebox:ro \
-  -v $(pwd)/target/nonpie/debug:/opt/nonpie:ro \
-  litebox-test /opt/litebox/litebox_test_harness spawn-tree --filter=PN.B.eof
-
-# Litebox sandbox (tests the shim):
-docker run --rm --cap-add SYS_PTRACE -e LITEBOX_NO_AUDIT=1 \
-  -v $(pwd)/target/debug:/opt/litebox:ro \
-  -v $(pwd)/target/nonpie/debug:/opt/nonpie:ro \
-  litebox-test /opt/litebox/litebox_tool_executor \
-    --rootfs / --record-baseline \
-    -- /opt/litebox/litebox_test_harness spawn-tree --filter=PN.B.eof
-```
-
-Running `litebox_test_harness` directly (without `litebox_tool_executor`)
-tests the **native kernel**, NOT litebox's shim. The coordinator prints
-`[coord] runtime:` at startup to identify the environment.
-
-Useful integration-test env vars (all read by `tests/integration.rs`):
-
-- `LITEBOX_TEST_JOBS=N` — concurrent docker runs (default 5).
-- `LITEBOX_DRAIN_BACKLOG=N` — concurrent draining containers (default 20).
-- `LITEBOX_FORCE_FULL_MATRIX=1` — opt out of the lazy non-PIE
-  spawn heuristic; always spawn the full agent matrix.
-- `LITEBOX_KEEP_CONTAINER=1` — drop `--rm`; containers survive
-  for `docker logs <name>` inspection.
-- `LITEBOX_NO_AUDIT=1` — disable audit logging in the runner.
+Why there and not here: the litebox integration test harness has a
+custom shape (uses `cargo test` deliberately rather than `cargo
+nextest`; spawns one `docker run` per Trial; reads several
+`LITEBOX_*` env knobs) and its guidance is most useful when read
+alongside the harness source.
 
 ### Docker images
 
@@ -280,29 +158,6 @@ docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/
 Never write diagnostic output to stdout or stderr from the runner or shim —
 these are reserved for guest use (VS Code captures them). Use
 `debug_log_print` which writes to `/tmp/rst-diag.log`.
-
-### Analyzing audit logs
-
-For quick checks, `grep` on the JSONL file is fine (e.g., `grep '"err"' audit.jsonl`).
-
-For deeper analysis — finding needle-in-the-haystack errors, measuring syscall
-latency distributions, or tracing cross-thread interactions — use
-`litebox_audit_query` to import the log into SQLite. This pre-joins enter/exit
-events and lets you run ad-hoc SQL queries (950× faster than grep for indexed
-lookups on large logs).
-
-```bash
-# Import and query in one step
-litebox_audit_query sql --file /path/to/audit.jsonl \
-  "SELECT syscall, result_err, COUNT(*) AS cnt FROM syscalls WHERE result_err IS NOT NULL GROUP BY syscall, result_err ORDER BY cnt DESC"
-
-# See the full schema and example queries
-litebox_audit_query schema
-```
-
-Key columns: `syscall`, `args` (JSON), `duration_ns`, `result_ok`, `result_err`
-(negated errno), `worker` (host PID), `pid`/`tid` (guest). See `schema` output
-for the complete reference and 10+ ready-to-use queries.
 
 ## Host fd range conventions
 
