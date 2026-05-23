@@ -134,6 +134,19 @@ enum ScenarioKind {
     /// when the poll() returns POLLIN on one fd in a busy set
     /// (some fd-index ordering issue), this catches it.
     PollLoopPostSleepWithInerts,
+    /// PTYR.write_then_exec_then_write — child writes "PRE\n",
+    /// then execve's into a sibling leaf that writes "POST\n"
+    /// and exits. Both writes use the SAME inherited slave PTY
+    /// fd (CLOEXEC clear).
+    ///
+    /// Captures the Phase H dropbear failure pattern: under
+    /// dropbear, `exec /bin/bash -c "echo L2"` after an earlier
+    /// `echo L1` loses L2. Bash bytes written *after* an execve
+    /// (whether in-place exec or fork+exec) do not reach the
+    /// master in the real-stack case. This test exercises the
+    /// shim's execve path for slave-PTY-fd inheritance across
+    /// re-exec.
+    WriteThenExecThenWrite,
     /// PTYR.isatty — child calls `isatty(0/1/2)` post-exec and prints
     /// `isatty: 0=Y 1=Y 2=Y`. Confirms all three stdio fds are TTYs in
     /// the new worker after a non-PIE execve.
@@ -261,6 +274,11 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "write_then_exec_then_write",
+        kind: ScenarioKind::WriteThenExecThenWrite,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "isatty",
         kind: ScenarioKind::Isatty,
         per_binary_type: true,
@@ -316,6 +334,8 @@ const PTYR_READ_EAGAIN_THEN_WRITE: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.read_eagain_then_write");
 const PTYR_POLL_LOOP_POST_SLEEP_WITH_INERTS: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.poll_loop_post_sleep_with_inerts");
+const PTYR_WRITE_THEN_EXEC_THEN_WRITE: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.write_then_exec_then_write");
 const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
 const PARENT_EXIT_THEN_CHILD_IO: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.parent_exit_then_child_io");
@@ -984,6 +1004,65 @@ async fn handle_ptyr_poll_loop_post_sleep_with_inerts(
     Ok(PtyOut { detail })
 }
 
+async fn handle_ptyr_write_then_exec_then_write(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(
+        &[
+            args.target.clone(),
+            "pty-write-then-exec".into(),
+            args.target,
+        ],
+        true,
+    )?;
+
+    // Drain master in a dropbear-style loop: poll(POLLIN|POLLHUP);
+    // BREAK on POLLHUP (dropbear closes the SSH channel here);
+    // accumulate POLLIN bytes. If a spurious POLLHUP fires during
+    // the child's in-place execve (slave handle briefly detaches
+    // from the broker, master_open_count or slave_open_count
+    // momentarily transitions), the post-execve "POST\n" write
+    // never makes it to the recorded buffer.
+    let mut buf = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "write-then-exec-then-write: timeout; captured={:?}",
+                String::from_utf8_lossy(&buf)
+            )
+            .into());
+        }
+        let revents = pty.poll_now_timeout(libc::POLLIN | libc::POLLHUP, 50)?;
+        if revents & libc::POLLIN != 0 {
+            while let Some(bytes) = pty.try_read_now(4096)? {
+                if bytes.is_empty() {
+                    break;
+                }
+                buf.extend_from_slice(&bytes);
+            }
+        }
+        if revents & libc::POLLHUP != 0 {
+            // Final drain attempt, then exit loop (dropbear pattern).
+            while let Some(bytes) = pty.try_read_now(4096)? {
+                if bytes.is_empty() {
+                    break;
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            break;
+        }
+    }
+    expect_exit_zero(pid)?;
+    let data = String::from_utf8_lossy(&buf).to_string();
+    // PTY OPOST: \n → \r\n.
+    let detail = exact(&data, "PRE\r\nPOST\r\n")?;
+    Ok(PtyOut { detail })
+}
+
 async fn handle_ptyr_isatty(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -1089,6 +1168,10 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         PTYR_POLL_LOOP_POST_SLEEP_WITH_INERTS,
         handle_ptyr_poll_loop_post_sleep_with_inerts
     );
+    register_handler!(
+        PTYR_WRITE_THEN_EXEC_THEN_WRITE,
+        handle_ptyr_write_then_exec_then_write
+    );
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
     register_handler!(PARENT_EXIT_THEN_CHILD_IO, handle_parent_exit_then_child_io);
 
@@ -1118,6 +1201,14 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!(
         "pty-poll-loop-post-sleep",
         leaf_subcmd::subcmd_pty_poll_loop_post_sleep
+    );
+    crate::register_leaf_subcommand!(
+        "pty-write-then-exec",
+        leaf_subcmd::subcmd_pty_write_then_exec
+    );
+    crate::register_leaf_subcommand!(
+        "pty-write-post-exec",
+        leaf_subcmd::subcmd_pty_write_post_exec
     );
     crate::register_leaf_subcommand!("pty-isatty-check", leaf_subcmd::subcmd_pty_isatty_check);
     crate::register_leaf_subcommand!(
@@ -1291,6 +1382,10 @@ async fn drive_target(
         }
         ScenarioKind::PollLoopPostSleepWithInerts => {
             run.send_named_typed(handle, &PTYR_POLL_LOOP_POST_SLEEP_WITH_INERTS, args)
+                .await?
+        }
+        ScenarioKind::WriteThenExecThenWrite => {
+            run.send_named_typed(handle, &PTYR_WRITE_THEN_EXEC_THEN_WRITE, args)
                 .await?
         }
         ScenarioKind::Isatty => run.send_named_typed(handle, &PTYR_ISATTY, args).await?,
@@ -1715,6 +1810,46 @@ mod leaf_subcmd {
             Ok(s) if s.success() => 0,
             _ => 1,
         }
+    }
+
+    /// PTYR.write_then_exec leaf — writes "PRE\n" to stdout, then
+    /// execve's `argv[2]` (the target binary) with subcmd
+    /// `pty-write-post-exec`. The slave PTY fd is fd 1 and CLOEXEC
+    /// is clear; the post-exec leaf inherits it and writes "POST\n".
+    pub(super) fn subcmd_pty_write_then_exec(args: &[String]) -> i32 {
+        use std::io::Write;
+        let target = match args.get(2) {
+            Some(t) => t.as_str(),
+            None => return 2,
+        };
+        let mut stdout = std::io::stdout();
+        if writeln!(stdout, "PRE").is_err() || stdout.flush().is_err() {
+            return 1;
+        }
+        let target_c = match std::ffi::CString::new(target) {
+            Ok(c) => c,
+            Err(_) => return 2,
+        };
+        let leaf = std::ffi::CString::new("pty-write-post-exec").expect("static leaf name");
+        let argv = [target_c.as_ptr(), leaf.as_ptr(), std::ptr::null()];
+        // SAFETY: execv replaces this process; on success no return;
+        // on error returns -1. We return 127 on error (standard
+        // exec-failure convention).
+        unsafe {
+            libc::execv(target_c.as_ptr(), argv.as_ptr());
+        }
+        127
+    }
+
+    /// PTYR.write_post_exec leaf — counterpart to write_then_exec.
+    /// Writes "POST\n" and exits.
+    pub(super) fn subcmd_pty_write_post_exec(_args: &[String]) -> i32 {
+        use std::io::Write;
+        let mut stdout = std::io::stdout();
+        if writeln!(stdout, "POST").is_err() || stdout.flush().is_err() {
+            return 1;
+        }
+        0
     }
 
     /// PTYR.isatty: probe `isatty(0)/isatty(1)/isatty(2)` after exec
