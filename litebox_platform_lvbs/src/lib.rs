@@ -1056,7 +1056,7 @@ impl<Host: HostInterface> RawMutex<Host> {
             // If the futex value does not match val, then the call fails
             // immediately with the error EAGAIN.
             Err(Errno::EAGAIN) => Err(ImmediatelyWokenUp),
-            Err(Errno::EINTR) => Err(ImmediatelyWokenUp),
+            Err(Errno::EINTR) => Ok(UnblockedOrTimedOut::Unblocked),
             Err(Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
             Err(e) => panic!("Error: {e:?}"),
         }
