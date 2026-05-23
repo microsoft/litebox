@@ -3,6 +3,4 @@
 
 mod pe;
 
-pub(crate) use pe::PeLoader;
-
-pub use pe::WindowsLoadError;
+pub(super) use pe::{PeLoader, WindowsLoadError};

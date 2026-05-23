@@ -15,6 +15,7 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features =
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [dev-dependencies]
+litebox_common_windows = { version = "0.1.0", path = "../litebox_common_windows" }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
 tar = "0.4"
 

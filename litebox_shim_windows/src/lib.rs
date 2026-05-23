@@ -19,6 +19,7 @@ use core::sync::atomic::{AtomicI32, Ordering};
 use litebox::LiteBox;
 use litebox::mm::PageManager;
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 use litebox_platform_multiplex::Platform;
 
@@ -179,12 +180,19 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
-        // TODO: Decode the NT syscall number and dispatch only NtTerminateProcess here.
+        if NtSysno::from_raw(ctx.orig_rax) != Some(NtSysno::NtTerminateProcess) {
+            litebox_util_log::debug!(
+                syscall_number = ctx.orig_rax;
+                "Unsupported Windows syscall"
+            );
+            return ContinueOperation::Terminate;
+        }
+
         litebox_util_log::debug!(
             syscall_number = ctx.orig_rax,
             process_handle:% = format_args!("{:#x}", ctx.r10),
             exit_status:% = format_args!("{:#x}", ctx.rdx);
-            "Handling temporary NtTerminateProcess syscall"
+            "Handling NtTerminateProcess syscall"
         );
         self.process
             .exit_code

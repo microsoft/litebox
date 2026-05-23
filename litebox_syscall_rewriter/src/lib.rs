@@ -24,6 +24,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use litebox_common_windows::NtSysno;
 use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::elf::{ElfFile, ProgramHeader as _};
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
@@ -112,6 +113,12 @@ struct TextSectionInfo {
 struct SyscallPatchResult {
     found_syscall: bool,
     skipped_addrs: Vec<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct NtSysnoExport {
+    addr: u64,
+    sysno: NtSysno,
 }
 
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
@@ -238,7 +245,7 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
     buf[..input_binary.len()].copy_from_slice(input_binary);
     let buf = &mut buf[..input_binary.len()];
 
-    let (text_sections, trampoline_base_rva, trampoline_base_addr) = {
+    let (text_sections, nt_sysno_exports, trampoline_base_rva, trampoline_base_addr) = {
         let pe = PeFile64::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
         let optional_header = pe.nt_headers().optional_header();
         let size_of_image = u64::from(optional_header.size_of_image());
@@ -262,13 +269,20 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         };
-        (text_sections, trampoline_base_rva, trampoline_base_addr)
+        let nt_sysno_exports = pe_nt_sysno_exports(&file)?;
+        (
+            text_sections,
+            nt_sysno_exports,
+            trampoline_base_rva,
+            trampoline_base_addr,
+        )
     };
 
     for section in &text_sections {
         let section_data = section_slice_mut(buf, section)?;
         rewrite_gs_to_fs_in_section(Arch::X86_64, section.vaddr, section_data)?;
     }
+    rewrite_exported_nt_sysnos(buf, &text_sections, &nt_sysno_exports)?;
 
     let mut trampoline_data = Vec::from(trampoline.unwrap_or(0).to_le_bytes());
     // Windows ntdll packs some syscall stubs too tightly for the generic
@@ -345,6 +359,78 @@ fn pe_text_sections(
         return Err(InternalError::NoTextSectionFound);
     }
     Ok(text_sections)
+}
+
+fn pe_nt_sysno_exports(file: &object::File<'_>) -> Result<Vec<NtSysnoExport>> {
+    let mut exports = Vec::new();
+
+    for export in file
+        .exports()
+        .map_err(|e| Error::ParseError(e.to_string()))?
+    {
+        let Ok(name) = core::str::from_utf8(export.name()) else {
+            continue;
+        };
+        if let Some(sysno) = NtSysno::from_export_name(name) {
+            exports.push(NtSysnoExport {
+                addr: export.address(),
+                sysno,
+            });
+        }
+    }
+
+    Ok(exports)
+}
+
+fn rewrite_exported_nt_sysnos(
+    buf: &mut [u8],
+    text_sections: &[TextSectionInfo],
+    nt_sysno_exports: &[NtSysnoExport],
+) -> Result<usize> {
+    let mut rewritten = 0;
+
+    for export in nt_sysno_exports {
+        for section in text_sections {
+            if export.addr < section.vaddr || export.addr >= section.vaddr + section.size {
+                continue;
+            }
+
+            let section_data = section_slice_mut(buf, section)?;
+            let offset = usize::try_from(export.addr - section.vaddr).unwrap();
+            if rewrite_exported_nt_sysno(section_data, offset, export.sysno) {
+                rewritten += 1;
+            }
+            break;
+        }
+    }
+
+    Ok(rewritten)
+}
+
+fn rewrite_exported_nt_sysno(
+    section_data: &mut [u8],
+    export_offset: usize,
+    sysno: NtSysno,
+) -> bool {
+    let Some(stub) = section_data.get_mut(export_offset..) else {
+        return false;
+    };
+    let stub_len = stub.len().min(32);
+    let Some(syscall_offset) = stub[..stub_len]
+        .windows(2)
+        .position(|bytes| bytes == [0x0f, 0x05])
+    else {
+        return false;
+    };
+    let Some(mov_eax_offset) = stub[..syscall_offset]
+        .windows(5)
+        .position(|bytes| bytes[0] == 0xb8)
+    else {
+        return false;
+    };
+
+    stub[mov_eax_offset + 1..mov_eax_offset + 5].copy_from_slice(&sysno.as_raw().to_le_bytes());
+    true
 }
 
 fn rewrite_gs_to_fs_in_section(
@@ -538,7 +624,7 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     if vaddr % 0x1000 != 0 {
         return false;
     }
-    if file_offset + trampoline_size != header_start as u64 {
+    if file_offset.checked_add(trampoline_size) != Some(header_start as u64) {
         return false;
     }
 
@@ -954,7 +1040,7 @@ fn patch_dense_windows_syscall_stub(
     let fallback_offset = usize::try_from(fallback_addr - section_base_addr).unwrap();
     section_data[fallback_offset] = 0xeb;
     section_data[fallback_offset + 1] =
-        i8::try_from(i128::from(stub_addr) - i128::from(fallback_addr + 2))
+        i8::try_from(i128::from(stub_addr) - i128::from(fallback_addr) - 2)
             .map_err(|_| {
                 Error::AddressOverflow("dense Windows syscall fallback jump out of range".into())
             })?
@@ -1286,7 +1372,8 @@ fn hook_syscall_and_after(
     // any RIP-relative memory operands for the new location.
     let syscall_inst_end = syscall_inst.next_ip();
     let postsyscall_bytes = if syscall_inst_end < replace_end {
-        let postsyscall_target = target_addr + preamble_len;
+        let postsyscall_target =
+            checked_add_u64(target_addr, preamble_len, "post-syscall trampoline target")?;
         match reencode_instructions(
             &instructions[(inst_index + 1)..replace_end_idx],
             postsyscall_target,
@@ -1348,4 +1435,45 @@ fn hook_syscall_and_after(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_exported_nt_stub_sysno() {
+        let mut stub = [
+            0x4c, 0x8b, 0xd1, // mov r10, rcx
+            0xb8, 0x34, 0x12, 0x00, 0x00, // mov eax, 0x1234
+            0xf6, 0x04, 0x25, 0x08, 0x03, 0xfe, 0x7f, 0x01, // test byte ptr [...], 1
+            0x75, 0x03, // jne +3
+            0x0f, 0x05, // syscall
+            0xc3, // ret
+            0xcd, 0x2e, // int 2e
+            0xc3, // ret
+        ];
+
+        assert!(rewrite_exported_nt_sysno(
+            &mut stub,
+            0,
+            NtSysno::NtTerminateProcess,
+        ));
+        assert_eq!(
+            &stub[4..8],
+            &NtSysno::NtTerminateProcess.as_raw().to_le_bytes(),
+        );
+    }
+
+    #[test]
+    fn leaves_non_syscall_export_unchanged() {
+        let mut bytes = [0xb8, 0x34, 0x12, 0x00, 0x00, 0xc3];
+
+        assert!(!rewrite_exported_nt_sysno(
+            &mut bytes,
+            0,
+            NtSysno::NtTerminateProcess,
+        ));
+        assert_eq!(bytes, [0xb8, 0x34, 0x12, 0x00, 0x00, 0xc3]);
+    }
 }

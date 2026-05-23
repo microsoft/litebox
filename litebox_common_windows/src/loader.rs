@@ -24,31 +24,26 @@ const MAX_SECTIONS: usize = 96;
 /// The result of parsing a PE32+ file.
 #[derive(Debug)]
 pub struct PeParsedFile {
-    /// Basic image metadata from the PE optional and COFF headers.
-    pub image: PeImageInfo,
-    /// Raw PE section headers in file order.
+    image: PeImageInfo,
     sections: Vec<pe::ImageSectionHeader>,
-    /// Data directory entries indexed by `IMAGE_DIRECTORY_ENTRY_*`.
-    pub data_directories: Vec<PeDataDirectory>,
+    data_directories: Vec<PeDataDirectory>,
     trampoline: Option<PeTrampolineInfo>,
 }
 
-/// Basic PE image metadata needed by the Windows shim loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PeImageInfo {
-    pub machine: u16,
-    pub characteristics: u16,
-    pub image_base: usize,
-    pub entry_point_rva: usize,
-    pub size_of_image: usize,
-    pub size_of_headers: usize,
-    pub section_alignment: usize,
-    pub file_alignment: usize,
-    /// e.g. `IMAGE_SUBSYSTEM_WINDOWS_CUI`.
-    pub subsystem: u16,
-    pub dll_characteristics: u16,
-    pub size_of_heap_reserve: usize,
-    pub size_of_heap_commit: usize,
+struct PeImageInfo {
+    machine: u16,
+    characteristics: u16,
+    image_base: usize,
+    entry_point_rva: usize,
+    size_of_image: usize,
+    size_of_headers: usize,
+    section_alignment: usize,
+    file_alignment: usize,
+    subsystem: u16,
+    dll_characteristics: u16,
+    size_of_heap_reserve: usize,
+    size_of_heap_commit: usize,
 }
 
 /// Information about the mapped PE image.
@@ -77,29 +72,25 @@ struct TrampolineHeader64 {
 
 const TRAMPOLINE_MAGIC: [u8; 8] = *b"LITEBOX0";
 
-/// A PE data directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PeDataDirectory {
-    pub virtual_address: u32,
-    pub size: u32,
+struct PeDataDirectory {
+    virtual_address: u32,
+    size: u32,
 }
 
 /// Errors that can occur when parsing a PE file.
 #[derive(Debug, Error)]
 pub enum PeParseError<E> {
-    /// The input file could not be read.
     #[error("I/O error")]
     Io(#[source] E),
-    /// The file is not a supported Windows executable image.
     #[error("unsupported PE image")]
     UnsupportedImage,
-    /// The LiteBox trampoline footer is malformed.
     #[error("bad LiteBox trampoline")]
     BadTrampoline,
-    /// The LiteBox trampoline footer has an unsupported version.
+    /// The LiteBox trampoline magic was found but the version byte is unknown.
     #[error("invalid LiteBox trampoline version")]
     BadTrampolineVersion,
-    /// A PE field overflowed the host representation used by this parser.
+    /// A PE field overflowed the host's `usize` representation.
     #[error("PE field overflow")]
     Overflow,
 }
@@ -107,19 +98,15 @@ pub enum PeParseError<E> {
 /// Errors that can occur when mapping a PE image into memory.
 #[derive(Debug, Error)]
 pub enum PeLoadError<E> {
-    /// Memory mapping error.
     #[error("memory mapping error")]
     Map(#[source] E),
-    /// The image contains inconsistent or overflowing fields.
     #[error("invalid PE image")]
     InvalidImage,
     /// The image had to be loaded away from its preferred base but has no base relocations.
     #[error("PE image requires base relocations")]
     RelocationRequired,
-    /// The image contains a relocation type this loader does not support.
     #[error("unsupported PE base relocation type {0}")]
     UnsupportedRelocation(u16),
-    /// A mapped memory access failed.
     #[error(transparent)]
     Fault(#[from] Fault),
 }
@@ -716,7 +703,6 @@ fn usize_from_u64<E>(value: u64) -> Result<usize, PeParseError<E>> {
     value.try_into().map_err(|_| PeParseError::Overflow)
 }
 
-/// Round `address` down to the nearest [`PAGE_SIZE`] multiple.
 pub fn page_align_down(address: usize) -> usize {
     address & !(PAGE_SIZE - 1)
 }
@@ -776,10 +762,7 @@ pub trait MapMemory {
 
 /// Trait for reading and writing memory that has been mapped via [`MapMemory`].
 pub trait AccessMemory {
-    /// Read from memory.
     fn read(&mut self, address: usize, buf: &mut [u8]) -> Result<(), Fault>;
-
-    /// Write to memory.
     fn write(&mut self, address: usize, data: &[u8]) -> Result<(), Fault>;
 }
 
@@ -796,15 +779,13 @@ pub struct Protection {
 }
 
 impl Protection {
-    /// Read-write, no-execute.
-    pub(crate) const RW: Self = Self {
+    const RW: Self = Self {
         read: true,
         write: true,
         execute: false,
     };
 
-    /// Read-only.
-    pub(crate) const R: Self = Self {
+    const R: Self = Self {
         read: true,
         write: false,
         execute: false,

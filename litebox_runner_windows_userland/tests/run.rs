@@ -3,13 +3,6 @@
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
-use std::ffi::c_void;
-
-unsafe extern "system" {
-    fn GetModuleHandleA(module_name: *const u8) -> *mut c_void;
-    fn GetProcAddress(module: *mut c_void, proc_name: *const u8) -> *const c_void;
-}
-
 #[test]
 fn loads_minimal_pe_without_imports() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no_import");
@@ -63,8 +56,8 @@ fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
     let source_path = test_dir.join("no_import.rs");
     let raw_exe_path = test_dir.join("no_import.raw.exe");
     let exe_path = test_dir.join("no_import.exe");
-    let syscall_number = nt_terminate_process_syscall_number();
-    println!("Using NtTerminateProcess syscall number `{syscall_number:#x}`");
+    let syscall_number = litebox_common_windows::NtSysno::NtTerminateProcess.as_raw();
+    println!("Using LiteBox NtTerminateProcess sysno `{syscall_number:#x}`");
     std::fs::write(
         &source_path,
         minimal_pe_with_nt_terminate_process_syscall_source(syscall_number),
@@ -131,41 +124,6 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {{
     }}
 }}
 "#
-    )
-}
-
-fn nt_terminate_process_syscall_number() -> u32 {
-    // SAFETY: These are static NUL-terminated strings, and GetModuleHandleA does not retain them.
-    let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr().cast()) };
-    assert!(
-        !ntdll.is_null(),
-        "ntdll.dll is not loaded in the test process"
-    );
-
-    // SAFETY: These are static NUL-terminated strings, and GetProcAddress does not retain them.
-    let nt_terminate_process =
-        unsafe { GetProcAddress(ntdll, c"NtTerminateProcess".as_ptr().cast()) };
-    assert!(
-        !nt_terminate_process.is_null(),
-        "NtTerminateProcess is not exported by ntdll.dll"
-    );
-
-    // SAFETY: `nt_terminate_process` points to executable code in the loaded ntdll image. Reading
-    // a small prefix of the function stub is sufficient to decode the `mov eax, imm32` syscall ID.
-    let stub = unsafe { std::slice::from_raw_parts(nt_terminate_process.cast::<u8>(), 32) };
-    let syscall_offset = stub
-        .windows(2)
-        .position(|bytes| bytes == [0x0f, 0x05])
-        .expect("NtTerminateProcess stub does not contain syscall instruction");
-    let mov_eax_offset = stub[..syscall_offset]
-        .iter()
-        .position(|byte| *byte == 0xb8)
-        .expect("NtTerminateProcess stub does not load a syscall number into eax");
-
-    u32::from_le_bytes(
-        stub[mov_eax_offset + 1..mov_eax_offset + 5]
-            .try_into()
-            .unwrap(),
     )
 }
 

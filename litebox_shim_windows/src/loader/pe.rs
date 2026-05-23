@@ -25,14 +25,12 @@ const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
 
-/// Struct to hold the information needed to start the program.
 pub(crate) struct PeLoadInfo {
     pub(crate) entry_point: usize,
     pub(crate) stack_top: usize,
     pub(crate) ntdll_mapping: Option<MappingInfo>,
 }
 
-/// Loader for Windows PE files.
 pub(crate) struct PeLoader<'a, FS: ShimFS> {
     fs: Arc<FS>,
     page_manager: &'a crate::WindowsPageManager,
@@ -50,6 +48,9 @@ impl<'a, FS: ShimFS> PeLoader<'a, FS> {
 
         let length =
             NonZeroPageSize::new(INITIAL_STACK_SIZE).ok_or(PeImageAccessError::AddressOverflow)?;
+        // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` does not set
+        // `fixed_addr`, so the page manager picks an unused region — there is no overlapping-
+        // mapping precondition for the caller to uphold.
         let stack_base = unsafe {
             self.page_manager
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
@@ -139,13 +140,11 @@ fn load_image_with_writable_sections<FS: ShimFS>(
 /// Errors that can occur while opening, parsing, and mapping a Windows PE image.
 #[derive(Debug, Error)]
 pub enum WindowsLoadError {
-    /// PE parsing failed.
     #[error("failed to parse PE image")]
     Parse(#[source] PeParseError<PeImageAccessError>),
-    /// PE image mapping failed.
     #[error("failed to load PE image")]
     Load(#[source] PeLoadError<PeImageAccessError>),
-    /// Opening the PE image failed.
+    /// Accessing the PE backing file or its mapped memory failed.
     #[error(transparent)]
     Access(#[from] PeImageAccessError),
     /// Guest ntdll.dll does not export LdrInitializeThunk.
@@ -329,28 +328,22 @@ impl<FS: ShimFS> MapMemory for PeImageMapper<'_, FS> {
 /// Errors from the shim-side PE image backing file and memory mapper.
 #[derive(Debug, Error)]
 pub enum PeImageAccessError {
-    /// Opening the executable failed.
     #[error("failed to open PE image")]
     Open(#[from] litebox::fs::errors::OpenError),
-    /// Reading the executable failed.
     #[error("failed to read PE image")]
     Read(#[from] litebox::fs::errors::ReadError),
-    /// Reading file metadata failed.
     #[error("failed to read PE image metadata")]
     FileStatus(#[from] litebox::fs::errors::FileStatusError),
-    /// The backing file ended before the requested range was read.
+    /// The backing file ended before the requested range was filled.
     #[error("short read from PE image")]
     ShortRead,
-    /// A PE file offset or image address overflowed this host representation.
+    /// A PE file offset or image address overflowed the host's `usize`.
     #[error("PE image address overflow")]
     AddressOverflow,
-    /// A memory mapping operation failed.
     #[error(transparent)]
     Mapping(#[from] MappingError),
-    /// A memory protection operation failed.
     #[error(transparent)]
     Protect(#[from] VmemProtectError),
-    /// A mapped memory access failed.
     #[error("mapped PE image memory access failed")]
     MemoryAccess,
 }
