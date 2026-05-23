@@ -108,6 +108,32 @@ enum ScenarioKind {
     /// signalfd SIGCHLD firing during the sleep changes the poll
     /// wakeup pattern relative to master's POLLIN delivery).
     DropbearEmul,
+    /// PTYR.select_loop_post_sleep — variant of `dropbear_emul` that
+    /// uses `select(2)` instead of `poll(2)`. Real dropbear historically
+    /// uses select() (it's the portable BSD-derived API). If the
+    /// shim's select-on-broker-fd path has a bug that poll() avoids,
+    /// this test catches it.
+    SelectLoopPostSleep,
+    /// PTYR.read_eagain_then_write — child writes 2 lines, sleeps
+    /// 200ms, writes 3 more lines, exits. Parent drains GREEDILY
+    /// (read until EAGAIN), then waits for the next POLLIN.
+    ///
+    /// Captures the "edge-triggered notification" hazard: if the
+    /// broker fires POLLIN once per write *batch* and the parent
+    /// drains to EAGAIN inside that batch, a subsequent write must
+    /// fire another POLLIN. If the broker only fires when the
+    /// subscriber's ring transitions empty→non-empty, the
+    /// post-drain write could be missed if it arrives during a
+    /// brief drain race.
+    ReadEagainThenWrite,
+    /// PTYR.poll_loop_post_sleep_with_inerts — parent polls a 6-fd
+    /// set: master + signalfd + 4 inert pipes (nothing ever written).
+    /// Real dropbear's poll set has the listen socket, channel data
+    /// socket(s), and several pipes — a multi-fd poll with most
+    /// entries returning revents=0. If a shim bug only manifests
+    /// when the poll() returns POLLIN on one fd in a busy set
+    /// (some fd-index ordering issue), this catches it.
+    PollLoopPostSleepWithInerts,
     /// PTYR.isatty — child calls `isatty(0/1/2)` post-exec and prints
     /// `isatty: 0=Y 1=Y 2=Y`. Confirms all three stdio fds are TTYs in
     /// the new worker after a non-PIE execve.
@@ -220,6 +246,21 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "select_loop_post_sleep",
+        kind: ScenarioKind::SelectLoopPostSleep,
+        per_binary_type: true,
+    },
+    ScenarioDef {
+        name: "read_eagain_then_write",
+        kind: ScenarioKind::ReadEagainThenWrite,
+        per_binary_type: true,
+    },
+    ScenarioDef {
+        name: "poll_loop_post_sleep_with_inerts",
+        kind: ScenarioKind::PollLoopPostSleepWithInerts,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "isatty",
         kind: ScenarioKind::Isatty,
         per_binary_type: true,
@@ -269,6 +310,12 @@ const PTYR_POLL_LOOP_POST_SLEEP: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.poll_loop_post_sleep");
 const PTYR_DROPBEAR_EMUL: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.dropbear_emul");
+const PTYR_SELECT_LOOP_POST_SLEEP: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.select_loop_post_sleep");
+const PTYR_READ_EAGAIN_THEN_WRITE: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.read_eagain_then_write");
+const PTYR_POLL_LOOP_POST_SLEEP_WITH_INERTS: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.poll_loop_post_sleep_with_inerts");
 const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
 const PARENT_EXIT_THEN_CHILD_IO: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.parent_exit_then_child_io");
@@ -731,6 +778,212 @@ async fn handle_ptyr_dropbear_emul(
     })
 }
 
+async fn handle_ptyr_select_loop_post_sleep(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-poll-loop-post-sleep".into()], true)?;
+
+    let mut buf = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let pty_fd = pty.as_raw_fd();
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "select-loop: timeout; captured={:?}",
+                String::from_utf8_lossy(&buf)
+            )
+            .into());
+        }
+        // SAFETY: writing to a zero-initialized fd_set then FD_SET.
+        let mut rfds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe { libc::FD_SET(pty_fd, &mut rfds) };
+        let mut tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 50_000,
+        };
+        // SAFETY: rfds is valid; nfds = pty_fd + 1; tv has correct size.
+        let rc = unsafe {
+            libc::select(
+                pty_fd + 1,
+                &mut rfds,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut tv,
+            )
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("select: {err}").into());
+        }
+        // SAFETY: rfds is initialized; FD_ISSET reads it.
+        if rc > 0 && unsafe { libc::FD_ISSET(pty_fd, &rfds) } {
+            match pty.try_read_now(4096)? {
+                Some(bytes) if bytes.is_empty() => break,
+                Some(bytes) => buf.extend_from_slice(&bytes),
+                None => {}
+            }
+        }
+        // Probe completion via poll(POLLHUP, 0) since select() doesn't
+        // surface POLLHUP separately.
+        let hup = pty.poll_now_timeout(libc::POLLIN | libc::POLLHUP, 0)?;
+        if hup & libc::POLLHUP != 0 {
+            while let Some(bytes) = pty.try_read_now(4096)? {
+                if bytes.is_empty() {
+                    break;
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            break;
+        }
+    }
+    expect_exit_zero(pid)?;
+    let s = String::from_utf8_lossy(&buf).to_string();
+    let expected = "L01\r\nL02\r\nL03\r\nL04\r\nL05\r\n";
+    let detail = exact(&s, expected)?;
+    Ok(PtyOut { detail })
+}
+
+async fn handle_ptyr_read_eagain_then_write(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-poll-loop-post-sleep".into()], true)?;
+    let mut buf = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "eagain-then-write: timeout; captured={:?}",
+                String::from_utf8_lossy(&buf)
+            )
+            .into());
+        }
+        let revents = pty.poll_now_timeout(libc::POLLIN | libc::POLLHUP, 200)?;
+        if revents & libc::POLLIN != 0 {
+            // Drain GREEDILY until EAGAIN. This is the
+            // "read-until-empty in a single wakeup" pattern that
+            // event loops use. If the broker only fires POLLIN on
+            // empty→non-empty transitions, a write that lands
+            // during our drain window must still generate a
+            // subsequent POLLIN — otherwise it's permanently lost
+            // because we never see another readiness event.
+            loop {
+                match pty.try_read_now(4096)? {
+                    Some(b) if b.is_empty() => break,
+                    Some(b) => buf.extend_from_slice(&b),
+                    None => break, // EAGAIN
+                }
+            }
+        }
+        if revents & libc::POLLHUP != 0 {
+            while let Some(b) = pty.try_read_now(4096)? {
+                if b.is_empty() {
+                    break;
+                }
+                buf.extend_from_slice(&b);
+            }
+            break;
+        }
+    }
+    expect_exit_zero(pid)?;
+    let s = String::from_utf8_lossy(&buf).to_string();
+    let expected = "L01\r\nL02\r\nL03\r\nL04\r\nL05\r\n";
+    let detail = exact(&s, expected)?;
+    Ok(PtyOut { detail })
+}
+
+async fn handle_ptyr_poll_loop_post_sleep_with_inerts(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // Create 4 inert pipe pairs; the parent polls the read ends.
+    // Nothing is ever written to these — they should always
+    // return revents=0. Mimics dropbear's busier poll set.
+    let mut inert_fds: Vec<OwnedFd> = Vec::new();
+    let mut _write_keep: Vec<OwnedFd> = Vec::new();
+    for _ in 0..4 {
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe2 takes a 2-element i32 array.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if rc < 0 {
+            return Err(format!("pipe2: {}", std::io::Error::last_os_error()).into());
+        }
+        // SAFETY: pipe2 returned two valid fds we now own.
+        inert_fds.push(unsafe { OwnedFd::from_raw_fd(fds[0]) });
+        _write_keep.push(unsafe { OwnedFd::from_raw_fd(fds[1]) });
+    }
+
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-poll-loop-post-sleep".into()], true)?;
+
+    let mut buf = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "with-inerts: timeout; captured={:?}",
+                String::from_utf8_lossy(&buf)
+            )
+            .into());
+        }
+        let mut pollfds = Vec::with_capacity(1 + inert_fds.len());
+        pollfds.push(libc::pollfd {
+            fd: pty.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        });
+        for f in &inert_fds {
+            pollfds.push(libc::pollfd {
+                fd: f.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        // SAFETY: pollfds is a valid Vec<pollfd> with the given length.
+        let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 50) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("poll: {err}").into());
+        }
+        let m_revents = pollfds[0].revents;
+        if m_revents & libc::POLLIN != 0
+            && let Some(bytes) = pty.try_read_now(4096)?
+        {
+            if bytes.is_empty() {
+                break;
+            }
+            buf.extend_from_slice(&bytes);
+        }
+        if m_revents & libc::POLLHUP != 0 {
+            while let Some(bytes) = pty.try_read_now(4096)? {
+                if bytes.is_empty() {
+                    break;
+                }
+                buf.extend_from_slice(&bytes);
+            }
+            break;
+        }
+    }
+    expect_exit_zero(pid)?;
+    let s = String::from_utf8_lossy(&buf).to_string();
+    let expected = "L01\r\nL02\r\nL03\r\nL04\r\nL05\r\n";
+    let detail = exact(&s, expected)?;
+    Ok(PtyOut { detail })
+}
+
 async fn handle_ptyr_isatty(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -824,6 +1077,18 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(PTYR_SLAVE_CLOSE_HUP, handle_ptyr_slave_close_hup);
     register_handler!(PTYR_POLL_LOOP_POST_SLEEP, handle_ptyr_poll_loop_post_sleep);
     register_handler!(PTYR_DROPBEAR_EMUL, handle_ptyr_dropbear_emul);
+    register_handler!(
+        PTYR_SELECT_LOOP_POST_SLEEP,
+        handle_ptyr_select_loop_post_sleep
+    );
+    register_handler!(
+        PTYR_READ_EAGAIN_THEN_WRITE,
+        handle_ptyr_read_eagain_then_write
+    );
+    register_handler!(
+        PTYR_POLL_LOOP_POST_SLEEP_WITH_INERTS,
+        handle_ptyr_poll_loop_post_sleep_with_inerts
+    );
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
     register_handler!(PARENT_EXIT_THEN_CHILD_IO, handle_parent_exit_then_child_io);
 
@@ -1014,6 +1279,18 @@ async fn drive_target(
         }
         ScenarioKind::DropbearEmul => {
             run.send_named_typed(handle, &PTYR_DROPBEAR_EMUL, args)
+                .await?
+        }
+        ScenarioKind::SelectLoopPostSleep => {
+            run.send_named_typed(handle, &PTYR_SELECT_LOOP_POST_SLEEP, args)
+                .await?
+        }
+        ScenarioKind::ReadEagainThenWrite => {
+            run.send_named_typed(handle, &PTYR_READ_EAGAIN_THEN_WRITE, args)
+                .await?
+        }
+        ScenarioKind::PollLoopPostSleepWithInerts => {
+            run.send_named_typed(handle, &PTYR_POLL_LOOP_POST_SLEEP_WITH_INERTS, args)
                 .await?
         }
         ScenarioKind::Isatty => run.send_named_typed(handle, &PTYR_ISATTY, args).await?,
