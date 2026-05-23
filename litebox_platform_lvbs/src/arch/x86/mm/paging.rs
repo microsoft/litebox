@@ -893,7 +893,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 #[cfg(not(debug_assertions))]
                 {
                     crate::serial_println!("Invalid frame address: {:#x}", pa);
-                    return Err(PageFaultError::AllocationFailed);
+                    return Err(PageFaultError::AccessError("Invalid frame address"));
                 }
             }
         }
