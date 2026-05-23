@@ -12,7 +12,7 @@ bridges per fd, with type-specific relay threads.  This leads to:
 2. **Nested bridge chains**: grandchild workers create bridges to child
    workers, not to the original fd owner.  Data traverses multiple hops
    with no relay at intermediate workers.
-3. **Epoll incompatibility**: `HostPipeFd` (raw OS pipe wrapper) doesn't
+3. **Epoll incompatibility**: `ExternalFd` (raw OS pipe wrapper) doesn't
    support `register_observer`, so epoll-driven programs (Node.js) never
    wake up.
 4. **Per-fd overhead**: each bridged fd creates 2 OS pipe fds + a bridge
@@ -163,7 +163,7 @@ preserving endpoints:
   → correct (same as base branch)
 - Virtual pipe → classified as `Pipe` → `Pipe` binding → bridge writes
   to virtual pipe → correct
-- HostPipeFd (from prior bridge) → classified as `Pipe` → `HostPipe`
+- ExternalFd (from prior bridge) → classified as `Pipe` → `ExternalFd`
   binding → posix_spawn dup2 → correct
 
 No changes to the exec worker mechanism needed.
@@ -266,13 +266,13 @@ Add `litebox_shim_linux/src/multiplexer.rs`:
 ### Phase 3: Parent + Worker Dispatchers
 
 - Parent dispatcher with per-stream queues (non-blocking event loop)
-- Worker dispatcher replacing `install_host_pipe_fd`
+- Worker dispatcher replacing `install_external_fd`
 - Object-based stream mapping (dedup by `object_id`)
 - Integration with `commit_delayed_fork` and `restore_process`
 
 ### Phase 4: Remove Ad-hoc Bridges
 
-- Remove `HostPipeFd` and related code
+- Remove `ExternalFd` and related code
 - Remove per-fd OS pipe bridge creation
 - Remove `FdReplacement` / relay thread mechanism
 - Remove `child_pipe_bridges` vector

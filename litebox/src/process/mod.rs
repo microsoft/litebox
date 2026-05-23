@@ -115,7 +115,7 @@ pub struct ProcessContext {
 /// Blocking byte-stream reader for worker-exec stdio bridging.
 ///
 /// Implementations are called in a loop from a bridge thread to transfer data
-/// from a guest byte stream (e.g., a unix socket) to a host pipe.
+/// from a guest byte stream (e.g., a unix socket) to a external fd.
 #[allow(clippy::result_unit_err)]
 pub trait WorkerExecStreamReader: Send + Sync + 'static {
     /// Read up to `buf.len()` bytes, blocking until data is available.
@@ -126,7 +126,7 @@ pub trait WorkerExecStreamReader: Send + Sync + 'static {
 /// Blocking byte-stream writer for worker-exec stdio bridging.
 ///
 /// Implementations are called in a loop from a bridge thread to transfer data
-/// from a host pipe into a guest byte stream (e.g., a unix socket).
+/// from a external fd into a guest byte stream (e.g., a unix socket).
 #[allow(clippy::result_unit_err)]
 pub trait WorkerExecStreamWriter: Send + Sync + 'static {
     /// Write `buf`, blocking until space is available.
@@ -149,8 +149,8 @@ pub enum WorkerExecInputBinding<
     Inherit,
     /// Duplicate one of the parent host stdio fds onto worker stdin.
     HostStdio { fd: i32 },
-    /// Duplicate a host pipe bridge fd onto worker stdin.
-    HostPipe { fd: i32 },
+    /// Duplicate a external fd bridge fd onto worker stdin.
+    ExternalFd { fd: i32 },
     /// Explicitly close the worker stdin stream before exec.
     Close,
     /// Proxy worker stdin reads from an existing guest filesystem descriptor.
@@ -176,8 +176,8 @@ pub enum WorkerExecOutputBinding<
     Inherit,
     /// Duplicate one of the parent host stdio fds onto this worker stream.
     HostStdio { fd: i32 },
-    /// Duplicate a host pipe bridge fd onto this worker stream.
-    HostPipe { fd: i32 },
+    /// Duplicate a external fd bridge fd onto this worker stream.
+    ExternalFd { fd: i32 },
     /// Explicitly close the worker stream before exec.
     Close,
     /// Proxy the worker stream into an existing guest filesystem descriptor.

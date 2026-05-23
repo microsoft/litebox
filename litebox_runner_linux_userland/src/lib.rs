@@ -212,7 +212,7 @@ pub struct CliArgs {
     #[arg(long = "fork-restore-ack-fd", hide = true, requires = "fork_restore")]
     pub fork_restore_ack_fd: Option<i32>,
 
-    /// Internal: pipe bridge specs for fork-restore (host-pipe passthrough).
+    /// Internal: pipe bridge specs for fork-restore (external-fd passthrough).
     /// Each value has the format `guest_fd:direction:host_fd` where direction
     /// is 'r' (read) or 'w' (write).
     #[arg(long = "pipe-bridge", hide = true)]
@@ -531,42 +531,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         } else {
             litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
         }
-    }
-
-    // C.5* follow-up: gate eager-broker `sys_pipe2` on an env var
-    // so tests can probe both legacy host-pipe and eager-broker
-    // codepaths without recompiling. `LITEBOX_EAGER_BROKER_PIPE=1`
-    // (or 'true' / 'yes', case-insensitive) flips it on.
-    //
-    // **F.9 status (2026-05-18)**: substrate complete (emit-side
-    // dup_handle + post-wait_worker_host release in
-    // exec_on_remote_host) PLUS PE.13 fix (fork-snapshot restore
-    // calls dup_handle so PE.9's strict ownership check doesn't fire
-    // on the implicit on_close release; matching parent-side release
-    // moved to spawn-async-wait task in commit_delayed_fork).
-    //
-    // Under LITEBOX_EAGER_BROKER_PIPE=1:
-    // - PB.c2p: 20/20
-    // - PIDF: 9/11 (PE.13 improved from 6/11)
-    //   * Remaining 2/11: PIDF.exit_self.{nonpie-glibc, non-pie-static-musl}
-    //     fail with EIO at std::process::Command::output's read of
-    //     the child's stdout pipe. Cross-bt (nonpie) exec uses
-    //     exec_on_remote_host. The transit ref accounting is
-    //     evidently still off for this specific case. Needs separate
-    //     investigation.
-    //
-    // F.9: flipped default to ON 2026-05-18. The under-load PB suite
-    // races that previously blocked this flip were the EINTR-from-
-    // SIGCHLD signal-disposition bug in sys_epoll_pwait/sys_ppoll
-    // (fixed in this branch). PB full suite is 113/113 stable across
-    // 5 runs under load; PXEOF/EPIPE/PXP all 100%. Opt-out via
-    // LITEBOX_EAGER_BROKER_PIPE=0.
-    {
-        let enabled = std::env::var("LITEBOX_EAGER_BROKER_PIPE")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(true);
-        litebox_shim_linux::syscalls::set_eager_broker_pipe_enabled(enabled);
     }
 
     // Phase F: equivalent runtime gate for eager broker-backed
@@ -1097,15 +1061,15 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                     );
                 }
                 let direction = match bridge.direction {
-                    b'r' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
-                    b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
-                    _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
+                    b'r' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Read,
+                    b'b' => {
+                        litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite
+                    }
+                    _ => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Write,
                 };
-                program.entrypoints.install_host_pipe_fd(
-                    bridge.guest_fd,
-                    bridge.host_fd,
-                    direction,
-                );
+                program
+                    .entrypoints
+                    .install_external_fd(bridge.guest_fd, bridge.host_fd, direction);
             }
         }
 
@@ -1209,13 +1173,13 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     let pipe_bridges_tcp = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
     for bridge in &pipe_bridges_tcp {
         let direction = match bridge.direction {
-            b'r' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
-            b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
-            _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
+            b'r' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Read,
+            b'b' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
+            _ => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Write,
         };
         program
             .entrypoints
-            .install_host_pipe_fd(bridge.guest_fd, bridge.host_fd, direction);
+            .install_external_fd(bridge.guest_fd, bridge.host_fd, direction);
     }
 
     // Install broker-backed shim fd entries for fds inherited across
@@ -1476,7 +1440,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         .fork_restore_ack_fd
         .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-ack-fd"))?;
 
-    // Parse pipe bridge specs (host-pipe passthrough from prior bridges).
+    // Parse pipe bridge specs (external-fd passthrough from prior bridges).
     let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
 
     // Parse mux stream specs.
@@ -1631,7 +1595,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
 }
 
 /// A parsed pipe bridge specification from the `--pipe-bridge` CLI arg.
-/// Used for host-pipe passthrough fds from prior delayed-fork bridges.
+/// Used for external-fd passthrough fds from prior delayed-fork bridges.
 struct PipeBridgeSpec {
     guest_fd: usize,
     host_fd: i32,
@@ -1763,7 +1727,7 @@ fn parse_local_pipe_specs(specs: &[String]) -> Result<Vec<LocalPipeSpec>> {
 
 /// Restore a child process from a fork snapshot and write the ack status to the parent.
 ///
-/// Sets up both host-pipe passthrough fds and multiplexer stream endpoints,
+/// Sets up both external-fd passthrough fds and multiplexer stream endpoints,
 /// then starts the worker mux dispatcher thread before acking.
 #[allow(clippy::too_many_arguments)]
 fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
@@ -1786,18 +1750,18 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
         Ok(program) => {
             let mut mux_thread_handle: Option<std::thread::JoinHandle<()>> = None;
 
-            // Install HostPipe FDs for passthrough pipe bridges.
+            // Install ExternalFd FDs for passthrough pipe bridges.
             for bridge in pipe_bridges {
                 let direction = match bridge.direction {
-                    b'r' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
-                    b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
-                    _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
+                    b'r' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Read,
+                    b'b' => {
+                        litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite
+                    }
+                    _ => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Write,
                 };
-                program.entrypoints.install_host_pipe_fd(
-                    bridge.guest_fd,
-                    bridge.host_fd,
-                    direction,
-                );
+                program
+                    .entrypoints
+                    .install_external_fd(bridge.guest_fd, bridge.host_fd, direction);
             }
 
             // Install connected pipe pairs for child-only pipes (both
@@ -1830,30 +1794,36 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     // and install only the receiver at read_fd.  The guest
                     // reads the data and then gets EOF.
                     if write_fd == usize::MAX {
-                        // Orphan pipe: create a real OS pipe, write drained
-                        // data, close write end, install read end at guest fd.
-                        // Using a host pipe avoids the pollee.wait mechanism
-                        // which doesn't work on non-guest background threads.
-                        let (os_read, os_write) = litebox_platform_multiplex::platform()
-                            .create_host_pipe()
-                            .expect("create_host_pipe for orphan");
+                        let provider = litebox_shim_linux::syscalls::broker_pipe_provider()
+                            .expect("broker pipe provider for orphan local pipe");
+                        let (read_handle, write_handle) = provider
+                            .create_pipe(1024 * 1024, 4096)
+                            .expect("create broker pipe for orphan");
                         if !drained.is_empty() {
                             let mut offset = 0;
                             while offset < drained.len() {
-                                match litebox_platform_multiplex::platform()
-                                    .write_host_fd(os_write, &drained[offset..])
-                                {
+                                match provider.write_pipe(write_handle, &drained[offset..]) {
+                                    Ok(0) | Err(_) => break,
                                     Ok(n) => offset += n,
-                                    Err(_) => break,
                                 }
                             }
                         }
-                        litebox_platform_multiplex::platform().close_host_fd(os_write);
-                        program.entrypoints.install_host_pipe_fd(
-                            read_fd,
-                            os_read,
-                            litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
-                        );
+                        provider.release(write_handle);
+                        program
+                            .entrypoints
+                            .install_broker_bridge_fd(
+                                read_fd,
+                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Pipe,
+                                read_handle,
+                                Some(
+                                    litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
+                                ),
+                                None,
+                                None,
+                                None,
+                            )
+                            .expect("install broker orphan read end");
+                        provider.release(read_handle);
                         continue;
                     }
 
@@ -2517,13 +2487,13 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
         for bridge in &pipe_bridges {
             let direction = match bridge.direction {
-                b'r' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
-                b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
-                _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
+                b'r' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Read,
+                b'b' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
+                _ => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Write,
             };
             program
                 .entrypoints
-                .install_host_pipe_fd(bridge.guest_fd, bridge.host_fd, direction);
+                .install_external_fd(bridge.guest_fd, bridge.host_fd, direction);
         }
 
         // Install broker-backed shim fd entries for fds inherited across

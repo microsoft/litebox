@@ -1069,7 +1069,7 @@ mod leaf_subcmd {
     }
 
     fn role_shared_writer_fork() -> i32 {
-        // Create a host pipe via libc::pipe2. Fork; both halves hold
+        // Create a external fd via libc::pipe2. Fork; both halves hold
         // the write end. Sequence:
         //   1. parent (this process) writes "PARENT" then closes own write end.
         //   2. child writes "CHILD" then sleeps 100ms then exits.

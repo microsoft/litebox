@@ -332,7 +332,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    /// Creates a host pipe and returns its (read, write) ends as `OwnedFd`s.
+    /// Creates a external fd and returns its (read, write) ends as `OwnedFd`s.
     fn pipe_pair() -> (OwnedFd, OwnedFd) {
         let mut fds = [0i32; 2];
         let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };

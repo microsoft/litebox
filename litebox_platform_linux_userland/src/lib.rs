@@ -175,7 +175,7 @@ struct WorkerHostProcess {
 }
 
 /// Describes a pipe-backed stdio fd that was set up with direct OS pipe I/O
-/// (no bridge thread). The parent should install a `HostPipeFd` wrapping
+/// (no bridge thread). The parent should install a `ExternalFd` wrapping
 /// `parent_os_fd` at the appropriate guest fd number.
 pub struct ExecPipeDirectIo {
     /// The child worker's stdio fd number (0, 1, or 2).
@@ -192,7 +192,7 @@ pub struct WorkerExecSpawnResult {
     pub host_pid: i32,
     /// Pipe-backed stdio fds that use direct OS pipe I/O instead of bridge
     /// threads. Non-empty only when `direct_pipe_io` was requested. The caller
-    /// is responsible for installing `HostPipeFd` entries for these and closing
+    /// is responsible for installing `ExternalFd` entries for these and closing
     /// them on error.
     pub direct_pipes: Vec<ExecPipeDirectIo>,
 }
@@ -1510,8 +1510,8 @@ impl LinuxUserland {
                     return Err(-1_i32);
                 }
             }
-            WorkerExecInputBinding::HostPipe { fd } => {
-                // dup2 the host pipe fd onto stdin in the child.
+            WorkerExecInputBinding::ExternalFd { fd } => {
+                // dup2 the external fd fd onto stdin in the child.
                 // The fd has O_CLOEXEC but posix_spawn file actions run
                 // before exec, so dup2 succeeds and fd 0 survives exec.
                 if unsafe { libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, 0) } != 0
@@ -1563,7 +1563,7 @@ impl LinuxUserland {
                         return Err(-1_i32);
                     }
                 }
-                WorkerExecOutputBinding::HostPipe { fd } => {
+                WorkerExecOutputBinding::ExternalFd { fd } => {
                     if unsafe {
                         libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, fd_num)
                     } != 0
@@ -1689,7 +1689,7 @@ impl LinuxUserland {
         let mut direct_pipes = Vec::new();
         for (source, write_fd) in input_bridges {
             if direct_pipe_io && matches!(&source, WorkerExecInputSource::Pipe { .. }) {
-                // Skip bridge thread: the caller will install a HostPipeFd for
+                // Skip bridge thread: the caller will install a ExternalFd for
                 // the parent's corresponding pipe endpoint.
                 let raw_fd = write_fd.into_raw_fd();
                 direct_pipes.push(ExecPipeDirectIo {
@@ -1748,7 +1748,7 @@ impl LinuxUserland {
 
     /// Read from an arbitrary host file descriptor.
     ///
-    /// Used by `HostPipeFd` entries to do I/O on real OS pipe FDs that bridge
+    /// Used by `ExternalFd` entries to do I/O on real OS pipe FDs that bridge
     /// fork children across host processes.
     pub fn read_host_fd(
         &self,
@@ -1757,7 +1757,7 @@ impl LinuxUserland {
     ) -> Result<usize, litebox_common_linux::errno::Errno> {
         use litebox_common_linux::errno::Errno;
         loop {
-            // Safety: fd is a valid host FD obtained from create_host_pipe.
+            // Safety: fd is a valid host FD obtained from create_external_fd.
             let result = unsafe {
                 syscalls::syscall4(
                     syscalls::Sysno::read,
@@ -1780,7 +1780,7 @@ impl LinuxUserland {
 
     /// Write to an arbitrary host file descriptor.
     ///
-    /// Used by `HostPipeFd` entries to do I/O on real OS pipe FDs that bridge
+    /// Used by `ExternalFd` entries to do I/O on real OS pipe FDs that bridge
     /// fork children across host processes.
     pub fn write_host_fd(
         &self,
@@ -1789,7 +1789,7 @@ impl LinuxUserland {
     ) -> Result<usize, litebox_common_linux::errno::Errno> {
         use litebox_common_linux::errno::Errno;
         loop {
-            // Safety: fd is a valid host FD obtained from create_host_pipe.
+            // Safety: fd is a valid host FD obtained from create_external_fd.
             let result = unsafe {
                 syscalls::syscall4(
                     syscalls::Sysno::write,
@@ -1813,7 +1813,7 @@ impl LinuxUserland {
 
     /// Close a host file descriptor.
     pub fn close_host_fd(&self, fd: i32) {
-        // Safety: fd is a valid host FD obtained from create_host_pipe.
+        // Safety: fd is a valid host FD obtained from create_external_fd.
         unsafe {
             let _ = syscalls::syscall2(
                 syscalls::Sysno::close,
@@ -1840,7 +1840,7 @@ impl LinuxUserland {
     ///
     /// Returns `(read_fd, write_fd)` as raw file descriptor numbers.
     /// Both FDs have `O_CLOEXEC` set.
-    pub fn create_host_pipe(&self) -> Result<(i32, i32), litebox_common_linux::errno::Errno> {
+    pub fn create_external_fd(&self) -> Result<(i32, i32), litebox_common_linux::errno::Errno> {
         let mut fds = [0i32; 2];
         let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
         if ret != 0 {
@@ -1875,7 +1875,7 @@ impl LinuxUserland {
         Ok((fds[0], fds[1]))
     }
 
-    /// Try to enlarge a host pipe's capacity to at least `size` bytes.
+    /// Try to enlarge a external fd's capacity to at least `size` bytes.
     ///
     /// Best-effort: silently ignores errors (e.g. unprivileged processes
     /// cannot exceed `/proc/sys/fs/pipe-max-size`).
@@ -2054,7 +2054,7 @@ impl LinuxUserland {
             spawn_argv.push(CString::new(spec).map_err(|_| -1_i32)?);
         }
 
-        // Add --pipe-bridge for host-pipe passthrough fds (from prior bridges).
+        // Add --pipe-bridge for external-fd passthrough fds (from prior bridges).
         for &(guest_fd, host_fd, dir) in passthrough_fds {
             let _ = self.clear_cloexec(host_fd);
             let dir_char = match dir {
@@ -2132,7 +2132,7 @@ impl LinuxUserland {
                     return Err(-1_i32);
                 }
             }
-            WorkerExecInputBinding::HostPipe { fd } => {
+            WorkerExecInputBinding::ExternalFd { fd } => {
                 if unsafe { libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, 0) } != 0
                 {
                     return Err(-1_i32);
@@ -2181,7 +2181,7 @@ impl LinuxUserland {
                         return Err(-1_i32);
                     }
                 }
-                WorkerExecOutputBinding::HostPipe { fd } => {
+                WorkerExecOutputBinding::ExternalFd { fd } => {
                     if unsafe {
                         libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, fd_num)
                     } != 0
@@ -2773,7 +2773,7 @@ fn update_fd_nonblocking(fd: &std::os::fd::OwnedFd, nonblocking: bool) -> std::i
     Ok(())
 }
 
-fn host_pipe_capacity_granularity() -> usize {
+fn external_fd_capacity_granularity() -> usize {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(page_size)
         .ok()
@@ -2782,7 +2782,7 @@ fn host_pipe_capacity_granularity() -> usize {
 }
 
 fn supports_bridge_pipe_capacity(capacity: usize) -> bool {
-    capacity >= host_pipe_capacity_granularity()
+    capacity >= external_fd_capacity_granularity()
 }
 
 fn set_pipe_capacity(fd: &std::os::fd::OwnedFd, capacity: usize) -> std::io::Result<usize> {
@@ -2797,11 +2797,11 @@ fn set_pipe_capacity(fd: &std::os::fd::OwnedFd, capacity: usize) -> std::io::Res
         return Err(std::io::Error::last_os_error());
     }
     usize::try_from(actual)
-        .map_err(|_| std::io::Error::other("host pipe capacity did not fit in usize"))
+        .map_err(|_| std::io::Error::other("external fd capacity did not fit in usize"))
 }
 
 fn set_pipe_capacity_at_most(fd: &std::os::fd::OwnedFd, limit: usize) -> std::io::Result<()> {
-    let granularity = host_pipe_capacity_granularity();
+    let granularity = external_fd_capacity_granularity();
     let mut requested = limit / granularity * granularity;
 
     while requested >= granularity {
@@ -2813,7 +2813,7 @@ fn set_pipe_capacity_at_most(fd: &std::os::fd::OwnedFd, limit: usize) -> std::io
     }
 
     Err(std::io::Error::other(
-        "host pipe capacity cannot be constrained to the guest writable space",
+        "external fd capacity cannot be constrained to the guest writable space",
     ))
 }
 
@@ -2858,7 +2858,7 @@ where
         }
         WorkerExecInputBinding::Inherit
         | WorkerExecInputBinding::HostStdio { .. }
-        | WorkerExecInputBinding::HostPipe { .. }
+        | WorkerExecInputBinding::ExternalFd { .. }
         | WorkerExecInputBinding::Close => None,
     }
 }
@@ -2892,7 +2892,7 @@ where
             ),
             WorkerExecOutputBinding::Inherit
             | WorkerExecOutputBinding::HostStdio { .. }
-            | WorkerExecOutputBinding::HostPipe { .. }
+            | WorkerExecOutputBinding::ExternalFd { .. }
             | WorkerExecOutputBinding::Close => continue,
         };
         if let Some(existing) = groups.iter_mut().find(|group| group.key == key) {

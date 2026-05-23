@@ -250,7 +250,7 @@ pub struct FdMetadataSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrokerFdTokenSnapshot {
     pub token_id: u64,
-    pub host_pipe_direction: Option<crate::syscalls::host_pipe::HostPipeDirection>,
+    pub external_fd_direction: Option<crate::syscalls::external_fd::ExternalFdDirection>,
 }
 
 /// Broker handle reference carried through `FdMetadataSnapshot` so a
@@ -1190,11 +1190,11 @@ impl FdMetadataSnapshot {
             Some(token) => {
                 w.write_u8(1);
                 w.write_u64(token.token_id);
-                let dir_byte = match token.host_pipe_direction {
+                let dir_byte = match token.external_fd_direction {
                     None => 0,
-                    Some(crate::syscalls::host_pipe::HostPipeDirection::Read) => 1,
-                    Some(crate::syscalls::host_pipe::HostPipeDirection::Write) => 2,
-                    Some(crate::syscalls::host_pipe::HostPipeDirection::ReadWrite) => 3,
+                    Some(crate::syscalls::external_fd::ExternalFdDirection::Read) => 1,
+                    Some(crate::syscalls::external_fd::ExternalFdDirection::Write) => 2,
+                    Some(crate::syscalls::external_fd::ExternalFdDirection::ReadWrite) => 3,
                 };
                 w.write_u8(dir_byte);
             }
@@ -1274,21 +1274,21 @@ impl FdMetadataSnapshot {
             1 => {
                 let token_id = r.read_u64()?;
                 let dir_byte = r.read_u8()?;
-                let host_pipe_direction = match dir_byte {
+                let external_fd_direction = match dir_byte {
                     0 => None,
-                    1 => Some(crate::syscalls::host_pipe::HostPipeDirection::Read),
-                    2 => Some(crate::syscalls::host_pipe::HostPipeDirection::Write),
-                    3 => Some(crate::syscalls::host_pipe::HostPipeDirection::ReadWrite),
+                    1 => Some(crate::syscalls::external_fd::ExternalFdDirection::Read),
+                    2 => Some(crate::syscalls::external_fd::ExternalFdDirection::Write),
+                    3 => Some(crate::syscalls::external_fd::ExternalFdDirection::ReadWrite),
                     other => {
                         return Err(SnapshotDeserializeError::InvalidEnum(
-                            "BrokerFdTokenSnapshot::host_pipe_direction",
+                            "BrokerFdTokenSnapshot::external_fd_direction",
                             other,
                         ));
                     }
                 };
                 Some(BrokerFdTokenSnapshot {
                     token_id,
-                    host_pipe_direction,
+                    external_fd_direction,
                 })
             }
             other => {

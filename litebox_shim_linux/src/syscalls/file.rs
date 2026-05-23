@@ -726,7 +726,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Eventfd(_fd) => None, // non-PTY descriptor has no PTY rdev
                 crate::RawFdRef::Epoll(_fd) => None, // non-PTY descriptor has no PTY rdev
                 crate::RawFdRef::Unix(_fd) => None, // non-PTY descriptor has no PTY rdev
-                crate::RawFdRef::HostPipe(_fd) => None, // non-PTY descriptor has no PTY rdev
+                crate::RawFdRef::ExternalFd(_fd) => None, // non-PTY descriptor has no PTY rdev
                 crate::RawFdRef::BrokerPipe(_fd) => None, // non-PTY descriptor has no PTY rdev
                 crate::RawFdRef::BrokerSocketPair(_fd) => None, // non-PTY descriptor has no PTY rdev
                 crate::RawFdRef::BrokerPty(_fd) => None, // direct BrokerPty lookup is handled above
@@ -1399,7 +1399,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -1486,7 +1486,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Eventfd(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::Epoll(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::Unix(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
-                crate::RawFdRef::HostPipe(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::ExternalFd(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::BrokerPipe(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::BrokerSocketPair(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::BrokerPty(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
@@ -1573,7 +1573,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -1644,7 +1644,7 @@ impl<FS: ShimFS> Task<FS> {
                         crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                         crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                         crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                        crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                         crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                         crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                         crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -1925,15 +1925,15 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 }
-                crate::RawFdRef::HostPipe(fd) => {
+                crate::RawFdRef::ExternalFd(fd) => {
                     let handle = self
                         .global
                         .litebox
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
-                    handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
-                        super::host_pipe::read_host_pipe(
+                    handle.with_entry(|entry: &super::external_fd::ExternalFd| {
+                        super::external_fd::read_external_fd(
                             self.global.platform,
                             entry,
                             &mut buf.borrow_mut(),
@@ -2104,7 +2104,7 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 }
-                crate::RawFdRef::HostPipe(fd) => {
+                crate::RawFdRef::ExternalFd(fd) => {
                     #[cfg(feature = "trace_syscalls")]
                     if raw_fd <= 2 {
                         litebox::log_println!(
@@ -2121,8 +2121,8 @@ impl<FS: ShimFS> Task<FS> {
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
-                    handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
-                        super::host_pipe::write_host_pipe(self.global.platform, entry, buf)
+                    handle.with_entry(|entry: &super::external_fd::ExternalFd| {
+                        super::external_fd::write_external_fd(self.global.platform, entry, buf)
                     })
                 }
                 crate::RawFdRef::BrokerPipe(fd) => {
@@ -2447,7 +2447,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Eventfd(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
                 crate::RawFdRef::Epoll(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
                 crate::RawFdRef::Unix(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
-                crate::RawFdRef::HostPipe(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::ExternalFd(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
                 crate::RawFdRef::BrokerPipe(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
                 crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
                 crate::RawFdRef::BrokerPty(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
@@ -2504,7 +2504,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -2527,7 +2527,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::Eventfd(_) => (),
             crate::RawFdRef::Epoll(_) => (),
             crate::RawFdRef::Unix(_) => (),
-            crate::RawFdRef::HostPipe(_) => (),
+            crate::RawFdRef::ExternalFd(_) => (),
             crate::RawFdRef::BrokerPipe(_) => (),
             crate::RawFdRef::BrokerSocketPair(_) => (),
             crate::RawFdRef::BrokerPty(_) => (),
@@ -2606,7 +2606,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-            crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -2852,11 +2852,13 @@ impl<FS: ShimFS> Task<FS> {
             drop(entry);
             return Ok(());
         }
-        if let Ok(fd) = rds.fd_consume_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd) {
+        if let Ok(fd) =
+            rds.fd_consume_raw_integer::<super::external_fd::ExternalFdSubsystem>(raw_fd)
+        {
             drop(rds);
             // Remove the descriptor table entry.  The OS fd is only closed
             // when this was the last reference (i.e. remove() returns the
-            // entry), because dup'd HostPipeFd entries share the same
+            // entry), because dup'd ExternalFd entries share the same
             // underlying SharedEntry and we must not invalidate the fd for
             // other aliases.
             let mut dt = self.global.litebox.descriptor_table_mut();
@@ -2961,7 +2963,7 @@ impl<FS: ShimFS> Task<FS> {
                     .descriptor_table_mut()
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
             }
-            crate::RawFdRef::HostPipe(fd) => {
+            crate::RawFdRef::ExternalFd(fd) => {
                 let _old = self
                     .global
                     .litebox
@@ -3168,19 +3170,23 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 }
-                crate::RawFdRef::HostPipe(fd) => {
+                crate::RawFdRef::ExternalFd(fd) => {
                     let handle = self
                         .global
                         .litebox
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
-                    handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
+                    handle.with_entry(|entry: &super::external_fd::ExternalFd| {
                         read_once_to_iovecs(
                             iovs,
                             || self.park_if_deferred(),
                             |buf| {
-                                super::host_pipe::read_host_pipe(self.global.platform, entry, buf)
+                                super::external_fd::read_external_fd(
+                                    self.global.platform,
+                                    entry,
+                                    buf,
+                                )
                             },
                         )
                     })
@@ -3333,7 +3339,7 @@ fn fcntl_status_flags<FS: ShimFS>(
             crate::RawFdRef::Eventfd(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::Epoll(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::Unix(fd) => getfl_from_handle!(fd),
-            crate::RawFdRef::HostPipe(fd) => getfl_from_handle!(fd),
+            crate::RawFdRef::ExternalFd(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::BrokerPipe(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::BrokerSocketPair(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::BrokerPty(fd) => getfl_from_handle!(fd),
@@ -3575,16 +3581,16 @@ impl<FS: ShimFS> Task<FS> {
                         })
                     })
                 }
-                crate::RawFdRef::HostPipe(fd) => {
+                crate::RawFdRef::ExternalFd(fd) => {
                     let handle = self
                         .global
                         .litebox
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
-                    handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
+                    handle.with_entry(|entry: &super::external_fd::ExternalFd| {
                         write_once_from_iovecs(iovs, |buf| {
-                            super::host_pipe::write_host_pipe(self.global.platform, entry, buf)
+                            super::external_fd::write_external_fd(self.global.platform, entry, buf)
                         })
                     })
                 }
@@ -3693,7 +3699,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Eventfd(_) => Ok(()),
                     crate::RawFdRef::Epoll(_) => Ok(()),
                     crate::RawFdRef::Unix(_) => Ok(()),
-                    crate::RawFdRef::HostPipe(_) => Ok(()),
+                    crate::RawFdRef::ExternalFd(_) => Ok(()),
                     crate::RawFdRef::BrokerPipe(_) => Ok(()),
                     crate::RawFdRef::BrokerSocketPair(_) => Ok(()),
                     crate::RawFdRef::BrokerPty(_) => Ok(()),
@@ -3716,7 +3722,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -3974,7 +3980,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Eventfd(_) => (),
                     crate::RawFdRef::Epoll(_) => (),
                     crate::RawFdRef::Unix(_) => (),
-                    crate::RawFdRef::HostPipe(_) => (),
+                    crate::RawFdRef::ExternalFd(_) => (),
                     crate::RawFdRef::BrokerPipe(_) => (),
                     crate::RawFdRef::BrokerSocketPair(_) => (),
                     crate::RawFdRef::BrokerPty(_) => (),
@@ -4004,7 +4010,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -4180,18 +4186,18 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     ..Default::default()
                 })
             }
-            crate::RawFdRef::HostPipe(fd) => {
+            crate::RawFdRef::ExternalFd(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 let dir = task
                     .global
                     .litebox
                     .descriptor_table()
-                    .with_entry(fd, |e: &super::host_pipe::HostPipeFd| e.direction)
+                    .with_entry(fd, |e: &super::external_fd::ExternalFd| e.direction)
                     .ok_or(Errno::EBADF)?;
                 let read_write_mode = match dir {
-                    super::host_pipe::HostPipeDirection::Read => Mode::RUSR,
-                    super::host_pipe::HostPipeDirection::Write => Mode::WUSR,
-                    super::host_pipe::HostPipeDirection::ReadWrite => {
+                    super::external_fd::ExternalFdDirection::Read => Mode::RUSR,
+                    super::external_fd::ExternalFdDirection::Write => Mode::WUSR,
+                    super::external_fd::ExternalFdDirection::ReadWrite => {
                         Mode::from_bits_truncate(Mode::RUSR.bits() | Mode::WUSR.bits())
                     }
                 };
@@ -4357,7 +4363,7 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
             crate::RawFdRef::Eventfd(_) => false, // host-PTY stat override only applies to FS aliases
             crate::RawFdRef::Epoll(_) => false, // host-PTY stat override only applies to FS aliases
             crate::RawFdRef::Unix(_) => false,  // host-PTY stat override only applies to FS aliases
-            crate::RawFdRef::HostPipe(_) => false, // host-PTY stat override only applies to FS aliases
+            crate::RawFdRef::ExternalFd(_) => false, // host-PTY stat override only applies to FS aliases
             crate::RawFdRef::BrokerPipe(_) => false, // host-PTY stat override only applies to FS aliases
             crate::RawFdRef::BrokerSocketPair(_) => false, // host-PTY stat override only applies to FS aliases
             crate::RawFdRef::BrokerPty(_) => false, // broker PTYs report their own synthetic stat
@@ -4425,7 +4431,7 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
         crate::RawFdRef::Eventfd(fd) => get_flags(global, fd),
         crate::RawFdRef::Epoll(fd) => get_flags(global, fd),
         crate::RawFdRef::Unix(fd) => get_flags(global, fd),
-        crate::RawFdRef::HostPipe(fd) => get_flags(global, fd),
+        crate::RawFdRef::ExternalFd(fd) => get_flags(global, fd),
         crate::RawFdRef::BrokerPipe(fd) => get_flags(global, fd),
         crate::RawFdRef::BrokerSocketPair(fd) => get_flags(global, fd),
         crate::RawFdRef::BrokerPty(fd) => get_flags(global, fd),
@@ -4457,7 +4463,7 @@ fn set_file_descriptor_flags<FS: ShimFS>(
         crate::RawFdRef::Eventfd(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::Epoll(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::Unix(fd) => set_flags(global, fd, flags),
-        crate::RawFdRef::HostPipe(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::ExternalFd(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::BrokerPipe(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::BrokerSocketPair(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::BrokerPty(fd) => set_flags(global, fd, flags),
@@ -4712,7 +4718,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -5027,14 +5033,14 @@ impl<FS: ShimFS> Task<FS> {
                         toggle_flags!(fd);
                         Ok(())
                     }
-                    crate::RawFdRef::HostPipe(fd) => {
+                    crate::RawFdRef::ExternalFd(fd) => {
                         let handle = self
                             .global
                             .litebox
                             .descriptor_table()
                             .entry_handle(fd)
                             .ok_or(Errno::EBADF)?;
-                        handle.with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| {
+                        handle.with_entry(|file: &crate::syscalls::external_fd::ExternalFd| {
                             let diff = (file.get_status() & setfl_mask) ^ flags;
                             if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
                                 log_unsupported!("unsupported flags");
@@ -5224,7 +5230,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::Epoll(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::Unix(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-            crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
@@ -5260,159 +5266,66 @@ impl<FS: ShimFS> Task<FS> {
             (f, flags.contains(OFlags::CLOEXEC))
         };
 
-        // Phase C.3: eager-broker `sys_pipe2`. Gated on the runtime
-        // boolean `super::broker_pipe::eager_broker_pipe_enabled()`,
-        // which the runner sets from the env var
-        // `LITEBOX_EAGER_BROKER_PIPE=1` at startup. Default `false`
-        // keeps the committed state regression-clean while the
-        // legacy host-pipe-bridge code is phased out.
-        //
-        // When `true`, every guest `pipe2()` allocates a pair of
-        // broker-backed handles (one per end). The two
-        // `BrokerPipeFd`s each own one registry refcount and
-        // release on Drop.
-        let eager_broker = super::broker_pipe::eager_broker_pipe_enabled();
-        if eager_broker && let Some(provider) = super::broker_pipe::broker_pipe_provider() {
-            let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
-            // create_pipe returns two distinct broker state-registry
-            // handles — one for each end. Each handle's registry
-            // refcount = 1 initially; the two BrokerPipeFds we
-            // create below each own one ref and will release on Drop.
-            let (read_handle, write_handle) = provider
-                .create_pipe(
-                    DEFAULT_PIPE_BUF_SIZE as u64,
-                    // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
-                    4096,
-                )
-                .map_err(|_| Errno::ENODEV)?;
+        let provider = super::broker_pipe::broker_pipe_provider().ok_or(Errno::ENODEV)?;
+        let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
+        let (read_handle, write_handle) = provider
+            .create_pipe(
+                DEFAULT_PIPE_BUF_SIZE as u64,
+                // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
+                4096,
+            )
+            .map_err(|_| Errno::ENODEV)?;
 
-            let writer_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
-                alloc::sync::Arc::clone(&provider),
-                write_handle,
-                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
-                entry_flags,
-                0, // creation_site: sys_pipe2
-            );
-            let reader_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
-                provider,
-                read_handle,
-                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
-                entry_flags,
-                0, // creation_site: sys_pipe2
-            );
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let writer = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(writer_entry);
-            let reader = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(reader_entry);
-            // Mirror the legacy `Pipes`-backed path's metadata. Code
-            // elsewhere in the shim queries `PipeStatusFlags` for
-            // status-flag updates (`fcntl(F_SETFL)`) and uses
-            // `GuestCreatedPipe` as a marker for fds the guest created
-            // (so the host doesn't try to close them as host fds).
-            {
-                let initial_status = OFlags::from(pipe_flags);
-                let _ = dt.set_entry_metadata(
-                    &writer,
-                    crate::PipeStatusFlags(initial_status | OFlags::WRONLY),
-                );
-                let _ = dt.set_entry_metadata(
-                    &reader,
-                    crate::PipeStatusFlags(initial_status | OFlags::RDONLY),
-                );
-                let _ = dt.set_entry_metadata(&writer, crate::GuestCreatedPipe);
-                let _ = dt.set_entry_metadata(&reader, crate::GuestCreatedPipe);
-            }
-            if cloexec {
-                let _ = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC);
-                let _ = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC);
-            }
-            drop(dt);
-
-            let files = self.files.borrow();
-            let wr_raw_fd = files.insert_raw_fd(writer).map_err(|writer| {
-                let _ = self.global.litebox.descriptor_table_mut().remove(&writer);
-                Errno::EMFILE
-            })?;
-            let rd_raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
-                let _ = self.do_close(wr_raw_fd);
-                let _ = self.global.litebox.descriptor_table_mut().remove(&reader);
-                Errno::EMFILE
-            })?;
-            return Ok((
-                rd_raw_fd.try_into().map_err(|_| Errno::EMFILE)?,
-                wr_raw_fd.try_into().map_err(|_| Errno::EMFILE)?,
-            ));
-        }
-
-        // Legacy fallback: in-shim local pipe (no broker provider).
-        let (writer, reader) = self.global.pipes.create_pipe(
-            DEFAULT_PIPE_BUF_SIZE,
-            pipe_flags,
-            // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
-            core::num::NonZero::new(4096),
+        let writer_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
+            alloc::sync::Arc::clone(&provider),
+            write_handle,
+            litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
+            entry_flags,
+            0, // creation_site: sys_pipe2
         );
-
+        let reader_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
+            provider,
+            read_handle,
+            litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
+            entry_flags,
+            0, // creation_site: sys_pipe2
+        );
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let writer = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(writer_entry);
+        let reader = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(reader_entry);
         {
             let initial_status = OFlags::from(pipe_flags);
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let old = dt.set_entry_metadata(
+            let _ = dt.set_entry_metadata(
                 &writer,
                 crate::PipeStatusFlags(initial_status | OFlags::WRONLY),
             );
-            assert!(old.is_none());
-            let old = dt.set_entry_metadata(
+            let _ = dt.set_entry_metadata(
                 &reader,
                 crate::PipeStatusFlags(initial_status | OFlags::RDONLY),
             );
-            assert!(old.is_none());
-            let old = dt.set_entry_metadata(&writer, crate::GuestCreatedPipe);
-            assert!(old.is_none());
-            let old = dt.set_entry_metadata(&reader, crate::GuestCreatedPipe);
-            assert!(old.is_none());
+            let _ = dt.set_entry_metadata(&writer, crate::GuestCreatedPipe);
+            let _ = dt.set_entry_metadata(&reader, crate::GuestCreatedPipe);
         }
-
         if cloexec {
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let None = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC) else {
-                unreachable!()
-            };
-            let None = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC) else {
-                unreachable!()
-            };
+            let _ = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC);
+            let _ = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC);
         }
+        drop(dt);
 
         let files = self.files.borrow();
-        #[cfg(feature = "trace_syscalls")]
-        let writer_object_id = writer.object_id().as_u64();
         let wr_raw_fd = files.insert_raw_fd(writer).map_err(|writer| {
-            self.global.pipes.close(&writer).unwrap();
+            let _ = self.global.litebox.descriptor_table_mut().remove(&writer);
             Errno::EMFILE
         })?;
-        #[cfg(feature = "trace_syscalls")]
-        let reader_object_id = reader.object_id().as_u64();
         let rd_raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
-            let writer = files
-                .raw_descriptor_store
-                .write()
-                .fd_consume_raw_integer(wr_raw_fd)
-                .unwrap();
-            self.global.pipes.close(&writer).unwrap();
-            self.global.pipes.close(&reader).unwrap();
+            let _ = self.do_close(wr_raw_fd);
+            let _ = self.global.litebox.descriptor_table_mut().remove(&reader);
             Errno::EMFILE
         })?;
-        #[cfg(feature = "trace_syscalls")]
-        if rd_raw_fd <= 20 || wr_raw_fd <= 20 {
-            litebox::log_println!(
-                self.global.platform,
-                "[FD-TRACE] pid={} pipe2 read_fd={} read_object_id={} write_fd={} write_object_id={} flags={:?}",
-                self.pid,
-                rd_raw_fd,
-                reader_object_id,
-                wr_raw_fd,
-                writer_object_id,
-                flags,
-            );
-        }
-        Ok((rd_raw_fd.try_into().unwrap(), wr_raw_fd.try_into().unwrap()))
+        Ok((
+            rd_raw_fd.try_into().map_err(|_| Errno::EMFILE)?,
+            wr_raw_fd.try_into().map_err(|_| Errno::EMFILE)?,
+        ))
     }
 
     pub fn sys_eventfd2(&self, initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
@@ -6224,8 +6137,8 @@ impl<FS: ShimFS> Task<FS> {
                         crate::RawFdRef::Unix(_fd) => {
                             todo!("FIONREAD on Unix socket: real Linux returns queued readable byte count")
                         }
-                        crate::RawFdRef::HostPipe(_fd) => {
-                            todo!("FIONREAD on host pipe: real Linux returns queued readable byte count")
+                        crate::RawFdRef::ExternalFd(_fd) => {
+                            todo!("FIONREAD on external fd: real Linux returns queued readable byte count")
                         }
                         crate::RawFdRef::BrokerPipe(_fd) => {
                             todo!("FIONREAD on broker pipe: real Linux returns queued readable byte count")
@@ -6331,14 +6244,14 @@ impl<FS: ShimFS> Task<FS> {
                             });
                             Ok(())
                         }
-                        crate::RawFdRef::HostPipe(fd) => {
+                        crate::RawFdRef::ExternalFd(fd) => {
                             let handle = self
                                 .global
                                 .litebox
                                 .descriptor_table()
                                 .entry_handle(fd)
                                 .ok_or(Errno::EBADF)?;
-                            handle.with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| {
+                            handle.with_entry(|file: &crate::syscalls::external_fd::ExternalFd| {
                                 self.global
                                     .platform
                                     .set_host_fd_nonblocking(file.raw_fd(), val != 0)?;
@@ -6473,7 +6386,7 @@ impl<FS: ShimFS> Task<FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 }
-                crate::RawFdRef::HostPipe(fd) => {
+                crate::RawFdRef::ExternalFd(fd) => {
                     let _old = self
                         .global
                         .litebox
@@ -6563,7 +6476,7 @@ impl<FS: ShimFS> Task<FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
                 }
-                crate::RawFdRef::HostPipe(fd) => {
+                crate::RawFdRef::ExternalFd(fd) => {
                     let _old = self
                         .global
                         .litebox
@@ -6623,7 +6536,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::Epoll(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::Unix(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
-                    crate::RawFdRef::HostPipe(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerPty(_) => {
@@ -6720,7 +6633,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::Eventfd(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::Epoll(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::Unix(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
-                    crate::RawFdRef::HostPipe(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
+                    crate::RawFdRef::ExternalFd(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerPipe(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerSocketPair(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::BrokerPty(_fd) => {
@@ -7387,7 +7300,7 @@ impl<FS: ShimFS> Task<FS> {
                 target,
                 min_fd,
             ),
-            crate::RawFdRef::HostPipe(fd) => dup(
+            crate::RawFdRef::ExternalFd(fd) => dup(
                 &self.global,
                 &files,
                 fd,
@@ -7554,7 +7467,7 @@ impl<FS: ShimFS> Task<FS> {
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
                         }
-                        crate::RawFdRef::HostPipe(fd) => {
+                        crate::RawFdRef::ExternalFd(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
@@ -7720,7 +7633,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::Eventfd(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::Epoll(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::Unix(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-            crate::RawFdRef::HostPipe(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::ExternalFd(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPipe(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerSocketPair(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPty(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd

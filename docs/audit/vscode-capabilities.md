@@ -102,7 +102,7 @@ Near misses: `posix_spawn` (`#21`), exact glibc DNS/netlink flow (`#20`), `io_ur
 
 ## discovered-additional-capabilities
 
-- **PTY-host pipe/socketpair bridge is already a separate VS Code pressure area.** The seed listed `epoll`+`pidfd`, but current tests also cover the ptyHost-style pipe/socketpair bridge via `PB.epoll*` (`main.rs:4610-4617`, `:4750-4759`). Keep it separate from real PTY work so regressions localize correctly.
+- **PTY-external fd/socketpair bridge is already a separate VS Code pressure area.** The seed listed `epoll`+`pidfd`, but current tests also cover the ptyHost-style pipe/socketpair bridge via `PB.epoll*` (`main.rs:4610-4617`, `:4750-4759`). Keep it separate from real PTY work so regressions localize correctly.
 - **`Exec.env` is a protocol blocker for child-process realism.** `protocol-surface.md:264-322` shows `Exec` cannot set, remove, or clear environment variables. VS Code/Node startup is heavily env-sensitive.
 - **Background readiness and observed-state waits are capabilities, not only framework ergonomics.** `synchronization-primitives.md:53-73` shows they directly gate loopback TCP, Unix socket, and inherited-listener tests.
 - **Exact glibc netlink flow remains missing even with multiple netlink ingredients covered.** `orphan-diff-findings.md:85-117` identifies the combined `sendmsg` + `MSG_PEEK|MSG_TRUNC` + `GETLINK`/`GETADDR` sequence gap.

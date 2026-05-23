@@ -35,7 +35,7 @@ Code (citations are against this worktree on
 
 - `litebox_shim_linux/src/syscalls/*` — per-syscall handlers + shim
   state structs (`process.rs`, `eventfd.rs`, `unix.rs`,
-  `signal/*`, `net.rs`, `epoll.rs`, `file.rs`, `host_pipe.rs`, …).
+  `signal/*`, `net.rs`, `epoll.rs`, `file.rs`, `external_fd.rs`, …).
 - `litebox/src/process/*`, `litebox/src/fd/*`, `litebox/src/net/*`,
   `litebox/src/fs/*`, `litebox/src/event/*` — shared shim types.
 - `litebox_broker/src/*` — broker-hosted state:
@@ -445,7 +445,7 @@ Status: 🟢 OK · 🔴 BROKEN · ⚪ UNTESTED · ⛔ GAP. VSCS:
 - **What**: cross-worker pipe implementation backed by shared
   memory rings, used when a pipe spans worker boundaries.
 - **Where**: shim side in `litebox/src/pipes.rs`,
-  `litebox_shim_linux/src/syscalls/host_pipe.rs`; shared shm ring
+  `litebox_shim_linux/src/syscalls/external_fd.rs`; shared shm ring
   primitive in `litebox_common_*` crates.
 - **XW mechanism**: shm region + atomic indices; broker mediates
   setup (handshake via fd-token).
@@ -456,7 +456,7 @@ Status: 🟢 OK · 🔴 BROKEN · ⚪ UNTESTED · ⛔ GAP. VSCS:
   `read`/`write` syscall counts presumably include pipe traffic
   between sshd, VS Code Server, and the extension host.
 - **Citations**: `litebox_test_harness/src/coordinator/pipe_bridge.rs`
-  (test surface), shim impl at `host_pipe.rs`.
+  (test surface), shim impl at `external_fd.rs`.
 
 ### 4.2 FIFO (named pipe)
 - **VSCS**: 💤 COLD. `mkfifo` not on unique list.

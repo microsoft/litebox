@@ -498,18 +498,9 @@ fn docker_run_base_args() -> Vec<String> {
     // Capture detailed Rust panic backtraces for diagnostics; harmless
     // when nothing panics.
     v.extend(["-e".to_string(), "RUST_BACKTRACE=full".to_string()]);
-    // C.5* follow-up: forward selected LITEBOX_* env vars into the
-    // container so test invocations can flip runtime gates without a
-    // rebuild. Currently:
-    //   - LITEBOX_EAGER_BROKER_PIPE=1: enable eager-broker sys_pipe2
-    //     in the shim (gated to be off by default in the committed
-    //     state; tests opt in per-invocation).
-    //   - LITEBOX_EAGER_BROKER_SOCKETPAIR=1: enable eager-broker
-    //     sys_socketpair for AF_UNIX SOCK_STREAM (Phase F; off by
-    //     default).
-    // Add more LITEBOX_* gates here as they're introduced.
+    // Forward selected LITEBOX_* env vars into the container so test
+    // invocations can flip runtime gates without a rebuild.
     for var in [
-        "LITEBOX_EAGER_BROKER_PIPE",
         "LITEBOX_EAGER_BROKER_SOCKETPAIR",
         "LITEBOX_PE10_DIAG",
         "LITEBOX_PE5_DIAG",

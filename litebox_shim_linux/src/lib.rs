@@ -132,20 +132,20 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         *self.task.process_state.borrow().controlling_pty.lock() = Some(pty_id);
     }
 
-    /// Install a host-backed pipe FD into the restored child's descriptor table.
+    /// Install a external fd FD into the restored child's descriptor table.
     ///
     /// Called by the runner after `restore_process` to replace virtual pipe
     /// endpoints with real OS pipe FDs for cross-host-process communication.
     /// This replaces any existing pipe endpoint at the given guest FD number.
-    pub fn install_host_pipe_fd(
+    pub fn install_external_fd(
         &self,
         guest_fd: usize,
         host_fd: i32,
-        direction: syscalls::host_pipe::HostPipeDirection,
+        direction: syscalls::external_fd::ExternalFdDirection,
     ) {
-        let entry = syscalls::host_pipe::HostPipeFd::new(host_fd, direction);
+        let entry = syscalls::external_fd::ExternalFd::new(host_fd, direction);
         let mut dt = self.task.global.litebox.descriptor_table_mut();
-        let typed_fd: litebox::fd::TypedFd<syscalls::host_pipe::HostPipeSubsystem> =
+        let typed_fd: litebox::fd::TypedFd<syscalls::external_fd::ExternalFdSubsystem> =
             dt.insert(entry);
         drop(dt);
 
@@ -180,7 +180,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .remove(&old_sock);
             rds = files.raw_descriptor_store.write();
         } else if let Ok(old_host) =
-            rds.fd_consume_raw_integer::<syscalls::host_pipe::HostPipeSubsystem>(guest_fd)
+            rds.fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
         {
             drop(rds);
             let entry = self
@@ -198,9 +198,9 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             rds = files.raw_descriptor_store.write();
         }
 
-        // Install the HostPipe FD at the same guest fd number.
+        // Install the ExternalFd FD at the same guest fd number.
         let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
-        debug_assert!(ok, "install_host_pipe_fd: slot {guest_fd} still occupied");
+        debug_assert!(ok, "install_external_fd: slot {guest_fd} still occupied");
     }
 
     /// Install a virtual pipe FD for a multiplexer stream endpoint.
@@ -274,7 +274,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .remove(&old_sock);
             rds = files.raw_descriptor_store.write();
         } else if let Ok(old_host) =
-            rds.fd_consume_raw_integer::<syscalls::host_pipe::HostPipeSubsystem>(guest_fd)
+            rds.fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
         {
             drop(rds);
             let entry = self
@@ -370,7 +370,45 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .descriptor_table_mut()
                     .insert(bp_fd);
                 let mut rds = files.raw_descriptor_store.write();
-                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+                if let Ok(old_pipe) =
+                    rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(guest_fd)
+                {
+                    drop(rds);
+                    let _ = self.task.global.pipes.close(&old_pipe);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+                    drop(rds);
+                    let _ = files.fs.close(&old_fs);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_sock) =
+                    rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
+                {
+                    drop(rds);
+                    let _ = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_sock);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_host) = rds
+                    .fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
+                {
+                    drop(rds);
+                    if let Some(entry) = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_host)
+                    {
+                        let host_fd = entry.take_fd();
+                        if host_fd >= 0 {
+                            self.task.global.platform.close_host_fd(host_fd);
+                        }
+                    }
+                    rds = files.raw_descriptor_store.write();
+                }
                 let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
                 debug_assert!(
                     ok,
@@ -1533,7 +1571,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
         // Recreate unconnected Unix sockets. Connected/socketpair descriptors
         // are also seeded here so any bridge fd installation below has an fd
-        // table entry to replace with the cross-process host pipe.
+        // table entry to replace with the cross-process external fd.
         {
             use litebox_common_linux::{SockFlags, SockType};
             use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
@@ -1687,7 +1725,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }
         }
 
-        // Restore host-fd tokens for HostPipeFd entries. Snapshot capture
+        // Restore host-fd tokens for ExternalFd entries. Snapshot capture
         // registered a duplicated host fd with the broker fd-token registry;
         // this worker materializes a fresh fd and then releases the token's
         // transient registry reference.
@@ -1700,7 +1738,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 let Some(token) = entry.metadata.broker_fd_token else {
                     continue;
                 };
-                let Some(direction) = token.host_pipe_direction else {
+                let Some(direction) = token.external_fd_direction else {
                     continue;
                 };
                 let Some(client) = litebox_common_linux::fd_token_client::global_client() else {
@@ -1711,12 +1749,12 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     continue;
                 };
                 let _ = client.release(token.token_id);
-                let host_entry = syscalls::host_pipe::HostPipeFd::new(raw_fd, direction);
+                let host_entry = syscalls::external_fd::ExternalFd::new(raw_fd, direction);
                 let typed = self
                     .global
                     .litebox
                     .descriptor_table_mut()
-                    .insert::<syscalls::host_pipe::HostPipeSubsystem>(host_entry);
+                    .insert::<syscalls::external_fd::ExternalFdSubsystem>(host_entry);
                 let mut rds = child_files.raw_descriptor_store.write();
                 if entry.fd <= 2 {
                     let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
@@ -2422,9 +2460,9 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     /// `BrokerSocketpairSubsystem`) adds a new closure parameter,
     /// which is a compile-time forcing function for every call site
     /// to make an explicit decision about the new kind. Historically
-    /// this dispatcher was 6-arm and `HostPipeSubsystem` /
+    /// this dispatcher was 6-arm and `ExternalFdSubsystem` /
     /// `BrokerPipeSubsystem` were handled via per-syscall
-    /// `try_host_pipe_fd` / `try_broker_pipe_fd` early-return fast
+    /// `try_external_fd_fd` / `try_broker_pipe_fd` early-return fast
     /// paths; several syscalls forgot the broker-pipe fast path,
     /// silently returning EBADF on broker-pipe fds. The 8-arm shape
     /// makes that class of bug a compile error.
@@ -2478,7 +2516,7 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(f(RawFdRef::HostPipe(&fd)));
+            return Ok(f(RawFdRef::ExternalFd(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
@@ -2513,7 +2551,7 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     Eventfd(&'a Arc<TypedFd<syscalls::eventfd::EventfdSubsystem>>),
     Epoll(&'a Arc<TypedFd<syscalls::epoll::EpollSubsystem<FS>>>),
     Unix(&'a Arc<TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>>),
-    HostPipe(&'a Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>),
+    ExternalFd(&'a Arc<TypedFd<syscalls::external_fd::ExternalFdSubsystem>>),
     BrokerPipe(&'a Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>),
     BrokerSocketPair(&'a Arc<TypedFd<syscalls::broker_socketpair::BrokerSocketPairSubsystem>>),
     BrokerPty(&'a Arc<TypedFd<syscalls::broker_pty::BrokerPtySubsystem>>),
@@ -2755,7 +2793,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Eventfd(_fd) => alloc::format!("raw={raw_fd} eventfd"),
                 crate::RawFdRef::Epoll(_fd) => alloc::format!("raw={raw_fd} epoll"),
                 crate::RawFdRef::Unix(_fd) => alloc::format!("raw={raw_fd} unix"),
-                crate::RawFdRef::HostPipe(_fd) => alloc::format!("raw={raw_fd} host_pipe"),
+                crate::RawFdRef::ExternalFd(_fd) => alloc::format!("raw={raw_fd} external_fd"),
                 crate::RawFdRef::BrokerPipe(_fd) => alloc::format!("raw={raw_fd} broker_pipe"),
                 crate::RawFdRef::BrokerSocketPair(_fd) => {
                     alloc::format!("raw={raw_fd} broker_pipe")
@@ -4548,7 +4586,7 @@ struct FdReplacement {
     /// The raw host OS file descriptor for the parent's end of the pipe.
     host_fd: i32,
     /// Whether this endpoint is a read or write end.
-    direction: syscalls::host_pipe::HostPipeDirection,
+    direction: syscalls::external_fd::ExternalFdDirection,
     /// The virtual subsystem that owned the original fd.
     #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
     subsystem: ReplacedSubsystem,
@@ -4560,13 +4598,13 @@ struct FdReplacement {
     /// parent's existing virtual pipe).
     ///
     /// When `direct: true`, the parent's guest fd MUST be installed as
-    /// a HostPipeFd over `host_fd` (consume the old slot, install the
-    /// new HostPipeFd), so reads/writes flow directly to the OS pipe
+    /// a ExternalFd over `host_fd` (consume the old slot, install the
+    /// new ExternalFd), so reads/writes flow directly to the OS pipe
     /// connected to the worker.
     ///
     /// When `direct: false`, the bridge thread already handles the data
     /// flow via the parent's existing virtual pipe; the FdReplacement
-    /// here installs the HostPipeFd at a slot that's NOT the parent's
+    /// here installs the ExternalFd at a slot that's NOT the parent's
     /// virtual pipe (different guest fd), or no installation is
     /// necessary. Consuming the parent's virtual pipe at the slot
     /// would orphan the bridge thread.
@@ -4585,17 +4623,17 @@ struct MuxParentStream {
     guest_fd: usize,
     /// Read = parent reads (child writes, WorkerToParent).
     /// Write = parent writes (child reads, ParentToWorker).
-    direction: syscalls::host_pipe::HostPipeDirection,
+    direction: syscalls::external_fd::ExternalFdDirection,
     /// Which virtual subsystem owned the original fd.
     #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
     subsystem: ReplacedSubsystem,
     /// Data drained from the virtual channel before migration.
     /// Sent as the first mux message(s) when the parent dispatcher starts.
     drained_data: Vec<u8>,
-    /// For host-backed pipes from prior bridges: the raw OS fd to relay.
+    /// For external fds from prior bridges: the raw OS fd to relay.
     /// The parent dispatcher bridges between this fd and the mux.
     /// -1 for virtual pipe/socket streams (parent creates a new virtual pipe).
-    host_pipe_fd: i32,
+    external_fd_fd: i32,
     /// When true, the parent's existing pipe at `guest_fd` is used directly
     /// by the dispatcher (nested fork case — one-sided pipe, other end is in
     /// the parent's own mux dispatcher).  The fd table entry is NOT replaced.
@@ -4729,7 +4767,7 @@ struct ForkContext {
     /// Snapshot of the parent's pipe FDs at fork time: (guest_fd, direction, pipe_pair_id).
     /// Used by `commit_delayed_fork` to find the parent's counterpart pipe endpoints
     /// so both sides can be replaced with real OS pipes.
-    parent_pipe_fds: Vec<(usize, syscalls::host_pipe::HostPipeDirection, usize)>,
+    parent_pipe_fds: Vec<(usize, syscalls::external_fd::ExternalFdDirection, usize)>,
     /// Snapshot of the parent's Unix socket FDs at fork time:
     /// (guest_fd, socket_pair_id, object_id).
     /// Used by `commit_delayed_fork` to find the parent's peer socket endpoints
