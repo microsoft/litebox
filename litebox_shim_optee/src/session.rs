@@ -526,16 +526,6 @@ impl SessionManager {
         self.single_instance_cache.remove_if_same(uuid, expected)
     }
 
-    /// Keep per-UUID locks for the lifetime of the manager.
-    ///
-    /// Replacing a lock while another core still holds the old one would let a
-    /// racing Open/Invoke/Close path bypass serialization for the same UUID.
-    /// This is intentionally a no-op, matching `known_flags` as per-UUID
-    /// lifecycle metadata retained for observed TAs.
-    pub fn evict_single_instance_lock_if_unused(&self, uuid: &TeeUuid) {
-        let _ = uuid;
-    }
-
     /// Get the total count of unique TA instances (for limit checking).
     ///
     /// This counts:
@@ -564,16 +554,23 @@ impl SessionManager {
 
     /// Atomically reserve a creation slot and run `f` to create a new TA instance.
     ///
-    /// For single-instance TAs, the caller must already hold the per-UUID
-    /// serialization lock (see [`SessionManager::single_instance_lock`]),
-    /// which guarantees no other core is creating an instance for this UUID
-    /// concurrently. This function re-checks the single-instance cache under
-    /// the creation lock so a freshly-cached instance from a prior holder of
-    /// the per-UUID lock is observed before starting a new load.
+    /// # Caller contract
+    ///
+    /// For single-instance TAs, **the caller MUST already hold the per-UUID
+    /// serialization lock** returned by [`SessionManager::single_instance_lock`]
+    /// for `uuid`. That lock is the sole guarantee that no other core is
+    /// creating, reusing, or tearing down an instance for this UUID
+    /// concurrently — this function does NOT re-establish that exclusion
+    /// itself. Violating this contract can produce duplicate single-instance
+    /// TAs cached under the same UUID and break the single-instance invariant.
+    ///
+    /// Under that lock, this function re-checks the single-instance cache so a
+    /// freshly-cached instance from a prior holder of the per-UUID lock is
+    /// observed before starting a new load.
     ///
     /// For multi-instance TAs, each session gets its own independent
     /// `TaInstance`. Multiple cores may create instances of the same UUID
-    /// concurrently.
+    /// concurrently and no per-UUID lock is required.
     pub fn with_creation_slot<F>(
         &self,
         uuid: &TeeUuid,

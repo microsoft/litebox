@@ -44,8 +44,8 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{
-    ActiveSessionGuard, CreationReservation, SessionEntry, SessionIdGuard, SessionManager,
-    SessionTarget, TaInstance, allocate_session_id,
+    ActiveSessionGuard, CreationReservation, SessionIdGuard, SessionManager, SessionTarget,
+    TaInstance, allocate_session_id,
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
@@ -535,7 +535,7 @@ fn handle_open_session(
 
     // Resolve or create the TA instance. For single-instance TAs, the UUID
     // lock above serializes creation, reuse, and teardown for this TA.
-    let result = match session_manager().with_creation_slot(&ta_uuid, is_single_instance, || {
+    match session_manager().with_creation_slot(&ta_uuid, is_single_instance, || {
         open_session_new_instance(
             msg_args,
             msg_args_phys_addr,
@@ -555,19 +555,7 @@ fn handle_open_session(
         ),
         Ok(CreationReservation::SlotReserved) => Ok(()),
         Err(e) => Err(e),
-    };
-
-    // If we conservatively held the per-UUID lock but no single-instance TA
-    // ended up cached under this UUID, evict the lock entry we just inserted.
-    // This covers (a) the TA turned out to be multi-instance and (b) load
-    // failed entirely. The helper's cache-empty check is the safety guard:
-    // if a single-instance TA is now cached for this UUID, the entry is in
-    // legitimate use and `evict_single_instance_lock_if_unused` is a no-op.
-    if single_instance_lock.is_some() {
-        session_manager().evict_single_instance_lock_if_unused(&ta_uuid);
     }
-
-    result
 }
 
 /// Open a new session on an existing single-instance TA.
@@ -970,12 +958,8 @@ fn open_session_new_instance(
 /// Consumes `active_guard` so it is dropped immediately after `unregister_session`
 /// recycles the id — the ordering matters: subsequent SMCs for `session_id` then
 /// see the new session (or `None`), neither of which depends on our guard.
-///
-/// The caller's per-UUID lock guard (if any) stays in its own scope, so the
-/// lock remains held across `evict_single_instance_lock_if_unused`.
 fn finalize_dead_session(
     session_id: u32,
-    session_entry: &SessionEntry,
     active_guard: ActiveSessionGuard<'_>,
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
@@ -984,7 +968,6 @@ fn finalize_dead_session(
 ) -> Result<(), OpteeSmcReturnCode> {
     session_manager().unregister_session(session_id);
     drop(active_guard);
-    session_manager().evict_single_instance_lock_if_unused(&session_entry.ta_uuid);
     msg_args.ret = return_code;
     msg_args.ret_origin = TeeOrigin::Tee;
     write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
@@ -1042,7 +1025,6 @@ fn handle_invoke_command(
     let SessionTarget::Live(instance_arc) = session_entry.target.clone() else {
         return finalize_dead_session(
             session_id,
-            &session_entry,
             active_guard,
             msg_args,
             msg_args_phys_addr,
@@ -1197,7 +1179,6 @@ fn handle_close_session(
     let SessionTarget::Live(instance_arc) = session_entry.target.clone() else {
         return finalize_dead_session(
             session_id,
-            &session_entry,
             active_guard,
             msg_args,
             msg_args_phys_addr,
