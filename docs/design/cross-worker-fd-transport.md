@@ -40,7 +40,7 @@ For each guest UnixSocket fd in the parent's table:
 
 - **Stdio slot heuristic** (lines 5235-5244): fd 0 → Read direction;
   fd 1/2 → Write; fd 3+ → ReadWrite (Node.js IPC, etc.).
-- **Bidirectional** (`HostPipeDirection::ReadWrite`, line 5297-5331):
+- **Bidirectional** (`ExternalFdDirection::ReadWrite`, line 5297-5331):
   create a host kernel `socketpair()`; child gets one end, parent peer
   gets the other. Pairing is by `(pair_id, object_id)`: same `pair_id`,
   different `object_id` ⇒ peer.
@@ -224,9 +224,9 @@ This has been the single most regression-heavy surface in the codebase
    and Path B's `UnixTransport::Tcp { proxy }` are unrelated state. The
    `UnixConnectedStream::clone_for_fork` likely doesn't even attempt to
    transition Channel→Tcp on fork-migration; the existing Path A
-   replaces the in-memory channel with a host pipe, but the post-restore
+   replaces the in-memory channel with a external fd, but the post-restore
    guest doesn't end up with `UnixTransport::Tcp` — it ends up with a
-   `HostPipeFd`-style replacement that's NOT a unix socket subsystem fd.
+   `ExternalFd`-style replacement that's NOT a unix socket subsystem fd.
    This is why post-fork follow-up sendmsg with SCM_RIGHTS doesn't even
    reach `try_sendto`'s passed_fds drop — it goes through the pipe
    bridge layer where SCM_RIGHTS isn't a concept at all.
@@ -295,7 +295,7 @@ Alternative: a separate side channel for tokens. Adds connection state
 (workers must establish a second link to broker). Not preferred unless
 9P framing genuinely can't accommodate.
 
-### Q: Path A (host-pipe bridge) — host SCM_RIGHTS or token via shm ring?
+### Q: Path A (external-fd bridge) — host SCM_RIGHTS or token via shm ring?
 
 **Both, but token via shm ring is the architecturally aligned answer.**
 
@@ -329,7 +329,7 @@ both the proxy and a per-direction frame parser/serializer.
 
 - Does the existing UnixSocket bridge (Path A) need to be folded into
   Path B's `UnixTransport::Tcp` — i.e., should fork-migrated unix sockets
-  use TCP-via-broker instead of host pipes? Cleaner, but a much bigger
+  use TCP-via-broker instead of external fds? Cleaner, but a much bigger
   diff with stdio implications.
 - For listen-fd inheritance (FKLC.inherit), is the new abstraction a
   `Listener` token kind, or a separate "register listener with peer"

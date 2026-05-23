@@ -40,7 +40,7 @@ UnixSocket) when the slot is stdio AND the object matches.
 - `shim_linux/lib.rs::FdReplacement.direct` — when `direct=true`, the
   replacement is a pipe end produced by `spawn_result.direct_pipes` for
   worker stdio under `use_direct_stdio` — the parent slot must be
-  CONSUMED so a `HostPipeFd` can be installed. When `direct=false`, the
+  CONSUMED so a `ExternalFd` can be installed. When `direct=false`, the
   parent's existing virtual pipe must STAY at the slot for the bridge
   thread.
 - `runner_linux_userland/lib.rs::perform_ipc_handshake` — wave-3 fix
@@ -88,7 +88,7 @@ themselves.
 ### I-4. The "direct" stdio fast-path consumes the parent's slot.
 
 `FdReplacement.direct = true` (the wave-1 Bug B `fe76db98` invariant):
-the parent's virtual pipe slot is REPLACED by a `HostPipeFd` for the
+the parent's virtual pipe slot is REPLACED by a `ExternalFd` for the
 direct path. The bridge thread does not own the slot.
 
 `FdReplacement.direct = false`: the parent's virtual pipe STAYS; the

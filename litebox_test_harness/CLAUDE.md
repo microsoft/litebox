@@ -392,7 +392,7 @@ what the first fork did.
 |---|---|---|---|
 | Worker-host spawn | True-fork (`process.rs:6444-6492`) and delayed-fork exec when `needs_remote` (`process.rs:9218-9276`) | New host PID in `fork_child_host_pids`, control-plane ownership, background waiter | **No** |
 | Worker-host teardown | Child host exit (`process.rs:6288-6344`); exec path waits synchronously (`process.rs:8981-9015`) | Removes mappings, unregisters from control plane, reports to process registry | **No** |
-| fd-bridge inheritance | Delayed-fork exec collects child pipes/sockets, builds `parent_*_replacements` (`process.rs:8698-8970`) | `vfork_info.fd_replacements`; direct stdio installed as `HostPipeFd` | **No** |
+| fd-bridge inheritance | Delayed-fork exec collects child pipes/sockets, builds `parent_*_replacements` (`process.rs:8698-8970`) | `vfork_info.fd_replacements`; direct stdio installed as `ExternalFd` | **No** |
 | pidfd registration | `pidfd_open` for local targets only (`process.rs:1732-1775`); rejects remote-running | Plain fd in local table | **No** |
 | Signal-mask propagation | True-fork snapshots blocked mask, handlers, altstack (`process.rs:6727-6740`); exec resets via `reset_for_exec()` (`process.rs:9362-9369`) | Snapshot of current task only | **No** |
 | execveat / fork-restore handoff | Routed via `exec_on_remote_host` if `needs_remote` (`process.rs:9142-9165`) | Bridges + `reset_for_exec()` clears thread-local state | **No** |

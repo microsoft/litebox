@@ -111,7 +111,7 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
                     // them BEFORE entering with_socket.
                     //
                     // For genuinely-not-a-socket subsystems (regular
-                    // file, pipe, eventfd, signalfd, epoll, host-pipe),
+                    // file, pipe, eventfd, signalfd, epoll, external-fd),
                     // ENOTSOCK is the correct errno per POSIX.
                     //
                     // assert_socket_like_handled() panics if the fd's

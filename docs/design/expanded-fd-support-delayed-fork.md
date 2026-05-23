@@ -43,7 +43,7 @@ _                                                         → REJECTED
 
 3. **At commit time** (`commit_delayed_fork`): for each pipe fd in the
    child's (modified) fd table:
-   - Create an OS pipe pair via `create_host_pipe()`.
+   - Create an OS pipe pair via `create_external_fd()`.
    - Assign endpoints by direction: child-reads → child gets read end;
      child-writes → child gets write end.
    - Drain any buffered virtual pipe data into the OS pipe.
@@ -55,11 +55,11 @@ _                                                         → REJECTED
 
 4. **After vfork completes**: the parent wakes and applies each
    `PipeReplacement` — consuming the old virtual pipe fd from its own
-   fd table and inserting a `HostPipeFd` at the same slot.
+   fd table and inserting a `ExternalFd` at the same slot.
 
-5. **In the child worker**: `install_host_pipe_fd()` inserts `HostPipeFd`
+5. **In the child worker**: `install_external_fd()` inserts `ExternalFd`
    entries at the bridge fd slots.  When the child later calls `exec`,
-   `worker_exec_input/output_binding` returns `HostPipe { fd }`, and
+   `worker_exec_input/output_binding` returns `ExternalFd { fd }`, and
    `posix_spawn_file_actions_adddup2` wires the OS fd onto the stdio slot.
 
 ### Unix socket internals
@@ -114,7 +114,7 @@ Direction for each socket bridge is inferred from the stdio slot
 **Scope limitation**: this design only handles the conventional stdio
 pattern where fd 0 is read-only input and fd 1/2 are write-only output.
 Programs that write to fd 0 or read from fd 1/2 will get `EBADF` from the
-`HostPipeFd` direction check, matching real pipe semantics.  Fully
+`ExternalFd` direction check, matching real pipe semantics.  Fully
 bidirectional bridging (using OS socketpair) is deferred to future work.
 
 ### Phase G1: Socket pair identification
@@ -221,7 +221,7 @@ to `FdReplacement` to reflect broader scope:
 struct FdReplacement {
     guest_fd: usize,
     host_fd: i32,
-    direction: HostPipeDirection,
+    direction: ExternalFdDirection,
     subsystem: ReplacedSubsystem,  // Pipe or UnixSocket
 }
 
@@ -251,7 +251,7 @@ to handle `UnixSocketSubsystem` as well:
 
 ```rust
 for repl in replacements {
-    let entry = HostPipeFd::new(repl.host_fd, repl.direction);
+    let entry = ExternalFd::new(repl.host_fd, repl.direction);
     let mut dt = self.global.litebox.descriptor_table_mut();
     let typed_fd = dt.insert(entry);
     drop(dt);
@@ -280,7 +280,7 @@ for repl in replacements {
 
 #### Generalize child-side installation
 
-`install_host_pipe_fd()` (lib.rs:99–139) must also consume
+`install_external_fd()` (lib.rs:99–139) must also consume
 `UnixSocketSubsystem` entries.  Add a probe after the existing `Pipes` and
 `FS` probes:
 
@@ -306,7 +306,7 @@ For each child fd that is a connected UnixSocket on a stdio slot (0/1/2):
      ForkRejectReason::BidirectionalSocketOnMultipleStdioSlots
   4. Deduplicate: if same object_id already bridged (dup'd socket on
      multiple same-direction slots), dup the existing bridge's OS fd
-  5. Create OS pipe: (os_read, os_write) = create_host_pipe()
+  5. Create OS pipe: (os_read, os_write) = create_external_fd()
   6. Assign: child gets os_read (if Read) or os_write (if Write)
   7. Drain child's recv_channel into OS pipe (if direction == Read)
      — see Phase G4 for drain details
@@ -320,7 +320,7 @@ For each child fd that is a connected UnixSocket on a stdio slot (0/1/2):
 
 **Dup'd parent fds**: when the parent has multiple fds pointing to the same
 peer socket (e.g., fd 4 and fd 9 both dup'd from the same socketpair end),
-ALL matching fds get replaced with `HostPipeFd`.  Use `filter()` instead of
+ALL matching fds get replaced with `ExternalFd`.  Use `filter()` instead of
 `find()` to collect all matches.  Each replacement gets a `dup_host_fd()`
 of the same OS pipe end.
 
@@ -331,7 +331,7 @@ drain is destructive (data removed from the virtual channel), partial
 drain failure must NOT allow the child to resume locally.
 
 **Files**: `process.rs` (do_fork, commit_delayed_fork), `lib.rs`
-  (ForkContext, FdReplacement, install_host_pipe_fd)
+  (ForkContext, FdReplacement, install_external_fd)
 **Complexity**: Medium — follows pipe bridge pattern closely but with
   pair_id matching via object_id exclusion and dup-aware replacement.
 
@@ -483,8 +483,8 @@ G5 is independent of G3/G4 and can be implemented in any order after G2.
 6. **Seek position**: `OpenFileDescriptionSnapshot.file_offset` is not yet
    captured.  Regular file redirections may resume at the wrong offset.
 
-7. **HostPipeFd direction enforcement**: after bridging, the child's fd 0
-   is a Read-only HostPipeFd and fd 1/2 are Write-only.  Programs that
+7. **ExternalFd direction enforcement**: after bridging, the child's fd 0
+   is a Read-only ExternalFd and fd 1/2 are Write-only.  Programs that
    write to fd 0 or read from fd 1/2 get `EBADF`, matching real pipe
    semantics.  This is correct for conventional stdio usage but breaks
    programs using bidirectional sockets on single fd slots.
