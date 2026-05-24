@@ -37,6 +37,11 @@ pub(crate) mod tcp_state;
 pub(crate) mod tcp_stress;
 pub(crate) mod vscode_shape;
 
+#[must_use]
+pub fn dispatch_fast_leaf(args: &[String]) -> Option<i32> {
+    special_cases::dispatch_fast_leaf(args)
+}
+
 use crate::protocol::{Command, Response};
 use crate::test_registry::matches_filter;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

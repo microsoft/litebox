@@ -55,6 +55,14 @@ mod proc;
 mod term;
 mod unix_socket;
 
+#[allow(dead_code)] // used by the integration binary's argv fast path
+pub(crate) fn dispatch_fast_leaf(args: &[String]) -> Option<i32> {
+    match args.get(1).map(String::as_str) {
+        Some("fs-test") => Some(fs::run(args.get(2).map_or("help", String::as_str), args)),
+        _ => None,
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct ExecScriptArgs {
     shell: String,

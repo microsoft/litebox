@@ -168,11 +168,21 @@ fn test_exec_open_read(bin_type: &str, path: &str) -> i32 {
         }
     };
 
-    // Wait for child to write the file
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
-    // Read while child still alive — print result BEFORE kill/wait
-    let result = std::fs::read_to_string(path);
+    // Wait for the child to create the file, then read while it is still alive.
+    // Cross-binary-type exec can spend several seconds starting the new worker
+    // before the leaf reaches do-write-sleep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut result;
+    loop {
+        result = std::fs::read_to_string(path);
+        if result.is_ok() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     match &result {
         Ok(s) if s == data => {
             println!("FS_OK:op=exec-open-read,bin={bin_type},path={path}");
