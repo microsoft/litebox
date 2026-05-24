@@ -6007,6 +6007,19 @@ impl<FS: ShimFS> Task<FS> {
             .platform
             .destroy_address_space(fc.address_space_id);
 
+        // The child worker acknowledged a successful restore, so every
+        // broker-backed fd in the snapshot has installed its own restore-side
+        // reference. Drop the parent's transit refs now; keeping pipe writer
+        // transit refs until worker exit makes readers in that same worker wait
+        // forever for EOF.
+        {
+            let _caller_pid_guard =
+                litebox_common_linux::fd_token_client::set_caller_pid_scope(self.process_id.0);
+            for transit in fc.fork_snapshot_broker_transit.drain(..) {
+                transit.releaser.release(transit.handle_id);
+            }
+        }
+
         // Spawn a background thread that waits for the child worker to exit
         // and reports the exit to the process registry (same as do_true_fork).
         {
@@ -6015,29 +6028,8 @@ impl<FS: ShimFS> Task<FS> {
 
             let global = self.global.clone();
             let child_proc_id = self.process_id;
-            // PE.13 (2026-05-18): move the fork_snapshot_broker_transit
-            // list into the wait task so we can release the parent's
-            // emit-side dup_handle refs AFTER the child worker exits.
-            // Pair with my new dup_handle in the fork-snapshot restore
-            // (lib.rs:1573 area): net broker rc change across the
-            // fork is 0 (parent +1 transit, child +1 restore dup, child
-            // -1 close, parent -1 this drain).
-            let transit_refs: alloc::vec::Vec<
-                crate::syscalls::fork_snapshot::ForkSnapshotBrokerTransit,
-            > = core::mem::take(&mut fc.fork_snapshot_broker_transit);
             self.global.platform.spawn_background_task(move || {
                 let exit_code = global.platform.wait_worker_host(host_pid);
-
-                // Release the parent's emit-side dup_handle transit
-                // refs now that the child has exited and no longer
-                // needs the bridge state alive. These dup_handles were
-                // emitted on behalf of the child pid, so the asynchronous
-                // waiter re-stamps the same caller_pid before releasing.
-                let _caller_pid_guard =
-                    litebox_common_linux::fd_token_client::set_caller_pid_scope(child_proc_id.0);
-                for transit in transit_refs {
-                    transit.releaser.release(transit.handle_id);
-                }
 
                 let exit_status = if exit_code > 255 {
                     (exit_code - 256) + 128
