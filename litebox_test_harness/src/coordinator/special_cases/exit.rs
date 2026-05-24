@@ -257,6 +257,104 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
             crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
+
+    // EX10: node spawns a subprocess via child_process.spawnSync.
+    // Copilot CLI uses spawnSync/exec heavily to invoke git, gh, etc.
+    // This exercises node's libuv subprocess path under litebox.
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX10.node_spawn_sync",
+        timeout = 60,
+        agents[a = AgentName::Dpg1],
+        |run| {
+            let resp = run
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "const cp = require('child_process'); const r = cp.spawnSync('/bin/echo', ['SPAWN_OK']); process.stdout.write(r.stdout.toString()); process.exit(r.status === 0 ? 0 : 1);".into(),
+                        ],
+                        timeout_ms: Some(15 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
+                .await;
+            let pass =
+                matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("SPAWN_OK"));
+            crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    // EX11: node async spawn with event emitter (the most common
+    // Copilot CLI pattern: spawn child, await close event).
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX11.node_spawn_event",
+        timeout = 60,
+        agents[a = AgentName::Dpg1],
+        |run| {
+            let resp = run
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "const cp = require('child_process'); const ch = cp.spawn('/bin/echo', ['EVENT_OK']); let out=''; ch.stdout.on('data',d=>out+=d); ch.on('close',c=>{process.stdout.write(out); process.exit(c);});".into(),
+                        ],
+                        timeout_ms: Some(15 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
+                .await;
+            let pass =
+                matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("EVENT_OK"));
+            crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    // EX12: node spawns a node subprocess (recursive node) — exercises
+    // the cross-bt fork path that Copilot CLI takes when the launcher
+    // node spawns the actual agent node.
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX12.node_spawn_node",
+        timeout = 60,
+        agents[a = AgentName::Dpg1],
+        |run| {
+            let resp = run
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "const cp = require('child_process'); const r = cp.spawnSync('/usr/local/bin/node', ['-e', 'console.log(\"INNER_OK\")']); process.stdout.write(r.stdout.toString()); process.exit(r.status === 0 ? 0 : 1);".into(),
+                        ],
+                        timeout_ms: Some(20 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
+                .await;
+            let pass =
+                matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("INNER_OK"));
+            crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
