@@ -2993,13 +2993,11 @@ impl<FS: ShimFS> Task<FS> {
             // advance the shared consumer index.  We restore the index
             // after CoW so the parent doesn't lose data.
             //
-            // Also snapshot pipe writer fd_ref_counts.  The vfork child
-            // may close pipe write-ends (e.g. tokio's Command::spawn
-            // closes the parent's write-end in the child).  on_close
-            // decrements the shared fd_ref_count to 0, signaling EOF to
-            // readers.  After CoW restore the fd table re-contains the
-            // write-end entry, but the fd_ref_count is still 0.  We must
-            // restore it so pipes don't report spurious EOF.
+            // Also snapshot the parent-owned pipe writer fd counts.  The
+            // vfork child has an independent fd table, but pipe write-end
+            // refcounts live in the shared descriptor entry; child close/exec
+            // activity must not be able to remove or resurrect the parent's
+            // writer refs.
             let pipe_positions: alloc::vec::Vec<(
                 alloc::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>>,
                 usize,
@@ -3030,17 +3028,33 @@ impl<FS: ShimFS> Task<FS> {
             )> = {
                 let files = self.files.borrow();
                 let rds = files.raw_descriptor_store.read();
-                let mut counts = alloc::vec::Vec::new();
+                let mut counts = BTreeMap::<
+                    u64,
+                    (
+                        alloc::sync::Arc<
+                            litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
+                        >,
+                        usize,
+                    ),
+                >::new();
                 for raw_fd in rds.iter_alive() {
                     if let Ok(typed) =
                         rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
                     {
-                        if let Some(count) = self.global.pipes.snapshot_writer_ref_count(&typed) {
-                            counts.push((typed, count));
+                        if self
+                            .global
+                            .pipes
+                            .snapshot_writer_ref_count(&typed)
+                            .is_some()
+                        {
+                            counts
+                                .entry(typed.object_id().as_u64())
+                                .and_modify(|(_, count)| *count += 1)
+                                .or_insert((typed, 1));
                         }
                     }
                 }
-                counts
+                counts.into_values().collect()
             };
 
             // Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
@@ -3077,8 +3091,9 @@ impl<FS: ShimFS> Task<FS> {
             }
             drop(pipe_positions);
 
-            // Restore pipe writer fd_ref_counts so readers don't see
-            // spurious EOF from the vfork child's close.
+            // Restore pipe writer fd_ref_counts to the parent's fd table
+            // contribution.  Restoring the pre-fork global count would include
+            // the child's transient dup refs and keep readers from seeing EOF.
             for (typed, saved_count) in &pipe_writer_ref_counts {
                 self.global
                     .pipes
