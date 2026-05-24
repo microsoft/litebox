@@ -6,6 +6,8 @@
 #   litebox-test             — test harness rootfs (bash + coreutils + Node.js)
 #   litebox-vscode           — VS Code Server rootfs (adds SSH, VS Code CLI+Server)
 #   litebox-vscode-prewrite  — VS Code + pre-rewritten node binary (faster startup)
+#   litebox-vscode-native    — VS Code Server image without litebox (native baseline)
+#   litebox-agent-cli        — Copilot CLI rootfs (dropbear + Node + @github/copilot)
 #
 # Usage:
 #   docker build --target litebox-test   -t litebox-test   -f litebox_tool_executor/rootfs/Dockerfile .
@@ -206,3 +208,62 @@ FROM litebox-vscode AS litebox-vscode-native
 
 EXPOSE 22
 CMD ["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"]
+
+# === Stage 2e: Copilot CLI rootfs (interactive + non-interactive automation) ===
+#
+# Sshd-as-entry-point image used by the Copilot CLI integration scenarios
+# (see `litebox_test_harness/tests/integration.rs`, `copilot::*` Trials).
+# The test harness drives this image identically in both passes:
+#
+#   native pass : docker run litebox-agent-cli                                 \
+#                   dropbear -F -E -B -R -p 22
+#   litebox pass: docker run litebox-agent-cli                                 \
+#                   litebox_tool_executor --rootfs / --                        \
+#                   dropbear -F -E -B -R -p 22
+#
+# The host-side test then `ssh -tt -p <PORT> root@127.0.0.1` into the
+# container and runs `copilot ...` as the remote command (or as the
+# interactive shell). Empty-password root auth via dropbear `-B`.
+#
+# Usage:
+#   docker build --target litebox-agent-cli -t litebox-agent-cli \
+#     -f litebox_tool_executor/rootfs/Dockerfile .
+FROM litebox-base AS litebox-agent-cli
+
+# Node.js — pinned, matches the test-harness image to keep ABI surface
+# consistent across the two rootfses.
+ARG NODE_VERSION=v24.14.1
+RUN curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz" \
+    | tar xJ --strip-components=1 -C /usr/local \
+    && node --version
+
+# Dropbear ssh + tools commonly invoked by the Copilot Bash tool in
+# the scenarios. `dropbear-bin` mirrors `litebox-vscode`'s setup so
+# the integration tests exercise the same sshd binary.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        dropbear-bin git jq ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /etc/dropbear \
+    && dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
+
+# Allow blank-password root auth via dropbear `-B`. The litebox-base
+# image ships root with a hashed password; clear it so the test can
+# `sshpass -p ""` non-interactively without managing keys.
+RUN passwd -d root
+
+# Copilot CLI. Pin version so test behaviour doesn't drift silently
+# with upstream releases.
+ARG COPILOT_CLI_VERSION=1.0.51
+RUN npm install -g "@github/copilot@${COPILOT_CLI_VERSION}" \
+    && npm cache clean --force \
+    && copilot --version
+
+# Workspace mount point — the integration test bind-mounts a fresh
+# per-trial fixture tree here.
+RUN mkdir -p /workspace
+WORKDIR /workspace
+
+# Litebox binaries are bind-mounted at runtime under /opt/litebox/.
+
+EXPOSE 22
