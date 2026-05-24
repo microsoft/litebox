@@ -9456,7 +9456,14 @@ impl<FS: ShimFS> Task<FS> {
         // fork child (userland), the child still uses the parent's ProcessState
         // at this point, so we must check against the child's actual partition
         // (from the ForkContext) rather than the parent's.
-        let needs_remote = if let Some(fixed_range) = loader.fixed_load_range() {
+        let fixed_load_range = loader.fixed_load_range();
+        let needs_remote = if fixed_load_range.is_some() && loader.has_interpreter() {
+            // Dynamically linked ET_EXEC binaries rely on their loader's normal
+            // in-process link-map/unwind state. Keep them in the current worker
+            // and use the ET_EXEC biasing loader instead of migrating to a fresh
+            // worker host.
+            false
+        } else if let Some(fixed_range) = fixed_load_range {
             let (pm_min, pm_max) = if let Some(fc) = self.fork_context.borrow().as_ref() {
                 use litebox::platform::AddressSpaceProvider;
                 let child_range = self

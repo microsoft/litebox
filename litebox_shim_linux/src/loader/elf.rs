@@ -1283,6 +1283,11 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         self.main.parsed.fixed_load_range()
     }
 
+    /// Returns whether the main ELF has a `PT_INTERP` dynamic loader.
+    pub fn has_interpreter(&self) -> bool {
+        self.interp.is_some()
+    }
+
     /// Read the current executable bytes from the already-open main ELF file.
     pub fn main_file_bytes(&self) -> Result<Vec<u8>, Errno> {
         Self::file_bytes(&self.main)
