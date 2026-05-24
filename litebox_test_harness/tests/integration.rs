@@ -1202,6 +1202,19 @@ fn main() {
         Ok(())
     }));
 
+    // Copilot CLI integration scenarios — only register when explicitly
+    // requested via filter or env. See `mod copilot` below for the full
+    // contract and the documented FAIL-today scenarios.
+    if copilot::requested(&positionals) {
+        // Run the canonical setup() too: copilot tests bind-mount
+        // /opt/litebox/litebox_tool_executor into the litebox-pass
+        // container, so all 5 binary-type debug builds must exist.
+        let _ = setup();
+        let ws_root = workspace_root();
+        ensure_copilot_image(&ws_root);
+        copilot::register_trials(&mut trials);
+    }
+
     // OR-of-positionals prefilter. When two or more positional filters
     // were given, we already stripped the extras from libtest-mimic's
     // argv; here we drop trials that don't match ANY positional and
@@ -1883,4 +1896,859 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
              See details above."
         );
     }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//
+// Copilot CLI integration scenarios
+//
+// Trials that exercise Copilot CLI under litebox using the real
+// deployment shape (sshd-inside-sandbox, agent driven over SSH).
+// Two invocation modes per scenario, both fully automated via the
+// existing host-side PTY primitive (`litebox_test_harness::os::pty::Pty`):
+//
+//   copilot::pminus.<scenario>  — `ssh -tt root@127.0.0.1 -p N copilot -p ...`
+//   copilot::tui.<scenario>     — `ssh -tt root@127.0.0.1 -p N copilot` (prompt loop)
+//
+// Each registers `native::<full_id>` and `litebox::<full_id>` Trials.
+// Native pass runs plain dropbear; litebox pass wraps dropbear in
+// `litebox_tool_executor --rootfs / -- dropbear ...`. The ssh client
+// invocation is identical in both passes.
+//
+// Conditional registration: only registers when a positional filter
+// contains `copilot::` or `LITEBOX_INCLUDE_COPILOT=1` is set, so the
+// canonical full-suite `cargo test -p litebox_test_harness --test
+// integration` runs are unaffected.
+//
+// Concurrency cap `LITEBOX_COPILOT_JOBS` (default 1) bounds
+// concurrent Copilot trials independently of `LITEBOX_TEST_JOBS`.
+//
+// Three scenarios (`pipeline_wc`, `find_head`, `build`) are expected
+// to FAIL on the litebox pass on `wportnoy/vscode-server-in-litebox`
+// HEAD today. That is the TDD contract for the
+// bash-output-read-hang shim bug: native passes 12/12 (gold standard);
+// litebox passes 6/12 today and 12/12 after the shim is fixed. See
+// `litebox_test_harness/CLAUDE.md` "Copilot CLI integration scenarios".
+//
+// ════════════════════════════════════════════════════════════════════
+
+mod copilot {
+    use super::{Failed, Trial};
+    use litebox_test_harness::os::pty::Pty;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    /// Decision: should this `cargo test` invocation register the
+    /// Copilot Trials? Reads the env knob and scans the positional
+    /// filters (passed in from main()).
+    pub(super) fn requested(positionals: &[String]) -> bool {
+        if std::env::var_os("LITEBOX_INCLUDE_COPILOT").is_some() {
+            return true;
+        }
+        positionals.iter().any(|p| p.contains("copilot::"))
+    }
+
+    /// Concurrency cap. Independent of `LITEBOX_TEST_JOBS` — the
+    /// Copilot scenarios call the GitHub API, so default to serial.
+    fn jobs_cap() -> usize {
+        std::env::var("LITEBOX_COPILOT_JOBS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    }
+
+    fn copilot_semaphore() -> &'static std::sync::Mutex<usize> {
+        static SEM: OnceLock<std::sync::Mutex<usize>> = OnceLock::new();
+        SEM.get_or_init(|| std::sync::Mutex::new(jobs_cap()))
+    }
+
+    /// Tiny manual semaphore: acquire a slot or sleep.
+    /// (libtest-mimic uses a thread-per-trial pool; this throttles
+    /// Copilot trials specifically.)
+    struct CopilotPermit;
+    impl CopilotPermit {
+        fn acquire() -> Self {
+            loop {
+                {
+                    let mut g = copilot_semaphore().lock().expect("copilot sem");
+                    if *g > 0 {
+                        *g -= 1;
+                        return CopilotPermit;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    impl Drop for CopilotPermit {
+        fn drop(&mut self) {
+            if let Ok(mut g) = copilot_semaphore().lock() {
+                *g += 1;
+            }
+        }
+    }
+
+    /// Token discovery + loud-FAIL preflight. Order:
+    /// `COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `gh auth token`. The
+    /// returned token is never embedded in a panic message or
+    /// command-line argument visible via host `ps`.
+    pub(super) fn discover_token() -> Result<String, String> {
+        for var in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN"] {
+            if let Ok(t) = std::env::var(var) {
+                if !t.is_empty() {
+                    return Ok(t);
+                }
+            }
+        }
+        match Command::new("gh").args(["auth", "token"]).output() {
+            Ok(out) if out.status.success() => {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if s.is_empty() {
+                    Err("`gh auth token` succeeded but returned empty output. \
+                         Run `gh auth login`."
+                        .into())
+                } else {
+                    Ok(s)
+                }
+            }
+            Ok(out) => Err(format!(
+                "`gh auth token` exited {}. Run `gh auth login`. \
+                 (stderr suppressed; rerun manually to inspect.)",
+                out.status
+            )),
+            Err(e) => Err(format!(
+                "could not invoke `gh`: {e}. Install the GitHub CLI \
+                 and run `gh auth login`, or set COPILOT_GITHUB_TOKEN \
+                 / GH_TOKEN."
+            )),
+        }
+    }
+
+    /// Token cached once per test process. Discovered up front when
+    /// Copilot trials are registered, so any failure surfaces before
+    /// libtest-mimic starts scheduling trials.
+    fn token() -> &'static str {
+        static TOKEN: OnceLock<String> = OnceLock::new();
+        TOKEN.get_or_init(|| {
+            discover_token().unwrap_or_else(|e| panic!("copilot token preflight: {e}"))
+        })
+    }
+
+    /// One scenario: prompt template (canary → prompt text), how to
+    /// check the response against the canary, and per-trial timeout.
+    struct Scenario {
+        id: &'static str,
+        prompt: fn(&str) -> String,
+        check: fn(canary: &str, response: &str) -> bool,
+        /// Per-trial timeout in seconds for the `read` phase. Build
+        /// scenario is generous; everything else is bounded so the
+        /// bash-output-hang failure mode is detected reliably.
+        timeout_secs: u64,
+        /// Files to plant under workspace/ (relative path -> contents).
+        fixtures: &'static [(&'static str, &'static str)],
+    }
+
+    /// Default canary check: response contains the canary string.
+    /// Used by scenarios where the canary is planted in a fixture
+    /// file (so the model must invoke a tool to surface it), not
+    /// in the prompt text itself.
+    fn default_check(canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response);
+        r.contains(canary)
+    }
+
+    /// Hard-answer check for `simple_math`: response contains "4"
+    /// somewhere meaningful (digit '4' as a standalone token, not
+    /// "14" or "40"). The prompt does not embed any canary.
+    fn simple_math_check(_canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response);
+        // Look for "4" as a digit token. Crude but sufficient: the
+        // model's answer will say something like "4" or "Four" near
+        // the answer. We require either standalone digit '4' or
+        // the word "four" (case-insensitive).
+        let r_lower = r.to_lowercase();
+        if r_lower.contains("four") {
+            return true;
+        }
+        // Standalone '4': preceded/followed by non-digit or boundary.
+        let bytes = r.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b != b'4' {
+                continue;
+            }
+            let prev_non_digit = i == 0 || !bytes[i - 1].is_ascii_digit();
+            let next_non_digit = i + 1 == bytes.len() || !bytes[i + 1].is_ascii_digit();
+            if prev_non_digit && next_non_digit {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Bash-echo check for `simple_bash`: the prompt asks copilot to
+    /// run `echo CN-...` (the canary). The canary appears in the
+    /// response only if copilot's Bash tool actually executed and
+    /// the agent surfaced the output back.
+    fn simple_bash_check(canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response);
+        r.contains(canary)
+    }
+
+    /// `pipeline_wc` canary check: response mentions either fixture
+    /// filename and contains a digit (i.e., Copilot's Bash tool got
+    /// output back and Copilot summarized it). Today's failure mode
+    /// is a timeout message with no byte counts.
+    fn pipeline_wc_check(_canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response).to_lowercase();
+        let has_filename = r.contains("a.txt") || r.contains("b.txt");
+        let has_digit = r.chars().any(|c| c.is_ascii_digit());
+        let no_timeout = !r.contains("timed out") && !r.contains("timeout");
+        has_filename && has_digit && no_timeout
+    }
+
+    /// `find_head` canary check: response references at least two
+    /// fixture filenames (the canary is the set of one..six.txt).
+    fn find_head_check(_canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response).to_lowercase();
+        let hits = [
+            "one.txt",
+            "two.txt",
+            "three.txt",
+            "four.txt",
+            "five.txt",
+            "six.txt",
+        ]
+        .iter()
+        .filter(|n| r.contains(*n))
+        .count();
+        let no_timeout = !r.contains("timed out") && !r.contains("timeout");
+        hits >= 2 && no_timeout
+    }
+
+    /// `build` canary check: response mentions cargo build status
+    /// keywords (compiled / compiling / finished / error / warning)
+    /// and isn't a hang/timeout message.
+    fn build_check(_canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response).to_lowercase();
+        let saw_build = [
+            "compiling",
+            "compiled",
+            "finished",
+            "error",
+            "warning",
+            "litebox_timing",
+        ]
+        .iter()
+        .any(|kw| r.contains(*kw));
+        let no_timeout = !r.contains("timed out") && !r.contains("timeout");
+        saw_build && no_timeout
+    }
+
+    /// The 6 scenarios. Same workloads in both invocation modes.
+    fn scenarios() -> &'static [Scenario] {
+        &[
+            Scenario {
+                id: "simple_math",
+                prompt: |_| "What is 2 plus 2? Reply with just the number.".to_string(),
+                check: simple_math_check,
+                timeout_secs: 60,
+                fixtures: &[],
+            },
+            Scenario {
+                id: "simple_bash",
+                prompt: |c| {
+                    format!("Run the shell command `echo {c}` and tell me exactly what it printed.")
+                },
+                check: simple_bash_check,
+                timeout_secs: 90,
+                fixtures: &[],
+            },
+            Scenario {
+                id: "read_file",
+                prompt: |_| {
+                    "Run `cat /workspace/canary.txt` and tell me the entire contents of \
+                     the file, including the line that starts with `CN-`."
+                        .to_string()
+                },
+                check: default_check, // canary in fixture, not in prompt
+                timeout_secs: 90,
+                fixtures: &[("canary.txt", "__CANARY_PLACEHOLDER__\n")],
+            },
+            Scenario {
+                id: "pipeline_wc",
+                prompt: |_| {
+                    "Run `wc -c /workspace/a.txt /workspace/b.txt` and tell me which file \
+                     has more bytes."
+                        .to_string()
+                },
+                check: pipeline_wc_check,
+                timeout_secs: 120,
+                fixtures: &[
+                    ("a.txt", "aaa\n"),                      // 4 bytes
+                    ("b.txt", "bbbbbbbbbbbbbbbbbbbbbbbb\n"), // 25 bytes
+                ],
+            },
+            Scenario {
+                id: "find_head",
+                prompt: |_| {
+                    "Run `find /workspace -name '*.txt' | head -5` and list the filenames \
+                     you find."
+                        .to_string()
+                },
+                check: find_head_check,
+                timeout_secs: 120,
+                fixtures: &[
+                    ("one.txt", "1\n"),
+                    ("two.txt", "2\n"),
+                    ("three.txt", "3\n"),
+                    ("four.txt", "4\n"),
+                    ("five.txt", "5\n"),
+                    ("six.txt", "6\n"),
+                ],
+            },
+            Scenario {
+                id: "build",
+                prompt: |_| {
+                    "Run `CARGO_TARGET_DIR=/tmp/copilot-build cargo build -p litebox_timing` \
+                     inside /workspace/litebox-src and report whether it succeeded or what \
+                     compile errors it reported."
+                        .to_string()
+                },
+                check: build_check,
+                timeout_secs: 300,
+                fixtures: &[],
+            },
+        ]
+    }
+
+    /// Register all Copilot Trials (24 = 6 scenarios × 2 modes × 2 passes).
+    /// Called from `main()` only when `requested()` returned true.
+    pub(super) fn register_trials(trials: &mut Vec<Trial>) {
+        // Eagerly run the token preflight so failure surfaces before
+        // any Trial begins.
+        let _ = token();
+
+        for scn in scenarios() {
+            for mode in ["pminus", "tui"] {
+                for pass in ["native", "litebox"] {
+                    let id = format!("copilot::{mode}.{}", scn.id);
+                    let name = format!("{pass}::{id}");
+                    let scn_id = scn.id;
+                    let mode_owned = mode.to_string();
+                    let pass_owned = pass.to_string();
+                    trials.push(Trial::test(name, move || {
+                        run_scenario(&pass_owned, &mode_owned, scn_id)
+                    }));
+                }
+            }
+        }
+    }
+
+    fn run_scenario(pass: &str, mode: &str, scenario_id: &str) -> Result<(), Failed> {
+        let _permit = CopilotPermit::acquire();
+        let scn = scenarios()
+            .iter()
+            .find(|s| s.id == scenario_id)
+            .expect("scenario lookup");
+
+        // Per-trial canary: marker the model is asked to surface verbatim.
+        let canary = format!(
+            "CN-{}-{}-{}-{}",
+            scenario_id,
+            mode,
+            pass,
+            std::process::id()
+        );
+
+        // Fixture tree.
+        let fixture_dir = super::fixture_dir(pass, mode, scenario_id);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir)
+            .map_err(|e| format!("create fixture dir {}: {e}", fixture_dir.display()))?;
+        for (rel, content) in scn.fixtures {
+            let body = content.replace("__CANARY_PLACEHOLDER__", &canary);
+            let path = fixture_dir.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+            }
+            std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+        }
+        // For `build`, the workspace itself needs to be visible inside
+        // the container. Symlinks won't work (target path doesn't
+        // exist inside container). Bind-mount the host workspace at
+        // /workspace/litebox-src via an extra `-v` flag in the
+        // container spawn. The flag is added at ContainerHandle::spawn
+        // time based on scenario_id.
+        // Token env file inside the bind-mounted workspace. Mode 0600.
+        // dropbear strips env vars from session children (only PATH /
+        // HOME / SHELL / USER / LOGNAME / MAIL survive), so we can't
+        // rely on `docker run --env-file` reaching copilot. The remote
+        // command sources this file before exec'ing copilot.
+        let token_env_path = fixture_dir.join(".copilot-env");
+        super::write_token_env(&token_env_path, token())?;
+
+        // Spawn container.
+        let container =
+            ContainerHandle::spawn(pass, scenario_id, mode, &fixture_dir, scn.id == "build")?;
+        let port = container.ssh_port;
+
+        // Wait for sshd to listen.
+        wait_for_sshd(port, Duration::from_secs(30))?;
+
+        // Build the response by running the appropriate mode.
+        let prompt_text = (scn.prompt)(&canary);
+        let response = match mode {
+            "pminus" => drive_pminus(port, &prompt_text, scn.timeout_secs)?,
+            "tui" => drive_tui(port, &prompt_text, scn.timeout_secs)?,
+            _ => return Err(format!("unknown mode {mode}").into()),
+        };
+
+        // Persist the raw + ANSI-stripped transcript for forensics.
+        // Path mirrors test-logs convention so debuggers know where
+        // to look.
+        let log_dir = super::log_dir();
+        let _ = std::fs::create_dir_all(&log_dir);
+        let safe = format!("copilot-{pass}-{mode}-{scenario_id}");
+        let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &response);
+        let _ = std::fs::write(
+            log_dir.join(format!("{safe}.stripped.log")),
+            strip_ansi(&response),
+        );
+        let _ = std::fs::write(
+            log_dir.join(format!("{safe}.prompt.txt")),
+            format!("canary={canary}\n\n--- prompt ---\n{prompt_text}\n"),
+        );
+
+        // Verdict.
+        let ok = (scn.check)(&canary, &response);
+        if !ok {
+            let preview: String = strip_ansi(&response).chars().take(800).collect();
+            return Err(format!(
+                "{pass}::copilot::{mode}.{scenario_id} \
+                 canary check failed.\n\
+                 canary={canary}\n\
+                 transcript: {}\n\
+                 first 800 chars of response (ANSI-stripped):\n{preview}",
+                log_dir.join(format!("{safe}.stripped.log")).display(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Owned container that destroys itself on Drop.
+    struct ContainerHandle {
+        name: String,
+        ssh_port: u16,
+    }
+
+    impl ContainerHandle {
+        fn spawn(
+            pass: &str,
+            scenario_id: &str,
+            mode: &str,
+            fixture_dir: &Path,
+            mount_workspace_src: bool,
+        ) -> Result<Self, String> {
+            let ws_root = super::workspace_root();
+            let bin_dir = super::debug_dir();
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let name = format!("litebox-copilot-{pass}-{mode}-{scenario_id}-{pid}-{nanos}");
+
+            // CMD per pass.
+            let mut cmd = Command::new("docker");
+            cmd.args(["run", "-d", "--rm"])
+                .args(["--name", &name])
+                .args(["--cap-add", "SYS_PTRACE"])
+                .args(["-p", "127.0.0.1:0:22"])
+                .arg("-v")
+                .arg(format!("{}:/opt/litebox:ro", bin_dir.display()))
+                .arg("-v")
+                .arg(format!("{}:/workspace", fixture_dir.display()));
+            if mount_workspace_src {
+                cmd.arg("-v")
+                    .arg(format!("{}:/workspace/litebox-src:ro", ws_root.display()));
+            }
+            cmd.arg(super::copilot_image_name());
+            match pass {
+                "native" => {
+                    cmd.args(["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"]);
+                }
+                "litebox" => {
+                    // Use `--ssh` (no `--ssh-command`) so litebox sets
+                    // up the host:22 → sandbox:22 port forward AND lets
+                    // the ssh client choose the per-session remote
+                    // command. `--record-baseline` is the unconstrained
+                    // audit-only mode (no policy file) — this iteration
+                    // is about validating Copilot under litebox, not
+                    // policy enforcement.
+                    cmd.args([
+                        "/opt/litebox/litebox_tool_executor",
+                        "--rootfs",
+                        "/",
+                        "--record-baseline",
+                        "--ssh",
+                        "--ssh-port",
+                        "22",
+                    ]);
+                }
+                _ => return Err(format!("unknown pass {pass}")),
+            }
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            let out = cmd.output().map_err(|e| format!("docker run spawn: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "docker run failed (exit {}): {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+
+            // Find the host port mapped to container port 22.
+            let port_out = Command::new("docker")
+                .args(["port", &name, "22"])
+                .output()
+                .map_err(|e| format!("docker port: {e}"))?;
+            if !port_out.status.success() {
+                let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+                return Err(format!(
+                    "docker port {name} 22 failed: {}",
+                    String::from_utf8_lossy(&port_out.stderr)
+                ));
+            }
+            let mapping = String::from_utf8_lossy(&port_out.stdout);
+            let port = mapping
+                .lines()
+                .find_map(|l| {
+                    l.rsplit(':')
+                        .next()
+                        .and_then(|p| p.trim().parse::<u16>().ok())
+                })
+                .ok_or_else(|| format!("could not parse host port from `{mapping}`"))?;
+
+            Ok(ContainerHandle {
+                name,
+                ssh_port: port,
+            })
+        }
+    }
+
+    impl Drop for ContainerHandle {
+        fn drop(&mut self) {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &self.name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    fn wait_for_sshd(port: u16, timeout: Duration) -> Result<(), String> {
+        use std::io::Read;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(mut s) = std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().unwrap(),
+                Duration::from_millis(500),
+            ) {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 8];
+                if let Ok(n) = s.read(&mut buf) {
+                    if n >= 4 && &buf[..4] == b"SSH-" {
+                        // Banner received — sshd is fully up.
+                        return Ok(());
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        Err(format!(
+            "sshd on 127.0.0.1:{port} did not emit SSH banner within {timeout:?}"
+        ))
+    }
+
+    /// Common ssh argv (host-side options). Caller appends the remote
+    /// command. `sshpass -p ""` provides empty-password auth for
+    /// dropbear's `-B` flag.
+    fn ssh_argv_base(port: u16) -> Vec<String> {
+        vec![
+            "sshpass".into(),
+            "-p".into(),
+            "".into(),
+            "ssh".into(),
+            "-tt".into(),
+            "-p".into(),
+            port.to_string(),
+            "-o".into(),
+            "StrictHostKeyChecking=no".into(),
+            "-o".into(),
+            "UserKnownHostsFile=/dev/null".into(),
+            "-o".into(),
+            "PreferredAuthentications=password".into(),
+            "-o".into(),
+            "PubkeyAuthentication=no".into(),
+            "-o".into(),
+            "NumberOfPasswordPrompts=1".into(),
+            "-o".into(),
+            "LogLevel=ERROR".into(),
+            "root@127.0.0.1".into(),
+        ]
+    }
+
+    /// `-p` mode: invoke `copilot -p <prompt>` as the ssh remote
+    /// command, read its merged stdout/stderr to EOF.
+    ///
+    /// SSH concatenates remote argv with spaces and hands a single
+    /// string to the remote shell, so the prompt must be shell-quoted
+    /// before it joins the ssh argv. The remote shell first sources
+    /// the per-trial env file (containing COPILOT_GITHUB_TOKEN etc.)
+    /// because dropbear strips most environment variables when
+    /// exec'ing the session command.
+    fn drive_pminus(port: u16, prompt: &str, timeout_secs: u64) -> Result<String, String> {
+        let pty = Pty::open()?;
+        let mut argv = ssh_argv_base(port);
+        let remote_cmd = format!(
+            "set -a; . /workspace/.copilot-env; set +a; exec copilot -p {} --allow-all --no-color",
+            shell_quote(prompt),
+        );
+        argv.push(remote_cmd);
+        let pid = pty.fork_exec(&argv, /* ctrl_tty = */ true)?;
+        let result = read_with_deadline(&pty, Duration::from_secs(timeout_secs))?;
+        let _ = wait_pid(pid, Duration::from_secs(10));
+        Ok(result)
+    }
+
+    /// TUI mode: invoke `copilot --allow-all` interactively, send
+    /// the prompt followed by `\n`, then read until quiet, then send
+    /// the CLI's exit shortcut.
+    fn drive_tui(port: u16, prompt: &str, timeout_secs: u64) -> Result<String, String> {
+        let pty = Pty::open()?;
+        let mut argv = ssh_argv_base(port);
+        argv.push(
+            "set -a; . /workspace/.copilot-env; set +a; exec copilot --allow-all".to_string(),
+        );
+        let pid = pty.fork_exec(&argv, /* ctrl_tty = */ true)?;
+        // Wait for the first quiet window (the TUI has rendered its prompt).
+        let _initial = read_until_idle(&pty, Duration::from_secs(20), Duration::from_millis(1200))?;
+        // Send the prompt.
+        pty.write_all(prompt.as_bytes())?;
+        pty.write_all(b"\n")?;
+        // Read the response (longer idle window for model latency).
+        let response = read_until_idle(
+            &pty,
+            Duration::from_secs(timeout_secs),
+            Duration::from_millis(2500),
+        )?;
+        // Best-effort clean exit.
+        let _ = pty.write_all(b"/exit\n");
+        let _ = read_with_deadline(&pty, Duration::from_secs(5));
+        let _ = wait_pid(pid, Duration::from_secs(5));
+        Ok(response)
+    }
+
+    /// POSIX shell single-quote escaping: wrap in '...' and replace
+    /// any internal `'` with `'\''`.
+    fn shell_quote(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('\'');
+        for c in s.chars() {
+            if c == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(c);
+            }
+        }
+        out.push('\'');
+        out
+    }
+
+    /// Read everything from `pty` until EOF or `deadline` elapses.
+    fn read_with_deadline(pty: &Pty, deadline: Duration) -> Result<String, String> {
+        let start = Instant::now();
+        let mut out = String::new();
+        while start.elapsed() < deadline {
+            match pty.try_read_now(4096) {
+                Ok(Some(chunk)) if chunk.is_empty() => break, // EOF / EIO
+                Ok(Some(chunk)) => out.push_str(&String::from_utf8_lossy(&chunk)),
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read until `idle_window` of silence has elapsed (after any
+    /// data has been seen) or until `deadline` overall. Used for
+    /// TUI mode where there is no EOF until we send `/exit`.
+    fn read_until_idle(
+        pty: &Pty,
+        deadline: Duration,
+        idle_window: Duration,
+    ) -> Result<String, String> {
+        let start = Instant::now();
+        let mut out = String::new();
+        let mut last_data: Option<Instant> = None;
+        while start.elapsed() < deadline {
+            match pty.try_read_now(4096) {
+                Ok(Some(chunk)) if chunk.is_empty() => break,
+                Ok(Some(chunk)) => {
+                    out.push_str(&String::from_utf8_lossy(&chunk));
+                    last_data = Some(Instant::now());
+                }
+                Ok(None) => {
+                    if let Some(t) = last_data {
+                        if t.elapsed() >= idle_window {
+                            break;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    fn wait_pid(pid: libc::pid_t, _timeout: Duration) -> Result<(), String> {
+        let mut status: libc::c_int = 0;
+        // SAFETY: standard waitpid usage.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r < 0 {
+            return Err(format!(
+                "waitpid({pid}): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Strip ANSI CSI / OSC escapes. Best-effort; survives partial
+    /// sequences. Used for assertion-time text matching.
+    pub(super) fn strip_ansi(input: &str) -> String {
+        let bytes = input.as_bytes();
+        let mut out = String::with_capacity(input.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == 0x1B && i + 1 < bytes.len() {
+                let nxt = bytes[i + 1];
+                if nxt == b'[' {
+                    // CSI: ESC [ params final
+                    i += 2;
+                    while i < bytes.len() {
+                        let c = bytes[i];
+                        i += 1;
+                        if (0x40..=0x7E).contains(&c) {
+                            break;
+                        }
+                    }
+                    continue;
+                } else if nxt == b']' {
+                    // OSC: ESC ] ... BEL or ESC \
+                    i += 2;
+                    while i < bytes.len() {
+                        let c = bytes[i];
+                        i += 1;
+                        if c == 0x07 {
+                            break;
+                        }
+                        if c == 0x1B && i < bytes.len() && bytes[i] == b'\\' {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    continue;
+                } else {
+                    // Two-char sequence (ESC X)
+                    i += 2;
+                    continue;
+                }
+            }
+            if b == b'\r' {
+                i += 1;
+                continue;
+            }
+            out.push(b as char);
+            i += 1;
+        }
+        out
+    }
+}
+
+/// Image name for the Copilot CLI rootfs.
+fn copilot_image_name() -> &'static str {
+    "litebox-agent-cli"
+}
+
+/// Per-trial fixture directory.
+fn fixture_dir(pass: &str, mode: &str, scenario_id: &str) -> PathBuf {
+    target_dir()
+        .join("copilot-fixtures")
+        .join(format!("{pass}-{mode}-{scenario_id}"))
+}
+
+/// Write `COPILOT_GITHUB_TOKEN=<tok>` (plus the same value as
+/// `GH_TOKEN` and `GITHUB_TOKEN` so any Copilot-CLI variant finds
+/// it) to `path` with mode 0600. The token never appears in any
+/// command-line argv.
+fn write_token_env(path: &Path, tok: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir env parent: {e}"))?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("open env file {}: {e}", path.display()))?;
+    writeln!(f, "COPILOT_GITHUB_TOKEN={tok}").map_err(|e| format!("write env: {e}"))?;
+    writeln!(f, "GH_TOKEN={tok}").map_err(|e| format!("write env: {e}"))?;
+    writeln!(f, "GITHUB_TOKEN={tok}").map_err(|e| format!("write env: {e}"))?;
+    writeln!(f, "COPILOT_AUTO_UPDATE=false").map_err(|e| format!("write env: {e}"))?;
+    Ok(())
+}
+
+/// Build the `litebox-agent-cli` Docker image if missing. Called
+/// only when Copilot trials are being registered.
+fn ensure_copilot_image(ws_root: &Path) {
+    let check = Command::new("docker")
+        .args(["image", "inspect", copilot_image_name()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if matches!(check, Ok(s) if s.success()) {
+        return;
+    }
+    eprintln!("Building {} Docker image...", copilot_image_name());
+    let dockerfile = ws_root.join("litebox_tool_executor/rootfs/Dockerfile");
+    let status = Command::new("docker")
+        .args([
+            "build",
+            "--target",
+            copilot_image_name(),
+            "-t",
+            copilot_image_name(),
+            "-f",
+        ])
+        .arg(&dockerfile)
+        .arg(ws_root)
+        .status()
+        .expect("docker build litebox-agent-cli");
+    assert!(
+        status.success(),
+        "docker build {} failed",
+        copilot_image_name()
+    );
 }
