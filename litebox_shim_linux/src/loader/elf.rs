@@ -119,13 +119,29 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
         let ptr = mapping_ptr.next_multiple_of(align);
         let end = ptr + len;
         let mapping_end = mapping_ptr + mapping_len;
+        // `mmap(2)` and `munmap(2)` operate at page granularity. `len` (the
+        // ELF's `max_vaddr - min_vaddr` span) is in general NOT page-aligned
+        // — e.g. node.js's prebuilt linux-x64 binary has a span of 0x6403D68
+        // (104,911,080 bytes), so `end` ends mid-page. Calling munmap with a
+        // non-page-aligned start address fails with EINVAL on Linux, which
+        // surfaced as `execve` ↦ ENOEXEC for any guest fork+exec of node.
+        //
+        // The kernel's mmap call rounds the allocation up to a whole number
+        // of pages, so the *actual* mapped region is
+        // [mapping_ptr, mapping_end.next_multiple_of(PAGE_SIZE)). The head
+        // munmap is naturally page-aligned (mapping_ptr is page-aligned and
+        // align ≥ PAGE_SIZE), so it stays as-is. The tail munmap is
+        // recomputed in page units: release everything from the first page
+        // strictly after `end` to the actual end of the mapping.
+        let tail_start = end.next_multiple_of(PAGE_SIZE);
+        let tail_end = mapping_end.next_multiple_of(PAGE_SIZE);
         if ptr != mapping_ptr {
             self.task
                 .sys_munmap(MutPtr::from_usize(mapping_ptr), ptr - mapping_ptr)?;
         }
-        if end != mapping_end {
+        if tail_start < tail_end {
             self.task
-                .sys_munmap(MutPtr::from_usize(end), mapping_end - end)?;
+                .sys_munmap(MutPtr::from_usize(tail_start), tail_end - tail_start)?;
         }
         Ok(ptr)
     }
