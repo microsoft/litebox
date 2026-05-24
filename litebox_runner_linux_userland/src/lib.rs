@@ -1479,11 +1479,13 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    // Worker-host (fork-restore): the registry's init pid equals the
-    // worker's guest pid (carried in --guest-pid, defaulting to 1).
+    // Fork-restore replays a snapshot whose process identity may differ from
+    // the runner's default worker task params. Seed the local registry with the
+    // restored pid so any subsequent fork can register children with this
+    // process as their parent.
     {
-        let task = worker_task_params(&cli_args);
-        let pid = u32::try_from(task.pid).expect("worker task pid must be non-negative");
+        let pid = u32::try_from(snapshot.identity.pid)
+            .expect("fork-restore snapshot pid must be non-negative");
         shim_builder.init_with_pid(litebox::process::ProcessId(pid));
     }
     let litebox = shim_builder.litebox();
