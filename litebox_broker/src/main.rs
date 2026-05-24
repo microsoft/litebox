@@ -368,21 +368,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref listen_addr) = cli.network_proxy_listen {
         info!(addr = %listen_addr, "starting network proxy mode (listen)");
 
-        #[cfg(unix)]
-        let listener = IpcListener::bind_unix(std::path::Path::new(listen_addr))?;
-        #[cfg(windows)]
-        let listener = IpcListener::bind_endpoint(listen_addr)?;
-
-        info!(addr = %listen_addr, "network proxy listening");
-        litebox_timing::emit("broker_listen_called_ns");
-
         // Shared ELF patch cache — persists across connections so that
         // expensive ELF patching is amortized over the broker's lifetime.
         let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
 
-        // Pre-warm the cache with shared libraries that every guest process
-        // loads. Without this, the first worker connection pays ~3s for
-        // libc alone.
+        // Pre-warm the cache before publishing the listener. The tool
+        // executor treats the socket path as broker readiness; binding early
+        // lets the runner connect and then time out waiting for a handshake
+        // response while the broker is still pre-warming.
         if cli.rewrite_syscalls {
             if let Some(ref root_dir) = cli.root_dir {
                 let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
@@ -404,7 +397,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // These live in the docker image so their
                         // mtime is stable across containers.
                         "/usr/bin/bash",
+                        "/usr/bin/cat",
+                        "/usr/bin/grep",
                         "/usr/bin/true",
+                        "/usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.11.2",
                         "/usr/lib/x86_64-linux-gnu/libtinfo.so.6.4",
                         // Node.js (bundled with the litebox-test image
                         // and several integration scenarios that exec
@@ -416,6 +412,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         litebox_timing::emit("broker_prewarm_done_ns");
+
+        #[cfg(unix)]
+        let listener = IpcListener::bind_unix(std::path::Path::new(listen_addr))?;
+        #[cfg(windows)]
+        let listener = IpcListener::bind_endpoint(listen_addr)?;
+
+        info!(addr = %listen_addr, "network proxy listening");
+        litebox_timing::emit("broker_listen_called_ns");
         let extra_session_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // Accept connections, validating the LBNP handshake before entering the

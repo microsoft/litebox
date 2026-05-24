@@ -460,7 +460,7 @@ impl BrokerProcess {
                 .arg(format!("{host_port}:{guest_ip}:{guest_port}"));
         }
 
-        let child = cmd
+        let mut child = cmd
             .stdin(std::process::Stdio::null())
             .stdout(if let Some(p) = log_file {
                 std::fs::OpenOptions::new()
@@ -485,13 +485,10 @@ impl BrokerProcess {
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn litebox_broker: {e}"))?;
 
-        // Wait for the broker to bind its UDS. Poll on a tight 10 ms
-        // interval (down from 100 ms): before this change, p50
-        // `t_broker_bind_ms` was 105 ms — effectively one full poll
-        // cycle past actual readiness because the broker becomes
-        // ready within tens of ms. Total budget unchanged (5 s) but
-        // the typical case wakes up sooner.
-        for _ in 0..500 {
+        // Wait for the broker to bind its UDS. The broker may pre-warm ELF
+        // rewrites before publishing the socket, so keep the fast 10 ms poll
+        // interval but allow enough budget for a cold pre-warm.
+        for _ in 0..3000 {
             if socket_path.exists() {
                 litebox_timing::emit("broker_socket_ready_ns");
                 return Ok(Self {
@@ -500,14 +497,16 @@ impl BrokerProcess {
                     fd_token_socket_path,
                 });
             }
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("litebox_broker exited before binding IPC socket: {status}");
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        Ok(Self {
-            child,
-            socket_path,
-            fd_token_socket_path,
-        })
+        anyhow::bail!(
+            "Timed out waiting for litebox_broker to bind IPC socket at {}",
+            socket_path.display()
+        );
     }
 
     /// Get the IPC socket path for the runner's `--network-broker` flag.
