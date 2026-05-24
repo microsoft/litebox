@@ -8830,6 +8830,7 @@ impl<FS: ShimFS> Task<FS> {
             );
             signal_on_error(&vfork_info);
         })?;
+        let placeholder_stdio_bridge_fds = worker_exec_stdio_bridge_fds(&worker_stdio);
         let stdio_pipe_info: Vec<(i32, usize, super::external_fd::ExternalFdDirection)> = {
             let files = self.files.borrow();
             let rds = files.raw_descriptor_store.read();
@@ -9303,6 +9304,9 @@ impl<FS: ShimFS> Task<FS> {
             let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
             drop(files);
             for raw_fd in alive_fds {
+                if placeholder_stdio_bridge_fds.contains(&raw_fd) {
+                    continue;
+                }
                 let _ = self.do_close(raw_fd);
             }
         }
@@ -10316,6 +10320,21 @@ fn worker_exec_host_stdio_fd<FS: ShimFS>(
         .iter()
         .position(|candidate| *candidate == Some(object_id))
         .and_then(|idx| i32::try_from(idx).ok())
+}
+
+fn worker_exec_stdio_bridge_fds<FS: ShimFS>(
+    stdio: &WorkerExecStdioBindings<FS, Platform>,
+) -> Vec<usize> {
+    let mut fds = Vec::new();
+    if matches!(&stdio.stdin, WorkerExecInputBinding::Fs { .. }) {
+        fds.push(0);
+    }
+    for (raw_fd, binding) in [(1, &stdio.stdout), (2, &stdio.stderr)] {
+        if matches!(binding, WorkerExecOutputBinding::Fs { .. }) {
+            fds.push(raw_fd);
+        }
+    }
+    fds
 }
 
 fn worker_exec_input_binding<FS: ShimFS>(
