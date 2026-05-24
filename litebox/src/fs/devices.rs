@@ -447,13 +447,13 @@ impl<
             }
         };
         // Stdout/stderr are stream devices — offsets are meaningless.
-        self.litebox
-            .x
-            .platform
-            .write_to(stream, buf)
-            .map_err(|e| match e {
-                StdioWriteError::Closed => unimplemented!(),
-            })
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match self.litebox.x.platform.write_to(stream, buf) {
+            Ok(n) => Ok(n),
+            Err(StdioWriteError::Closed) => Ok(buf.len()),
+        }
     }
 
     fn seek(
