@@ -398,6 +398,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // mtime is stable across containers.
                         "/usr/bin/bash",
                         "/usr/bin/cat",
+                        "/usr/bin/echo",
                         "/usr/bin/grep",
                         "/usr/bin/true",
                         "/usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.11.2",
