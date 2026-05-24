@@ -1090,3 +1090,103 @@ listen sockets into the documented child fd slots and the child imports
 them into its listener registry before serving commands. Add new tests
 against that protocol path rather than reintroducing standalone helper
 subcommands.
+
+## Copilot CLI integration scenarios
+
+A separate suite of integration trials exercises **GitHub Copilot CLI
+running inside a litebox sandbox over SSH**, in both non-interactive
+(`copilot -p`) and interactive TUI modes. Used by sessions doing
+TDD-style validation of shim improvements that affect agent CLI
+workflows.
+
+**Trial namespace:** `copilot::pminus.<scenario>` (non-interactive)
+and `copilot::tui.<scenario>` (interactive). Each registers as
+`native::<full_id>` and `litebox::<full_id>`. 6 scenarios × 2 modes
+× 2 passes = 24 trials.
+
+**Invocation:**
+
+```bash
+# Single scenario:
+cargo test -p litebox_test_harness --test integration -- \
+  'native::copilot::pminus.simple_math' --exact
+
+# All non-interactive (`-p`) scenarios, both passes:
+cargo test -p litebox_test_harness --test integration -- \
+  'copilot::pminus'
+
+# Full Copilot suite:
+LITEBOX_COPILOT_JOBS=1 cargo test -p litebox_test_harness --test integration -- \
+  'copilot::'
+
+# Full Copilot suite without an explicit positional filter:
+LITEBOX_INCLUDE_COPILOT=1 LITEBOX_COPILOT_JOBS=1 \
+  cargo test -p litebox_test_harness --test integration
+```
+
+**Token requirement (loud-FAIL preflight):** the trials need a
+GitHub Copilot API token. Discovery order:
+`COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `gh auth token`. If none
+resolve, the suite panics at registration time with a remediation
+message. Tokens never appear in any host-visible argv (passed into
+the container via a 0600 bind-mounted env file that the remote
+shell sources before exec'ing copilot).
+
+**Concurrency cap:** `LITEBOX_COPILOT_JOBS` (default `1`),
+independent of `LITEBOX_TEST_JOBS`. Avoids GitHub API throttling
+and reduces model-output flakiness.
+
+**Registration is conditional** — the trials only register when a
+positional filter contains `copilot::` or `LITEBOX_INCLUDE_COPILOT`
+is set. Default `cargo test --test integration` runs are
+unaffected and the canonical "0 FAIL on native" contract is
+preserved.
+
+**Native is the gold standard.** Every scenario must pass under
+the native baseline; any native failure is a test bug, not a shim
+bug.
+
+**Today's litebox state on `wportnoy/vscode-server-in-litebox` HEAD**:
+all 6 litebox-pass `pminus` scenarios fail (empty responses from
+the Copilot CLI subprocess). This is broader than the historical
+bash-output-read-hang and currently looks like a Copilot-CLI /
+Node-under-litebox runtime issue. The trials are the diagnostic:
+when the shim regression is fixed, individual scenarios will
+start passing and the suite will show progress one scenario at a
+time.
+
+**Driver internals.** The host side reuses the existing PTY
+primitive (`litebox_test_harness::os::pty::Pty`) — `Pty::open()`
++ `fork_exec(ssh_argv, ctrl_tty=true)` — exactly the pattern used
+by `coordinator/pty.rs` tests. SSH connects to the dropbear
+running inside the container (litebox pass) or directly under
+docker (native pass). The remote command is shell-quoted and runs
+through `sh -c`, which sources the token env file before exec'ing
+copilot.
+
+**Scenarios** (same workloads in both modes):
+
+| Scenario      | Prompt strategy                                                                 |
+|---------------|---------------------------------------------------------------------------------|
+| `simple_math` | "What is 2+2? Reply with just the number." (answer check)                        |
+| `simple_bash` | "Run `echo <canary>` and tell me what it printed." (canary-in-output check)      |
+| `read_file`   | "Run `cat /workspace/canary.txt` and tell me the contents." (canary in fixture)  |
+| `pipeline_wc` | "Run `wc -c /workspace/{a,b}.txt` and tell me which is bigger."                  |
+| `find_head`   | "Run `find /workspace -name '*.txt' \| head -5` and list what you find."         |
+| `build`       | "Run `CARGO_TARGET_DIR=/tmp/c cargo build -p litebox_timing` ..."                |
+
+Per-trial transcripts land at
+`target/test-logs/copilot-<pass>-<mode>-<scenario>.{raw,stripped,prompt}`
+for forensics.
+
+**Files involved:**
+- `litebox_tool_executor/rootfs/Dockerfile` — `litebox-agent-cli` stage.
+- `litebox_test_harness/tests/integration.rs` — `mod copilot` and
+  conditional registration in `main()`.
+
+**Out of scope (deferred):** sandbox policy / allow / deny
+coverage. The agent-sandbox-demo branch
+(`experiments/agent-sandbox-demo/`) retains the interactive
+hand-driven demo with policy enforcement; this suite is the
+automated companion for repeatable validation.
+
