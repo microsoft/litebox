@@ -96,6 +96,10 @@ fn main() {
     litebox_timing::emit("harness_args_parsed_ns");
     let cmd = args.get(1).map_or("spawn-tree", String::as_str);
     let self_exe = &args[0];
+    if let Some(code) = coordinator::dispatch_fast_leaf(&args) {
+        litebox_timing::emit("harness_dispatch_ready_ns");
+        std::process::exit(code);
+    }
     // PTY tests dup the harness's stderr as stdout; gate diagnostic
     // prints (including the stderr `[TIMING]` proxy line used by the
     // integration harness to bracket the guest under a virtualized
