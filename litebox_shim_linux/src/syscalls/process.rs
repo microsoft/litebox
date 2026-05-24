@@ -4313,6 +4313,7 @@ impl<FS: ShimFS> Task<FS> {
             &mut reject,
             &mut fc.fork_snapshot_broker_transit,
             &mut fc.fork_snapshot_fd_token_transit,
+            true,
         );
         let memory = self.snapshot_memory(&mut reject);
 
@@ -6170,6 +6171,7 @@ impl<FS: ShimFS> Task<FS> {
             &mut reject,
             &mut _true_fork_transit,
             &mut _true_fork_fd_token_transit,
+            false,
         );
         let memory = self.snapshot_memory(&mut reject);
 
@@ -6520,6 +6522,7 @@ impl<FS: ShimFS> Task<FS> {
         reject: &mut super::fork_snapshot::ForkRejectReasons,
         broker_transit: &mut Vec<super::fork_snapshot::ForkSnapshotBrokerTransit>,
         fd_token_transit: &mut Vec<super::fork_snapshot::ForkSnapshotFdTokenTransit>,
+        skip_cloexec: bool,
     ) -> super::fork_snapshot::FdTableSnapshot {
         use super::fork_snapshot::{
             BrokerFdTokenSnapshot, BrokerHandleKind, BrokerHandleSnapshot, FdClass,
@@ -6544,16 +6547,32 @@ impl<FS: ShimFS> Task<FS> {
 
         // Enumerate all open fds and classify each inline (to avoid
         // double-borrowing self.files via a separate classify_fd call).
+        let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
+        let fd_flags_by_raw: BTreeMap<usize, FileDescriptorFlags> = alive_fds
+            .iter()
+            .map(|&raw_fd| {
+                let fd_flags = get_file_descriptor_flags(raw_fd, &self.global, &files)
+                    .unwrap_or_else(|_| FileDescriptorFlags::empty());
+                (raw_fd, fd_flags)
+            })
+            .collect();
+
         // Acquire descriptor table BEFORE raw_descriptor_store to preserve
         // the established dt → rds lock order.
         let dt = self.global.litebox.descriptor_table();
         let rds = files.raw_descriptor_store.read();
-        let alive_fds: Vec<usize> = rds.iter_alive().collect();
 
         let mut entries = Vec::new();
         let mut open_file_descriptions = Vec::new();
         for raw_fd in &alive_fds {
             let raw_fd = *raw_fd;
+            let fd_flags = fd_flags_by_raw
+                .get(&raw_fd)
+                .copied()
+                .unwrap_or_else(FileDescriptorFlags::empty);
+            if skip_cloexec && fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
+                continue;
+            }
 
             // Classify by subsystem type first, then promote to StdioFd if
             // the descriptor's object_id matches the original host stdio.
@@ -7065,7 +7084,7 @@ impl<FS: ShimFS> Task<FS> {
             entries.push(FdEntrySnapshot {
                 fd: raw_fd,
                 class,
-                fd_flags: 0, // TODO: read FD_CLOEXEC in a later phase
+                fd_flags: fd_flags.bits(),
                 status_flags: fs_status_flags,
                 object_id: object_id.map_or(0, litebox::fd::DescriptorObjectId::as_u64),
                 metadata,
@@ -8811,6 +8830,7 @@ impl<FS: ShimFS> Task<FS> {
             );
             signal_on_error(&vfork_info);
         })?;
+        let placeholder_stdio_bridge_fds = worker_exec_stdio_bridge_fds(&worker_stdio);
         let stdio_pipe_info: Vec<(i32, usize, super::external_fd::ExternalFdDirection)> = {
             let files = self.files.borrow();
             let rds = files.raw_descriptor_store.read();
@@ -9284,6 +9304,9 @@ impl<FS: ShimFS> Task<FS> {
             let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
             drop(files);
             for raw_fd in alive_fds {
+                if placeholder_stdio_bridge_fds.contains(&raw_fd) {
+                    continue;
+                }
                 let _ = self.do_close(raw_fd);
             }
         }
@@ -10297,6 +10320,21 @@ fn worker_exec_host_stdio_fd<FS: ShimFS>(
         .iter()
         .position(|candidate| *candidate == Some(object_id))
         .and_then(|idx| i32::try_from(idx).ok())
+}
+
+fn worker_exec_stdio_bridge_fds<FS: ShimFS>(
+    stdio: &WorkerExecStdioBindings<FS, Platform>,
+) -> Vec<usize> {
+    let mut fds = Vec::new();
+    if matches!(&stdio.stdin, WorkerExecInputBinding::Fs { .. }) {
+        fds.push(0);
+    }
+    for (raw_fd, binding) in [(1, &stdio.stdout), (2, &stdio.stderr)] {
+        if matches!(binding, WorkerExecOutputBinding::Fs { .. }) {
+            fds.push(raw_fd);
+        }
+    }
+    fds
 }
 
 fn worker_exec_input_binding<FS: ShimFS>(
