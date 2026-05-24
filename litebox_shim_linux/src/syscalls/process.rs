@@ -1969,15 +1969,16 @@ impl<FS: ShimFS> Task<FS> {
             && (!flags.contains(CloneFlags::VM) || flags.contains(CloneFlags::VFORK));
 
         if is_fork {
-            // Phase 2.F follow-up: route fork-like clone3 through the same
-            // do_fork path as legacy clone. Without this, modern glibc's
-            // `fork()` (which goes via clone3) returns ENOSYS and falls
-            // back to no fork at all — blocking cross-binary-type
-            // tests like EV.fork_inherit.nonpie-glibc.
-            //
-            // The `clone3` flag is plumbed into do_fork so any clone3-
-            // specific accounting can branch on it; the actual fork
-            // semantics (fd table, stdio, vfork parking) are identical.
+            if clone3 && stack == 0 && stack_size == 0 {
+                log_unsupported!("clone3 fork without child stack");
+                return Err(Errno::ENOSYS);
+            }
+
+            // Route fork-like clone3 with an explicit child stack through the
+            // same do_fork path as legacy clone. glibc uses that shape for
+            // posix_spawn-style helpers that run on a temporary child stack
+            // until execve; stackless raw clone3 remains unsupported and lets
+            // callers fall back to legacy clone.
             return self.do_fork(ctx, args, flags, clone3);
         }
 
