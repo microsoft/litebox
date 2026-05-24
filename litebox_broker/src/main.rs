@@ -404,6 +404,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "/usr/bin/bash",
                         "/usr/bin/true",
                         "/usr/lib/x86_64-linux-gnu/libtinfo.so.6.4",
+                        // Node.js (bundled with the litebox-test image
+                        // and several integration scenarios that exec
+                        // it: EX6-9 in `coordinator/special_cases/exit.rs`,
+                        // plus the Copilot CLI integration suite).
+                        "/usr/local/bin/node",
                     ],
                 );
             }
