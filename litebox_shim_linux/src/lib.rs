@@ -4798,6 +4798,9 @@ struct ForkContext {
     /// failure path we drain this list and call `release` on each
     /// to undo the dup so the broker refcount returns to baseline.
     fork_snapshot_broker_transit: Vec<crate::syscalls::fork_snapshot::ForkSnapshotBrokerTransit>,
+    /// Process-exit subscriptions that keep pidfd target ProcessState entries
+    /// alive until a restored child can install its own inherited-pidfd wake.
+    fork_snapshot_pidfd_process_transit: Vec<crate::syscalls::guest_pid::BrokerProcessExitWake>,
     /// Rollback list for host-fd tokens registered for fork-restore.
     fork_snapshot_fd_token_transit: Vec<crate::syscalls::fork_snapshot::ForkSnapshotFdTokenTransit>,
 }
