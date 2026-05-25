@@ -150,8 +150,8 @@ fn main() {
             let filter = args.iter().find_map(|a| a.strip_prefix("--filter="));
             // JSON results are emitted incrementally on stdout from
             // TestRunner::record as each test completes (see coordinator/mod.rs).
-            // We just compute the summary counts here. Outcomes are strictly
-            // `pass` or `FAIL` — there is no expected-failure mechanism.
+            // We just compute the summary counts here. XFAIL counts as pass;
+            // XPASS counts as FAIL so stale annotations keep CI red.
             let results = coordinator::run_filtered(self_exe, filter);
             let pass_count = results.iter().filter(|r| r.outcome() == "pass").count();
             let fail_count = results.iter().filter(|r| r.outcome() == "FAIL").count();

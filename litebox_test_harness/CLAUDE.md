@@ -356,6 +356,16 @@ first.
    ordering. The binary-type segment may be omitted only when the
    test does not exec a binary at all.
 
+### Annotating known failures
+
+Use `.expected_fail_on_litebox("reason")` on an individual registry
+builder only when a tuple is known to fail under litebox but still must
+pass on the native baseline. A litebox failure becomes an `XFAIL` and
+counts as pass; a litebox pass becomes `XPASS` and counts as fail so the
+stale annotation is removed. Example:
+`reg.test("inherit", "tcp_listen", "INHERIT.tcp_listen.accept.dpg.dng").expected_fail_on_litebox("tracked in issue #NNN").build(...)`.
+Do not use this for native failures.
+
 ### Matrix arrays (where to fan out a new test)
 
 For binary-type-sensitive tests, register against one of these
