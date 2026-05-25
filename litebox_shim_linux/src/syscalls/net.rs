@@ -2293,6 +2293,7 @@ impl<FS: ShimFS> Task<FS> {
                 // because we haven't given the PassedFd to anyone yet).
                 let files = self.files.borrow();
                 let rds = files.raw_descriptor_store.read();
+                let mut sent_broker_token = false;
                 if let Ok(typed) =
                     rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
                 {
@@ -2301,28 +2302,29 @@ impl<FS: ShimFS> Task<FS> {
                         .and_then(|h| h.with_entry(|e| e.broker_backed_handle()))
                     {
                         // Found a broker-backed eventfd. Ask the broker
-                        // to dup the handle so the receiver has a
-                        // refcount waiting.
-                        if let Some(provider) = dt
+                        // to dup a transit ref so the handle survives
+                        // until the receiver materialises its own ref.
+                        let provider = dt
                             .entry_handle::<super::eventfd::EventfdSubsystem>(&typed)
                             .and_then(|h| h.with_entry(|e| e.broker_backed_provider()))
-                        {
-                            if provider.dup_handle(handle_id).is_ok() {
-                                passed_tokens.push(
-                                    litebox_common_linux::fd_transfer_frame::PassedToken::new(
-                                        litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd,
-                                        handle_id,
-                                    )
-                                    .map_err(|_| Errno::EINVAL)?,
-                                );
-                            }
-                        }
+                            .ok_or(Errno::EIO)?;
+                        provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                        passed_tokens.push(
+                            litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd,
+                                handle_id,
+                            )
+                            .map_err(|_| Errno::EINVAL)?,
+                        );
+                        sent_broker_token = true;
                     }
                 }
                 drop(rds);
                 drop(files);
 
-                passed_fds.push(passed);
+                if !sent_broker_token {
+                    passed_fds.push(passed);
+                }
             }
 
             offset += cmsg_align(cmsg.cmsg_len);
@@ -2876,6 +2878,16 @@ impl<FS: ShimFS> Task<FS> {
                             continue;
                         };
                         let handle_id = token.id();
+                        // The sender's SCM path dup'd a transit ref to keep
+                        // the broker state alive while the LBFD frame was in
+                        // flight. The receiver must also acquire the handle on
+                        // its own broker connection before installing the fd;
+                        // otherwise its later close/release is rejected as
+                        // "not owned by this connection" and the control
+                        // socket is torn down.
+                        if provider.dup_handle(handle_id).is_err() {
+                            continue;
+                        }
                         // Apply MSG_CMSG_CLOEXEC right at construction
                         // (matches Linux recvmsg semantics where the
                         // received fd is created with CLOEXEC atomically).
