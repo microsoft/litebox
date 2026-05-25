@@ -37,6 +37,8 @@ pub fn run(sub: &str) -> i32 {
         "socketpair-fork-read" => test_socketpair_fork_read(),
         "socketpair-fork-read-bare" => test_socketpair_fork_read_bare(),
         "socketpair-exec" => test_socketpair_exec(),
+        "socketpair-shutdown" => test_socketpair_shutdown(),
+        "socketpair-shutdown-parent" => test_socketpair_shutdown_parent(),
         "fork-errno-touch" => test_fork_errno_touch(),
         // Helper: child side of socketpair-exec (inherits fd from parent)
         "socketpair-exec-child" => socketpair_exec_child(),
@@ -928,6 +930,218 @@ fn test_socketpair_exec() -> i32 {
     }
 }
 
+/// `US6S`: `socketpair(AF_UNIX)` + `shutdown(SHUT_WR)` — minimal repro
+/// for the wave-6 W6-C5 fix. Node.js's libuv child_process spawn calls
+/// `shutdown(fd, SHUT_WR)` on a broker-backed socketpair fd to signal
+/// half-close. Pre-fix, this dispatch was missing from the shim, so
+/// the syscall hung — and any spawnSync() child waiting on the parent
+/// (e.g., for stdout pipe drain) also stalled.
+///
+/// This test: parent creates a socketpair, fork+exec'd child sends
+/// "PING" then `shutdown(SHUT_WR)` to signal "done sending", parent
+/// reads "PING" then sees EOF (which only happens if shutdown
+/// propagated correctly).
+fn test_socketpair_shutdown() -> i32 {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    if rc != 0 {
+        println!("US6S_SOCKETPAIR_FAIL:{}", errno());
+        return 1;
+    }
+    let parent_fd = fds[0];
+    let child_fd = fds[1];
+    eprintln!("[US6S] socketpair ok: parent_fd={parent_fd}, child_fd={child_fd}");
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("US6S_FORK_FAIL:{}", errno());
+        return 1;
+    }
+
+    if pid == 0 {
+        // Child: write PING then shutdown(SHUT_WR), exit.
+        unsafe { libc::close(parent_fd) };
+        let msg = b"PING";
+        let n = unsafe { libc::write(child_fd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
+        if n != msg.len() as isize {
+            eprintln!("[US6S-child] write failed n={n} errno={}", errno());
+            unsafe { libc::_exit(1) };
+        }
+        let rc = unsafe { libc::shutdown(child_fd, libc::SHUT_WR) };
+        if rc != 0 {
+            eprintln!("[US6S-child] shutdown(SHUT_WR) failed: {}", errno());
+            unsafe { libc::_exit(2) };
+        }
+        unsafe { libc::close(child_fd) };
+        unsafe { libc::_exit(0) };
+    }
+
+    // Parent: close child end, set a recv timeout so we fail loudly
+    // instead of hanging the test, read PING, expect EOF on next read.
+    unsafe { libc::close(child_fd) };
+    let tv = libc::timeval {
+        tv_sec: 5,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::setsockopt(
+            parent_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const tv).cast::<libc::c_void>(),
+            core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+
+    let mut buf = [0u8; 64];
+    let n = unsafe {
+        libc::read(
+            parent_fd,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len(),
+        )
+    };
+    if n != 4 {
+        println!("US6S_READ1_FAIL:n={n},errno={}", errno());
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        unsafe { libc::close(parent_fd) };
+        return 1;
+    }
+    let msg = std::str::from_utf8(&buf[..n as usize]).unwrap_or("?");
+    if msg != "PING" {
+        println!("US6S_BAD_PING:msg={msg:?}");
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        unsafe { libc::close(parent_fd) };
+        return 1;
+    }
+
+    // Second read should return 0 (EOF) because child did shutdown(SHUT_WR).
+    let n2 = unsafe {
+        libc::read(
+            parent_fd,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len(),
+        )
+    };
+    unsafe { libc::close(parent_fd) };
+    if n2 != 0 {
+        println!("US6S_NO_EOF:n2={n2},errno={}", errno());
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        return 1;
+    }
+
+    let mut status = 0i32;
+    unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    let exit_code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        99
+    };
+    if exit_code != 0 {
+        println!("US6S_CHILD_FAIL:exit={exit_code}");
+        return 1;
+    }
+
+    println!("US6S_SOCKETPAIR_SHUTDOWN_OK");
+    0
+}
+
+/// `US6SP`: parent-side `shutdown(SHUT_WR)`. Mirrors node's libuv
+/// pattern more precisely: parent does the shutdown on its write end
+/// after sending its message, child reads to EOF then echoes back.
+fn test_socketpair_shutdown_parent() -> i32 {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    if rc != 0 {
+        println!("US6SP_SOCKETPAIR_FAIL:{}", errno());
+        return 1;
+    }
+    let parent_fd = fds[0];
+    let child_fd = fds[1];
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("US6SP_FORK_FAIL:{}", errno());
+        return 1;
+    }
+
+    if pid == 0 {
+        // Child: read until EOF, then write reply.
+        unsafe { libc::close(parent_fd) };
+        let mut acc = Vec::<u8>::new();
+        let mut buf = [0u8; 64];
+        loop {
+            let n =
+                unsafe { libc::read(child_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            acc.extend_from_slice(&buf[..n as usize]);
+        }
+        let reply = b"PONG";
+        let _ =
+            unsafe { libc::write(child_fd, reply.as_ptr().cast::<libc::c_void>(), reply.len()) };
+        unsafe { libc::close(child_fd) };
+        unsafe { libc::_exit(if acc == b"PING" { 0 } else { 1 }) };
+    }
+
+    // Parent: send PING, shutdown(SHUT_WR), read reply.
+    unsafe { libc::close(child_fd) };
+    let msg = b"PING";
+    let n = unsafe { libc::write(parent_fd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
+    if n != msg.len() as isize {
+        println!("US6SP_WRITE_FAIL:n={n},errno={}", errno());
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        return 1;
+    }
+    let rc = unsafe { libc::shutdown(parent_fd, libc::SHUT_WR) };
+    if rc != 0 {
+        println!("US6SP_SHUTDOWN_FAIL:errno={}", errno());
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        return 1;
+    }
+    let tv = libc::timeval {
+        tv_sec: 5,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::setsockopt(
+            parent_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const tv).cast::<libc::c_void>(),
+            core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+    let mut buf = [0u8; 64];
+    let n2 = unsafe {
+        libc::read(
+            parent_fd,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len(),
+        )
+    };
+    unsafe { libc::close(parent_fd) };
+    let mut status = 0i32;
+    unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    let exit_code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        99
+    };
+    let reply = if n2 > 0 {
+        std::str::from_utf8(&buf[..n2 as usize]).unwrap_or("?")
+    } else {
+        "?"
+    };
+    if n2 != 4 || reply != "PONG" || exit_code != 0 {
+        println!("US6SP_FAIL:n2={n2},reply={reply:?},exit={exit_code}");
+        return 1;
+    }
+    println!("US6SP_SOCKETPAIR_SHUTDOWN_PARENT_OK");
+    0
+}
+
 /// Helper for `US6c`: exec'd child reads from inherited socketpair fd,
 /// writes reply, exits.
 fn socketpair_exec_child() -> i32 {
@@ -1617,6 +1831,81 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                         )
                         .await;
                     let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("US6R_SOCKETPAIR_FORK_READ_OK"));
+                    crate::coordinator::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                }
+            );
+
+            // US6S: socketpair + child shutdown(SHUT_WR). Minimal repro
+            // for the wave-6 W6-C5 fix (Copilot CLI / node child_process
+            // spawnSync blocker). Captures the broker socketpair
+            // shutdown() dispatch path.
+            let agent_name = agent;
+            let agent_label = agent.to_string();
+            let id = format!("US6S.socketpair_shutdown.{}.{agent}", bt.label());
+            typed_test!(
+                reg,
+                "xworker",
+                "unix_socket",
+                id,
+                timeout = 60,
+                agents[handle = agent_name],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let target = crate::binary_path(bt, &self_exe);
+                    let resp = run
+                        .send_named_typed(
+                            &handle,
+                            &EXEC_BIN,
+                            ExecBinArgs {
+                                argv: vec![
+                                    target,
+                                    "unix-socket-test".into(),
+                                    "socketpair-shutdown".into(),
+                                ],
+                                timeout_ms: Some(15 * 1000),
+                                stdin: None,
+                                env: vec![],
+                            },
+                        )
+                        .await;
+                    let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("US6S_SOCKETPAIR_SHUTDOWN_OK"));
+                    crate::coordinator::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                }
+            );
+
+            // US6SP: socketpair + parent shutdown(SHUT_WR) followed by
+            // reply read. Mirrors node libuv's exact pattern more
+            // closely than US6S.
+            let agent_name = agent;
+            let agent_label = agent.to_string();
+            let id = format!("US6SP.socketpair_shutdown_parent.{}.{agent}", bt.label());
+            typed_test!(
+                reg,
+                "xworker",
+                "unix_socket",
+                id,
+                timeout = 60,
+                agents[handle = agent_name],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let target = crate::binary_path(bt, &self_exe);
+                    let resp = run
+                        .send_named_typed(
+                            &handle,
+                            &EXEC_BIN,
+                            ExecBinArgs {
+                                argv: vec![
+                                    target,
+                                    "unix-socket-test".into(),
+                                    "socketpair-shutdown-parent".into(),
+                                ],
+                                timeout_ms: Some(15 * 1000),
+                                stdin: None,
+                                env: vec![],
+                            },
+                        )
+                        .await;
+                    let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("US6SP_SOCKETPAIR_SHUTDOWN_PARENT_OK"));
                     crate::coordinator::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                 }
             );
