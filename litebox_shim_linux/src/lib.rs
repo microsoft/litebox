@@ -179,6 +179,17 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .descriptor_table_mut()
                 .remove(&old_sock);
             rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_broker_pipe) =
+            rds.fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
+        {
+            drop(rds);
+            let _ = self
+                .task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_broker_pipe);
+            rds = files.raw_descriptor_store.write();
         } else if let Ok(old_host) =
             rds.fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
         {
@@ -272,6 +283,17 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .litebox
                 .descriptor_table_mut()
                 .remove(&old_sock);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_broker_pipe) =
+            rds.fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
+        {
+            drop(rds);
+            let _ = self
+                .task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_broker_pipe);
             rds = files.raw_descriptor_store.write();
         } else if let Ok(old_host) =
             rds.fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
@@ -390,6 +412,17 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                         .litebox
                         .descriptor_table_mut()
                         .remove(&old_sock);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_broker_pipe) = rds
+                    .fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
+                {
+                    drop(rds);
+                    let _ = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_broker_pipe);
                     rds = files.raw_descriptor_store.write();
                 } else if let Ok(old_host) = rds
                     .fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
