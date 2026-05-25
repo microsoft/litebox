@@ -63,4 +63,9 @@ pub trait BrokerSocketPairProvider: BrokerSubscribable {
     /// non-atomic writes). `BrokerOpError::InvalidValue` indicates
     /// peer-closed (EPIPE).
     fn write_socketpair(&self, handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError>;
+
+    /// Applies `shutdown(SHUT_WR)` to the socketpair endpoint addressed
+    /// by `handle`, making the peer observe EOF after buffered data is
+    /// drained while preserving the peer's ability to write back.
+    fn shutdown_socketpair_write(&self, handle: u64) -> Result<(), BrokerOpError>;
 }

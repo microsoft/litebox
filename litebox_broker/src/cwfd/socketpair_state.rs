@@ -15,9 +15,9 @@
 //!
 //! Scope: Phase F initial cut handles `AF_UNIX + SOCK_STREAM` only.
 //! Messages with `SCM_RIGHTS` / `SCM_CREDENTIALS`, `SOCK_SEQPACKET`,
-//! `SOCK_DGRAM`, and `shutdown()` semantics are intentionally out of
-//! scope for this iteration. The shim should not promote non-stream
-//! AF_UNIX pairs to the broker until those are modeled.
+//! and `SOCK_DGRAM` are intentionally out of scope for this iteration.
+//! The shim should not promote non-stream AF_UNIX pairs to the broker
+//! until those are modeled.
 
 use core::any::Any;
 use std::collections::VecDeque;
@@ -75,6 +75,11 @@ pub struct SocketPairInner {
     /// `NOTIFY_EVENT_ERR` (writes would EPIPE).
     a_open: AtomicBool,
     b_open: AtomicBool,
+    /// True while endpoint A/B may still send bytes to its peer.
+    /// `shutdown(SHUT_WR)` clears only the caller's write-open flag;
+    /// dropping the endpoint clears both liveness and write-open.
+    a_write_open: AtomicBool,
+    b_write_open: AtomicBool,
     /// Linux `PIPE_BUF`-equivalent for atomicity. Writes whose
     /// `len <= atomic_write_size` are atomic: they either fit entirely
     /// or return `WouldBlock`. Larger writes may produce partial
@@ -111,6 +116,8 @@ impl SocketPairInner {
             }),
             a_open: AtomicBool::new(true),
             b_open: AtomicBool::new(true),
+            a_write_open: AtomicBool::new(true),
+            b_write_open: AtomicBool::new(true),
             atomic_write_size,
             subject_a: SubscriptionList::new(),
             subject_b: SubscriptionList::new(),
@@ -129,6 +136,14 @@ impl SocketPairInner {
         self.b_open.load(Ordering::Acquire)
     }
 
+    fn a_write_open(&self) -> bool {
+        self.a_write_open.load(Ordering::Acquire)
+    }
+
+    fn b_write_open(&self) -> bool {
+        self.b_write_open.load(Ordering::Acquire)
+    }
+
     /// Read up to `max_len` bytes destined for `endpoint`.
     fn read(
         &self,
@@ -138,14 +153,23 @@ impl SocketPairInner {
         if max_len == 0 {
             return Ok(Vec::new());
         }
-        // A reads from buffer_ba (data sent by B). Peer-close = !b_open.
-        let (buf_mutex, peer_open, peer_subject) = match endpoint {
-            SocketPairEndpoint::A => (&self.buffer_ba, self.b_open(), &self.subject_b),
-            SocketPairEndpoint::B => (&self.buffer_ab, self.a_open(), &self.subject_a),
+        // A reads from buffer_ba (data sent by B). EOF when the peer
+        // endpoint is gone or has shut down its write side.
+        let (buf_mutex, peer_can_write, peer_subject) = match endpoint {
+            SocketPairEndpoint::A => (
+                &self.buffer_ba,
+                self.b_open() && self.b_write_open(),
+                &self.subject_b,
+            ),
+            SocketPairEndpoint::B => (
+                &self.buffer_ab,
+                self.a_open() && self.a_write_open(),
+                &self.subject_a,
+            ),
         };
         let mut buf = buf_mutex.lock().expect("SocketPairInner poisoned");
         if buf.buf.is_empty() {
-            if !peer_open {
+            if !peer_can_write {
                 // PE.10 diag: log first time we report EOF to a reader
                 // — this is the case that surfaces tokio's "EOF on
                 // self-pipe" panic when broker socketpair rc accounting
@@ -175,7 +199,7 @@ impl SocketPairInner {
         let writable = buf.buf.len() < buf.capacity;
         drop(buf);
         // Notify peer that its outbound buffer now has more room.
-        if writable && peer_open {
+        if writable && peer_can_write {
             peer_subject.notify(NOTIFY_EVENT_OUT);
         }
         if n > 0 {
@@ -192,12 +216,23 @@ impl SocketPairInner {
         if bytes.is_empty() {
             return Ok(0);
         }
-        // A writes to buffer_ab. EPIPE if peer (B) closed.
-        let (buf_mutex, peer_open, peer_subject) = match endpoint {
-            SocketPairEndpoint::A => (&self.buffer_ab, self.b_open(), &self.subject_b),
-            SocketPairEndpoint::B => (&self.buffer_ba, self.a_open(), &self.subject_a),
+        // A writes to buffer_ab. EPIPE if this end has been write-shut
+        // or if peer (B) closed.
+        let (buf_mutex, this_write_open, peer_open, peer_subject) = match endpoint {
+            SocketPairEndpoint::A => (
+                &self.buffer_ab,
+                self.a_write_open(),
+                self.b_open(),
+                &self.subject_b,
+            ),
+            SocketPairEndpoint::B => (
+                &self.buffer_ba,
+                self.b_write_open(),
+                self.a_open(),
+                &self.subject_a,
+            ),
         };
-        if !peer_open {
+        if !this_write_open || !peer_open {
             return Err(SocketPairError::PeerClosed);
         }
         let mut buf = buf_mutex.lock().expect("SocketPairInner poisoned");
@@ -223,9 +258,19 @@ impl SocketPairInner {
     }
 
     fn current_events(&self, endpoint: SocketPairEndpoint) -> u32 {
-        let (in_buf_mutex, out_buf_mutex, peer_open) = match endpoint {
-            SocketPairEndpoint::A => (&self.buffer_ba, &self.buffer_ab, self.b_open()),
-            SocketPairEndpoint::B => (&self.buffer_ab, &self.buffer_ba, self.a_open()),
+        let (in_buf_mutex, out_buf_mutex, peer_open, peer_can_write) = match endpoint {
+            SocketPairEndpoint::A => (
+                &self.buffer_ba,
+                &self.buffer_ab,
+                self.b_open(),
+                self.b_open() && self.b_write_open(),
+            ),
+            SocketPairEndpoint::B => (
+                &self.buffer_ab,
+                &self.buffer_ba,
+                self.a_open(),
+                self.a_open() && self.a_write_open(),
+            ),
         };
         let mut events = 0;
         let in_buf = in_buf_mutex.lock().expect("SocketPairInner poisoned");
@@ -238,12 +283,32 @@ impl SocketPairInner {
             events |= NOTIFY_EVENT_OUT;
         }
         drop(out_buf);
+        if !peer_can_write {
+            // Peer write-half close: deliver HUP + IN so blocked readers
+            // wake to EOF after draining any buffered data. Only a full
+            // peer close sets ERR, because half-close still permits the
+            // peer to receive our writes.
+            events |= NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN;
+        }
         if !peer_open {
-            // Peer-close: deliver HUP + IN (so blocked readers wake to
-            // EOF) and ERR (so blocked writers wake to EPIPE).
-            events |= NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN | NOTIFY_EVENT_ERR;
+            events |= NOTIFY_EVENT_ERR;
         }
         events
+    }
+
+    fn shutdown_write(&self, endpoint: SocketPairEndpoint) {
+        match endpoint {
+            SocketPairEndpoint::A => {
+                if self.a_write_open.swap(false, Ordering::AcqRel) {
+                    self.subject_b.notify(NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN);
+                }
+            }
+            SocketPairEndpoint::B => {
+                if self.b_write_open.swap(false, Ordering::AcqRel) {
+                    self.subject_a.notify(NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN);
+                }
+            }
+        }
     }
 }
 
@@ -293,6 +358,10 @@ impl SocketPairEnd {
 
     pub fn write(&self, bytes: &[u8]) -> Result<usize, SocketPairError> {
         self.inner.write(self.endpoint, bytes)
+    }
+
+    pub fn shutdown_write(&self) {
+        self.inner.shutdown_write(self.endpoint);
     }
 }
 
@@ -389,6 +458,7 @@ impl Drop for SocketPairEnd {
                     "SocketPairEnd::drop endpoint=A with a_open=false (double-Drop?)"
                 );
                 self.inner.a_open.store(false, Ordering::Release);
+                self.inner.a_write_open.store(false, Ordering::Release);
                 // Wake B: peer close = IN (read EOF) + HUP + ERR (write EPIPE).
                 self.inner
                     .subject_b
@@ -400,6 +470,7 @@ impl Drop for SocketPairEnd {
                     "SocketPairEnd::drop endpoint=B with b_open=false (double-Drop?)"
                 );
                 self.inner.b_open.store(false, Ordering::Release);
+                self.inner.b_write_open.store(false, Ordering::Release);
                 self.inner
                     .subject_a
                     .notify(NOTIFY_EVENT_HUP | NOTIFY_EVENT_IN | NOTIFY_EVENT_ERR);
@@ -510,6 +581,18 @@ mod tests {
         assert_eq!(&got, b"queued");
         let next = a.read(64).unwrap();
         assert!(next.is_empty());
+    }
+
+    #[test]
+    fn shutdown_write_preserves_reply_direction() {
+        let (a, b) = pair();
+        a.write(b"ping").unwrap();
+        a.shutdown_write();
+        assert_eq!(b.read(64).unwrap(), b"ping");
+        assert!(b.read(64).unwrap().is_empty());
+        b.write(b"pong").unwrap();
+        assert_eq!(a.read(64).unwrap(), b"pong");
+        assert_eq!(a.write(b"again").unwrap_err(), SocketPairError::PeerClosed);
     }
 
     #[test]
