@@ -610,6 +610,18 @@ pub fn build_audit_event(
             ev.int(*advice as u64);
             ev
         }
+        SyscallRequest::Sendfile {
+            out_fd,
+            in_fd,
+            count,
+            ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*out_fd);
+            ev.fd(*in_fd);
+            ev.int(*count as u64);
+            ev
+        }
         SyscallRequest::CopyFileRange {
             fd_in,
             fd_out,
@@ -1324,6 +1336,7 @@ pub fn syscall_canonical_name(
         S::Statfs { .. } => "statfs",
         S::Fstatfs { .. } => "fstatfs",
         S::Fadvise64 { .. } => "fadvise64",
+        S::Sendfile { .. } => "sendfile",
         S::CopyFileRange { .. } => "copy_file_range",
         S::Eventfd2 { .. } => "eventfd2",
         S::MemfdCreate { .. } => "memfd_create",

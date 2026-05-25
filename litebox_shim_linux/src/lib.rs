@@ -3933,6 +3933,12 @@ impl<FS: ShimFS> Task<FS> {
                 self.validate_fd(fd)?;
                 Ok(0)
             }
+            SyscallRequest::Sendfile {
+                out_fd,
+                in_fd,
+                offset,
+                count,
+            } => self.sys_sendfile(out_fd, in_fd, offset, count),
             SyscallRequest::CopyFileRange {
                 fd_in,
                 off_in,
