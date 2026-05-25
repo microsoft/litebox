@@ -179,6 +179,17 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .descriptor_table_mut()
                 .remove(&old_sock);
             rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_broker_pipe) =
+            rds.fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
+        {
+            drop(rds);
+            let _ = self
+                .task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_broker_pipe);
+            rds = files.raw_descriptor_store.write();
         } else if let Ok(old_host) =
             rds.fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
         {
@@ -272,6 +283,17 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .litebox
                 .descriptor_table_mut()
                 .remove(&old_sock);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_broker_pipe) =
+            rds.fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
+        {
+            drop(rds);
+            let _ = self
+                .task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_broker_pipe);
             rds = files.raw_descriptor_store.write();
         } else if let Ok(old_host) =
             rds.fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
@@ -390,6 +412,17 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                         .litebox
                         .descriptor_table_mut()
                         .remove(&old_sock);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_broker_pipe) = rds
+                    .fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
+                {
+                    drop(rds);
+                    let _ = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_broker_pipe);
                     rds = files.raw_descriptor_store.write();
                 } else if let Ok(old_host) = rds
                     .fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
@@ -4798,6 +4831,9 @@ struct ForkContext {
     /// failure path we drain this list and call `release` on each
     /// to undo the dup so the broker refcount returns to baseline.
     fork_snapshot_broker_transit: Vec<crate::syscalls::fork_snapshot::ForkSnapshotBrokerTransit>,
+    /// Process-exit subscriptions that keep pidfd target ProcessState entries
+    /// alive until a restored child can install its own inherited-pidfd wake.
+    fork_snapshot_pidfd_process_transit: Vec<crate::syscalls::guest_pid::BrokerProcessExitWake>,
     /// Rollback list for host-fd tokens registered for fork-restore.
     fork_snapshot_fd_token_transit: Vec<crate::syscalls::fork_snapshot::ForkSnapshotFdTokenTransit>,
 }
