@@ -1974,6 +1974,14 @@ impl<FS: ShimFS> Task<FS> {
         self.do_shutdown(sockfd, read, write)
     }
     fn do_shutdown(&self, sockfd: u32, read: bool, write: bool) -> Result<(), Errno> {
+        if let Some(result) = self.try_with_broker_sp(sockfd, |typed| {
+            let handle = self.broker_sp_handle(typed)?;
+            handle.with_entry(|entry| entry.shutdown(read, write));
+            Ok(())
+        }) {
+            return result;
+        }
+
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
