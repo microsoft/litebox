@@ -3188,6 +3188,10 @@ impl<FS: ShimFS> Task<FS> {
                 // thread bookkeeping immediately after fork before user code.
                 | Sysno::rt_sigaction | Sysno::rt_sigprocmask | Sysno::sigaltstack
                 | Sysno::set_tid_address | Sysno::set_robust_list
+                // Thread/runtime teardown before exit_group.  Rust/glibc may
+                // unmap and madvise thread stacks after user code calls exit;
+                // migrating at that point only stalls the vfork parent.
+                | Sysno::munmap | Sysno::madvise
                 // Identity.
                 | Sysno::setuid | Sysno::setgid | Sysno::setgroups
                 | Sysno::setreuid | Sysno::setregid
