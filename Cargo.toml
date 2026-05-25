@@ -23,6 +23,7 @@ members = [
     "litebox_util_log",
     "litebox_util_log_macros",
     "litebox_broker",
+    "litebox_panic_hook",
     "litebox_tool_executor",
     "litebox_test_harness",
     "litebox_timing",

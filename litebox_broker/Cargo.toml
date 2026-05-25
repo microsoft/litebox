@@ -8,6 +8,7 @@ bitflags = "2"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux", features = ["std"] }
+litebox_panic_hook = { version = "0.1.0", path = "../litebox_panic_hook" }
 litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter" }
 litebox_timing = { path = "../litebox_timing" }
 serde = { version = "1", features = ["derive"] }

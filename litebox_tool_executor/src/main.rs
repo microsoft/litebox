@@ -110,6 +110,7 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    litebox_panic_hook::install("tool_executor");
     litebox_timing::init_from_env();
     litebox_timing::emit("container_pid1_started_ns");
     let cli = Cli::parse();
