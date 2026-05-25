@@ -2713,6 +2713,7 @@ impl<FS: ShimFS> Task<FS> {
                 parent_mux_pipe_pair_ids: self.mux_pipe_pair_ids.borrow().clone(),
                 parent_is_delayed_fork: self.delayed_fork_pending.get() || nested_delayed_fork,
                 fork_snapshot_broker_transit: Vec::new(),
+                fork_snapshot_pidfd_process_transit: Vec::new(),
                 fork_snapshot_fd_token_transit: Vec::new(),
             };
             (
@@ -4173,6 +4174,7 @@ impl<FS: ShimFS> Task<FS> {
             for transit in fc.fork_snapshot_broker_transit.drain(..) {
                 transit.releaser.release(transit.handle_id);
             }
+            fc.fork_snapshot_pidfd_process_transit.clear();
             for transit in fc.fork_snapshot_fd_token_transit.drain(..) {
                 let _ = transit.client.release(transit.token_id);
             }
@@ -4312,6 +4314,7 @@ impl<FS: ShimFS> Task<FS> {
         let fd_table = self.snapshot_fd_table(
             &mut reject,
             &mut fc.fork_snapshot_broker_transit,
+            &mut fc.fork_snapshot_pidfd_process_transit,
             &mut fc.fork_snapshot_fd_token_transit,
             true,
         );
@@ -6019,6 +6022,7 @@ impl<FS: ShimFS> Task<FS> {
             for transit in fc.fork_snapshot_broker_transit.drain(..) {
                 transit.releaser.release(transit.handle_id);
             }
+            fc.fork_snapshot_pidfd_process_transit.clear();
         }
 
         // Spawn a background thread that waits for the child worker to exit
@@ -6167,9 +6171,12 @@ impl<FS: ShimFS> Task<FS> {
             Vec::new();
         let mut _true_fork_fd_token_transit: Vec<super::fork_snapshot::ForkSnapshotFdTokenTransit> =
             Vec::new();
+        let mut _true_fork_pidfd_process_transit: Vec<super::guest_pid::BrokerProcessExitWake> =
+            Vec::new();
         let fd_table = self.snapshot_fd_table(
             &mut reject,
             &mut _true_fork_transit,
+            &mut _true_fork_pidfd_process_transit,
             &mut _true_fork_fd_token_transit,
             false,
         );
@@ -6521,6 +6528,7 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         reject: &mut super::fork_snapshot::ForkRejectReasons,
         broker_transit: &mut Vec<super::fork_snapshot::ForkSnapshotBrokerTransit>,
+        pidfd_process_transit: &mut Vec<super::guest_pid::BrokerProcessExitWake>,
         fd_token_transit: &mut Vec<super::fork_snapshot::ForkSnapshotFdTokenTransit>,
         skip_cloexec: bool,
     ) -> super::fork_snapshot::FdTableSnapshot {
@@ -6818,6 +6826,14 @@ impl<FS: ShimFS> Task<FS> {
                                 }
                             };
                             if kind == BrokerHandleKind::Pidfd {
+                                if let Ok(target_pid) = u32::try_from(handle_id)
+                                    && let Some(wake) =
+                                        super::guest_pid::try_subscribe_broker_process_exit(
+                                            litebox::process::ProcessId(target_pid),
+                                        )
+                                {
+                                    pidfd_process_transit.push(wake);
+                                }
                                 Some(BrokerHandleSnapshot {
                                     kind,
                                     handle_id,
@@ -8909,6 +8925,12 @@ impl<FS: ShimFS> Task<FS> {
             >,
             u64,
         )> = alloc::vec::Vec::new();
+        // Process-token pidfd bridges need an in-transit exit subscription:
+        // the source pidfd can close before the remote exec'd child installs
+        // its own subscription, but the target may exit in that window.
+        let mut broker_pidfd_process_transit: alloc::vec::Vec<
+            super::guest_pid::BrokerProcessExitWake,
+        > = alloc::vec::Vec::new();
         {
             // Collect EventfdSubsystem fds (non-stdio) and promote each to
             // broker-backed if not already. Skip on broker-provider absence
@@ -8981,6 +9003,13 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     };
                     if kind == BrokerHandleKind::Pidfd {
+                        if let Ok(target_pid) = u32::try_from(handle_id)
+                            && let Some(wake) = super::guest_pid::try_subscribe_broker_process_exit(
+                                litebox::process::ProcessId(target_pid),
+                            )
+                        {
+                            broker_pidfd_process_transit.push(wake);
+                        }
                         broker_eventfd_specs
                             .push(alloc::format!("{raw_fd}:{kind_str}:{handle_id}"));
                     } else if let Some(releaser) = releaser
