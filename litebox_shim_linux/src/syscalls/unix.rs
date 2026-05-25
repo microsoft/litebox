@@ -715,34 +715,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
 
     fn try_sendto(&self, msg: Message) -> Result<(), (Message, Errno)> {
         match &self.transport {
-            UnixTransport::Channel { send, .. } => {
-                // Phase B-Step10 refcount audit: `parse_sendmsg_cmsg`
-                // eagerly called `provider.dup_handle` on every
-                // broker-backed entry (it had to, because by this
-                // point we no longer have task context to look up the
-                // provider). On the in-worker Channel path the
-                // `PassedFd` aliases the SAME global-dt EventFile
-                // entry the sender already holds, so the duplicate
-                // broker refcount is redundant — when the receiver's
-                // installed fd is dropped, only ONE `release_eventfd`
-                // fires (from `EventFile::Drop` once the last alias
-                // goes). Undo the eager dup here.
-                if let Some(provider) = super::eventfd::broker_eventfd_provider() {
-                    for token in &msg.passed_tokens {
-                        if matches!(
-                            token.tag(),
-                            litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd
-                        ) {
-                            provider.release_eventfd(token.id());
-                        }
-                    }
-                }
-                // Strip tokens — they're a cross-worker concept; the
-                // in-worker path doesn't carry them across.
-                let mut msg = msg;
-                msg.passed_tokens.clear();
-                send.try_write_one(msg)
-            }
+            UnixTransport::Channel { send, .. } => send.try_write_one(msg),
             UnixTransport::Tcp { proxy, .. } => {
                 use litebox::net::socket_channel::NetworkProxy;
                 // Phase B-Step8e: always-LBFD-frame on the cross-worker
@@ -837,8 +810,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 }
             }
             UnixTransport::Channel { recv, .. } => {
-                let _ = received_tokens;
-                self.try_recvfrom_channel(recv, buf, seqpacket, received_fds)
+                self.try_recvfrom_channel(recv, buf, seqpacket, received_fds, received_tokens)
             }
         }
     }
@@ -883,6 +855,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         mut buf: &mut [u8],
         seqpacket: bool,
         received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, TryOpError<Errno>> {
         if seqpacket {
             // SOCK_SEQPACKET: return exactly one message per recv call.
@@ -894,6 +867,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                     let copy_len = buf.len().min(msg.data.len());
                     buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
                     received_fds.append(&mut msg.passed_fds);
+                    received_tokens.append(&mut msg.passed_tokens);
                     Ok((true, copy_len))
                 })
                 .map_err(|e| match e {
@@ -907,9 +881,12 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         let mut total_read = 0;
         while !buf.is_empty() {
             let n = match recv.peek_and_consume_one(|msg| {
-                // Extract any passed fds from the first message that carries them.
+                // Extract any passed fds/tokens from the first message that carries them.
                 if !msg.passed_fds.is_empty() {
                     received_fds.append(&mut msg.passed_fds);
+                }
+                if !msg.passed_tokens.is_empty() {
+                    received_tokens.append(&mut msg.passed_tokens);
                 }
                 if buf.len() >= msg.data.len() {
                     buf[..msg.data.len()].copy_from_slice(&msg.data);

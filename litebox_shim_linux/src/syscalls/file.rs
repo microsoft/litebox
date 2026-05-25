@@ -2220,6 +2220,80 @@ impl<FS: ShimFS> Task<FS> {
         Ok(status)
     }
 
+    pub fn sys_sendfile(
+        &self,
+        out_fd: i32,
+        in_fd: i32,
+        offset: MutPtr<i64>,
+        count: usize,
+    ) -> Result<usize, Errno> {
+        let mut explicit_pos = self.copy_file_range_explicit_offset(offset)?;
+        let mut copied = 0usize;
+        let mut buf = vec![0u8; count.min(super::super::MAX_KERNEL_BUF_SIZE).min(16 * 1024)];
+
+        while copied < count {
+            let chunk_len = core::cmp::min(count - copied, buf.len());
+            let read = match self.sys_read(in_fd, &mut buf[..chunk_len], explicit_pos) {
+                Ok(n) => n,
+                Err(err) if copied == 0 => return Err(err),
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
+            self.park_if_deferred();
+
+            let mut written = 0usize;
+            while written < read {
+                let wrote = match self.sys_write(out_fd, &buf[written..read], None) {
+                    Ok(0) if copied == 0 && written == 0 => {
+                        if explicit_pos.is_none() {
+                            self.sys_lseek(
+                                in_fd,
+                                -isize::try_from(read).map_err(|_| Errno::EOVERFLOW)?,
+                                SeekWhence::RelativeToCurrentOffset,
+                            )?;
+                        }
+                        return Err(Errno::EIO);
+                    }
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(err) if copied == 0 && written == 0 => {
+                        if explicit_pos.is_none() {
+                            self.sys_lseek(
+                                in_fd,
+                                -isize::try_from(read).map_err(|_| Errno::EOVERFLOW)?,
+                                SeekWhence::RelativeToCurrentOffset,
+                            )?;
+                        }
+                        return Err(err);
+                    }
+                    Err(_) => break,
+                };
+                written = written.checked_add(wrote).ok_or(Errno::EOVERFLOW)?;
+                self.park_if_deferred();
+            }
+
+            if explicit_pos.is_none() && written < read {
+                self.sys_lseek(
+                    in_fd,
+                    -isize::try_from(read - written).map_err(|_| Errno::EOVERFLOW)?,
+                    SeekWhence::RelativeToCurrentOffset,
+                )?;
+            }
+            copied = copied.checked_add(written).ok_or(Errno::EOVERFLOW)?;
+            if let Some(pos) = explicit_pos.as_mut() {
+                *pos = pos.checked_add(written).ok_or(Errno::EOVERFLOW)?;
+            }
+            if written < read {
+                break;
+            }
+        }
+
+        self.finish_copy_file_range_explicit_offset(offset, explicit_pos)?;
+        Ok(copied)
+    }
+
     pub fn sys_copy_file_range(
         &self,
         fd_in: i32,

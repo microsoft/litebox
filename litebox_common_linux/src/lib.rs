@@ -2604,6 +2604,13 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         len: i64,
         advice: i32,
     },
+    /// Copy data from a file descriptor to another descriptor.
+    Sendfile {
+        out_fd: i32,
+        in_fd: i32,
+        offset: Platform::RawMutPointer<i64>,
+        count: usize,
+    },
     /// Copy a range of data from one file to another.
     CopyFileRange {
         fd_in: i32,
@@ -3736,6 +3743,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 offset,
                 len,
                 advice
+            }),
+            Sysno::sendfile => sys_req!(Sendfile {
+                out_fd,
+                in_fd,
+                offset:*,
+                count
             }),
             Sysno::copy_file_range => sys_req!(CopyFileRange {
                 fd_in,
