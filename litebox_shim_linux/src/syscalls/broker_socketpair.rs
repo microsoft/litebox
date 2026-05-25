@@ -14,7 +14,7 @@
 //! wire).
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use litebox::{
     event::{Events, IOPollable, observer::Observer, polling::Pollee, wait::WaitContext},
@@ -78,6 +78,8 @@ pub(crate) struct BrokerSocketPairFd<P: RawSyncPrimitivesProvider + litebox::pla
     common: BrokerBackedCommon<P>,
     endpoint: BrokerSocketPairEndpoint,
     status: AtomicU32,
+    read_shutdown: AtomicBool,
+    write_shutdown: AtomicBool,
     pollee: Arc<Pollee<P>>,
 }
 
@@ -121,6 +123,8 @@ where
             common,
             endpoint,
             status: AtomicU32::new((access | (flags & OFlags::STATUS_FLAGS_MASK)).bits()),
+            read_shutdown: AtomicBool::new(false),
+            write_shutdown: AtomicBool::new(false),
             pollee: Arc::new(Pollee::new()),
         }
     }
@@ -157,6 +161,9 @@ impl BrokerSocketPairFd<Platform> {
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
         if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.read_shutdown.load(Ordering::Acquire) {
             return Ok(0);
         }
         self.common.ensure_subscribed(&self.pollee);
@@ -199,9 +206,24 @@ impl BrokerSocketPairFd<Platform> {
             })
     }
 
+    pub(crate) fn shutdown(&self, read: bool, write: bool) {
+        // Broker socketpair protocol does not yet model peer-visible half-close;
+        // preserve fd-local shutdown semantics and rely on close for peer HUP.
+        if read {
+            self.read_shutdown.store(true, Ordering::Release);
+            self.common.set_readable(false);
+        }
+        if write {
+            self.write_shutdown.store(true, Ordering::Release);
+        }
+    }
+
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, Errno> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        if self.write_shutdown.load(Ordering::Acquire) {
+            return Err(Errno::EPIPE);
         }
         self.common.ensure_subscribed(&self.pollee);
         // WriteSocketPair body overhead = 16 bytes (handle_id u64 +
