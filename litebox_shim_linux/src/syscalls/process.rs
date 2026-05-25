@@ -6044,6 +6044,8 @@ impl<FS: ShimFS> Task<FS> {
 
                 global.fork_child_host_pids.write().remove(&child_proc_id.0);
 
+                super::guest_pid::try_mark_broker_process_exited(child_proc_id.0, exit_status);
+
                 global
                     .control_plane
                     .unregister_running_process(child_proc_id);
@@ -6325,6 +6327,8 @@ impl<FS: ShimFS> Task<FS> {
                 // Remove the fork child host PID mapping first to prevent
                 // kill() from forwarding signals to a potentially-reused PID.
                 global.fork_child_host_pids.write().remove(&child_proc_id.0);
+
+                super::guest_pid::try_mark_broker_process_exited(child_proc_id.0, exit_status);
 
                 // Unregister from control plane before exit notification.
                 global
@@ -9353,6 +9357,12 @@ impl<FS: ShimFS> Task<FS> {
             .fork_child_host_pids
             .write()
             .remove(&self.process_id.0);
+        let broker_exit_status = if exit_code > 255 {
+            (exit_code - 256) + 128
+        } else {
+            exit_code
+        };
+        super::guest_pid::try_mark_broker_process_exited(self.process_id.0, broker_exit_status);
 
         // Phase F.9: now that worker B has exited, release the pipe
         // transit dup_handle refs that the emit-side bumped at exec
