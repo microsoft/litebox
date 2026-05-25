@@ -33,8 +33,9 @@ use crate::fd_token_protocol::{
     build_read_siginfo_request, build_read_socketpair_request,
     build_register_notification_ring_request, build_register_process_request,
     build_register_request, build_release_request, build_set_pgid_request, build_set_sid_request,
-    build_subscribe_eventfd_request, build_subscribe_process_exit_request,
-    build_subscribe_pty_request, build_subscribe_signal_inbox_request, build_unsubscribe_request,
+    build_shutdown_socketpair_write_request, build_subscribe_eventfd_request,
+    build_subscribe_process_exit_request, build_subscribe_pty_request,
+    build_subscribe_signal_inbox_request, build_unsubscribe_request,
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
     build_write_socketpair_request, decode, parse_create_pidfd_response_ok,
     parse_create_pty_response_ok, parse_create_socketpair_response_body, parse_handle_body,
@@ -1002,6 +1003,28 @@ impl FdTokenClient {
                 .map_err(ClientError::Protocol),
             StatusCode::WouldBlock => Err(ClientError::WouldBlock),
             StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: 0 }),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn shutdown_socketpair_write(&self, handle_id: u64) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_shutdown_socketpair_write_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::ShutdownSocketPairWriteResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }

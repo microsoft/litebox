@@ -87,6 +87,12 @@ impl BrokerSocketPairProvider for RunnerBrokerSocketPairProvider {
             .write_socketpair(handle, bytes)
             .map_err(client_err_to_broker_err)
     }
+
+    fn shutdown_socketpair_write(&self, handle: u64) -> Result<(), BrokerOpError> {
+        self.client
+            .shutdown_socketpair_write(handle)
+            .map_err(client_err_to_broker_err)
+    }
 }
 
 struct CallbackBridge {

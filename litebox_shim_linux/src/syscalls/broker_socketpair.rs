@@ -206,16 +206,17 @@ impl BrokerSocketPairFd<Platform> {
             })
     }
 
-    pub(crate) fn shutdown(&self, read: bool, write: bool) {
-        // Broker socketpair protocol does not yet model peer-visible half-close;
-        // preserve fd-local shutdown semantics and rely on close for peer HUP.
+    pub(crate) fn shutdown(&self, read: bool, write: bool) -> Result<(), Errno> {
         if read {
             self.read_shutdown.store(true, Ordering::Release);
             self.common.set_readable(false);
         }
-        if write {
-            self.write_shutdown.store(true, Ordering::Release);
+        if write && !self.write_shutdown.swap(true, Ordering::AcqRel) {
+            self.provider
+                .shutdown_socketpair_write(self.handle())
+                .map_err(broker_err_to_errno)?;
         }
+        Ok(())
     }
 
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, Errno> {
