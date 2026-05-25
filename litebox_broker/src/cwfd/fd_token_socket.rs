@@ -1193,6 +1193,7 @@ fn handle_control_connection_inner(
                     | Opcode::CreateSocketPair
                     | Opcode::ReadSocketPair
                     | Opcode::WriteSocketPair
+                    | Opcode::ShutdownSocketPairWrite
                     | Opcode::CreatePty
                     | Opcode::OpenPtySlave
                     | Opcode::PtyRead

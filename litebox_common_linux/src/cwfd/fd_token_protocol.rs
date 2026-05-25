@@ -132,6 +132,7 @@ pub enum Opcode {
     CreateSocketPair = 0x30,
     ReadSocketPair = 0x31,
     WriteSocketPair = 0x32,
+    ShutdownSocketPairWrite = 0x33,
     CreatePty = 0x60,
     OpenPtySlave = 0x65,
     PtyRead = 0x61,
@@ -187,6 +188,7 @@ pub enum Opcode {
     CreateSocketPairResponse = 0xB0,
     ReadSocketPairResponse = 0xB1,
     WriteSocketPairResponse = 0xB2,
+    ShutdownSocketPairWriteResponse = 0xB3,
     CreatePtyResponse = 0xE0,
     OpenPtySlaveResponse = 0xE5,
     PtyReadResponse = 0xE1,
@@ -314,6 +316,7 @@ impl Opcode {
             Opcode::CreateSocketPair => Some(Opcode::CreateSocketPairResponse),
             Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
             Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
+            Opcode::ShutdownSocketPairWrite => Some(Opcode::ShutdownSocketPairWriteResponse),
             Opcode::CreatePty => Some(Opcode::CreatePtyResponse),
             Opcode::OpenPtySlave => Some(Opcode::OpenPtySlaveResponse),
             Opcode::PtyRead => Some(Opcode::PtyReadResponse),
@@ -358,6 +361,7 @@ impl Opcode {
                 | Opcode::CreateSocketPair
                 | Opcode::ReadSocketPair
                 | Opcode::WriteSocketPair
+                | Opcode::ShutdownSocketPairWrite
                 | Opcode::CreatePty
                 | Opcode::OpenPtySlave
                 | Opcode::PtyRead
@@ -417,6 +421,7 @@ impl TryFrom<u8> for Opcode {
             0x30 => Ok(Opcode::CreateSocketPair),
             0x31 => Ok(Opcode::ReadSocketPair),
             0x32 => Ok(Opcode::WriteSocketPair),
+            0x33 => Ok(Opcode::ShutdownSocketPairWrite),
             0x60 => Ok(Opcode::CreatePty),
             0x65 => Ok(Opcode::OpenPtySlave),
             0x61 => Ok(Opcode::PtyRead),
@@ -453,6 +458,7 @@ impl TryFrom<u8> for Opcode {
             0xB0 => Ok(Opcode::CreateSocketPairResponse),
             0xB1 => Ok(Opcode::ReadSocketPairResponse),
             0xB2 => Ok(Opcode::WriteSocketPairResponse),
+            0xB3 => Ok(Opcode::ShutdownSocketPairWriteResponse),
             0xE0 => Ok(Opcode::CreatePtyResponse),
             0xE5 => Ok(Opcode::OpenPtySlaveResponse),
             0xE1 => Ok(Opcode::PtyReadResponse),
@@ -1954,6 +1960,29 @@ pub fn build_write_socketpair_response_ok(written: u64) -> OwnedFrame {
 
 pub fn parse_write_socketpair_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
     parse_handle_body(body, Opcode::WriteSocketPairResponse)
+}
+
+/// Body for [`Opcode::ShutdownSocketPairWrite`]: (handle: u64).
+pub fn build_shutdown_socketpair_write_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::ShutdownSocketPairWrite,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_shutdown_socketpair_write_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::ShutdownSocketPairWrite)
+}
+
+pub fn build_shutdown_socketpair_write_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::ShutdownSocketPairWriteResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
 }
 
 /// Body for [`Opcode::CreatePty`]: empty (allocates one master/slave pair).

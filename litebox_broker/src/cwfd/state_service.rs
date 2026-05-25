@@ -43,19 +43,20 @@ use litebox_common_linux::fd_token_protocol::{
     build_read_pipe_response_ok, build_read_siginfo_response_ok, build_read_socketpair_response_ok,
     build_register_notification_ring_response_ok, build_register_process_response_ok,
     build_release_response_ok, build_set_pgid_response_ok, build_set_sid_response_ok,
-    build_subscribe_eventfd_response_ok, build_subscribe_process_exit_response_ok,
-    build_subscribe_pty_response_ok, build_subscribe_signal_inbox_response_ok,
-    build_unsubscribe_response_ok, build_unsubscribe_signal_inbox_response_ok,
-    build_write_eventfd_response_ok, build_write_pipe_response_ok,
-    build_write_socketpair_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
-    parse_create_pipe_body, parse_create_signalfd_body, parse_create_socketpair_body,
-    parse_deliver_signal_inbox_body, parse_handle_body, parse_mark_process_exited_body,
-    parse_open_pty_slave_body, parse_pidfd_exited_request, parse_pty_ioctl_body,
-    parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body, parse_read_pipe_body,
-    parse_read_socketpair_body, parse_set_pgid_body, parse_set_sid_body,
-    parse_subscribe_eventfd_body, parse_subscribe_process_exit_body, parse_subscribe_pty_body,
-    parse_subscribe_signal_inbox_body, parse_unsubscribe_body, parse_unsubscribe_signal_inbox_body,
-    parse_write_eventfd_body, parse_write_pipe_body, parse_write_socketpair_body,
+    build_shutdown_socketpair_write_response_ok, build_subscribe_eventfd_response_ok,
+    build_subscribe_process_exit_response_ok, build_subscribe_pty_response_ok,
+    build_subscribe_signal_inbox_response_ok, build_unsubscribe_response_ok,
+    build_unsubscribe_signal_inbox_response_ok, build_write_eventfd_response_ok,
+    build_write_pipe_response_ok, build_write_socketpair_response_ok, parse_create_eventfd_body,
+    parse_create_pidfd_body, parse_create_pipe_body, parse_create_signalfd_body,
+    parse_create_socketpair_body, parse_deliver_signal_inbox_body, parse_handle_body,
+    parse_mark_process_exited_body, parse_open_pty_slave_body, parse_pidfd_exited_request,
+    parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body,
+    parse_read_pipe_body, parse_read_socketpair_body, parse_set_pgid_body, parse_set_sid_body,
+    parse_shutdown_socketpair_write_body, parse_subscribe_eventfd_body,
+    parse_subscribe_process_exit_body, parse_subscribe_pty_body, parse_subscribe_signal_inbox_body,
+    parse_unsubscribe_body, parse_unsubscribe_signal_inbox_body, parse_write_eventfd_body,
+    parse_write_pipe_body, parse_write_socketpair_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -181,6 +182,9 @@ pub fn handle_request(
         Opcode::CreateSocketPair => handle_create_socketpair(registry, request, in_fds),
         Opcode::ReadSocketPair => handle_read_socketpair(registry, request, in_fds),
         Opcode::WriteSocketPair => handle_write_socketpair(registry, request, in_fds),
+        Opcode::ShutdownSocketPairWrite => {
+            handle_shutdown_socketpair_write(registry, request, in_fds)
+        }
         Opcode::ReadSiginfo => handle_read_siginfo(registry, request, in_fds),
         Opcode::PushSiginfo => handle_push_siginfo(registry, request, in_fds),
         Opcode::CreatePty => handle_create_pty(registry, request, in_fds),
@@ -926,6 +930,33 @@ fn handle_write_socketpair(
         Err(SocketPairError::PeerClosed) => {
             status_err(Opcode::WriteSocketPairResponse, StatusCode::InvalidValue)
         }
+    }
+}
+
+fn handle_shutdown_socketpair_write(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::ShutdownSocketPairWriteResponse);
+    }
+    let handle_id = match parse_shutdown_socketpair_write_body(request.body) {
+        Ok(handle_id) => handle_id,
+        Err(_) => return protocol_err(Opcode::ShutdownSocketPairWriteResponse),
+    };
+    let state = match resolve_socketpair_end(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::ShutdownSocketPairWriteResponse, status),
+    };
+    let end = state
+        .as_any()
+        .downcast_ref::<SocketPairEnd>()
+        .expect("resolve_socketpair_end checked");
+    end.shutdown_write();
+    HandlerResult {
+        frame: build_shutdown_socketpair_write_response_ok(),
+        out_fd: None,
     }
 }
 
