@@ -66,6 +66,8 @@ type BrokerSocketPairHandle = litebox::fd::EntryHandle<
     Platform,
     crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem,
 >;
+type BrokerTcpConnTypedFd =
+    litebox::fd::TypedFd<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>;
 
 impl<FS: ShimFS> super::file::FilesState<FS> {
     /// Helper to dispatch socket operations based on socket type (INET vs Unix).
@@ -1256,6 +1258,26 @@ impl<FS: ShimFS> Task<FS> {
             .entry_handle(typed)
             .ok_or(Errno::EBADF)
     }
+
+    fn try_with_broker_tcp_conn<R>(
+        &self,
+        sockfd: u32,
+        op: impl FnOnce(&BrokerTcpConnTypedFd) -> Result<R, Errno>,
+    ) -> Option<Result<R, Errno>> {
+        let raw_fd = match usize::try_from(sockfd) {
+            Ok(raw_fd) => raw_fd,
+            Err(_) => return Some(Err(Errno::EBADF)),
+        };
+        let broker_tcp = {
+            let files = self.files.borrow();
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
+                .ok()
+        };
+        broker_tcp.map(|typed| op(typed.as_ref()))
+    }
 }
 
 impl<FS: ShimFS> Task<FS> {
@@ -1816,6 +1838,16 @@ impl<FS: ShimFS> Task<FS> {
         if !crate::syscalls::broker_tcp_conn::broker_tcp_conn_accept_enabled() {
             return Ok(None);
         }
+        let peer_addr = match peer_addr.cloned() {
+            Some(addr) => Some(addr),
+            None => self
+                .global
+                .net
+                .lock()
+                .get_remote_addr(accepted_file)
+                .ok()
+                .map(SocketAddress::Inet),
+        };
         let Some(SocketAddress::Inet(SocketAddr::V4(peer))) = peer_addr else {
             return Ok(None);
         };
@@ -3303,7 +3335,7 @@ impl<FS: ShimFS> Task<FS> {
         if self.netlink_sockets.borrow().contains_key(&sockfd) {
             return Ok(());
         }
-        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| match optname {
+        let broker_sockopt = |optname| match optname {
             SocketOptionName::Socket(
                 SocketOption::RCVTIMEO
                 | SocketOption::SNDTIMEO
@@ -3320,7 +3352,13 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(())
             }
             _ => Err(Errno::ENOPROTOOPT),
-        }) {
+        };
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| broker_sockopt(optname)) {
+            return result;
+        }
+        if let Some(result) =
+            self.try_with_broker_tcp_conn(sockfd, |_typed| broker_sockopt(optname))
+        {
             return result;
         }
         self.files.borrow().with_socket(
@@ -3382,7 +3420,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             return Ok(0);
         }
-        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| match optname {
+        let broker_getsockopt = |optname| match optname {
             SocketOptionName::Socket(
                 SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER,
             ) => self
@@ -3411,7 +3449,13 @@ impl<FS: ShimFS> Task<FS> {
                 super::write_to_user(0u32, optval, len)
             }
             _ => Err(Errno::ENOPROTOOPT),
-        }) {
+        };
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| broker_getsockopt(optname)) {
+            return result;
+        }
+        if let Some(result) =
+            self.try_with_broker_tcp_conn(sockfd, |_typed| broker_getsockopt(optname))
+        {
             return result;
         }
         self.files.borrow().with_socket(
@@ -3465,6 +3509,11 @@ impl<FS: ShimFS> Task<FS> {
         }) {
             return result;
         }
+        if let Some(result) =
+            self.try_with_broker_tcp_conn(sockfd, |_typed| Ok(SocketAddress::default()))
+        {
+            return result;
+        }
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -3502,6 +3551,11 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| {
             Ok(SocketAddress::Unix(super::unix::UnixSocketAddr::Unnamed))
         }) {
+            return result;
+        }
+        if let Some(result) =
+            self.try_with_broker_tcp_conn(sockfd, |_typed| Ok(SocketAddress::default()))
+        {
             return result;
         }
         self.files.borrow().with_socket(
