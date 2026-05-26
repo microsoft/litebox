@@ -154,6 +154,17 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             .install_signalfd_bridge_fd(guest_fd, handle_id, mask_bits, nonblock)
     }
 
+    pub fn install_brokerfile_bridge_fd(
+        &self,
+        guest_fd: usize,
+        path: &str,
+        position: usize,
+        status_flags_bits: u32,
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
+        self.task
+            .install_brokerfile_bridge_fd(guest_fd, path, position, status_flags_bits)
+    }
+
     /// Install a external fd FD into the restored child's descriptor table.
     ///
     /// Called by the runner after `restore_process` to replace virtual pipe

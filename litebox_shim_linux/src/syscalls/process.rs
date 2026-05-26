@@ -9219,6 +9219,45 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            let fs_fds: alloc::vec::Vec<(usize, alloc::sync::Arc<litebox::fd::TypedFd<FS>>)> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if raw_fd <= 2 || !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in fs_fds {
+                let bridge_info = {
+                    let files = self.files.borrow();
+                    files.fs.fd_path(&typed).and_then(|path| {
+                        let position = files
+                            .fs
+                            .seek(&typed, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
+                            .ok()?;
+                        let status_flags_bits = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(&typed, |crate::StdioStatusFlags(flags)| flags.bits())
+                            .unwrap_or(OFlags::RDONLY.bits());
+                        Some((path, position, status_flags_bits))
+                    })
+                };
+                if let Some((path, position, status_flags_bits)) = bridge_info {
+                    broker_eventfd_specs.push(alloc::format!(
+                        "{raw_fd}:brokerfile:{status_flags_bits}:{position}:{}",
+                        brokerfile_bridge_encode_path(&path)
+                    ));
+                }
+            }
+
             let signalfd_fds: alloc::vec::Vec<(
                 usize,
                 alloc::sync::Arc<litebox::fd::TypedFd<super::signalfd::SignalfdSubsystem>>,
@@ -10153,6 +10192,16 @@ fn worker_exec_fd_survives_exec<FS: ShimFS>(
         && get_file_descriptor_flags(raw_fd, global, files)
             .map(|flags| !flags.contains(FileDescriptorFlags::FD_CLOEXEC))
             .unwrap_or(false)
+}
+
+fn brokerfile_bridge_encode_path(path: &str) -> alloc::string::String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = alloc::string::String::with_capacity(path.len() * 2);
+    for byte in path.as_bytes() {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 fn worker_exec_has_unsupported_stdio<FS: ShimFS>(
