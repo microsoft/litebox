@@ -9213,6 +9213,29 @@ impl<FS: ShimFS> Task<FS> {
                     ));
                 }
             }
+
+            let network_fds: alloc::vec::Vec<usize> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if rds
+                        .fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
+                        .is_ok()
+                    {
+                        out.push(raw_fd);
+                    }
+                }
+                out
+            };
+            for raw_fd in network_fds {
+                if let Some(spec) = self.tcp_listen_worker_exec_bridge_spec(raw_fd) {
+                    broker_eventfd_specs.push(spec);
+                }
+            }
         }
 
         // Resolve the worker load path through the current guest filesystem so

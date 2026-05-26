@@ -376,6 +376,46 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     ))
 }
 
+fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
+    entrypoints: &litebox_shim_linux::LinuxShimEntrypoints<FS>,
+    spec: &str,
+) -> Result<()> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.get(1) == Some(&"tcp_listen") {
+        if parts.len() != 4 {
+            anyhow::bail!("broker-fd-bridge: bad tcp_listen spec {spec:?}");
+        }
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let port: u16 = parts[2]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad port {:?}: {e}", parts[2]))?;
+        let reuse_port = match parts[3] {
+            "0" => false,
+            "1" => true,
+            other => anyhow::bail!("broker-fd-bridge: bad reuse flag {other:?}"),
+        };
+        return entrypoints
+            .install_tcp_listen_bridge_fd(guest_fd, port, reuse_port)
+            .map_err(|err| anyhow!("broker-fd-bridge: tcp_listen {spec:?}: {err:?}"));
+    }
+
+    let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
+        parse_broker_fd_bridge_spec(spec)?;
+    entrypoints
+        .install_broker_bridge_fd(
+            guest_fd,
+            kind,
+            handle_id,
+            pipe_direction,
+            socketpair_endpoint,
+            pty_role,
+            pty_id,
+        )
+        .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))
+}
+
 fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
     let path = path.as_ref();
     let abs_path = std::path::absolute(path)
@@ -1097,20 +1137,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
-                parse_broker_fd_bridge_spec(spec)?;
-            program
-                .entrypoints
-                .install_broker_bridge_fd(
-                    guest_fd,
-                    kind,
-                    handle_id,
-                    pipe_direction,
-                    socketpair_endpoint,
-                    pty_role,
-                    pty_id,
-                )
-                .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+            install_broker_fd_bridge_spec(&program.entrypoints, spec)?;
         }
 
         if let Some(pty_id) = cli_args.controlling_pty {
@@ -1206,20 +1233,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // extended in Phase C.3 to handle pipe).
     let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
     for spec in &cli_args.broker_fd_bridge {
-        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
-            parse_broker_fd_bridge_spec(spec)?;
-        program
-            .entrypoints
-            .install_broker_bridge_fd(
-                guest_fd,
-                kind,
-                handle_id,
-                pipe_direction,
-                socketpair_endpoint,
-                pty_role,
-                pty_id,
-            )
-            .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+        install_broker_fd_bridge_spec(&program.entrypoints, spec)?;
     }
 
     if let Some(pty_id) = cli_args.controlling_pty {
@@ -2522,20 +2536,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(guest_task);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
-                parse_broker_fd_bridge_spec(spec)?;
-            program
-                .entrypoints
-                .install_broker_bridge_fd(
-                    guest_fd,
-                    kind,
-                    handle_id,
-                    pipe_direction,
-                    socketpair_endpoint,
-                    pty_role,
-                    pty_id,
-                )
-                .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+            install_broker_fd_bridge_spec(&program.entrypoints, spec)?;
         }
 
         // Stage B: restore parent's controlling PTY so /dev/tty resolves
