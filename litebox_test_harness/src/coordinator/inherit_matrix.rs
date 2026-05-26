@@ -9,6 +9,7 @@
 //! the corresponding runner.
 
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::os::eventfd::EventFd;
 use crate::{BinaryType, register_handler, register_leaf_subcommand};
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,8 @@ use super::registry::Registry;
 
 const TCP_LISTEN_MATRIX: HandlerToken<TcpListenTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.tcp_listen");
+const EVENTFD_MATRIX: HandlerToken<EventfdTrialArgs, ChildOutput> =
+    HandlerToken::new("inherit_matrix.eventfd");
 
 const TCP_LISTEN_OPS: &[InheritOp] = &[
     InheritOp::Accept,
@@ -161,6 +164,13 @@ struct TcpListenTrialArgs {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct EventfdTrialArgs {
+    child_binary: String,
+    op: InheritOp,
+    timeout_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct ChildOutput {
     exit_code: i32,
     stdout: String,
@@ -169,18 +179,21 @@ struct ChildOutput {
 
 pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(TCP_LISTEN_MATRIX, handle_tcp_listen_trial);
+    register_handler!(EVENTFD_MATRIX, handle_eventfd_trial);
     register_leaf_subcommand!("inherit-matrix", leaf_subcmd::subcmd_inherit_matrix);
 
-    for &parent_bt in BinaryType::ALL {
-        for &child_bt in BinaryType::ALL {
-            for &op in valid_ops(InheritSubsystem::TcpListen) {
-                let trial = InheritTrial {
-                    parent_bt,
-                    child_bt,
-                    subsystem: InheritSubsystem::TcpListen,
-                    op,
-                };
-                register_trial(reg, trial);
+    for &subsystem in &[InheritSubsystem::TcpListen, InheritSubsystem::Eventfd] {
+        for &parent_bt in BinaryType::ALL {
+            for &child_bt in BinaryType::ALL {
+                for &op in valid_ops(subsystem) {
+                    let trial = InheritTrial {
+                        parent_bt,
+                        child_bt,
+                        subsystem,
+                        op,
+                    };
+                    register_trial(reg, trial);
+                }
             }
         }
     }
@@ -239,22 +252,45 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
             Box::pin(async move {
                 let self_exe = run.self_exe().to_string();
                 let child_binary = crate::binary_path(trial.child_bt, &self_exe);
-                let result = run
-                    .send_named_typed(
-                        &parent_handle,
-                        &TCP_LISTEN_MATRIX,
-                        TcpListenTrialArgs {
-                            child_binary,
-                            op: trial.op,
-                            timeout_ms: 5000,
-                        },
-                    )
-                    .await;
+                let result = match trial.subsystem {
+                    InheritSubsystem::TcpListen => {
+                        run.send_named_typed(
+                            &parent_handle,
+                            &TCP_LISTEN_MATRIX,
+                            TcpListenTrialArgs {
+                                child_binary,
+                                op: trial.op,
+                                timeout_ms: 5000,
+                            },
+                        )
+                        .await
+                    }
+                    InheritSubsystem::Eventfd => {
+                        run.send_named_typed(
+                            &parent_handle,
+                            &EVENTFD_MATRIX,
+                            EventfdTrialArgs {
+                                child_binary,
+                                op: trial.op,
+                                timeout_ms: 2000,
+                            },
+                        )
+                        .await
+                    }
+                    _ => Err(format!(
+                        "{} scaffolded dispatch placeholder; implementation pending",
+                        trial.subsystem.id()
+                    )),
+                };
                 match result {
                     Ok(out) if out.exit_code == 0 => TestOutcome::new(
                         parent.name(),
                         true,
-                        format!("child {} inherited tcp_listen fd", trial.op.id()),
+                        format!(
+                            "child {} inherited {} fd",
+                            trial.op.id(),
+                            trial.subsystem.id()
+                        ),
                     ),
                     Ok(out) => TestOutcome::new(
                         parent.name(),
@@ -315,7 +351,7 @@ fn run_tcp_conn_trial() -> String {
 
 #[allow(dead_code)]
 fn run_eventfd_trial() -> String {
-    "INHERIT.eventfd: scaffold pending".into()
+    "eventfd is implemented by handle_eventfd_trial".into()
 }
 
 #[allow(dead_code)]
@@ -336,6 +372,115 @@ fn run_pty_trial() -> String {
 #[allow(dead_code)]
 fn run_broker_file_trial() -> String {
     "INHERIT.broker_file: scaffold pending".into()
+}
+
+async fn handle_eventfd_trial(
+    args: EventfdTrialArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    let ev = EventFd::open(0, "nonblock|semaphore|cloexec")
+        .map_err(|e| HandlerError(format!("eventfd open: {e}")))?;
+    let fd = ev.as_raw_fd();
+    clear_cloexec(fd)?;
+
+    let (child_value, parent_value) = match args.op {
+        InheritOp::Read | InheritOp::Poll => (42_u64, 0_u64),
+        InheritOp::Write => (100_u64, 100_u64),
+        _ => {
+            return Err(HandlerError(format!(
+                "unsupported eventfd op {}",
+                args.op.id()
+            )));
+        }
+    };
+
+    if args.op == InheritOp::Read {
+        ev.write(child_value)
+            .map_err(|e| HandlerError(format!("eventfd pre-write {child_value}: {e}")))?;
+    }
+
+    let mut child = Command::new(&args.child_binary);
+    child
+        .args([
+            "inherit-matrix",
+            "eventfd-child",
+            args.op.id(),
+            &child_value.to_string(),
+            &args.timeout_ms.to_string(),
+        ])
+        .env("LITEBOX_INHERIT_FD", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = child
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+
+    if args.op == InheritOp::Poll {
+        ev.write(child_value)
+            .map_err(|e| HandlerError(format!("eventfd poll-write {child_value}: {e}")))?;
+    } else if args.op == InheritOp::Write {
+        read_eventfd_total(&ev, parent_value, Duration::from_millis(args.timeout_ms))?;
+    }
+
+    let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 1000))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut exit_code = output.status.code().unwrap_or(-1);
+
+    if exit_code == 0 {
+        match args.op {
+            InheritOp::Read | InheritOp::Poll if stdout != "1" => {
+                exit_code = 1;
+                return Ok(ChildOutput {
+                    exit_code,
+                    stdout,
+                    stderr: format!("eventfd semaphore read mismatch: expected 1; {stderr}"),
+                });
+            }
+            InheritOp::Write if stdout != parent_value.to_string() => {
+                exit_code = 1;
+                return Ok(ChildOutput {
+                    exit_code,
+                    stdout,
+                    stderr: format!(
+                        "eventfd write stdout mismatch: expected {parent_value}; {stderr}"
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ChildOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_eventfd_total(
+    ev: &EventFd,
+    expected_total: u64,
+    timeout: Duration,
+) -> Result<(), HandlerError> {
+    let deadline = Instant::now() + timeout;
+    let mut total = 0_u64;
+    while total < expected_total && Instant::now() < deadline {
+        match ev.read() {
+            Ok(value) => total = total.saturating_add(value),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => return Err(HandlerError(format!("eventfd read parent total: {e}"))),
+        }
+    }
+    if total == expected_total {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "eventfd parent read timed out: total={total} expected={expected_total}"
+        )))
+    }
 }
 
 async fn handle_tcp_listen_trial(
@@ -556,6 +701,7 @@ mod leaf_subcmd {
     pub(super) fn subcmd_inherit_matrix(args: &[String]) -> i32 {
         match args.get(2).map(String::as_str) {
             Some("tcp-listen-child") => tcp_listen_child(args),
+            Some("eventfd-child") => eventfd_child(args),
             Some(other) => {
                 eprintln!("inherit-matrix: unknown subcommand: {other}");
                 2
@@ -565,6 +711,98 @@ mod leaf_subcmd {
                 2
             }
         }
+    }
+
+    fn eventfd_child(args: &[String]) -> i32 {
+        let Some(op) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix eventfd-child: missing op");
+            return 2;
+        };
+        let Some(value) = args.get(4).and_then(|s| s.parse::<u64>().ok()) else {
+            eprintln!("inherit-matrix eventfd-child: bad value");
+            return 2;
+        };
+        let Some(timeout_ms) = args.get(5).and_then(|s| s.parse::<i32>().ok()) else {
+            eprintln!("inherit-matrix eventfd-child: bad timeout");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix eventfd-child: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+
+        match op {
+            "read" => read_eventfd(fd, 1),
+            "write" => write_eventfd(fd, value),
+            "poll" => poll_read_eventfd(fd, timeout_ms, 1),
+            other => {
+                eprintln!("inherit-matrix eventfd-child: unknown op {other}");
+                2
+            }
+        }
+    }
+
+    fn read_eventfd(fd: RawFd, expected: u64) -> i32 {
+        let mut value = 0_u64;
+        loop {
+            // SAFETY: value is valid writable storage for one eventfd word.
+            let n =
+                unsafe { libc::read(fd, std::ptr::from_mut(&mut value).cast::<libc::c_void>(), 8) };
+            if n == 8 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("inherit-matrix eventfd read: n={n} err={err}");
+                return 1;
+            }
+        }
+        if value != expected {
+            eprintln!("inherit-matrix eventfd read: value={value} expected={expected}");
+            return 1;
+        }
+        println!("{value}");
+        0
+    }
+
+    fn write_eventfd(fd: RawFd, value: u64) -> i32 {
+        loop {
+            // SAFETY: value is valid readable storage for one eventfd word.
+            let n =
+                unsafe { libc::write(fd, std::ptr::from_ref(&value).cast::<libc::c_void>(), 8) };
+            if n == 8 {
+                println!("{value}");
+                return 0;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("inherit-matrix eventfd write: n={n} err={err}");
+                return 1;
+            }
+        }
+    }
+
+    fn poll_read_eventfd(fd: RawFd, timeout_ms: i32, expected: u64) -> i32 {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is initialized and the count matches the buffer length.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+        if rc <= 0 || pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "inherit-matrix eventfd poll: rc={} revents={} err={}",
+                rc,
+                pfd.revents,
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        read_eventfd(fd, expected)
     }
 
     fn tcp_listen_child(args: &[String]) -> i32 {
