@@ -398,6 +398,12 @@ pub trait IPInterfaceProvider {
         Ok(())
     }
 
+    /// Send a port-listen transfer control message (LBPL action 2) to the broker.
+    /// The default implementation is a no-op (platforms without a broker).
+    fn send_port_listen_transfer(&self, _port: u16) -> Result<(), SendError> {
+        Ok(())
+    }
+
     /// Diagnostic callback: smoltcp generated a RST packet.
     /// Called from TxToken with the pre-poll TCP socket state.
     /// Default is no-op; overridden by platforms that can log.

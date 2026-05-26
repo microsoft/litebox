@@ -18,6 +18,13 @@ use tracing::{error, info, warn};
 /// MTU matching the guest-side smoltcp configuration.
 pub const DEVICE_MTU: usize = 1600;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortListenAction {
+    Unlisten,
+    Listen,
+    Transfer,
+}
+
 /// smoltcp device with a staging buffer for SYN-peek dispatch.
 pub struct IpcDevice {
     fd: IpcStream,
@@ -68,15 +75,24 @@ impl IpcDevice {
 
     /// Check if the staged packet is a port-listen control message (not an IP packet).
     /// Format: [0x00, 'P', 'L', port_hi, port_lo, action]
-    /// where action: 1 = listen, 0 = unlisten.
-    /// Returns Some((port, is_listen)) if it's a control message, None otherwise.
-    pub fn take_port_listen_msg(&mut self) -> Option<(u16, bool)> {
+    /// where action: 1 = listen, 0 = unlisten, 2 = transfer.
+    /// Returns Some((port, action)) if it's a control message, None otherwise.
+    pub fn take_port_listen_msg(&mut self) -> Option<(u16, PortListenAction)> {
         let len = self.rx_len?;
         if len >= 6 && self.rx_buf[0] == 0x00 && self.rx_buf[1] == b'P' && self.rx_buf[2] == b'L' {
             let port = u16::from_be_bytes([self.rx_buf[3], self.rx_buf[4]]);
-            let is_listen = self.rx_buf[5] != 0;
+            let action = match self.rx_buf[5] {
+                0 => PortListenAction::Unlisten,
+                1 => PortListenAction::Listen,
+                2 => PortListenAction::Transfer,
+                other => {
+                    warn!("unknown LBPL action {other} for port {port}");
+                    self.rx_len = None;
+                    return None;
+                }
+            };
             self.rx_len = None; // consume the message
-            Some((port, is_listen))
+            Some((port, action))
         } else {
             None
         }

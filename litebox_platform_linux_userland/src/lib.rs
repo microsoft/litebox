@@ -4690,6 +4690,21 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 }
 
+impl LinuxUserland {
+    fn send_port_listen_action(
+        &self,
+        port: u16,
+        action: u8,
+    ) -> Result<(), litebox::platform::SendError> {
+        if self.network_transport.read().unwrap().is_none() {
+            return Ok(());
+        }
+        let port_bytes = port.to_be_bytes();
+        let msg: [u8; 6] = [0x00, b'P', b'L', port_bytes[0], port_bytes[1], action];
+        litebox::platform::IPInterfaceProvider::send_ip_packet(self, &msg)
+    }
+}
+
 impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
         let transport = self.network_transport.read().unwrap();
@@ -4810,16 +4825,11 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         port: u16,
         listen: bool,
     ) -> Result<(), litebox::platform::SendError> {
-        // Check if network transport is available (it won't be during
-        // shutdown or when running without a broker).
-        if self.network_transport.read().unwrap().is_none() {
-            return Ok(());
-        }
-        // LBPL control message: [0x00, 'P', 'L', port_hi, port_lo, action]
-        let port_bytes = port.to_be_bytes();
-        let msg: [u8; 6] = [0x00, b'P', b'L', port_bytes[0], port_bytes[1], listen as u8];
-        // Send through the same IPC framing as IP packets.
-        self.send_ip_packet(&msg)
+        self.send_port_listen_action(port, listen as u8)
+    }
+
+    fn send_port_listen_transfer(&self, port: u16) -> Result<(), litebox::platform::SendError> {
+        self.send_port_listen_action(port, 2)
     }
 
     fn on_rst_transmitted(

@@ -250,9 +250,6 @@ impl PortRouter {
     }
 
     /// Transfer a TCP listen route from one worker proxy to another.
-    ///
-    /// Design stub only: the implementation must atomically validate the
-    /// current owner and retarget future routed streams to `to_sender`.
     pub fn transfer_listen_route(
         &self,
         port: u16,
@@ -260,8 +257,52 @@ impl PortRouter {
         to_worker_id: u64,
         to_sender: std::sync::mpsc::Sender<RoutedStream>,
     ) -> Result<TransferListenRouteOutcome, TransferListenRouteError> {
-        let _ = (port, from_worker_id, to_worker_id, to_sender);
-        todo!("transfer_listen_route: validate route ownership and retarget sender")
+        let mut routes = self.routes.lock().unwrap();
+        let Some((owner, sender)) = routes.get_mut(&port) else {
+            return Err(TransferListenRouteError::PortNotRegistered);
+        };
+
+        if *owner == to_worker_id {
+            return Ok(TransferListenRouteOutcome::AlreadyOwnedByTarget);
+        }
+        if *owner != from_worker_id {
+            return Err(TransferListenRouteError::SourceNotOwner {
+                actual_owner: *owner,
+            });
+        }
+
+        *owner = to_worker_id;
+        *sender = to_sender;
+        info!(
+            "port router: transferred port {port} from worker {from_worker_id} to worker {to_worker_id}"
+        );
+        Ok(TransferListenRouteOutcome::Transferred)
+    }
+
+    /// Transfer a TCP listen route to `to_worker_id`, inferring the source from
+    /// the current route owner.
+    pub fn transfer_listen_route_from_current(
+        &self,
+        port: u16,
+        to_worker_id: u64,
+        to_sender: std::sync::mpsc::Sender<RoutedStream>,
+    ) -> Result<TransferListenRouteOutcome, TransferListenRouteError> {
+        let mut routes = self.routes.lock().unwrap();
+        let Some((owner, sender)) = routes.get_mut(&port) else {
+            return Err(TransferListenRouteError::PortNotRegistered);
+        };
+
+        if *owner == to_worker_id {
+            return Ok(TransferListenRouteOutcome::AlreadyOwnedByTarget);
+        }
+
+        let from_worker_id = *owner;
+        *owner = to_worker_id;
+        *sender = to_sender;
+        info!(
+            "port router: transferred port {port} from worker {from_worker_id} to worker {to_worker_id}"
+        );
+        Ok(TransferListenRouteOutcome::Transferred)
     }
 
     /// Try to route an accepted TCP stream to the worker that owns `guest_port`.
@@ -945,39 +986,71 @@ fn run_inner(
         // Step 1b: Check for port-listen control messages.
         // Workers send these when they call listen(port) to register
         // their interest in receiving inbound connections.
-        if let Some((port, is_listen)) = device.take_port_listen_msg() {
-            if is_listen {
-                if let Some(ref tx) = inbound_routed_tx {
-                    port_router.register(port, worker_id, tx.clone());
-                    registered_ports.push(port);
-                    info!("worker registered listen on port {port}");
-                    // File-based diagnostic
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/rst-diag.log")
-                    {
-                        let _ =
-                            writeln!(f, "BROKER PORT REGISTER: port={port} worker_id={worker_id}");
-                    }
-                } else {
-                    // Init proxy received a listen notification — register
-                    // but no routing needed (init handles its own inbound).
-                    info!("init proxy listen on port {port} (local)");
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/rst-diag.log")
-                    {
-                        let _ = writeln!(f, "BROKER PORT REGISTER (init, local): port={port}");
+        if let Some((port, action)) = device.take_port_listen_msg() {
+            match action {
+                device::PortListenAction::Listen => {
+                    if let Some(ref tx) = inbound_routed_tx {
+                        port_router.register(port, worker_id, tx.clone());
+                        registered_ports.push(port);
+                        info!("worker registered listen on port {port}");
+                        // File-based diagnostic
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/rst-diag.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "BROKER PORT REGISTER: port={port} worker_id={worker_id}"
+                            );
+                        }
+                    } else {
+                        // Init proxy received a listen notification — register
+                        // but no routing needed (init handles its own inbound).
+                        info!("init proxy listen on port {port} (local)");
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/rst-diag.log")
+                        {
+                            let _ = writeln!(f, "BROKER PORT REGISTER (init, local): port={port}");
+                        }
                     }
                 }
-            } else {
-                port_router.unregister(port);
-                registered_ports.retain(|p| *p != port);
-                info!("unregistered listen on port {port}");
+                device::PortListenAction::Unlisten => {
+                    port_router.unregister(port);
+                    registered_ports.retain(|p| *p != port);
+                    info!("unregistered listen on port {port}");
+                }
+                device::PortListenAction::Transfer => {
+                    if let Some(ref tx) = inbound_routed_tx {
+                        match port_router.transfer_listen_route_from_current(
+                            port,
+                            worker_id,
+                            tx.clone(),
+                        ) {
+                            Ok(TransferListenRouteOutcome::Transferred) => {
+                                if !registered_ports.contains(&port) {
+                                    registered_ports.push(port);
+                                }
+                                info!("worker transferred listen route for port {port}");
+                            }
+                            Ok(TransferListenRouteOutcome::AlreadyOwnedByTarget) => {
+                                if !registered_ports.contains(&port) {
+                                    registered_ports.push(port);
+                                }
+                                info!("listen route for port {port} already owned by worker");
+                            }
+                            Err(err) => {
+                                warn!("failed to transfer listen route for port {port}: {err:?}");
+                            }
+                        }
+                    } else {
+                        warn!("init proxy cannot transfer listen route for port {port}");
+                    }
+                }
             }
         }
 
@@ -2874,11 +2947,67 @@ fn discover_host_dns() -> Ipv4Addr {
 mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
+    #[cfg(windows)]
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    fn routed_stream_sender() -> std::sync::mpsc::Sender<RoutedStream> {
+        std::sync::mpsc::channel().0
+    }
+
+    #[test]
+    fn transfer_listen_route_swaps_owner() {
+        let router = PortRouter::new();
+        router.register(12345, 1, routed_stream_sender());
+
+        let result = router.transfer_listen_route(12345, 1, 2, routed_stream_sender());
+        assert_eq!(result, Ok(TransferListenRouteOutcome::Transferred));
+        assert_eq!(router.routes.lock().unwrap().get(&12345).unwrap().0, 2);
+    }
+
+    #[test]
+    fn transfer_listen_route_is_idempotent_for_target_owner() {
+        let router = PortRouter::new();
+        router.register(12345, 2, routed_stream_sender());
+
+        let result = router.transfer_listen_route(12345, 1, 2, routed_stream_sender());
+        assert_eq!(result, Ok(TransferListenRouteOutcome::AlreadyOwnedByTarget));
+        assert_eq!(router.routes.lock().unwrap().get(&12345).unwrap().0, 2);
+    }
+
+    #[test]
+    fn transfer_listen_route_reports_missing_port() {
+        let router = PortRouter::new();
+
+        let result = router.transfer_listen_route(12345, 1, 2, routed_stream_sender());
+        assert_eq!(result, Err(TransferListenRouteError::PortNotRegistered));
+    }
+
+    #[test]
+    fn transfer_listen_route_rejects_unexpected_source() {
+        let router = PortRouter::new();
+        router.register(12345, 3, routed_stream_sender());
+
+        let result = router.transfer_listen_route(12345, 1, 2, routed_stream_sender());
+        assert_eq!(
+            result,
+            Err(TransferListenRouteError::SourceNotOwner { actual_owner: 3 })
+        );
+        assert_eq!(router.routes.lock().unwrap().get(&12345).unwrap().0, 3);
+    }
+
+    #[test]
+    fn transfer_listen_route_from_current_swaps_owner() {
+        let router = PortRouter::new();
+        router.register(12345, 1, routed_stream_sender());
+
+        let result = router.transfer_listen_route_from_current(12345, 2, routed_stream_sender());
+        assert_eq!(result, Ok(TransferListenRouteOutcome::Transferred));
+        assert_eq!(router.routes.lock().unwrap().get(&12345).unwrap().0, 2);
+    }
 
     #[test]
     fn test_build_udp_packet_valid() {
