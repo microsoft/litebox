@@ -30,6 +30,8 @@ use super::registry::Registry;
 
 const TCP_LISTEN_MATRIX: HandlerToken<TcpListenTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.tcp_listen");
+const PIPE_MATRIX: HandlerToken<PipeTrialArgs, ChildOutput> =
+    HandlerToken::new("inherit_matrix.pipe");
 const EVENTFD_MATRIX: HandlerToken<EventfdTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.eventfd");
 const PTY_MATRIX: HandlerToken<PtyTrialArgs, ChildOutput> = HandlerToken::new("inherit_matrix.pty");
@@ -44,8 +46,11 @@ const TCP_LISTEN_OPS: &[InheritOp] = &[
     InheritOp::GetSockoptReuseport,
 ];
 
-#[allow(dead_code)]
-const PIPE_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Write, InheritOp::Poll];
+const PIPE_OPS: &[InheritOp] = &[
+    InheritOp::ParentWritesChildReads,
+    InheritOp::ChildWritesParentReads,
+    InheritOp::ChildCloseParentReadsEof,
+];
 #[allow(dead_code)]
 const SOCKETPAIR_OPS: &[InheritOp] = &[
     InheritOp::Read,
@@ -143,6 +148,9 @@ enum InheritOp {
     RecvPending,
     RecvAfterFork,
     RecvCloseEof,
+    ParentWritesChildReads,
+    ChildWritesParentReads,
+    ChildCloseParentReadsEof,
     ReadAtOffset0,
     WriteThenParentReadsBack,
     LseekThenRead,
@@ -166,6 +174,9 @@ impl InheritOp {
             Self::RecvPending => "recv_pending",
             Self::RecvAfterFork => "recv_after_fork",
             Self::RecvCloseEof => "recv_close_eof",
+            Self::ParentWritesChildReads => "parent_writes_child_reads",
+            Self::ChildWritesParentReads => "child_writes_parent_reads",
+            Self::ChildCloseParentReadsEof => "child_close_parent_reads_eof",
             Self::ReadAtOffset0 => "read_at_offset_0",
             Self::WriteThenParentReadsBack => "write_then_parent_reads_back",
             Self::LseekThenRead => "lseek_then_read",
@@ -195,6 +206,13 @@ impl InheritTrial {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct TcpListenTrialArgs {
+    child_binary: String,
+    op: InheritOp,
+    timeout_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PipeTrialArgs {
     child_binary: String,
     op: InheritOp,
     timeout_ms: u64,
@@ -238,6 +256,7 @@ struct ChildOutput {
 
 pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(TCP_LISTEN_MATRIX, handle_tcp_listen_trial);
+    register_handler!(PIPE_MATRIX, handle_pipe_trial);
     register_handler!(EVENTFD_MATRIX, handle_eventfd_trial);
     register_handler!(PTY_MATRIX, handle_pty_trial);
     register_handler!(SIGNALFD_MATRIX, handle_signalfd_trial);
@@ -246,6 +265,7 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
 
     for &subsystem in &[
         InheritSubsystem::TcpListen,
+        InheritSubsystem::Pipe,
         InheritSubsystem::Eventfd,
         InheritSubsystem::Pty,
         InheritSubsystem::Signalfd,
@@ -281,6 +301,7 @@ const fn valid_ops(subsystem: InheritSubsystem) -> &'static [InheritOp] {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
     let id = trial.id();
     let parent = parent_agent(trial.parent_bt);
@@ -302,6 +323,18 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
                                 child_binary,
                                 op: trial.op,
                                 timeout_ms: 5000,
+                            },
+                        )
+                        .await
+                    }
+                    InheritSubsystem::Pipe => {
+                        run.send_named_typed(
+                            &parent_handle,
+                            &PIPE_MATRIX,
+                            PipeTrialArgs {
+                                child_binary,
+                                op: trial.op,
+                                timeout_ms: 2000,
                             },
                         )
                         .await
@@ -401,7 +434,7 @@ fn run_scaffolded_trial(subsystem: InheritSubsystem, _op: InheritOp) -> String {
         InheritSubsystem::TcpListen => {
             "tcp_listen is implemented by handle_tcp_listen_trial".into()
         }
-        InheritSubsystem::Pipe => run_pipe_trial(),
+        InheritSubsystem::Pipe => "pipe is implemented by handle_pipe_trial".into(),
         InheritSubsystem::SocketPair => run_socketpair_trial(),
         InheritSubsystem::TcpConn => run_tcp_conn_trial(),
         InheritSubsystem::Eventfd => run_eventfd_trial(),
@@ -413,8 +446,8 @@ fn run_scaffolded_trial(subsystem: InheritSubsystem, _op: InheritOp) -> String {
 }
 
 #[allow(dead_code)]
-fn run_pipe_trial() -> String {
-    "INHERIT.pipe: scaffold pending".into()
+fn run_pipe_trial_scaffold() -> String {
+    "pipe is implemented by handle_pipe_trial".into()
 }
 
 #[allow(dead_code)]
@@ -450,6 +483,161 @@ fn run_pty_trial() -> String {
 #[allow(dead_code)]
 fn run_broker_file_trial() -> String {
     "brokerfile is implemented by handle_brokerfile_trial".into()
+}
+
+async fn handle_pipe_trial(
+    args: PipeTrialArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    run_pipe_trial(&args)
+}
+
+fn run_pipe_trial(args: &PipeTrialArgs) -> Result<ChildOutput, HandlerError> {
+    let (read_end, write_end) = pipe_owned(libc::O_CLOEXEC)?;
+    let read_fd = read_end.as_raw_fd();
+    let write_fd = write_end.as_raw_fd();
+    let child_fd = match args.op {
+        InheritOp::ParentWritesChildReads => read_fd,
+        InheritOp::ChildWritesParentReads | InheritOp::ChildCloseParentReadsEof => write_fd,
+        _ => {
+            return Err(HandlerError(format!(
+                "unsupported pipe op {}",
+                args.op.id()
+            )));
+        }
+    };
+    // `LITEBOX_INHERIT_FD` documents the single pipe end intentionally
+    // inherited by the exec'd child: read end for p2c, write end for c2p/EOF.
+    clear_cloexec(child_fd)?;
+
+    if args.op == InheritOp::ParentWritesChildReads {
+        write_all_fd(write_fd, b"ping", "pipe parent write ping").map_err(HandlerError)?;
+    }
+
+    let mut child = Command::new(&args.child_binary);
+    child
+        .args(["inherit-matrix", "pipe-child", args.op.id()])
+        .env("LITEBOX_INHERIT_FD", child_fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+
+    let mut parent_error = None;
+    match args.op {
+        InheritOp::ParentWritesChildReads => {
+            drop(write_end);
+        }
+        InheritOp::ChildWritesParentReads => {
+            drop(write_end);
+            if let Err(e) = read_pipe_payload(read_fd, b"pong", args.timeout_ms) {
+                parent_error = Some(e);
+            }
+        }
+        InheritOp::ChildCloseParentReadsEof => {
+            drop(write_end);
+            if let Err(e) = read_pipe_eof(read_fd, args.timeout_ms) {
+                parent_error = Some(e);
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    if parent_error.is_some() {
+        let _ = child.kill();
+    }
+
+    let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 1000))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut exit_code = output.status.code().unwrap_or(-1);
+
+    if let Some(e) = parent_error {
+        exit_code = 1;
+        return Ok(ChildOutput {
+            exit_code,
+            stdout,
+            stderr: format!("{}; {stderr}", e.0),
+        });
+    }
+
+    if exit_code == 0 {
+        let expected = match args.op {
+            InheritOp::ParentWritesChildReads => "ping",
+            InheritOp::ChildWritesParentReads => "pong",
+            InheritOp::ChildCloseParentReadsEof => "closed",
+            _ => unreachable!(),
+        };
+        if stdout != expected {
+            exit_code = 1;
+            return Ok(ChildOutput {
+                exit_code,
+                stdout,
+                stderr: format!("pipe stdout mismatch: expected {expected}; {stderr}"),
+            });
+        }
+    }
+
+    Ok(ChildOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_pipe_payload(fd: RawFd, expected: &[u8], timeout_ms: u64) -> Result<(), HandlerError> {
+    let revents = poll_fd(
+        fd,
+        libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        timeout_ms,
+        "pipe parent payload",
+    )?;
+    if revents & libc::POLLIN == 0 {
+        return Err(HandlerError(format!(
+            "pipe parent payload poll got {}, expected POLLIN",
+            describe_events(revents)
+        )));
+    }
+    let mut buf = vec![0_u8; expected.len()];
+    read_exact_fd(fd, &mut buf, "pipe parent read")?;
+    if buf == expected {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "pipe parent payload mismatch: got {:?}, expected {:?}",
+            String::from_utf8_lossy(&buf),
+            String::from_utf8_lossy(expected)
+        )))
+    }
+}
+
+fn read_pipe_eof(fd: RawFd, timeout_ms: u64) -> Result<(), HandlerError> {
+    let revents = poll_fd(
+        fd,
+        libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        timeout_ms,
+        "pipe parent EOF",
+    )?;
+    if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+        return Err(HandlerError(format!(
+            "pipe parent EOF poll got {}, expected EOF readiness",
+            describe_events(revents)
+        )));
+    }
+    let mut byte = [0_u8; 1];
+    // SAFETY: `byte` is valid writable memory and fd is a live pipe read end.
+    let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast::<libc::c_void>(), byte.len()) };
+    match n.cmp(&0) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(HandlerError(format!(
+            "pipe parent EOF read expected 0, got {n} bytes"
+        ))),
+        std::cmp::Ordering::Less => Err(HandlerError(format!(
+            "pipe parent EOF read: {}",
+            std::io::Error::last_os_error()
+        ))),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1445,6 +1633,7 @@ mod leaf_subcmd {
     pub(super) fn subcmd_inherit_matrix(args: &[String]) -> i32 {
         match args.get(2).map(String::as_str) {
             Some("tcp-listen-child") => tcp_listen_child(args),
+            Some("pipe-child") => pipe_child(args),
             Some("eventfd-child") => eventfd_child(args),
             Some("pty-child") => pty_child(args),
             Some("signalfd-child") => signalfd_child(args),
@@ -1458,6 +1647,68 @@ mod leaf_subcmd {
                 2
             }
         }
+    }
+
+    fn pipe_child(args: &[String]) -> i32 {
+        let Some(op) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix pipe-child: missing op");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix pipe-child: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+
+        match op {
+            "parent_writes_child_reads" => read_pipe_child(fd, b"ping"),
+            "child_writes_parent_reads" => write_pipe_child(fd, b"pong"),
+            "child_close_parent_reads_eof" => close_pipe_child(fd),
+            other => {
+                eprintln!("inherit-matrix pipe-child: unknown op {other}");
+                2
+            }
+        }
+    }
+
+    fn read_pipe_child(fd: RawFd, expected: &[u8]) -> i32 {
+        let mut buf = vec![0_u8; expected.len()];
+        if read_exact_raw_fd(fd, &mut buf, "pipe child read") != 0 {
+            return 1;
+        }
+        if buf != expected {
+            eprintln!(
+                "inherit-matrix pipe child read: got {:?} expected {:?}",
+                String::from_utf8_lossy(&buf),
+                String::from_utf8_lossy(expected)
+            );
+            return 1;
+        }
+        println!("{}", String::from_utf8_lossy(&buf));
+        0
+    }
+
+    fn write_pipe_child(fd: RawFd, payload: &[u8]) -> i32 {
+        if write_all_raw_fd(fd, payload, "pipe child write") != 0 {
+            return 1;
+        }
+        println!("{}", String::from_utf8_lossy(payload));
+        0
+    }
+
+    fn close_pipe_child(fd: RawFd) -> i32 {
+        // SAFETY: best-effort close of the inherited pipe write end.
+        if unsafe { libc::close(fd) } != 0 {
+            eprintln!(
+                "inherit-matrix pipe child close: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        println!("closed");
+        0
     }
 
     fn brokerfile_child(args: &[String]) -> i32 {
