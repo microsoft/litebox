@@ -2097,6 +2097,15 @@ impl<FS: ShimFS> Task<FS> {
                 let handle = self.broker_sp_handle(fd)?;
                 handle.with_entry(|entry| entry.shutdown(read, write))
             }
+            crate::RawFdRef::BrokerTcpConn(fd) => {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|entry| entry.shutdown(read, write))
+            }
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTSOCK),
         })?
@@ -2429,6 +2438,10 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         crate::RawFdRef::BrokerSocketPair(_) => {
                             // Broker socketpairs are not broker-token-transferable over SCM yet.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::BrokerTcpConn(_) => {
+                            // Broker TCP connections are not broker-token-transferable over SCM yet.
                             Ok(false)
                         }
                         crate::RawFdRef::BrokerPty(_) => {

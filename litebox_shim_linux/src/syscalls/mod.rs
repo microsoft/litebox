@@ -7,6 +7,7 @@ pub(crate) mod broker_backed;
 pub(crate) mod broker_pipe;
 pub(crate) mod broker_pty;
 pub(crate) mod broker_socketpair;
+pub(crate) mod broker_tcp_conn;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub(crate) mod guest_pid;

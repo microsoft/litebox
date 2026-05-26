@@ -4418,6 +4418,7 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::Unix(_)
                         | crate::RawFdRef::BrokerPipe(_)
                         | crate::RawFdRef::BrokerSocketPair(_)
+                        | crate::RawFdRef::BrokerTcpConn(_)
                         | crate::RawFdRef::BrokerPty(_)
                         | crate::RawFdRef::Signalfd(_) => {}
                         crate::RawFdRef::Pipes(typed) => {
@@ -6677,6 +6678,12 @@ impl<FS: ShimFS> Task<FS> {
                             // UnixSocket so the broker-handle metadata is emitted
                             // below and the restored worker can re-attach to the
                             // same broker `SocketPairState` endpoint.
+                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerTcpConn(fd) => {
+                            // Stage 1 scaffold: classify as UnixSocket-shaped
+                            // broker state, matching BrokerSocketPair until the
+                            // TCP-connection-specific bridge metadata lands.
                             (FdClass::UnixSocket, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerPty(fd) => (
@@ -10498,6 +10505,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 // the actual inherited/closed stdio behavior later.
                 crate::RawFdRef::BrokerPipe(_broker_pipe) => false,
                 crate::RawFdRef::BrokerSocketPair(_broker_socketpair) => false,
+                crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => false,
                 crate::RawFdRef::BrokerPty(_broker_pty) => false,
                 crate::RawFdRef::Signalfd(_signalfd) => false,
             })
@@ -10667,6 +10675,7 @@ fn worker_exec_input_binding<FS: ShimFS>(
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::BrokerSocketPair(_broker_pipe) => WorkerExecInputBinding::Close,
+            crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => WorkerExecInputBinding::Close,
 
             // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
             // before exec; the --broker-fd-bridge install path will install
@@ -10819,6 +10828,7 @@ fn worker_exec_output_binding<FS: ShimFS>(
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::BrokerSocketPair(_broker_pipe) => WorkerExecOutputBinding::Close,
+            crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => WorkerExecOutputBinding::Close,
 
             // BrokerPipeSubsystem (Phase C.3): close the worker's output slot
             // before exec; the --broker-fd-bridge install path will install
