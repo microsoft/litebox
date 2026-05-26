@@ -8,6 +8,9 @@
 //! [`crate::fd_token_service`] (host-fd ops) and — once Phase B-Step6
 //! lands — `crate::state_service` (eventfd and other state-object ops).
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_request};
 use crate::fd_tokens::BrokerFdTokenRegistry;
 use crate::pgrp_signal_inbox::PgrpSignalInbox;

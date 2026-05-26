@@ -7,6 +7,9 @@
 //! number range. They forward to the appropriate NT handlers or provide
 //! direct implementations.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use core::sync::atomic::Ordering::Relaxed;
 
 use litebox::mm::PageManager;

@@ -10,8 +10,5 @@ libc = "0.2"
 litebox_panic_hook = { version = "0.1.0", path = "../litebox_panic_hook" }
 litebox_timing = { version = "0.1.0", path = "../litebox_timing" }
 
-[lints.rust]
-warnings = "deny"
-
-[lints.clippy]
-pedantic = { level = "deny", priority = -1 }
+[lints]
+workspace = true

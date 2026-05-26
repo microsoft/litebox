@@ -7,7 +7,6 @@
 //! chosen by the [platform multiplex](../litebox_platform_multiplex/index.html).
 
 #![no_std]
-#![allow(clippy::wildcard_enum_match_arm)]
 #![expect(
     clippy::unused_self,
     reason = "by convention, syscalls and related methods take &self even if unused"

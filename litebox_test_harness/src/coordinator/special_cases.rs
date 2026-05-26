@@ -8,6 +8,9 @@
 //! on the state left by the previous exec on the same agent (e.g., "run
 //! non-PIE, then run PIE — does the PIE see clean output?").
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
 use super::common::{BASH, BashArgs, EXEC_BIN, ExecBinArgs};
 // pipe_bridge import removed — US3.bidirectional now uses the

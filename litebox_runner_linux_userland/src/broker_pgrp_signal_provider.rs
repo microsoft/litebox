@@ -8,6 +8,9 @@
 //! standard-signal use (SIGWINCH and job-control signals) because the shim's
 //! pending-signal queues coalesce standard signals at delivery time.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use litebox_common_linux::cwfd::broker_pgrp_signal_provider::{
     BrokerPgrpSignalCallback, BrokerPgrpSignalProvider,
 };

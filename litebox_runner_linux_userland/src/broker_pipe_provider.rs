@@ -3,6 +3,9 @@
 
 //! Runner-side implementation of [`BrokerPipeProvider`].
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use litebox_common_linux::broker_eventfd::{NotificationCallback, NotificationDispatcher};
 use litebox_common_linux::broker_pipe_provider::{
     BrokerEventCallback, BrokerOpError, BrokerPipeProvider,

@@ -3,6 +3,8 @@
 
 //! Error handling. See [`Errno`].
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
 #![expect(
     clippy::match_same_arms,
     reason = "in this one module, we want to make sure we do the necessary repeat, just to keep consistency; \

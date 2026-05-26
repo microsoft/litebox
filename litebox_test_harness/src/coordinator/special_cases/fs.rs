@@ -4,6 +4,9 @@
 //! Filesystem and pipe-lifecycle special-case argv leaves, and CWF.*
 //! (cross-worker file I/O) tests.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use super::*;
 
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};

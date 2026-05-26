@@ -3,6 +3,9 @@
 
 //! Event file for notification, pid-backed polling, and timer-backed polling.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use alloc::sync::Arc;
 use core::{
     convert::Infallible,

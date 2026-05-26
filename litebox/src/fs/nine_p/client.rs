@@ -9,6 +9,9 @@
 //! sends its message under the write lock, then spin-waits for the dedicated
 //! worker thread to deliver the matching response.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

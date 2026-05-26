@@ -8,6 +8,9 @@
 //! must not block TCP progress. The family is migrated to handler
 //! dispatch so TCP and file operations happen directly in handler bodies.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use std::os::fd::AsRawFd;
 use std::thread::JoinHandle;
 

@@ -3,6 +3,9 @@
 
 //! This module manages the stack layout for TA (stack and `UteeParams`).
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use litebox::{
     mm::linux::CreatePagesFlags,
     platform::{RawConstPointer, RawMutPointer},

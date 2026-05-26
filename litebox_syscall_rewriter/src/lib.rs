@@ -14,6 +14,8 @@
 //!
 //! This crate currently only supports x86-64 (i.e., amd64) ELFs.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 

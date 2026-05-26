@@ -4,6 +4,9 @@
 //! Test coordinator. Runs as the init process, drives all test
 //! operations through pipes to child agents.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 pub(crate) mod agents;
 pub(crate) mod clone3_matrix;
 pub(crate) mod common;

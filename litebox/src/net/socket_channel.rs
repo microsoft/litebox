@@ -44,6 +44,9 @@
 //! - **No lock contention**: User read/write operations and network processing can proceed
 //!   concurrently without blocking each other.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use alloc::boxed::Box;
 use core::{
     net::SocketAddr,

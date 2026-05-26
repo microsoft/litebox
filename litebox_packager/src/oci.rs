@@ -576,7 +576,9 @@ fn normalize_path(path: &Path) -> PathBuf {
                 result.pop();
             }
             std::path::Component::CurDir | std::path::Component::RootDir => {}
-            c => result.push(c),
+            c @ (std::path::Component::Prefix(_) | std::path::Component::Normal(_)) => {
+                result.push(c);
+            }
         }
     }
     result.iter().collect()
