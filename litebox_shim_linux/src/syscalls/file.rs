@@ -5766,7 +5766,9 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
         if flags.contains(MemfdFlags::HUGETLB) {
-            return Err(Errno::ENOSYS);
+            unimplemented!(
+                "litebox does not support hugetlb memfd files: no huge-page backing store"
+            );
         }
         // MFD_EXEC and MFD_NOEXEC_SEAL are mutually exclusive.
         if flags.contains(MemfdFlags::EXEC) && flags.contains(MemfdFlags::NOEXEC_SEAL) {

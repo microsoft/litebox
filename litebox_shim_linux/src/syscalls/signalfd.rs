@@ -224,7 +224,7 @@ impl<FS: crate::ShimFS> crate::Task<FS> {
         nonblock: bool,
     ) -> Result<(), Errno> {
         let Some(provider) = broker_signalfd_provider() else {
-            return Err(Errno::ENOSYS);
+            unreachable!("installing signalfd bridge requires the broker signalfd provider");
         };
         let file = SignalfdFile::new_broker_backed(
             provider,

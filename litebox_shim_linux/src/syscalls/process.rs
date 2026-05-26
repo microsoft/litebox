@@ -9732,9 +9732,8 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // The syscall handler loop will stop the local shim task before it can
-        // resume guest code. Return ENOSYS as a placeholder — this path should
-        // not be reached in practice.
-        Err(Errno::ENOSYS)
+        // resume guest code.
+        unreachable!("remote exec worker returned to the local shim task")
     }
 
     fn worker_exec_stdio_bindings(&self) -> Result<WorkerExecStdioBindings<FS, Platform>, Errno> {
@@ -9845,9 +9844,8 @@ impl<FS: ShimFS> Task<FS> {
             ExecRoute::RemoteHost { .. } => {
                 // A previous route_exec call determined this process needs a
                 // remote host. This shouldn't happen on the first exec call
-                // since we check needs_remote_host below; this arm exists for
-                // completeness and future re-routing scenarios.
-                return Err(Errno::ENOSYS);
+                // since we check needs_remote_host below.
+                unreachable!("initial execve was already routed to a remote host")
             }
         }
         let loader = crate::loader::elf::ElfLoader::new(self, &path).map_err(Errno::from)?;
