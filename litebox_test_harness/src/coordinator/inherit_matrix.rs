@@ -11,6 +11,7 @@
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::os::eventfd::EventFd;
 use crate::os::pty::Pty;
+use crate::os::signalfd::Signalfd;
 use crate::{BinaryType, register_handler, register_leaf_subcommand};
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,8 @@ const TCP_LISTEN_MATRIX: HandlerToken<TcpListenTrialArgs, ChildOutput> =
 const EVENTFD_MATRIX: HandlerToken<EventfdTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.eventfd");
 const PTY_MATRIX: HandlerToken<PtyTrialArgs, ChildOutput> = HandlerToken::new("inherit_matrix.pty");
+const SIGNALFD_MATRIX: HandlerToken<SignalfdTrialArgs, ChildOutput> =
+    HandlerToken::new("inherit_matrix.signalfd");
 
 const TCP_LISTEN_OPS: &[InheritOp] = &[
     InheritOp::Accept,
@@ -57,8 +60,11 @@ const TCP_CONN_OPS: &[InheritOp] = &[
 ];
 #[allow(dead_code)]
 const EVENTFD_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Write, InheritOp::Poll];
-#[allow(dead_code)]
-const SIGNALFD_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Poll];
+const SIGNALFD_OPS: &[InheritOp] = &[
+    InheritOp::RecvPending,
+    InheritOp::RecvAfterFork,
+    InheritOp::RecvCloseEof,
+];
 #[allow(dead_code)]
 const TIMERFD_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Poll];
 #[allow(dead_code)]
@@ -128,6 +134,9 @@ enum InheritOp {
     SlaveWrite,
     SlaveRead,
     SlaveClose,
+    RecvPending,
+    RecvAfterFork,
+    RecvCloseEof,
 }
 
 impl InheritOp {
@@ -145,6 +154,9 @@ impl InheritOp {
             Self::SlaveWrite => "slave_write",
             Self::SlaveRead => "slave_read",
             Self::SlaveClose => "slave_close",
+            Self::RecvPending => "recv_pending",
+            Self::RecvAfterFork => "recv_after_fork",
+            Self::RecvCloseEof => "recv_close_eof",
         }
     }
 }
@@ -191,6 +203,13 @@ struct PtyTrialArgs {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct SignalfdTrialArgs {
+    child_binary: String,
+    op: InheritOp,
+    timeout_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct ChildOutput {
     exit_code: i32,
     stdout: String,
@@ -201,12 +220,14 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(TCP_LISTEN_MATRIX, handle_tcp_listen_trial);
     register_handler!(EVENTFD_MATRIX, handle_eventfd_trial);
     register_handler!(PTY_MATRIX, handle_pty_trial);
+    register_handler!(SIGNALFD_MATRIX, handle_signalfd_trial);
     register_leaf_subcommand!("inherit-matrix", leaf_subcmd::subcmd_inherit_matrix);
 
     for &subsystem in &[
         InheritSubsystem::TcpListen,
         InheritSubsystem::Eventfd,
         InheritSubsystem::Pty,
+        InheritSubsystem::Signalfd,
     ] {
         for &parent_bt in BinaryType::ALL {
             for &child_bt in BinaryType::ALL {
@@ -279,6 +300,18 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
                             &parent_handle,
                             &PTY_MATRIX,
                             PtyTrialArgs {
+                                child_binary,
+                                op: trial.op,
+                                timeout_ms: 2000,
+                            },
+                        )
+                        .await
+                    }
+                    InheritSubsystem::Signalfd => {
+                        run.send_named_typed(
+                            &parent_handle,
+                            &SIGNALFD_MATRIX,
+                            SignalfdTrialArgs {
                                 child_binary,
                                 op: trial.op,
                                 timeout_ms: 2000,
@@ -365,7 +398,7 @@ fn run_eventfd_trial() -> String {
 
 #[allow(dead_code)]
 fn run_signalfd_trial() -> String {
-    "INHERIT.signalfd: scaffold pending".into()
+    "signalfd is implemented by handle_signalfd_trial".into()
 }
 
 #[allow(dead_code)]
@@ -381,6 +414,195 @@ fn run_pty_trial() -> String {
 #[allow(dead_code)]
 fn run_broker_file_trial() -> String {
     "INHERIT.broker_file: scaffold pending".into()
+}
+
+async fn handle_signalfd_trial(
+    args: SignalfdTrialArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    Signalfd::block_signals(&[libc::SIGUSR1])
+        .map_err(|e| HandlerError(format!("signalfd block SIGUSR1: {e}")))?;
+    let sfd = Signalfd::open(&[libc::SIGUSR1], "nonblock|cloexec")
+        .map_err(|e| HandlerError(format!("signalfd open: {e}")))?;
+    let fd = sfd.as_raw_fd();
+    clear_cloexec(fd)?;
+
+    let ready_pipe = if matches!(args.op, InheritOp::RecvAfterFork | InheritOp::RecvCloseEof) {
+        Some(pipe_owned(libc::O_CLOEXEC)?)
+    } else {
+        None
+    };
+    let go_pipe = if args.op == InheritOp::RecvCloseEof {
+        Some(pipe_owned(libc::O_CLOEXEC)?)
+    } else {
+        None
+    };
+
+    if let Some((_, ready_write)) = &ready_pipe {
+        clear_cloexec(ready_write.as_raw_fd())?;
+    }
+    if let Some((go_read, _)) = &go_pipe {
+        clear_cloexec(go_read.as_raw_fd())?;
+    }
+
+    let mut child = Command::new(&args.child_binary);
+    child
+        .args([
+            "inherit-matrix",
+            "signalfd-child",
+            args.op.id(),
+            &args.timeout_ms.to_string(),
+        ])
+        .env("LITEBOX_INHERIT_FD", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some((_, ready_write)) = &ready_pipe {
+        child.env("LITEBOX_READY_FD", ready_write.as_raw_fd().to_string());
+    }
+    if let Some((go_read, _)) = &go_pipe {
+        child.env("LITEBOX_GO_FD", go_read.as_raw_fd().to_string());
+    }
+
+    let mut child = child
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+    let child_pid = child.id();
+    let ready_read = ready_pipe.map(|(read, write)| {
+        drop(write);
+        read
+    });
+    let go_write = go_pipe.map(|(read, write)| {
+        drop(read);
+        write
+    });
+
+    let mut parent_error = None;
+    match args.op {
+        InheritOp::RecvPending => {
+            if let Err(e) = kill_pid(child_pid, libc::SIGUSR1, "signalfd recv_pending") {
+                parent_error = Some(e);
+            }
+        }
+        InheritOp::RecvAfterFork => {
+            if let Some(ready_read) = ready_read.as_ref()
+                && let Err(e) = read_ready_byte(ready_read.as_raw_fd(), args.timeout_ms)
+            {
+                parent_error = Some(e);
+            }
+            if parent_error.is_none()
+                && let Err(e) = kill_pid(child_pid, libc::SIGUSR1, "signalfd recv_after_fork")
+            {
+                parent_error = Some(e);
+            }
+        }
+        InheritOp::RecvCloseEof => {
+            if let Some(ready_read) = ready_read.as_ref()
+                && let Err(e) = read_ready_byte(ready_read.as_raw_fd(), args.timeout_ms)
+            {
+                parent_error = Some(e);
+            }
+            if parent_error.is_none() {
+                drop(sfd);
+                if let Some(go_write) = go_write.as_ref()
+                    && let Err(e) = write_all_fd(go_write.as_raw_fd(), b"g", "signalfd close sync")
+                {
+                    parent_error = Some(HandlerError(e));
+                }
+            }
+        }
+        _ => {
+            return Err(HandlerError(format!(
+                "unsupported signalfd op {}",
+                args.op.id()
+            )));
+        }
+    }
+
+    if parent_error.is_some() {
+        let _ = child.kill();
+    }
+
+    let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 1000))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut exit_code = output.status.code().unwrap_or(-1);
+
+    if let Some(e) = parent_error {
+        exit_code = 1;
+        return Ok(ChildOutput {
+            exit_code,
+            stdout,
+            stderr: format!("{}; {stderr}", e.0),
+        });
+    }
+
+    if exit_code == 0 {
+        let expected = match args.op {
+            InheritOp::RecvPending | InheritOp::RecvAfterFork => libc::SIGUSR1.to_string(),
+            InheritOp::RecvCloseEof => "eagain".to_string(),
+            _ => String::new(),
+        };
+        if stdout != expected {
+            exit_code = 1;
+            return Ok(ChildOutput {
+                exit_code,
+                stdout,
+                stderr: format!("signalfd stdout mismatch: expected {expected}; {stderr}"),
+            });
+        }
+    }
+
+    Ok(ChildOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+fn kill_pid(pid: u32, signo: i32, context: &str) -> Result<(), HandlerError> {
+    // SAFETY: kill is called with a child pid returned by spawn and a valid signal number.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, signo) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "{context}: kill({pid}, {signo}): {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+fn pipe_owned(flags: i32) -> Result<(OwnedFd, OwnedFd), HandlerError> {
+    let mut fds = [0; 2];
+    // SAFETY: pipe2 initializes both fd slots on success.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), flags) } != 0 {
+        return Err(HandlerError(format!(
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: pipe2 returned two fresh descriptors owned by this function.
+    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: pipe2 returned two fresh descriptors owned by this function.
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((read, write))
+}
+
+fn read_ready_byte(fd: RawFd, timeout_ms: u64) -> Result<(), HandlerError> {
+    let revents = poll_fd(
+        fd,
+        libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        timeout_ms,
+        "signalfd child ready",
+    )?;
+    if revents & libc::POLLIN == 0 {
+        return Err(HandlerError(format!(
+            "signalfd child ready poll got {}, expected POLLIN",
+            describe_events(revents)
+        )));
+    }
+    let mut byte = [0_u8; 1];
+    read_exact_fd(fd, &mut byte, "signalfd child ready read")
 }
 
 async fn handle_pty_trial(
@@ -1010,6 +1232,7 @@ mod leaf_subcmd {
             Some("tcp-listen-child") => tcp_listen_child(args),
             Some("eventfd-child") => eventfd_child(args),
             Some("pty-child") => pty_child(args),
+            Some("signalfd-child") => signalfd_child(args),
             Some(other) => {
                 eprintln!("inherit-matrix: unknown subcommand: {other}");
                 2
@@ -1017,6 +1240,178 @@ mod leaf_subcmd {
             None => {
                 eprintln!("inherit-matrix: missing subcommand");
                 2
+            }
+        }
+    }
+
+    fn signalfd_child(args: &[String]) -> i32 {
+        let Some(op) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix signalfd-child: missing op");
+            return 2;
+        };
+        let Some(timeout_ms) = args.get(4).and_then(|s| s.parse::<i32>().ok()) else {
+            eprintln!("inherit-matrix signalfd-child: bad timeout");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix signalfd-child: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+
+        match op {
+            "recv_pending" => poll_read_signalfd(fd, timeout_ms, libc::SIGUSR1),
+            "recv_after_fork" => recv_signalfd_after_fork(fd, timeout_ms),
+            "recv_close_eof" => recv_signalfd_close_eof(fd),
+            other => {
+                eprintln!("inherit-matrix signalfd-child: unknown op {other}");
+                2
+            }
+        }
+    }
+
+    fn recv_signalfd_after_fork(fd: RawFd, timeout_ms: i32) -> i32 {
+        if check_signalfd_eagain(fd, "recv_after_fork initial") != 0 {
+            return 1;
+        }
+        if write_env_fd_byte("LITEBOX_READY_FD", b'r') != 0 {
+            return 1;
+        }
+        poll_read_signalfd(fd, timeout_ms, libc::SIGUSR1)
+    }
+
+    fn recv_signalfd_close_eof(fd: RawFd) -> i32 {
+        if write_env_fd_byte("LITEBOX_READY_FD", b'r') != 0 {
+            return 1;
+        }
+        if read_env_fd_byte("LITEBOX_GO_FD") != 0 {
+            return 1;
+        }
+        if check_signalfd_eagain(fd, "recv_close_eof") != 0 {
+            return 1;
+        }
+        println!("eagain");
+        0
+    }
+
+    fn poll_read_signalfd(fd: RawFd, timeout_ms: i32, expected_signo: i32) -> i32 {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is initialized and the count matches the buffer length.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+        if rc <= 0 || pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "inherit-matrix signalfd poll: rc={} revents={} err={}",
+                rc,
+                pfd.revents,
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        match read_signalfd_signo(fd) {
+            Ok(Some(signo)) if signo == expected_signo as u32 => {
+                println!("{signo}");
+                0
+            }
+            Ok(Some(signo)) => {
+                eprintln!("inherit-matrix signalfd read: signo={signo} expected={expected_signo}");
+                1
+            }
+            Ok(None) => {
+                eprintln!("inherit-matrix signalfd read: unexpected EAGAIN after poll");
+                1
+            }
+            Err(e) => {
+                eprintln!("inherit-matrix signalfd read: {e}");
+                1
+            }
+        }
+    }
+
+    fn check_signalfd_eagain(fd: RawFd, context: &str) -> i32 {
+        match read_signalfd_signo(fd) {
+            Ok(None) => 0,
+            Ok(Some(signo)) => {
+                eprintln!("inherit-matrix signalfd {context}: unexpected signo {signo}");
+                1
+            }
+            Err(e) => {
+                eprintln!("inherit-matrix signalfd {context}: {e}");
+                1
+            }
+        }
+    }
+
+    fn read_signalfd_signo(fd: RawFd) -> Result<Option<u32>, String> {
+        let mut buf = [0_u8; 128];
+        loop {
+            // SAFETY: buf is valid writable storage for one signalfd_siginfo.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            if n == 128 {
+                return Ok(Some(u32::from_ne_bytes(buf[0..4].try_into().unwrap())));
+            }
+            if n >= 0 {
+                return Err(format!("short read: {n}"));
+            }
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => {}
+                Some(libc::EAGAIN) => return Ok(None),
+                _ => return Err(err.to_string()),
+            }
+        }
+    }
+
+    fn write_env_fd_byte(var: &str, byte: u8) -> i32 {
+        let Some(fd) = std::env::var(var)
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix signalfd-child: bad {var}");
+            return 2;
+        };
+        loop {
+            // SAFETY: byte points to valid readable storage; fd is inherited from the parent.
+            let n = unsafe { libc::write(fd, std::ptr::from_ref(&byte).cast::<libc::c_void>(), 1) };
+            if n == 1 {
+                return 0;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("inherit-matrix signalfd write {var}: n={n} err={err}");
+                return 1;
+            }
+        }
+    }
+
+    fn read_env_fd_byte(var: &str) -> i32 {
+        let Some(fd) = std::env::var(var)
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix signalfd-child: bad {var}");
+            return 2;
+        };
+        let mut byte = [0_u8; 1];
+        loop {
+            // SAFETY: byte points to valid writable storage; fd is inherited from the parent.
+            let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+            if n == 1 {
+                return 0;
+            }
+            if n == 0 {
+                eprintln!("inherit-matrix signalfd read {var}: unexpected EOF");
+                return 1;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("inherit-matrix signalfd read {var}: n={n} err={err}");
+                return 1;
             }
         }
     }
