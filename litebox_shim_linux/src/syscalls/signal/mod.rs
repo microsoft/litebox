@@ -1126,6 +1126,9 @@ impl<FS: ShimFS> Task<FS> {
                 );
                 return Err(Errno::EOPNOTSUPP);
             }
+            if self.try_deliver_remote_signalfd(target.0, signal, &siginfo_kill(signal)) {
+                return Ok(0);
+            }
             let ret = self
                 .global
                 .platform
@@ -1733,6 +1736,38 @@ impl<FS: ShimFS> Task<FS> {
             SIG_DFL => matches!(signal.default_disposition(), SignalDisposition::Ignore),
             _ => false,
         }
+    }
+
+    fn try_deliver_remote_signalfd(
+        &self,
+        target_pid: u32,
+        signal: Signal,
+        siginfo: &Siginfo,
+    ) -> bool {
+        let Some(target) = self
+            .global
+            .remote_signalfd_targets
+            .read()
+            .get(&target_pid)
+            .cloned()
+        else {
+            return false;
+        };
+        if !SigSet::from_u64(target.blocked_mask).contains(signal) {
+            return false;
+        }
+        let Some(provider) = super::signalfd::broker_signalfd_provider() else {
+            return false;
+        };
+        let payload = super::signalfd::signalfd_siginfo_payload(siginfo, self.pid);
+        for sfd in target.signalfds {
+            if SigSet::from_u64(sfd.mask_bits).contains(signal)
+                && provider.push_siginfo(sfd.handle_id, &payload).is_ok()
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn deliver_signal_to_signalfd(&self, signal: Signal, siginfo: &Siginfo) -> bool {
