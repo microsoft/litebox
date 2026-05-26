@@ -2356,72 +2356,83 @@ impl<FS: ShimFS> Task<FS> {
                 let files = self.files.borrow();
                 let rds = files.raw_descriptor_store.read();
 
-                // Peek at the entry to extract a broker handle if present.
-                // This is done before duplicate_for_passing so we hold the
-                // rds read lock once.
-                let broker_token = rds
-                    .fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-                    .ok()
-                    .and_then(|typed| {
-                        // Note: with_entry is the typed-fd's entry accessor;
-                        // we re-fetch the typed fd because fd_from_raw_integer
-                        // consumed it via .ok().
-                        let typed = rds
-                            .fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-                            .ok()?;
-                        drop(typed); // we already have what we need via the closure below
-                        let _ = typed;
-                        None::<litebox_common_linux::fd_transfer_frame::PassedToken>
-                    });
-                // The dance above doesn't quite work — see comments. Use
-                // entry_handle (which is on dt, not rds) and peek through
-                // it. Simpler approach: after duplicate_for_passing, the
-                // PassedFd is in our hand; if its type_id matches
-                // EventfdSubsystem we can look it up in dt.
-                let _ = broker_token; // discard the failed attempt
-
                 let passed = rds
                     .duplicate_for_passing(raw_fd, &mut dt)
                     .ok_or(Errno::EBADF)?;
                 drop(rds);
                 drop(files);
 
-                // Now peek at the entry via dt's typed-fd API for the
-                // EventfdSubsystem and check if it's BrokerBacked.
-                // The PassedFd carries the OwnedFd we just duplicated;
-                // the type_id is recorded inside but we can also detect
-                // by trying to fetch the entry handle for EventfdSubsystem
-                // at the same raw_fd via the worker's files (still valid
-                // because we haven't given the PassedFd to anyone yet).
                 let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
-                let mut sent_broker_token = false;
-                if let Ok(typed) =
-                    rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-                {
-                    if let Some(handle_id) = dt
-                        .entry_handle::<super::eventfd::EventfdSubsystem>(&typed)
-                        .and_then(|h| h.with_entry(|e| e.broker_backed_handle()))
-                    {
-                        // Found a broker-backed eventfd. Ask the broker
-                        // to dup a transit ref so the handle survives
-                        // until the receiver materialises its own ref.
-                        let provider = dt
-                            .entry_handle::<super::eventfd::EventfdSubsystem>(&typed)
-                            .and_then(|h| h.with_entry(|e| e.broker_backed_provider()))
-                            .ok_or(Errno::EIO)?;
-                        provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
-                        passed_tokens.push(
-                            litebox_common_linux::fd_transfer_frame::PassedToken::new(
-                                litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd,
-                                handle_id,
-                            )
-                            .map_err(|_| Errno::EINVAL)?,
-                        );
-                        sent_broker_token = true;
+                let sent_broker_token = files.run_on_raw_fd(raw_fd, |raw_fd_ref| -> Result<bool, Errno> {
+                    match raw_fd_ref {
+                        crate::RawFdRef::Fs(_) => {
+                            // Filesystem descriptors are kernel-backed and transfer as PassedFd.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::Net(_) => {
+                            // Network descriptors are kernel-backed and transfer as PassedFd.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::Pipes(_) => {
+                            // Pipes are kernel-backed and transfer as PassedFd.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::Eventfd(typed) => {
+                            if let Some(handle_id) = dt
+                                .entry_handle::<super::eventfd::EventfdSubsystem>(typed)
+                                .and_then(|h| h.with_entry(|e| e.broker_backed_handle()))
+                            {
+                                // Found a broker-backed eventfd. Ask the broker
+                                // to dup a transit ref so the handle survives
+                                // until the receiver materialises its own ref.
+                                let provider = dt
+                                    .entry_handle::<super::eventfd::EventfdSubsystem>(typed)
+                                    .and_then(|h| h.with_entry(|e| e.broker_backed_provider()))
+                                    .ok_or(Errno::EIO)?;
+                                provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                                passed_tokens.push(
+                                    litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                        litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd,
+                                        handle_id,
+                                    )
+                                    .map_err(|_| Errno::EINVAL)?,
+                                );
+                                Ok(true)
+                            } else {
+                                // Kernel-backed eventfds transfer as PassedFd.
+                                Ok(false)
+                            }
+                        }
+                        crate::RawFdRef::Epoll(_) => {
+                            // Epoll descriptors are not broker-token-transferable yet.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::Unix(_) => {
+                            // Unix sockets are kernel-backed and transfer as PassedFd.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::ExternalFd(_) => {
+                            // External fds are sealed host fds and transfer as PassedFd.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::BrokerPipe(_) => {
+                            // Broker pipes are not broker-token-transferable over SCM yet.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::BrokerSocketPair(_) => {
+                            // Broker socketpairs are not broker-token-transferable over SCM yet.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::BrokerPty(_) => {
+                            // Broker ptys are not broker-token-transferable over SCM yet.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::Signalfd(_) => {
+                            // Signalfds are not broker-token-transferable yet.
+                            Ok(false)
+                        }
                     }
-                }
-                drop(rds);
+                })??;
                 drop(files);
 
                 if !sent_broker_token {
