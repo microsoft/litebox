@@ -39,6 +39,8 @@ const SIGNALFD_MATRIX: HandlerToken<SignalfdTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.signalfd");
 const BROKER_FILE_MATRIX: HandlerToken<BrokerFileTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.brokerfile");
+const TIMERFD_MATRIX: HandlerToken<TimerfdTrialArgs, ChildOutput> =
+    HandlerToken::new("inherit_matrix.timerfd");
 
 const TCP_LISTEN_OPS: &[InheritOp] = &[
     InheritOp::Accept,
@@ -73,8 +75,11 @@ const SIGNALFD_OPS: &[InheritOp] = &[
     InheritOp::RecvAfterFork,
     InheritOp::RecvCloseEof,
 ];
-#[allow(dead_code)]
-const TIMERFD_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Poll];
+const TIMERFD_OPS: &[InheritOp] = &[
+    InheritOp::ReadAfterExpire,
+    InheritOp::ArmThenInheritThenRead,
+    InheritOp::PollReadableAfterExpire,
+];
 #[allow(dead_code)]
 const PTY_OPS: &[InheritOp] = &[
     InheritOp::SlaveWrite,
@@ -154,6 +159,9 @@ enum InheritOp {
     ReadAtOffset0,
     WriteThenParentReadsBack,
     LseekThenRead,
+    ReadAfterExpire,
+    ArmThenInheritThenRead,
+    PollReadableAfterExpire,
 }
 
 impl InheritOp {
@@ -180,6 +188,9 @@ impl InheritOp {
             Self::ReadAtOffset0 => "read_at_offset_0",
             Self::WriteThenParentReadsBack => "write_then_parent_reads_back",
             Self::LseekThenRead => "lseek_then_read",
+            Self::ReadAfterExpire => "read_after_expire",
+            Self::ArmThenInheritThenRead => "arm_then_inherit_then_read",
+            Self::PollReadableAfterExpire => "poll_readable_after_expire",
         }
     }
 }
@@ -248,6 +259,13 @@ struct BrokerFileTrialArgs {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct TimerfdTrialArgs {
+    child_binary: String,
+    op: InheritOp,
+    timeout_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct ChildOutput {
     exit_code: i32,
     stdout: String,
@@ -261,6 +279,7 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(PTY_MATRIX, handle_pty_trial);
     register_handler!(SIGNALFD_MATRIX, handle_signalfd_trial);
     register_handler!(BROKER_FILE_MATRIX, handle_brokerfile_trial);
+    register_handler!(TIMERFD_MATRIX, handle_timerfd_trial);
     register_leaf_subcommand!("inherit-matrix", leaf_subcmd::subcmd_inherit_matrix);
 
     for &subsystem in &[
@@ -270,6 +289,7 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
         InheritSubsystem::Pty,
         InheritSubsystem::Signalfd,
         InheritSubsystem::BrokerFile,
+        InheritSubsystem::Timerfd,
     ] {
         for &parent_bt in BinaryType::ALL {
             for &child_bt in BinaryType::ALL {
@@ -388,6 +408,18 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
                         )
                         .await
                     }
+                    InheritSubsystem::Timerfd => {
+                        run.send_named_typed(
+                            &parent_handle,
+                            &TIMERFD_MATRIX,
+                            TimerfdTrialArgs {
+                                child_binary,
+                                op: trial.op,
+                                timeout_ms: 1000,
+                            },
+                        )
+                        .await
+                    }
                     _ => Err(format!(
                         "{} scaffolded dispatch placeholder; implementation pending",
                         trial.subsystem.id()
@@ -472,7 +504,7 @@ fn run_signalfd_trial() -> String {
 
 #[allow(dead_code)]
 fn run_timerfd_trial() -> String {
-    "INHERIT.timerfd: scaffold pending".into()
+    "timerfd is implemented by handle_timerfd_trial".into()
 }
 
 #[allow(dead_code)]
@@ -828,6 +860,140 @@ fn read_ready_byte(fd: RawFd, timeout_ms: u64) -> Result<(), HandlerError> {
     }
     let mut byte = [0_u8; 1];
     read_exact_fd(fd, &mut byte, "signalfd child ready read")
+}
+
+async fn handle_timerfd_trial(
+    args: TimerfdTrialArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    let timerfd = open_timerfd()?;
+    let fd = timerfd.as_raw_fd();
+    clear_cloexec(fd)?;
+
+    match args.op {
+        InheritOp::ReadAfterExpire => {
+            arm_timerfd(fd, Duration::from_millis(50))?;
+            wait_for_timerfd_readable(fd, args.timeout_ms, "timerfd pre-fork expiry")?;
+        }
+        InheritOp::ArmThenInheritThenRead => {
+            arm_timerfd(fd, Duration::from_millis(200))?;
+        }
+        InheritOp::PollReadableAfterExpire => {
+            arm_timerfd(fd, Duration::from_millis(50))?;
+        }
+        _ => {
+            return Err(HandlerError(format!(
+                "unsupported timerfd op {}",
+                args.op.id()
+            )));
+        }
+    }
+
+    let child = Command::new(&args.child_binary)
+        .args([
+            "inherit-matrix",
+            "timerfd-child",
+            args.op.id(),
+            &args.timeout_ms.to_string(),
+        ])
+        .env("LITEBOX_INHERIT_FD", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+
+    let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 1000))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut exit_code = output.status.code().unwrap_or(-1);
+
+    if exit_code == 0 {
+        let count = match stdout.parse::<u64>() {
+            Ok(count) => count,
+            Err(e) => {
+                return Ok(ChildOutput {
+                    exit_code: 1,
+                    stdout,
+                    stderr: format!("timerfd stdout parse: {e}; {stderr}"),
+                });
+            }
+        };
+        match args.op {
+            InheritOp::ReadAfterExpire | InheritOp::PollReadableAfterExpire if count == 0 => {
+                exit_code = 1;
+                return Ok(ChildOutput {
+                    exit_code,
+                    stdout,
+                    stderr: format!("timerfd read count mismatch: expected >=1; {stderr}"),
+                });
+            }
+            InheritOp::ArmThenInheritThenRead if count != 1 => {
+                exit_code = 1;
+                return Ok(ChildOutput {
+                    exit_code,
+                    stdout,
+                    stderr: format!("timerfd read count mismatch: expected 1; {stderr}"),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ChildOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+fn open_timerfd() -> Result<OwnedFd, HandlerError> {
+    // SAFETY: timerfd_create is called with constant clock/flag values; errors are checked below.
+    let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, 0) };
+    if fd < 0 {
+        return Err(HandlerError(format!(
+            "timerfd_create(CLOCK_MONOTONIC): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: timerfd_create returned a fresh descriptor and ownership is transferred here.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn arm_timerfd(fd: RawFd, duration: Duration) -> Result<(), HandlerError> {
+    let spec = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: duration.subsec_nanos().into(),
+        },
+    };
+    // SAFETY: `spec` is initialized and `fd` is expected to be a live timerfd.
+    if unsafe { libc::timerfd_settime(fd, 0, std::ptr::from_ref(&spec), std::ptr::null_mut()) } != 0
+    {
+        return Err(HandlerError(format!(
+            "timerfd_settime: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn wait_for_timerfd_readable(
+    fd: RawFd,
+    timeout_ms: u64,
+    context: &str,
+) -> Result<(), HandlerError> {
+    let revents = poll_fd(fd, libc::POLLIN | libc::POLLERR, timeout_ms, context)?;
+    if revents & libc::POLLIN == 0 {
+        return Err(HandlerError(format!(
+            "{context}: poll got {}, expected POLLIN",
+            describe_events(revents)
+        )));
+    }
+    Ok(())
 }
 
 async fn handle_pty_trial(
@@ -1638,6 +1804,7 @@ mod leaf_subcmd {
             Some("pty-child") => pty_child(args),
             Some("signalfd-child") => signalfd_child(args),
             Some("brokerfile-child") => brokerfile_child(args),
+            Some("timerfd-child") => timerfd_child(args),
             Some(other) => {
                 eprintln!("inherit-matrix: unknown subcommand: {other}");
                 2
@@ -1814,6 +1981,73 @@ mod leaf_subcmd {
             }
         }
         0
+    }
+
+    fn timerfd_child(args: &[String]) -> i32 {
+        let Some(op) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix timerfd-child: missing op");
+            return 2;
+        };
+        let Some(timeout_ms) = args.get(4).and_then(|s| s.parse::<i32>().ok()) else {
+            eprintln!("inherit-matrix timerfd-child: bad timeout");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix timerfd-child: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+
+        match op {
+            "read_after_expire" => read_timerfd(fd),
+            "arm_then_inherit_then_read" | "poll_readable_after_expire" => {
+                poll_read_timerfd(fd, timeout_ms)
+            }
+            other => {
+                eprintln!("inherit-matrix timerfd-child: unknown op {other}");
+                2
+            }
+        }
+    }
+
+    fn poll_read_timerfd(fd: RawFd, timeout_ms: i32) -> i32 {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is initialized and the count matches the buffer length.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+        if rc <= 0 || pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "inherit-matrix timerfd poll: rc={} revents={} err={}",
+                rc,
+                pfd.revents,
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        read_timerfd(fd)
+    }
+
+    fn read_timerfd(fd: RawFd) -> i32 {
+        let mut value = 0_u64;
+        loop {
+            // SAFETY: value is valid writable storage for one timerfd expiration count.
+            let n =
+                unsafe { libc::read(fd, std::ptr::from_mut(&mut value).cast::<libc::c_void>(), 8) };
+            if n == 8 {
+                println!("{value}");
+                return 0;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("inherit-matrix timerfd read: n={n} err={err}");
+                return 1;
+            }
+        }
     }
 
     fn signalfd_child(args: &[String]) -> i32 {
