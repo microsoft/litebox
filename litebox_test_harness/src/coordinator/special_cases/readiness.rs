@@ -7,20 +7,24 @@
 //! which changes peer readiness must wake a peer waiting in `poll`, and that
 //! the subsequent `read` observes the corresponding data or EOF.
 
+use std::ffi::CString;
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use super::{AgentName, HandlerCtx, HandlerError, HandlerToken, Registry};
 use crate::coordinator::TestOutcome;
+use crate::os::pty::Pty;
 use crate::register_handler;
 
 const READINESS: HandlerToken<ReadinessTrial, ReadinessOut> = HandlerToken::new("readiness.run");
 const POLL_TIMEOUT_MS: i32 = 2_000;
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_THEN_CLOSE_PAYLOAD: &[u8] = b"READY_TCP_PAYLOAD";
+const PTY_SLAVE_PAYLOAD: &[u8] = b"READY_PTY_SLAVE";
+const PTY_MASTER_PAYLOAD: &[u8] = b"READY_PTY_MASTER";
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 struct ReadinessTrial {
@@ -69,6 +73,10 @@ enum PeerOp {
     ShutdownWr,
     Close,
     WriteThenClose,
+    SlaveClose,
+    SlaveWriteThenClose,
+    SlaveWrite,
+    MasterWrite,
 }
 
 impl PeerOp {
@@ -77,6 +85,10 @@ impl PeerOp {
             Self::ShutdownWr => "peer_shutdown_wr",
             Self::Close => "peer_close",
             Self::WriteThenClose => "peer_write_then_close",
+            Self::SlaveClose => "slave_close",
+            Self::SlaveWriteThenClose => "slave_write_then_close",
+            Self::SlaveWrite => "slave_write",
+            Self::MasterWrite => "master_write",
         }
     }
 }
@@ -97,7 +109,7 @@ async fn handle_readiness(
         ReadinessSubsystem::SocketPair => skip_pending(ReadinessSubsystem::SocketPair),
         ReadinessSubsystem::Eventfd => skip_pending(ReadinessSubsystem::Eventfd),
         ReadinessSubsystem::Signalfd => skip_pending(ReadinessSubsystem::Signalfd),
-        ReadinessSubsystem::Pty => skip_pending(ReadinessSubsystem::Pty),
+        ReadinessSubsystem::Pty => run_pty_trial(trial.op),
         ReadinessSubsystem::BrokerPipe => skip_pending(ReadinessSubsystem::BrokerPipe),
     };
     Ok(match result {
@@ -128,11 +140,16 @@ fn skip_pending(subsystem: ReadinessSubsystem) -> TrialResult {
 fn valid_ops(subsystem: ReadinessSubsystem) -> &'static [PeerOp] {
     match subsystem {
         ReadinessSubsystem::TcpConn => &[PeerOp::ShutdownWr, PeerOp::Close, PeerOp::WriteThenClose],
+        ReadinessSubsystem::Pty => &[
+            PeerOp::SlaveClose,
+            PeerOp::SlaveWriteThenClose,
+            PeerOp::MasterWrite,
+            PeerOp::SlaveWrite,
+        ],
         ReadinessSubsystem::Pipe
         | ReadinessSubsystem::SocketPair
         | ReadinessSubsystem::Eventfd
         | ReadinessSubsystem::Signalfd
-        | ReadinessSubsystem::Pty
         | ReadinessSubsystem::BrokerPipe => &[],
     }
 }
@@ -236,11 +253,151 @@ fn run_tcp_conn_trial_inner(op: PeerOp) -> Result<String, String> {
                 n.max(WRITE_THEN_CLOSE_PAYLOAD.len())
             ))
         }
+        PeerOp::SlaveClose
+        | PeerOp::SlaveWriteThenClose
+        | PeerOp::SlaveWrite
+        | PeerOp::MasterWrite => Err(format!("unsupported tcp_conn op {}", op.label())),
+    }
+}
+
+fn run_pty_trial(op: PeerOp) -> TrialResult {
+    match run_pty_trial_inner(op) {
+        Ok(detail) => TrialResult::Passed(detail),
+        Err(detail) => TrialResult::Failed(detail),
+    }
+}
+
+fn run_pty_trial_inner(op: PeerOp) -> Result<String, String> {
+    let (master, slave) = open_raw_pty_pair()?;
+
+    match op {
+        PeerOp::SlaveClose => {
+            drop(slave);
+            let revents = poll_fd(master.as_raw_fd(), pty_readiness_mask(), POLL_TIMEOUT_MS)?;
+            require_any(revents, libc::POLLHUP, "slave_close master poll")?;
+            let read_detail = read_zero_or_eio(master.as_raw_fd(), "slave_close master read")?;
+            Ok(format!(
+                "master_poll={} master_read={read_detail}",
+                describe_events(revents)
+            ))
+        }
+        PeerOp::SlaveWriteThenClose => {
+            write_all_fd(slave.as_raw_fd(), PTY_SLAVE_PAYLOAD, "slave write")?;
+            drop(slave);
+
+            let revents1 = poll_fd(master.as_raw_fd(), pty_readiness_mask(), POLL_TIMEOUT_MS)?;
+            require_any(revents1, libc::POLLIN, "slave_write_then_close data poll")?;
+            read_exact_payload(
+                master.as_raw_fd(),
+                PTY_SLAVE_PAYLOAD,
+                "slave_write_then_close data read",
+            )?;
+
+            let revents2 = poll_fd(master.as_raw_fd(), pty_readiness_mask(), POLL_TIMEOUT_MS)?;
+            require_any(revents2, libc::POLLHUP, "slave_write_then_close hup poll")?;
+            let read_detail = read_zero_or_eio(
+                master.as_raw_fd(),
+                "slave_write_then_close post-payload read",
+            )?;
+            Ok(format!(
+                "data_poll={} hup_poll={} read={} bytes then {read_detail}",
+                describe_events(revents1),
+                describe_events(revents2),
+                PTY_SLAVE_PAYLOAD.len()
+            ))
+        }
+        PeerOp::SlaveWrite => {
+            write_all_fd(slave.as_raw_fd(), PTY_SLAVE_PAYLOAD, "slave write")?;
+            let revents = poll_fd(master.as_raw_fd(), pty_readiness_mask(), POLL_TIMEOUT_MS)?;
+            require_any(revents, libc::POLLIN, "slave_write master poll")?;
+            read_exact_payload(
+                master.as_raw_fd(),
+                PTY_SLAVE_PAYLOAD,
+                "slave_write master read",
+            )?;
+            Ok(format!(
+                "master_poll={} read={} bytes",
+                describe_events(revents),
+                PTY_SLAVE_PAYLOAD.len()
+            ))
+        }
+        PeerOp::MasterWrite => {
+            write_all_fd(master.as_raw_fd(), PTY_MASTER_PAYLOAD, "master write")?;
+            let revents = poll_fd(
+                slave.as_raw_fd(),
+                libc::POLLIN | libc::POLLHUP,
+                POLL_TIMEOUT_MS,
+            )?;
+            require_any(revents, libc::POLLIN, "master_write slave poll")?;
+            read_exact_payload(
+                slave.as_raw_fd(),
+                PTY_MASTER_PAYLOAD,
+                "master_write slave read",
+            )?;
+            Ok(format!(
+                "slave_poll={} read={} bytes",
+                describe_events(revents),
+                PTY_MASTER_PAYLOAD.len()
+            ))
+        }
+        PeerOp::ShutdownWr | PeerOp::Close | PeerOp::WriteThenClose => {
+            Err(format!("unsupported pty op {}", op.label()))
+        }
     }
 }
 
 fn readiness_mask() -> libc::c_short {
     libc::POLLIN | libc::POLLHUP | libc::POLLRDHUP
+}
+
+fn pty_readiness_mask() -> libc::c_short {
+    libc::POLLIN | libc::POLLHUP | libc::POLLERR
+}
+
+fn open_raw_pty_pair() -> Result<(Pty, OwnedFd), String> {
+    let master = Pty::open()?;
+    let slave_path = CString::new(master.slave_path())
+        .map_err(|e| format!("pty slave path contains nul: {e}"))?;
+    // SAFETY: `slave_path` is a valid nul-terminated path returned by ptsname_r.
+    let slave_fd = unsafe {
+        libc::open(
+            slave_path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if slave_fd < 0 {
+        return Err(format!(
+            "open pty slave {}: {}",
+            master.slave_path(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `open` returned a fresh fd and ownership is transferred to OwnedFd.
+    let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+    make_raw(slave.as_raw_fd())?;
+    Ok((master, slave))
+}
+
+fn make_raw(fd: i32) -> Result<(), String> {
+    // SAFETY: zeroed termios is immediately initialized by tcgetattr on success.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: tcgetattr writes termios state for a live PTY slave fd.
+    if unsafe { libc::tcgetattr(fd, &raw mut termios) } != 0 {
+        return Err(format!(
+            "tcgetattr fd {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: cfmakeraw mutates an initialized termios value in place.
+    unsafe { libc::cfmakeraw(&raw mut termios) };
+    // SAFETY: tcsetattr reads the initialized termios for a live PTY slave fd.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const termios) } != 0 {
+        return Err(format!(
+            "tcsetattr raw fd {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 fn poll_fd(fd: i32, events: libc::c_short, timeout_ms: i32) -> Result<libc::c_short, String> {
@@ -251,7 +408,7 @@ fn poll_fd(fd: i32, events: libc::c_short, timeout_ms: i32) -> Result<libc::c_sh
     };
     loop {
         // SAFETY: `pfd` points to one initialized pollfd, the count is 1,
-        // and `fd` is owned by a live TcpStream for the duration of the call.
+        // and `fd` is owned by a live endpoint for the duration of the call.
         let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
         if rc > 0 {
             return Ok(pfd.revents);
@@ -299,13 +456,70 @@ fn read_once(fd: i32, buf: &mut [u8]) -> Result<usize, String> {
     syscall_len(n, "read")
 }
 
+fn write_all_fd(fd: i32, mut buf: &[u8], op: &str) -> Result<(), String> {
+    while !buf.is_empty() {
+        // SAFETY: `buf` is readable memory and `fd` is a live PTY endpoint fd.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
+        let n = syscall_len(n, op)?;
+        if n == 0 {
+            return Err(format!("{op} wrote 0 bytes"));
+        }
+        buf = &buf[n..];
+    }
+    Ok(())
+}
+
+fn read_exact_payload(fd: i32, expected: &[u8], context: &str) -> Result<(), String> {
+    let mut buf = vec![0_u8; expected.len()];
+    let n = read_fd_once(fd, &mut buf, context)?;
+    if n != expected.len() {
+        return Err(format!(
+            "{context}: read length mismatch: got {n}, expected {}",
+            expected.len()
+        ));
+    }
+    if buf != expected {
+        return Err(format!(
+            "{context}: payload mismatch: got {:?}, expected {:?}",
+            String::from_utf8_lossy(&buf),
+            String::from_utf8_lossy(expected)
+        ));
+    }
+    Ok(())
+}
+
+fn read_zero_or_eio(fd: i32, context: &str) -> Result<&'static str, String> {
+    let mut buf = [0_u8; 1];
+    // SAFETY: `buf` is valid writable memory and `fd` is a live PTY endpoint fd.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    if n == 0 {
+        return Ok("EOF");
+    }
+    if n > 0 {
+        return Err(format!("{context}: expected EOF/EIO, got {n} bytes"));
+    }
+    let errno = errno();
+    if errno == libc::EIO {
+        Ok("EIO")
+    } else if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+        Err(format!("{context}: read would block after readiness"))
+    } else {
+        Err(format!("{context}: read failed errno={errno}"))
+    }
+}
+
+fn read_fd_once(fd: i32, buf: &mut [u8], op: &str) -> Result<usize, String> {
+    // SAFETY: `buf` is valid writable memory and `fd` is a live PTY endpoint fd.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    syscall_len(n, op)
+}
+
 fn syscall_len(n: isize, op: &str) -> Result<usize, String> {
     if n < 0 {
         let errno = errno();
         if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
             Err(format!(
-                "{op} would block after poll timeout={}ms",
-                POLL_TIMEOUT_MS
+                "{op} would block after poll timeout={POLL_TIMEOUT_MS}ms"
             ))
         } else {
             Err(format!("{op} failed errno={errno}"))
