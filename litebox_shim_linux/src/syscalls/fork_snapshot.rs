@@ -367,7 +367,7 @@ impl core::fmt::Debug for ForkSnapshotBrokerTransit {
 /// Classification of a file descriptor for export/import decisions.
 ///
 /// The first version supports only a narrow set; unsupported classes cause
-/// `fork()` to return `ENOSYS`.
+/// `fork()` to panic with an ENOSYS-audit todo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FdClass {
     /// Regular file or directory opened by path.

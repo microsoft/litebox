@@ -185,7 +185,7 @@ impl<FS: crate::ShimFS> crate::Task<FS> {
         use litebox::platform::RawConstPointer as _;
         let mask = mask.read_at_offset(0).ok_or(Errno::EFAULT)?;
         let Some(provider) = broker_signalfd_provider() else {
-            return Err(Errno::ENOSYS);
+            todo!("ENOSYS audit: signalfd without broker provider; reachable but not implemented");
         };
         let handle = provider
             .create_signalfd(mask.as_u64(), 0)
@@ -226,7 +226,7 @@ impl<FS: crate::ShimFS> crate::Task<FS> {
         nonblock: bool,
     ) -> Result<(), Errno> {
         let Some(provider) = broker_signalfd_provider() else {
-            return Err(Errno::ENOSYS);
+            unreachable!("installing signalfd bridge requires the broker signalfd provider");
         };
         let file = SignalfdFile::new_broker_backed(
             provider,

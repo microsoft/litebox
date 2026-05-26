@@ -5769,7 +5769,9 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
         if flags.contains(MemfdFlags::HUGETLB) {
-            return Err(Errno::ENOSYS);
+            unimplemented!(
+                "litebox does not support hugetlb memfd files: no huge-page backing store"
+            );
         }
         // MFD_EXEC and MFD_NOEXEC_SEAL are mutually exclusive.
         if flags.contains(MemfdFlags::EXEC) && flags.contains(MemfdFlags::NOEXEC_SEAL) {
@@ -5788,7 +5790,9 @@ impl<FS: ShimFS> Task<FS> {
             .fs
             .create_anonymous_file(&name_str, mode)
             .map_err(|e| match e {
-                CreateAnonymousFileError::NotSupported => Errno::ENOSYS,
+                CreateAnonymousFileError::NotSupported => {
+                    todo!("ENOSYS audit: memfd_create on filesystem without anonymous-file support; reachable but not implemented")
+                }
                 CreateAnonymousFileError::Io | _ => Errno::EIO,
             })?;
         {
