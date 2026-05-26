@@ -534,6 +534,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
 
         if self.is_readable() {
             events |= Events::IN;
+            if read_shut {
+                events |= Events::RDHUP;
+            }
         } else if read_shut {
             // Peer sent FIN, all buffered data consumed.  Report IN so
             // epoll wakes the reader; try_read will return Eof.
@@ -1286,6 +1289,24 @@ mod tests {
         let events = channel.check_io_events();
         assert!(events.contains(Events::IN)); // Data available
         assert!(events.contains(Events::OUT)); // Can still write
+    }
+
+    #[test]
+    fn stream_channel_reports_rdhup_with_buffered_data() {
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
+        channel.set_state(SocketState::Connected);
+
+        let data = b"data";
+        channel.push_rx_data_with(|buf: &mut [u8]| {
+            let to_copy = core::cmp::min(buf.len(), data.len());
+            buf[..to_copy].copy_from_slice(&data[..to_copy]);
+            to_copy
+        });
+        channel.shutdown_read();
+
+        let events = channel.check_io_events();
+        assert!(events.contains(Events::IN));
+        assert!(events.contains(Events::RDHUP));
     }
 
     // ==================== DatagramSocketChannel Tests ======================================

@@ -46,6 +46,7 @@ bitflags::bitflags! {
 }
 
 const MAX_NESTED_EPOLL_DEPTH: usize = 5;
+const MAX_SOCKET_SETTLE_POLLS: usize = 16;
 
 pub(crate) enum EpollDescriptor<FS: ShimFS> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
@@ -428,7 +429,6 @@ impl<FS: ShimFS> EpollFile<FS> {
         maxevents: usize,
         events: &mut Vec<EpollEvent>,
     ) {
-        const MAX_SOCKET_SETTLE_POLLS: usize = 16;
         let target = self.socket_interest_count().min(maxevents);
         if target <= 1 || events.len() >= target {
             return;
@@ -1089,6 +1089,12 @@ struct PollEntry {
 #[derive(Clone)]
 struct PollEntryObserver(Waker<Platform>);
 
+fn should_settle_socket_rdhup(mask: Events, revents: Events) -> bool {
+    mask.contains(Events::RDHUP)
+        && revents.contains(Events::IN)
+        && !revents.intersects(Events::RDHUP | Events::HUP)
+}
+
 impl PollSet {
     /// Returns a new empty `PollSet` with the given interest capacity.
     pub fn with_capacity(capacity: usize) -> Self {
@@ -1120,6 +1126,10 @@ impl PollSet {
         files: &FilesState<FS>,
         waker: Option<&Waker<Platform>>,
     ) -> bool {
+        if self.has_socket_entries(global, files) {
+            EpollFile::<FS>::drive_network_until_idle(global);
+        }
+
         let mut is_ready = false;
         for entry in &mut self.entries {
             entry.revents = if entry.fd < 0 {
@@ -1147,9 +1157,22 @@ impl PollSet {
                     None
                 };
                 // TODO: add machinery to unregister the observer to avoid leaks.
-                poll_descriptor
+                let is_socket = matches!(poll_descriptor, EpollDescriptor::Socket(_));
+                let mut revents = poll_descriptor
                     .poll(global, &*files.fs, entry.mask, observer)
-                    .unwrap_or(Events::NVAL)
+                    .unwrap_or(Events::NVAL);
+                if is_socket && should_settle_socket_rdhup(entry.mask, revents) {
+                    for _ in 0..MAX_SOCKET_SETTLE_POLLS {
+                        EpollFile::<FS>::drive_network_until_idle(global);
+                        revents = poll_descriptor
+                            .poll(global, &*files.fs, entry.mask, None)
+                            .unwrap_or(Events::NVAL);
+                        if !should_settle_socket_rdhup(entry.mask, revents) {
+                            break;
+                        }
+                    }
+                }
+                revents
             } else {
                 Events::NVAL
             };
@@ -1230,6 +1253,23 @@ impl PollSet {
                 other => other,
             }
         }
+    }
+
+    fn has_socket_entries<FS: ShimFS>(
+        &self,
+        global: &GlobalState<FS>,
+        files: &FilesState<FS>,
+    ) -> bool {
+        self.entries.iter().any(|entry| {
+            if entry.fd < 0 {
+                return false;
+            }
+            let raw_fd = entry.fd.reinterpret_as_unsigned() as usize;
+            matches!(
+                EpollDescriptor::try_from(global, files, raw_fd),
+                Ok(EpollDescriptor::Socket(_))
+            )
+        })
     }
 
     /// Returns true if any entry in the poll set requires host polling.
