@@ -23,6 +23,7 @@ use litebox::{
         errors::AcceptError,
         socket_channel::{NetworkProxy, SocketState},
     },
+    platform::IPInterfaceProvider as _,
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt as _,
 };
@@ -914,6 +915,12 @@ impl<FS: ShimFS> GlobalState<FS> {
 
     fn listen(&self, fd: &SocketFd, backlog: u16) -> Result<(), Errno> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
+    }
+
+    fn send_listen_route_transfer(&self, port: u16) -> Result<(), Errno> {
+        self.platform
+            .send_port_listen_transfer(port)
+            .map_err(|_| Errno::EIO)
     }
 
     fn shutdown(&self, fd: &SocketFd, read: bool, write: bool) -> Result<(), Errno> {
@@ -2023,9 +2030,8 @@ impl<FS: ShimFS> Task<FS> {
             &fd,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
         )?;
-        // TODO(transfer_listen_route): after the broker API is wired, this
-        // worker-exec bridge should transfer the parent's listen route here.
-        self.global.listen(&fd, 16)
+        self.global.listen(&fd, 16)?;
+        self.global.send_listen_route_transfer(port)
     }
 
     /// Get the local port for an INET socket. Returns None if not bound.
