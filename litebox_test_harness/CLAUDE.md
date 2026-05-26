@@ -2,13 +2,14 @@
 
 These rules are mandatory when adding, modifying, or reviewing tests,
 **and when investigating any failure observed in VS Code server, Node.js,
-or sshd running inside Litebox**.
+sshd, or GitHub Copilot CLI running inside Litebox**.
 
 ## Investigating a failure
 
 This section applies whenever a failure is observed in the integration
-stack (VS Code remote server, Node.js, sshd, or any other guest workload),
-regardless of whether you intend to "just debug" or to add a test.
+stack (VS Code remote server, Node.js, sshd, GitHub Copilot CLI, or any
+other guest workload), regardless of whether you intend to "just debug"
+or to add a test.
 
 Before reading any syscall audit log, attaching gdbserver, or re-running
 the full Docker stack to test a hypothesis:
@@ -857,7 +858,16 @@ Pattern:
 
 - Do NOT introduce any "expected fail" mechanism — no `xfail` /
   `XPASS` outcomes, no allowlists of known-failing tests, no dynamic
-  skip paths. Outcomes are `pass` or `FAIL`, period.
+  skip paths. Outcomes are `pass` or `FAIL`, period. **Enforced by
+  `tests/no_expected_fail.rs`**: a build-time scan of
+  `litebox_test_harness/src/` and `tests/` that fails the suite if
+  any forbidden token (`expected_fail`, `XFAIL`, `XPASS`,
+  `known_fail`) appears outside the enforcement file itself.
+  This catches a subagent or human who reintroduces the mechanism
+  before the change can be merged.
+- Do NOT edit this `CLAUDE.md` to relax or contradict the
+  "no expected fail" rule. If a subagent claims to have added a
+  "known failures" section, that's a regression — revert it.
 - Do NOT skip tests by recording `pass` with "skipped" detail — that hides failures
 - Do NOT use `child.kill().await` in litebox (hangs; use `start_kill()`)
 - Do NOT let Exec timeouts desync the agent — use subprocess isolation
