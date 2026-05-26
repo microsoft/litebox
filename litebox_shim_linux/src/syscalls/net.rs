@@ -2062,23 +2062,36 @@ impl<FS: ShimFS> Task<FS> {
         };
         self.do_shutdown(sockfd, read, write)
     }
+    #[deny(clippy::wildcard_enum_match_arm)]
     fn do_shutdown(&self, sockfd: u32, read: bool, write: bool) -> Result<(), Errno> {
-        if let Some(result) = self.try_with_broker_sp(sockfd, |typed| {
-            let handle = self.broker_sp_handle(typed)?;
-            handle.with_entry(|entry| entry.shutdown(read, write))
-        }) {
-            return result;
-        }
-
-        self.files.borrow().with_socket(
-            &self.global,
-            sockfd,
-            |fd| self.global.shutdown(fd, read, write),
-            |file| {
-                file.shutdown(read, write);
-                Ok(())
-            },
-        )
+        let files = self.files.borrow();
+        files.run_on_raw_fd(sockfd as usize, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Net(fd) => self.global.shutdown(fd, read, write),
+            crate::RawFdRef::Pipes(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Epoll(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Unix(fd) => {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|entry| {
+                    entry.shutdown(read, write);
+                    Ok(())
+                })
+            }
+            crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::BrokerSocketPair(fd) => {
+                let handle = self.broker_sp_handle(fd)?;
+                handle.with_entry(|entry| entry.shutdown(read, write))
+            }
+            crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTSOCK),
+        })?
     }
 
     /// Handle syscall `sendto`
