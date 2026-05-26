@@ -52,6 +52,7 @@ mod net;
 mod netlink;
 mod pipe_lifecycle;
 mod proc;
+mod readiness;
 mod term;
 mod unix_socket;
 
@@ -544,6 +545,10 @@ pub(super) fn register_capture_pipe(reg: &mut Registry<'_>) {
 
 pub(super) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
     proc::register_proc_filesystem_tests(reg);
+}
+
+pub(super) fn register_readiness_tests(reg: &mut Registry<'_>) {
+    readiness::register_readiness_tests(reg);
 }
 
 pub(super) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {

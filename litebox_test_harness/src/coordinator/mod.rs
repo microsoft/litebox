@@ -973,6 +973,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     clone3_matrix::register_clone3_matrix(&mut registry::Registry::new(&mut tests));
     scm_rights::register_scm_rights_tests(&mut registry::Registry::new(&mut tests));
     sockopt::register_sockopt_tests(&mut registry::Registry::new(&mut tests));
+    special_cases::register_readiness_tests(&mut registry::Registry::new(&mut tests));
     tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));
     tcp_state::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     tcp_state::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
