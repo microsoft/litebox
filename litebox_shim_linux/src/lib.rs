@@ -143,6 +143,17 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             .install_tcp_listen_bridge_fd(guest_fd, port, reuse_port)
     }
 
+    pub fn install_signalfd_bridge_fd(
+        &self,
+        guest_fd: usize,
+        handle_id: u64,
+        mask_bits: u64,
+        nonblock: bool,
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
+        self.task
+            .install_signalfd_bridge_fd(guest_fd, handle_id, mask_bits, nonblock)
+    }
+
     /// Install a external fd FD into the restored child's descriptor table.
     ///
     /// Called by the runner after `restore_process` to replace virtual pipe

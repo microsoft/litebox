@@ -75,6 +75,14 @@ impl SignalfdFile {
         )
     }
 
+    pub(crate) fn worker_exec_bridge_snapshot(&self) -> (u64, u64, bool) {
+        (
+            self.common.handle(),
+            self.mask.as_u64(),
+            self.get_status().contains(OFlags::NONBLOCK),
+        )
+    }
+
     pub(crate) fn handles_signal(&self, signal: Signal) -> bool {
         self.mask.contains(signal)
     }
@@ -206,6 +214,47 @@ impl<FS: crate::ShimFS> crate::Task<FS> {
             Errno::EMFILE
         })?;
         Ok(raw_fd.try_into().unwrap())
+    }
+
+    pub(crate) fn install_signalfd_bridge_fd(
+        &self,
+        guest_fd: usize,
+        handle_id: u64,
+        mask_bits: u64,
+        nonblock: bool,
+    ) -> Result<(), Errno> {
+        let Some(provider) = broker_signalfd_provider() else {
+            return Err(Errno::ENOSYS);
+        };
+        let file = SignalfdFile::new_broker_backed(
+            provider,
+            handle_id,
+            nonblock,
+            SigSet::from_u64(mask_bits),
+        );
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<SignalfdSubsystem>(file);
+
+        if self
+            .files
+            .borrow()
+            .raw_descriptor_store
+            .read()
+            .is_alive(guest_fd)
+        {
+            self.do_close(guest_fd)?;
+        }
+
+        let files = self.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+        if rds.fd_into_specific_raw_integer(typed, guest_fd) {
+            Ok(())
+        } else {
+            Err(Errno::EBADF)
+        }
     }
 }
 

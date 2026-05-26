@@ -9219,6 +9219,50 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            let signalfd_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::signalfd::SignalfdSubsystem>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in signalfd_fds {
+                let signalfd_provider = super::signalfd::broker_signalfd_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let bridge_info = dt_local
+                    .with_entry(&typed, |sfd: &super::signalfd::SignalfdFile| {
+                        sfd.worker_exec_bridge_snapshot()
+                    });
+                drop(dt_local);
+                if let (Some(provider), Some((handle_id, mask_bits, nonblock))) =
+                    (signalfd_provider, bridge_info)
+                {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
+                    broker_eventfd_specs.push(alloc::format!(
+                        "{raw_fd}:signalfd:{handle_id}:{mask_bits}:{}",
+                        u8::from(nonblock)
+                    ));
+                    broker_eventfd_transit_release.push((releaser, handle_id));
+                }
+            }
+
             let network_fds: alloc::vec::Vec<usize> = {
                 let files = self.files.borrow();
                 let rds = files.raw_descriptor_store.read();
