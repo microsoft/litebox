@@ -2023,6 +2023,8 @@ impl<FS: ShimFS> Task<FS> {
             &fd,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
         )?;
+        // TODO(transfer_listen_route): after the broker API is wired, this
+        // worker-exec bridge should transfer the parent's listen route here.
         self.global.listen(&fd, 16)
     }
 

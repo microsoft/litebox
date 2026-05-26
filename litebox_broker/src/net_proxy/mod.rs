@@ -170,6 +170,18 @@ pub struct RoutedStream {
     pub guest_port: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferListenRouteOutcome {
+    Transferred,
+    AlreadyOwnedByTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferListenRouteError {
+    PortNotRegistered,
+    SourceNotOwner { actual_owner: u64 },
+}
+
 impl Default for PortRouter {
     fn default() -> Self {
         Self::new()
@@ -235,6 +247,21 @@ impl PortRouter {
                 );
             }
         }
+    }
+
+    /// Transfer a TCP listen route from one worker proxy to another.
+    ///
+    /// Design stub only: the implementation must atomically validate the
+    /// current owner and retarget future routed streams to `to_sender`.
+    pub fn transfer_listen_route(
+        &self,
+        port: u16,
+        from_worker_id: u64,
+        to_worker_id: u64,
+        to_sender: std::sync::mpsc::Sender<RoutedStream>,
+    ) -> Result<TransferListenRouteOutcome, TransferListenRouteError> {
+        let _ = (port, from_worker_id, to_worker_id, to_sender);
+        todo!("transfer_listen_route: validate route ownership and retarget sender")
     }
 
     /// Try to route an accepted TCP stream to the worker that owns `guest_port`.
