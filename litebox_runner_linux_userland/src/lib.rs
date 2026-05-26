@@ -468,8 +468,8 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             .map_err(|err| anyhow!("broker-fd-bridge: brokerfile {spec:?}: {err:?}"));
     }
 
-    if parts.get(1) == Some(&"timerfd") && parts.len() == 9 {
-        // spec format: {raw_fd}:timerfd:{clockid_u32}:{nonblock_u8}:{value_sec}:{value_nsec}:{interval_sec}:{interval_nsec}:{pending}
+    if parts.get(1) == Some(&"timerfd") && parts.len() == 10 {
+        // spec format: {raw_fd}:timerfd:{clockid_u32}:{nonblock_u8}:{value_sec}:{value_nsec}:{interval_sec}:{interval_nsec}:{pending}:{snapshot_now_ns}
         let guest_fd: usize = parts[0]
             .parse()
             .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
@@ -510,6 +510,12 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
         let pending_expirations: u64 = parts[8]
             .parse()
             .map_err(|e| anyhow!("broker-fd-bridge: bad timerfd pending {:?}: {e}", parts[8]))?;
+        let snapshot_now_ns: u64 = parts[9].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad timerfd snapshot_now_ns {:?}: {e}",
+                parts[9]
+            )
+        })?;
         let spec_val = litebox_common_linux::ItimerSpec {
             value: litebox_common_linux::Timespec {
                 tv_sec: value_sec,
@@ -525,7 +531,14 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             },
         };
         return entrypoints
-            .install_timerfd_bridge_fd(guest_fd, clockid, nonblock, spec_val, pending_expirations)
+            .install_timerfd_bridge_fd(
+                guest_fd,
+                clockid,
+                nonblock,
+                spec_val,
+                pending_expirations,
+                snapshot_now_ns,
+            )
             .map_err(|err| anyhow!("broker-fd-bridge: timerfd {spec:?}: {err:?}"));
     }
 

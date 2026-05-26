@@ -172,9 +172,16 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         nonblock: bool,
         spec: litebox_common_linux::ItimerSpec,
         pending_expirations: u64,
+        snapshot_now_ns: u64,
     ) -> Result<(), litebox_common_linux::errno::Errno> {
-        self.task
-            .install_timerfd_bridge_fd(guest_fd, clockid, nonblock, spec, pending_expirations)
+        self.task.install_timerfd_bridge_fd(
+            guest_fd,
+            clockid,
+            nonblock,
+            spec,
+            pending_expirations,
+            snapshot_now_ns,
+        )
     }
 
     /// Install a external fd FD into the restored child's descriptor table.

@@ -9381,9 +9381,9 @@ impl<FS: ShimFS> Task<FS> {
                     )
                     .flatten();
                 drop(dt_local);
-                if let Some((clockid, nonblock, spec, pending)) = snapshot {
+                if let Some((clockid, nonblock, spec, pending, snapshot_now_ns)) = snapshot {
                     broker_eventfd_specs.push(alloc::format!(
-                        "{raw_fd}:timerfd:{}:{}:{}:{}:{}:{}:{}",
+                        "{raw_fd}:timerfd:{}:{}:{}:{}:{}:{}:{}:{}",
                         clockid as u32,
                         u8::from(nonblock),
                         spec.value.tv_sec,
@@ -9391,6 +9391,7 @@ impl<FS: ShimFS> Task<FS> {
                         spec.interval.tv_sec,
                         spec.interval.tv_nsec,
                         pending,
+                        snapshot_now_ns,
                     ));
                 }
             }
