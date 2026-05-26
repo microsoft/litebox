@@ -213,38 +213,10 @@ const fn valid_ops(subsystem: InheritSubsystem) -> &'static [InheritOp] {
     }
 }
 
-const NON_PIE_CHILD_ACCEPT_XFAIL_REASON: &str =
-    "non-PIE child cross-worker listen-queue ownership pending (follow-up to non-PIE inherit fix)";
-
-fn expected_fail_reason(trial: InheritTrial) -> Option<&'static str> {
-    if matches!(trial.subsystem, InheritSubsystem::TcpListen)
-        && matches!(trial.op, InheritOp::Accept)
-        && matches!(
-            trial.parent_bt,
-            BinaryType::PieGlibc
-                | BinaryType::NonPieGlibc
-                | BinaryType::StaticPieGlibc
-                | BinaryType::StaticPieMusl
-                | BinaryType::NonPieStaticMusl
-        )
-        && matches!(
-            trial.child_bt,
-            BinaryType::NonPieGlibc | BinaryType::NonPieStaticMusl
-        )
-    {
-        Some(NON_PIE_CHILD_ACCEPT_XFAIL_REASON)
-    } else {
-        None
-    }
-}
-
 fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
     let id = trial.id();
     let parent = parent_agent(trial.parent_bt);
-    let mut test = reg.test("vscode", "inherit_matrix", id).timeout(30);
-    if let Some(reason) = expected_fail_reason(trial) {
-        test = test.expected_fail_on_litebox(reason);
-    }
+    let test = reg.test("vscode", "inherit_matrix", id).timeout(30);
 
     test.build(move |cx| {
         let parent_handle = cx.require(parent);
