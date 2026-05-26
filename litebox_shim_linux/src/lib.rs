@@ -2614,6 +2614,98 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     Signalfd(&'a Arc<TypedFd<syscalls::signalfd::SignalfdSubsystem>>),
 }
 
+/// Planned worker-exec fd-bridge decision for a `RawFdRef`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum WorkerExecBridgeDecision {
+    Bridge(WorkerExecBridgeState),
+    NotNeeded(WorkerExecNoBridgeReason),
+}
+
+/// Explicit non-bridgeable outcomes so every `RawFdRef` variant records a decision.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum WorkerExecNoBridgeReason {
+    KernelFdInherited,
+    BrokerOnlyState,
+    NotWorkerExecBridgeable,
+}
+
+/// Closed worker-exec fd state carried through the runner bridge spec channel.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum WorkerExecBridgeState {
+    BrokerFile(BrokerFileBridgeState),
+    TcpListen(TcpListenBridgeState),
+    Signalfd(SignalfdBridgeState),
+    Timerfd(TimerfdBridgeState),
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct BrokerFileBridgeState {
+    pub(crate) handle_id: u64,
+    pub(crate) access_mode: u32,
+    pub(crate) status_flags: u32,
+    pub(crate) offset: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct TcpListenBridgeState {
+    pub(crate) port: u16,
+    pub(crate) reuse_port: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SignalfdBridgeState {
+    pub(crate) handle_id: u64,
+    pub(crate) mask_bits: u64,
+    pub(crate) nonblock: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct TimerfdBridgeState {
+    pub(crate) clock_id: i32,
+    pub(crate) flags: u32,
+    pub(crate) next_expiration_ns: u64,
+    pub(crate) interval_ns: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
+    pub(crate) fn worker_exec_bridge_decision(&self) -> WorkerExecBridgeDecision {
+        match self {
+            RawFdRef::Fs(_fd) => todo!("encode BrokerFileBridgeState when fs fd is broker-backed"),
+            RawFdRef::Net(_fd) => {
+                todo!("encode TcpListenBridgeState when socket is a bridged listener")
+            }
+            RawFdRef::Pipes(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::KernelFdInherited)
+            }
+            RawFdRef::Eventfd(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::KernelFdInherited)
+            }
+            RawFdRef::Epoll(_fd) => WorkerExecBridgeDecision::NotNeeded(
+                WorkerExecNoBridgeReason::NotWorkerExecBridgeable,
+            ),
+            RawFdRef::Unix(_fd) => WorkerExecBridgeDecision::NotNeeded(
+                WorkerExecNoBridgeReason::NotWorkerExecBridgeable,
+            ),
+            RawFdRef::ExternalFd(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::KernelFdInherited)
+            }
+            RawFdRef::BrokerPipe(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::BrokerSocketPair(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::BrokerPty(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::Signalfd(_fd) => {
+                todo!("encode SignalfdBridgeState from broker-backed signalfd")
+            }
+        }
+    }
+}
+
 // This places size limits on maximum read/write sizes that might occur; it exists primarily to
 // prevent OOM due to the user asking for a _massive_ read or such at once. Keeping this too small
 // has the downside of requiring too many syscalls, while having it be too large allows for massive
