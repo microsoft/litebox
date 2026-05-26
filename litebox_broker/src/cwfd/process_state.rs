@@ -75,7 +75,7 @@ impl ProcessState {
     /// Convenience constructor that wraps the new state in an `Arc`
     /// for direct hand-off to
     /// [`crate::state_registry::BrokerStateRegistry::register`].
-    pub fn arc() -> Arc<dyn StateObject + Send + Sync> {
+    pub fn arc() -> Arc<Self> {
         Arc::new(Self::new())
     }
 

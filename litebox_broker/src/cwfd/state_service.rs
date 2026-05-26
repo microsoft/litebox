@@ -29,7 +29,9 @@ use crate::process_state::ProcessState;
 use crate::pty_state::{PtyError, PtyState};
 use crate::signalfd_state::SignalfdState;
 use crate::socketpair_state::{SocketPairEnd, SocketPairError};
-use crate::state_registry::{BrokerStateRegistry, StateHandle, StateObject, StateRegistryError};
+use crate::state_registry::{
+    BrokerStateRegistry, StateHandle, StateObjectEnum, StateRegistryError,
+};
 use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use litebox_common_linux::fd_token_protocol::PtyEndpoint;
 use litebox_common_linux::fd_token_protocol::{
@@ -471,7 +473,7 @@ fn handle_pidfd_exited(
         }
         Err(_) => return status_err(Opcode::PidfdExitedResponse, StatusCode::Internal),
     };
-    let Some(pidfd) = state.as_any().downcast_ref::<PidfdState>() else {
+    let StateObjectEnum::Pidfd(pidfd) = state.as_ref() else {
         return status_err(Opcode::PidfdExitedResponse, StatusCode::SubsystemMismatch);
     };
     HandlerResult {
@@ -539,10 +541,12 @@ fn handle_subscribe_process_exit(
         }
         Err(_) => return status_err(Opcode::SubscribeProcessExitResponse, StatusCode::Internal),
     };
-    let process = state
-        .as_any()
-        .downcast_ref::<ProcessState>()
-        .expect("subsystem_tag check guarantees ProcessState");
+    let StateObjectEnum::Process(process) = state.as_ref() else {
+        return status_err(
+            Opcode::SubscribeProcessExitResponse,
+            StatusCode::SubsystemMismatch,
+        );
+    };
     let handle = StateHandle::from_id(pid);
     if registry.dup(handle).is_err() {
         return status_err(
@@ -597,10 +601,12 @@ fn handle_mark_process_exited(
         }
         Err(_) => return status_err(Opcode::MarkProcessExitedResponse, StatusCode::Internal),
     };
-    let process = state
-        .as_any()
-        .downcast_ref::<ProcessState>()
-        .expect("subsystem_tag check guarantees ProcessState");
+    let StateObjectEnum::Process(process) = state.as_ref() else {
+        return status_err(
+            Opcode::MarkProcessExitedResponse,
+            StatusCode::SubsystemMismatch,
+        );
+    };
     process.mark_exited(exit_code);
     HandlerResult {
         frame: build_mark_process_exited_response_ok(),
@@ -631,10 +637,9 @@ fn handle_read_eventfd(
         }
         Err(_) => return status_err(Opcode::ReadEventfdResponse, StatusCode::Internal),
     };
-    let eventfd = state
-        .as_any()
-        .downcast_ref::<EventfdState>()
-        .expect("subsystem_tag check guarantees EventfdState");
+    let StateObjectEnum::Eventfd(eventfd) = state.as_ref() else {
+        return status_err(Opcode::ReadEventfdResponse, StatusCode::SubsystemMismatch);
+    };
     match eventfd.read() {
         Ok(v) => HandlerResult {
             frame: build_read_eventfd_response_ok(v),
@@ -673,10 +678,9 @@ fn handle_write_eventfd(
         }
         Err(_) => return status_err(Opcode::WriteEventfdResponse, StatusCode::Internal),
     };
-    let eventfd = state
-        .as_any()
-        .downcast_ref::<EventfdState>()
-        .expect("subsystem_tag check guarantees EventfdState");
+    let StateObjectEnum::Eventfd(eventfd) = state.as_ref() else {
+        return status_err(Opcode::WriteEventfdResponse, StatusCode::SubsystemMismatch);
+    };
     match eventfd.write(value) {
         Ok(()) => HandlerResult {
             frame: build_write_eventfd_response_ok(),
@@ -726,10 +730,18 @@ fn handle_create_pipe(
 fn resolve_pipe_read(
     registry: &BrokerStateRegistry,
     handle_id: u64,
-) -> Result<Arc<dyn crate::state_registry::StateObject>, StatusCode> {
+) -> Result<Arc<PipeReadEnd>, StatusCode> {
     match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Pipe) {
-        Ok(s) if s.as_any().is::<PipeReadEnd>() => Ok(s),
-        Ok(_) => Err(StatusCode::SubsystemMismatch),
+        Ok(s) => match s.as_ref() {
+            StateObjectEnum::PipeReadEnd(read_end) => Ok(Arc::clone(read_end)),
+            StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeWriteEnd(_)
+            | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Pty(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::Process(_) => Err(StatusCode::SubsystemMismatch),
+        },
         Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
         Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
         Err(_) => Err(StatusCode::Internal),
@@ -739,10 +751,18 @@ fn resolve_pipe_read(
 fn resolve_pipe_write(
     registry: &BrokerStateRegistry,
     handle_id: u64,
-) -> Result<Arc<dyn crate::state_registry::StateObject>, StatusCode> {
+) -> Result<Arc<PipeWriteEnd>, StatusCode> {
     match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Pipe) {
-        Ok(s) if s.as_any().is::<PipeWriteEnd>() => Ok(s),
-        Ok(_) => Err(StatusCode::SubsystemMismatch),
+        Ok(s) => match s.as_ref() {
+            StateObjectEnum::PipeWriteEnd(write_end) => Ok(Arc::clone(write_end)),
+            StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeReadEnd(_)
+            | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Pty(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::Process(_) => Err(StatusCode::SubsystemMismatch),
+        },
         Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
         Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
         Err(_) => Err(StatusCode::Internal),
@@ -768,11 +788,7 @@ fn handle_read_pipe(
         Ok(s) => s,
         Err(status) => return status_err(Opcode::ReadPipeResponse, status),
     };
-    let read_end = state
-        .as_any()
-        .downcast_ref::<PipeReadEnd>()
-        .expect("resolve_pipe_read checked");
-    match read_end.read(max_len) {
+    match state.read(max_len) {
         Ok(bytes) => HandlerResult {
             frame: build_read_pipe_response_ok(&bytes),
             out_fd: None,
@@ -800,11 +816,7 @@ fn handle_write_pipe(
             return status_err(Opcode::WritePipeResponse, status);
         }
     };
-    let write_end = state
-        .as_any()
-        .downcast_ref::<PipeWriteEnd>()
-        .expect("resolve_pipe_write checked");
-    match write_end.write(&bytes) {
+    match state.write(&bytes) {
         Ok(n) => HandlerResult {
             frame: build_write_pipe_response_ok(n as u64),
             out_fd: None,
@@ -854,10 +866,18 @@ fn handle_create_socketpair(
 fn resolve_socketpair_end(
     registry: &BrokerStateRegistry,
     handle_id: u64,
-) -> Result<Arc<dyn crate::state_registry::StateObject>, StatusCode> {
+) -> Result<Arc<SocketPairEnd>, StatusCode> {
     match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::UnixSocket) {
-        Ok(s) if s.as_any().is::<SocketPairEnd>() => Ok(s),
-        Ok(_) => Err(StatusCode::SubsystemMismatch),
+        Ok(s) => match s.as_ref() {
+            StateObjectEnum::SocketPairEnd(end) => Ok(Arc::clone(end)),
+            StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeReadEnd(_)
+            | StateObjectEnum::PipeWriteEnd(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Pty(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::Process(_) => Err(StatusCode::SubsystemMismatch),
+        },
         Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
         Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
         Err(_) => Err(StatusCode::Internal),
@@ -883,11 +903,7 @@ fn handle_read_socketpair(
         Ok(s) => s,
         Err(status) => return status_err(Opcode::ReadSocketPairResponse, status),
     };
-    let end = state
-        .as_any()
-        .downcast_ref::<SocketPairEnd>()
-        .expect("resolve_socketpair_end checked");
-    match end.read(max_len) {
+    match state.read(max_len) {
         Ok(bytes) => HandlerResult {
             frame: build_read_socketpair_response_ok(&bytes),
             out_fd: None,
@@ -915,11 +931,7 @@ fn handle_write_socketpair(
         Ok(s) => s,
         Err(status) => return status_err(Opcode::WriteSocketPairResponse, status),
     };
-    let end = state
-        .as_any()
-        .downcast_ref::<SocketPairEnd>()
-        .expect("resolve_socketpair_end checked");
-    match end.write(&bytes) {
+    match state.write(&bytes) {
         Ok(n) => HandlerResult {
             frame: build_write_socketpair_response_ok(n as u64),
             out_fd: None,
@@ -949,11 +961,7 @@ fn handle_shutdown_socketpair_write(
         Ok(s) => s,
         Err(status) => return status_err(Opcode::ShutdownSocketPairWriteResponse, status),
     };
-    let end = state
-        .as_any()
-        .downcast_ref::<SocketPairEnd>()
-        .expect("resolve_socketpair_end checked");
-    end.shutdown_write();
+    state.shutdown_write();
     HandlerResult {
         frame: build_shutdown_socketpair_write_response_ok(),
         out_fd: None,
@@ -1008,10 +1016,9 @@ fn handle_read_siginfo(
         }
         Err(_) => return status_err(Opcode::ReadSiginfoResponse, StatusCode::Internal),
     };
-    let signalfd = state
-        .as_any()
-        .downcast_ref::<SignalfdState>()
-        .expect("subsystem_tag check guarantees SignalfdState");
+    let StateObjectEnum::Signalfd(signalfd) = state.as_ref() else {
+        return status_err(Opcode::ReadSiginfoResponse, StatusCode::SubsystemMismatch);
+    };
     match signalfd.read_siginfo() {
         Ok(Some(payload)) => HandlerResult {
             frame: build_read_siginfo_response_ok(&payload),
@@ -1050,10 +1057,9 @@ fn handle_push_siginfo(
         }
         Err(_) => return status_err(Opcode::PushSiginfoResponse, StatusCode::Internal),
     };
-    let signalfd = state
-        .as_any()
-        .downcast_ref::<SignalfdState>()
-        .expect("subsystem_tag check guarantees SignalfdState");
+    let StateObjectEnum::Signalfd(signalfd) = state.as_ref() else {
+        return status_err(Opcode::PushSiginfoResponse, StatusCode::SubsystemMismatch);
+    };
     signalfd.enqueue_siginfo(payload);
     HandlerResult {
         frame: build_push_siginfo_response_ok(),
@@ -1099,10 +1105,9 @@ fn handle_open_pty_slave(
         let Ok(state) = registry.resolve(handle, SubsystemTag::Pty) else {
             continue;
         };
-        let pty = state
-            .as_any()
-            .downcast_ref::<PtyState>()
-            .expect("Pty tag guarantees PtyState");
+        let StateObjectEnum::Pty(pty) = state.as_ref() else {
+            continue;
+        };
         if pty.pty_id() == pty_id
             && pty.endpoint() == litebox_common_linux::fd_token_protocol::PtyEndpoint::Slave
         {
@@ -1122,9 +1127,20 @@ fn resolve_pty(
     registry: &BrokerStateRegistry,
     handle_id: u64,
     response: Opcode,
-) -> Result<std::sync::Arc<dyn StateObject + Send + Sync>, HandlerResult> {
+) -> Result<Arc<PtyState>, HandlerResult> {
     match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Pty) {
-        Ok(s) => Ok(s),
+        Ok(s) => match s.as_ref() {
+            StateObjectEnum::Pty(pty) => Ok(Arc::clone(pty)),
+            StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeReadEnd(_)
+            | StateObjectEnum::PipeWriteEnd(_)
+            | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::Process(_) => {
+                Err(status_err(response, StatusCode::SubsystemMismatch))
+            }
+        },
         Err(StateRegistryError::UnknownHandle(_)) => {
             Err(status_err(response, StatusCode::UnknownHandle))
         }
@@ -1151,11 +1167,7 @@ fn handle_pty_read(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let pty = state
-        .as_any()
-        .downcast_ref::<PtyState>()
-        .expect("Pty tag guarantees PtyState");
-    match pty.read(max_len as usize) {
+    match state.read(max_len as usize) {
         Ok(data) => HandlerResult {
             frame: build_pty_read_response_ok(&data),
             out_fd: None,
@@ -1186,11 +1198,7 @@ pub fn handle_pty_write(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let pty = state
-        .as_any()
-        .downcast_ref::<PtyState>()
-        .expect("Pty tag guarantees PtyState");
-    match pty.write(&data) {
+    match state.write(&data) {
         Ok(result) => {
             if let Some(inbox) = pgrp_signal_inbox {
                 let siginfo =
@@ -1230,13 +1238,9 @@ pub fn handle_pty_ioctl(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let pty = state
-        .as_any()
-        .downcast_ref::<PtyState>()
-        .expect("Pty tag guarantees PtyState");
     // Caller ids are supplied as best-effort payload-independent defaults until
     // Phase G's broker process/session model can validate job control globally.
-    match pty.ioctl(op, &payload, 1, 1, 1) {
+    match state.ioctl(op, &payload, 1, 1, 1) {
         Ok(result) => {
             if let (Some(inbox), Some((pgrp, signum))) = (pgrp_signal_inbox, result.signal_pgrp)
                 && pgrp > 0
@@ -1401,13 +1405,13 @@ fn handle_release_state(
     // Specifically: when a slave handle's refcount drops to 1, only
     // the master's anchor remains — no user-space slave fd-holders.
     // Notify master with POLLHUP+POLLIN (kernel-PTY semantic).
-    let pty_state: Option<Arc<dyn StateObject + Send + Sync>> = registry
+    let pty_state: Option<Arc<StateObjectEnum>> = registry
         .resolve(StateHandle::from_id(handle_id), SubsystemTag::Pty)
         .ok();
     match registry.release(StateHandle::from_id(handle_id)) {
         Ok(new_rc) => {
             if let Some(state) = pty_state
-                && let Some(pty) = state.as_any().downcast_ref::<PtyState>()
+                && let StateObjectEnum::Pty(pty) = state.as_ref()
                 && pty.endpoint() == PtyEndpoint::Slave
                 && new_rc == 1
             {
