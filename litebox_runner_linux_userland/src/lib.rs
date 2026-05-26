@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
@@ -290,6 +292,7 @@ type BrokerFdBridgeParsed = (
 /// `fd:kind:handle_id[:subkind]` and returns the components.
 ///
 /// `subkind` is required for pipe direction, unix socketpair endpoint, and PTY role.
+#[deny(clippy::wildcard_enum_match_arm)]
 fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
     use litebox_common_linux::broker_pty_provider::BrokerPtyRole;
@@ -349,13 +352,17 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Pty, None) => {
             anyhow::bail!("broker-fd-bridge: pty kind requires :m or :s suffix (spec {spec:?})")
         }
-        (_, Some(extra)) => {
+        (BrokerHandleKind::Eventfd, Some(extra))
+        | (BrokerHandleKind::Pidfd, Some(extra))
+        | (BrokerHandleKind::Signalfd, Some(extra)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
                 parts[1]
             )
         }
-        (_, None) => (None, None, None),
+        (BrokerHandleKind::Eventfd, None)
+        | (BrokerHandleKind::Pidfd, None)
+        | (BrokerHandleKind::Signalfd, None) => (None, None, None),
     };
     let pty_id = if kind == BrokerHandleKind::Pty {
         match parts.get(4) {

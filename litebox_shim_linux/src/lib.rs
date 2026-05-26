@@ -7,6 +7,7 @@
 //! chosen by the [platform multiplex](../litebox_platform_multiplex/index.html).
 
 #![no_std]
+#![allow(clippy::wildcard_enum_match_arm)]
 #![expect(
     clippy::unused_self,
     reason = "by convention, syscalls and related methods take &self even if unused"
@@ -342,6 +343,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
     /// `pipe_direction` MUST be `Some(_)` when `kind == Pipe` and SHOULD be
     /// `None` otherwise. The parser supplies it from the optional `r`/`w`
     /// suffix on the bridge spec (`fd:pipe:handle_id:r|w`).
+    #[deny(clippy::wildcard_enum_match_arm)]
     pub fn install_broker_bridge_fd(
         &self,
         guest_fd: usize,
