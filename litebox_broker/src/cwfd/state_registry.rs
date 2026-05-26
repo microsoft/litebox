@@ -75,6 +75,7 @@ use crate::cwfd::pty_state::PtyState;
 use crate::cwfd::signalfd_state::SignalfdState;
 use crate::cwfd::socketpair_state::SocketPairEnd;
 use crate::cwfd::subscription_list::{SubscribeError, UnsubscribeError};
+use crate::cwfd::tcp_conn_state::TcpConnState;
 
 /// An opaque, broker-global handle to a [`StateObject`] held by the
 /// broker on behalf of one or more workers.
@@ -150,6 +151,7 @@ pub enum StateKind {
     PipeReadEnd,
     PipeWriteEnd,
     SocketPairEnd,
+    TcpConn,
     Signalfd,
     Pty,
     Pidfd,
@@ -163,6 +165,7 @@ pub enum StateObjectEnum {
     PipeReadEnd(Arc<PipeReadEnd>),
     PipeWriteEnd(Arc<PipeWriteEnd>),
     SocketPairEnd(Arc<SocketPairEnd>),
+    TcpConn(Arc<TcpConnState>),
     Signalfd(Arc<SignalfdState>),
     Pty(Arc<PtyState>),
     Pidfd(Arc<PidfdState>),
@@ -176,6 +179,7 @@ impl StateObjectEnum {
             StateObjectEnum::PipeReadEnd(_) => StateKind::PipeReadEnd,
             StateObjectEnum::PipeWriteEnd(_) => StateKind::PipeWriteEnd,
             StateObjectEnum::SocketPairEnd(_) => StateKind::SocketPairEnd,
+            StateObjectEnum::TcpConn(_) => StateKind::TcpConn,
             StateObjectEnum::Signalfd(_) => StateKind::Signalfd,
             StateObjectEnum::Pty(_) => StateKind::Pty,
             StateObjectEnum::Pidfd(_) => StateKind::Pidfd,
@@ -189,6 +193,7 @@ impl StateObjectEnum {
             StateObjectEnum::PipeReadEnd(state) => state.subsystem_tag(),
             StateObjectEnum::PipeWriteEnd(state) => state.subsystem_tag(),
             StateObjectEnum::SocketPairEnd(state) => state.subsystem_tag(),
+            StateObjectEnum::TcpConn(state) => state.subsystem_tag(),
             StateObjectEnum::Signalfd(state) => state.subsystem_tag(),
             StateObjectEnum::Pty(state) => state.subsystem_tag(),
             StateObjectEnum::Pidfd(state) => state.subsystem_tag(),
@@ -215,6 +220,9 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
+            StateObjectEnum::TcpConn(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
             StateObjectEnum::Signalfd(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
@@ -232,6 +240,7 @@ impl StateObjectEnum {
             StateObjectEnum::PipeReadEnd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::PipeWriteEnd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::SocketPairEnd(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::TcpConn(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Signalfd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Pty(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Pidfd(state) => state.unsubscribe(subscription_id),
@@ -284,6 +293,12 @@ impl From<Arc<PipeWriteEnd>> for StateObjectEnum {
 impl From<Arc<SocketPairEnd>> for StateObjectEnum {
     fn from(state: Arc<SocketPairEnd>) -> Self {
         StateObjectEnum::SocketPairEnd(state)
+    }
+}
+
+impl From<Arc<TcpConnState>> for StateObjectEnum {
+    fn from(state: Arc<TcpConnState>) -> Self {
+        StateObjectEnum::TcpConn(state)
     }
 }
 
