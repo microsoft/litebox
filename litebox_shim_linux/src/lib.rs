@@ -537,6 +537,32 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 );
                 Ok(())
             }
+            BrokerHandleKind::TcpConn => {
+                let provider = syscalls::broker_tcp_conn::broker_tcp_conn_provider().ok_or(())?;
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(handle_id);
+                let tcp_fd = syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+                    provider,
+                    handle_id,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem> =
+                    self.task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .insert(tcp_fd);
+                let mut rds = files.raw_descriptor_store.write();
+                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+                debug_assert!(
+                    ok,
+                    "install_broker_bridge_fd(tcp_conn): slot {guest_fd} still occupied"
+                );
+                Ok(())
+            }
             // C.5l guardrail: Signalfd / Pty are accepted by the
             // emit-side fork-snapshot code, but the install side
             // here has no implementation. Returning `Err(())` was
@@ -1712,6 +1738,39 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         );
                         continue;
                     }
+                    if broker_handle.kind == BrokerHandleKind::TcpConn {
+                        let Some(provider) = syscalls::broker_tcp_conn::broker_tcp_conn_provider()
+                        else {
+                            continue;
+                        };
+                        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                            alloc::sync::Arc::clone(&provider) as _;
+                        let _ = releaser.dup_handle(broker_handle.handle_id);
+                        let tcp_fd = syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+                            provider,
+                            broker_handle.handle_id,
+                            litebox::fs::OFlags::from_bits_retain(entry.status_flags),
+                        );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                            tcp_fd,
+                        );
+                        let mut rds = child_files.raw_descriptor_store.write();
+                        if entry.fd <= 2 {
+                            let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                        }
+                        let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                        debug_assert!(
+                            success,
+                            "broker_tcp_conn fd slot {} occupied during restore",
+                            entry.fd
+                        );
+                        continue;
+                    }
                 }
 
                 if let Some(socket) =
@@ -1782,6 +1841,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         // dedicated branch if FdClass::UnixSocket doesn't
                         // exist yet — handled near the FdClass::Pipe block).
                         BrokerHandleKind::UnixSocket => None,
+                        BrokerHandleKind::TcpConn => None,
                         // `Signalfd` is restored by its dedicated FdClass branch below.
                         BrokerHandleKind::Signalfd => todo!(
                             "fork-snapshot restore for BrokerHandleKind::Signalfd \

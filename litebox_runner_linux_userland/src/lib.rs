@@ -20,6 +20,7 @@ pub mod broker_pipe_provider;
 pub mod broker_pty_provider;
 pub mod broker_signalfd_provider;
 pub mod broker_socketpair_provider;
+pub mod broker_tcp_conn_provider;
 pub mod guest_pid_provider;
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -314,6 +315,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         "pty" => BrokerHandleKind::Pty,
         "pipe" => BrokerHandleKind::Pipe,
         "unix_socket" => BrokerHandleKind::UnixSocket,
+        "tcp_conn" => BrokerHandleKind::TcpConn,
         other => anyhow::bail!("broker-fd-bridge: bad kind {other:?}"),
     };
     let handle_id: u64 = parts[2]
@@ -356,7 +358,8 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         }
         (BrokerHandleKind::Eventfd, Some(extra))
         | (BrokerHandleKind::Pidfd, Some(extra))
-        | (BrokerHandleKind::Signalfd, Some(extra)) => {
+        | (BrokerHandleKind::Signalfd, Some(extra))
+        | (BrokerHandleKind::TcpConn, Some(extra)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
                 parts[1]
@@ -364,7 +367,8 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         }
         (BrokerHandleKind::Eventfd, None)
         | (BrokerHandleKind::Pidfd, None)
-        | (BrokerHandleKind::Signalfd, None) => (None, None, None),
+        | (BrokerHandleKind::Signalfd, None)
+        | (BrokerHandleKind::TcpConn, None) => (None, None, None),
     };
     let pty_id = if kind == BrokerHandleKind::Pty {
         match parts.get(4) {
@@ -3395,6 +3399,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_socketpair_provider(socketpair_provider)
         .map_err(|_| anyhow!("socketpair provider already set"))?;
+
+    let tcp_conn_provider = Arc::new(
+        crate::broker_tcp_conn_provider::RunnerBrokerTcpConnProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_tcp_conn_provider(tcp_conn_provider)
+        .map_err(|_| anyhow!("tcp conn provider already set"))?;
 
     let pgrp_signal_provider = Arc::new(
         crate::broker_pgrp_signal_provider::RunnerBrokerPgrpSignalProvider::new(

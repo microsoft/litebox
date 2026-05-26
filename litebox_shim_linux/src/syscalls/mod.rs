@@ -22,6 +22,7 @@ pub use broker_socketpair::{
     broker_socketpair_provider, eager_broker_socketpair_enabled, set_broker_socketpair_provider,
     set_eager_broker_socketpair_enabled,
 };
+pub use broker_tcp_conn::{broker_tcp_conn_provider, set_broker_tcp_conn_provider};
 pub use eventfd::broker_eventfd_provider;
 pub use eventfd::broker_pgrp_signal_provider;
 pub use eventfd::broker_pidfd_provider;

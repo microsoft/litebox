@@ -6681,9 +6681,9 @@ impl<FS: ShimFS> Task<FS> {
                             (FdClass::UnixSocket, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerTcpConn(fd) => {
-                            // Stage 1 scaffold: classify as UnixSocket-shaped
-                            // broker state, matching BrokerSocketPair until the
-                            // TCP-connection-specific bridge metadata lands.
+                            // Broker-hosted connected TCP is fork-bridged via
+                            // broker_handle metadata; keep the existing UnixSocket
+                            // migratable class bucket until FdClass grows a TCP arm.
                             (FdClass::UnixSocket, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerPty(fd) => (
@@ -6838,6 +6838,11 @@ impl<FS: ShimFS> Task<FS> {
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
                                 BrokerHandleKind::UnixSocket => {
                                     super::broker_socketpair::broker_socketpair_provider()
+                                        .as_ref()
+                                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                                }
+                                BrokerHandleKind::TcpConn => {
+                                    super::broker_tcp_conn::broker_tcp_conn_provider()
                                         .as_ref()
                                         .map(|p| alloc::sync::Arc::clone(p) as _)
                                 }
@@ -7060,6 +7065,48 @@ impl<FS: ShimFS> Task<FS> {
                                             handle_id,
                                             pipe_direction: None,
                                             socketpair_endpoint: Some(endpoint),
+                                            pty_role: None,
+                                            pty_id: None,
+                                        })
+                                    }
+                                    Err(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                } else if let Ok(typed) = rds
+                    .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
+                {
+                    let tcp_provider = super::broker_tcp_conn::broker_tcp_conn_provider();
+                    let entry_result = dt.with_entry(
+                        &typed,
+                        |tcp_fd: &super::broker_tcp_conn::BrokerTcpConnFd<crate::Platform>| {
+                            tcp_fd.fork_snapshot_handle()
+                        },
+                    );
+                    match entry_result {
+                        Some((kind, handle_id)) => {
+                            let releaser_opt: Option<
+                                alloc::sync::Arc<
+                                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                                >,
+                            > = tcp_provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
+                            if let Some(releaser) = releaser_opt {
+                                match releaser.dup_handle(handle_id) {
+                                    Ok(()) => {
+                                        broker_transit.push(ForkSnapshotBrokerTransit {
+                                            releaser,
+                                            handle_id,
+                                            kind,
+                                        });
+                                        Some(BrokerHandleSnapshot {
+                                            kind,
+                                            handle_id,
+                                            pipe_direction: None,
+                                            socketpair_endpoint: None,
                                             pty_role: None,
                                             pty_id: None,
                                         })
@@ -8994,6 +9041,7 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Pty => "pty",
                         BrokerHandleKind::Pipe => "pipe",
                         BrokerHandleKind::UnixSocket => "unix_socket",
+                        BrokerHandleKind::TcpConn => "tcp_conn",
                     };
                     let releaser: Option<
                         alloc::sync::Arc<
@@ -9015,6 +9063,11 @@ impl<FS: ShimFS> Task<FS> {
                             .map(|p| alloc::sync::Arc::clone(p) as _),
                         BrokerHandleKind::UnixSocket => {
                             super::broker_socketpair::broker_socketpair_provider()
+                                .as_ref()
+                                .map(|p| alloc::sync::Arc::clone(p) as _)
+                        }
+                        BrokerHandleKind::TcpConn => {
+                            super::broker_tcp_conn::broker_tcp_conn_provider()
                                 .as_ref()
                                 .map(|p| alloc::sync::Arc::clone(p) as _)
                         }
@@ -9224,6 +9277,50 @@ impl<FS: ShimFS> Task<FS> {
                     broker_eventfd_specs.push(alloc::format!(
                         "{raw_fd}:unix_socket:{handle_id}:{endpoint_char}"
                     ));
+                }
+            }
+
+            let broker_tcp_conn_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<
+                    litebox::fd::TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>,
+                >,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) = rds
+                        .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                            raw_fd,
+                        )
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in broker_tcp_conn_fds {
+                let tcp_provider = super::broker_tcp_conn::broker_tcp_conn_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let handle_id = dt_local.with_entry(
+                    &typed,
+                    |tcp_fd: &super::broker_tcp_conn::BrokerTcpConnFd<crate::Platform>| {
+                        tcp_fd.handle()
+                    },
+                );
+                drop(dt_local);
+                if let (Some(provider), Some(handle_id)) = (tcp_provider, handle_id) {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
+                    broker_eventfd_specs.push(alloc::format!("{raw_fd}:tcp_conn:{handle_id}"));
                 }
             }
 
