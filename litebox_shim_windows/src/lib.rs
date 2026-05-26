@@ -15,6 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicI32, Ordering};
+use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
 use litebox::mm::PageManager;
@@ -180,24 +181,26 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
-        if NtSysno::from_raw(ctx.orig_rax) != Some(NtSysno::NtTerminateProcess) {
+        if NtSysno::from_raw(ctx.orig_rax) == Some(NtSysno::NtTerminateProcess) {
             litebox_util_log::debug!(
-                syscall_number = ctx.orig_rax;
-                "Unsupported Windows syscall"
+                syscall_number = ctx.orig_rax,
+                process_handle:% = format_args!("{:#x}", ctx.r10),
+                exit_status:% = format_args!("{:#x}", ctx.rdx);
+                "Handling NtTerminateProcess syscall"
             );
+            self.process
+                .exit_code
+                .store(windows_exit_status_to_i32(ctx.rdx), Ordering::Relaxed);
+            ctx.rax = NtStatus::SUCCESS.to_usize();
             return ContinueOperation::Terminate;
         }
 
         litebox_util_log::debug!(
-            syscall_number = ctx.orig_rax,
-            process_handle:% = format_args!("{:#x}", ctx.r10),
-            exit_status:% = format_args!("{:#x}", ctx.rdx);
-            "Handling NtTerminateProcess syscall"
+            syscall_number = ctx.orig_rax;
+            "Unsupported Windows syscall"
         );
-        self.process
-            .exit_code
-            .store(windows_exit_status_to_i32(ctx.rdx), Ordering::Relaxed);
-        ContinueOperation::Terminate
+        ctx.rax = NtStatus::UNSUCCESSFUL.to_usize();
+        ContinueOperation::Resume
     }
 
     fn handle_interrupt_request(
