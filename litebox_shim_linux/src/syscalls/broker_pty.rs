@@ -29,6 +29,8 @@ pub use super::eventfd::{broker_pty_provider, set_broker_pty_provider};
 
 pub(crate) struct BrokerPtySubsystem;
 impl FdEnabledSubsystem for BrokerPtySubsystem {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::BrokerPty;
+
     type Entry = BrokerPtyFd<Platform>;
 }
 

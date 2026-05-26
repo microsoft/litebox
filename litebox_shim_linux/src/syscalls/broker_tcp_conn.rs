@@ -48,6 +48,8 @@ pub fn broker_tcp_conn_provider() -> Option<Arc<dyn BrokerTcpConnProvider>> {
 
 pub(crate) struct BrokerTcpConnSubsystem;
 impl FdEnabledSubsystem for BrokerTcpConnSubsystem {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::BrokerTcpConn;
+
     type Entry = BrokerTcpConnFd<Platform>;
 }
 

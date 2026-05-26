@@ -30,6 +30,8 @@ use crate::{GlobalState, ShimFS};
 
 pub(crate) struct EpollSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
 impl<FS: ShimFS> FdEnabledSubsystem for EpollSubsystem<FS> {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::Epoll;
+
     type Entry = EpollFile<FS>;
 }
 impl<FS: ShimFS> FdEnabledSubsystemEntry for EpollFile<FS> {}

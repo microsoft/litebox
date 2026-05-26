@@ -946,6 +946,8 @@ pub struct DescriptorEntry<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> crate::fd::FdEnabledSubsystem
     for Pipes<Platform>
 {
+    const KIND: crate::fd::SubsystemKind = crate::fd::SubsystemKind::Pipes;
+
     type Entry = DescriptorEntry<Platform>;
 }
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> crate::fd::FdEnabledSubsystemEntry

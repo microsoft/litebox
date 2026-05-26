@@ -2434,5 +2434,6 @@ crate::fd::enable_fds_for_subsystem! {
     @Platform: { sync::RawSyncPrimitivesProvider }, W: { transport::Write };
     FileSystem<Platform, W>;
     Descriptor;
+    crate::fd::SubsystemKind::Fs;
     -> FileFd<Platform, W>;
 }

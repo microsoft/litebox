@@ -35,6 +35,35 @@ pub struct Descriptors<Platform: RawSyncPrimitivesProvider> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DescriptorObjectId(u64);
 
+/// Closed set of fd-owning subsystems.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubsystemKind {
+    /// Filesystem descriptors.
+    Fs,
+    /// Network socket descriptors.
+    Net,
+    /// Pipe descriptors.
+    Pipes,
+    /// Eventfd and timerfd descriptors.
+    Eventfd,
+    /// Epoll descriptors.
+    Epoll,
+    /// Unix-domain socket descriptors.
+    Unix,
+    /// Host external fd descriptors.
+    ExternalFd,
+    /// Broker pipe descriptors.
+    BrokerPipe,
+    /// Broker socketpair descriptors.
+    BrokerSocketPair,
+    /// Broker pty descriptors.
+    BrokerPty,
+    /// Signalfd descriptors.
+    Signalfd,
+    /// Broker TCP connection descriptors.
+    BrokerTcpConn,
+}
+
 impl DescriptorObjectId {
     /// Returns the raw numeric value.
     pub fn as_u64(self) -> u64 {
@@ -76,6 +105,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let object_id = self.allocate_object_id();
         let entry = DescriptorEntry {
             entry: alloc::boxed::Box::new(entry.into()),
+            subsystem_kind: Subsystem::KIND,
             metadata: AnyMap::new(),
         };
         let idx = self
@@ -661,19 +691,19 @@ pub struct RawDescriptorStorage {
 /// receiving side with [`RawDescriptorStorage::insert_passed_fd`].
 pub struct PassedFd {
     owned: OwnedFd,
-    type_id: core::any::TypeId,
+    subsystem_kind: SubsystemKind,
 }
 
 struct StoredFd {
     x: Arc<OwnedFd>,
-    subsystem_entry_type_id: core::any::TypeId,
+    subsystem_kind: SubsystemKind,
 }
 
 impl Clone for StoredFd {
     fn clone(&self) -> Self {
         Self {
             x: Arc::clone(&self.x),
-            subsystem_entry_type_id: self.subsystem_entry_type_id,
+            subsystem_kind: self.subsystem_kind,
         }
     }
 }
@@ -681,12 +711,12 @@ impl StoredFd {
     fn new<Subsystem: FdEnabledSubsystem>(fd: TypedFd<Subsystem>) -> Self {
         Self {
             x: Arc::new(fd.x),
-            subsystem_entry_type_id: core::any::TypeId::of::<Subsystem::Entry>(),
+            subsystem_kind: Subsystem::KIND,
         }
     }
     #[must_use]
     fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
-        self.subsystem_entry_type_id == core::any::TypeId::of::<Subsystem::Entry>()
+        self.subsystem_kind == Subsystem::KIND
     }
 }
 
@@ -723,7 +753,7 @@ impl RawDescriptorStorage {
                             .expect("fd should not be closed during fork");
                         StoredFd {
                             x: Arc::new(new_owned),
-                            subsystem_entry_type_id: stored.subsystem_entry_type_id,
+                            subsystem_kind: stored.subsystem_kind,
                         }
                     })
                 })
@@ -749,7 +779,7 @@ impl RawDescriptorStorage {
         let new_owned = global_dt.duplicate_raw_fd(&stored.x)?;
         Some(PassedFd {
             owned: new_owned,
-            type_id: stored.subsystem_entry_type_id,
+            subsystem_kind: stored.subsystem_kind,
         })
     }
 
@@ -773,7 +803,7 @@ impl RawDescriptorStorage {
             });
         let stored = StoredFd {
             x: Arc::new(passed.owned),
-            subsystem_entry_type_id: passed.type_id,
+            subsystem_kind: passed.subsystem_kind,
         };
         let old = self.stored_fds[raw_fd].replace(stored);
         assert!(old.is_none());
@@ -951,6 +981,9 @@ impl RawDescriptorStorage {
 
 /// A LiteBox subsystem that support having file descriptors.
 pub trait FdEnabledSubsystem: Sized {
+    /// Closed subsystem tag used for exhaustive descriptor dispatch.
+    const KIND: SubsystemKind;
+
     /// The per-FD entry type stored in the descriptor table for this subsystem
     type Entry: FdEnabledSubsystemEntry + 'static;
 }
@@ -1012,6 +1045,7 @@ impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
 /// A crate-internal entry for a descriptor.
 pub(crate) struct DescriptorEntry {
     entry: alloc::boxed::Box<dyn FdEnabledSubsystemEntry>,
+    subsystem_kind: SubsystemKind,
     metadata: AnyMap,
 }
 
@@ -1019,7 +1053,7 @@ impl DescriptorEntry {
     /// Check if this entry matches the specified subsystem
     #[must_use]
     fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
-        core::any::TypeId::of::<Subsystem::Entry>() == core::any::Any::type_id(self.entry.as_ref())
+        self.subsystem_kind == Subsystem::KIND
     }
 
     /// Obtains `self` as the subsystem's entry type.
@@ -1157,6 +1191,7 @@ macro_rules! enable_fds_for_subsystem {
         $system:ty;
         $(@ $($ent_param:ident $(: { $($ent_constraint:tt)* })?),*;)?
         $entry:ty;
+        $kind:expr;
         $(-> $fd:ident $(<$($fd_param:ident),*>)?;)?
     ) => {
         #[doc(hidden)]
@@ -1168,6 +1203,8 @@ macro_rules! enable_fds_for_subsystem {
         impl $(< $($sys_param $(: $($sys_constraint)*)?),* >)? $crate::fd::FdEnabledSubsystem
             for $system
         {
+            const KIND: $crate::fd::SubsystemKind = $kind;
+
             type Entry = DescriptorEntry $(< $($ent_param),* >)?;
         }
         impl $(< $($ent_param $(: $($ent_constraint)*)?),* >)? $crate::fd::FdEnabledSubsystemEntry

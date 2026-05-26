@@ -37,6 +37,8 @@ use super::guest_pid::BrokerProcessExitWake;
 
 pub(crate) struct EventfdSubsystem;
 impl FdEnabledSubsystem for EventfdSubsystem {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::Eventfd;
+
     type Entry = EventFile<Platform>;
 }
 impl FdEnabledSubsystemEntry for EventFile<Platform> {}

@@ -54,6 +54,8 @@ pub fn broker_pipe_provider() -> Option<Arc<dyn BrokerPipeProvider>> {
 
 pub(crate) struct BrokerPipeSubsystem;
 impl FdEnabledSubsystem for BrokerPipeSubsystem {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::BrokerPipe;
+
     type Entry = BrokerPipeFd<Platform>;
 }
 

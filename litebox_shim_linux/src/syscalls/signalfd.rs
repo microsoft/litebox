@@ -18,6 +18,8 @@ use litebox_platform_multiplex::Platform;
 
 pub(crate) struct SignalfdSubsystem;
 impl FdEnabledSubsystem for SignalfdSubsystem {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::Signalfd;
+
     type Entry = SignalfdFile;
 }
 impl FdEnabledSubsystemEntry for SignalfdFile {}

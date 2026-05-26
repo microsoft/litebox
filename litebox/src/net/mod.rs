@@ -2052,5 +2052,6 @@ crate::fd::enable_fds_for_subsystem! {
     Network<Platform>;
     @Platform: { platform::TimeProvider + sync::RawSyncPrimitivesProvider };
     SocketHandle<Platform>;
+    crate::fd::SubsystemKind::Net;
     -> SocketFd<Platform>;
 }
