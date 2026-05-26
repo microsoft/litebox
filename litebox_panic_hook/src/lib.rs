@@ -40,10 +40,10 @@ pub fn install_with_path(process_label: &'static str, path: impl Into<PathBuf>) 
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let bt = std::backtrace::Backtrace::force_capture();
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "<unknown>".to_string());
+        let location = info.location().map_or_else(
+            || "<unknown>".to_string(),
+            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
+        );
         let payload = if let Some(s) = info.payload().downcast_ref::<&'static str>() {
             (*s).to_string()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
