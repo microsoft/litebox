@@ -258,7 +258,7 @@ impl<FS: crate::ShimFS> crate::Task<FS> {
     }
 }
 
-fn signalfd_siginfo_payload(siginfo: &Siginfo, sender_pid: i32) -> Vec<u8> {
+pub(crate) fn signalfd_siginfo_payload(siginfo: &Siginfo, sender_pid: i32) -> Vec<u8> {
     let mut payload = Vec::with_capacity(128);
     payload.resize(128, 0);
     payload[0..4].copy_from_slice(&(siginfo.signo as u32).to_ne_bytes());

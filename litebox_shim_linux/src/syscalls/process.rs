@@ -8940,6 +8940,7 @@ impl<FS: ShimFS> Task<FS> {
         let mut broker_pidfd_process_transit: alloc::vec::Vec<
             super::guest_pid::BrokerProcessExitWake,
         > = alloc::vec::Vec::new();
+        let mut remote_signalfd_entries = alloc::vec::Vec::new();
         {
             // Collect EventfdSubsystem fds (non-stdio) and promote each to
             // broker-backed if not already. Skip on broker-provider absence
@@ -9259,6 +9260,10 @@ impl<FS: ShimFS> Task<FS> {
                         "{raw_fd}:signalfd:{handle_id}:{mask_bits}:{}",
                         u8::from(nonblock)
                     ));
+                    remote_signalfd_entries.push(crate::RemoteSignalfdEntry {
+                        handle_id,
+                        mask_bits,
+                    });
                     broker_eventfd_transit_release.push((releaser, handle_id));
                 }
             }
@@ -9355,6 +9360,15 @@ impl<FS: ShimFS> Task<FS> {
             .fork_child_host_pids
             .write()
             .insert(self.process_id.0, host_pid);
+        if !remote_signalfd_entries.is_empty() {
+            self.global.remote_signalfd_targets.write().insert(
+                self.process_id.0,
+                crate::RemoteSignalfdTarget {
+                    blocked_mask: self.signals.get_blocked().as_u64(),
+                    signalfds: remote_signalfd_entries,
+                },
+            );
+        }
 
         if let Some((vd, parent_pipe_fds, _parent_socket_fds)) = &vfork_info {
             for direct in spawn_result.direct_pipes {
@@ -9427,6 +9441,10 @@ impl<FS: ShimFS> Task<FS> {
         let exit_code = self.global.platform.wait_worker_host(host_pid);
         self.global
             .fork_child_host_pids
+            .write()
+            .remove(&self.process_id.0);
+        self.global
+            .remote_signalfd_targets
             .write()
             .remove(&self.process_id.0);
         let broker_exit_status = if exit_code > 255 {

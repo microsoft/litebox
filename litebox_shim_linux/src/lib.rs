@@ -838,6 +838,7 @@ impl LinuxShimBuilder {
             epoll_graph_lock: litebox::sync::Mutex::new(()),
             control_plane,
             fork_child_host_pids: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            remote_signalfd_targets: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             proc_cmdlines: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             inotify_instances: litebox::sync::Mutex::new(Vec::new()),
         });
@@ -4518,6 +4519,9 @@ struct GlobalState<FS: ShimFS> {
     /// Mapping from guest ProcessId.0 → remote worker host OS PID.
     /// Used to forward signals to fork-restore and remote-exec workers.
     fork_child_host_pids: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, i32>>,
+    /// Signalfds inherited by a remote-exec worker, keyed by guest ProcessId.0.
+    remote_signalfd_targets:
+        litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, RemoteSignalfdTarget>>,
     /// Synthetic `/proc/<pid>/cmdline` contents for locally-known guest PIDs.
     proc_cmdlines: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<i32, Vec<u8>>>,
     /// Open inotify instances visible to all tasks on this shim host.
@@ -4525,6 +4529,18 @@ struct GlobalState<FS: ShimFS> {
         Platform,
         Vec<alloc::sync::Arc<litebox::sync::Mutex<Platform, syscalls::file::InotifyInstanceState>>>,
     >,
+}
+
+#[derive(Clone)]
+struct RemoteSignalfdTarget {
+    blocked_mask: u64,
+    signalfds: Vec<RemoteSignalfdEntry>,
+}
+
+#[derive(Clone)]
+struct RemoteSignalfdEntry {
+    handle_id: u64,
+    mask_bits: u64,
 }
 
 struct PgrpSignalCallback<FS: ShimFS> {
