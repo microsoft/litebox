@@ -25,8 +25,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::TestOutcome;
-use super::agents::AgentName;
+use super::agents::{AgentHandle, AgentName};
 use super::registry::Registry;
+use super::run_context::RunContext;
 
 const TCP_LISTEN_MATRIX: HandlerToken<TcpListenTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.tcp_listen");
@@ -43,6 +44,12 @@ const TIMERFD_MATRIX: HandlerToken<TimerfdTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.timerfd");
 const SOCKETPAIR_MATRIX: HandlerToken<SocketpairTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.socketpair");
+const TCP_CONN_MATRIX: HandlerToken<TcpConnTrialArgs, ChildOutput> =
+    HandlerToken::new("inherit_matrix.tcp_conn");
+const TCP_CONN_PEER: HandlerToken<TcpConnPeerArgs, TcpConnPeerOutput> =
+    HandlerToken::new("inherit_matrix.tcp_conn_peer");
+
+const TCP_CONN_READY: &str = "tcp_conn_listening";
 
 const TCP_LISTEN_OPS: &[InheritOp] = &[
     InheritOp::Accept,
@@ -60,13 +67,10 @@ const SOCKETPAIR_OPS: &[InheritOp] = &[
     InheritOp::WriteThenParentReads,
     InheritOp::ChildShutdownThenParentEof,
 ];
-#[allow(dead_code)]
 const TCP_CONN_OPS: &[InheritOp] = &[
-    InheritOp::Read,
-    InheritOp::Write,
-    InheritOp::Poll,
-    InheritOp::Shutdown,
-    InheritOp::GetSockname,
+    InheritOp::ParentWritesChildReads,
+    InheritOp::ChildWritesParentReads,
+    InheritOp::ChildShutdownThenParentEof,
 ];
 #[allow(dead_code)]
 const EVENTFD_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Write, InheritOp::Poll];
@@ -279,6 +283,27 @@ struct TimerfdTrialArgs {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct TcpConnTrialArgs {
+    child_binary: String,
+    op: InheritOp,
+    timeout_ms: u64,
+    port: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+struct TcpConnPeerArgs {
+    op: InheritOp,
+    timeout_ms: u64,
+    port: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct TcpConnPeerOutput {
+    passed: bool,
+    detail: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct ChildOutput {
     exit_code: i32,
     stdout: String,
@@ -294,6 +319,8 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(BROKER_FILE_MATRIX, handle_brokerfile_trial);
     register_handler!(TIMERFD_MATRIX, handle_timerfd_trial);
     register_handler!(SOCKETPAIR_MATRIX, handle_socketpair_trial);
+    register_handler!(TCP_CONN_MATRIX, handle_tcp_conn_trial);
+    register_handler!(TCP_CONN_PEER, handle_tcp_conn_peer);
     register_leaf_subcommand!("inherit-matrix", leaf_subcmd::subcmd_inherit_matrix);
 
     for &subsystem in &[
@@ -305,6 +332,7 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
         InheritSubsystem::Signalfd,
         InheritSubsystem::BrokerFile,
         InheritSubsystem::Timerfd,
+        InheritSubsystem::TcpConn,
     ] {
         for &parent_bt in BinaryType::ALL {
             for &child_bt in BinaryType::ALL {
@@ -344,6 +372,7 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
 
     test.build(move |cx| {
         let parent_handle = cx.require(parent);
+        let tcp_peer = cx.require(AgentName::Dpg2);
         Box::new(move |run| {
             Box::pin(async move {
                 let self_exe = run.self_exe().to_string();
@@ -447,10 +476,10 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
                         )
                         .await
                     }
-                    _ => Err(format!(
-                        "{} scaffolded dispatch placeholder; implementation pending",
-                        trial.subsystem.id()
-                    )),
+                    InheritSubsystem::TcpConn => {
+                        run_tcp_conn_trial(run, &parent_handle, &tcp_peer, trial, child_binary)
+                            .await
+                    }
                 };
                 match result {
                     Ok(out) if out.exit_code == 0 => TestOutcome::new(
@@ -477,6 +506,56 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
     });
 }
 
+async fn run_tcp_conn_trial(
+    run: &mut RunContext<'_>,
+    parent: &AgentHandle,
+    peer: &AgentHandle,
+    trial: InheritTrial,
+    child_binary: String,
+) -> Result<ChildOutput, String> {
+    let port = tcp_conn_port(trial.parent_bt, trial.child_bt, trial.op);
+    let args = TcpConnTrialArgs {
+        child_binary,
+        op: trial.op,
+        timeout_ms: 2000,
+        port,
+    };
+    let peer_args = TcpConnPeerArgs {
+        op: trial.op,
+        timeout_ms: 2000,
+        port,
+    };
+
+    run.run_write_typed(parent, &TCP_CONN_MATRIX, args).await?;
+    run.run_read_checkpoint(parent, TCP_CONN_READY).await?;
+    run.run_resume(parent, TCP_CONN_READY).await?;
+
+    let peer_out = run.send_named_typed(peer, &TCP_CONN_PEER, peer_args).await;
+    let parent_out = run.run_read_result(parent, &TCP_CONN_MATRIX).await;
+
+    match (parent_out, peer_out) {
+        (Ok(mut out), Ok(peer_out)) => {
+            if !peer_out.passed {
+                out.exit_code = 1;
+                out.stderr = format!("tcp peer failed: {}; {}", peer_out.detail, out.stderr);
+            }
+            Ok(out)
+        }
+        (Ok(mut out), Err(peer_err)) => {
+            out.exit_code = 1;
+            out.stderr = format!("tcp peer handler: {peer_err}; {}", out.stderr);
+            Ok(out)
+        }
+        (Err(parent_err), Ok(peer_out)) => Err(format!(
+            "parent result: {parent_err}; peer: passed={} detail={}",
+            peer_out.passed, peer_out.detail
+        )),
+        (Err(parent_err), Err(peer_err)) => Err(format!(
+            "parent result: {parent_err}; peer handler: {peer_err}"
+        )),
+    }
+}
+
 const fn parent_agent(bt: BinaryType) -> AgentName {
     match bt {
         BinaryType::PieGlibc => AgentName::Dpg1,
@@ -484,6 +563,32 @@ const fn parent_agent(bt: BinaryType) -> AgentName {
         BinaryType::StaticPieGlibc => AgentName::Dpg1Spg,
         BinaryType::StaticPieMusl => AgentName::Dpg1Spm,
         BinaryType::NonPieStaticMusl => AgentName::Dpg1Snm,
+    }
+}
+
+fn tcp_conn_port(parent_bt: BinaryType, child_bt: BinaryType, op: InheritOp) -> u16 {
+    36_000
+        + binary_type_index(parent_bt) * 15
+        + binary_type_index(child_bt) * 3
+        + tcp_conn_op_index(op)
+}
+
+const fn binary_type_index(bt: BinaryType) -> u16 {
+    match bt {
+        BinaryType::PieGlibc => 0,
+        BinaryType::NonPieGlibc => 1,
+        BinaryType::StaticPieGlibc => 2,
+        BinaryType::StaticPieMusl => 3,
+        BinaryType::NonPieStaticMusl => 4,
+    }
+}
+
+fn tcp_conn_op_index(op: InheritOp) -> u16 {
+    match op {
+        InheritOp::ParentWritesChildReads => 0,
+        InheritOp::ChildWritesParentReads => 1,
+        InheritOp::ChildShutdownThenParentEof => 2,
+        _ => unreachable!("invalid tcp_conn op {}", op.id()),
     }
 }
 
@@ -495,7 +600,7 @@ fn run_scaffolded_trial(subsystem: InheritSubsystem, _op: InheritOp) -> String {
         }
         InheritSubsystem::Pipe => "pipe is implemented by handle_pipe_trial".into(),
         InheritSubsystem::SocketPair => run_socketpair_trial(),
-        InheritSubsystem::TcpConn => run_tcp_conn_trial(),
+        InheritSubsystem::TcpConn => run_tcp_conn_trial_scaffold(),
         InheritSubsystem::Eventfd => run_eventfd_trial(),
         InheritSubsystem::Signalfd => run_signalfd_trial(),
         InheritSubsystem::Timerfd => run_timerfd_trial(),
@@ -515,8 +620,8 @@ fn run_socketpair_trial() -> String {
 }
 
 #[allow(dead_code)]
-fn run_tcp_conn_trial() -> String {
-    "INHERIT.tcp_conn: scaffold pending".into()
+fn run_tcp_conn_trial_scaffold() -> String {
+    "tcp_conn is implemented by handle_tcp_conn_trial".into()
 }
 
 #[allow(dead_code)]
@@ -542,6 +647,132 @@ fn run_pty_trial() -> String {
 #[allow(dead_code)]
 fn run_broker_file_trial() -> String {
     "brokerfile is implemented by handle_brokerfile_trial".into()
+}
+
+async fn handle_tcp_conn_trial(
+    args: TcpConnTrialArgs,
+    ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    let (listener, _) = create_tcp_listener_on_port(args.port)?;
+    ctx.checkpoint(TCP_CONN_READY).await?;
+    wait_for_listener_connection(&listener, args.timeout_ms)?;
+    let (conn, _) = listener
+        .accept()
+        .map_err(|e| HandlerError(format!("tcp_conn accept: {e}")))?;
+    drop(listener);
+    let fd = conn.as_raw_fd();
+    clear_cloexec(fd)?;
+
+    let mut child = Command::new(&args.child_binary);
+    child
+        .args([
+            "inherit-matrix",
+            "tcp-conn-child",
+            args.op.id(),
+            &args.timeout_ms.to_string(),
+        ])
+        .env("LITEBOX_INHERIT_FD", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = child
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+
+    let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 1000))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut exit_code = output.status.code().unwrap_or(-1);
+
+    if exit_code == 0 {
+        let expected = match args.op {
+            InheritOp::ParentWritesChildReads => "ping",
+            InheritOp::ChildWritesParentReads => "pong",
+            InheritOp::ChildShutdownThenParentEof => "shutdown",
+            _ => {
+                return Err(HandlerError(format!(
+                    "unsupported tcp_conn op {}",
+                    args.op.id()
+                )));
+            }
+        };
+        if stdout != expected {
+            exit_code = 1;
+            return Ok(ChildOutput {
+                exit_code,
+                stdout,
+                stderr: format!("tcp_conn child stdout mismatch: expected {expected}; {stderr}"),
+            });
+        }
+    }
+
+    Ok(ChildOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+async fn handle_tcp_conn_peer(
+    args: TcpConnPeerArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<TcpConnPeerOutput, HandlerError> {
+    Ok(tcp_conn_peer_out(run_tcp_conn_peer(args)))
+}
+
+fn run_tcp_conn_peer(args: TcpConnPeerArgs) -> Result<String, String> {
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, args.port));
+    let mut stream = connect_loopback_with_timeout(addr, args.timeout_ms)
+        .map_err(|e| format!("tcp_conn peer connect port {}: {e}", args.port))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(args.timeout_ms)))
+        .map_err(|e| format!("tcp_conn peer set_read_timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(args.timeout_ms)))
+        .map_err(|e| format!("tcp_conn peer set_write_timeout: {e}"))?;
+
+    match args.op {
+        InheritOp::ParentWritesChildReads => {
+            stream
+                .write_all(b"ping")
+                .map_err(|e| format!("tcp_conn peer write ping: {e}"))?;
+            Ok("wrote ping".to_string())
+        }
+        InheritOp::ChildWritesParentReads => {
+            let mut buf = [0_u8; 4];
+            stream
+                .read_exact(&mut buf)
+                .map_err(|e| format!("tcp_conn peer read pong: {e}"))?;
+            if buf != *b"pong" {
+                return Err(format!(
+                    "tcp_conn peer payload mismatch: got {:?}, expected pong",
+                    String::from_utf8_lossy(&buf)
+                ));
+            }
+            Ok("read pong".to_string())
+        }
+        InheritOp::ChildShutdownThenParentEof => {
+            let mut buf = [0_u8; 1];
+            match stream.read(&mut buf) {
+                Ok(0) => Ok("read EOF".to_string()),
+                Ok(n) => Err(format!("tcp_conn peer EOF read got {n} bytes")),
+                Err(e) => Err(format!("tcp_conn peer EOF read: {e}")),
+            }
+        }
+        _ => Err(format!("unsupported tcp_conn peer op {}", args.op.id())),
+    }
+}
+
+fn tcp_conn_peer_out(result: Result<String, String>) -> TcpConnPeerOutput {
+    match result {
+        Ok(detail) => TcpConnPeerOutput {
+            passed: true,
+            detail,
+        },
+        Err(detail) => TcpConnPeerOutput {
+            passed: false,
+            detail,
+        },
+    }
 }
 
 async fn handle_pipe_trial(
@@ -1849,6 +2080,11 @@ async fn handle_tcp_listen_trial(
 
 #[allow(clippy::cast_possible_truncation)]
 fn create_tcp_listener() -> Result<(TcpListener, SocketAddr), HandlerError> {
+    create_tcp_listener_on_port(0)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn create_tcp_listener_on_port(port: u16) -> Result<(TcpListener, SocketAddr), HandlerError> {
     // SAFETY: socket parameters are constants; errors are checked below.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -1859,26 +2095,20 @@ fn create_tcp_listener() -> Result<(TcpListener, SocketAddr), HandlerError> {
     }
 
     let one: libc::c_int = 1;
-    // SAFETY: fd is live; `one` points to an initialized c_int.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            std::ptr::from_ref(&one).cast::<libc::c_void>(),
-            std::mem::size_of_val(&one) as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        // SAFETY: fd is owned in this function on the error path.
-        unsafe { libc::close(fd) };
-        return Err(HandlerError(format!("setsockopt(SO_REUSEPORT): {err}")));
+    for (opt, name) in [
+        (libc::SO_REUSEADDR, "SO_REUSEADDR"),
+        (libc::SO_REUSEPORT, "SO_REUSEPORT"),
+    ] {
+        if let Err(e) = set_socket_bool_opt(fd, opt, name, &one) {
+            // SAFETY: fd is owned in this function on the error path.
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
     }
 
     let addr = libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: 0u16.to_be(),
+        sin_port: port.to_be(),
         sin_addr: libc::in_addr {
             s_addr: libc::htonl(libc::INADDR_LOOPBACK),
         },
@@ -1896,7 +2126,7 @@ fn create_tcp_listener() -> Result<(TcpListener, SocketAddr), HandlerError> {
         let err = std::io::Error::last_os_error();
         // SAFETY: fd is owned in this function on the error path.
         unsafe { libc::close(fd) };
-        return Err(HandlerError(format!("bind(127.0.0.1:0): {err}")));
+        return Err(HandlerError(format!("bind(127.0.0.1:{port}): {err}")));
     }
     // SAFETY: fd is live; errors are checked below.
     let rc = unsafe { libc::listen(fd, 16) };
@@ -1920,6 +2150,34 @@ fn create_tcp_listener() -> Result<(TcpListener, SocketAddr), HandlerError> {
     ))
 }
 
+fn set_socket_bool_opt(
+    fd: RawFd,
+    opt: libc::c_int,
+    name: &str,
+    value: &libc::c_int,
+) -> Result<(), HandlerError> {
+    let opt_len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+        .expect("c_int size fits socklen_t");
+    // SAFETY: fd is live; `value` points to an initialized c_int.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            std::ptr::from_ref(value).cast::<libc::c_void>(),
+            opt_len,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "setsockopt({name}): {}",
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
 fn clear_cloexec(fd: RawFd) -> Result<(), HandlerError> {
     // SAFETY: fcntl operates on a live fd; errors are checked.
     let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
@@ -1930,6 +2188,42 @@ fn clear_cloexec(fd: RawFd) -> Result<(), HandlerError> {
         )));
     }
     Ok(())
+}
+
+fn wait_for_listener_connection(
+    listener: &TcpListener,
+    timeout_ms: u64,
+) -> Result<(), HandlerError> {
+    let revents = poll_fd(
+        listener.as_raw_fd(),
+        libc::POLLIN | libc::POLLERR,
+        timeout_ms,
+        "tcp_conn listener accept",
+    )?;
+    if revents & libc::POLLIN == 0 {
+        return Err(HandlerError(format!(
+            "tcp_conn listener poll got {}, expected POLLIN",
+            describe_events(revents)
+        )));
+    }
+    Ok(())
+}
+
+fn connect_loopback_with_timeout(addr: SocketAddr, timeout_ms: u64) -> std::io::Result<TcpStream> {
+    let timeout = Duration::from_millis(timeout_ms);
+    let deadline = Instant::now() + timeout;
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout")))
 }
 
 fn connect_and_expect_ok(addr: SocketAddr, timeout_ms: u64) -> Result<(), HandlerError> {
@@ -2002,6 +2296,7 @@ mod leaf_subcmd {
             Some("tcp-listen-child") => tcp_listen_child(args),
             Some("pipe-child") => pipe_child(args),
             Some("socketpair-child") => socketpair_child(args),
+            Some("tcp-conn-child") => tcp_conn_child(args),
             Some("eventfd-child") => eventfd_child(args),
             Some("pty-child") => pty_child(args),
             Some("signalfd-child") => signalfd_child(args),
@@ -2160,6 +2455,95 @@ mod leaf_subcmd {
         if rc <= 0 || pfd.revents & libc::POLLIN == 0 {
             eprintln!(
                 "inherit-matrix {context} poll: rc={} revents={} err={}",
+                rc,
+                pfd.revents,
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        0
+    }
+
+    fn tcp_conn_child(args: &[String]) -> i32 {
+        let Some(op) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix tcp-conn-child: missing op");
+            return 2;
+        };
+        let Some(timeout_ms) = args.get(4).and_then(|s| s.parse::<i32>().ok()) else {
+            eprintln!("inherit-matrix tcp-conn-child: bad timeout");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix tcp-conn-child: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+
+        match op {
+            "parent_writes_child_reads" => read_tcp_conn_child(fd, timeout_ms, b"ping"),
+            "child_writes_parent_reads" => write_tcp_conn_child(fd, b"pong"),
+            "child_shutdown_then_parent_eof" => shutdown_tcp_conn_child(fd),
+            other => {
+                eprintln!("inherit-matrix tcp-conn-child: unknown op {other}");
+                2
+            }
+        }
+    }
+
+    fn read_tcp_conn_child(fd: RawFd, timeout_ms: i32, expected: &[u8]) -> i32 {
+        if poll_inherited_fd(fd, timeout_ms, "tcp_conn child read") != 0 {
+            return 1;
+        }
+        let mut buf = vec![0_u8; expected.len()];
+        if read_exact_raw_fd(fd, &mut buf, "tcp_conn child read") != 0 {
+            return 1;
+        }
+        if buf != expected {
+            eprintln!(
+                "inherit-matrix tcp_conn child read: got {:?} expected {:?}",
+                String::from_utf8_lossy(&buf),
+                String::from_utf8_lossy(expected)
+            );
+            return 1;
+        }
+        println!("{}", String::from_utf8_lossy(&buf));
+        0
+    }
+
+    fn write_tcp_conn_child(fd: RawFd, payload: &[u8]) -> i32 {
+        if write_all_raw_fd(fd, payload, "tcp_conn child write") != 0 {
+            return 1;
+        }
+        println!("{}", String::from_utf8_lossy(payload));
+        0
+    }
+
+    fn shutdown_tcp_conn_child(fd: RawFd) -> i32 {
+        // SAFETY: fd is expected to be an inherited connected TCP socket.
+        if unsafe { libc::shutdown(fd, libc::SHUT_WR) } != 0 {
+            eprintln!(
+                "inherit-matrix tcp_conn shutdown(SHUT_WR): {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        println!("shutdown");
+        0
+    }
+
+    fn poll_inherited_fd(fd: RawFd, timeout_ms: i32, context: &str) -> i32 {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is initialized and the count matches the buffer length.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+        if rc <= 0 || pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "inherit-matrix {context}: poll rc={} revents={} err={}",
                 rc,
                 pfd.revents,
                 std::io::Error::last_os_error()
