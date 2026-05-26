@@ -9321,6 +9321,7 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     }
                     broker_eventfd_specs.push(alloc::format!("{raw_fd}:tcp_conn:{handle_id}"));
+                    broker_eventfd_transit_release.push((releaser, handle_id));
                 }
             }
 

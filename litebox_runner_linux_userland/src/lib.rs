@@ -430,6 +430,18 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             .map_err(|err| anyhow!("broker-fd-bridge: tcp_listen {spec:?}: {err:?}"));
     }
 
+    if parts.get(1) == Some(&"tcp_conn") && parts.len() == 3 {
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let handle_id: u64 = parts[2]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad handle {:?}: {e}", parts[2]))?;
+        return entrypoints
+            .install_broker_tcp_conn_bridge_fd(guest_fd, handle_id)
+            .map_err(|err| anyhow!("broker-fd-bridge: tcp_conn {spec:?}: {err:?}"));
+    }
+
     if parts.get(1) == Some(&"signalfd") && parts.len() == 5 {
         let guest_fd: usize = parts[0]
             .parse()

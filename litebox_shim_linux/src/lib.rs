@@ -184,6 +184,38 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         )
     }
 
+    pub fn install_broker_tcp_conn_bridge_fd(
+        &self,
+        guest_fd: usize,
+        handle_id: u64,
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
+        let provider =
+            syscalls::broker_tcp_conn::broker_tcp_conn_provider().ok_or(Errno::ENODEV)?;
+        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+        let releaser: alloc::sync::Arc<dyn BrokerSubscribable> = Arc::clone(&provider) as _;
+        let _ = releaser.dup_handle(handle_id);
+        let tcp_fd = syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+            provider,
+            handle_id,
+            litebox::fs::OFlags::empty(),
+        );
+        let typed: litebox::fd::TypedFd<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem> = self
+            .task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert(tcp_fd);
+
+        let _ = self.task.do_close(guest_fd);
+        let files = self.task.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+        if rds.fd_into_specific_raw_integer(typed, guest_fd) {
+            Ok(())
+        } else {
+            Err(Errno::EBADF)
+        }
+    }
+
     /// Install a external fd FD into the restored child's descriptor table.
     ///
     /// Called by the runner after `restore_process` to replace virtual pipe
@@ -569,6 +601,58 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
                     drop(rds);
                     let _ = files.fs.close(&old_fs);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_unix) =
+                    rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
+                {
+                    drop(rds);
+                    let _ = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_unix);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_pipe) = rds
+                    .fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(guest_fd)
+                {
+                    drop(rds);
+                    let _ = self.task.global.pipes.close(&old_pipe);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_eventfd) = rds
+                    .fd_consume_raw_integer::<syscalls::eventfd::EventfdSubsystem>(guest_fd)
+                {
+                    drop(rds);
+                    let _ = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_eventfd);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_broker_pipe) = rds
+                    .fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
+                {
+                    drop(rds);
+                    let _ = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_broker_pipe);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_broker_sp) = rds
+                    .fd_consume_raw_integer::<
+                        syscalls::broker_socketpair::BrokerSocketPairSubsystem,
+                    >(guest_fd)
+                {
+                    drop(rds);
+                    let _ = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_broker_sp);
                     rds = files.raw_descriptor_store.write();
                 } else if let Ok(old_host) = rds
                     .fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
