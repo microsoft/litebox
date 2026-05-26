@@ -1972,6 +1972,9 @@ impl<FS: ShimFS> Task<FS> {
         if is_fork {
             if clone3 && stack == 0 && stack_size == 0 {
                 log_unsupported!("clone3 fork without child stack");
+                // Real Linux: ENOSYS when clone3 is unsupported on this
+                // architecture/kernel. Litebox reports this unsupported
+                // clone3 shape as absent so libc can fall back to clone.
                 return Err(Errno::ENOSYS);
             }
 
@@ -2089,6 +2092,9 @@ impl<FS: ShimFS> Task<FS> {
         }
         if clone3 && stack == 0 {
             log_unsupported!("clone3 thread without child stack");
+            // Real Linux: ENOSYS when clone3 is unsupported on this
+            // architecture/kernel. Litebox reports this unsupported
+            // clone3 shape as absent so libc can fall back to clone.
             return Err(Errno::ENOSYS);
         }
         let sp = if stack != 0 {
