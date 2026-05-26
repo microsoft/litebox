@@ -5102,6 +5102,10 @@ impl litebox::platform::TimeProvider for LinuxUserland {
             ),
         }
     }
+
+    fn monotonic_timestamp(&self) -> Option<Duration> {
+        Some(self.now().inner)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

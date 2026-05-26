@@ -79,6 +79,38 @@ const SOCKFS_DEV: u64 = 0x000c;
 const PIPEFS_DEV: u64 = 0x000d;
 const ANON_INODE_DEV: u64 = 0x000e;
 
+fn timerfd_bridge_restore_spec(
+    spec: ItimerSpec,
+    pending_expirations: u64,
+    elapsed_ns: u128,
+) -> Result<ItimerSpec, Errno> {
+    let mut restore_spec = spec;
+    let had_value = spec.value.tv_sec != 0 || spec.value.tv_nsec != 0;
+    if had_value {
+        let value = core::time::Duration::try_from(spec.value)?;
+        let adjusted_ns = value.as_nanos().saturating_sub(elapsed_ns);
+        restore_spec.value = if adjusted_ns == 0 {
+            litebox_common_linux::Timespec {
+                tv_sec: 0,
+                tv_nsec: 1,
+            }
+        } else {
+            let secs = adjusted_ns / 1_000_000_000;
+            let nsecs = adjusted_ns % 1_000_000_000;
+            litebox_common_linux::Timespec {
+                tv_sec: i64::try_from(secs).map_err(|_| Errno::EINVAL)?,
+                tv_nsec: u64::try_from(nsecs).map_err(|_| Errno::EINVAL)?,
+            }
+        };
+    } else if pending_expirations > 0 {
+        restore_spec.value = litebox_common_linux::Timespec {
+            tv_sec: 0,
+            tv_nsec: 1,
+        };
+    }
+    Ok(restore_spec)
+}
+
 /// Marker metadata attached to fds opened via the host PTY device path
 /// (e.g., `/dev/pts/156`). Causes the shim's `descriptor_stat()` to override
 /// `st_dev`, `st_ino`, and `st_rdev` with the real host PTY identity so that
@@ -2589,8 +2621,8 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Reinstall a timerfd at `guest_fd` for a non-PIE worker-exec child.
     /// Receives the snapshot taken by the parent before exec
-    /// (clock, NONBLOCK flag, ItimerSpec, pending_expirations) and
-    /// reconstructs the timerfd state by creating a fresh timerfd and
+    /// (clock, NONBLOCK flag, ItimerSpec, pending_expirations, snapshot time)
+    /// and reconstructs the timerfd state by creating a fresh timerfd and
     /// re-arming it via the same `set_time` path used by
     /// `sys_timerfd_settime`. If the parent had already accumulated
     /// pending expirations that have not been read yet, we arm a tiny
@@ -2605,6 +2637,7 @@ impl<FS: ShimFS> Task<FS> {
         nonblock: bool,
         spec: ItimerSpec,
         pending_expirations: u64,
+        snapshot_now_ns: u64,
     ) -> Result<(), Errno> {
         let mut flags = TimerfdFlags::empty();
         if nonblock {
@@ -2651,25 +2684,16 @@ impl<FS: ShimFS> Task<FS> {
             self.do_close(created)?;
         }
 
-        // Restore the timer arming. If the parent had an active timer,
-        // re-arm at the remaining value; if expirations were already
-        // pending, arm a 1ns timer so the child observes at least one.
-        let restore_spec =
-            if pending_expirations > 0 && spec.value.tv_sec == 0 && spec.value.tv_nsec == 0 {
-                // Already-expired path: a fresh timerfd doesn't carry pending
-                // expirations across exec, so arm a 1ns catch-up to ensure the
-                // child's first read returns a non-zero count. This is an
-                // approximation; the exact pending count is not transferred.
-                ItimerSpec {
-                    interval: spec.interval,
-                    value: litebox_common_linux::Timespec {
-                        tv_sec: 0,
-                        tv_nsec: 1,
-                    },
-                }
-            } else {
-                spec
-            };
+        let install_now_ns = self
+            .global
+            .platform
+            .monotonic_timestamp()
+            .ok_or(Errno::EINVAL)?
+            .as_nanos();
+        let elapsed_ns = install_now_ns.saturating_sub(u128::from(snapshot_now_ns));
+
+        let restore_spec = timerfd_bridge_restore_spec(spec, pending_expirations, elapsed_ns)?;
+
         if restore_spec.value.tv_sec != 0 || restore_spec.value.tv_nsec != 0 {
             let raw_fd_i32 = i32::try_from(guest_fd).map_err(|_| Errno::EBADF)?;
             self.sys_timerfd_settime(raw_fd_i32, TimerfdTimerFlags::empty(), restore_spec, None)?;
@@ -7872,6 +7896,48 @@ mod tests {
     use litebox_common_linux::IoctlArg;
 
     extern crate std;
+
+    fn timer_spec(value_sec: i64, value_nsec: u64) -> ItimerSpec {
+        ItimerSpec {
+            value: litebox_common_linux::Timespec {
+                tv_sec: value_sec,
+                tv_nsec: value_nsec,
+            },
+            interval: litebox_common_linux::Timespec {
+                tv_sec: 2,
+                tv_nsec: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn timerfd_bridge_restore_ages_active_value() {
+        let restored = timerfd_bridge_restore_spec(timer_spec(1, 500), 0, 250).unwrap();
+        assert_eq!(restored.value.tv_sec, 1);
+        assert_eq!(restored.value.tv_nsec, 250);
+        assert_eq!(restored.interval.tv_sec, 2);
+    }
+
+    #[test]
+    fn timerfd_bridge_restore_catches_up_expired_in_transit() {
+        let restored = timerfd_bridge_restore_spec(timer_spec(0, 100), 0, 100).unwrap();
+        assert_eq!(restored.value.tv_sec, 0);
+        assert_eq!(restored.value.tv_nsec, 1);
+    }
+
+    #[test]
+    fn timerfd_bridge_restore_preserves_disarmed_without_pending() {
+        let restored = timerfd_bridge_restore_spec(timer_spec(0, 0), 0, 1_000).unwrap();
+        assert_eq!(restored.value.tv_sec, 0);
+        assert_eq!(restored.value.tv_nsec, 0);
+    }
+
+    #[test]
+    fn timerfd_bridge_restore_catches_up_pending_expiration() {
+        let restored = timerfd_bridge_restore_spec(timer_spec(0, 0), 1, 0).unwrap();
+        assert_eq!(restored.value.tv_sec, 0);
+        assert_eq!(restored.value.tv_nsec, 1);
+    }
 
     #[test]
     fn fspath_new() {

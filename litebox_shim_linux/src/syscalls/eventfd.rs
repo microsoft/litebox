@@ -650,13 +650,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     ///
     /// Returns `None` if this `EventFile` is not a timerfd. Otherwise
     /// returns the data needed to reconstruct an equivalent timerfd on
-    /// the receiving side: clock id, NONBLOCK flag, and the current
+    /// the receiving side: clock id, NONBLOCK flag, the current
     /// `ItimerSpec` (after running `update()` so already-elapsed
     /// expirations are reflected in `pending_expirations` rather than
-    /// in `value`).
+    /// in `value`), and the monotonic timestamp used to age the
+    /// relative `value` while the bridge is in transit.
     pub(crate) fn timerfd_worker_exec_bridge_snapshot(
         &self,
-    ) -> Option<(ClockId, bool, ItimerSpec, u64)> {
+    ) -> Option<(ClockId, bool, ItimerSpec, u64, u64)> {
         let mut inner = self.inner.lock();
         let EventFileInner::Timerfd(timer) = &mut *inner else {
             return None;
@@ -665,6 +666,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         timer.update();
         let pending = timer.pending_expirations;
         let spec = timer.current_spec();
+        let snapshot_now_ns = timer
+            .platform
+            .monotonic_timestamp()?
+            .as_nanos()
+            .try_into()
+            .ok()?;
         // Read clockid via i32-as-IntEnum: ClockId is `#[repr(i32)] non_exhaustive` and
         // doesn't derive Copy, so reconstruct from the discriminant.
         let clockid_disc = match &timer.clockid {
@@ -682,7 +689,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         let clockid = ClockId::try_from(clockid_disc as i32).ok()?;
         let status = OFlags::from_bits_retain(self.status.load(Ordering::Relaxed));
         let nonblock = status.contains(OFlags::NONBLOCK);
-        Some((clockid, nonblock, spec, pending))
+        Some((clockid, nonblock, spec, pending, snapshot_now_ns))
     }
 
     super::common_functions_for_file_status!();

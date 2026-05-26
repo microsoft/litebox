@@ -483,6 +483,14 @@ pub trait TimeProvider {
     fn now(&self) -> Self::Instant;
     /// Returns the current system time.
     fn current_time(&self) -> Self::SystemTime;
+
+    /// Returns a process-independent monotonic timestamp when the platform can
+    /// expose one. The epoch is unspecified; callers may only compare values
+    /// from the same host clock to measure elapsed time.
+    fn monotonic_timestamp(&self) -> Option<core::time::Duration> {
+        let _ = self;
+        None
+    }
 }
 
 /// An opaque measurement of a monotonically nondecreasing clock.
