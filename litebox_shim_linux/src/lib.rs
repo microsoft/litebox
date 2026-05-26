@@ -165,6 +165,18 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             .install_brokerfile_bridge_fd(guest_fd, path, position, status_flags_bits)
     }
 
+    pub fn install_timerfd_bridge_fd(
+        &self,
+        guest_fd: usize,
+        clockid: litebox_common_linux::ClockId,
+        nonblock: bool,
+        spec: litebox_common_linux::ItimerSpec,
+        pending_expirations: u64,
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
+        self.task
+            .install_timerfd_bridge_fd(guest_fd, clockid, nonblock, spec, pending_expirations)
+    }
+
     /// Install a external fd FD into the restored child's descriptor table.
     ///
     /// Called by the runner after `restore_process` to replace virtual pipe

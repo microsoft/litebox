@@ -9329,6 +9329,64 @@ impl<FS: ShimFS> Task<FS> {
                     broker_eventfd_specs.push(spec);
                 }
             }
+
+            // Non-PIE worker-exec timerfd snapshot. Timerfd shares the
+            // EventfdSubsystem storage (see `EventFile::new_timer`); we
+            // identify timerfd entries via `is_timerfd()` then snapshot
+            // their state for reconstruction in the child.
+            let timerfd_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::eventfd::EventfdSubsystem>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                    {
+                        let dt_local = self.global.litebox.descriptor_table();
+                        let is_timer = dt_local
+                            .with_entry(
+                                &typed,
+                                |evf: &super::eventfd::EventFile<crate::Platform>| evf.is_timerfd(),
+                            )
+                            .unwrap_or(false);
+                        drop(dt_local);
+                        if is_timer {
+                            out.push((raw_fd, typed));
+                        }
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in timerfd_fds {
+                let dt_local = self.global.litebox.descriptor_table();
+                let snapshot = dt_local
+                    .with_entry(
+                        &typed,
+                        |evf: &super::eventfd::EventFile<crate::Platform>| {
+                            evf.timerfd_worker_exec_bridge_snapshot()
+                        },
+                    )
+                    .flatten();
+                drop(dt_local);
+                if let Some((clockid, nonblock, spec, pending)) = snapshot {
+                    broker_eventfd_specs.push(alloc::format!(
+                        "{raw_fd}:timerfd:{}:{}:{}:{}:{}:{}:{}",
+                        clockid as u32,
+                        u8::from(nonblock),
+                        spec.value.tv_sec,
+                        spec.value.tv_nsec,
+                        spec.interval.tv_sec,
+                        spec.interval.tv_nsec,
+                        pending,
+                    ));
+                }
+            }
         }
 
         // Resolve the worker load path through the current guest filesystem so

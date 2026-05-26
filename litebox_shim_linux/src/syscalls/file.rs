@@ -2587,6 +2587,96 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Reinstall a timerfd at `guest_fd` for a non-PIE worker-exec child.
+    /// Receives the snapshot taken by the parent before exec
+    /// (clock, NONBLOCK flag, ItimerSpec, pending_expirations) and
+    /// reconstructs the timerfd state by creating a fresh timerfd and
+    /// re-arming it via the same `set_time` path used by
+    /// `sys_timerfd_settime`. If the parent had already accumulated
+    /// pending expirations that have not been read yet, we arm a tiny
+    /// catch-up timer so the child's first read observes a non-zero
+    /// expiration count (approximation — the real kernel timerfd
+    /// preserves the exact pending count, which is not transferable
+    /// without queueing it on the broker side).
+    pub(crate) fn install_timerfd_bridge_fd(
+        &self,
+        guest_fd: usize,
+        clockid: ClockId,
+        nonblock: bool,
+        spec: ItimerSpec,
+        pending_expirations: u64,
+    ) -> Result<(), Errno> {
+        let mut flags = TimerfdFlags::empty();
+        if nonblock {
+            flags |= TimerfdFlags::NONBLOCK;
+        }
+        // Use sys_timerfd_create to allocate a fresh guest fd, then
+        // duplicate-into the requested slot. Mirrors install_*_bridge_fd
+        // pattern used by other subsystems.
+        let created = self.sys_timerfd_create(clockid, flags)? as usize;
+        if created != guest_fd {
+            let typed = {
+                let files = self.files.borrow();
+                files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(created)
+                    .map_err(|_| Errno::EBADF)?
+            };
+            // Close any existing descriptor at the target slot.
+            if self
+                .files
+                .borrow()
+                .raw_descriptor_store
+                .read()
+                .is_alive(guest_fd)
+            {
+                self.do_close(guest_fd)?;
+            }
+            // Duplicate the entry into the requested slot, then close the
+            // original creation slot.
+            let dup = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(&typed)
+                .ok_or(Errno::EBADF)?;
+            {
+                let files = self.files.borrow();
+                let mut rds = files.raw_descriptor_store.write();
+                if !rds.fd_into_specific_raw_integer(dup, guest_fd) {
+                    return Err(Errno::EBADF);
+                }
+            }
+            self.do_close(created)?;
+        }
+
+        // Restore the timer arming. If the parent had an active timer,
+        // re-arm at the remaining value; if expirations were already
+        // pending, arm a 1ns timer so the child observes at least one.
+        let restore_spec =
+            if pending_expirations > 0 && spec.value.tv_sec == 0 && spec.value.tv_nsec == 0 {
+                // Already-expired path: a fresh timerfd doesn't carry pending
+                // expirations across exec, so arm a 1ns catch-up to ensure the
+                // child's first read returns a non-zero count. This is an
+                // approximation; the exact pending count is not transferred.
+                ItimerSpec {
+                    interval: spec.interval,
+                    value: litebox_common_linux::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 1,
+                    },
+                }
+            } else {
+                spec
+            };
+        if restore_spec.value.tv_sec != 0 || restore_spec.value.tv_nsec != 0 {
+            let raw_fd_i32 = i32::try_from(guest_fd).map_err(|_| Errno::EBADF)?;
+            self.sys_timerfd_settime(raw_fd_i32, TimerfdTimerFlags::empty(), restore_spec, None)?;
+        }
+        Ok(())
+    }
+
     /// Handle syscall `mkdir`
     pub fn sys_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
         let pathname = self.resolve_path(pathname)?;
