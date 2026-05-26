@@ -41,6 +41,8 @@ const BROKER_FILE_MATRIX: HandlerToken<BrokerFileTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.brokerfile");
 const TIMERFD_MATRIX: HandlerToken<TimerfdTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.timerfd");
+const SOCKETPAIR_MATRIX: HandlerToken<SocketpairTrialArgs, ChildOutput> =
+    HandlerToken::new("inherit_matrix.socketpair");
 
 const TCP_LISTEN_OPS: &[InheritOp] = &[
     InheritOp::Accept,
@@ -53,12 +55,10 @@ const PIPE_OPS: &[InheritOp] = &[
     InheritOp::ChildWritesParentReads,
     InheritOp::ChildCloseParentReadsEof,
 ];
-#[allow(dead_code)]
 const SOCKETPAIR_OPS: &[InheritOp] = &[
-    InheritOp::Read,
-    InheritOp::Write,
-    InheritOp::Poll,
-    InheritOp::Shutdown,
+    InheritOp::ReadAfterParentWrite,
+    InheritOp::WriteThenParentReads,
+    InheritOp::ChildShutdownThenParentEof,
 ];
 #[allow(dead_code)]
 const TCP_CONN_OPS: &[InheritOp] = &[
@@ -156,6 +156,9 @@ enum InheritOp {
     ParentWritesChildReads,
     ChildWritesParentReads,
     ChildCloseParentReadsEof,
+    ReadAfterParentWrite,
+    WriteThenParentReads,
+    ChildShutdownThenParentEof,
     ReadAtOffset0,
     WriteThenParentReadsBack,
     LseekThenRead,
@@ -185,6 +188,9 @@ impl InheritOp {
             Self::ParentWritesChildReads => "parent_writes_child_reads",
             Self::ChildWritesParentReads => "child_writes_parent_reads",
             Self::ChildCloseParentReadsEof => "child_close_parent_reads_eof",
+            Self::ReadAfterParentWrite => "read_after_parent_write",
+            Self::WriteThenParentReads => "write_then_parent_reads",
+            Self::ChildShutdownThenParentEof => "child_shutdown_then_parent_eof",
             Self::ReadAtOffset0 => "read_at_offset_0",
             Self::WriteThenParentReadsBack => "write_then_parent_reads_back",
             Self::LseekThenRead => "lseek_then_read",
@@ -224,6 +230,13 @@ struct TcpListenTrialArgs {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct PipeTrialArgs {
+    child_binary: String,
+    op: InheritOp,
+    timeout_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SocketpairTrialArgs {
     child_binary: String,
     op: InheritOp,
     timeout_ms: u64,
@@ -280,11 +293,13 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(SIGNALFD_MATRIX, handle_signalfd_trial);
     register_handler!(BROKER_FILE_MATRIX, handle_brokerfile_trial);
     register_handler!(TIMERFD_MATRIX, handle_timerfd_trial);
+    register_handler!(SOCKETPAIR_MATRIX, handle_socketpair_trial);
     register_leaf_subcommand!("inherit-matrix", leaf_subcmd::subcmd_inherit_matrix);
 
     for &subsystem in &[
         InheritSubsystem::TcpListen,
         InheritSubsystem::Pipe,
+        InheritSubsystem::SocketPair,
         InheritSubsystem::Eventfd,
         InheritSubsystem::Pty,
         InheritSubsystem::Signalfd,
@@ -355,6 +370,18 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
                                 child_binary,
                                 op: trial.op,
                                 timeout_ms: 2000,
+                            },
+                        )
+                        .await
+                    }
+                    InheritSubsystem::SocketPair => {
+                        run.send_named_typed(
+                            &parent_handle,
+                            &SOCKETPAIR_MATRIX,
+                            SocketpairTrialArgs {
+                                child_binary,
+                                op: trial.op,
+                                timeout_ms: 5000,
                             },
                         )
                         .await
@@ -484,7 +511,7 @@ fn run_pipe_trial_scaffold() -> String {
 
 #[allow(dead_code)]
 fn run_socketpair_trial() -> String {
-    "INHERIT.socketpair: scaffold pending".into()
+    "socketpair is implemented by handle_socketpair_trial".into()
 }
 
 #[allow(dead_code)]
@@ -616,6 +643,180 @@ fn run_pipe_trial(args: &PipeTrialArgs) -> Result<ChildOutput, HandlerError> {
         stdout,
         stderr,
     })
+}
+
+async fn handle_socketpair_trial(
+    args: SocketpairTrialArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    let (parent_end, child_end) = socketpair_owned()?;
+    let parent_fd = parent_end.as_raw_fd();
+    let child_fd = child_end.as_raw_fd();
+    clear_cloexec(child_fd)?;
+
+    if args.op == InheritOp::ReadAfterParentWrite {
+        write_all_fd(parent_fd, b"ping", "socketpair parent pre-write").map_err(HandlerError)?;
+    }
+
+    let mut child = Command::new(&args.child_binary);
+    child
+        .args([
+            "inherit-matrix",
+            "socketpair-child",
+            args.op.id(),
+            &args.timeout_ms.to_string(),
+        ])
+        .env("LITEBOX_INHERIT_FD", child_fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+    drop(child_end);
+
+    let mut parent_error = None;
+    match args.op {
+        InheritOp::ReadAfterParentWrite => {}
+        InheritOp::WriteThenParentReads => {
+            if let Err(e) = read_socketpair_payload(parent_fd, b"pong", args.timeout_ms) {
+                parent_error = Some(e);
+            }
+        }
+        InheritOp::ChildShutdownThenParentEof => {
+            if let Err(e) = read_socketpair_eof(parent_fd, args.timeout_ms) {
+                parent_error = Some(e);
+            }
+        }
+        _ => {
+            return Err(HandlerError(format!(
+                "unsupported socketpair op {}",
+                args.op.id()
+            )));
+        }
+    }
+
+    if parent_error.is_some() {
+        let _ = child.kill();
+    }
+
+    let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 1000))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut exit_code = output.status.code().unwrap_or(-1);
+
+    if let Some(e) = parent_error {
+        exit_code = 1;
+        return Ok(ChildOutput {
+            exit_code,
+            stdout,
+            stderr: format!("{}; {stderr}", e.0),
+        });
+    }
+
+    if exit_code == 0 {
+        let expected = match args.op {
+            InheritOp::ReadAfterParentWrite => "ping",
+            InheritOp::WriteThenParentReads => "pong",
+            InheritOp::ChildShutdownThenParentEof => "shutdown",
+            _ => unreachable!(),
+        };
+        if stdout != expected {
+            exit_code = 1;
+            return Ok(ChildOutput {
+                exit_code,
+                stdout,
+                stderr: format!("socketpair stdout mismatch: expected {expected}; {stderr}"),
+            });
+        }
+    }
+
+    Ok(ChildOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+fn socketpair_owned() -> Result<(OwnedFd, OwnedFd), HandlerError> {
+    let mut fds = [0; 2];
+    // SAFETY: socketpair initializes both fd slots on success.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(HandlerError(format!(
+            "socketpair(AF_UNIX, SOCK_STREAM): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: socketpair returned two fresh descriptors owned by this function.
+    let left = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: socketpair returned two fresh descriptors owned by this function.
+    let right = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((left, right))
+}
+
+fn read_socketpair_payload(
+    fd: RawFd,
+    expected: &[u8],
+    timeout_ms: u64,
+) -> Result<(), HandlerError> {
+    let revents = poll_fd(
+        fd,
+        libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        timeout_ms,
+        "socketpair parent payload",
+    )?;
+    if revents & libc::POLLIN == 0 {
+        return Err(HandlerError(format!(
+            "socketpair parent payload poll got {}, expected POLLIN",
+            describe_events(revents)
+        )));
+    }
+    let mut buf = vec![0_u8; expected.len()];
+    read_exact_fd(fd, &mut buf, "socketpair parent read")?;
+    if buf == expected {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "socketpair parent payload mismatch: got {:?}, expected {:?}",
+            String::from_utf8_lossy(&buf),
+            String::from_utf8_lossy(expected)
+        )))
+    }
+}
+
+fn read_socketpair_eof(fd: RawFd, timeout_ms: u64) -> Result<(), HandlerError> {
+    let revents = poll_fd(
+        fd,
+        libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        timeout_ms,
+        "socketpair parent EOF",
+    )?;
+    if revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+        return Err(HandlerError(format!(
+            "socketpair parent EOF poll got {}, expected POLLIN/POLLHUP",
+            describe_events(revents)
+        )));
+    }
+    let mut byte = [0_u8; 1];
+    // SAFETY: `byte` is valid writable memory and fd is a live socketpair endpoint.
+    let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast::<libc::c_void>(), byte.len()) };
+    match n.cmp(&0) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(HandlerError(format!(
+            "socketpair parent EOF read expected 0, got {n} bytes"
+        ))),
+        std::cmp::Ordering::Less => Err(HandlerError(format!(
+            "socketpair parent EOF read: {}",
+            std::io::Error::last_os_error()
+        ))),
+    }
 }
 
 fn read_pipe_payload(fd: RawFd, expected: &[u8], timeout_ms: u64) -> Result<(), HandlerError> {
@@ -1800,6 +2001,7 @@ mod leaf_subcmd {
         match args.get(2).map(String::as_str) {
             Some("tcp-listen-child") => tcp_listen_child(args),
             Some("pipe-child") => pipe_child(args),
+            Some("socketpair-child") => socketpair_child(args),
             Some("eventfd-child") => eventfd_child(args),
             Some("pty-child") => pty_child(args),
             Some("signalfd-child") => signalfd_child(args),
@@ -1875,6 +2077,95 @@ mod leaf_subcmd {
             return 1;
         }
         println!("closed");
+        0
+    }
+
+    fn socketpair_child(args: &[String]) -> i32 {
+        let Some(op) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix socketpair-child: missing op");
+            return 2;
+        };
+        let Some(timeout_ms) = args.get(4).and_then(|s| s.parse::<i32>().ok()) else {
+            eprintln!("inherit-matrix socketpair-child: bad timeout");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix socketpair-child: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+
+        match op {
+            "read_after_parent_write" => read_socketpair_child(fd, timeout_ms, b"ping"),
+            "write_then_parent_reads" => write_socketpair_child(fd, b"pong"),
+            "child_shutdown_then_parent_eof" => shutdown_socketpair_child(fd),
+            other => {
+                eprintln!("inherit-matrix socketpair-child: unknown op {other}");
+                2
+            }
+        }
+    }
+
+    fn read_socketpair_child(fd: RawFd, timeout_ms: i32, expected: &[u8]) -> i32 {
+        if poll_readable_child(fd, timeout_ms, "socketpair read") != 0 {
+            return 1;
+        }
+        let mut buf = vec![0_u8; expected.len()];
+        if read_exact_raw_fd(fd, &mut buf, "socketpair read") != 0 {
+            return 1;
+        }
+        if buf != expected {
+            eprintln!(
+                "inherit-matrix socketpair read: got {:?} expected {:?}",
+                String::from_utf8_lossy(&buf),
+                String::from_utf8_lossy(expected)
+            );
+            return 1;
+        }
+        println!("{}", String::from_utf8_lossy(expected));
+        0
+    }
+
+    fn write_socketpair_child(fd: RawFd, payload: &[u8]) -> i32 {
+        if write_all_raw_fd(fd, payload, "socketpair write") != 0 {
+            return 1;
+        }
+        println!("{}", String::from_utf8_lossy(payload));
+        0
+    }
+
+    fn shutdown_socketpair_child(fd: RawFd) -> i32 {
+        // SAFETY: fd is the inherited socket endpoint; errors are checked.
+        if unsafe { libc::shutdown(fd, libc::SHUT_WR) } != 0 {
+            eprintln!(
+                "inherit-matrix socketpair shutdown(SHUT_WR): {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        println!("shutdown");
+        0
+    }
+
+    fn poll_readable_child(fd: RawFd, timeout_ms: i32, context: &str) -> i32 {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is initialized and the count matches the buffer length.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+        if rc <= 0 || pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "inherit-matrix {context} poll: rc={} revents={} err={}",
+                rc,
+                pfd.revents,
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
         0
     }
 
