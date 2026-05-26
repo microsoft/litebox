@@ -62,90 +62,34 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
+    #[deny(clippy::wildcard_enum_match_arm)]
     pub fn try_from(
         global: &GlobalState<FS>,
         files: &FilesState<FS>,
         raw_fd: usize,
     ) -> Result<Self, Errno> {
-        enum ResolvedFd<FS: ShimFS> {
-            File(Arc<crate::FileFd<FS>>),
-            Socket(Arc<super::net::SocketFd>),
-            Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
-            Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
-            Signalfd(Arc<TypedFd<super::signalfd::SignalfdSubsystem>>),
-            Epoll(Arc<TypedFd<EpollSubsystem<FS>>>),
-            Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
-            ExternalFd(Arc<TypedFd<super::external_fd::ExternalFdSubsystem>>),
-            BrokerPipe(Arc<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
-            BrokerPty(Arc<TypedFd<super::broker_pty::BrokerPtySubsystem>>),
-            BrokerSocketPair(Arc<TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>),
-        }
-
-        let resolved = {
-            let rds = files.raw_descriptor_store.read();
-            if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-                ResolvedFd::File(fd)
-            } else if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<Platform>>(raw_fd) {
-                ResolvedFd::Socket(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd)
-            {
-                ResolvedFd::Pipe(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-            {
-                ResolvedFd::Eventfd(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
-            {
-                ResolvedFd::Signalfd(fd)
-            } else if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<FS>>(raw_fd) {
-                ResolvedFd::Epoll(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
-            {
-                ResolvedFd::Unix(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::external_fd::ExternalFdSubsystem>(raw_fd)
-            {
-                ResolvedFd::ExternalFd(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
-            {
-                ResolvedFd::BrokerPipe(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
-            {
-                ResolvedFd::BrokerPty(fd)
-            } else if let Ok(fd) = rds
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
-            {
-                ResolvedFd::BrokerSocketPair(fd)
-            } else {
-                return Err(Errno::EBADF);
-            }
-        };
-
-        Ok(match resolved {
-            ResolvedFd::File(fd) => EpollDescriptor::File(fd),
-            ResolvedFd::Socket(fd) => EpollDescriptor::Socket(fd),
-            ResolvedFd::Pipe(fd) => EpollDescriptor::Pipe(fd),
-            ResolvedFd::Eventfd(fd) => EpollDescriptor::Eventfd(fd),
-            ResolvedFd::Signalfd(fd) => EpollDescriptor::Signalfd(fd),
-            ResolvedFd::Epoll(fd) => {
+        files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(fd) => Ok(EpollDescriptor::File(Arc::clone(fd))),
+            crate::RawFdRef::Net(fd) => Ok(EpollDescriptor::Socket(Arc::clone(fd))),
+            crate::RawFdRef::Pipes(fd) => Ok(EpollDescriptor::Pipe(Arc::clone(fd))),
+            crate::RawFdRef::Eventfd(fd) => Ok(EpollDescriptor::Eventfd(Arc::clone(fd))),
+            crate::RawFdRef::Epoll(fd) => {
                 let handle = global
                     .litebox
                     .descriptor_table()
-                    .entry_handle(&fd)
+                    .entry_handle(fd)
                     .ok_or(Errno::EBADF)?;
-                EpollDescriptor::Epoll(handle)
+                Ok(EpollDescriptor::Epoll(handle))
             }
-            ResolvedFd::Unix(fd) => EpollDescriptor::Unix(fd),
-            ResolvedFd::ExternalFd(fd) => EpollDescriptor::ExternalFd(fd),
-            ResolvedFd::BrokerPipe(fd) => EpollDescriptor::BrokerPipe(fd),
-            ResolvedFd::BrokerPty(fd) => EpollDescriptor::BrokerPty(fd),
-            ResolvedFd::BrokerSocketPair(fd) => EpollDescriptor::BrokerSocketPair(fd),
-        })
+            crate::RawFdRef::Unix(fd) => Ok(EpollDescriptor::Unix(Arc::clone(fd))),
+            crate::RawFdRef::ExternalFd(fd) => Ok(EpollDescriptor::ExternalFd(Arc::clone(fd))),
+            crate::RawFdRef::BrokerPipe(fd) => Ok(EpollDescriptor::BrokerPipe(Arc::clone(fd))),
+            crate::RawFdRef::BrokerSocketPair(fd) => {
+                Ok(EpollDescriptor::BrokerSocketPair(Arc::clone(fd)))
+            }
+            crate::RawFdRef::BrokerPty(fd) => Ok(EpollDescriptor::BrokerPty(Arc::clone(fd))),
+            crate::RawFdRef::Signalfd(fd) => Ok(EpollDescriptor::Signalfd(Arc::clone(fd))),
+        })?
     }
 }
 
