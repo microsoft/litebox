@@ -10,13 +10,15 @@
 
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::os::eventfd::EventFd;
+use crate::os::pty::Pty;
 use crate::{BinaryType, register_handler, register_leaf_subcommand};
 
 use serde::{Deserialize, Serialize};
 
+use std::ffi::CString;
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -28,6 +30,7 @@ const TCP_LISTEN_MATRIX: HandlerToken<TcpListenTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.tcp_listen");
 const EVENTFD_MATRIX: HandlerToken<EventfdTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.eventfd");
+const PTY_MATRIX: HandlerToken<PtyTrialArgs, ChildOutput> = HandlerToken::new("inherit_matrix.pty");
 
 const TCP_LISTEN_OPS: &[InheritOp] = &[
     InheritOp::Accept,
@@ -59,7 +62,11 @@ const SIGNALFD_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Poll];
 #[allow(dead_code)]
 const TIMERFD_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Poll];
 #[allow(dead_code)]
-const PTY_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Write, InheritOp::Poll];
+const PTY_OPS: &[InheritOp] = &[
+    InheritOp::SlaveWrite,
+    InheritOp::SlaveRead,
+    InheritOp::SlaveClose,
+];
 #[allow(dead_code)]
 const BROKER_FILE_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Write, InheritOp::Dup];
 
@@ -118,6 +125,9 @@ enum InheritOp {
     Shutdown,
     GetSockname,
     GetSockoptReuseport,
+    SlaveWrite,
+    SlaveRead,
+    SlaveClose,
 }
 
 impl InheritOp {
@@ -132,6 +142,9 @@ impl InheritOp {
             Self::Shutdown => "shutdown",
             Self::GetSockname => "getsockname",
             Self::GetSockoptReuseport => "getsockopt_reuseport",
+            Self::SlaveWrite => "slave_write",
+            Self::SlaveRead => "slave_read",
+            Self::SlaveClose => "slave_close",
         }
     }
 }
@@ -171,6 +184,13 @@ struct EventfdTrialArgs {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct PtyTrialArgs {
+    child_binary: String,
+    op: InheritOp,
+    timeout_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct ChildOutput {
     exit_code: i32,
     stdout: String,
@@ -180,9 +200,14 @@ struct ChildOutput {
 pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(TCP_LISTEN_MATRIX, handle_tcp_listen_trial);
     register_handler!(EVENTFD_MATRIX, handle_eventfd_trial);
+    register_handler!(PTY_MATRIX, handle_pty_trial);
     register_leaf_subcommand!("inherit-matrix", leaf_subcmd::subcmd_inherit_matrix);
 
-    for &subsystem in &[InheritSubsystem::TcpListen, InheritSubsystem::Eventfd] {
+    for &subsystem in &[
+        InheritSubsystem::TcpListen,
+        InheritSubsystem::Eventfd,
+        InheritSubsystem::Pty,
+    ] {
         for &parent_bt in BinaryType::ALL {
             for &child_bt in BinaryType::ALL {
                 for &op in valid_ops(subsystem) {
@@ -242,6 +267,18 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
                             &parent_handle,
                             &EVENTFD_MATRIX,
                             EventfdTrialArgs {
+                                child_binary,
+                                op: trial.op,
+                                timeout_ms: 2000,
+                            },
+                        )
+                        .await
+                    }
+                    InheritSubsystem::Pty => {
+                        run.send_named_typed(
+                            &parent_handle,
+                            &PTY_MATRIX,
+                            PtyTrialArgs {
                                 child_binary,
                                 op: trial.op,
                                 timeout_ms: 2000,
@@ -338,12 +375,109 @@ fn run_timerfd_trial() -> String {
 
 #[allow(dead_code)]
 fn run_pty_trial() -> String {
-    "INHERIT.pty: scaffold pending".into()
+    "pty is implemented by handle_pty_trial".into()
 }
 
 #[allow(dead_code)]
 fn run_broker_file_trial() -> String {
     "INHERIT.broker_file: scaffold pending".into()
+}
+
+async fn handle_pty_trial(
+    args: PtyTrialArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    let (master, slave) = open_raw_pty_pair()?;
+    let slave_fd = slave.as_raw_fd();
+    clear_cloexec(slave_fd)?;
+
+    let mut child = Command::new(&args.child_binary);
+    child
+        .args([
+            "inherit-matrix",
+            "pty-child",
+            args.op.id(),
+            &args.timeout_ms.to_string(),
+        ])
+        .env("LITEBOX_INHERIT_FD", slave_fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = child
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+    drop(slave);
+
+    let mut parent_error = None;
+    match args.op {
+        InheritOp::SlaveWrite => {
+            if let Err(e) = read_pty_payload(master.as_raw_fd(), b"hi\n", args.timeout_ms) {
+                parent_error = Some(e);
+            }
+        }
+        InheritOp::SlaveRead => {
+            if let Err(e) = write_all_fd(master.as_raw_fd(), b"hi\n", "pty master write") {
+                parent_error = Some(HandlerError(e));
+            }
+        }
+        InheritOp::SlaveClose => {
+            if let Err(e) = wait_pty_hup_or_eof(master.as_raw_fd(), args.timeout_ms) {
+                parent_error = Some(e);
+            }
+        }
+        _ => {
+            return Err(HandlerError(format!("unsupported pty op {}", args.op.id())));
+        }
+    }
+
+    let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 1000))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut exit_code = output.status.code().unwrap_or(-1);
+
+    if let Some(e) = parent_error {
+        exit_code = 1;
+        return Ok(ChildOutput {
+            exit_code,
+            stdout,
+            stderr: format!("{}; {stderr}", e.0),
+        });
+    }
+
+    if exit_code == 0 {
+        match args.op {
+            InheritOp::SlaveWrite if stdout != "wrote" => {
+                exit_code = 1;
+                return Ok(ChildOutput {
+                    exit_code,
+                    stdout,
+                    stderr: format!("pty slave_write stdout mismatch: expected wrote; {stderr}"),
+                });
+            }
+            InheritOp::SlaveRead if stdout != "hi" => {
+                exit_code = 1;
+                return Ok(ChildOutput {
+                    exit_code,
+                    stdout,
+                    stderr: format!("pty slave_read stdout mismatch: expected hi; {stderr}"),
+                });
+            }
+            InheritOp::SlaveClose if stdout != "closed" => {
+                exit_code = 1;
+                return Ok(ChildOutput {
+                    exit_code,
+                    stdout,
+                    stderr: format!("pty slave_close stdout mismatch: expected closed; {stderr}"),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ChildOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
 }
 
 async fn handle_eventfd_trial(
@@ -428,6 +562,207 @@ async fn handle_eventfd_trial(
         stdout,
         stderr,
     })
+}
+
+fn open_raw_pty_pair() -> Result<(Pty, OwnedFd), HandlerError> {
+    let master = Pty::open().map_err(|e| HandlerError(format!("pty open: {e}")))?;
+    let slave_path = CString::new(master.slave_path())
+        .map_err(|e| HandlerError(format!("pty slave path contains nul: {e}")))?;
+    // SAFETY: `slave_path` is a valid nul-terminated path returned by ptsname_r.
+    let slave_fd = unsafe {
+        libc::open(
+            slave_path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if slave_fd < 0 {
+        return Err(HandlerError(format!(
+            "open pty slave {}: {}",
+            master.slave_path(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `open` returned a fresh fd and ownership is transferred to OwnedFd.
+    let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+    make_raw(slave.as_raw_fd())?;
+    Ok((master, slave))
+}
+
+fn make_raw(fd: RawFd) -> Result<(), HandlerError> {
+    // SAFETY: zeroed termios is immediately initialized by tcgetattr on success.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: tcgetattr writes termios state for a live PTY slave fd.
+    if unsafe { libc::tcgetattr(fd, &raw mut termios) } != 0 {
+        return Err(HandlerError(format!(
+            "tcgetattr fd {fd}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: cfmakeraw mutates an initialized termios value in place.
+    unsafe { libc::cfmakeraw(&raw mut termios) };
+    // SAFETY: tcsetattr reads the initialized termios for a live PTY slave fd.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const termios) } != 0 {
+        return Err(HandlerError(format!(
+            "tcsetattr raw fd {fd}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn read_pty_payload(fd: RawFd, expected: &[u8], timeout_ms: u64) -> Result<(), HandlerError> {
+    let revents = poll_fd(
+        fd,
+        libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        timeout_ms,
+        "pty master payload",
+    )?;
+    if revents & libc::POLLIN == 0 {
+        return Err(HandlerError(format!(
+            "pty master payload poll got {}, expected POLLIN",
+            describe_events(revents)
+        )));
+    }
+    let mut buf = vec![0_u8; expected.len()];
+    read_exact_fd(fd, &mut buf, "pty master read")?;
+    if buf == expected {
+        Ok(())
+    } else {
+        Err(HandlerError(format!(
+            "pty master payload mismatch: got {:?}, expected {:?}",
+            String::from_utf8_lossy(&buf),
+            String::from_utf8_lossy(expected)
+        )))
+    }
+}
+
+fn wait_pty_hup_or_eof(fd: RawFd, timeout_ms: u64) -> Result<(), HandlerError> {
+    let revents = poll_fd(
+        fd,
+        libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        timeout_ms,
+        "pty master close",
+    )?;
+    if revents & libc::POLLHUP != 0 {
+        return Ok(());
+    }
+    if revents & (libc::POLLIN | libc::POLLERR) == 0 {
+        return Err(HandlerError(format!(
+            "pty slave close poll got {}, expected EOF/POLLHUP",
+            describe_events(revents)
+        )));
+    }
+    let mut buf = [0_u8; 1];
+    // SAFETY: `buf` is valid writable memory and fd is a live PTY master fd.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    if n == 0 {
+        return Ok(());
+    }
+    if n > 0 {
+        return Err(HandlerError(format!(
+            "pty slave close read expected EOF/EIO, got {n} bytes"
+        )));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EIO) {
+        Ok(())
+    } else {
+        Err(HandlerError(format!("pty slave close read: {err}")))
+    }
+}
+
+fn poll_fd(
+    fd: RawFd,
+    events: libc::c_short,
+    timeout_ms: u64,
+    context: &str,
+) -> Result<libc::c_short, HandlerError> {
+    let timeout_ms = i32::try_from(timeout_ms).unwrap_or(i32::MAX);
+    let mut pfd = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `pfd` points to one initialized pollfd; the fd remains live for the call.
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+        if rc > 0 {
+            return Ok(pfd.revents);
+        }
+        if rc == 0 {
+            return Err(HandlerError(format!(
+                "{context}: poll timeout after {timeout_ms}ms waiting for {}",
+                describe_events(events)
+            )));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(HandlerError(format!("{context}: poll: {err}")));
+        }
+    }
+}
+
+fn read_exact_fd(fd: RawFd, mut buf: &mut [u8], context: &str) -> Result<(), HandlerError> {
+    while !buf.is_empty() {
+        // SAFETY: `buf` is valid writable memory and fd is live for this read.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n > 0 {
+            let n = usize::try_from(n)
+                .map_err(|e| HandlerError(format!("{context}: read length conversion: {e}")))?;
+            let (_, rest) = buf.split_at_mut(n);
+            buf = rest;
+            continue;
+        }
+        if n == 0 {
+            return Err(HandlerError(format!("{context}: unexpected EOF")));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(HandlerError(format!("{context}: read: {err}")));
+        }
+    }
+    Ok(())
+}
+
+fn write_all_fd(fd: RawFd, mut buf: &[u8], context: &str) -> Result<(), String> {
+    while !buf.is_empty() {
+        // SAFETY: `buf` is readable memory and fd is live for this write.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n > 0 {
+            let n = usize::try_from(n).map_err(|e| format!("{context}: length: {e}"))?;
+            buf = &buf[n..];
+            continue;
+        }
+        if n == 0 {
+            return Err(format!("{context}: wrote 0 bytes"));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("{context}: {err}"));
+        }
+    }
+    Ok(())
+}
+
+fn describe_events(events: libc::c_short) -> String {
+    let mut names = Vec::new();
+    if events & libc::POLLIN != 0 {
+        names.push("POLLIN");
+    }
+    if events & libc::POLLHUP != 0 {
+        names.push("POLLHUP");
+    }
+    if events & libc::POLLERR != 0 {
+        names.push("POLLERR");
+    }
+    if events & libc::POLLNVAL != 0 {
+        names.push("POLLNVAL");
+    }
+    if names.is_empty() {
+        format!("0x{events:x}")
+    } else {
+        format!("{}(0x{events:x})", names.join("|"))
+    }
 }
 
 fn read_eventfd_total(
@@ -674,6 +1009,7 @@ mod leaf_subcmd {
         match args.get(2).map(String::as_str) {
             Some("tcp-listen-child") => tcp_listen_child(args),
             Some("eventfd-child") => eventfd_child(args),
+            Some("pty-child") => pty_child(args),
             Some(other) => {
                 eprintln!("inherit-matrix: unknown subcommand: {other}");
                 2
@@ -683,6 +1019,116 @@ mod leaf_subcmd {
                 2
             }
         }
+    }
+
+    fn pty_child(args: &[String]) -> i32 {
+        let Some(op) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix pty-child: missing op");
+            return 2;
+        };
+        let Some(timeout_ms) = args.get(4).and_then(|s| s.parse::<i32>().ok()) else {
+            eprintln!("inherit-matrix pty-child: bad timeout");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix pty-child: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+
+        match op {
+            "slave_write" => write_pty_slave(fd, b"hi\n"),
+            "slave_read" => read_pty_slave(fd, timeout_ms, b"hi\n"),
+            "slave_close" => close_pty_slave(fd),
+            other => {
+                eprintln!("inherit-matrix pty-child: unknown op {other}");
+                2
+            }
+        }
+    }
+
+    fn write_pty_slave(fd: RawFd, mut buf: &[u8]) -> i32 {
+        while !buf.is_empty() {
+            // SAFETY: `buf` is readable memory and fd is the inherited PTY slave.
+            let n = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
+            if n > 0 {
+                buf = &buf[n.cast_unsigned()..];
+                continue;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("inherit-matrix pty write: n={n} err={err}");
+                return 1;
+            }
+        }
+        println!("wrote");
+        0
+    }
+
+    fn read_pty_slave(fd: RawFd, timeout_ms: i32, expected: &[u8]) -> i32 {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is initialized and the count matches the buffer length.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+        if rc <= 0 || pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "inherit-matrix pty read poll: rc={} revents={} err={}",
+                rc,
+                pfd.revents,
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+
+        let mut buf = vec![0_u8; expected.len()];
+        let mut filled = 0;
+        while filled < buf.len() {
+            // SAFETY: the remaining `buf` slice is valid writable memory.
+            let n = unsafe {
+                libc::read(
+                    fd,
+                    buf[filled..].as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len() - filled,
+                )
+            };
+            if n > 0 {
+                filled += n.cast_unsigned();
+                continue;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("inherit-matrix pty read: n={n} err={err}");
+                return 1;
+            }
+        }
+        if buf != expected {
+            eprintln!(
+                "inherit-matrix pty read: got {:?} expected {:?}",
+                String::from_utf8_lossy(&buf),
+                String::from_utf8_lossy(expected)
+            );
+            return 1;
+        }
+        println!("{}", String::from_utf8_lossy(expected).trim_end());
+        0
+    }
+
+    fn close_pty_slave(fd: RawFd) -> i32 {
+        // SAFETY: best-effort close of the inherited PTY slave fd.
+        if unsafe { libc::close(fd) } != 0 {
+            eprintln!(
+                "inherit-matrix pty close: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        println!("closed");
+        0
     }
 
     fn eventfd_child(args: &[String]) -> i32 {
