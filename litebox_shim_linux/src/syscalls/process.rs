@@ -4398,7 +4398,7 @@ impl<FS: ShimFS> Task<FS> {
             use super::external_fd::ExternalFdDirection;
 
             let files = self.files.borrow();
-            let rds = files.raw_descriptor_store.read();
+            let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
 
             // Gather child's pipe FDs with their directions and pair IDs.
             let mut child_pipes: Vec<(usize, ExternalFdDirection, usize)> = Vec::new();
@@ -4407,28 +4407,42 @@ impl<FS: ShimFS> Task<FS> {
                 usize,
                 alloc::sync::Arc<litebox::fd::TypedFd<super::external_fd::ExternalFdSubsystem>>,
             )> = Vec::new();
-            for raw_fd in rds.iter_alive() {
-                if let Ok(typed) =
-                    rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                {
-                    let direction = match self.global.pipes.half_pipe_type(&typed) {
-                        Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => ExternalFdDirection::Read,
-                        Ok(litebox::pipes::HalfPipeType::SenderHalf) => ExternalFdDirection::Write,
-                        Err(_) => continue,
-                    };
-                    let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) else {
-                        continue;
-                    };
-                    child_pipes.push((raw_fd, direction, pair_id));
-                } else if let Ok(typed) =
-                    rds.fd_from_raw_integer::<super::external_fd::ExternalFdSubsystem>(raw_fd)
-                {
-                    // Already host-backed — collect for later extraction
-                    // (need descriptor_table lock which we acquire after rds).
-                    child_external_fd_fds.push((raw_fd, typed));
-                }
+            for raw_fd in alive_fds {
+                let _ = files.run_on_raw_fd(raw_fd, |raw_fd_ref| {
+                    #[deny(clippy::wildcard_enum_match_arm)]
+                    match raw_fd_ref {
+                        crate::RawFdRef::Fs(_)
+                        | crate::RawFdRef::Net(_)
+                        | crate::RawFdRef::Eventfd(_)
+                        | crate::RawFdRef::Epoll(_)
+                        | crate::RawFdRef::Unix(_)
+                        | crate::RawFdRef::BrokerPipe(_)
+                        | crate::RawFdRef::BrokerSocketPair(_)
+                        | crate::RawFdRef::BrokerPty(_)
+                        | crate::RawFdRef::Signalfd(_) => {}
+                        crate::RawFdRef::Pipes(typed) => {
+                            let direction = match self.global.pipes.half_pipe_type(typed) {
+                                Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
+                                    ExternalFdDirection::Read
+                                }
+                                Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
+                                    ExternalFdDirection::Write
+                                }
+                                Err(_) => return,
+                            };
+                            let Ok(pair_id) = self.global.pipes.pipe_pair_id(typed) else {
+                                return;
+                            };
+                            child_pipes.push((raw_fd, direction, pair_id));
+                        }
+                        crate::RawFdRef::ExternalFd(typed) => {
+                            // Already host-backed — collect for later extraction
+                            // (need descriptor_table lock which we acquire after rds).
+                            child_external_fd_fds.push((raw_fd, Arc::clone(typed)));
+                        }
+                    }
+                });
             }
-            drop(rds);
             drop(files);
 
             // Filter out mux-managed pipes inherited from the parent.
@@ -6572,7 +6586,6 @@ impl<FS: ShimFS> Task<FS> {
         // Acquire descriptor table BEFORE raw_descriptor_store to preserve
         // the established dt → rds lock order.
         let dt = self.global.litebox.descriptor_table();
-        let rds = files.raw_descriptor_store.read();
 
         let mut entries = Vec::new();
         let mut open_file_descriptions = Vec::new();
@@ -6590,103 +6603,94 @@ impl<FS: ShimFS> Task<FS> {
             // the descriptor's object_id matches the original host stdio.
             // For filesystem fds, also probe terminal metadata markers so we
             // can accept terminal fds through the snapshot gate.
-            let (subsystem_class, object_id, terminal_meta, _socket_pair_id) = if let Ok(fd) =
-                rds.fd_from_raw_integer::<FS>(raw_fd)
-            {
-                let oid = Some(fd.object_id());
-                // Probe terminal metadata markers on this filesystem fd.
-                // HostStdioSourceFd only counts as terminal when the
-                // underlying host stream is actually a tty.
-                let host_stdio_source = dt
-                    .with_metadata(&fd, |m: &crate::HostStdioSourceFd| m.0)
-                    .ok()
-                    .filter(|&source_fd| {
-                        let stream = match source_fd {
-                            0 => litebox::platform::StdioStream::Stdin,
-                            1 => litebox::platform::StdioStream::Stdout,
-                            _ => litebox::platform::StdioStream::Stderr,
-                        };
-                        self.global.platform.is_a_tty(stream)
-                    });
-                let is_tty_alias = dt.with_metadata(&fd, |_: &crate::HostTtyAlias| ()).is_ok();
-                let is_pty_device = dt
-                    .with_metadata(&fd, |_: &super::file::HostPtyDeviceFd| ())
-                    .is_ok();
+            let (subsystem_class, object_id, terminal_meta, _socket_pair_id) = files
+                .run_on_raw_fd(raw_fd, |raw_fd_ref| {
+                    #[deny(clippy::wildcard_enum_match_arm)]
+                    match raw_fd_ref {
+                        crate::RawFdRef::Fs(fd) => {
+                            let oid = Some(fd.object_id());
+                            // Probe terminal metadata markers on this filesystem fd.
+                            // HostStdioSourceFd only counts as terminal when the
+                            // underlying host stream is actually a tty.
+                            let host_stdio_source = dt
+                                .with_metadata(fd, |m: &crate::HostStdioSourceFd| m.0)
+                                .ok()
+                                .filter(|&source_fd| {
+                                    let stream = match source_fd {
+                                        0 => litebox::platform::StdioStream::Stdin,
+                                        1 => litebox::platform::StdioStream::Stdout,
+                                        _ => litebox::platform::StdioStream::Stderr,
+                                    };
+                                    self.global.platform.is_a_tty(stream)
+                                });
+                            let is_tty_alias =
+                                dt.with_metadata(fd, |_: &crate::HostTtyAlias| ()).is_ok();
+                            let is_pty_device = dt
+                                .with_metadata(fd, |_: &super::file::HostPtyDeviceFd| ())
+                                .is_ok();
 
-                let meta = if host_stdio_source.is_some() || is_tty_alias || is_pty_device {
-                    Some(FdMetadataSnapshot {
-                        host_stdio_source_fd: host_stdio_source,
-                        is_host_tty_alias: is_tty_alias,
-                        is_host_pty_device: is_pty_device,
-                        ..Default::default()
-                    })
-                } else {
-                    None
-                };
-                (FdClass::FilesystemFd, oid, meta, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
-            {
-                (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-            {
-                (FdClass::Pipe, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::external_fd::ExternalFdSubsystem>(raw_fd)
-            {
-                // Host-backed pipe (from a prior delayed-fork bridge).
-                (FdClass::Pipe, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
-            {
-                // Broker-backed pipe. Classify as Pipe so the
-                // broker-handle metadata is emitted below and the restored
-                // worker can re-attach to the same broker `PipeState`.
-                (FdClass::Pipe, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) = rds
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
-            {
-                // Phase F: eager-broker socketpair. Classify as
-                // UnixSocket so the broker-handle metadata is emitted
-                // below and the restored worker can re-attach to the
-                // same broker `SocketPairState` endpoint.
-                (FdClass::UnixSocket, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
-            {
-                (
-                    FdClass::FilesystemFd,
-                    Some(fd.object_id()),
-                    Some(FdMetadataSnapshot::default()),
-                    None,
-                )
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-            {
-                (FdClass::EventFd, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
-            {
-                (FdClass::Signalfd, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
-            {
-                (FdClass::Epoll, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
-            {
-                let dt_inner = self.global.litebox.descriptor_table();
-                let pair_id = dt_inner
-                    .with_entry(&fd, |sock: &super::unix::UnixSocket<FS>| {
-                        sock.socket_pair_id()
-                    })
-                    .flatten();
-                drop(dt_inner);
-                (FdClass::UnixSocket, Some(fd.object_id()), None, pair_id)
-            } else {
-                (FdClass::Other, None, None, None)
-            };
+                            let meta =
+                                if host_stdio_source.is_some() || is_tty_alias || is_pty_device {
+                                    Some(FdMetadataSnapshot {
+                                        host_stdio_source_fd: host_stdio_source,
+                                        is_host_tty_alias: is_tty_alias,
+                                        is_host_pty_device: is_pty_device,
+                                        ..Default::default()
+                                    })
+                                } else {
+                                    None
+                                };
+                            (FdClass::FilesystemFd, oid, meta, None)
+                        }
+                        crate::RawFdRef::Net(fd) => {
+                            (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::Pipes(fd) => {
+                            (FdClass::Pipe, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::Eventfd(fd) => {
+                            (FdClass::EventFd, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::Epoll(fd) => {
+                            (FdClass::Epoll, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::Unix(fd) => {
+                            let pair_id = dt
+                                .with_entry(fd, |sock: &super::unix::UnixSocket<FS>| {
+                                    sock.socket_pair_id()
+                                })
+                                .flatten();
+                            (FdClass::UnixSocket, Some(fd.object_id()), None, pair_id)
+                        }
+                        crate::RawFdRef::ExternalFd(fd) => {
+                            // Host-backed pipe (from a prior delayed-fork bridge).
+                            (FdClass::Pipe, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerPipe(fd) => {
+                            // Broker-backed pipe. Classify as Pipe so the
+                            // broker-handle metadata is emitted below and the restored
+                            // worker can re-attach to the same broker `PipeState`.
+                            (FdClass::Pipe, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerSocketPair(fd) => {
+                            // Phase F: eager-broker socketpair. Classify as
+                            // UnixSocket so the broker-handle metadata is emitted
+                            // below and the restored worker can re-attach to the
+                            // same broker `SocketPairState` endpoint.
+                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerPty(fd) => (
+                            FdClass::FilesystemFd,
+                            Some(fd.object_id()),
+                            Some(FdMetadataSnapshot::default()),
+                            None,
+                        ),
+                        crate::RawFdRef::Signalfd(fd) => {
+                            (FdClass::Signalfd, Some(fd.object_id()), None, None)
+                        }
+                    }
+                })
+                .unwrap_or((FdClass::Other, None, None, None));
 
             // Promote to StdioFd only if this fd sits at a stdio slot AND
             // its object_id matches ANY of the original host stdio descriptors.
@@ -6741,6 +6745,8 @@ impl<FS: ShimFS> Task<FS> {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
             }
+
+            let rds = files.raw_descriptor_store.read();
 
             // Per-fd diagnostic trace for delayed-fork analysis.
             #[cfg(feature = "trace_syscalls")]
@@ -7122,7 +7128,6 @@ impl<FS: ShimFS> Task<FS> {
                 });
             }
         }
-        drop(rds);
         drop(dt);
 
         let stdio_object_ids = [
