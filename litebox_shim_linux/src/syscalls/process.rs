@@ -8988,6 +8988,12 @@ impl<FS: ShimFS> Task<FS> {
             >,
             u64,
         )> = alloc::vec::Vec::new();
+        let mut broker_tcp_conn_transit_release: alloc::vec::Vec<(
+            alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            >,
+            u64,
+        )> = alloc::vec::Vec::new();
         // Process-token pidfd bridges need an in-transit exit subscription:
         // the source pidfd can close before the remote exec'd child installs
         // its own subscription, but the target may exit in that window.
@@ -9321,7 +9327,7 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     }
                     broker_eventfd_specs.push(alloc::format!("{raw_fd}:tcp_conn:{handle_id}"));
-                    broker_eventfd_transit_release.push((releaser, handle_id));
+                    broker_tcp_conn_transit_release.push((releaser, handle_id));
                 }
             }
 
@@ -9549,6 +9555,9 @@ impl<FS: ShimFS> Task<FS> {
                 for (releaser, handle_id) in &broker_pty_transit_release {
                     releaser.release(*handle_id);
                 }
+                for (releaser, handle_id) in &broker_tcp_conn_transit_release {
+                    releaser.release(*handle_id);
+                }
                 signal_on_error(&vfork_info);
                 Errno::ENOMEM
             })?;
@@ -9666,7 +9675,7 @@ impl<FS: ShimFS> Task<FS> {
         // worker itself exits — which is too late, the parent's
         // reader times out.
         //
-        // Pipe and PTY transit refs are drained here. Eventfd/signalfd
+        // Pipe, PTY, and TCP connection transit refs are drained here. Eventfd/signalfd
         // refs stay alive (they're cleaned via worker-conn cleanup);
         // releasing them here breaks PIDF tests where the pidfd subscription
         // needs the broker state alive past exec.
@@ -9674,6 +9683,9 @@ impl<FS: ShimFS> Task<FS> {
             releaser.release(handle_id);
         }
         for (releaser, handle_id) in broker_pty_transit_release.drain(..) {
+            releaser.release(handle_id);
+        }
+        for (releaser, handle_id) in broker_tcp_conn_transit_release.drain(..) {
             releaser.release(handle_id);
         }
 

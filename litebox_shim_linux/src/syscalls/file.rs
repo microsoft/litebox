@@ -3160,6 +3160,14 @@ impl<FS: ShimFS> Task<FS> {
             drop(entry);
             return Ok(());
         }
+        if let Ok(fd) =
+            rds.fd_consume_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
+        {
+            drop(rds);
+            let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
+            drop(entry);
+            return Ok(());
+        }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
         {
             drop(rds);

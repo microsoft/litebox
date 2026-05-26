@@ -166,6 +166,23 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerTcpConn(_) => "BrokerTcpConn",
         }
     }
+
+    fn needs_network_drive(&self) -> bool {
+        match self {
+            DescriptorRef::Socket(socket) => socket.upgrade().is_some(),
+            DescriptorRef::BrokerTcpConn(tcp_conn) => tcp_conn.upgrade().is_some(),
+            DescriptorRef::Eventfd(_)
+            | DescriptorRef::Signalfd(_)
+            | DescriptorRef::Epoll(_)
+            | DescriptorRef::File(_)
+            | DescriptorRef::Pipe(_)
+            | DescriptorRef::Unix(_)
+            | DescriptorRef::ExternalFd(_)
+            | DescriptorRef::BrokerPipe(_)
+            | DescriptorRef::BrokerPty(_)
+            | DescriptorRef::BrokerSocketPair(_) => false,
+        }
+    }
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
@@ -442,7 +459,7 @@ impl<FS: ShimFS> EpollFile<FS> {
         maxevents: usize,
         events: &mut Vec<EpollEvent>,
     ) {
-        let target = self.socket_interest_count().min(maxevents);
+        let target = self.network_drive_interest_count().min(maxevents);
         if target <= 1 || events.len() >= target {
             return;
         }
@@ -470,7 +487,7 @@ impl<FS: ShimFS> EpollFile<FS> {
             if events.len() >= maxevents {
                 return;
             }
-            if !matches!(&entry.desc, DescriptorRef::Socket(socket) if socket.upgrade().is_some()) {
+            if !entry.desc.needs_network_drive() {
                 continue;
             }
             if let Some((Some(event), _)) = entry.poll(global, fs, false)
@@ -488,16 +505,14 @@ impl<FS: ShimFS> EpollFile<FS> {
     }
 
     fn has_socket_interests(&self) -> bool {
-        self.socket_interest_count() != 0
+        self.network_drive_interest_count() != 0
     }
 
-    fn socket_interest_count(&self) -> usize {
+    fn network_drive_interest_count(&self) -> usize {
         let interests = self.interests.lock();
         interests
             .values()
-            .filter(|entry| {
-                matches!(&entry.desc, DescriptorRef::Socket(socket) if socket.upgrade().is_some())
-            })
+            .filter(|entry| entry.desc.needs_network_drive())
             .count()
     }
 
@@ -1282,7 +1297,7 @@ impl PollSet {
             let raw_fd = entry.fd.reinterpret_as_unsigned() as usize;
             matches!(
                 EpollDescriptor::try_from(global, files, raw_fd),
-                Ok(EpollDescriptor::Socket(_))
+                Ok(EpollDescriptor::Socket(_) | EpollDescriptor::BrokerTcpConn(_))
             )
         })
     }

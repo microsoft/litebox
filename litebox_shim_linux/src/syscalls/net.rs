@@ -2262,6 +2262,29 @@ impl<FS: ShimFS> Task<FS> {
             }
             return ret;
         }
+        if let Some(ret) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            if sockaddr.is_some() {
+                Err(Errno::EISCONN)
+            } else {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(typed)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
+            }
+        }) {
+            if let Err(Errno::EPIPE) = ret
+                && !flags.contains(SendFlags::NOSIGNAL)
+            {
+                self.send_signal(
+                    litebox_common_linux::signal::Signal::SIGPIPE,
+                    super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+                );
+            }
+            return ret;
+        }
         let ret = self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -3249,6 +3272,21 @@ impl<FS: ShimFS> Task<FS> {
                 .ok();
             if let Some(typed) = broker_sp {
                 let handle = self.broker_sp_handle(typed.as_ref())?;
+                let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))?;
+                return Ok(size);
+            }
+            let broker_tcp_conn = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
+                .ok();
+            if let Some(typed) = broker_tcp_conn {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(&typed)
+                    .ok_or(Errno::EBADF)?;
                 let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))?;
                 return Ok(size);
             }
