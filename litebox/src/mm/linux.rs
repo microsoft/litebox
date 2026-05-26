@@ -5,6 +5,9 @@
 //! backed by a memory [backend](PageManagementProvider). It provides functionality to create, remove, resize,
 //! move, and protect memory mappings within a process's virtual address space.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use core::ops::Range;
 
 use alloc::vec::Vec;

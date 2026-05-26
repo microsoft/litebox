@@ -6,6 +6,9 @@
 //! Wraps [`FdTokenClient`] for RegisterProcess / Release and the
 //! Phase-G process-exit RPCs against the broker's process registry.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use litebox_common_linux::broker_eventfd::NotificationDispatcher;
 use litebox_common_linux::cwfd::notification_frame::{NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN};
 use litebox_common_linux::fd_token_client::FdTokenClient;

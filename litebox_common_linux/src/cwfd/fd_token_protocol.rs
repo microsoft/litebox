@@ -70,6 +70,9 @@
 //! is 24 bytes (Subscribe), so this is comfortably generous; the
 //! cap exists primarily to bound memory on a malformed peer.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use alloc::vec::Vec;
 
 /// Wire-format magic ("LBFD" — LiteBox FD).

@@ -14,6 +14,9 @@
 //! local stack variables — no `AgentState` access.
 //! `crate::os::inotify` provides the libc wrapper.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};

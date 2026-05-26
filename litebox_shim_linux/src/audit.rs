@@ -8,6 +8,8 @@
 //! Call [`set_audit_log_fd`] before the guest starts to redirect events to a dedicated file
 //! descriptor instead, keeping stderr clean for real error messages.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
 // We intentionally store raw bits of signed values (e.g., status codes, ProtFlags) as u64.
 #![allow(clippy::cast_sign_loss)]
 

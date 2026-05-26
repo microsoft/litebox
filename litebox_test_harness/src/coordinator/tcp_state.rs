@@ -10,6 +10,9 @@
 //! - `XCONN.*` — cross-worker and same-worker first-connect correctness
 //! - `FKLC.*` — fork-listen-close (VS Code CLI fd-inheritance pattern)
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use std::collections::HashSet;
 use std::os::fd::FromRawFd;
 use std::time::Duration as StdDuration;

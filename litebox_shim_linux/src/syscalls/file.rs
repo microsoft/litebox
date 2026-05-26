@@ -3,6 +3,9 @@
 
 //! Implementation of file related syscalls, e.g., `open`, `read`, `write`, etc.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,

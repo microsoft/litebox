@@ -8,6 +8,9 @@
 //! the dispatch/data model so the next subsystem can be added by filling in
 //! the corresponding runner.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::os::eventfd::EventFd;
 use crate::os::pty::Pty;

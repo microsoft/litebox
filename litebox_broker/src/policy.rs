@@ -7,6 +7,9 @@
 //! operation.  The default [`AllowAllPolicy`] permits everything — swap it out
 //! for an Oso-backed implementation when the policy engine is integrated.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use std::path::{Path, PathBuf};
 
 /// The kind of file system operation being requested.

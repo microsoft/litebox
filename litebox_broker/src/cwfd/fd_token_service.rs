@@ -9,6 +9,9 @@
 //! eventfd opcodes alongside; this module stays focused on host-fd
 //! `Register` / `Materialize` / `Release`.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::fd_tokens::{BrokerFdToken, BrokerFdTokenError, BrokerFdTokenRegistry};
 use litebox_common_linux::fd_token_protocol::{
     Frame, Opcode, OwnedFrame, StatusCode, build_error_response, build_materialize_response_ok,

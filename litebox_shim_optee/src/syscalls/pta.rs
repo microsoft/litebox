@@ -4,6 +4,9 @@
 //! Implementation of pseudo TAs (PTAs) which export system services as
 //! the functions of built-in TAs.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::{Task, UserConstPtr, UserMutPtr};
 use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _},

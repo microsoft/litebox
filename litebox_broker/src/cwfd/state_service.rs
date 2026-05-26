@@ -19,6 +19,9 @@
 //! its ring once via `RegisterNotificationRing`; subsequent
 //! `SubscribeEventfd` calls use that sender.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
 use crate::eventfd_state::{EventfdError, EventfdState};
 use crate::pgrp_signal_inbox::{

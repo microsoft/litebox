@@ -10,6 +10,8 @@
 //! * `KPX.*` — cross-agent PID and /proc visibility (observer × target
 //!   pairs across the full agent tree).
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
 #![allow(clippy::items_after_statements)]
 
 use super::*;

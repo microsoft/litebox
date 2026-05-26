@@ -16,6 +16,9 @@
 //! `AgentHandle -> &'static str` mapping is private to this module
 //! and is the only place the wire-level name is materialized.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use std::time::Duration;
 
 use crate::protocol::{Command, Response};

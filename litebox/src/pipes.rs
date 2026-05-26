@@ -376,18 +376,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         use ringbuf::traits::Consumer as _;
         use ringbuf::traits::Observer as _;
         let dt = self.litebox.descriptor_table();
-        if let Some(entry) = dt.get_entry(fd) {
-            if let PipeEnd::Receiver(r) = &entry.entry {
-                let rb = r.endpoint.rb.lock();
-                // Reset consumer to saved position.  set_read_index
-                // updates the Frozen cache + commits to the shared rb.
-                unsafe { rb.set_read_index(position) };
-                // Force the CachingCons to re-fetch the producer's
-                // write_index from the shared ring buffer.  write_index()
-                // on CachingCons triggers Frozen::fetch() which updates
-                // the cached write position.
-                let _ = rb.write_index();
-            }
+        if let Some(entry) = dt.get_entry(fd)
+            && let PipeEnd::Receiver(r) = &entry.entry
+        {
+            let rb = r.endpoint.rb.lock();
+            // Reset consumer to saved position.  set_read_index
+            // updates the Frozen cache + commits to the shared rb.
+            unsafe { rb.set_read_index(position) };
+            // Force the CachingCons to re-fetch the producer's
+            // write_index from the shared ring buffer.  write_index()
+            // on CachingCons triggers Frozen::fetch() which updates
+            // the cached write position.
+            let _ = rb.write_index();
         }
     }
 
@@ -415,10 +415,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// vfork child's close.
     pub fn restore_writer_ref_count(&self, fd: &PipeFd<Platform>, count: usize) {
         let dt = self.litebox.descriptor_table();
-        if let Some(entry) = dt.get_entry(fd) {
-            if let PipeEnd::Sender(w) = &entry.entry {
-                w.fd_ref_count.store(count, Ordering::Release);
-            }
+        if let Some(entry) = dt.get_entry(fd)
+            && let PipeEnd::Sender(w) = &entry.entry
+        {
+            w.fd_ref_count.store(count, Ordering::Release);
         }
     }
 }

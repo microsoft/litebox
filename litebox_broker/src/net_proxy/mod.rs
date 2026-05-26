@@ -15,6 +15,9 @@
 //! handshake. Once a connection is ESTABLISHED, a host-side `TcpStream` is
 //! opened and data is relayed bidirectionally.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 mod device;
 pub mod dns_tracker;
 

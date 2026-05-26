@@ -17,6 +17,9 @@
 //! `BASH.*` (bash fork/exec), `FWE.*` (fork+exec from non-PIE worker-exec
 //! hosts), `SK.*` (SIGKILL subtree teardown).
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use std::process::Stdio;
 use std::time::Duration;
 

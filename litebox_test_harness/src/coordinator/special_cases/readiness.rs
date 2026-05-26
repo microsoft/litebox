@@ -7,6 +7,9 @@
 //! which changes peer readiness must wake a peer waiting in `poll`, and that
 //! the subsequent `read` observes the corresponding data or EOF.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use std::ffi::CString;
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

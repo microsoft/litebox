@@ -15,6 +15,9 @@
 //! world physical addresses to exchange a large amount of data. Also, like the OP-TEE
 //! SMC call, some OP-TEE messages/commands target OP-TEE shim not TAs (e.g., register
 //! shared memory).
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::{NormalWorldConstPtr, NormalWorldMutPtr};
 use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;

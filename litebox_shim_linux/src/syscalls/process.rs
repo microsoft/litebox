@@ -3,6 +3,9 @@
 
 //! Process/thread related syscalls.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::syscalls::file::{get_file_descriptor_flags, proc_cmdline_from_argv};
 use crate::{ConstPtr, MutPtr, ShimFS, Task, multihost::ExecRoute};
 use alloc::boxed::Box;
