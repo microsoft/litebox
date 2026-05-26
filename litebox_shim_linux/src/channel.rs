@@ -63,10 +63,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform,
         self.is_shutdown.load(Ordering::Acquire)
     }
 
-    /// Returns `true` on the call that effected the transition so callers can
+    /// Returns `true` on the call that affected the transition so callers can
     /// gate one-shot side-effects (e.g. peer wake-ups); idempotent thereafter.
     /// The boolean reports newness, not fallibility — the state is always shut
-    /// after this call.
+    /// down after this call.
     fn shutdown(&self) -> bool {
         !self.is_shutdown.swap(true, Ordering::Release)
     }

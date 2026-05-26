@@ -1762,7 +1762,7 @@ impl<FS: ShimFS> Task<FS> {
                     .map(SocketAddress::Inet)
                     .map_err(Errno::from)
             },
-            |file| Ok(SocketAddress::Unix(file.get_local_addr())),
+            |unix| Ok(SocketAddress::Unix(unix.get_local_addr())),
         )
     }
 

@@ -1740,12 +1740,12 @@ pub enum ShutdownHow {
 impl ShutdownHow {
     /// Returns `true` when this `how` disables the receive side (`SHUT_RD` or `SHUT_RDWR`).
     #[must_use]
-    pub fn shuts_down_read(self) -> bool {
+    pub fn is_shutdown_read(self) -> bool {
         matches!(self, Self::Read | Self::Both)
     }
     /// Returns `true` when this `how` disables the send side (`SHUT_WR` or `SHUT_RDWR`).
     #[must_use]
-    pub fn shuts_down_write(self) -> bool {
+    pub fn is_shutdown_write(self) -> bool {
         matches!(self, Self::Write | Self::Both)
     }
 }

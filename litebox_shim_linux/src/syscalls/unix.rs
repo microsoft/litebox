@@ -209,10 +209,10 @@ impl<FS: ShimFS> UnixInitStream<FS> {
     }
 
     fn shutdown(&self, how: ShutdownHow) {
-        if how.shuts_down_read() && !self.read_shutdown.swap(true, Ordering::Release) {
+        if how.is_shutdown_read() && !self.read_shutdown.swap(true, Ordering::Release) {
             self.pollee.notify_observers(Events::IN);
         }
-        if how.shuts_down_write() {
+        if how.is_shutdown_write() {
             self.write_shutdown.store(true, Ordering::Release);
         }
     }
@@ -577,10 +577,10 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
 
     fn shutdown(&self, how: ShutdownHow) {
         let mut events = Events::empty();
-        if how.shuts_down_read() && self.recv_channel.shutdown() {
+        if how.is_shutdown_read() && self.recv_channel.shutdown() {
             events |= Events::IN | Events::RDHUP;
         }
-        if how.shuts_down_write() && self.connected_send_channel.shutdown() {
+        if how.is_shutdown_write() && self.connected_send_channel.shutdown() {
             events |= Events::OUT | Events::HUP;
         }
         self.pollee.notify_observers(events);
@@ -901,7 +901,7 @@ impl<FS: ShimFS> UnixStream<FS> {
         self.with_state_ref(|state| match state {
             UnixStreamState::Init(init) => init.shutdown(how),
             UnixStreamState::Listen(listen) => {
-                if how.shuts_down_read() {
+                if how.is_shutdown_read() {
                     listen.backlog.shutdown();
                 }
             }
@@ -1050,14 +1050,14 @@ impl<FS: ShimFS> UnixDatagramInner<FS> {
 
     fn shutdown(&mut self, how: ShutdownHow) {
         let mut events = Events::empty();
-        if how.shuts_down_read() {
+        if how.is_shutdown_read() {
             self.read_shutdown = true;
             if let Some(recv_channel) = &self.recv_channel {
                 recv_channel.shutdown();
             }
             events |= Events::IN | Events::RDHUP;
         }
-        if how.shuts_down_write() {
+        if how.is_shutdown_write() {
             self.write_shutdown = true;
             if let Some((connected_send_channel, _)) = &self.connected_send_channel {
                 connected_send_channel.shutdown();
@@ -1253,36 +1253,27 @@ impl<FS: ShimFS> UnixDatagram<FS> {
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
         let inner = self.inner.read();
-        let recv_shutdown = inner.read_shutdown
-            || inner
-                .recv_channel
-                .as_ref()
-                .is_some_and(ReadEnd::is_shutdown);
-        let send_shutdown = inner.write_shutdown
-            || inner
-                .connected_send_channel
-                .as_ref()
-                .is_some_and(|(c, _)| c.is_shutdown());
-        if let Some(recv_channel) = &inner.recv_channel {
-            if recv_shutdown {
-                events |= Events::IN | Events::RDHUP;
-            } else if !recv_channel.is_empty() {
-                events |= Events::IN;
-            }
-        } else if recv_shutdown {
+        let recv_shutdown = inner.read_shutdown;
+        let send_shutdown = inner.write_shutdown;
+
+        if recv_shutdown {
             events |= Events::IN | Events::RDHUP;
+        } else if let Some(recv_channel) = &inner.recv_channel
+            && !recv_channel.is_empty()
+        {
+            events |= Events::IN;
         }
+
         if let Some((connected_send_channel, _)) = &inner.connected_send_channel {
             if !connected_send_channel.is_full() {
                 events |= Events::OUT;
             }
-        } else if !inner.write_shutdown {
+        } else if !send_shutdown {
             // If not connected, allow to sendto any address?
             events |= Events::OUT;
         }
         // Linux reports POLLHUP on a dgram fd only when *both* local directions are
         // shut down (peer-side shutdown is invisible since dgrams are connectionless).
-        // Matches `UnixConnectedStream::check_io_events`.
         if recv_shutdown && send_shutdown {
             events |= Events::HUP;
         }
