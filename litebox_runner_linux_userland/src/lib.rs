@@ -225,7 +225,8 @@ pub struct CliArgs {
     /// broker-backed fd at `fd` referencing broker handle `handle_id` of
     /// `kind` (eventfd | pidfd | signalfd | pty | pipe). The optional
     /// `direction` ('r' or 'w') is required for `kind=pipe` and identifies
-    /// which end of the broker `PipeState` this fd represents.
+    /// which end of the broker `PipeState` this fd represents. Signalfd uses
+    /// `fd:signalfd:handle_id:mask_bits:nonblock`.
     ///
     /// Used by the runner during worker-exec startup to seed broker-backed
     /// shim fd entries at the right fd slots before the worker binary
@@ -406,6 +407,26 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
         return entrypoints
             .install_tcp_listen_bridge_fd(guest_fd, port, reuse_port)
             .map_err(|err| anyhow!("broker-fd-bridge: tcp_listen {spec:?}: {err:?}"));
+    }
+
+    if parts.get(1) == Some(&"signalfd") && parts.len() == 5 {
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let handle_id: u64 = parts[2]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad handle {:?}: {e}", parts[2]))?;
+        let mask_bits: u64 = parts[3]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad signalfd mask {:?}: {e}", parts[3]))?;
+        let nonblock = match parts[4] {
+            "0" => false,
+            "1" => true,
+            other => anyhow::bail!("broker-fd-bridge: bad signalfd nonblock flag {other:?}"),
+        };
+        return entrypoints
+            .install_signalfd_bridge_fd(guest_fd, handle_id, mask_bits, nonblock)
+            .map_err(|err| anyhow!("broker-fd-bridge: signalfd {spec:?}: {err:?}"));
     }
 
     let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
