@@ -17,7 +17,8 @@ use crate::{BinaryType, register_handler, register_leaf_subcommand};
 use serde::{Deserialize, Serialize};
 
 use std::ffi::CString;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::{Command, Stdio};
@@ -34,6 +35,8 @@ const EVENTFD_MATRIX: HandlerToken<EventfdTrialArgs, ChildOutput> =
 const PTY_MATRIX: HandlerToken<PtyTrialArgs, ChildOutput> = HandlerToken::new("inherit_matrix.pty");
 const SIGNALFD_MATRIX: HandlerToken<SignalfdTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.signalfd");
+const BROKER_FILE_MATRIX: HandlerToken<BrokerFileTrialArgs, ChildOutput> =
+    HandlerToken::new("inherit_matrix.brokerfile");
 
 const TCP_LISTEN_OPS: &[InheritOp] = &[
     InheritOp::Accept,
@@ -73,8 +76,11 @@ const PTY_OPS: &[InheritOp] = &[
     InheritOp::SlaveRead,
     InheritOp::SlaveClose,
 ];
-#[allow(dead_code)]
-const BROKER_FILE_OPS: &[InheritOp] = &[InheritOp::Read, InheritOp::Write, InheritOp::Dup];
+const BROKER_FILE_OPS: &[InheritOp] = &[
+    InheritOp::ReadAtOffset0,
+    InheritOp::WriteThenParentReadsBack,
+    InheritOp::LseekThenRead,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -114,7 +120,7 @@ impl InheritSubsystem {
             Self::Signalfd => "signalfd",
             Self::Timerfd => "timerfd",
             Self::Pty => "pty",
-            Self::BrokerFile => "broker_file",
+            Self::BrokerFile => "brokerfile",
         }
     }
 }
@@ -137,6 +143,9 @@ enum InheritOp {
     RecvPending,
     RecvAfterFork,
     RecvCloseEof,
+    ReadAtOffset0,
+    WriteThenParentReadsBack,
+    LseekThenRead,
 }
 
 impl InheritOp {
@@ -157,6 +166,9 @@ impl InheritOp {
             Self::RecvPending => "recv_pending",
             Self::RecvAfterFork => "recv_after_fork",
             Self::RecvCloseEof => "recv_close_eof",
+            Self::ReadAtOffset0 => "read_at_offset_0",
+            Self::WriteThenParentReadsBack => "write_then_parent_reads_back",
+            Self::LseekThenRead => "lseek_then_read",
         }
     }
 }
@@ -210,6 +222,14 @@ struct SignalfdTrialArgs {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct BrokerFileTrialArgs {
+    child_binary: String,
+    op: InheritOp,
+    timeout_ms: u64,
+    test_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct ChildOutput {
     exit_code: i32,
     stdout: String,
@@ -221,6 +241,7 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(EVENTFD_MATRIX, handle_eventfd_trial);
     register_handler!(PTY_MATRIX, handle_pty_trial);
     register_handler!(SIGNALFD_MATRIX, handle_signalfd_trial);
+    register_handler!(BROKER_FILE_MATRIX, handle_brokerfile_trial);
     register_leaf_subcommand!("inherit-matrix", leaf_subcmd::subcmd_inherit_matrix);
 
     for &subsystem in &[
@@ -228,6 +249,7 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
         InheritSubsystem::Eventfd,
         InheritSubsystem::Pty,
         InheritSubsystem::Signalfd,
+        InheritSubsystem::BrokerFile,
     ] {
         for &parent_bt in BinaryType::ALL {
             for &child_bt in BinaryType::ALL {
@@ -270,6 +292,7 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
             Box::pin(async move {
                 let self_exe = run.self_exe().to_string();
                 let child_binary = crate::binary_path(trial.child_bt, &self_exe);
+                let trial_id = trial.id();
                 let result = match trial.subsystem {
                     InheritSubsystem::TcpListen => {
                         run.send_named_typed(
@@ -315,6 +338,19 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
                                 child_binary,
                                 op: trial.op,
                                 timeout_ms: 2000,
+                            },
+                        )
+                        .await
+                    }
+                    InheritSubsystem::BrokerFile => {
+                        run.send_named_typed(
+                            &parent_handle,
+                            &BROKER_FILE_MATRIX,
+                            BrokerFileTrialArgs {
+                                child_binary,
+                                op: trial.op,
+                                timeout_ms: 2000,
+                                test_id: trial_id.clone(),
                             },
                         )
                         .await
@@ -413,9 +449,10 @@ fn run_pty_trial() -> String {
 
 #[allow(dead_code)]
 fn run_broker_file_trial() -> String {
-    "INHERIT.broker_file: scaffold pending".into()
+    "brokerfile is implemented by handle_brokerfile_trial".into()
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_signalfd_trial(
     args: SignalfdTrialArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -561,7 +598,7 @@ async fn handle_signalfd_trial(
 
 fn kill_pid(pid: u32, signo: i32, context: &str) -> Result<(), HandlerError> {
     // SAFETY: kill is called with a child pid returned by spawn and a valid signal number.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, signo) };
+    let rc = unsafe { libc::kill(pid.cast_signed(), signo) };
     if rc == 0 {
         Ok(())
     } else {
@@ -700,6 +737,184 @@ async fn handle_pty_trial(
         stdout,
         stderr,
     })
+}
+
+const BROKERFILE_READ_PAYLOAD: &[u8] = b"brokerfile inherited read\n";
+const BROKERFILE_WRITE_PAYLOAD: &[u8] = b"hello\n";
+const BROKERFILE_LSEEK_PAYLOAD: &[u8] = b"ABCDEFGH";
+const BROKERFILE_LSEEK_EXPECTED: &[u8] = b"DEF";
+
+async fn handle_brokerfile_trial(
+    args: BrokerFileTrialArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    let path = brokerfile_path(&args.test_id);
+    let result = run_brokerfile_trial(&args, &path);
+    let cleanup = std::fs::remove_file(&path);
+
+    match result {
+        Ok(mut out) => {
+            if out.exit_code == 0
+                && let Err(e) = cleanup
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                out.exit_code = 1;
+                out.stderr = format!("brokerfile cleanup {path}: {e}; {}", out.stderr);
+            }
+            Ok(out)
+        }
+        Err(e) => {
+            let _ = cleanup;
+            Err(e)
+        }
+    }
+}
+
+fn run_brokerfile_trial(
+    args: &BrokerFileTrialArgs,
+    path: &str,
+) -> Result<ChildOutput, HandlerError> {
+    let _ = std::fs::remove_file(path);
+    let mut file = prepare_brokerfile_parent_fd(args.op, path)?;
+    let fd = file.as_raw_fd();
+    clear_cloexec(fd)?;
+
+    let mut child = Command::new(&args.child_binary);
+    child
+        .args(["inherit-matrix", "brokerfile-child", args.op.id()])
+        .env("LITEBOX_INHERIT_FD", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = child
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+
+    let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 1000))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut exit_code = output.status.code().unwrap_or(-1);
+
+    if exit_code == 0 {
+        match args.op {
+            InheritOp::ReadAtOffset0 => {
+                exit_code = check_child_stdout(
+                    &stdout,
+                    BROKERFILE_READ_PAYLOAD,
+                    "brokerfile read_at_offset_0",
+                );
+            }
+            InheritOp::WriteThenParentReadsBack => {
+                if stdout != "hello" {
+                    exit_code = 1;
+                    return Ok(ChildOutput {
+                        exit_code,
+                        stdout,
+                        stderr: format!(
+                            "brokerfile write stdout mismatch: expected hello; {stderr}"
+                        ),
+                    });
+                }
+                let contents =
+                    read_parent_file_from_start(&mut file, BROKERFILE_WRITE_PAYLOAD.len())?;
+                if contents != BROKERFILE_WRITE_PAYLOAD {
+                    exit_code = 1;
+                    return Ok(ChildOutput {
+                        exit_code,
+                        stdout,
+                        stderr: format!(
+                            "brokerfile parent read mismatch: got {:?}, expected {:?}; {stderr}",
+                            String::from_utf8_lossy(&contents),
+                            String::from_utf8_lossy(BROKERFILE_WRITE_PAYLOAD)
+                        ),
+                    });
+                }
+            }
+            InheritOp::LseekThenRead => {
+                exit_code = check_child_stdout(
+                    &stdout,
+                    BROKERFILE_LSEEK_EXPECTED,
+                    "brokerfile lseek_then_read",
+                );
+            }
+            _ => {
+                return Err(HandlerError(format!(
+                    "unsupported brokerfile op {}",
+                    args.op.id()
+                )));
+            }
+        }
+    }
+
+    Ok(ChildOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+fn prepare_brokerfile_parent_fd(op: InheritOp, path: &str) -> Result<File, HandlerError> {
+    match op {
+        InheritOp::ReadAtOffset0 => {
+            File::create(path)
+                .map_err(|e| HandlerError(format!("brokerfile create {path}: {e}")))?;
+            let file = OpenOptions::new()
+                .read(true)
+                .open(path)
+                .map_err(|e| HandlerError(format!("brokerfile open read {path}: {e}")))?;
+            std::fs::write(path, BROKERFILE_READ_PAYLOAD)
+                .map_err(|e| HandlerError(format!("brokerfile seed write {path}: {e}")))?;
+            Ok(file)
+        }
+        InheritOp::WriteThenParentReadsBack => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| HandlerError(format!("brokerfile open read/write {path}: {e}"))),
+        InheritOp::LseekThenRead => {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| HandlerError(format!("brokerfile open lseek {path}: {e}")))?;
+            file.write_all(BROKERFILE_LSEEK_PAYLOAD)
+                .map_err(|e| HandlerError(format!("brokerfile seed lseek payload: {e}")))?;
+            file.flush()
+                .map_err(|e| HandlerError(format!("brokerfile seed flush: {e}")))?;
+            Ok(file)
+        }
+        _ => Err(HandlerError(format!(
+            "unsupported brokerfile op {}",
+            op.id()
+        ))),
+    }
+}
+
+fn read_parent_file_from_start(file: &mut File, len: usize) -> Result<Vec<u8>, HandlerError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| HandlerError(format!("brokerfile parent seek: {e}")))?;
+    let mut buf = vec![0_u8; len];
+    file.read_exact(&mut buf)
+        .map_err(|e| HandlerError(format!("brokerfile parent read: {e}")))?;
+    Ok(buf)
+}
+
+fn check_child_stdout(stdout: &str, expected: &[u8], _context: &str) -> i32 {
+    let expected = String::from_utf8_lossy(expected);
+    let expected = expected.trim_end_matches('\n');
+    i32::from(stdout != expected)
+}
+
+fn brokerfile_path(test_id: &str) -> String {
+    let sanitized: String = test_id
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' => c,
+            _ => '_',
+        })
+        .collect();
+    format!("/tmp/canary-{sanitized}-{}.txt", std::process::id())
 }
 
 async fn handle_eventfd_trial(
@@ -1233,6 +1448,7 @@ mod leaf_subcmd {
             Some("eventfd-child") => eventfd_child(args),
             Some("pty-child") => pty_child(args),
             Some("signalfd-child") => signalfd_child(args),
+            Some("brokerfile-child") => brokerfile_child(args),
             Some(other) => {
                 eprintln!("inherit-matrix: unknown subcommand: {other}");
                 2
@@ -1242,6 +1458,111 @@ mod leaf_subcmd {
                 2
             }
         }
+    }
+
+    fn brokerfile_child(args: &[String]) -> i32 {
+        let Some(op) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix brokerfile-child: missing op");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix brokerfile-child: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+
+        match op {
+            "read_at_offset_0" => read_brokerfile(fd, b"brokerfile inherited read\n"),
+            "write_then_parent_reads_back" => write_brokerfile(fd, b"hello\n"),
+            "lseek_then_read" => lseek_read_brokerfile(fd, 3, b"DEF"),
+            other => {
+                eprintln!("inherit-matrix brokerfile-child: unknown op {other}");
+                2
+            }
+        }
+    }
+
+    fn read_brokerfile(fd: RawFd, expected: &[u8]) -> i32 {
+        let mut buf = vec![0_u8; expected.len()];
+        if read_exact_raw_fd(fd, &mut buf, "brokerfile read") != 0 {
+            return 1;
+        }
+        if buf != expected {
+            eprintln!(
+                "inherit-matrix brokerfile read: got {:?} expected {:?}",
+                String::from_utf8_lossy(&buf),
+                String::from_utf8_lossy(expected)
+            );
+            return 1;
+        }
+        println!("{}", String::from_utf8_lossy(&buf).trim_end_matches('\n'));
+        0
+    }
+
+    fn write_brokerfile(fd: RawFd, payload: &[u8]) -> i32 {
+        if write_all_raw_fd(fd, payload, "brokerfile write") != 0 {
+            return 1;
+        }
+        println!(
+            "{}",
+            String::from_utf8_lossy(payload).trim_end_matches('\n')
+        );
+        0
+    }
+
+    fn lseek_read_brokerfile(fd: RawFd, offset: libc::off_t, expected: &[u8]) -> i32 {
+        // SAFETY: fd is inherited from the parent and the result is checked.
+        let pos = unsafe { libc::lseek(fd, offset, libc::SEEK_SET) };
+        if pos != offset {
+            eprintln!(
+                "inherit-matrix brokerfile lseek: pos={pos} expected={offset} err={}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        read_brokerfile(fd, expected)
+    }
+
+    fn read_exact_raw_fd(fd: RawFd, mut buf: &mut [u8], context: &str) -> i32 {
+        while !buf.is_empty() {
+            // SAFETY: buf is valid writable memory and fd is inherited from the parent.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            if n > 0 {
+                let n = n.cast_unsigned();
+                let (_, rest) = buf.split_at_mut(n);
+                buf = rest;
+                continue;
+            }
+            if n == 0 {
+                eprintln!("inherit-matrix {context}: unexpected EOF");
+                return 1;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("inherit-matrix {context}: n={n} err={err}");
+                return 1;
+            }
+        }
+        0
+    }
+
+    fn write_all_raw_fd(fd: RawFd, mut buf: &[u8], context: &str) -> i32 {
+        while !buf.is_empty() {
+            // SAFETY: buf is valid readable memory and fd is inherited from the parent.
+            let n = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
+            if n > 0 {
+                buf = &buf[n.cast_unsigned()..];
+                continue;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("inherit-matrix {context}: n={n} err={err}");
+                return 1;
+            }
+        }
+        0
     }
 
     fn signalfd_child(args: &[String]) -> i32 {
@@ -1314,7 +1635,7 @@ mod leaf_subcmd {
             return 1;
         }
         match read_signalfd_signo(fd) {
-            Ok(Some(signo)) if signo == expected_signo as u32 => {
+            Ok(Some(signo)) if signo == expected_signo.cast_unsigned() => {
                 println!("{signo}");
                 0
             }
