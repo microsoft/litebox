@@ -57,8 +57,8 @@
 //! it, the table can be sharded; the public API is shape-stable
 //! against that change.
 //!
-//! Each `Arc<dyn StateObject + Send + Sync>` is responsible for its
-//! own internal synchronization — the registry is just a table.
+//! Each [`StateObjectEnum`] variant is responsible for its own internal
+//! synchronization — the registry is just a table.
 
 use core::any::Any;
 use std::collections::HashMap;
@@ -67,6 +67,13 @@ use std::sync::{Arc, Mutex};
 use litebox_common_linux::cwfd::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::cwfd::notification_ring::NotificationSender;
 
+use crate::cwfd::eventfd_state::EventfdState;
+use crate::cwfd::pidfd_state::PidfdState;
+use crate::cwfd::pipe_state::{PipeReadEnd, PipeWriteEnd};
+use crate::cwfd::process_state::ProcessState;
+use crate::cwfd::pty_state::PtyState;
+use crate::cwfd::signalfd_state::SignalfdState;
+use crate::cwfd::socketpair_state::SocketPairEnd;
 use crate::cwfd::subscription_list::{SubscribeError, UnsubscribeError};
 
 /// An opaque, broker-global handle to a [`StateObject`] held by the
@@ -100,24 +107,18 @@ impl StateHandle {
 ///
 /// Implementors model a single resource (one eventfd, one TCP socket,
 /// etc.) and carry whatever per-resource state they need (counter,
-/// socket handle, ...). The registry holds them as
-/// `Arc<dyn StateObject + Send + Sync>` so it can dispatch refcount
-/// management without knowing the concrete type.
-///
-/// The trait itself is intentionally minimal — concrete types expose
-/// rich operation APIs through the dyn-`Any` downcast. The broker's
-/// service handlers downcast to the appropriate concrete state type
-/// based on the request opcode and the handle's recorded
-/// [`SubsystemTag`].
+/// socket handle, ...). The registry stores the closed
+/// [`StateObjectEnum`] so RPC dispatch can match exhaustively over every
+/// broker-owned state kind.
 pub trait StateObject: Any + Send + Sync + core::fmt::Debug {
     /// Returns the subsystem tag that classifies this state. Used by
     /// the registry for cross-checks (e.g. "this handle is tagged
     /// Eventfd, so I expect Read/Write/Subscribe ops, not Accept").
     fn subsystem_tag(&self) -> SubsystemTag;
 
-    /// Returns `self` as `&dyn Any` for downcasting to the concrete
-    /// state type. Concrete subsystem services use this to recover
-    /// type-specific operation APIs.
+    /// Returns `self` as `&dyn Any` for legacy helpers and unit tests.
+    /// RPC dispatch should match on [`StateObjectEnum`] instead of
+    /// downcasting through this method.
     fn as_any(&self) -> &dyn Any;
 
     /// Kind-agnostic subscribe. Adds `subscription_id` to this
@@ -140,6 +141,174 @@ pub trait StateObject: Any + Send + Sync + core::fmt::Debug {
     /// Kind-agnostic unsubscribe. Removes the subscription previously
     /// installed via [`Self::subscribe`].
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError>;
+}
+
+/// Closed set of broker-hosted state object variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateKind {
+    Eventfd,
+    PipeReadEnd,
+    PipeWriteEnd,
+    SocketPairEnd,
+    Signalfd,
+    Pty,
+    Pidfd,
+    Process,
+}
+
+/// A tagged broker-hosted state object.
+#[derive(Clone, Debug)]
+pub enum StateObjectEnum {
+    Eventfd(Arc<EventfdState>),
+    PipeReadEnd(Arc<PipeReadEnd>),
+    PipeWriteEnd(Arc<PipeWriteEnd>),
+    SocketPairEnd(Arc<SocketPairEnd>),
+    Signalfd(Arc<SignalfdState>),
+    Pty(Arc<PtyState>),
+    Pidfd(Arc<PidfdState>),
+    Process(Arc<ProcessState>),
+}
+
+impl StateObjectEnum {
+    pub fn kind(&self) -> StateKind {
+        match self {
+            StateObjectEnum::Eventfd(_) => StateKind::Eventfd,
+            StateObjectEnum::PipeReadEnd(_) => StateKind::PipeReadEnd,
+            StateObjectEnum::PipeWriteEnd(_) => StateKind::PipeWriteEnd,
+            StateObjectEnum::SocketPairEnd(_) => StateKind::SocketPairEnd,
+            StateObjectEnum::Signalfd(_) => StateKind::Signalfd,
+            StateObjectEnum::Pty(_) => StateKind::Pty,
+            StateObjectEnum::Pidfd(_) => StateKind::Pidfd,
+            StateObjectEnum::Process(_) => StateKind::Process,
+        }
+    }
+
+    pub fn subsystem_tag(&self) -> SubsystemTag {
+        match self {
+            StateObjectEnum::Eventfd(state) => state.subsystem_tag(),
+            StateObjectEnum::PipeReadEnd(state) => state.subsystem_tag(),
+            StateObjectEnum::PipeWriteEnd(state) => state.subsystem_tag(),
+            StateObjectEnum::SocketPairEnd(state) => state.subsystem_tag(),
+            StateObjectEnum::Signalfd(state) => state.subsystem_tag(),
+            StateObjectEnum::Pty(state) => state.subsystem_tag(),
+            StateObjectEnum::Pidfd(state) => state.subsystem_tag(),
+            StateObjectEnum::Process(state) => state.subsystem_tag(),
+        }
+    }
+
+    pub fn subscribe(
+        &self,
+        subscription_id: u64,
+        events_mask: u32,
+        sender: Arc<Mutex<NotificationSender>>,
+    ) -> Result<(), SubscribeError> {
+        match self {
+            StateObjectEnum::Eventfd(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
+            StateObjectEnum::PipeReadEnd(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
+            StateObjectEnum::PipeWriteEnd(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
+            StateObjectEnum::SocketPairEnd(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
+            StateObjectEnum::Signalfd(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
+            StateObjectEnum::Pty(state) => state.subscribe(subscription_id, events_mask, sender),
+            StateObjectEnum::Pidfd(state) => state.subscribe(subscription_id, events_mask, sender),
+            StateObjectEnum::Process(state) => {
+                StateObject::subscribe(state.as_ref(), subscription_id, events_mask, sender)
+            }
+        }
+    }
+
+    pub fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
+        match self {
+            StateObjectEnum::Eventfd(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::PipeReadEnd(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::PipeWriteEnd(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::SocketPairEnd(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::Signalfd(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::Pty(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::Pidfd(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::Process(state) => state.unsubscribe(subscription_id),
+        }
+    }
+}
+
+impl StateObject for StateObjectEnum {
+    fn subsystem_tag(&self) -> SubsystemTag {
+        StateObjectEnum::subsystem_tag(self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn subscribe(
+        &self,
+        subscription_id: u64,
+        events_mask: u32,
+        sender: Arc<Mutex<NotificationSender>>,
+    ) -> Result<(), SubscribeError> {
+        StateObjectEnum::subscribe(self, subscription_id, events_mask, sender)
+    }
+
+    fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
+        StateObjectEnum::unsubscribe(self, subscription_id)
+    }
+}
+
+impl From<Arc<EventfdState>> for StateObjectEnum {
+    fn from(state: Arc<EventfdState>) -> Self {
+        StateObjectEnum::Eventfd(state)
+    }
+}
+
+impl From<Arc<PipeReadEnd>> for StateObjectEnum {
+    fn from(state: Arc<PipeReadEnd>) -> Self {
+        StateObjectEnum::PipeReadEnd(state)
+    }
+}
+
+impl From<Arc<PipeWriteEnd>> for StateObjectEnum {
+    fn from(state: Arc<PipeWriteEnd>) -> Self {
+        StateObjectEnum::PipeWriteEnd(state)
+    }
+}
+
+impl From<Arc<SocketPairEnd>> for StateObjectEnum {
+    fn from(state: Arc<SocketPairEnd>) -> Self {
+        StateObjectEnum::SocketPairEnd(state)
+    }
+}
+
+impl From<Arc<SignalfdState>> for StateObjectEnum {
+    fn from(state: Arc<SignalfdState>) -> Self {
+        StateObjectEnum::Signalfd(state)
+    }
+}
+
+impl From<Arc<PtyState>> for StateObjectEnum {
+    fn from(state: Arc<PtyState>) -> Self {
+        StateObjectEnum::Pty(state)
+    }
+}
+
+impl From<Arc<PidfdState>> for StateObjectEnum {
+    fn from(state: Arc<PidfdState>) -> Self {
+        StateObjectEnum::Pidfd(state)
+    }
+}
+
+impl From<Arc<ProcessState>> for StateObjectEnum {
+    fn from(state: Arc<ProcessState>) -> Self {
+        StateObjectEnum::Process(state)
+    }
 }
 
 /// Errors returned by [`BrokerStateRegistry`] operations.
@@ -172,7 +341,7 @@ pub enum StateRegistryError {
 }
 
 struct Entry {
-    state: Arc<dyn StateObject + Send + Sync>,
+    state: Arc<StateObjectEnum>,
     refcount: u32,
 }
 
@@ -258,7 +427,8 @@ impl BrokerStateRegistry {
 
     /// Inserts a new state object with refcount = 1 and returns its
     /// handle.
-    pub fn register(&self, state: Arc<dyn StateObject + Send + Sync>) -> StateHandle {
+    pub fn register(&self, state: impl Into<StateObjectEnum>) -> StateHandle {
+        let state = Arc::new(state.into());
         let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
         let id = s.next_id;
         s.next_id = s
@@ -379,7 +549,7 @@ impl BrokerStateRegistry {
         &self,
         handle: StateHandle,
         expected_tag: SubsystemTag,
-    ) -> Result<Arc<dyn StateObject + Send + Sync>, StateRegistryError> {
+    ) -> Result<Arc<StateObjectEnum>, StateRegistryError> {
         let s = self.state.lock().expect("BrokerStateRegistry poisoned");
         let entry = s
             .table
@@ -402,7 +572,7 @@ impl BrokerStateRegistry {
     pub fn resolve_untyped(
         &self,
         handle: StateHandle,
-    ) -> Result<Arc<dyn StateObject + Send + Sync>, StateRegistryError> {
+    ) -> Result<Arc<StateObjectEnum>, StateRegistryError> {
         let s = self.state.lock().expect("BrokerStateRegistry poisoned");
         let entry = s
             .table
@@ -426,78 +596,15 @@ impl BrokerStateRegistry {
 mod tests {
     use super::*;
 
-    /// A minimal `StateObject` for tests: a `Mutex<u64>` counter,
-    /// reachable as `Eventfd` for tag-check purposes.
-    #[derive(Debug)]
-    struct TestCounter {
-        value: Mutex<u64>,
-    }
-
-    impl TestCounter {
-        fn new(initial: u64) -> Arc<Self> {
-            Arc::new(Self {
-                value: Mutex::new(initial),
-            })
-        }
-
-        fn get(&self) -> u64 {
-            *self.value.lock().expect("test counter poisoned")
-        }
-
-        fn add(&self, n: u64) {
-            *self.value.lock().expect("test counter poisoned") += n;
-        }
-    }
-
-    impl StateObject for TestCounter {
-        fn subsystem_tag(&self) -> SubsystemTag {
-            SubsystemTag::Eventfd
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn subscribe(
-            &self,
-            _subscription_id: u64,
-            _events_mask: u32,
-            _sender: Arc<Mutex<NotificationSender>>,
-        ) -> Result<(), SubscribeError> {
-            // Test stubs ignore subscriptions.
-            Ok(())
-        }
-        fn unsubscribe(&self, _subscription_id: u64) -> Result<(), UnsubscribeError> {
-            Ok(())
-        }
-    }
-
-    /// A second test state for tag-mismatch checks.
-    #[derive(Debug)]
-    struct OtherState;
-    impl StateObject for OtherState {
-        fn subsystem_tag(&self) -> SubsystemTag {
-            SubsystemTag::TcpSocket
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn subscribe(
-            &self,
-            _subscription_id: u64,
-            _events_mask: u32,
-            _sender: Arc<Mutex<NotificationSender>>,
-        ) -> Result<(), SubscribeError> {
-            Ok(())
-        }
-        fn unsubscribe(&self, _subscription_id: u64) -> Result<(), UnsubscribeError> {
-            Ok(())
-        }
+    fn test_eventfd(initial: u64) -> Arc<EventfdState> {
+        EventfdState::new(initial, false)
     }
 
     #[test]
     fn register_returns_unique_handles() {
         let reg = BrokerStateRegistry::new();
-        let h1 = reg.register(TestCounter::new(0));
-        let h2 = reg.register(TestCounter::new(0));
+        let h1 = reg.register(test_eventfd(0));
+        let h2 = reg.register(test_eventfd(0));
         assert_ne!(h1.id(), h2.id());
         assert_eq!(reg.live_handle_count(), 2);
     }
@@ -505,19 +612,19 @@ mod tests {
     #[test]
     fn register_id_monotonically_increasing() {
         let reg = BrokerStateRegistry::new();
-        let h1 = reg.register(TestCounter::new(0));
-        let h2 = reg.register(TestCounter::new(0));
-        let h3 = reg.register(TestCounter::new(0));
+        let h1 = reg.register(test_eventfd(0));
+        let h2 = reg.register(test_eventfd(0));
+        let h3 = reg.register(test_eventfd(0));
         assert!(h1.id() < h2.id() && h2.id() < h3.id());
         reg.release(h1).unwrap();
-        let h4 = reg.register(TestCounter::new(0));
+        let h4 = reg.register(test_eventfd(0));
         assert!(h4.id() > h3.id(), "ids must not be reused after release");
     }
 
     #[test]
     fn release_drops_at_zero_refcount() {
         let reg = BrokerStateRegistry::new();
-        let counter = TestCounter::new(7);
+        let counter = test_eventfd(7);
         assert_eq!(Arc::strong_count(&counter), 1);
         let counter_clone = Arc::clone(&counter);
 
@@ -531,13 +638,13 @@ mod tests {
         assert_eq!(reg.live_handle_count(), 0);
 
         // Counter value still accessible since we held a reference.
-        assert_eq!(counter.get(), 7);
+        assert_eq!(counter.current_value(), 7);
     }
 
     #[test]
     fn dup_increments_refcount_release_balances() {
         let reg = BrokerStateRegistry::new();
-        let h1 = reg.register(TestCounter::new(0));
+        let h1 = reg.register(test_eventfd(0));
         let h2 = reg.dup(h1).unwrap();
         assert_eq!(h1, h2);
         assert_eq!(reg.live_handle_count(), 1);
@@ -573,18 +680,22 @@ mod tests {
     #[test]
     fn resolve_returns_same_arc_for_repeated_calls() {
         let reg = BrokerStateRegistry::new();
-        let counter = TestCounter::new(0);
-        let h = reg.register(Arc::clone(&counter) as Arc<dyn StateObject + Send + Sync>);
+        let counter = test_eventfd(0);
+        let h = reg.register(Arc::clone(&counter));
 
         let r1 = reg.resolve(h, SubsystemTag::Eventfd).unwrap();
         let r2 = reg.resolve(h, SubsystemTag::Eventfd).unwrap();
         assert!(Arc::ptr_eq(&r1, &r2), "resolve must return the same Arc");
 
         // Mutate via one reference, observe via another.
-        let r1_typed = r1.as_any().downcast_ref::<TestCounter>().unwrap();
-        r1_typed.add(5);
-        let r2_typed = r2.as_any().downcast_ref::<TestCounter>().unwrap();
-        assert_eq!(r2_typed.get(), 5);
+        let StateObjectEnum::Eventfd(r1_typed) = r1.as_ref() else {
+            panic!("expected Eventfd variant");
+        };
+        r1_typed.write(5).unwrap();
+        let StateObjectEnum::Eventfd(r2_typed) = r2.as_ref() else {
+            panic!("expected Eventfd variant");
+        };
+        assert_eq!(r2_typed.current_value(), 5);
 
         reg.release(h).unwrap();
     }
@@ -601,16 +712,16 @@ mod tests {
     #[test]
     fn resolve_tag_mismatch_errors() {
         let reg = BrokerStateRegistry::new();
-        let h = reg.register(TestCounter::new(0));
-        // TestCounter reports Eventfd; ask for TcpSocket.
-        match reg.resolve(h, SubsystemTag::TcpSocket) {
+        let h = reg.register(test_eventfd(0));
+        // EventfdState reports Eventfd; ask for Process.
+        match reg.resolve(h, SubsystemTag::Process) {
             Err(StateRegistryError::TagMismatch {
                 handle,
                 expected,
                 actual,
             }) => {
                 assert_eq!(handle, h);
-                assert_eq!(expected, SubsystemTag::TcpSocket);
+                assert_eq!(expected, SubsystemTag::Process);
                 assert_eq!(actual, SubsystemTag::Eventfd);
             }
             other => panic!("expected TagMismatch, got {other:?}"),
@@ -621,16 +732,16 @@ mod tests {
     #[test]
     fn resolve_untyped_works_for_both_tags() {
         let reg = BrokerStateRegistry::new();
-        let h_ev = reg.register(TestCounter::new(0));
-        let h_tcp = reg.register(Arc::new(OtherState));
+        let h_ev = reg.register(test_eventfd(0));
+        let h_proc = reg.register(ProcessState::arc());
 
         let s1 = reg.resolve_untyped(h_ev).unwrap();
-        let s2 = reg.resolve_untyped(h_tcp).unwrap();
+        let s2 = reg.resolve_untyped(h_proc).unwrap();
         assert_eq!(s1.subsystem_tag(), SubsystemTag::Eventfd);
-        assert_eq!(s2.subsystem_tag(), SubsystemTag::TcpSocket);
+        assert_eq!(s2.subsystem_tag(), SubsystemTag::Process);
 
         reg.release(h_ev).unwrap();
-        reg.release(h_tcp).unwrap();
+        reg.release(h_proc).unwrap();
     }
 
     #[test]
@@ -646,7 +757,7 @@ mod tests {
             let reg = Arc::clone(&reg);
             handles.push(thread::spawn(move || {
                 for _ in 0..n_iters {
-                    let h = reg.register(TestCounter::new(0));
+                    let h = reg.register(test_eventfd(0));
                     let h2 = reg.dup(h).unwrap();
                     let _arc = reg.resolve(h, SubsystemTag::Eventfd).unwrap();
                     reg.release(h2).unwrap();
