@@ -247,6 +247,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::ExternalFd(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::Signalfd(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
         })?
@@ -271,6 +272,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::ExternalFd(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::BrokerPipe(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::BrokerSocketPair(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::BrokerTcpConn(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::BrokerPty(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::Signalfd(_) => None,  // non-FS descriptor has no filesystem path,
             })
@@ -931,6 +933,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::ExternalFd(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::BrokerPipe(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::BrokerSocketPair(_) => None, // CoW fast path only supports FS static backing
+                crate::RawFdRef::BrokerTcpConn(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::BrokerPty(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::Signalfd(_) => None, // CoW fast path only supports FS static backing,
             })

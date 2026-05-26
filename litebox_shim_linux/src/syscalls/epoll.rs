@@ -60,6 +60,7 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
     BrokerPipe(Arc<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
     BrokerPty(Arc<TypedFd<super::broker_pty::BrokerPtySubsystem>>),
     BrokerSocketPair(Arc<TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>),
+    BrokerTcpConn(Arc<TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>>),
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
@@ -88,6 +89,9 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             crate::RawFdRef::BrokerSocketPair(fd) => {
                 Ok(EpollDescriptor::BrokerSocketPair(Arc::clone(fd)))
             }
+            crate::RawFdRef::BrokerTcpConn(fd) => {
+                Ok(EpollDescriptor::BrokerTcpConn(Arc::clone(fd)))
+            }
             crate::RawFdRef::BrokerPty(fd) => Ok(EpollDescriptor::BrokerPty(Arc::clone(fd))),
             crate::RawFdRef::Signalfd(fd) => Ok(EpollDescriptor::Signalfd(Arc::clone(fd))),
         })?
@@ -106,6 +110,7 @@ enum DescriptorRef<FS: ShimFS> {
     BrokerPipe(Weak<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
     BrokerPty(Weak<TypedFd<super::broker_pty::BrokerPtySubsystem>>),
     BrokerSocketPair(Weak<TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>),
+    BrokerTcpConn(Weak<TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>>),
 }
 
 impl<FS: ShimFS> DescriptorRef<FS> {
@@ -122,6 +127,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             EpollDescriptor::BrokerPipe(bp) => Self::BrokerPipe(Arc::downgrade(bp)),
             EpollDescriptor::BrokerPty(pty) => Self::BrokerPty(Arc::downgrade(pty)),
             EpollDescriptor::BrokerSocketPair(sp) => Self::BrokerSocketPair(Arc::downgrade(sp)),
+            EpollDescriptor::BrokerTcpConn(tcp) => Self::BrokerTcpConn(Arc::downgrade(tcp)),
         }
     }
 
@@ -140,6 +146,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerSocketPair(sp) => {
                 sp.upgrade().map(EpollDescriptor::BrokerSocketPair)
             }
+            DescriptorRef::BrokerTcpConn(tcp) => tcp.upgrade().map(EpollDescriptor::BrokerTcpConn),
         }
     }
 
@@ -156,6 +163,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerPipe(_) => "BrokerPipe",
             DescriptorRef::BrokerPty(_) => "BrokerPty",
             DescriptorRef::BrokerSocketPair(_) => "BrokerSocketPair",
+            DescriptorRef::BrokerTcpConn(_) => "BrokerTcpConn",
         }
     }
 }
@@ -233,6 +241,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
+            EpollDescriptor::BrokerTcpConn(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
         }
     }
 
@@ -258,6 +270,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             EpollDescriptor::BrokerPipe(_) => false,
             EpollDescriptor::BrokerPty(_) => false,
             EpollDescriptor::BrokerSocketPair(_) => false,
+            EpollDescriptor::BrokerTcpConn(_) => false,
             _ => false,
         }
     }
@@ -784,6 +797,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                 EpollDescriptor::BrokerPipe(_) => "BrokerPipe",
                 EpollDescriptor::BrokerPty(_) => "BrokerPty",
                 EpollDescriptor::BrokerSocketPair(_) => "BrokerSocketPair",
+                EpollDescriptor::BrokerTcpConn(_) => "BrokerTcpConn",
             };
             let msg = alloc::format!(
                 "[epoll-diag] ADD fd={fd} type={fd_type} mask={mask:?} events={events:?} host_poll={is_host_poll} ready={}\n",
@@ -875,6 +889,7 @@ impl EpollEntryKey {
             EpollDescriptor::BrokerPipe(bp) => bp.object_id(),
             EpollDescriptor::BrokerPty(pty) => pty.object_id(),
             EpollDescriptor::BrokerSocketPair(sp) => sp.object_id(),
+            EpollDescriptor::BrokerTcpConn(tcp) => tcp.object_id(),
         };
         Self(fd, object_id)
     }

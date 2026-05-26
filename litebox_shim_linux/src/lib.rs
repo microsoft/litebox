@@ -2608,6 +2608,10 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
+            return Ok(f(RawFdRef::BrokerTcpConn(&fd)));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
             return Ok(f(RawFdRef::BrokerPty(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -2634,6 +2638,7 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     ExternalFd(&'a Arc<TypedFd<syscalls::external_fd::ExternalFdSubsystem>>),
     BrokerPipe(&'a Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>),
     BrokerSocketPair(&'a Arc<TypedFd<syscalls::broker_socketpair::BrokerSocketPairSubsystem>>),
+    BrokerTcpConn(&'a Arc<TypedFd<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>>),
     BrokerPty(&'a Arc<TypedFd<syscalls::broker_pty::BrokerPtySubsystem>>),
     Signalfd(&'a Arc<TypedFd<syscalls::signalfd::SignalfdSubsystem>>),
 }
@@ -2718,6 +2723,9 @@ impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
             }
             RawFdRef::BrokerSocketPair(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::BrokerTcpConn(_fd) => {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
             }
             RawFdRef::BrokerPty(_fd) => {
@@ -2968,9 +2976,12 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::ExternalFd(_fd) => alloc::format!("raw={raw_fd} external_fd"),
                 crate::RawFdRef::BrokerPipe(_fd) => alloc::format!("raw={raw_fd} broker_pipe"),
                 crate::RawFdRef::BrokerSocketPair(_fd) => {
-                    alloc::format!("raw={raw_fd} broker_pipe")
+                    alloc::format!("raw={raw_fd} broker_socketpair")
                 }
-                crate::RawFdRef::BrokerPty(_fd) => alloc::format!("raw={raw_fd} broker_pipe"),
+                crate::RawFdRef::BrokerTcpConn(_fd) => {
+                    alloc::format!("raw={raw_fd} broker_tcp_conn")
+                }
+                crate::RawFdRef::BrokerPty(_fd) => alloc::format!("raw={raw_fd} broker_pty"),
                 crate::RawFdRef::Signalfd(_fd) => alloc::format!("raw={raw_fd} signalfd"),
             })
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))
