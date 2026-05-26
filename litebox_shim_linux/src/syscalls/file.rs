@@ -2530,6 +2530,63 @@ impl<FS: ShimFS> Task<FS> {
             .flatten()
     }
 
+    pub(crate) fn install_brokerfile_bridge_fd(
+        &self,
+        guest_fd: usize,
+        path: &str,
+        position: usize,
+        status_flags_bits: u32,
+    ) -> Result<(), Errno> {
+        let status_flags = OFlags::from_bits_retain(status_flags_bits) & OFlags::STATUS_FLAGS_MASK;
+        let file = self
+            .files
+            .borrow()
+            .fs
+            .open(path, status_flags, Mode::empty())
+            .map_err(Errno::from)?;
+
+        {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status_flags)) else {
+                unreachable!()
+            };
+        }
+        self.files
+            .borrow()
+            .fs
+            .set_open_status_flags(&file, status_flags)
+            .map_err(|_| Errno::EBADF)?;
+        if position != 0 {
+            self.files
+                .borrow()
+                .fs
+                .seek(
+                    &file,
+                    isize::try_from(position).map_err(|_| Errno::EINVAL)?,
+                    SeekWhence::RelativeToBeginning,
+                )
+                .map_err(Errno::from)?;
+        }
+
+        if self
+            .files
+            .borrow()
+            .raw_descriptor_store
+            .read()
+            .is_alive(guest_fd)
+        {
+            self.do_close(guest_fd)?;
+        }
+
+        let files = self.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+        if rds.fd_into_specific_raw_integer(file, guest_fd) {
+            Ok(())
+        } else {
+            Err(Errno::EBADF)
+        }
+    }
+
     /// Handle syscall `mkdir`
     pub fn sys_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
         let pathname = self.resolve_path(pathname)?;

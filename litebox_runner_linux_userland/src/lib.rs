@@ -226,7 +226,8 @@ pub struct CliArgs {
     /// `kind` (eventfd | pidfd | signalfd | pty | pipe). The optional
     /// `direction` ('r' or 'w') is required for `kind=pipe` and identifies
     /// which end of the broker `PipeState` this fd represents. Signalfd uses
-    /// `fd:signalfd:handle_id:mask_bits:nonblock`.
+    /// `fd:signalfd:handle_id:mask_bits:nonblock`; brokerfile uses
+    /// `fd:brokerfile:status_flags:position:path_hex`.
     ///
     /// Used by the runner during worker-exec startup to seed broker-backed
     /// shim fd entries at the right fd slots before the worker binary
@@ -384,6 +385,22 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     ))
 }
 
+fn decode_brokerfile_bridge_path(encoded: &str) -> Result<String> {
+    if encoded.len() % 2 != 0 {
+        anyhow::bail!("broker-fd-bridge: odd-length brokerfile path");
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for chunk in encoded.as_bytes().chunks_exact(2) {
+        let hex = std::str::from_utf8(chunk)
+            .map_err(|e| anyhow!("broker-fd-bridge: bad brokerfile path hex: {e}"))?;
+        bytes.push(
+            u8::from_str_radix(hex, 16)
+                .map_err(|e| anyhow!("broker-fd-bridge: bad brokerfile path hex {hex:?}: {e}"))?,
+        );
+    }
+    String::from_utf8(bytes).map_err(|e| anyhow!("broker-fd-bridge: bad brokerfile path utf8: {e}"))
+}
+
 fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
     entrypoints: &litebox_shim_linux::LinuxShimEntrypoints<FS>,
     spec: &str,
@@ -427,6 +444,28 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
         return entrypoints
             .install_signalfd_bridge_fd(guest_fd, handle_id, mask_bits, nonblock)
             .map_err(|err| anyhow!("broker-fd-bridge: signalfd {spec:?}: {err:?}"));
+    }
+
+    if parts.get(1) == Some(&"brokerfile") && parts.len() == 5 {
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let status_flags_bits: u32 = parts[2].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad brokerfile status flags {:?}: {e}",
+                parts[2]
+            )
+        })?;
+        let position: usize = parts[3].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad brokerfile position {:?}: {e}",
+                parts[3]
+            )
+        })?;
+        let path = decode_brokerfile_bridge_path(parts[4])?;
+        return entrypoints
+            .install_brokerfile_bridge_fd(guest_fd, &path, position, status_flags_bits)
+            .map_err(|err| anyhow!("broker-fd-bridge: brokerfile {spec:?}: {err:?}"));
     }
 
     let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
