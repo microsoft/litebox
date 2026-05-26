@@ -759,6 +759,8 @@ impl<
         + crate::platform::TimeProvider,
 > crate::fd::FdEnabledSubsystem for FileSystem<Platform>
 {
+    const KIND: crate::fd::SubsystemKind = crate::fd::SubsystemKind::Fs;
+
     type Entry = DescriptorEntry<Platform>;
 }
 impl<

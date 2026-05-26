@@ -69,6 +69,8 @@ pub fn broker_socketpair_provider() -> Option<Arc<dyn BrokerSocketPairProvider>>
 
 pub(crate) struct BrokerSocketPairSubsystem;
 impl FdEnabledSubsystem for BrokerSocketPairSubsystem {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::BrokerSocketPair;
+
     type Entry = BrokerSocketPairFd<Platform>;
 }
 

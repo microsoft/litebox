@@ -22,6 +22,8 @@ use litebox_platform_multiplex::Platform;
 pub(crate) struct ExternalFdSubsystem;
 
 impl FdEnabledSubsystem for ExternalFdSubsystem {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::ExternalFd;
+
     type Entry = ExternalFd;
 }
 

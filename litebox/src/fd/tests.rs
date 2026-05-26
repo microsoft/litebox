@@ -13,6 +13,8 @@ use crate::platform::mock::MockPlatform;
 
 struct MockSubsystem;
 impl FdEnabledSubsystem for MockSubsystem {
+    const KIND: crate::fd::SubsystemKind = crate::fd::SubsystemKind::Fs;
+
     type Entry = MockEntry;
 }
 struct MockEntry {
@@ -22,6 +24,8 @@ impl FdEnabledSubsystemEntry for MockEntry {}
 
 struct MockSubsystem2;
 impl FdEnabledSubsystem for MockSubsystem2 {
+    const KIND: crate::fd::SubsystemKind = crate::fd::SubsystemKind::Net;
+
     type Entry = MockEntry2;
 }
 struct MockEntry2 {

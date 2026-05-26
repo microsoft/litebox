@@ -1492,5 +1492,6 @@ crate::fd::enable_fds_for_subsystem! {
     FileSystem<Platform>;
     @ Platform: { sync::RawSyncPrimitivesProvider };
     Descriptor<Platform>;
+    crate::fd::SubsystemKind::Fs;
     -> FileFd<Platform>;
 }

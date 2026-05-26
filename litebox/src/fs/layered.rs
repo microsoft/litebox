@@ -2701,5 +2701,6 @@ crate::fd::enable_fds_for_subsystem! {
     FileSystem<Platform, Upper, Lower>;
     @Upper: { super::FileSystem + 'static }, Lower: { super::FileSystem + 'static };
     Descriptor<Upper, Lower>;
+    crate::fd::SubsystemKind::Fs;
     -> FileFd<Platform, Upper, Lower>;
 }

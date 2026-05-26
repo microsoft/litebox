@@ -42,6 +42,8 @@ use crate::{
 
 pub(crate) struct UnixSocketSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
 impl<FS: ShimFS> FdEnabledSubsystem for UnixSocketSubsystem<FS> {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::Unix;
+
     type Entry = UnixSocket<FS>;
 }
 impl<FS: ShimFS> FdEnabledSubsystemEntry for UnixSocket<FS> {}
