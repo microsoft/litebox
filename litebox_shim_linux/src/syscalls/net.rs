@@ -10,7 +10,7 @@ use core::{
 };
 
 use alloc::sync::Arc;
-use alloc::{string::ToString, vec::Vec};
+use alloc::{string::String, string::ToString, vec::Vec};
 use litebox::{
     event::{
         Events, IOPollable,
@@ -1935,6 +1935,95 @@ impl<FS: ShimFS> Task<FS> {
             |fd| self.global.listen(fd, backlog),
             |file| file.listen(self, backlog, &self.global),
         )
+    }
+
+    pub(crate) fn tcp_listen_worker_exec_bridge_spec(&self, raw_fd: usize) -> Option<String> {
+        let fd = {
+            let files = self.files.borrow();
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
+                .ok()?
+        };
+        let dt = self.global.litebox.descriptor_table();
+        let sock_type = dt.with_metadata(&fd, |ty: &SockType| *ty).ok()?;
+        if sock_type != SockType::Stream {
+            return None;
+        }
+        let reuse_port = self
+            .global
+            .with_socket_options(&fd, |options| options.reuse_port);
+        if !reuse_port {
+            return None;
+        }
+        let port = self.global.net.lock().get_local_addr(&fd).ok()?.port();
+        if port == 0 {
+            return None;
+        }
+        Some(alloc::format!("{raw_fd}:tcp_listen:{port}:1"))
+    }
+
+    pub(crate) fn install_tcp_listen_bridge_fd(
+        &self,
+        guest_fd: usize,
+        port: u16,
+        reuse_port: bool,
+    ) -> Result<(), Errno> {
+        let created_fd = self.do_socket(
+            AddressFamily::INET,
+            SockType::Stream,
+            SockFlags::empty(),
+            IPProtocol::TCP as u8,
+        )? as usize;
+        if created_fd != guest_fd {
+            let typed = {
+                let files = self.files.borrow();
+                files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(created_fd)
+                    .map_err(|_| Errno::EBADF)?
+            };
+            let dup = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(&typed)
+                .ok_or(Errno::EBADF)?;
+            if self
+                .files
+                .borrow()
+                .raw_descriptor_store
+                .read()
+                .is_alive(guest_fd)
+            {
+                self.do_close(guest_fd)?;
+            }
+            {
+                let files = self.files.borrow();
+                let mut rds = files.raw_descriptor_store.write();
+                if !rds.fd_into_specific_raw_integer(dup, guest_fd) {
+                    return Err(Errno::EBADF);
+                }
+            }
+            self.do_close(created_fd)?;
+        }
+        let fd = {
+            let files = self.files.borrow();
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(guest_fd)
+                .map_err(|_| Errno::EBADF)?
+        };
+        self.global
+            .with_socket_options_mut(&fd, |options| options.reuse_port = reuse_port);
+        self.global.bind(
+            &fd,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+        )?;
+        self.global.listen(&fd, 16)
     }
 
     /// Get the local port for an INET socket. Returns None if not bound.

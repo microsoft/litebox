@@ -132,6 +132,16 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         *self.task.process_state.borrow().controlling_pty.lock() = Some(pty_id);
     }
 
+    pub fn install_tcp_listen_bridge_fd(
+        &self,
+        guest_fd: usize,
+        port: u16,
+        reuse_port: bool,
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
+        self.task
+            .install_tcp_listen_bridge_fd(guest_fd, port, reuse_port)
+    }
+
     /// Install a external fd FD into the restored child's descriptor table.
     ///
     /// Called by the runner after `restore_process` to replace virtual pipe
