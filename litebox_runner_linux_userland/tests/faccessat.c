@@ -1,44 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#define _GNU_SOURCE
-#include <errno.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-
-#define FAIL(msg)                                                              \
-    do {                                                                       \
-        fprintf(stderr, "FAIL: %s (line %d): %s (errno=%d: %s)\n", __func__,   \
-                __LINE__, (msg), errno, strerror(errno));                      \
-        exit(1);                                                               \
-    } while (0)
-
-#define EXPECT(cond, msg)                                                      \
-    do {                                                                       \
-        if (!(cond)) {                                                         \
-            FAIL(msg);                                                         \
-        }                                                                      \
-    } while (0)
+#include "helpers.h"
 
 static long raw_faccessat(int dirfd, const char *pathname, int mode) {
     return syscall(SYS_faccessat, dirfd, pathname, mode);
 }
 
-static void create_file(const char *path, mode_t mode) {
-    int fd = open(path, O_RDONLY | O_CREAT, mode);
-    EXPECT(fd >= 0, "create test file failed");
-    EXPECT(close(fd) == 0, "close test file failed");
-}
-
 static void test_at_fdcwd_success(void) {
     const char *path = "/tmp/lb_faccessat_success";
     unlink(path);
-    create_file(path, 0600);
+    create_test_file(path, 0600);
 
     errno = 0;
     long ret = raw_faccessat(AT_FDCWD, path, F_OK);
@@ -67,7 +39,7 @@ static void test_missing_path_enoent(void) {
 static void test_mode_permission_denied(void) {
     const char *path = "/tmp/lb_faccessat_readonly";
     unlink(path);
-    create_file(path, 0400);
+    create_test_file(path, 0400);
 
     errno = 0;
     long ret = raw_faccessat(AT_FDCWD, path, W_OK);
@@ -85,7 +57,7 @@ static void test_mode_permission_denied(void) {
 static void test_invalid_mode_einval(void) {
     const char *path = "/tmp/lb_faccessat_invalid_mode";
     unlink(path);
-    create_file(path, 0600);
+    create_test_file(path, 0600);
 
     errno = 0;
     long ret = raw_faccessat(AT_FDCWD, path, R_OK | 8);

@@ -18,8 +18,8 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, InodeType,
-    IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno, signal::Signal,
+    AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
+    InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno, signal::Signal,
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
@@ -1057,10 +1057,8 @@ impl<FS: ShimFS> Task<FS> {
         write_to_iovec(iovs, |buf, _total| self.sys_write(fd, buf, None))
     }
 
-    fn validate_access_mode(mode: &litebox_common_linux::AccessFlags) -> Result<(), Errno> {
-        let valid_mode = litebox_common_linux::AccessFlags::R_OK
-            | litebox_common_linux::AccessFlags::W_OK
-            | litebox_common_linux::AccessFlags::X_OK;
+    fn validate_access_mode(mode: &AccessFlags) -> Result<(), Errno> {
+        let valid_mode = AccessFlags::R_OK | AccessFlags::W_OK | AccessFlags::X_OK;
         if mode.intersects(valid_mode.complement()) {
             return Err(Errno::EINVAL);
         }
@@ -1068,10 +1066,10 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn do_access_mode(
-        mode: litebox::fs::Mode,
+        mode: Mode,
         owner: AccessUserInfo,
         caller: AccessUserInfo,
-        access_mode: &litebox_common_linux::AccessFlags,
+        access_mode: &AccessFlags,
     ) -> Result<(), Errno> {
         if access_mode.is_empty() {
             return Ok(());
@@ -1083,14 +1081,13 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             (Mode::ROTH, Mode::WOTH, Mode::XOTH)
         };
-        if access_mode.contains(litebox_common_linux::AccessFlags::R_OK) && !mode.contains(read) {
+        if access_mode.contains(AccessFlags::R_OK) && !mode.contains(read) {
             return Err(Errno::EACCES);
         }
-        if access_mode.contains(litebox_common_linux::AccessFlags::W_OK) && !mode.contains(write) {
+        if access_mode.contains(AccessFlags::W_OK) && !mode.contains(write) {
             return Err(Errno::EACCES);
         }
-        if access_mode.contains(litebox_common_linux::AccessFlags::X_OK) && !mode.contains(execute)
-        {
+        if access_mode.contains(AccessFlags::X_OK) && !mode.contains(execute) {
             return Err(Errno::EACCES);
         }
         Ok(())
@@ -1113,10 +1110,9 @@ impl<FS: ShimFS> Task<FS> {
     fn do_access(
         &self,
         pathname: impl path::Arg,
-        mode: litebox_common_linux::AccessFlags,
+        mode: AccessFlags,
         caller: AccessUserInfo,
     ) -> Result<(), Errno> {
-        Self::validate_access_mode(&mode)?;
         let status = self.files.borrow().fs.file_status(pathname)?;
         Self::do_access_mode(status.mode, status.owner.into(), caller, &mode)
     }
@@ -1126,7 +1122,7 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         dirfd: i32,
         pathname: impl path::Arg,
-        mode: litebox_common_linux::AccessFlags,
+        mode: AccessFlags,
         flags: AtFlags,
     ) -> Result<(), Errno> {
         let supported_flags =
