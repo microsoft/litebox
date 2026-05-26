@@ -67,6 +67,37 @@ impl TestOutcome {
     }
 }
 
+/// Registry annotation for a known litebox-only failure.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpectedFailure {
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutcomeKind {
+    Pass,
+    Fail,
+    Xfail,
+    Xpass,
+}
+
+impl OutcomeKind {
+    #[must_use]
+    pub const fn is_effective_pass(self) -> bool {
+        matches!(self, Self::Pass | Self::Xfail)
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "FAIL",
+            Self::Xfail => "XFAIL",
+            Self::Xpass => "XPASS",
+        }
+    }
+}
+
 pub(crate) fn expect_listening_port(resp: &Response, requested_port: u16) -> Result<u16, String> {
     match resp {
         Response::Listening { port } if requested_port == 0 && *port != 0 => Ok(*port),
@@ -124,6 +155,7 @@ pub struct Test {
     /// up the non-PIE infrastructure even if no static `NP`/`NPC`/
     /// `D{3..5}` handle was required.
     pub(crate) needs_nonpie_for_ephemerals: bool,
+    pub(crate) expected_fail_on_litebox: Option<ExpectedFailure>,
     pub(crate) run: TestRunFn,
 }
 
@@ -165,6 +197,10 @@ fn teardown_tree_timeout() -> Duration {
         return Duration::from_millis(ms);
     }
     Duration::from_millis(5_000)
+}
+
+fn is_litebox_runtime(runtime_env: &str) -> bool {
+    runtime_env.starts_with("litebox sandbox")
 }
 
 /// Detect whether we're running inside litebox or on native Linux.
@@ -234,22 +270,31 @@ pub(crate) struct Child {
     pub(crate) process: tokio::process::Child,
 }
 
-/// Result of a single test. Outcomes are strictly `pass` or `FAIL` —
-/// there is no expected-failure mechanism: a litebox test that does
-/// not work fails for real, and a native baseline test must pass.
+/// Result of a single test.
 #[derive(Debug, Clone)]
 pub struct TestResult {
     pub id: String,
     pub agent: String,
     pub actual_pass: bool,
+    kind: OutcomeKind,
     pub detail: String,
 }
 
 impl TestResult {
-    /// Effective outcome: `"pass"` or `"FAIL"`.
+    /// Effective outcome for summary/exit-code purposes: `"pass"` or `"FAIL"`.
     #[must_use]
     pub fn outcome(&self) -> &'static str {
-        if self.actual_pass { "pass" } else { "FAIL" }
+        if self.kind.is_effective_pass() {
+            "pass"
+        } else {
+            "FAIL"
+        }
+    }
+
+    /// Human-facing outcome label printed beside the test line.
+    #[must_use]
+    pub fn display_outcome(&self) -> &'static str {
+        self.kind.label()
     }
 }
 
@@ -279,10 +324,65 @@ pub struct TestRunner {
     declared_union: std::collections::HashSet<String>,
 }
 
+struct InterpretedOutcome {
+    kind: OutcomeKind,
+    detail: String,
+}
+
+fn interpret_outcome(
+    actual_pass: bool,
+    expected_fail_on_litebox: Option<ExpectedFailure>,
+    is_litebox: bool,
+    detail: &str,
+) -> InterpretedOutcome {
+    let Some(expected_failure) = expected_fail_on_litebox.filter(|_| is_litebox) else {
+        return InterpretedOutcome {
+            kind: if actual_pass {
+                OutcomeKind::Pass
+            } else {
+                OutcomeKind::Fail
+            },
+            detail: detail.to_string(),
+        };
+    };
+
+    if actual_pass {
+        InterpretedOutcome {
+            kind: OutcomeKind::Xpass,
+            detail: format!(
+                "XPASS: annotation is stale, remove; reason: {}; actual pass: {detail}",
+                expected_failure.reason
+            ),
+        }
+    } else {
+        InterpretedOutcome {
+            kind: OutcomeKind::Xfail,
+            detail: format!(
+                "XFAIL: {}; actual failure: {detail}",
+                expected_failure.reason
+            ),
+        }
+    }
+}
+
 impl TestRunner {
-    /// Record a test result. The only outcomes are `pass` and `FAIL`;
-    /// there is no expected-failure path.
     fn record(&mut self, test: &str, agent: &str, pass: bool, detail: &str) {
+        let kind = if pass {
+            OutcomeKind::Pass
+        } else {
+            OutcomeKind::Fail
+        };
+        self.record_with_kind(test, agent, pass, kind, detail);
+    }
+
+    fn record_with_kind(
+        &mut self,
+        test: &str,
+        agent: &str,
+        actual_pass: bool,
+        kind: OutcomeKind,
+        detail: &str,
+    ) {
         use std::io::Write as _;
         let key = format!("{test} {agent}");
         if !self.recorded_ids.insert(key) {
@@ -292,11 +392,13 @@ impl TestRunner {
         let result = TestResult {
             id: test.to_string(),
             agent: agent.to_string(),
-            actual_pass: pass,
+            actual_pass,
+            kind,
             detail: detail.to_string(),
         };
+        let display_outcome = result.display_outcome();
         let outcome = result.outcome();
-        eprintln!("  {outcome}: {test} [{agent}] {detail}");
+        eprintln!("  {display_outcome}: {test} [{agent}] {detail}");
         // Emit the JSON record incrementally on stdout, flushed immediately,
         // so partial runs survive the integration-test pipeline even if the
         // coordinator process is killed before reaching end-of-main. Native
@@ -307,6 +409,7 @@ impl TestRunner {
                 "test": test,
                 "agent": agent,
                 "result": outcome,
+                "display_result": display_outcome,
                 "detail": detail,
             })
         );
@@ -997,6 +1100,7 @@ pub fn collect_all_tests() -> Vec<Test> {
 #[allow(clippy::too_many_lines)] // top-level dispatch + setup; refactoring out is invasive.
 async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     let runtime_env = detect_runtime_environment();
+    let is_litebox = is_litebox_runtime(&runtime_env);
     eprintln!("[coord] runtime: {runtime_env}");
 
     let mut runner = TestRunner {
@@ -1085,22 +1189,46 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         runner.spawn_tree(&declared_union).await;
         for test in new_filtered {
             crate::pause_points::pause_if_match("harness:test-start", &test.id);
-            let timeout_dur = Duration::from_secs(test.timeout_secs);
+            let test_id = test.id.clone();
+            let timeout_secs = test.timeout_secs;
+            let expected_fail_on_litebox = test.expected_fail_on_litebox;
+            let timeout_dur = Duration::from_secs(timeout_secs);
             if let Ok(outcome) = tokio::time::timeout(timeout_dur, (test.run)(&mut runner)).await {
-                let tag = if outcome.pass {
+                let interpreted = interpret_outcome(
+                    outcome.pass,
+                    expected_fail_on_litebox,
+                    is_litebox,
+                    &outcome.detail,
+                );
+                let tag = if interpreted.kind.is_effective_pass() {
                     "harness:test-end-pass"
                 } else {
                     "harness:test-end-fail"
                 };
-                crate::pause_points::pause_if_match(tag, &test.id);
-                runner.record(&test.id, &outcome.agent, outcome.pass, &outcome.detail);
+                crate::pause_points::pause_if_match(tag, &test_id);
+                runner.record_with_kind(
+                    &test_id,
+                    &outcome.agent,
+                    outcome.pass,
+                    interpreted.kind,
+                    &interpreted.detail,
+                );
             } else {
-                crate::pause_points::pause_if_match("harness:test-end-fail", &test.id);
-                runner.record(
-                    &test.id,
+                let detail = format!("test timeout ({timeout_secs}s)");
+                let interpreted =
+                    interpret_outcome(false, expected_fail_on_litebox, is_litebox, &detail);
+                let tag = if interpreted.kind.is_effective_pass() {
+                    "harness:test-end-pass"
+                } else {
+                    "harness:test-end-fail"
+                };
+                crate::pause_points::pause_if_match(tag, &test_id);
+                runner.record_with_kind(
+                    &test_id,
                     "?",
                     false,
-                    &format!("test timeout ({}s)", test.timeout_secs),
+                    interpreted.kind,
+                    &interpreted.detail,
                 );
                 // Agent stream is desynchronized — poison all agents
                 // so subsequent tests fail fast.
@@ -1315,6 +1443,35 @@ mod tests {
             spawned_agents: std::collections::HashSet::new(),
             declared_union: std::collections::HashSet::new(),
         }
+    }
+
+    #[test]
+    fn expected_fail_interpretation_matches_litebox_semantics() {
+        let expected = Some(ExpectedFailure {
+            reason: "known litebox gap",
+        });
+
+        let plain_fail = interpret_outcome(false, None, true, "boom");
+        assert_eq!(plain_fail.kind, OutcomeKind::Fail);
+        assert_eq!(plain_fail.detail, "boom");
+
+        let xfail = interpret_outcome(false, expected, true, "boom");
+        assert_eq!(xfail.kind, OutcomeKind::Xfail);
+        assert!(xfail.kind.is_effective_pass());
+        assert!(xfail.detail.contains("XFAIL: known litebox gap"));
+
+        let xpass = interpret_outcome(true, expected, true, "ok");
+        assert_eq!(xpass.kind, OutcomeKind::Xpass);
+        assert!(!xpass.kind.is_effective_pass());
+        assert!(xpass.detail.contains("XPASS: annotation is stale"));
+
+        let native_fail = interpret_outcome(false, expected, false, "native boom");
+        assert_eq!(native_fail.kind, OutcomeKind::Fail);
+        assert_eq!(native_fail.detail, "native boom");
+
+        let native_pass = interpret_outcome(true, expected, false, "native ok");
+        assert_eq!(native_pass.kind, OutcomeKind::Pass);
+        assert_eq!(native_pass.detail, "native ok");
     }
 
     #[tokio::test]

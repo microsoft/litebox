@@ -11,7 +11,7 @@
 //! cannot mention an agent it didn't declare.
 
 use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
-use super::{Test, TestOutcome, TestRunFn};
+use super::{ExpectedFailure, Test, TestOutcome, TestRunFn};
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -88,12 +88,20 @@ pub struct TestBuilder<'b, 'a: 'b> {
     group: &'static str,
     id: String,
     timeout_secs: u64,
+    expected_fail_on_litebox: Option<ExpectedFailure>,
 }
 
 impl<'b, 'a: 'b> TestBuilder<'b, 'a> {
     /// Override the per-test timeout (default: 60 seconds).
     pub fn timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
+        self
+    }
+
+    /// Mark this test as a known litebox-only failure.
+    #[allow(dead_code)]
+    pub fn expected_fail_on_litebox(mut self, reason: &'static str) -> Self {
+        self.expected_fail_on_litebox = Some(ExpectedFailure { reason });
         self
     }
 
@@ -132,6 +140,7 @@ impl<'b, 'a: 'b> TestBuilder<'b, 'a> {
             timeout_secs: self.timeout_secs,
             declared_agents: declared,
             needs_nonpie_for_ephemerals,
+            expected_fail_on_litebox: self.expected_fail_on_litebox,
             run: bridged,
         });
     }
@@ -166,6 +175,7 @@ impl<'a> Registry<'a> {
             group,
             id: id.into(),
             timeout_secs: 60,
+            expected_fail_on_litebox: None,
         }
     }
 
