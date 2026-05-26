@@ -2260,30 +2260,121 @@ fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: Duration,
 ) -> Result<std::process::Output, HandlerError> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    if let Some(stdout) = stdout.as_ref() {
+        set_nonblock(stdout.as_raw_fd(), "child stdout")?;
+    }
+    if let Some(stderr) = stderr.as_ref() {
+        set_nonblock(stderr.as_raw_fd(), "child stderr")?;
+    }
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        match child
+        let _ = drain_available(&mut stdout, &mut stdout_buf, "child stdout")?;
+        let _ = drain_available(&mut stderr, &mut stderr_buf, "child stderr")?;
+        if let Some(status) = child
             .try_wait()
             .map_err(|e| HandlerError(format!("try_wait: {e}")))?
         {
-            Some(_) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|e| HandlerError(format!("wait_with_output: {e}")))?;
-                return Ok(output);
+            drain_after_exit(&mut stdout, &mut stdout_buf, &mut stderr, &mut stderr_buf)?;
+            return Ok(std::process::Output {
+                status,
+                stdout: stdout_buf,
+                stderr: stderr_buf,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let _ = child.kill();
+    drop(stdout);
+    drop(stderr);
+    if !stderr_buf.is_empty() {
+        stderr_buf.push(b'\n');
+    }
+    stderr_buf.extend_from_slice(b"timeout waiting for child");
+    let kill_deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| HandlerError(format!("try_wait after timeout: {e}")))?
+        {
+            break status;
+        }
+        if Instant::now() >= kill_deadline {
+            stderr_buf.extend_from_slice(b"; child did not exit after kill");
+            break std::os::unix::process::ExitStatusExt::from_raw(137 << 8);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+    })
+}
+
+fn drain_after_exit(
+    stdout: &mut Option<std::process::ChildStdout>,
+    stdout_buf: &mut Vec<u8>,
+    stderr: &mut Option<std::process::ChildStderr>,
+    stderr_buf: &mut Vec<u8>,
+) -> Result<(), HandlerError> {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        let stdout_open = drain_available(stdout, stdout_buf, "child stdout")?;
+        let stderr_open = drain_available(stderr, stderr_buf, "child stderr")?;
+        if !stdout_open && !stderr_open {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+fn drain_available<R: Read>(
+    reader: &mut Option<R>,
+    buf: &mut Vec<u8>,
+    context: &str,
+) -> Result<bool, HandlerError> {
+    let Some(stream) = reader.as_mut() else {
+        return Ok(false);
+    };
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                *reader = None;
+                return Ok(false);
             }
-            None => std::thread::sleep(Duration::from_millis(25)),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
+            Err(e) => return Err(HandlerError(format!("read {context}: {e}"))),
         }
     }
-    let _ = child.kill();
-    let output = child
-        .wait_with_output()
-        .map_err(|e| HandlerError(format!("wait after timeout: {e}")))?;
-    Ok(std::process::Output {
-        status: output.status,
-        stdout: output.stdout,
-        stderr: [output.stderr, b"timeout waiting for child".to_vec()].concat(),
-    })
+}
+
+fn set_nonblock(fd: RawFd, context: &str) -> Result<(), HandlerError> {
+    // SAFETY: fcntl(F_GETFL) only reads descriptor flags for this live child pipe fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(HandlerError(format!(
+            "fcntl(F_GETFL) {context}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: fcntl(F_SETFL) updates descriptor flags for this live child pipe fd.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(HandlerError(format!(
+            "fcntl(F_SETFL O_NONBLOCK) {context}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 mod leaf_subcmd {
