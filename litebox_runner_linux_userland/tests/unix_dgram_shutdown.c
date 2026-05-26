@@ -3,9 +3,28 @@
 
 #include "helpers.h"
 #include <fcntl.h>
+#include <sys/un.h>
 
 static void make_dgram_pair(int sv[2]) {
     make_socket_pair(SOCK_DGRAM, sv);
+}
+
+static void make_addr(struct sockaddr_un *addr, const char *name) {
+    memset(addr, 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    snprintf(addr->sun_path, sizeof(addr->sun_path), "/tmp/lb_dgram_%s_%d", name, getpid());
+    unlink(addr->sun_path);
+}
+
+static int bind_dgram_addr(const struct sockaddr_un *addr, const char *op) {
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        die("socket(AF_UNIX, SOCK_DGRAM)");
+    }
+    if (bind(fd, (const struct sockaddr *)addr, sizeof(*addr)) != 0) {
+        die(op);
+    }
+    return fd;
 }
 
 // SHUT_RD on a connected datagram socket: queued datagrams remain readable; once the queue
@@ -108,7 +127,7 @@ static void test_shutdown_both_combines_read_and_write_rules(void) {
     close_pair(sv);
 }
 
-// When the peer calls shutdown(SHUT_WR), Linux does NOT synthesize EOF on the local recv —
+// When the peer calls shutdown(SHUT_WR), Linux does NOT synthesize EOF on the local recv;
 // unlike a local SHUT_RD, the socket is still connected and could in principle receive
 // from another sender, so a blocking recv keeps blocking (we observe EAGAIN via RCVTIMEO).
 // Queued datagrams must still drain first.
@@ -128,6 +147,59 @@ static void test_peer_shutdown_write_drains_then_blocks(void) {
     expect_blocking_recv_eagain(sv[0], "blocking recv after peer SHUT_WR with empty queue");
 
     close_pair(sv);
+}
+
+static void test_pre_connect_shutdown_write_blocks_future_sends(void) {
+    struct sockaddr_un server_addr;
+    make_addr(&server_addr, "pre_wr_server");
+    int server = bind_dgram_addr(&server_addr, "bind(server)");
+
+    int sender = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (sender < 0) {
+        die("socket(sender)");
+    }
+    expect_sys_shutdown(sender, SHUT_WR, "pre-sendto shutdown(SHUT_WR)");
+
+    errno = 0;
+    ssize_t n = sendto(sender, "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL,
+                       (struct sockaddr *)&server_addr, sizeof(server_addr));
+    if (n != -1) {
+        fprintf(stderr, "FAIL: sendto after pre-connect SHUT_WR expected failure, got %zd\n", n);
+        exit(1);
+    }
+    if (errno != EPIPE) {
+        fail_errno("sendto after pre-connect SHUT_WR", EPIPE);
+    }
+
+    if (connect(sender, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
+        die("connect after pre-connect SHUT_WR");
+    }
+    expect_send_errno(sender, EPIPE, "send after connect with pre-connect SHUT_WR");
+
+    close(sender);
+    close(server);
+    unlink(server_addr.sun_path);
+}
+
+static void test_pre_bind_shutdown_read_blocks_future_recvs(void) {
+    struct sockaddr_un receiver_addr;
+    make_addr(&receiver_addr, "pre_rd_receiver");
+
+    int receiver = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (receiver < 0) {
+        die("socket(receiver)");
+    }
+    set_recv_timeout(receiver);
+
+    expect_sys_shutdown(receiver, SHUT_RD, "pre-bind shutdown(SHUT_RD)");
+    if (bind(receiver, (struct sockaddr *)&receiver_addr, sizeof(receiver_addr)) != 0) {
+        die("bind(receiver) after pre-bind SHUT_RD");
+    }
+
+    expect_recv_eof(receiver, "blocking recv after bind with pre-bind SHUT_RD");
+
+    close(receiver);
+    unlink(receiver_addr.sun_path);
 }
 
 static void test_shutdown_invalid_how_returns_einval(void) {
@@ -175,6 +247,8 @@ int main(void) {
     test_shutdown_write_keeps_receive_side_open();
     test_shutdown_both_combines_read_and_write_rules();
     test_peer_shutdown_write_drains_then_blocks();
+    test_pre_connect_shutdown_write_blocks_future_sends();
+    test_pre_bind_shutdown_read_blocks_future_recvs();
     test_shutdown_invalid_how_returns_einval();
     test_shutdown_fd_validated_before_how();
 

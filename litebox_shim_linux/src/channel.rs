@@ -33,7 +33,8 @@ macro_rules! common_functions_for_channel {
             }
         }
 
-        fn is_peer_shutdown(&self) -> bool {
+        /// Has the peer (i.e., other end) been shut down?
+        pub(crate) fn is_peer_shutdown(&self) -> bool {
             if let Some(peer) = self.peer.upgrade() {
                 peer.is_shutdown()
             } else {
@@ -98,7 +99,8 @@ impl<T> ReadEnd<T> {
     ) -> Result<R, Errno> {
         // Linux preserves bytes already queued when the read side is shut down
         // (via shutdown(SHUT_RD) or peer close), so consult the buffer before
-        // returning ESHUTDOWN — the caller observes EOF only once the queue drains.
+        // returning ESHUTDOWN; the caller observes EOF only once the queue drains.
+        let is_shutdown = self.is_shutdown() || self.is_peer_shutdown();
         let mut guard = self.endpoint.rb.lock();
         if let Some(item) = guard.first_mut() {
             let (should_consume, ret) = f(item)?;
@@ -110,9 +112,7 @@ impl<T> ReadEnd<T> {
             }
             return Ok(ret);
         }
-        drop(guard);
-
-        if self.is_shutdown() || self.is_peer_shutdown() {
+        if is_shutdown {
             return Err(Errno::ESHUTDOWN);
         }
 
@@ -289,7 +289,7 @@ mod tests {
             Channel::<u32>::new(4, writer_pollee.clone(), reader_pollee).split();
         let flag = Arc::new(AtomicBool::new(false));
         let observer: Arc<FlagOnNotify> = Arc::new(FlagOnNotify(flag.clone()));
-        // The peer of `reader` is the writer's endpoint, whose pollee is `writer_pollee` —
+        // The peer of `reader` is the writer's endpoint, whose pollee is `writer_pollee`;
         // register the observer there to detect that `reader.shutdown()` reaches it.
         writer_pollee.register_observer(
             Arc::downgrade(&observer) as Weak<dyn Observer<Events>>,

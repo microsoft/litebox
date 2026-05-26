@@ -10,6 +10,24 @@ static void make_stream_pair(int sv[2]) {
     make_socket_pair(SOCK_STREAM, sv);
 }
 
+static int make_listen_socket(struct sockaddr_un *sa, const char *name) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        die("socket(listen)");
+    }
+    memset(sa, 0, sizeof(*sa));
+    sa->sun_family = AF_UNIX;
+    snprintf(sa->sun_path, sizeof(sa->sun_path), "/tmp/lb_shut_%s_%d", name, getpid());
+    unlink(sa->sun_path);
+    if (bind(fd, (struct sockaddr *)sa, sizeof(*sa)) != 0) {
+        die("bind(listen)");
+    }
+    if (listen(fd, 4) != 0) {
+        die("listen()");
+    }
+    return fd;
+}
+
 static void test_shutdown_read_drains_then_returns_eof(void) {
     int sv[2];
     const char *queued = "before-shut-rd";
@@ -76,7 +94,7 @@ static void test_shutdown_both_combines_read_and_write_rules(void) {
     close_pair(sv);
 }
 
-// shutdown() on an unconnected (Init) AF_UNIX stream socket succeeds silently on Linux —
+// shutdown() on an unconnected (Init) AF_UNIX stream socket succeeds silently on Linux;
 // unlike inet sockets, unix_shutdown does not enforce ENOTCONN. Lock this in so the silent
 // success path in UnixStream::shutdown stays honest.
 static void test_shutdown_unconnected_succeeds(void) {
@@ -92,19 +110,8 @@ static void test_shutdown_unconnected_succeeds(void) {
 // the socket transitions to Connected: a `shutdown(SHUT_WR)` on a freshly-created Init socket
 // must cause the post-connect `send()` to fail with EPIPE.
 static void test_init_shutdown_persists_to_connected(void) {
-    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (srv < 0) {
-        die("socket(server)");
-    }
-    struct sockaddr_un sa = { .sun_family = AF_UNIX };
-    snprintf(sa.sun_path, sizeof(sa.sun_path), "/tmp/lb_shut_init_%d", getpid());
-    unlink(sa.sun_path);
-    if (bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        die("bind(server)");
-    }
-    if (listen(srv, 4) != 0) {
-        die("listen(server)");
-    }
+    struct sockaddr_un sa;
+    int srv = make_listen_socket(&sa, "init");
 
     int c = socket(AF_UNIX, SOCK_STREAM, 0);
     if (c < 0) {
@@ -122,7 +129,7 @@ static void test_init_shutdown_persists_to_connected(void) {
 }
 
 // A fresh Init Unix-stream socket polls as OUT|HUP (HUP because it's not connected).
-// After shutdown(SHUT_RD) — even pre-connect — Linux additionally reports POLLIN because
+// After shutdown(SHUT_RD), even pre-connect, Linux additionally reports POLLIN because
 // a recv would return EOF immediately. SHUT_WR alone leaves the poll output unchanged.
 static void test_init_shutdown_read_makes_poll_in_ready(void) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -158,19 +165,8 @@ static void test_init_shutdown_read_makes_poll_in_ready(void) {
 // accept returns EINVAL (not tested here to avoid pthreads), and poll reports both POLLIN
 // and POLLHUP.
 static void test_listen_shutdown_signals_in_and_hup(void) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        die("socket(listen)");
-    }
-    struct sockaddr_un sa = { .sun_family = AF_UNIX };
-    snprintf(sa.sun_path, sizeof(sa.sun_path), "/tmp/lb_shut_listen_%d", getpid());
-    unlink(sa.sun_path);
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        die("bind(listen)");
-    }
-    if (listen(fd, 4) != 0) {
-        die("listen()");
-    }
+    struct sockaddr_un sa;
+    int fd = make_listen_socket(&sa, "listen");
     expect_sys_shutdown(fd, SHUT_RDWR, "shutdown(listen, SHUT_RDWR)");
 
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
@@ -191,22 +187,11 @@ static void test_listen_shutdown_signals_in_and_hup(void) {
     unlink(sa.sun_path);
 }
 
-// Non-blocking accept on a shut-down listen socket returns EAGAIN on Linux (not EINVAL —
+// Non-blocking accept on a shut-down listen socket returns EAGAIN on Linux (not EINVAL;
 // the empty-queue fast path runs before the shutdown check kicks in).
 static void test_listen_shutdown_nonblocking_accept_returns_eagain(void) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        die("socket(listen)");
-    }
-    struct sockaddr_un sa = { .sun_family = AF_UNIX };
-    snprintf(sa.sun_path, sizeof(sa.sun_path), "/tmp/lb_shut_nbacc_%d", getpid());
-    unlink(sa.sun_path);
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        die("bind(listen)");
-    }
-    if (listen(fd, 4) != 0) {
-        die("listen()");
-    }
+    struct sockaddr_un sa;
+    int fd = make_listen_socket(&sa, "nbacc");
     if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) != 0) {
         die("fcntl O_NONBLOCK");
     }
@@ -244,19 +229,8 @@ static void *blocking_accept_thread(void *arg) {
 }
 
 static void test_listen_shutdown_blocking_accept_returns_einval(void) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        die("socket(listen)");
-    }
-    struct sockaddr_un sa = { .sun_family = AF_UNIX };
-    snprintf(sa.sun_path, sizeof(sa.sun_path), "/tmp/lb_shut_blkacc_%d", getpid());
-    unlink(sa.sun_path);
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        die("bind(listen)");
-    }
-    if (listen(fd, 4) != 0) {
-        die("listen()");
-    }
+    struct sockaddr_un sa;
+    int fd = make_listen_socket(&sa, "blkacc");
 
     struct blocking_accept_ctx ctx = { .fd = fd, .ret = 0, .err = 0 };
     pthread_t t;
@@ -285,8 +259,84 @@ static void test_listen_shutdown_blocking_accept_returns_einval(void) {
     unlink(sa.sun_path);
 }
 
+static void test_listen_shutdown_write_keeps_accepting(void) {
+    struct sockaddr_un sa;
+    int fd = make_listen_socket(&sa, "listen_wr");
+
+    expect_sys_shutdown(fd, SHUT_WR, "shutdown(listen, SHUT_WR)");
+
+    int client = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (client < 0) {
+        die("socket(client)");
+    }
+    if (connect(client, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        die("connect after listen SHUT_WR");
+    }
+    int accepted = accept(fd, NULL, NULL);
+    if (accepted < 0) {
+        die("accept after listen SHUT_WR");
+    }
+
+    close(accepted);
+    close(client);
+    close(fd);
+    unlink(sa.sun_path);
+}
+
+static void test_listen_shutdown_read_preserves_queued_connections(void) {
+    struct sockaddr_un sa;
+    int fd = make_listen_socket(&sa, "listen_rd");
+    if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) != 0) {
+        die("fcntl O_NONBLOCK");
+    }
+
+    int queued_client = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (queued_client < 0) {
+        die("socket(queued client)");
+    }
+    if (connect(queued_client, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        die("queued connect before listen SHUT_RD");
+    }
+
+    expect_sys_shutdown(fd, SHUT_RD, "shutdown(listen, SHUT_RD)");
+
+    int refused_client = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (refused_client < 0) {
+        die("socket(refused client)");
+    }
+    errno = 0;
+    if (connect(refused_client, (struct sockaddr *)&sa, sizeof(sa)) != -1) {
+        fprintf(stderr, "FAIL: connect after listen SHUT_RD expected failure\n");
+        exit(1);
+    }
+    if (errno != ECONNREFUSED) {
+        fail_errno("connect after listen SHUT_RD", ECONNREFUSED);
+    }
+
+    int accepted = accept(fd, NULL, NULL);
+    if (accepted < 0) {
+        die("accept queued connection after listen SHUT_RD");
+    }
+
+    errno = 0;
+    int drained = accept(fd, NULL, NULL);
+    if (drained != -1) {
+        fprintf(stderr, "FAIL: drained accept after listen SHUT_RD expected -1, got %d\n", drained);
+        exit(1);
+    }
+    if (errno != EAGAIN) {
+        fail_errno("drained accept after listen SHUT_RD", EAGAIN);
+    }
+
+    close(accepted);
+    close(refused_client);
+    close(queued_client);
+    close(fd);
+    unlink(sa.sun_path);
+}
+
 // When the *peer* calls shutdown(SHUT_WR), the local recv side must drain any queued bytes
-// first, then observe EOF on a subsequent recv — same behavior as a local SHUT_RD, just
+// first, then observe EOF on a subsequent recv: same behavior as a local SHUT_RD, just
 // triggered from the other side. Locks in the channel-layer "peer shutdown" drain path.
 static void test_peer_shutdown_write_drains_then_returns_eof(void) {
     int sv[2];
@@ -302,6 +352,31 @@ static void test_peer_shutdown_write_drains_then_returns_eof(void) {
 
     expect_recv_string(sv[0], queued, "recv queued bytes after peer SHUT_WR");
     expect_recv_eof(sv[0], "blocking recv after peer SHUT_WR queue drained");
+
+    close_pair(sv);
+}
+
+static void test_peer_shutdown_write_reports_read_ready(void) {
+    int sv[2];
+
+    make_stream_pair(sv);
+
+    expect_sys_shutdown(sv[1], SHUT_WR, "peer shutdown(SHUT_WR)");
+
+    struct pollfd pfd = { .fd = sv[0], .events = POLLIN | POLLRDHUP };
+    int r = poll(&pfd, 1, 0);
+    if (r != 1) {
+        fprintf(stderr, "FAIL: poll after peer SHUT_WR expected 1, got %d (errno=%d)\n",
+                r, errno);
+        exit(1);
+    }
+    if (!(pfd.revents & POLLIN) || !(pfd.revents & POLLRDHUP)) {
+        fprintf(stderr,
+                "FAIL: poll after peer SHUT_WR expected POLLIN|POLLRDHUP, got revents=0x%x\n",
+                pfd.revents);
+        exit(1);
+    }
+    expect_recv_eof(sv[0], "recv after peer SHUT_WR readiness");
 
     close_pair(sv);
 }
@@ -329,7 +404,10 @@ int main(void) {
     test_listen_shutdown_signals_in_and_hup();
     test_listen_shutdown_nonblocking_accept_returns_eagain();
     test_listen_shutdown_blocking_accept_returns_einval();
+    test_listen_shutdown_write_keeps_accepting();
+    test_listen_shutdown_read_preserves_queued_connections();
     test_peer_shutdown_write_drains_then_returns_eof();
+    test_peer_shutdown_write_reports_read_ready();
     test_shutdown_invalid_how_returns_einval();
 
     printf("All unix stream shutdown tests passed.\n");
