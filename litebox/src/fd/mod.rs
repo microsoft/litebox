@@ -694,6 +694,14 @@ pub struct PassedFd {
     subsystem_kind: SubsystemKind,
 }
 
+impl PassedFd {
+    /// Returns the subsystem kind for the fd being passed.
+    #[must_use]
+    pub fn subsystem_kind(&self) -> SubsystemKind {
+        self.subsystem_kind
+    }
+}
+
 struct StoredFd {
     x: Arc<OwnedFd>,
     subsystem_kind: SubsystemKind,
