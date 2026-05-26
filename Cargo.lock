@@ -1614,6 +1614,7 @@ dependencies = [
  "libc",
  "litebox_common_linux",
  "litebox_common_windows",
+ "litebox_panic_hook",
  "litebox_syscall_rewriter",
  "litebox_timing",
  "serde",
@@ -1681,6 +1682,10 @@ dependencies = [
  "tokio",
  "walkdir",
 ]
+
+[[package]]
+name = "litebox_panic_hook"
+version = "0.1.0"
 
 [[package]]
 name = "litebox_platform_linux_kernel"
@@ -1797,6 +1802,7 @@ dependencies = [
  "litebox",
  "litebox_broker",
  "litebox_common_linux",
+ "litebox_panic_hook",
  "litebox_platform_linux_userland",
  "litebox_platform_multiplex",
  "litebox_shim_linux",
@@ -1968,6 +1974,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "litebox_panic_hook",
  "litebox_timing",
 ]
 

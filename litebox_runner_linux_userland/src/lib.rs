@@ -508,7 +508,22 @@ fn initial_program_data(
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
+fn guest_env_present(cli_args: &CliArgs, key: &str) -> bool {
+    cli_args.environment_variables.iter().any(|kv| {
+        kv == key
+            || kv
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+fn should_force_worker_panic(cli_args: &CliArgs) -> bool {
+    guest_env_present(cli_args, "LITEBOX_FORCE_PANIC_TEST")
+        && (cli_args.worker_exec || cli_args.fork_restore || cli_args.guest_pid.is_some())
+}
+
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    litebox_panic_hook::install("runner");
     litebox_timing::init_from_env();
     litebox_timing::emit("runner_started_ns");
     // Open audit log file if specified. Must happen before any early-return
@@ -604,6 +619,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // SSH retries.
     #[cfg(feature = "audit_log")]
     litebox_shim_linux::audit::set_worker_id(std::process::id() as i32);
+
+    if should_force_worker_panic(&cli_args) {
+        panic!("LITEBOX_PANIC_HOOK_TEST");
+    }
 
     // When running as a worker host for a non-PIE child exec, take the
     // simplified worker path that skips VA partitioning.
