@@ -27,6 +27,21 @@ use thiserror::Error;
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task, syscalls::signal};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[derive(Clone, Copy)]
+struct AccessUserInfo {
+    user: u32,
+    group: u32,
+}
+
+impl From<litebox::fs::UserInfo> for AccessUserInfo {
+    fn from(value: litebox::fs::UserInfo) -> Self {
+        Self {
+            user: u32::from(value.user),
+            group: u32::from(value.group),
+        }
+    }
+}
+
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
     umask: core::sync::atomic::AtomicU32,
@@ -1042,35 +1057,111 @@ impl<FS: ShimFS> Task<FS> {
         write_to_iovec(iovs, |buf, _total| self.sys_write(fd, buf, None))
     }
 
-    /// Handle syscall `access`
-    pub fn sys_access(
-        &self,
-        pathname: impl path::Arg,
-        mode: litebox_common_linux::AccessFlags,
+    fn validate_access_mode(mode: &litebox_common_linux::AccessFlags) -> Result<(), Errno> {
+        let valid_mode = litebox_common_linux::AccessFlags::R_OK
+            | litebox_common_linux::AccessFlags::W_OK
+            | litebox_common_linux::AccessFlags::X_OK;
+        if mode.intersects(valid_mode.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    fn do_access_mode(
+        mode: litebox::fs::Mode,
+        owner: AccessUserInfo,
+        caller: AccessUserInfo,
+        access_mode: &litebox_common_linux::AccessFlags,
     ) -> Result<(), Errno> {
-        let pathname = self.resolve_path(pathname)?;
-        let status = self.files.borrow().fs.file_status(pathname)?;
-        if mode == litebox_common_linux::AccessFlags::F_OK {
+        if access_mode.is_empty() {
             return Ok(());
         }
-        // TODO: the check is done using the calling process's real UID and GID.
-        // Here we assume the caller owns the file.
-        if mode.contains(litebox_common_linux::AccessFlags::R_OK)
-            && !status.mode.contains(litebox::fs::Mode::RUSR)
-        {
+        let (read, write, execute) = if caller.user == owner.user {
+            (Mode::RUSR, Mode::WUSR, Mode::XUSR)
+        } else if caller.group == owner.group {
+            (Mode::RGRP, Mode::WGRP, Mode::XGRP)
+        } else {
+            (Mode::ROTH, Mode::WOTH, Mode::XOTH)
+        };
+        if access_mode.contains(litebox_common_linux::AccessFlags::R_OK) && !mode.contains(read) {
             return Err(Errno::EACCES);
         }
-        if mode.contains(litebox_common_linux::AccessFlags::W_OK)
-            && !status.mode.contains(litebox::fs::Mode::WUSR)
-        {
+        if access_mode.contains(litebox_common_linux::AccessFlags::W_OK) && !mode.contains(write) {
             return Err(Errno::EACCES);
         }
-        if mode.contains(litebox_common_linux::AccessFlags::X_OK)
-            && !status.mode.contains(litebox::fs::Mode::XUSR)
+        if access_mode.contains(litebox_common_linux::AccessFlags::X_OK) && !mode.contains(execute)
         {
             return Err(Errno::EACCES);
         }
         Ok(())
+    }
+
+    fn access_user(&self, flags: &AtFlags) -> AccessUserInfo {
+        if flags.contains(AtFlags::AT_EACCESS) {
+            AccessUserInfo {
+                user: self.credentials.euid,
+                group: self.credentials.egid,
+            }
+        } else {
+            AccessUserInfo {
+                user: self.credentials.uid,
+                group: self.credentials.gid,
+            }
+        }
+    }
+
+    fn do_access(
+        &self,
+        pathname: impl path::Arg,
+        mode: litebox_common_linux::AccessFlags,
+        caller: AccessUserInfo,
+    ) -> Result<(), Errno> {
+        Self::validate_access_mode(&mode)?;
+        let status = self.files.borrow().fs.file_status(pathname)?;
+        Self::do_access_mode(status.mode, status.owner.into(), caller, &mode)
+    }
+
+    /// Handle syscall `faccessat`
+    pub(crate) fn sys_faccessat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: litebox_common_linux::AccessFlags,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let supported_flags =
+            AtFlags::AT_EACCESS | AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        if flags.intersects(supported_flags.complement()) {
+            return Err(Errno::EINVAL);
+        }
+
+        Self::validate_access_mode(&mode)?;
+        let caller = self.access_user(&flags);
+        let cwd = self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, || cwd.clone())?;
+        match fs_path {
+            FsPath::Absolute { path } => self.do_access(path, mode, caller),
+            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                self.do_access(cwd, mode, caller)
+            }
+            FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                let stat = descriptor_stat(fd as usize, self)?;
+                Self::do_access_mode(
+                    Mode::from_bits_retain(stat.st_mode),
+                    AccessUserInfo {
+                        user: stat.st_uid,
+                        group: stat.st_gid,
+                    },
+                    caller,
+                    &mode,
+                )
+            }
+            FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+            FsPath::FdRelative { .. } => {
+                log_unsupported!("fd-relative faccessat is not supported yet");
+                Err(Errno::EINVAL)
+            }
+        }
     }
 
     /// Read the target of a symbolic link
@@ -2774,8 +2865,14 @@ mod tests {
         // ── sys_lstat: lstat the relative file ──
         task.sys_lstat("file.txt").unwrap();
 
-        // ── sys_access: check relative file is accessible ──
-        task.sys_access("file.txt", AccessFlags::F_OK).unwrap();
+        // ── sys_faccessat: check relative file is accessible ──
+        task.sys_faccessat(
+            litebox_common_linux::AT_FDCWD,
+            "file.txt",
+            AccessFlags::F_OK,
+            AtFlags::empty(),
+        )
+        .unwrap();
 
         // ── sys_mkdir: create a subdirectory via relative path ──
         task.sys_mkdir("subdir", 0o777).unwrap();

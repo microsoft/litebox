@@ -674,9 +674,14 @@ impl<FS: ShimFS> Task<FS> {
                 pos_l,
                 pos_h,
             } => self.sys_pwritev(fd, iovec, iovcnt, preadv_pwritev_offset(pos_l, pos_h)),
-            SyscallRequest::Access { pathname, mode } => pathname
-                .to_cstring()
-                .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),
+            SyscallRequest::Faccessat {
+                dirfd,
+                pathname,
+                mode,
+                flags,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_faccessat(dirfd, path, mode, flags))
+            }),
             SyscallRequest::Madvise {
                 addr,
                 length,
