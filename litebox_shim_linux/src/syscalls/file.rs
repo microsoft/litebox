@@ -5785,7 +5785,9 @@ impl<FS: ShimFS> Task<FS> {
             .fs
             .create_anonymous_file(&name_str, mode)
             .map_err(|e| match e {
-                CreateAnonymousFileError::NotSupported => Errno::ENOSYS,
+                CreateAnonymousFileError::NotSupported => {
+                    todo!("ENOSYS audit: memfd_create on filesystem without anonymous-file support; reachable but not implemented")
+                }
                 CreateAnonymousFileError::Io | _ => Errno::EIO,
             })?;
         {

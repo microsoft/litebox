@@ -1919,11 +1919,11 @@ impl<FS: ShimFS> Task<FS> {
 
         if set_tid != 0 || set_tid_size != 0 {
             log_unsupported!("clone with set_tid");
-            return Err(Errno::ENOSYS);
+            todo!("ENOSYS audit: clone set_tid array; reachable but not implemented");
         }
         if clone3 && flags.contains(CloneFlags::PIDFD) {
             log_unsupported!("clone3 with pidfd");
-            return Err(Errno::ENOSYS);
+            todo!("ENOSYS audit: clone3 CLONE_PIDFD; reachable but not implemented");
         }
 
         // Note `exit_signal` is ignored for threads; validated for fork.
@@ -4357,7 +4357,9 @@ impl<FS: ShimFS> Task<FS> {
                 reject,
             );
             put_fc_back(self, fc);
-            return Err(Errno::ENOSYS);
+            todo!(
+                "ENOSYS audit: delayed fork rejected snapshot state; reachable but not implemented"
+            );
         }
 
         #[cfg(feature = "trace_syscalls")]
@@ -5097,7 +5099,9 @@ impl<FS: ShimFS> Task<FS> {
                                 self.global.platform.close_host_fd(pr.host_fd);
                             }
                             put_fc_back(self, fc);
-                            return Err(Errno::ENOSYS);
+                            todo!(
+                                "ENOSYS audit: delayed fork bidirectional unix socket stdio bridge; reachable but not implemented"
+                            );
                         }
                     }
                 }
@@ -5229,7 +5233,9 @@ impl<FS: ShimFS> Task<FS> {
                                     self.global.platform.close_host_fd(pr.host_fd);
                                 }
                                 put_fc_back(self, fc);
-                                return Err(Errno::ENOSYS);
+                                todo!(
+                                    "ENOSYS audit: delayed fork queued SCM_RIGHTS transfer; reachable but not implemented"
+                                );
                             }
                         }
 
@@ -5939,7 +5945,9 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 fc.vfork_done.mux_parent_streams.lock().clear();
                 put_fc_back(self, fc);
-                return Err(Errno::ENOSYS);
+                todo!(
+                    "ENOSYS audit: delayed fork worker stdio bindings; reachable but not implemented"
+                );
             }
         };
 
@@ -6143,7 +6151,7 @@ impl<FS: ShimFS> Task<FS> {
     ///   1. Snapshot the parent's state at the fork trap.
     ///   2. Restore that snapshot in a new worker host process.
     ///
-    /// Currently unimplemented — returns `ENOSYS`.
+    /// Currently unimplemented — panics when reached so missing true-fork support is loud.
     #[allow(unused_variables)]
     #[allow(dead_code)]
     fn do_true_fork(
@@ -6224,7 +6232,7 @@ impl<FS: ShimFS> Task<FS> {
                 let _ = transit.client.release(transit.token_id);
             }
             cleanup(self, child_as_id, child_process_id);
-            return Err(Errno::ENOSYS);
+            todo!("ENOSYS audit: true fork rejected snapshot state; reachable but not implemented");
         }
 
         let snapshot = super::fork_snapshot::ForkSnapshot {
@@ -6266,7 +6274,9 @@ impl<FS: ShimFS> Task<FS> {
                     let _ = transit.client.release(transit.token_id);
                 }
                 cleanup(self, child_as_id, child_process_id);
-                return Err(Errno::ENOSYS);
+                todo!(
+                    "ENOSYS audit: true fork worker stdio bindings; reachable but not implemented"
+                );
             }
         };
 
