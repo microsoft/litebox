@@ -646,6 +646,45 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Ok(timer.current_spec())
     }
 
+    /// Snapshot the timerfd state for the non-PIE worker-exec bridge.
+    ///
+    /// Returns `None` if this `EventFile` is not a timerfd. Otherwise
+    /// returns the data needed to reconstruct an equivalent timerfd on
+    /// the receiving side: clock id, NONBLOCK flag, and the current
+    /// `ItimerSpec` (after running `update()` so already-elapsed
+    /// expirations are reflected in `pending_expirations` rather than
+    /// in `value`).
+    pub(crate) fn timerfd_worker_exec_bridge_snapshot(
+        &self,
+    ) -> Option<(ClockId, bool, ItimerSpec, u64)> {
+        let mut inner = self.inner.lock();
+        let EventFileInner::Timerfd(timer) = &mut *inner else {
+            return None;
+        };
+        // Force materialization of already-expired expirations.
+        timer.update();
+        let pending = timer.pending_expirations;
+        let spec = timer.current_spec();
+        // Read clockid via i32-as-IntEnum: ClockId is `#[repr(i32)] non_exhaustive` and
+        // doesn't derive Copy, so reconstruct from the discriminant.
+        let clockid_disc = match &timer.clockid {
+            ClockId::RealTime => 0,
+            ClockId::Monotonic => 1,
+            ClockId::ProcessCputimeId => 2,
+            ClockId::ThreadCputimeId => 3,
+            ClockId::MonotonicRaw => 4,
+            ClockId::RealtimeCoarse => 5,
+            ClockId::MonotonicCoarse => 6,
+            ClockId::Boottime => 7,
+            _ => return None,
+        };
+        drop(inner);
+        let clockid = ClockId::try_from(clockid_disc as i32).ok()?;
+        let status = OFlags::from_bits_retain(self.status.load(Ordering::Relaxed));
+        let nonblock = status.contains(OFlags::NONBLOCK);
+        Some((clockid, nonblock, spec, pending))
+    }
+
     super::common_functions_for_file_status!();
 }
 
