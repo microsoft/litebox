@@ -2067,6 +2067,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         count: usize,
         offset: i64,
     },
+    Sendfile {
+        out_fd: i32,
+        in_fd: i32,
+        offset: Option<Platform::RawMutPointer<i64>>,
+        count: usize,
+    },
     Readv {
         fd: i32,
         iovec: Platform::RawConstPointer<IoReadVec<Platform::RawMutPointer<u8>>>,
@@ -2585,6 +2591,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 count,
                 offset
             }),
+            Sysno::sendfile => sys_req!(Sendfile { out_fd, in_fd, offset:*, count }),
             Sysno::readv => sys_req!(Readv { fd, iovec:*, iovcnt }),
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
             Sysno::preadv => sys_req!(Preadv { fd, iovec:*, iovcnt, pos_l, pos_h }),
