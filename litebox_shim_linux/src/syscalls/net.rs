@@ -1806,6 +1806,57 @@ impl<FS: ShimFS> Task<FS> {
         }
         Ok(fd)
     }
+    fn try_install_broker_tcp_accept(
+        &self,
+        accepted_file: &SocketFd,
+        peer_addr: Option<&SocketAddress>,
+        flags: SockFlags,
+        files: &crate::syscalls::file::FilesState<FS>,
+    ) -> Result<Option<usize>, Errno> {
+        if !crate::syscalls::broker_tcp_conn::broker_tcp_conn_accept_enabled() {
+            return Ok(None);
+        }
+        let Some(SocketAddress::Inet(SocketAddr::V4(peer))) = peer_addr else {
+            return Ok(None);
+        };
+        if peer.port() == 0 {
+            return Ok(None);
+        }
+        let handle_id = u64::from(peer.port());
+        let Some(provider) = crate::syscalls::broker_tcp_conn::broker_tcp_conn_provider() else {
+            return Ok(None);
+        };
+        if provider.poll_tcp_conn_events(handle_id).is_err() {
+            return Ok(None);
+        }
+
+        let _ = self
+            .global
+            .net
+            .lock()
+            .close(accepted_file, CloseBehavior::Immediate);
+        let status = if flags.contains(SockFlags::NONBLOCK) {
+            OFlags::NONBLOCK
+        } else {
+            OFlags::empty()
+        };
+        let tcp_fd = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+            provider, handle_id, status,
+        );
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let typed = dt.insert::<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(tcp_fd);
+        if flags.contains(SockFlags::CLOEXEC) {
+            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        drop(dt);
+        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+            let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+            Errno::EMFILE
+        })?;
+        Ok(Some(raw_fd))
+    }
+
     pub(super) fn do_accept(
         &self,
         sockfd: u32,
@@ -1825,6 +1876,15 @@ impl<FS: ShimFS> Task<FS> {
                     self.global
                         .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Inet);
+
+                if let Some(raw_fd) = self.try_install_broker_tcp_accept(
+                    &accepted_file,
+                    peer_addr.as_ref(),
+                    flags,
+                    files.as_ref(),
+                )? {
+                    return Ok((raw_fd, peer_addr));
+                }
 
                 let proxy = self
                     .global

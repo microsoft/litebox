@@ -26,6 +26,15 @@ use super::fork_snapshot::BrokerHandleKind;
 
 static BROKER_TCP_CONN_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerTcpConnProvider>> =
     once_cell::race::OnceBox::new();
+static BROKER_TCP_CONN_ACCEPT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_broker_tcp_conn_accept_enabled(enabled: bool) {
+    BROKER_TCP_CONN_ACCEPT_ENABLED.store(enabled, Ordering::Release);
+}
+
+pub fn broker_tcp_conn_accept_enabled() -> bool {
+    BROKER_TCP_CONN_ACCEPT_ENABLED.load(Ordering::Acquire)
+}
 
 pub fn set_broker_tcp_conn_provider(
     provider: Arc<dyn BrokerTcpConnProvider>,

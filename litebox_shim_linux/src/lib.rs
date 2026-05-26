@@ -555,7 +555,52 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                         .descriptor_table_mut()
                         .insert(tcp_fd);
                 let mut rds = files.raw_descriptor_store.write();
-                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+                if let Ok(old_sock) =
+                    rds.fd_consume_raw_integer::<litebox::net::Network<Platform>>(guest_fd)
+                {
+                    drop(rds);
+                    let _ = self
+                        .task
+                        .global
+                        .net
+                        .lock()
+                        .close(&old_sock, litebox::net::CloseBehavior::Immediate);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+                    drop(rds);
+                    let _ = files.fs.close(&old_fs);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_host) = rds
+                    .fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
+                {
+                    drop(rds);
+                    if let Some(entry) = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_host)
+                    {
+                        let host_fd = entry.take_fd();
+                        if host_fd >= 0 {
+                            self.task.global.platform.close_host_fd(host_fd);
+                        }
+                    }
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_tcp) = rds
+                    .fd_consume_raw_integer::<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                        guest_fd,
+                    )
+                {
+                    drop(rds);
+                    let _ = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_tcp);
+                    rds = files.raw_descriptor_store.write();
+                }
                 let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
                 debug_assert!(
                     ok,

@@ -237,12 +237,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handles for cross-worker SCM_RIGHTS transfer. The two registries
     // are constructed here and shared with the listener thread; their
     // Arc clones survive for the lifetime of the broker process.
+    let shared_state_registry = cli
+        .fd_token_broker_listen
+        .as_ref()
+        .map(|_| std::sync::Arc::new(litebox_broker::state_registry::BrokerStateRegistry::new()));
     let _fd_token_listener: Option<std::thread::JoinHandle<()>> =
         if let Some(path) = cli.fd_token_broker_listen.as_ref() {
             let fd_registry =
                 std::sync::Arc::new(litebox_broker::fd_tokens::BrokerFdTokenRegistry::new());
-            let state_registry =
-                std::sync::Arc::new(litebox_broker::state_registry::BrokerStateRegistry::new());
+            let state_registry = shared_state_registry
+                .as_ref()
+                .expect("state registry exists when fd-token listener is configured")
+                .clone();
             // Process registry: dedicated BrokerStateRegistry instance for
             // ProcessState entries. Disjoint id space from state_registry
             // keeps allocated guest pids sequential u32s (suitable for
@@ -319,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sandbox_policy,
             audit_log,
             forwards,
+            shared_state_registry.clone(),
         );
     }
     #[cfg(not(unix))]
@@ -418,6 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sandbox_policy.clone(),
                 audit_log.clone(),
                 forwards,
+                shared_state_registry.clone(),
             ) {
                 tracing::error!("network proxy error: {e}");
             }
