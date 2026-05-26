@@ -450,9 +450,30 @@ impl BrokerStateRegistry {
             .next_id
             .checked_add(1)
             .expect("BrokerStateRegistry id space exhausted");
+        Self::insert_locked(&mut s, id, state)
+    }
+
+    pub fn register_with_id(
+        &self,
+        id: u64,
+        state: impl Into<StateObjectEnum>,
+    ) -> Result<StateHandle, StateRegistryError> {
+        let state = Arc::new(state.into());
+        let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        if s.table.contains_key(&id) {
+            return Err(StateRegistryError::RefcountOverflow(StateHandle(id)));
+        }
+        if s.next_id <= id {
+            s.next_id = id
+                .checked_add(1)
+                .expect("BrokerStateRegistry id space exhausted");
+        }
+        Ok(Self::insert_locked(&mut s, id, state))
+    }
+
+    fn insert_locked(s: &mut State, id: u64, state: Arc<StateObjectEnum>) -> StateHandle {
         let tag = state.subsystem_tag();
         s.table.insert(id, Entry { state, refcount: 1 });
-        drop(s);
         // PE.10 diag: opt-in via LITEBOX_PE10_DIAG.
         if std::env::var_os("LITEBOX_PE10_DIAG").is_some() {
             use std::io::Write;

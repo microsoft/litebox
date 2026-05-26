@@ -759,6 +759,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
     }
 
+    // Stage 3a: broker-backed TCP accept is opt-in while the matrix is
+    // validated. The broker process reads the same environment variable.
+    {
+        let enabled = std::env::var("LITEBOX_BROKER_TCP_CONN")
+            .ok()
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        litebox_shim_linux::syscalls::set_broker_tcp_conn_accept_enabled(enabled);
+    }
+
     // Phase B-Step8c: if --fd-token-broker is supplied, connect to
     // the broker's fd-token control socket and register a
     // BrokerEventfdProvider so subsequent sys_eventfd2 calls produce

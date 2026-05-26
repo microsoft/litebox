@@ -29,6 +29,8 @@ use crate::sandbox_policy::SandboxPolicy;
 use crate::sock_compat::{
     self, AsRawSock, IpcListener, IpcStream, POLLERR, POLLHUP, POLLIN, POLLOUT, PollFd, RawSock,
 };
+use crate::state_registry::BrokerStateRegistry;
+use crate::tcp_conn_state::TcpConnState;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -168,6 +170,7 @@ pub struct RoutedStream {
     pub stream: std::net::TcpStream,
     pub guest_ip: Ipv4Addr,
     pub guest_port: u16,
+    pub broker_tcp_conn_handle: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +183,52 @@ pub enum TransferListenRouteOutcome {
 pub enum TransferListenRouteError {
     PortNotRegistered,
     SourceNotOwner { actual_owner: u64 },
+}
+
+fn broker_tcp_conn_accept_enabled() -> bool {
+    std::env::var("LITEBOX_BROKER_TCP_CONN")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn broker_tcp_conn_source_port(handle: u64) -> Option<u16> {
+    let port = u16::try_from(handle).ok()?;
+    (port > 0).then_some(port)
+}
+
+fn make_routed_stream(
+    stream: std::net::TcpStream,
+    guest_ip: Ipv4Addr,
+    guest_port: u16,
+    state_registry: Option<&BrokerStateRegistry>,
+) -> RoutedStream {
+    if broker_tcp_conn_accept_enabled()
+        && let Some(registry) = state_registry
+        && let Ok(state_stream) = stream.try_clone()
+    {
+        let handle = u64::from(alloc_inbound_src_port());
+        if let Ok((dummy_peer, dummy_worker_end)) = create_tcp_pair() {
+            let state = TcpConnState::new(state_stream);
+            if registry.register_with_id(handle, state).is_ok() {
+                let _ = dummy_peer.set_nonblocking(true);
+                std::mem::forget(dummy_peer);
+                return RoutedStream {
+                    stream: dummy_worker_end,
+                    guest_ip,
+                    guest_port,
+                    broker_tcp_conn_handle: Some(handle),
+                };
+            }
+        }
+    }
+
+    RoutedStream {
+        stream,
+        guest_ip,
+        guest_port,
+        broker_tcp_conn_handle: None,
+    }
 }
 
 impl Default for PortRouter {
@@ -312,14 +361,11 @@ impl PortRouter {
         guest_port: u16,
         guest_ip: Ipv4Addr,
         stream: std::net::TcpStream,
+        state_registry: Option<&BrokerStateRegistry>,
     ) -> Option<std::net::TcpStream> {
         let routes = self.routes.lock().unwrap();
         if let Some((_, sender)) = routes.get(&guest_port) {
-            let routed = RoutedStream {
-                stream,
-                guest_ip,
-                guest_port,
-            };
+            let routed = make_routed_stream(stream, guest_ip, guest_port, state_registry);
             match sender.send(routed) {
                 Ok(()) => {
                     debug!("port router: forwarded connection to worker on port {guest_port}");
@@ -327,7 +373,15 @@ impl PortRouter {
                 }
                 Err(e) => {
                     warn!("port router: worker channel closed for port {guest_port}");
-                    Some(e.0.stream) // return the stream
+                    if let Some(handle) = e.0.broker_tcp_conn_handle
+                        && let Some(registry) = state_registry
+                    {
+                        let _ =
+                            registry.release(crate::state_registry::StateHandle::from_id(handle));
+                        None
+                    } else {
+                        Some(e.0.stream)
+                    }
                 }
             }
         } else {
@@ -836,6 +890,7 @@ pub fn run(
     sandbox_policy: Option<Arc<SandboxPolicy>>,
     audit_log: Option<AuditLog>,
     inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
+    state_registry: Option<Arc<BrokerStateRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_with_session_slots(
         ipc_fd,
@@ -846,6 +901,7 @@ pub fn run(
         sandbox_policy,
         audit_log,
         inbound_forwards,
+        state_registry,
     )
 }
 
@@ -858,6 +914,7 @@ pub fn run_with_session_slots(
     sandbox_policy: Option<Arc<SandboxPolicy>>,
     audit_log: Option<AuditLog>,
     inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
+    state_registry: Option<Arc<BrokerStateRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port_router = Arc::new(PortRouter::new());
     let (init_routed_tx, init_routed_rx) = std::sync::mpsc::channel::<RoutedStream>();
@@ -871,6 +928,7 @@ pub fn run_with_session_slots(
         audit_log,
         inbound_forwards,
         port_router,
+        state_registry,
         Some(init_routed_rx),
         Some(init_routed_tx),
     )
@@ -886,6 +944,7 @@ fn run_inner(
     audit_log: Option<AuditLog>,
     inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
     port_router: Arc<PortRouter>,
+    state_registry: Option<Arc<BrokerStateRegistry>>,
     // Receiver for inbound TCP streams routed to this proxy by the port router.
     inbound_routed_rx: Option<std::sync::mpsc::Receiver<RoutedStream>>,
     // Sender for this proxy's inbound channel — registered with port_router
@@ -1141,7 +1200,12 @@ fn run_inner(
                                 // guest (10.0.0.2), not to the broker IP.
                                 let guest_ip = Ipv4Addr::new(10, 0, 0, 2);
                                 if port_router
-                                    .try_route(dst_port, guest_ip, remote_end)
+                                    .try_route(
+                                        dst_port,
+                                        guest_ip,
+                                        remote_end,
+                                        state_registry.as_deref(),
+                                    )
                                     .is_some()
                                 {
                                     warn!("port_router rejected routed stream for port {dst_port}");
@@ -1574,6 +1638,7 @@ fn run_inner(
                 let sandbox_policy = sandbox_policy.clone();
                 let audit_log = audit_log.clone();
                 let port_router = Arc::clone(&port_router);
+                let state_registry_for_session = state_registry.clone();
                 let (inbound_tx, inbound_rx) = std::sync::mpsc::channel::<RoutedStream>();
                 std::thread::spawn(move || {
                     let _session_permit = session_permit;
@@ -1582,7 +1647,7 @@ fn run_inner(
                         return;
                     }
                     info!("accepted additional LBNP client, handshake complete");
-                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy, audit_log, vec![], port_router, Some(inbound_rx), Some(inbound_tx)) {
+                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy, audit_log, vec![], port_router, state_registry_for_session, Some(inbound_rx), Some(inbound_tx)) {
                         tracing::error!("network proxy error: {e}");
                     }
                 });
@@ -1647,11 +1712,15 @@ fn run_inner(
 
                         // Check if a worker has registered for this port.
                         // If so, route the stream to the worker's proxy.
-                        let stream =
-                            match port_router.try_route(fwd.guest_port, fwd.guest_ip, stream) {
-                                None => continue, // routed to worker, they handle it
-                                Some(s) => s,     // no worker, we handle it
-                            };
+                        let stream = match port_router.try_route(
+                            fwd.guest_port,
+                            fwd.guest_ip,
+                            stream,
+                            state_registry.as_deref(),
+                        ) {
+                            None => continue, // routed to worker, they handle it
+                            Some(s) => s,     // no worker, we handle it
+                        };
 
                         // Create a smoltcp TCP socket that connects to the guest.
                         let tcp_rx =
@@ -1716,7 +1785,10 @@ fn run_inner(
                 tcp_socket.set_nagle_enabled(false);
                 let handle = sockets.add(tcp_socket);
 
-                let src_port = alloc_inbound_src_port();
+                let src_port = routed
+                    .broker_tcp_conn_handle
+                    .and_then(broker_tcp_conn_source_port)
+                    .unwrap_or_else(alloc_inbound_src_port);
 
                 let sock = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
                 let local = smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(BROKER_IP), src_port);
