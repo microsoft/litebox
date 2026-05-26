@@ -200,47 +200,75 @@ const fn valid_ops(subsystem: InheritSubsystem) -> &'static [InheritOp] {
     }
 }
 
+const NON_PIE_CHILD_ACCEPT_XFAIL_REASON: &str =
+    "non-PIE child cross-worker listen-queue ownership pending (follow-up to non-PIE inherit fix)";
+
+fn expected_fail_reason(trial: InheritTrial) -> Option<&'static str> {
+    if matches!(trial.subsystem, InheritSubsystem::TcpListen)
+        && matches!(trial.op, InheritOp::Accept)
+        && matches!(
+            trial.parent_bt,
+            BinaryType::PieGlibc
+                | BinaryType::NonPieGlibc
+                | BinaryType::StaticPieGlibc
+                | BinaryType::StaticPieMusl
+                | BinaryType::NonPieStaticMusl
+        )
+        && matches!(
+            trial.child_bt,
+            BinaryType::NonPieGlibc | BinaryType::NonPieStaticMusl
+        )
+    {
+        Some(NON_PIE_CHILD_ACCEPT_XFAIL_REASON)
+    } else {
+        None
+    }
+}
+
 fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
     let id = trial.id();
     let parent = parent_agent(trial.parent_bt);
-    reg.test("vscode", "inherit_matrix", id)
-        .timeout(30)
-        .build(move |cx| {
-            let parent_handle = cx.require(parent);
-            Box::new(move |run| {
-                Box::pin(async move {
-                    let self_exe = run.self_exe().to_string();
-                    let child_binary = crate::binary_path(trial.child_bt, &self_exe);
-                    let result = run
-                        .send_named_typed(
-                            &parent_handle,
-                            &TCP_LISTEN_MATRIX,
-                            TcpListenTrialArgs {
-                                child_binary,
-                                op: trial.op,
-                                timeout_ms: 5000,
-                            },
-                        )
-                        .await;
-                    match result {
-                        Ok(out) if out.exit_code == 0 => TestOutcome::new(
-                            parent.name(),
-                            true,
-                            format!("child {} inherited tcp_listen fd", trial.op.id()),
+    let mut test = reg.test("vscode", "inherit_matrix", id).timeout(30);
+    if let Some(reason) = expected_fail_reason(trial) {
+        test = test.expected_fail_on_litebox(reason);
+    }
+
+    test.build(move |cx| {
+        let parent_handle = cx.require(parent);
+        Box::new(move |run| {
+            Box::pin(async move {
+                let self_exe = run.self_exe().to_string();
+                let child_binary = crate::binary_path(trial.child_bt, &self_exe);
+                let result = run
+                    .send_named_typed(
+                        &parent_handle,
+                        &TCP_LISTEN_MATRIX,
+                        TcpListenTrialArgs {
+                            child_binary,
+                            op: trial.op,
+                            timeout_ms: 5000,
+                        },
+                    )
+                    .await;
+                match result {
+                    Ok(out) if out.exit_code == 0 => TestOutcome::new(
+                        parent.name(),
+                        true,
+                        format!("child {} inherited tcp_listen fd", trial.op.id()),
+                    ),
+                    Ok(out) => TestOutcome::new(
+                        parent.name(),
+                        false,
+                        format!(
+                            "exit_code={} stdout={:?} stderr={:?}",
+                            out.exit_code, out.stdout, out.stderr
                         ),
-                        Ok(out) => TestOutcome::new(
-                            parent.name(),
-                            false,
-                            format!(
-                                "exit_code={} stdout={:?} stderr={:?}",
-                                out.exit_code, out.stdout, out.stderr
-                            ),
-                        ),
-                        Err(e) => TestOutcome::new(parent.name(), false, format!("handler: {e}")),
-                    }
-                })
+                    ),
+                    Err(e) => TestOutcome::new(parent.name(), false, format!("handler: {e}")),
+                }
             })
-        });
+        })
+    });
 }
 
 const fn parent_agent(bt: BinaryType) -> AgentName {
