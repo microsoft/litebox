@@ -39,8 +39,8 @@ pub mod ptr;
 
 // Re-export session management types for convenience
 pub use session::{
-    ActiveSessionGuard, CreationReservation, MAX_TA_INSTANCES, SessionEntry, SessionManager,
-    SessionMap, SessionTarget, SingleInstanceCache, TaInstance, allocate_session_id,
+    MAX_TA_INSTANCES, SessionEntry, SessionManager, SessionMap, SessionTarget, SessionToken,
+    SingleInstanceCache, TaInstance, allocate_session_id,
 };
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
@@ -1449,6 +1449,10 @@ impl SessionIdPool {
     }
 
     /// Recycle a session ID for reuse. Fallback IDs are not recycled.
+    ///
+    /// "Recycled" only marks the bit free; [`IdPool`](litebox::utils::id_pool::IdPool)
+    /// is hint+wrap, so the ID is not handed out again until every higher ID
+    /// has been allocated first.
     pub fn recycle(session_id: u32) {
         if session_id == 0 || session_id > Self::MAX_RECYCLABLE_SESSION_ID {
             return;

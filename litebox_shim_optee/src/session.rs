@@ -12,17 +12,22 @@
 //!
 //! TA execution is serialized externally; [`TaInstance`] is shared as a plain
 //! `Arc<TaInstance>` without an inner mutex. The exclusivity invariant lives in
-//! [`SessionManager`]:
+//! [`SessionManager`] and is acquired through a single RAII [`SessionToken`]
+//! that bundles whichever locks the current operation requires:
 //!
 //! - **Single-instance TAs** (with `TA_FLAG_SINGLE_INSTANCE | TA_FLAG_MULTI_SESSION`)
-//!   share one [`TaInstance`] across all sessions. Open/Invoke/Close serialize on
-//!   a per-UUID `SpinMutex` returned by [`SessionManager::single_instance_lock`],
-//!   acquired non-blockingly at handler entry.
+//!   share one [`TaInstance`] across all sessions. The token internally holds a
+//!   per-UUID `SpinMutex` so Open/Invoke/Close serialize on the same UUID.
 //!
-//! - **Multi-instance TAs** have one [`TaInstance`] per session. Invoke/Close
-//!   serialize on a per-`session_id` entry acquired via
-//!   [`SessionManager::try_activate_session`], also acquired non-blockingly.
-//!   Different sessions run in parallel on their own instances.
+//! - **Multi-instance TAs** have one [`TaInstance`] per session. The token
+//!   internally holds a per-`session_id` marker so Invoke/Close cannot
+//!   re-enter the same session concurrently, while different sessions run
+//!   in parallel on their own instances.
+//!
+//! OpenSession callers go through [`SessionManager::with_creation_slot`],
+//! which manages the token internally. Invoke/Close callers acquire a token
+//! via [`SessionManager::try_acquire_for_session`]. Both are non-blocking
+//! and return `EThreadLimit` on contention.
 //!
 //! ### Difference from OP-TEE OS
 //!
@@ -44,11 +49,11 @@
 //! requiring RPCs that would give untrusted code control over secure world execution.
 //!
 //! On panic teardown or last-session close, sibling sessions of a single-instance
-//! TA are flipped to [`SessionTarget::Dead`] *before* the per-UUID lock entry is
+//! TA are flipped to [`SessionTarget::Dead`] *before* the cached instance is
 //! evicted (see [`SessionManager::remove_single_instance_if_same`]). A racing
-//! handler that subsequently allocates a fresh per-UUID lock will therefore
-//! observe `Dead` on its re-read of the session entry and short-circuit through
-//! the dead-target path.
+//! handler that subsequently acquires its own [`SessionToken`] for the UUID
+//! will therefore observe `Dead` on its re-read of the session entry and
+//! short-circuit through the dead-target path.
 //!
 //! Reference: <https://optee.readthedocs.io/en/latest/architecture/trusted_applications.html#multi-session>
 //!
@@ -363,28 +368,49 @@ impl Drop for SessionIdGuard {
     }
 }
 
-/// RAII guard returned by [`SessionManager::try_activate_session`] that removes
-/// the session id from the active set on drop. Provides per-session-id
-/// serialization for Invoke/Close handlers without requiring a mutex on the
-/// `TaInstance` itself.
-pub struct ActiveSessionGuard<'a> {
+/// RAII token bundling the serialization primitives required to safely
+/// execute an OP-TEE TA operation.
+///
+/// Acquired non-blockingly via [`SessionManager::try_acquire_for_session`]
+/// for Invoke/Close on an existing session. OpenSession uses the same
+/// token type internally through [`SessionManager::with_creation_slot`],
+/// which manages acquisition and release on the caller's behalf.
+///
+/// Holds whichever combination of locks is required for the operation:
+///
+/// - **Single-instance TAs**: a per-UUID `SpinMutex` that serializes all
+///   sessions on the same TA.
+/// - **Existing-session operations** (Invoke/Close): a per-session-id marker
+///   that prevents concurrent SMC entry by another core for the same id.
+///
+/// For multi-instance OpenSession, the token holds nothing (each session
+/// gets its own private instance, so no exclusion is required).
+///
+/// On drop, the per-UUID lock is released first, then the per-session-id
+/// marker.
+pub struct SessionToken<'a> {
     manager: &'a SessionManager,
-    session_id: u32,
+    /// Held `Arc` of the per-UUID `SpinMutex`. The guard returned by
+    /// `try_lock()` was [`core::mem::forget`]-ed at acquisition time; this
+    /// type's `Drop` calls `force_unlock` to release the mutex. The `Arc`
+    /// keeps the mutex alive across acquisition and release.
+    uuid_lock: Option<Arc<SpinMutex<()>>>,
+    /// Session id reserved in [`SessionManager::active_sessions`].
+    active_session_id: Option<u32>,
 }
 
-impl Drop for ActiveSessionGuard<'_> {
+impl Drop for SessionToken<'_> {
     fn drop(&mut self) {
-        self.manager.active_sessions.lock().remove(&self.session_id);
+        if let Some(lock) = self.uuid_lock.take() {
+            // SAFETY: This token holds the per-UUID lock because the
+            // acquisition path called `try_lock()` and forgot the resulting
+            // guard. No other holder exists, so `force_unlock` is sound.
+            unsafe { lock.force_unlock() };
+        }
+        if let Some(id) = self.active_session_id.take() {
+            self.manager.active_sessions.lock().remove(&id);
+        }
     }
-}
-
-/// Result of [`SessionManager::with_creation_slot`].
-pub enum CreationReservation {
-    /// An existing single-instance TA was found (another core cached it
-    /// between our initial lookup and the reservation). Reuse this instance.
-    ExistingSingleInstance(Arc<TaInstance>),
-    /// The creation closure ran successfully inside the reserved slot.
-    SlotReserved,
 }
 
 /// State for coordinating concurrent instance creation.
@@ -464,8 +490,18 @@ impl SessionManager {
         self.known_flags.lock().get(uuid).copied()
     }
 
-    /// Get the serialization lock for a single-instance TA UUID.
-    pub fn single_instance_lock(&self, uuid: TeeUuid) -> Arc<SpinMutex<()>> {
+    /// Whether `uuid` should be treated as single-instance for serialization.
+    ///
+    /// Returns the cached `is_single_instance()` if known, or `true` for the
+    /// first-ever load (we have not yet observed the TA's flags) to preserve
+    /// safety invariants conservatively.
+    fn assume_single_instance(&self, uuid: &TeeUuid) -> bool {
+        self.get_known_flags(uuid)
+            .is_none_or(|f| f.is_single_instance())
+    }
+
+    /// Get or create the per-UUID serialization mutex `Arc`.
+    fn uuid_lock_arc(&self, uuid: TeeUuid) -> Arc<SpinMutex<()>> {
         self.single_instance_locks
             .lock()
             .entry(uuid)
@@ -473,18 +509,108 @@ impl SessionManager {
             .clone()
     }
 
-    /// Try to mark `session_id` as actively handled. Returns a guard that
-    /// removes the marker on drop, or `None` if another core is already
-    /// inside an Invoke/Close handler for this session id.
-    pub fn try_activate_session(&self, session_id: u32) -> Option<ActiveSessionGuard<'_>> {
-        if self.active_sessions.lock().insert(session_id) {
-            Some(ActiveSessionGuard {
-                manager: self,
-                session_id,
-            })
+    /// Try to take the per-UUID serialization mutex non-blockingly. On
+    /// success returns the `Arc` whose forgotten guard is owned by the
+    /// caller — release via `force_unlock` on the returned `Arc`.
+    fn try_acquire_uuid_lock(&self, uuid: TeeUuid) -> Option<Arc<SpinMutex<()>>> {
+        let lock = self.uuid_lock_arc(uuid);
+        let guard = lock.try_lock()?;
+        // The lock now belongs to the SessionToken about to wrap us. Forget
+        // the guard so its `Drop` does not unlock; the token's `Drop` calls
+        // `force_unlock` via the retained `Arc`.
+        core::mem::forget(guard);
+        Some(lock)
+    }
+
+    /// Acquire a [`SessionToken`] for an OpenSession request.
+    ///
+    /// For single-instance TAs (including first-ever load of an unknown
+    /// UUID) this takes the per-UUID `SpinMutex` non-blockingly. For
+    /// already-known multi-instance TAs the returned token holds no locks —
+    /// each session creates its own private instance, so no exclusion is
+    /// required.
+    ///
+    /// Returns `Err(EThreadLimit)` if another core is currently inside an
+    /// operation on the same single-instance UUID.
+    fn try_acquire_for_open(&self, uuid: TeeUuid) -> Result<SessionToken<'_>, OpteeSmcReturnCode> {
+        let uuid_lock = if self.assume_single_instance(&uuid) {
+            Some(
+                self.try_acquire_uuid_lock(uuid)
+                    .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
+            )
         } else {
             None
+        };
+        Ok(SessionToken {
+            manager: self,
+            uuid_lock,
+            active_session_id: None,
+        })
+    }
+
+    /// Acquire a [`SessionToken`] for an Invoke/Close on an existing session.
+    ///
+    /// Always reserves the per-session-id slot in `active_sessions`. For
+    /// single-instance TAs additionally takes the per-UUID `SpinMutex` so
+    /// sibling sessions on the same TA serialize against this operation.
+    ///
+    /// Returns `Err(EBadCmd)` if `session_id` is not registered, or
+    /// `Err(EThreadLimit)` if another core is inside the same session or
+    /// holds the per-UUID lock for the same single-instance TA. On failure
+    /// any partial acquisition is released via the token's `Drop`.
+    ///
+    /// Defense in depth: after the per-session-id marker is held, the entry
+    /// is re-read and its `(uuid, flags)` validated against the pre-marker
+    /// snapshot used to decide whether to take the per-UUID lock. If they
+    /// diverge (the id was recycled and reused under a different TA between
+    /// our first read and the marker insert), `Err(EThreadLimit)` is
+    /// returned so the Linux driver retries — a fresh acquisition will see
+    /// the new entry from the start. This guards against the read/marker
+    /// TOCTOU without relying on
+    /// [`IdPool`](litebox::utils::id_pool::IdPool)'s hint+wrap to quarantine
+    /// recycled ids.
+    pub fn try_acquire_for_session(
+        &self,
+        session_id: u32,
+    ) -> Result<SessionToken<'_>, OpteeSmcReturnCode> {
+        let entry = self
+            .sessions
+            .get_entry(session_id)
+            .ok_or(OpteeSmcReturnCode::EBadCmd)?;
+        let snapshot_uuid = entry.ta_uuid;
+        let snapshot_single = entry.ta_flags.is_single_instance();
+        drop(entry);
+
+        if !self.active_sessions.lock().insert(session_id) {
+            return Err(OpteeSmcReturnCode::EThreadLimit);
         }
+        let mut token = SessionToken {
+            manager: self,
+            uuid_lock: None,
+            active_session_id: Some(session_id),
+        };
+
+        // Validate the snapshot under the marker. If the entry has changed
+        // identity (or vanished), our snapshot is stale; bail so the caller
+        // retries with a fresh view. Token's `Drop` releases the marker.
+        let entry_now = self
+            .sessions
+            .get_entry(session_id)
+            .ok_or(OpteeSmcReturnCode::EBadCmd)?;
+        if entry_now.ta_uuid != snapshot_uuid
+            || entry_now.ta_flags.is_single_instance() != snapshot_single
+        {
+            return Err(OpteeSmcReturnCode::EThreadLimit);
+        }
+
+        if snapshot_single {
+            // On failure, dropping `token` releases the marker we just took.
+            token.uuid_lock = Some(
+                self.try_acquire_uuid_lock(snapshot_uuid)
+                    .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
+            );
+        }
+        Ok(token)
     }
 
     /// Register a new session.
@@ -514,10 +640,10 @@ impl SessionManager {
     ///
     /// Callers tearing down on TA panic must have already called
     /// [`SessionMap::mark_sessions_dead_for_instance`] before invoking this,
-    /// so any handler that subsequently allocates a fresh per-UUID lock will
-    /// observe `Dead` on its re-read of the session entry. Callers on the
-    /// last-session-close path may skip the mark step — by that point there
-    /// are no sibling sessions to fence out.
+    /// so any handler that subsequently acquires its own [`SessionToken`]
+    /// for the UUID will observe `Dead` on its re-read of the session
+    /// entry. Callers on the last-session-close path may skip the mark
+    /// step — by that point there are no sibling sessions to fence out.
     pub fn remove_single_instance_if_same(
         &self,
         uuid: &TeeUuid,
@@ -552,58 +678,52 @@ impl SessionManager {
         self.instance_count() >= MAX_TA_INSTANCES
     }
 
-    /// Atomically reserve a creation slot and run `f` to create a new TA instance.
+    /// Drive an OpenSession to completion under the right serialization.
     ///
-    /// # Caller contract
+    /// Internally acquires the per-UUID `SpinMutex` for single-instance TAs
+    /// (or no lock for known multi-instance TAs), then either:
     ///
-    /// For single-instance TAs, **the caller MUST already hold the per-UUID
-    /// serialization lock** returned by [`SessionManager::single_instance_lock`]
-    /// for `uuid`. That lock is the sole guarantee that no other core is
-    /// creating, reusing, or tearing down an instance for this UUID
-    /// concurrently — this function does NOT re-establish that exclusion
-    /// itself. Violating this contract can produce duplicate single-instance
-    /// TAs cached under the same UUID and break the single-instance invariant.
+    /// - Calls `f(Some(existing))` if a cached single-instance TA is found
+    ///   for `uuid`. The lock is held throughout the call so the existing
+    ///   instance cannot be torn down or replaced beneath `f`.
+    /// - Reserves a creation slot (atomic capacity check including in-flight
+    ///   creations) and calls `f(None)` to load and register a new instance.
+    ///   The slot is released when `f` returns, regardless of outcome.
     ///
-    /// Under that lock, this function re-checks the single-instance cache so a
-    /// freshly-cached instance from a prior holder of the per-UUID lock is
-    /// observed before starting a new load.
-    ///
-    /// For multi-instance TAs, each session gets its own independent
-    /// `TaInstance`. Multiple cores may create instances of the same UUID
-    /// concurrently and no per-UUID lock is required.
-    pub fn with_creation_slot<F>(
-        &self,
-        uuid: &TeeUuid,
-        is_single_instance: bool,
-        f: F,
-    ) -> Result<CreationReservation, OpteeSmcReturnCode>
+    /// The per-UUID lock is released when this function returns; `f` runs
+    /// under it. For multi-instance TAs each session gets its own
+    /// independent `TaInstance`, so no per-UUID exclusion is required.
+    pub fn with_creation_slot<F>(&self, uuid: &TeeUuid, f: F) -> Result<(), OpteeSmcReturnCode>
     where
-        F: FnOnce() -> Result<(), OpteeSmcReturnCode>,
+        F: FnOnce(Option<Arc<TaInstance>>) -> Result<(), OpteeSmcReturnCode>,
     {
+        let token = self.try_acquire_for_open(*uuid)?;
+        let is_single_instance = token.uuid_lock.is_some();
+
+        // For single-instance TAs the per-UUID lock above keeps our UUID's
+        // cache entry stable. For multi-instance we don't consult the cache.
+        if is_single_instance && let Some(existing) = self.single_instance_cache.get(uuid) {
+            return f(Some(existing));
+        }
+
         {
             let mut state = self.creation_state.lock();
-
-            if is_single_instance && let Some(existing) = self.single_instance_cache.get(uuid) {
-                return Ok(CreationReservation::ExistingSingleInstance(existing));
-            }
-
             // Capacity check including in-flight creations.
             let total = self.instance_count() + state.pending_count;
             if total >= MAX_TA_INSTANCES {
                 return Err(OpteeSmcReturnCode::ENomem);
             }
-
             state.pending_count += 1;
         }
 
-        let result = f();
+        let result = f(None);
 
         {
             let mut state = self.creation_state.lock();
             state.pending_count = state.pending_count.saturating_sub(1);
         }
 
-        result.map(|()| CreationReservation::SlotReserved)
+        result
     }
 }
 

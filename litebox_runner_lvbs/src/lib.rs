@@ -44,8 +44,7 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{
-    ActiveSessionGuard, CreationReservation, SessionIdGuard, SessionManager, SessionTarget,
-    TaInstance, allocate_session_id,
+    SessionIdGuard, SessionManager, SessionTarget, SessionToken, TaInstance, allocate_session_id,
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
@@ -518,44 +517,24 @@ fn handle_open_session(
     let client_identity = ta_req_info.client_identity;
     let params = &ta_req_info.params;
 
-    // Look up cached TA flags to determine single vs multi-instance.
-    // For the first-ever load of a UUID (no cached flags), conservatively
-    // assume single-instance to preserve all safety invariants.
-    let is_single_instance = session_manager()
-        .get_known_flags(&ta_uuid)
-        .is_none_or(|f| f.is_single_instance());
-
-    let single_instance_lock =
-        is_single_instance.then(|| session_manager().single_instance_lock(ta_uuid));
-    let _single_instance_guard = if let Some(lock) = single_instance_lock.as_ref() {
-        Some(lock.try_lock().ok_or(OpteeSmcReturnCode::EThreadLimit)?)
-    } else {
-        None
-    };
-
-    // Resolve or create the TA instance. For single-instance TAs, the UUID
-    // lock above serializes creation, reuse, and teardown for this TA.
-    match session_manager().with_creation_slot(&ta_uuid, is_single_instance, || {
-        open_session_new_instance(
+    session_manager().with_creation_slot(&ta_uuid, |existing| match existing {
+        Some(instance) => open_session_single_instance(
+            msg_args,
+            msg_args_phys_addr,
+            instance,
+            params,
+            ta_uuid,
+            &ta_req_info,
+        ),
+        None => open_session_new_instance(
             msg_args,
             msg_args_phys_addr,
             params,
             ta_uuid,
             client_identity,
             &ta_req_info,
-        )
-    }) {
-        Ok(CreationReservation::ExistingSingleInstance(existing)) => open_session_single_instance(
-            msg_args,
-            msg_args_phys_addr,
-            existing.clone(),
-            params,
-            ta_uuid,
-            &ta_req_info,
         ),
-        Ok(CreationReservation::SlotReserved) => Ok(()),
-        Err(e) => Err(e),
-    }
+    })
 }
 
 /// Open a new session on an existing single-instance TA.
@@ -637,9 +616,9 @@ fn open_session_single_instance(
         );
 
         // Write error response BEFORE switching page tables (accesses user memory).
-        // The per-UUID lock held by the caller of `handle_open_session` keeps
-        // another core from tearing down the active page table while this core
-        // is copying TA outputs.
+        // The session token held by `with_creation_slot` keeps another core
+        // from tearing down the active page table while this core is copying
+        // TA outputs.
         let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
@@ -655,10 +634,10 @@ fn open_session_single_instance(
         if return_code == TeeResult::TargetDead {
             debug_serial_println!("Single-instance TA panicked during OpenSession, cleaning up");
 
-            // Mark sibling sessions dead BEFORE evicting the per-UUID lock
-            // (inside `remove_single_instance_if_same`). Otherwise a racing
-            // handler could allocate a fresh per-UUID lock and walk past a
-            // still-Live session entry.
+            // Mark sibling sessions dead BEFORE evicting the cached single
+            // instance. Otherwise a racing handler that subsequently
+            // acquires its own session token for the UUID could walk past
+            // a still-Live session entry.
             session_manager()
                 .sessions()
                 .mark_sessions_dead_for_instance(&instance_arc);
@@ -955,19 +934,16 @@ fn open_session_new_instance(
 
 /// Tear down a `Dead` session entry observed at Invoke/Close handler entry.
 ///
-/// Consumes `active_guard` so it is dropped immediately after `unregister_session`
-/// recycles the id — the ordering matters: subsequent SMCs for `session_id` then
-/// see the new session (or `None`), neither of which depends on our guard.
+/// Consumes `token`; serialization is released at the end of this function.
 fn finalize_dead_session(
     session_id: u32,
-    active_guard: ActiveSessionGuard<'_>,
+    _token: SessionToken<'_>,
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
     return_code: TeeResult,
     log_prefix: &str,
 ) -> Result<(), OpteeSmcReturnCode> {
     session_manager().unregister_session(session_id);
-    drop(active_guard);
     msg_args.ret = return_code;
     msg_args.ret_origin = TeeOrigin::Tee;
     write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
@@ -997,35 +973,16 @@ fn handle_invoke_command(
     let params = &ta_req_info.params;
     let session_id = ta_req_info.session;
 
-    // Get the session entry from the session map (need full entry for potential cleanup)
-    let session_entry = session_manager()
-        .get_session_entry(session_id)
-        .ok_or(OpteeSmcReturnCode::EBadCmd)?;
-    // Reserve this session id against concurrent SMC entry by another core.
-    let active_guard = session_manager()
-        .try_activate_session(session_id)
-        .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
-    // For single-instance TAs, also take the per-UUID lock so sibling sessions
-    // on the same TA serialize against us.
-    let single_instance_lock = session_entry
-        .ta_flags
-        .is_single_instance()
-        .then(|| session_manager().single_instance_lock(session_entry.ta_uuid));
-    let _single_instance_guard = if let Some(lock) = single_instance_lock.as_ref() {
-        Some(lock.try_lock().ok_or(OpteeSmcReturnCode::EThreadLimit)?)
-    } else {
-        None
-    };
-    // Re-read after acquiring both serialization primitives to pick up any
-    // concurrent transition to `Dead` or removal that happened while we were
-    // waiting on the locks above.
+    let token = session_manager().try_acquire_for_session(session_id)?;
+    // Re-read under the token to pick up any concurrent transition to
+    // `Dead` or removal that happened during acquisition.
     let session_entry = session_manager()
         .get_session_entry(session_id)
         .ok_or(OpteeSmcReturnCode::EBadCmd)?;
     let SessionTarget::Live(instance_arc) = session_entry.target.clone() else {
         return finalize_dead_session(
             session_id,
-            active_guard,
+            token,
             msg_args,
             msg_args_phys_addr,
             TeeResult::TargetDead,
@@ -1076,9 +1033,8 @@ fn handle_invoke_command(
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
     // Write response BEFORE switching page tables (accesses user memory).
-    // The active-session guard and (for single-instance) per-UUID lock prevent
-    // another core from tearing down the active page table while this core is
-    // copying TA outputs.
+    // The session token prevents another core from tearing down the active
+    // page table while this core is copying TA outputs.
     let write_result = write_msg_args_to_normal_world(
         msg_args,
         msg_args_phys_addr,
@@ -1101,9 +1057,9 @@ fn handle_invoke_command(
         let ta_flags = session_entry.ta_flags;
 
         if ta_flags.is_single_instance() {
-            // Mark siblings dead BEFORE evicting the per-UUID lock (inside
-            // `remove_single_instance_if_same`). Otherwise a racing handler
-            // could allocate a fresh per-UUID lock and walk past a still-Live
+            // Mark siblings dead BEFORE evicting the cached single instance.
+            // Otherwise a racing handler that subsequently acquires its own
+            // session token for the UUID could walk past a still-Live
             // session entry.
             session_manager()
                 .sessions()
@@ -1112,10 +1068,6 @@ fn handle_invoke_command(
         }
 
         session_manager().unregister_session(session_id);
-        // Release the active-session slot before the recycled id can race a
-        // new OpenSession; the session is gone from the map so any concurrent
-        // SMC for this id sees `None` regardless.
-        drop(active_guard);
 
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
@@ -1153,33 +1105,15 @@ fn handle_close_session(
 
     debug_serial_println!("CloseSession: session_id={}", session_id);
 
-    // Get the session entry from the session map
-    let session_entry = session_manager()
-        .get_session_entry(session_id)
-        .ok_or(OpteeSmcReturnCode::EBadCmd)?;
-    // Reserve this session id against concurrent SMC entry by another core.
-    let active_guard = session_manager()
-        .try_activate_session(session_id)
-        .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
-    // For single-instance TAs, also take the per-UUID lock so sibling sessions
-    // on the same TA serialize against us.
-    let single_instance_lock = session_entry
-        .ta_flags
-        .is_single_instance()
-        .then(|| session_manager().single_instance_lock(session_entry.ta_uuid));
-    let _single_instance_guard = if let Some(lock) = single_instance_lock.as_ref() {
-        Some(lock.try_lock().ok_or(OpteeSmcReturnCode::EThreadLimit)?)
-    } else {
-        None
-    };
-    // Re-read after acquiring both serialization primitives.
+    let token = session_manager().try_acquire_for_session(session_id)?;
+    // Re-read under the token.
     let session_entry = session_manager()
         .get_session_entry(session_id)
         .ok_or(OpteeSmcReturnCode::EBadCmd)?;
     let SessionTarget::Live(instance_arc) = session_entry.target.clone() else {
         return finalize_dead_session(
             session_id,
-            active_guard,
+            token,
             msg_args,
             msg_args_phys_addr,
             TeeResult::Success,
@@ -1223,12 +1157,9 @@ fn handle_close_session(
         None,
     );
 
-    // Remove the session entry from the map
+    // Remove the session entry from the map. The session token drops at
+    // the end of this function.
     let removed_entry = session_manager().unregister_session(session_id);
-    // Release the active-session slot before the recycled id can race a
-    // new OpenSession; the session is gone from the map so any concurrent
-    // SMC for this id sees `None` regardless.
-    drop(active_guard);
 
     // Check if this was the last session using the TA instance by counting
     // remaining sessions that reference this instance.
@@ -1249,9 +1180,9 @@ fn handle_close_session(
                 return write_result;
             }
 
-            // Clear single-instance cache (and evict its per-UUID lock) if this
-            // was a single-instance TA. No sibling sessions remain on this
-            // instance, so we don't need to mark anything `Dead` first.
+            // Clear the cached single instance if this was a single-instance TA.
+            // No sibling sessions remain, so we don't need to mark anything
+            // `Dead` first.
             if entry.ta_flags.is_single_instance() {
                 let _ =
                     session_manager().remove_single_instance_if_same(&entry.ta_uuid, &instance_arc);
