@@ -1771,6 +1771,7 @@ dependencies = [
  "litebox_platform_multiplex",
  "litebox_util_log",
  "thiserror",
+ "zerocopy",
 ]
 
 [[package]]

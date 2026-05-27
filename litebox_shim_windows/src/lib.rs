@@ -46,6 +46,31 @@ pub(crate) type WindowsFS = litebox::fs::layered::FileSystem<
 pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
 impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
+fn write_value<T>(address: usize, value: T) -> Option<()>
+where
+    T: zerocopy::FromBytes + zerocopy::IntoBytes,
+{
+    use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+    let ptr = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<T>::from_usize(
+        address,
+    );
+    ptr.write_at_offset(0, value)
+}
+
+fn write_slice<T>(address: usize, values: &[T]) -> Option<()>
+where
+    T: Copy + zerocopy::FromBytes + zerocopy::IntoBytes,
+{
+    use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+    let ptr = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<T>::from_usize(
+        address,
+    );
+    for (index, value) in values.iter().copied().enumerate() {
+        ptr.write_at_offset(index.try_into().ok()?, value)?;
+    }
+    Some(())
+}
+
 /// Builds a Windows NT shim instance.
 pub struct WindowsShimBuilder {
     litebox: LiteBox<Platform>,

@@ -4,11 +4,10 @@
 //! PE loader-facing parser and mapper.
 //!
 //! This module parses PE metadata and maps images through platform-provided traits.
-
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use core::cmp;
 use core::mem::size_of;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use object::endian::LittleEndian as LE;
 use object::pe;
@@ -73,9 +72,41 @@ struct TrampolineHeader64 {
 const TRAMPOLINE_MAGIC: [u8; 8] = *b"LITEBOX0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PeDataDirectory {
-    virtual_address: u32,
-    size: u32,
+pub struct PeDataDirectory {
+    /// Relative virtual address
+    pub rva: usize,
+    pub size: usize,
+}
+
+/// Maximum number of entries in `ntdll!KiUserInvertedFunctionTable`.
+pub const MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE: u32 = 512;
+
+/// Memory layout of this struct:
+///
+/// ```text
+/// +-----------------------------------+
+/// | KiUserInvertedFunctionTableHeader |
+/// +-----------------------------------+
+/// | KiUserInvertedFunctionTableEntry[MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE] |
+/// +-----------------------------------+
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct KiUserInvertedFunctionTableHeader {
+    pub current_size: u32,
+    pub maximum_size: u32,
+    pub epoch: u32,
+    pub overflow: u8,
+    pub padding_0: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct KiUserInvertedFunctionTableEntry {
+    pub exception_directory_address: usize,
+    pub image_base: usize,
+    pub image_size: u32,
+    pub size_of_table: u32,
 }
 
 /// Errors that can occur when parsing a PE file.
@@ -107,6 +138,18 @@ pub enum PeLoadError<E> {
     RelocationRequired,
     #[error("unsupported PE base relocation type {0}")]
     UnsupportedRelocation(u16),
+    #[error(transparent)]
+    Fault(#[from] Fault),
+}
+
+/// Errors that can occur when parsing the export table of a loaded PE image.
+#[derive(Debug, Error)]
+pub enum PeExportError {
+    #[error("invalid PE export table")]
+    InvalidImage,
+    /// A PE export field overflowed the host's `usize` representation.
+    #[error("PE export field overflow")]
+    Overflow,
     #[error(transparent)]
     Fault(#[from] Fault),
 }
@@ -158,6 +201,18 @@ impl PeParsedFile {
     #[must_use]
     pub fn has_trampoline(&self) -> bool {
         self.trampoline.is_some()
+    }
+
+    /// Returns the PE image size from the optional header.
+    #[must_use]
+    pub fn image_size(&self) -> usize {
+        self.image.size_of_image
+    }
+
+    /// Returns the exception directory, if present.
+    #[must_use]
+    pub fn exception_directory(&self) -> Option<PeDataDirectory> {
+        self.data_directory(pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION)
     }
 
     /// Load the PE image into memory.
@@ -298,6 +353,146 @@ impl PeParsedFile {
         })
     }
 
+    /// Look up selected named exports from an already-loaded PE image.
+    ///
+    /// The export name table is scanned once. The returned vector has the same
+    /// order as `names`; entries are `None` when the image does not export that
+    /// name as a concrete address.
+    pub fn find_export_addresses(
+        &self,
+        base_addr: usize,
+        mem: &mut impl AccessMemory,
+        names: &[&str],
+    ) -> Result<Vec<Option<usize>>, PeExportError> {
+        let mut addresses = Vec::new();
+        addresses.resize(names.len(), None);
+        if names.is_empty() {
+            return Ok(addresses);
+        }
+
+        let Some(export_dir) = self
+            .data_directories
+            .get(pe::IMAGE_DIRECTORY_ENTRY_EXPORT)
+            .filter(|directory| directory.rva != 0 && directory.size != 0)
+        else {
+            return Ok(addresses);
+        };
+
+        let export_rva = export_dir.rva;
+        let export_size = export_dir.size;
+        if export_size < size_of::<pe::ImageExportDirectory>() {
+            return Err(PeExportError::InvalidImage);
+        }
+        let export_end_rva = checked_add_export(export_rva, export_size)?;
+        if export_end_rva > self.image.size_of_image {
+            return Err(PeExportError::InvalidImage);
+        }
+
+        let directory_address = image_address(
+            base_addr,
+            self.image.size_of_image,
+            export_rva,
+            size_of::<pe::ImageExportDirectory>(),
+        )?;
+        let directory: pe::ImageExportDirectory = mem_read_pod(mem, directory_address)?;
+
+        let function_count = directory.number_of_functions.get(LE) as usize;
+        let name_count = directory.number_of_names.get(LE) as usize;
+        let address_table_rva = directory.address_of_functions.get(LE) as usize;
+        let name_table_rva = directory.address_of_names.get(LE) as usize;
+        let name_ordinal_table_rva = directory.address_of_name_ordinals.get(LE) as usize;
+
+        if function_count != 0 && address_table_rva == 0 {
+            return Err(PeExportError::InvalidImage);
+        }
+        validate_image_range(
+            self.image.size_of_image,
+            address_table_rva,
+            checked_mul_export(function_count, size_of::<u32>())?,
+        )?;
+        if name_count == 0 {
+            return Ok(addresses);
+        }
+        if name_table_rva == 0 || name_ordinal_table_rva == 0 {
+            return Err(PeExportError::InvalidImage);
+        }
+        validate_image_range(
+            self.image.size_of_image,
+            name_table_rva,
+            checked_mul_export(name_count, size_of::<u32>())?,
+        )?;
+        validate_image_range(
+            self.image.size_of_image,
+            name_ordinal_table_rva,
+            checked_mul_export(name_count, size_of::<u16>())?,
+        )?;
+
+        let mut found = 0;
+        for name_index in 0..name_count {
+            let name_pointer_address = image_address(
+                base_addr,
+                self.image.size_of_image,
+                checked_add_export(name_table_rva, name_index * size_of::<u32>())?,
+                size_of::<u32>(),
+            )?;
+            let name_rva = mem_read_u32(mem, name_pointer_address)? as usize;
+            let export_name =
+                read_c_string_at_rva(base_addr, self.image.size_of_image, mem, name_rva, None)?;
+            let Some(requested_index) = names.iter().position(|name| *name == export_name) else {
+                continue;
+            };
+            if addresses[requested_index].is_some() {
+                continue;
+            }
+
+            let ordinal_index_address = image_address(
+                base_addr,
+                self.image.size_of_image,
+                checked_add_export(name_ordinal_table_rva, name_index * size_of::<u16>())?,
+                size_of::<u16>(),
+            )?;
+            let ordinal_index = mem_read_export_u16(mem, ordinal_index_address)? as usize;
+            if ordinal_index >= function_count {
+                return Err(PeExportError::InvalidImage);
+            }
+
+            let function_rva_address = image_address(
+                base_addr,
+                self.image.size_of_image,
+                checked_add_export(address_table_rva, ordinal_index * size_of::<u32>())?,
+                size_of::<u32>(),
+            )?;
+            let function_rva = mem_read_u32(mem, function_rva_address)?;
+            if let Some(address) = export_address(
+                base_addr,
+                self.image.size_of_image,
+                export_rva,
+                export_end_rva,
+                function_rva,
+            )? {
+                addresses[requested_index] = Some(address);
+                found += 1;
+                if found == names.len() {
+                    break;
+                }
+            }
+        }
+
+        Ok(addresses)
+    }
+
+    fn data_directory(&self, index: usize) -> Option<PeDataDirectory> {
+        let directory = self
+            .data_directories
+            .get(index)
+            .filter(|directory| directory.rva != 0 && directory.size != 0)?;
+        directory
+            .rva
+            .checked_add(directory.size)
+            .filter(|end| *end <= self.image.size_of_image)?;
+        Some(*directory)
+    }
+
     /// Parse the LiteBox PE trampoline footer, if present.
     ///
     /// The trampoline RVA is relative to the image base. The first pointer-sized
@@ -436,8 +631,8 @@ impl PeParsedFile {
             .ok_or(PeLoadError::RelocationRequired)?;
 
         let image_end = checked_add_invalid!(base_addr, self.image.size_of_image)?;
-        let dir_addr = checked_add_invalid!(base_addr, reloc_dir.virtual_address as usize)?;
-        let dir_end = checked_add_invalid!(dir_addr, reloc_dir.size as usize)?;
+        let dir_addr = checked_add_invalid!(base_addr, reloc_dir.rva)?;
+        let dir_end = checked_add_invalid!(dir_addr, reloc_dir.size)?;
 
         // `delta` represents a possibly-negative offset via two's-complement
         // wrap in `usize`; the signed cast preserves the sign for `wrapping_add_signed`.
@@ -488,6 +683,102 @@ impl PeParsedFile {
 
         Ok(())
     }
+}
+
+fn export_address(
+    base_addr: usize,
+    image_size: usize,
+    export_rva: usize,
+    export_end_rva: usize,
+    function_rva: u32,
+) -> Result<Option<usize>, PeExportError> {
+    if function_rva == 0 {
+        return Ok(None);
+    }
+
+    let function_rva = function_rva as usize;
+    if function_rva >= export_rva && function_rva < export_end_rva {
+        return Ok(None);
+    }
+
+    image_address(base_addr, image_size, function_rva, 1).map(Some)
+}
+
+fn read_c_string_at_rva(
+    base_addr: usize,
+    image_size: usize,
+    mem: &mut impl AccessMemory,
+    rva: usize,
+    end_rva: Option<usize>,
+) -> Result<String, PeExportError> {
+    let end_rva = end_rva.unwrap_or(image_size);
+    if rva >= end_rva || end_rva > image_size {
+        return Err(PeExportError::InvalidImage);
+    }
+
+    let mut bytes = Vec::new();
+    for current_rva in rva..end_rva {
+        let address = image_address(base_addr, image_size, current_rva, 1)?;
+        let byte = mem_read_u8(mem, address)?;
+        if byte == 0 {
+            return String::from_utf8(bytes).map_err(|_| PeExportError::InvalidImage);
+        }
+        bytes.push(byte);
+    }
+
+    Err(PeExportError::InvalidImage)
+}
+
+fn mem_read_pod<T: Pod>(mem: &mut impl AccessMemory, address: usize) -> Result<T, PeExportError> {
+    let mut buf = alloc::vec![0u8; size_of::<T>()];
+    mem.read(address, &mut buf)?;
+    let (value, _) =
+        object::pod::from_bytes::<T>(&buf).map_err(|()| PeExportError::InvalidImage)?;
+    Ok(*value)
+}
+
+fn mem_read_u8(mem: &mut impl AccessMemory, address: usize) -> Result<u8, PeExportError> {
+    let mut buf = [0u8; size_of::<u8>()];
+    mem.read(address, &mut buf)?;
+    Ok(buf[0])
+}
+
+fn mem_read_u32(mem: &mut impl AccessMemory, address: usize) -> Result<u32, PeExportError> {
+    let mut buf = [0u8; size_of::<u32>()];
+    mem.read(address, &mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn mem_read_export_u16(mem: &mut impl AccessMemory, address: usize) -> Result<u16, PeExportError> {
+    let mut buf = [0u8; size_of::<u16>()];
+    mem.read(address, &mut buf)?;
+    Ok(u16::from_le_bytes(buf))
+}
+
+fn image_address(
+    base_addr: usize,
+    image_size: usize,
+    rva: usize,
+    len: usize,
+) -> Result<usize, PeExportError> {
+    validate_image_range(image_size, rva, len)?;
+    checked_add_export(base_addr, rva)
+}
+
+fn validate_image_range(image_size: usize, rva: usize, len: usize) -> Result<(), PeExportError> {
+    let end = checked_add_export(rva, len)?;
+    if end > image_size {
+        return Err(PeExportError::InvalidImage);
+    }
+    Ok(())
+}
+
+fn checked_add_export(left: usize, right: usize) -> Result<usize, PeExportError> {
+    left.checked_add(right).ok_or(PeExportError::Overflow)
+}
+
+fn checked_mul_export(left: usize, right: usize) -> Result<usize, PeExportError> {
+    left.checked_mul(right).ok_or(PeExportError::Overflow)
 }
 
 fn mem_read_u16<E>(mem: &mut impl AccessMemory, address: usize) -> Result<u16, PeLoadError<E>> {
@@ -615,12 +906,9 @@ fn parse_headers<F: ReadAt>(
     let data_directories: Vec<_> = raw_dirs
         .iter()
         .map(|dir| {
-            let virtual_address = dir.virtual_address.get(LE);
-            let size = dir.size.get(LE);
-            PeDataDirectory {
-                virtual_address,
-                size,
-            }
+            let rva = dir.virtual_address.get(LE) as usize;
+            let size = dir.size.get(LE) as usize;
+            PeDataDirectory { rva, size }
         })
         .collect();
 
@@ -816,4 +1104,160 @@ fn section_name_eq(section: &pe::ImageSectionHeader, name: &[u8]) -> bool {
         .position(|byte| *byte == 0)
         .unwrap_or(section.name.len());
     &section.name[..end] == name
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{vec, vec::Vec};
+
+    use super::*;
+
+    const TEST_BASE: usize = 0x1000_0000;
+    const TEST_IMAGE_SIZE: usize = 0x5000;
+    const EXPORT_RVA: usize = 0x2000;
+    const EXPORT_RVA_U32: u32 = 0x2000;
+
+    struct TestMemory {
+        base_addr: usize,
+        data: Vec<u8>,
+    }
+
+    impl TestMemory {
+        fn new(base_addr: usize, len: usize) -> Self {
+            Self {
+                base_addr,
+                data: vec![0; len],
+            }
+        }
+
+        fn put_u16(&mut self, rva: usize, value: u16) {
+            self.put_bytes(rva, &value.to_le_bytes());
+        }
+
+        fn put_u32(&mut self, rva: usize, value: u32) {
+            self.put_bytes(rva, &value.to_le_bytes());
+        }
+
+        fn put_bytes(&mut self, rva: usize, bytes: &[u8]) {
+            let end = rva + bytes.len();
+            self.data[rva..end].copy_from_slice(bytes);
+        }
+    }
+
+    impl AccessMemory for TestMemory {
+        fn read(&mut self, address: usize, buf: &mut [u8]) -> Result<(), Fault> {
+            let offset = address.checked_sub(self.base_addr).ok_or(Fault)?;
+            let end = offset.checked_add(buf.len()).ok_or(Fault)?;
+            let data = self.data.get(offset..end).ok_or(Fault)?;
+            buf.copy_from_slice(data);
+            Ok(())
+        }
+
+        fn write(&mut self, address: usize, data: &[u8]) -> Result<(), Fault> {
+            let offset = address.checked_sub(self.base_addr).ok_or(Fault)?;
+            let end = offset.checked_add(data.len()).ok_or(Fault)?;
+            let dst = self.data.get_mut(offset..end).ok_or(Fault)?;
+            dst.copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    fn parsed_file_with_export_directory(export_rva: u32, export_size: u32) -> PeParsedFile {
+        PeParsedFile {
+            image: PeImageInfo {
+                machine: pe::IMAGE_FILE_MACHINE_AMD64,
+                characteristics: pe::IMAGE_FILE_EXECUTABLE_IMAGE,
+                image_base: TEST_BASE,
+                entry_point_rva: 0x1000,
+                size_of_image: TEST_IMAGE_SIZE,
+                size_of_headers: PAGE_SIZE,
+                section_alignment: PAGE_SIZE,
+                file_alignment: 0x200,
+                subsystem: 0,
+                dll_characteristics: 0,
+                size_of_heap_reserve: 0,
+                size_of_heap_commit: 0,
+            },
+            sections: Vec::new(),
+            data_directories: vec![PeDataDirectory {
+                rva: export_rva as usize,
+                size: export_size as usize,
+            }],
+            trampoline: None,
+        }
+    }
+
+    fn write_export_directory(memory: &mut TestMemory) {
+        memory.put_u32(EXPORT_RVA + 16, 1);
+        memory.put_u32(EXPORT_RVA + 20, 2);
+        memory.put_u32(EXPORT_RVA + 24, 2);
+        memory.put_u32(EXPORT_RVA + 28, 0x2040);
+        memory.put_u32(EXPORT_RVA + 32, 0x2050);
+        memory.put_u32(EXPORT_RVA + 36, 0x2058);
+
+        memory.put_u32(0x2040, 0x1100);
+        memory.put_u32(0x2044, 0x2060);
+        memory.put_u32(0x2050, 0x2070);
+        memory.put_u32(0x2054, 0x2080);
+        memory.put_u16(0x2058, 0);
+        memory.put_u16(0x205a, 1);
+        memory.put_bytes(0x2060, b"KERNEL32.Sleep\0");
+        memory.put_bytes(0x2070, b"LocalFunction\0");
+        memory.put_bytes(0x2080, b"ForwardedFunction\0");
+    }
+
+    #[test]
+    fn find_export_addresses_returns_missing_entries_without_export_directory() {
+        let parsed = parsed_file_with_export_directory(0, 0);
+        let mut memory = TestMemory::new(TEST_BASE, TEST_IMAGE_SIZE);
+
+        let addresses = parsed
+            .find_export_addresses(TEST_BASE, &mut memory, &["LocalFunction"])
+            .unwrap();
+
+        assert_eq!(addresses, vec![None]);
+    }
+
+    #[test]
+    fn find_export_addresses_returns_requested_addresses_in_order() {
+        let parsed = parsed_file_with_export_directory(EXPORT_RVA_U32, 0x100);
+        let mut memory = TestMemory::new(TEST_BASE, TEST_IMAGE_SIZE);
+        write_export_directory(&mut memory);
+
+        let addresses = parsed
+            .find_export_addresses(
+                TEST_BASE,
+                &mut memory,
+                &["ForwardedFunction", "Missing", "LocalFunction"],
+            )
+            .unwrap();
+
+        assert_eq!(addresses, vec![None, None, Some(TEST_BASE + 0x1100)]);
+    }
+
+    #[test]
+    fn find_export_addresses_rejects_bad_name_ordinal() {
+        let parsed = parsed_file_with_export_directory(EXPORT_RVA_U32, 0x100);
+        let mut memory = TestMemory::new(TEST_BASE, TEST_IMAGE_SIZE);
+        write_export_directory(&mut memory);
+        memory.put_u16(0x2058, 2);
+
+        let error = parsed
+            .find_export_addresses(TEST_BASE, &mut memory, &["LocalFunction"])
+            .unwrap_err();
+
+        assert!(matches!(error, PeExportError::InvalidImage));
+    }
+
+    #[test]
+    fn find_export_addresses_rejects_short_export_directory() {
+        let parsed = parsed_file_with_export_directory(EXPORT_RVA_U32, 1);
+        let mut memory = TestMemory::new(TEST_BASE, TEST_IMAGE_SIZE);
+
+        let error = parsed
+            .find_export_addresses(TEST_BASE, &mut memory, &["LocalFunction"])
+            .unwrap_err();
+
+        assert!(matches!(error, PeExportError::InvalidImage));
+    }
 }

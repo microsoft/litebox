@@ -3,6 +3,7 @@
 
 use alloc::{sync::Arc, vec::Vec};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
+use litebox::utils::TruncateExt;
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{
@@ -11,8 +12,9 @@ use litebox::{
     platform::RawPointerProvider,
 };
 use litebox_common_windows::loader::{
-    AccessMemory, Fault, MapMemory, MappingInfo, PAGE_SIZE, PeLoadError, PeParseError,
-    PeParsedFile, Protection, ReadAt, page_align_down,
+    AccessMemory, Fault, KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
+    MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, MapMemory, MappingInfo, PAGE_SIZE, PeExportError,
+    PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt, page_align_down,
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
@@ -21,6 +23,15 @@ use crate::ShimFS;
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32/ntdll.dll"];
+const NTDLL_EXPORT_NAMES: &[&str] = &[
+    "LdrInitializeThunk",
+    "RtlUserThreadStart",
+    "KiUserInvertedFunctionTable",
+];
+const NTDLL_LDR_INITIALIZE_THUNK_EXPORT: usize = 0;
+const NTDLL_RTL_USER_THREAD_START_EXPORT: usize = 1;
+const NTDLL_KI_USER_INVERTED_FUNCTION_TABLE_EXPORT: usize = 2;
+const RUNTIME_FUNCTION_ENTRY_SIZE: usize = 12;
 const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
@@ -46,6 +57,13 @@ impl<'a, FS: ShimFS> PeLoader<'a, FS> {
         let application_entry_point = image.mapping.entry_point;
         let ntdll = load_ntdll(self.fs.clone(), self.page_manager, NTDLL_PATHS)?;
 
+        if let Some(ntdll) = &ntdll {
+            if !ntdll.image.parsed.has_trampoline() {
+                return Err(WindowsLoadError::UnrewrittenNtDll);
+            }
+            Self::initialize_ki_user_inverted_function_table(&image, ntdll)?;
+        }
+
         let length =
             NonZeroPageSize::new(INITIAL_STACK_SIZE).ok_or(PeImageAccessError::AddressOverflow)?;
         // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` does not set
@@ -69,20 +87,99 @@ impl<'a, FS: ShimFS> PeLoader<'a, FS> {
         Ok(PeLoadInfo {
             entry_point: application_entry_point,
             stack_top,
-            ntdll_mapping: ntdll.map(|image| image.mapping),
+            ntdll_mapping: ntdll.map(|ntdll| ntdll.image.mapping),
         })
+    }
+
+    fn initialize_ki_user_inverted_function_table(
+        application: &LoadedImage,
+        ntdll: &LoadedNtDll,
+    ) -> Result<(), WindowsLoadError> {
+        let table_address = ntdll.exports.ki_user_inverted_function_table;
+
+        let mut entries = Vec::new();
+        for image in [&ntdll.image, application] {
+            if let Some(entry) = image.inverted_function_table_entry()? {
+                entries.push(entry);
+            }
+        }
+
+        let header = KiUserInvertedFunctionTableHeader {
+            current_size: entries.len().truncate(),
+            maximum_size: MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE,
+            epoch: 0,
+            overflow: 0,
+            padding_0: [0; 3],
+        };
+
+        // `KI_USER_INVERTED_FUNCTION_TABLE` lives in ntdll's writable `.mrdata` section.
+        crate::write_value(table_address, header).ok_or(PeImageAccessError::MemoryAccess)?;
+        let entries_address = table_address
+            .checked_add(core::mem::size_of::<KiUserInvertedFunctionTableHeader>())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        crate::write_slice(entries_address, &entries).ok_or(PeImageAccessError::MemoryAccess)?;
+
+        litebox_util_log::debug!(
+            table:% = format_args!("{table_address:#x}");
+            "Initialized ntdll!KiUserInvertedFunctionTable"
+        );
+
+        Ok(())
     }
 }
 
 struct LoadedImage {
     mapping: MappingInfo,
+    parsed: PeParsedFile,
+}
+
+impl LoadedImage {
+    fn inverted_function_table_entry(
+        &self,
+    ) -> Result<Option<KiUserInvertedFunctionTableEntry>, WindowsLoadError> {
+        let Some(exception_directory) = self.parsed.exception_directory() else {
+            return Ok(None);
+        };
+        if !exception_directory
+            .size
+            .is_multiple_of(RUNTIME_FUNCTION_ENTRY_SIZE)
+        {
+            return Err(WindowsLoadError::InvalidNtDllExceptionDirectory);
+        }
+
+        let exception_directory_address = self
+            .mapping
+            .base_addr
+            .checked_add(exception_directory.rva)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let size_of_image = u32::try_from(self.parsed.image_size())
+            .map_err(|_| PeImageAccessError::AddressOverflow)?;
+
+        Ok(Some(KiUserInvertedFunctionTableEntry {
+            exception_directory_address,
+            image_base: self.mapping.base_addr,
+            image_size: size_of_image,
+            size_of_table: u32::try_from(exception_directory.size)
+                .map_err(|_| PeImageAccessError::AddressOverflow)?,
+        }))
+    }
+}
+
+struct LoadedNtDll {
+    image: LoadedImage,
+    exports: NtDllExports,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NtDllExports {
+    ki_user_inverted_function_table: usize,
 }
 
 fn load_ntdll<FS: crate::ShimFS>(
     fs: Arc<FS>,
     page_manager: &crate::WindowsPageManager,
     ntdll_paths: &[&str],
-) -> Result<Option<LoadedImage>, WindowsLoadError> {
+) -> Result<Option<LoadedNtDll>, WindowsLoadError> {
     for path in ntdll_paths {
         match load_image_with_writable_sections(
             fs.clone(),
@@ -91,8 +188,9 @@ fn load_ntdll<FS: crate::ShimFS>(
             NTDLL_WRITABLE_SECTIONS,
         ) {
             Ok(image) => {
+                let exports = ntdll_exports(&image)?;
                 litebox_util_log::debug!(path:% = path; "Loaded guest ntdll.dll");
-                return Ok(Some(image));
+                return Ok(Some(LoadedNtDll { image, exports }));
             }
             Err(error) if is_missing_file_error(&error) => {}
             Err(error) => return Err(error),
@@ -134,7 +232,35 @@ fn load_image_with_writable_sections<FS: ShimFS>(
     let mapping = parsed
         .load_with_writable_sections(&mut mapper, &mut memory, writable_section_names)
         .map_err(WindowsLoadError::Load)?;
-    Ok(LoadedImage { mapping })
+    Ok(LoadedImage { mapping, parsed })
+}
+
+fn ntdll_exports(image: &LoadedImage) -> Result<NtDllExports, WindowsLoadError> {
+    let mut memory = PeImageMemory;
+    let addresses = image
+        .parsed
+        .find_export_addresses(image.mapping.base_addr, &mut memory, NTDLL_EXPORT_NAMES)
+        .map_err(WindowsLoadError::Export)?;
+
+    addresses
+        .get(NTDLL_LDR_INITIALIZE_THUNK_EXPORT)
+        .copied()
+        .flatten()
+        .ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
+    addresses
+        .get(NTDLL_RTL_USER_THREAD_START_EXPORT)
+        .copied()
+        .flatten()
+        .ok_or(WindowsLoadError::MissingNtDllThreadEntrypoint)?;
+    let ki_user_inverted_function_table = addresses
+        .get(NTDLL_KI_USER_INVERTED_FUNCTION_TABLE_EXPORT)
+        .copied()
+        .flatten()
+        .ok_or(WindowsLoadError::MissingNtDllInvertedFunctionTable)?;
+
+    Ok(NtDllExports {
+        ki_user_inverted_function_table,
+    })
 }
 
 /// Errors that can occur while opening, parsing, and mapping a Windows PE image.
@@ -144,6 +270,8 @@ pub enum WindowsLoadError {
     Parse(#[source] PeParseError<PeImageAccessError>),
     #[error("failed to load PE image")]
     Load(#[source] PeLoadError<PeImageAccessError>),
+    #[error("failed to parse PE export table")]
+    Export(#[source] PeExportError),
     /// Accessing the PE backing file or its mapped memory failed.
     #[error(transparent)]
     Access(#[from] PeImageAccessError),
@@ -153,6 +281,12 @@ pub enum WindowsLoadError {
     /// Guest ntdll.dll does not export RtlUserThreadStart.
     #[error("guest ntdll.dll does not export RtlUserThreadStart")]
     MissingNtDllThreadEntrypoint,
+    /// Guest ntdll.dll does not export KiUserInvertedFunctionTable.
+    #[error("guest ntdll.dll does not export KiUserInvertedFunctionTable")]
+    MissingNtDllInvertedFunctionTable,
+    /// Guest ntdll.dll has an invalid exception directory.
+    #[error("guest ntdll.dll has an invalid exception directory")]
+    InvalidNtDllExceptionDirectory,
     /// Guest ntdll.dll has not been rewritten for LiteBox syscall/GS handling.
     #[error("guest ntdll.dll must be rewritten for LiteBox before entering its loader")]
     UnrewrittenNtDll,
@@ -415,4 +549,249 @@ fn page_range(address: usize, len: usize) -> Result<(usize, usize), PeImageAcces
         .and_then(|v| v.checked_next_multiple_of(PAGE_SIZE))
         .ok_or(PeImageAccessError::AddressOverflow)?;
     Ok((start, end - start))
+}
+
+#[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
+mod tests {
+    extern crate std;
+
+    use alloc::{string::String, vec, vec::Vec};
+
+    use super::*;
+
+    #[allow(non_snake_case)]
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(lp_module_name: *const u16) -> *mut core::ffi::c_void;
+        fn GetProcAddress(
+            h_module: *mut core::ffi::c_void,
+            lp_proc_name: *const core::ffi::c_char,
+        ) -> *mut core::ffi::c_void;
+        fn GetModuleFileNameW(
+            h_module: *mut core::ffi::c_void,
+            lp_filename: *mut u16,
+            n_size: u32,
+        ) -> u32;
+    }
+
+    #[test]
+    fn ntdll_exports_finds_ki_user_inverted_function_table() {
+        let ntdll = ntdll_module_base();
+        let loaded_ntdll = loaded_module_image(ntdll);
+
+        let exports = ntdll_exports(&loaded_ntdll).expect("failed to parse ntdll exports");
+        let expected_table = own_inverted_function_table() as usize;
+
+        assert_eq!(
+            exports.ki_user_inverted_function_table, expected_table,
+            "ntdll export lookup returned the wrong KiUserInvertedFunctionTable address"
+        );
+    }
+
+    #[test]
+    fn dumps_own_inverted_function_table() {
+        assert_eq!(
+            core::mem::size_of::<KiUserInvertedFunctionTableHeader>(),
+            16
+        );
+        assert_eq!(core::mem::size_of::<KiUserInvertedFunctionTableEntry>(), 24);
+
+        let table = own_inverted_function_table();
+        // SAFETY: `own_inverted_function_table` resolves a live data export from the
+        // current process's already-loaded ntdll. The header is copied immediately.
+        let header = unsafe { read_table_value::<KiUserInvertedFunctionTableHeader>(table) };
+
+        std::println!(
+            "ntdll!KiUserInvertedFunctionTable @ {:#x}: current_size={} maximum_size={} epoch={} overflow={}",
+            table as usize,
+            header.current_size,
+            header.maximum_size,
+            header.epoch,
+            header.overflow
+        );
+
+        assert!(header.maximum_size > 0);
+        assert!(header.maximum_size <= MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE);
+        assert!(header.current_size <= header.maximum_size);
+        assert!(header.current_size > 0);
+
+        let entries = read_inverted_function_table_entries(table, header.current_size);
+        for (index, entry) in entries.iter().enumerate() {
+            let binary_name = module_name_from_base(entry.image_base);
+            std::println!(
+                "  [{index}] binary=\"{}\" exception_directory={:#x} image_base={:#x} image_size={:#x} size_of_table={:#x}",
+                binary_name,
+                entry.exception_directory_address,
+                entry.image_base,
+                entry.image_size,
+                entry.size_of_table
+            );
+        }
+
+        assert_table_contains_entry(
+            &entries,
+            "ntdll.dll",
+            module_inverted_function_table_entry(ntdll_module_base()),
+        );
+        assert_table_contains_entry(
+            &entries,
+            "the test executable",
+            module_inverted_function_table_entry(application_module_base()),
+        );
+    }
+
+    fn own_inverted_function_table() -> *const u8 {
+        let ntdll = ntdll_module_base();
+
+        // SAFETY: The module handle was returned by `GetModuleHandleW`, and the
+        // symbol name is a valid NUL-terminated C string literal.
+        let table = unsafe { GetProcAddress(ntdll, c"KiUserInvertedFunctionTable".as_ptr()) };
+        assert!(
+            !table.is_null(),
+            "ntdll.dll does not export KiUserInvertedFunctionTable"
+        );
+
+        table.cast::<u8>()
+    }
+
+    fn ntdll_module_base() -> *mut core::ffi::c_void {
+        module_base(Some("ntdll.dll"))
+    }
+
+    fn application_module_base() -> *mut core::ffi::c_void {
+        module_base(None)
+    }
+
+    fn module_base(name: Option<&str>) -> *mut core::ffi::c_void {
+        let module_name: Option<Vec<u16>> = name.map(|name| {
+            let mut name: Vec<u16> = name.encode_utf16().collect();
+            name.push(0);
+            name
+        });
+        let module_name_ptr = module_name.as_ref().map_or(core::ptr::null(), Vec::as_ptr);
+        // SAFETY: The string is NUL-terminated and points to a process-owned buffer
+        // that remains alive for the duration of the call. A null pointer asks for
+        // the current process's executable module.
+        let module = unsafe { GetModuleHandleW(module_name_ptr) };
+        assert!(!module.is_null(), "module is not loaded in this process");
+
+        module
+    }
+
+    fn module_inverted_function_table_entry(
+        module: *mut core::ffi::c_void,
+    ) -> KiUserInvertedFunctionTableEntry {
+        let loaded_module = loaded_module_image(module);
+        loaded_module
+            .inverted_function_table_entry()
+            .expect("failed to build inverted function table entry")
+            .expect("loaded PE image has no exception directory")
+    }
+
+    fn loaded_module_image(module: *mut core::ffi::c_void) -> LoadedImage {
+        let base_addr = module as usize;
+        let mut module_memory = ModuleMemory {
+            base: base_addr as *const u8,
+        };
+        let parsed = PeParsedFile::parse(&mut module_memory)
+            .expect("failed to parse loaded PE image from memory");
+        LoadedImage {
+            mapping: MappingInfo {
+                base_addr,
+                image_size: parsed.image_size(),
+                entry_point: base_addr,
+            },
+            parsed,
+        }
+    }
+
+    fn module_name_from_base(image_base: usize) -> String {
+        let module = image_base as *mut core::ffi::c_void;
+        let mut buffer = vec![0u16; 260];
+        loop {
+            // SAFETY: `module` is the image base reported by ntdll's table, which is
+            // also the HMODULE for the loaded image. `buffer` is valid for `len` UTF-16
+            // code units and remains alive for the duration of the call.
+            let len = unsafe {
+                GetModuleFileNameW(
+                    module,
+                    buffer.as_mut_ptr(),
+                    u32::try_from(buffer.len()).unwrap(),
+                )
+            } as usize;
+            if len == 0 {
+                return String::from("<unknown>");
+            }
+            if len < buffer.len() {
+                return String::from_utf16_lossy(&buffer[..len]);
+            }
+            buffer.resize(buffer.len() * 2, 0);
+        }
+    }
+
+    fn read_inverted_function_table_entries(
+        table: *const u8,
+        current_size: u32,
+    ) -> Vec<KiUserInvertedFunctionTableEntry> {
+        let entries = table.wrapping_add(core::mem::size_of::<KiUserInvertedFunctionTableHeader>());
+        (0..current_size as usize)
+            .map(|index| {
+                let entry_address = entries
+                    .wrapping_add(index * core::mem::size_of::<KiUserInvertedFunctionTableEntry>());
+                // SAFETY: The header just read from ntdll says `current_size` entries are
+                // initialized immediately after the header in this same exported table.
+                unsafe { read_table_value::<KiUserInvertedFunctionTableEntry>(entry_address) }
+            })
+            .collect()
+    }
+
+    fn assert_table_contains_entry(
+        entries: &[KiUserInvertedFunctionTableEntry],
+        name: &str,
+        expected: KiUserInvertedFunctionTableEntry,
+    ) {
+        let actual = entries
+            .iter()
+            .find(|entry| entry.image_base == expected.image_base)
+            .unwrap_or_else(|| {
+                panic!("{name} was not present in the host inverted function table")
+            });
+
+        assert_eq!(
+            actual.exception_directory_address,
+            expected.exception_directory_address
+        );
+        assert_eq!(actual.image_size, expected.image_size);
+        assert_eq!(actual.size_of_table, expected.size_of_table);
+    }
+
+    unsafe fn read_table_value<T: zerocopy::FromBytes>(address: *const u8) -> T {
+        // SAFETY: The caller guarantees that `address` points to at least
+        // `size_of::<T>()` readable bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(address, core::mem::size_of::<T>()) };
+        T::read_from_bytes(bytes).expect("failed to read table value")
+    }
+
+    struct ModuleMemory {
+        base: *const u8,
+    }
+
+    impl ReadAt for ModuleMemory {
+        type Error = core::convert::Infallible;
+
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+            let offset: usize = offset.try_into().unwrap();
+            // SAFETY: The test only constructs `ModuleMemory` from live module image
+            // bases returned by `GetModuleHandleW`. `PeParsedFile::parse` reads PE
+            // headers and section headers, which remain mapped in loaded images.
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.base.add(offset), buf.as_mut_ptr(), buf.len());
+            }
+            Ok(())
+        }
+
+        fn size(&mut self) -> Result<u64, Self::Error> {
+            Ok(u64::MAX)
+        }
+    }
 }
