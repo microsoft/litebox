@@ -14,12 +14,15 @@
     clippy::similar_names
 )]
 
+use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::os::pty::{Pty, wait_child_timeout};
 use crate::register_handler;
 
 use super::TestOutcome;
@@ -48,6 +51,48 @@ struct Clone3Out {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+enum DropbearSessionStage {
+    ExecOnly,
+    Setsid,
+    DupStdio,
+    Tiocsctty,
+    Full,
+    FullBash,
+    FullSetidNetwork,
+}
+
+impl DropbearSessionStage {
+    fn label(self) -> &'static str {
+        match self {
+            DropbearSessionStage::ExecOnly => "exec_only",
+            DropbearSessionStage::Setsid => "setsid",
+            DropbearSessionStage::DupStdio => "dup_stdio",
+            DropbearSessionStage::Tiocsctty => "tiocsctty",
+            DropbearSessionStage::Full => "full",
+            DropbearSessionStage::FullBash => "full_bash",
+            DropbearSessionStage::FullSetidNetwork => "full_setid_network",
+        }
+    }
+
+    fn uses_pty_stdio(self) -> bool {
+        match self {
+            DropbearSessionStage::ExecOnly
+            | DropbearSessionStage::Setsid
+            | DropbearSessionStage::Tiocsctty => false,
+            DropbearSessionStage::DupStdio
+            | DropbearSessionStage::Full
+            | DropbearSessionStage::FullBash => true,
+            DropbearSessionStage::FullSetidNetwork => false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct DropbearSessionArgs {
+    stage: DropbearSessionStage,
+}
+
 // ─── Typed handler tokens ───────────────────────────────────────────
 
 const THREAD: HandlerToken<(), Clone3Out> = HandlerToken::new("clone3.thread");
@@ -60,6 +105,8 @@ const WITH_CGROUP: HandlerToken<Clone3ExecArgs, Clone3Out> =
 const VFORK: HandlerToken<(), Clone3Out> = HandlerToken::new("clone3.vfork");
 const DROPBEAR_VFORK: HandlerToken<(), Clone3Out> = HandlerToken::new("clone3.dropbear_vfork");
 const DROPBEAR_CLONE: HandlerToken<(), Clone3Out> = HandlerToken::new("clone.dropbear_vfork");
+const DROPBEAR_SESSION_SETUP: HandlerToken<DropbearSessionArgs, Clone3Out> =
+    HandlerToken::new("clone.dropbear_session_setup");
 
 // ─── Handlers ───────────────────────────────────────────────────────
 
@@ -131,6 +178,15 @@ async fn handle_dropbear_clone(
         .map_err(|e| HandlerError(format!("clone dropbear vfork task join: {e}")))
 }
 
+async fn handle_dropbear_session_setup(
+    args: DropbearSessionArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Clone3Out, HandlerError> {
+    tokio::task::spawn_blocking(move || run_clone_dropbear_session_setup(args.stage))
+        .await
+        .map_err(|e| HandlerError(format!("clone dropbear session setup task join: {e}")))
+}
+
 // ─── Registration ──────────────────────────────────────────────────
 
 pub(crate) fn register_clone3_matrix(reg: &mut Registry<'_>) {
@@ -142,6 +198,7 @@ pub(crate) fn register_clone3_matrix(reg: &mut Registry<'_>) {
     register_handler!(VFORK, handle_vfork);
     register_handler!(DROPBEAR_VFORK, handle_dropbear_vfork);
     register_handler!(DROPBEAR_CLONE, handle_dropbear_clone);
+    register_handler!(DROPBEAR_SESSION_SETUP, handle_dropbear_session_setup);
 
     for &agent in CL3_AGENTS {
         reg.single_agent_handler_test(
@@ -198,6 +255,46 @@ pub(crate) fn register_clone3_matrix(reg: &mut Registry<'_>) {
             &DROPBEAR_CLONE,
             check_dropbear_clone_success,
         );
+        register_dropbear_session_setup_cases(reg, agent);
+    }
+}
+
+fn register_dropbear_session_setup_cases(reg: &mut Registry<'_>, agent: AgentName) {
+    for stage in [
+        DropbearSessionStage::ExecOnly,
+        DropbearSessionStage::Setsid,
+        DropbearSessionStage::DupStdio,
+        DropbearSessionStage::Tiocsctty,
+        DropbearSessionStage::Full,
+        DropbearSessionStage::FullBash,
+        DropbearSessionStage::FullSetidNetwork,
+    ] {
+        let label = agent.to_string();
+        let test_id = format!("CL3.dropbear_session_setup.{}.{agent}", stage.label());
+        reg.test("vscode", "clone3", test_id)
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let result = run
+                            .send_named_typed(
+                                &handle,
+                                &DROPBEAR_SESSION_SETUP,
+                                DropbearSessionArgs { stage },
+                            )
+                            .await;
+                        let (pass, detail) = match result {
+                            Ok(out) => match check_dropbear_session_setup_success(&out) {
+                                Ok(detail) => (true, detail),
+                                Err(error) => (false, format!("{error}; response={out:?}")),
+                            },
+                            Err(error) => (false, error),
+                        };
+                        TestOutcome::new(&label, pass, detail)
+                    })
+                })
+            });
     }
 }
 
@@ -255,6 +352,20 @@ fn check_dropbear_clone_success(out: &Clone3Out) -> Result<String, String> {
         } if *pid > 0 => Ok(format!("{out:?}")),
         other => Err(format!(
             "expected dropbear-shaped clone/vfork child marker, got {other:?}"
+        )),
+    }
+}
+
+fn check_dropbear_session_setup_success(out: &Clone3Out) -> Result<String, String> {
+    match out {
+        Clone3Out {
+            pid,
+            pidfd: None,
+            ok: true,
+            error: None,
+        } if *pid > 0 => Ok(format!("{out:?}")),
+        other => Err(format!(
+            "expected dropbear session child to exec and exit successfully, got {other:?}"
         )),
     }
 }
@@ -580,6 +691,221 @@ fn run_clone_dropbear_vfork() -> Clone3Out {
         return clone_result_error(last_errno_name());
     }
     read_marker_and_wait(pipe_fds[0], rc as libc::pid_t, "dropbear_clone")
+}
+
+fn run_clone_dropbear_session_setup(stage: DropbearSessionStage) -> Clone3Out {
+    let pty = match Pty::open() {
+        Ok(pty) => pty,
+        Err(error) => return clone_result_error(format!("pty_open:{error}")),
+    };
+    let slave_path = match CString::new(pty.slave_path()) {
+        Ok(path) => path,
+        Err(error) => return clone_result_error(format!("slave_path:{error}")),
+    };
+    // SAFETY: `slave_path` is a valid C string; on success `slave_fd` is closed
+    // by both sides according to their post-clone ownership.
+    let slave_fd = unsafe { libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    if slave_fd < 0 {
+        return clone_result_error(format!("open_slave:{}", last_errno_name()));
+    }
+
+    let network_fds = if matches!(stage, DropbearSessionStage::FullSetidNetwork) {
+        // Dropbear's session child inherits live TCP sockets from the server.
+        // Keeping these fds open until the setid calls exercises delayed-fork
+        // snapshot rejection before the child reaches execve.
+        let fd0 = open_network_socket();
+        let fd1 = open_network_socket();
+        if fd0 < 0 || fd1 < 0 {
+            if fd0 >= 0 {
+                close_fd(fd0);
+            }
+            if fd1 >= 0 {
+                close_fd(fd1);
+            }
+            close_fd(slave_fd);
+            return clone_result_error(format!("socket:{}", last_errno_name()));
+        }
+        [fd0, fd1]
+    } else {
+        [-1, -1]
+    };
+
+    let master_fd = pty.as_raw_fd();
+    let echo = c"/bin/echo";
+    let bash = c"/bin/bash";
+    let true_path = c"/bin/true";
+    let echo_arg0 = c"echo";
+    let bash_arg0 = c"bash";
+    let true_arg0 = c"true";
+    let arg1 = c"HELLO_CL3";
+    let bash_arg1 = c"-c";
+    let bash_arg2 = c"echo HELLO_CL3";
+    let echo_argv = [echo_arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
+    let bash_argv = [
+        bash_arg0.as_ptr(),
+        bash_arg1.as_ptr(),
+        bash_arg2.as_ptr(),
+        std::ptr::null(),
+    ];
+    let true_argv = [true_arg0.as_ptr(), std::ptr::null()];
+    let envp = [std::ptr::null::<libc::c_char>()];
+
+    let flags = (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as usize;
+    // This is a handler-based probe because the scenario being tested is the
+    // child-side setup done after dropbear's own clone(2); the handler itself
+    // creates that fresh child and performs only raw syscalls before execve.
+    // SAFETY: The legacy clone syscall uses dropbear's CLONE_VM|CLONE_VFORK
+    // shape. The child does not run Rust destructors or allocate before exec.
+    #[cfg(target_arch = "x86_64")]
+    let rc: isize = unsafe {
+        let mut rax = libc::SYS_clone as usize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") rax,
+            in("rdi") flags,
+            in("rsi") 0usize,
+            in("rdx") 0usize,
+            in("r10") 0usize,
+            in("r8") 0usize,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        rax as isize
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let rc = unsafe { libc::vfork() } as isize;
+
+    if rc == 0 {
+        // SAFETY: vfork child: use raw syscalls only, then execve or _exit.
+        unsafe {
+            match stage {
+                DropbearSessionStage::ExecOnly => {}
+                DropbearSessionStage::Setsid
+                | DropbearSessionStage::DupStdio
+                | DropbearSessionStage::Tiocsctty
+                | DropbearSessionStage::Full
+                | DropbearSessionStage::FullBash
+                | DropbearSessionStage::FullSetidNetwork => {
+                    if libc::syscall(libc::SYS_setsid) < 0 {
+                        libc::syscall(libc::SYS_exit, 111i32);
+                    }
+                }
+            }
+            match stage {
+                DropbearSessionStage::ExecOnly
+                | DropbearSessionStage::Setsid
+                | DropbearSessionStage::DupStdio => {}
+                DropbearSessionStage::Tiocsctty
+                | DropbearSessionStage::Full
+                | DropbearSessionStage::FullBash
+                | DropbearSessionStage::FullSetidNetwork => {
+                    if libc::syscall(libc::SYS_ioctl, slave_fd, libc::TIOCSCTTY, 0usize) < 0 {
+                        libc::syscall(libc::SYS_exit, 112i32);
+                    }
+                }
+            }
+            match stage {
+                DropbearSessionStage::ExecOnly
+                | DropbearSessionStage::Setsid
+                | DropbearSessionStage::Tiocsctty => {}
+                DropbearSessionStage::DupStdio
+                | DropbearSessionStage::Full
+                | DropbearSessionStage::FullBash
+                | DropbearSessionStage::FullSetidNetwork => {
+                    for target in 0..=2 {
+                        if libc::syscall(libc::SYS_dup2, slave_fd, target) < 0 {
+                            libc::syscall(libc::SYS_exit, 113i32);
+                        }
+                    }
+                }
+            }
+            if matches!(stage, DropbearSessionStage::FullSetidNetwork) {
+                let gid = libc::syscall(libc::SYS_getgid);
+                if libc::syscall(libc::SYS_setgid, gid) < 0 {
+                    libc::syscall(libc::SYS_exit, 114i32);
+                }
+                let uid = libc::syscall(libc::SYS_getuid);
+                if libc::syscall(libc::SYS_setuid, uid) < 0 {
+                    libc::syscall(libc::SYS_exit, 115i32);
+                }
+            }
+            if slave_fd > 2 {
+                libc::syscall(libc::SYS_close, slave_fd);
+            }
+            libc::syscall(libc::SYS_close, master_fd);
+            match stage {
+                DropbearSessionStage::DupStdio | DropbearSessionStage::Full => {
+                    libc::syscall(
+                        libc::SYS_execve,
+                        echo.as_ptr(),
+                        echo_argv.as_ptr(),
+                        envp.as_ptr(),
+                    );
+                }
+                DropbearSessionStage::FullBash => {
+                    libc::syscall(
+                        libc::SYS_execve,
+                        bash.as_ptr(),
+                        bash_argv.as_ptr(),
+                        envp.as_ptr(),
+                    );
+                }
+                DropbearSessionStage::ExecOnly
+                | DropbearSessionStage::Setsid
+                | DropbearSessionStage::Tiocsctty
+                | DropbearSessionStage::FullSetidNetwork => {
+                    libc::syscall(
+                        libc::SYS_execve,
+                        true_path.as_ptr(),
+                        true_argv.as_ptr(),
+                        envp.as_ptr(),
+                    );
+                }
+            }
+            libc::syscall(libc::SYS_exit, 127i32);
+        }
+        unreachable!();
+    }
+
+    close_fd(slave_fd);
+    for fd in network_fds {
+        if fd >= 0 {
+            close_fd(fd);
+        }
+    }
+    if rc < 0 {
+        return clone_result_error(last_errno_name());
+    }
+    let pid = rc as libc::pid_t;
+    if stage.uses_pty_stdio() {
+        match pty.read(None) {
+            Ok(data) if data.contains("HELLO_CL3") => {}
+            Ok(data) => {
+                let _ = wait_child_timeout(pid, Duration::from_secs(1));
+                return clone_result_error(format!("missing HELLO_CL3 in pty data {data:?}"));
+            }
+            Err(error) => {
+                let _ = wait_child_timeout(pid, Duration::from_secs(1));
+                return clone_result_error(format!("pty_read:{error}"));
+            }
+        }
+    }
+    match wait_child_timeout(pid, Duration::from_secs(10)) {
+        Ok(0) => Clone3Out {
+            pid: pid as u64,
+            pidfd: None,
+            ok: true,
+            error: None,
+        },
+        Ok(status) => clone_result_error(format!("child_status:{status}")),
+        Err(error) => clone_result_error(format!("wait:{error}")),
+    }
+}
+
+fn open_network_socket() -> i32 {
+    // SAFETY: socket returns a new fd or -1; caller owns successful fds.
+    unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) }
 }
 
 fn read_marker_and_wait(read_fd: i32, pid: libc::pid_t, label: &str) -> Clone3Out {
