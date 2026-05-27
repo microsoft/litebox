@@ -2368,14 +2368,31 @@ mod copilot {
 
             // CMD per pass.
             let mut cmd = Command::new("docker");
-            cmd.args(["run", "-d", "--rm"])
-                .args(["--name", &name])
+            cmd.arg("run").arg("-d");
+            if !super::keep_containers() {
+                cmd.arg("--rm");
+            }
+            cmd.args(["--name", &name])
                 .args(["--cap-add", "SYS_PTRACE"])
                 .args(["-p", "127.0.0.1:0:22"])
                 .arg("-v")
                 .arg(format!("{}:/opt/litebox:ro", bin_dir.display()))
                 .arg("-v")
                 .arg(format!("{}:/workspace", fixture_dir.display()));
+            // Forward selected LITEBOX_* env vars into the container.
+            for var in [
+                "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+                "LITEBOX_BROKER_TCP_CONN",
+                "LITEBOX_PE10_DIAG",
+                "LITEBOX_PE5_DIAG",
+                "LITEBOX_CLEANUP_DELAY_MS",
+                "RUST_LOG",
+                "RUST_BACKTRACE",
+            ] {
+                if let Ok(val) = std::env::var(var) {
+                    cmd.args(["-e", &format!("{var}={val}")]);
+                }
+            }
             if mount_workspace_src {
                 cmd.arg("-v")
                     .arg(format!("{}:/workspace/litebox-src:ro", ws_root.display()));
@@ -2449,6 +2466,9 @@ mod copilot {
 
     impl Drop for ContainerHandle {
         fn drop(&mut self) {
+            if super::keep_containers() {
+                return;
+            }
             let _ = Command::new("docker")
                 .args(["rm", "-f", &self.name])
                 .stdout(Stdio::null())
