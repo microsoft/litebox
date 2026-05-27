@@ -2536,6 +2536,18 @@ mod copilot {
     /// because dropbear strips most environment variables when
     /// exec'ing the session command.
     fn drive_pminus(port: u16, prompt: &str, timeout_secs: u64) -> Result<String, String> {
+        // Two-shot kex retry: dropbear under litebox can accept TCP
+        // before its SSH handshake path is fully ready; mirror the
+        // `drive_bash` helper in the dropbear_bash suite.
+        let first = drive_pminus_once(port, prompt, timeout_secs)?;
+        if first.contains("kex_exchange_identification") {
+            std::thread::sleep(Duration::from_secs(7));
+            return drive_pminus_once(port, prompt, timeout_secs);
+        }
+        Ok(first)
+    }
+
+    fn drive_pminus_once(port: u16, prompt: &str, timeout_secs: u64) -> Result<String, String> {
         let pty = Pty::open()?;
         let mut argv = ssh_argv_base(port);
         let remote_cmd = format!(
@@ -2553,6 +2565,15 @@ mod copilot {
     /// the prompt followed by `\n`, then read until quiet, then send
     /// the CLI's exit shortcut.
     fn drive_tui(port: u16, prompt: &str, timeout_secs: u64) -> Result<String, String> {
+        let first = drive_tui_once(port, prompt, timeout_secs)?;
+        if first.contains("kex_exchange_identification") {
+            std::thread::sleep(Duration::from_secs(7));
+            return drive_tui_once(port, prompt, timeout_secs);
+        }
+        Ok(first)
+    }
+
+    fn drive_tui_once(port: u16, prompt: &str, timeout_secs: u64) -> Result<String, String> {
         let pty = Pty::open()?;
         let mut argv = ssh_argv_base(port);
         argv.push(
