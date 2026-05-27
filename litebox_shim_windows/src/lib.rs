@@ -15,6 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicI32, Ordering};
+use litebox::platform::RawConstPointer as _;
 use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
@@ -24,7 +25,10 @@ use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 use litebox_platform_multiplex::Platform;
 
+use crate::syscalls::SyscallRequest;
+
 mod loader;
+mod syscalls;
 
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 
@@ -206,26 +210,55 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
-        if NtSysno::from_raw(ctx.orig_rax) == Some(NtSysno::NtTerminateProcess) {
+        let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
             litebox_util_log::debug!(
-                syscall_number = ctx.orig_rax,
-                process_handle:% = format_args!("{:#x}", ctx.r10),
-                exit_status:% = format_args!("{:#x}", ctx.rdx);
-                "Handling NtTerminateProcess syscall"
+                syscall:? = NtSysno::from_raw(ctx.orig_rax);
+                "Unsupported Windows syscall"
             );
-            self.process
-                .exit_code
-                .store(windows_exit_status_to_i32(ctx.rdx), Ordering::Relaxed);
-            ctx.rax = NtStatus::SUCCESS.to_usize();
             return ContinueOperation::Terminate;
-        }
-
+        };
         litebox_util_log::debug!(
-            syscall_number = ctx.orig_rax;
-            "Unsupported Windows syscall"
+            syscall:? = req;
+            "Handling Windows"
         );
-        ctx.rax = NtStatus::UNSUCCESSFUL.to_usize();
-        ContinueOperation::Resume
+        let (result, op) = match req {
+            SyscallRequest::NtTerminateProcess {
+                process_handle,
+                exit_status,
+            } => {
+                litebox_util_log::debug!(
+                    syscall_number = ctx.orig_rax,
+                    process_handle:% = format_args!("{:#x}", process_handle),
+                    exit_status:% = format_args!("{:#x}", exit_status);
+                    "Handling NtTerminateProcess syscall"
+                );
+                self.process.exit_code.store(exit_status, Ordering::Relaxed);
+                (NtStatus::SUCCESS, ContinueOperation::Terminate)
+            }
+            SyscallRequest::NtAllocateVirtualMemory {
+                process_handle,
+                base_address,
+                zero_bits,
+                region_size,
+                allocation_type,
+                protect,
+            } => {
+                // TODO: placeholder for NtAllocateVirtualMemory
+                litebox_util_log::debug!(
+                    process_handle:% = format_args!("{:#x}", process_handle),
+                    base_address:% = format_args!("{:#x}", base_address.as_usize()),
+                    zero_bits:% = format_args!("{:#x}", zero_bits),
+                    region_size:% = format_args!("{:#x}", region_size.as_usize()),
+                    allocation_type:% = format_args!("{:#x}", allocation_type),
+                    protect:% = format_args!("{:#x}", protect);
+                    "Handling NtAllocateVirtualMemory syscall"
+                );
+                (NtStatus::UNSUCCESSFUL, ContinueOperation::Terminate)
+            }
+        };
+
+        ctx.rax = result.as_raw().cast_unsigned() as usize;
+        op
     }
 
     fn handle_interrupt_request(
@@ -275,11 +308,6 @@ impl<FS: ShimFS> EnterShim for WindowsShimEntrypoints<FS> {
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         self.task.handle_interrupt_request(ctx)
     }
-}
-
-fn windows_exit_status_to_i32(status: usize) -> i32 {
-    let low_bits = u32::try_from(status & 0xffff_ffff).unwrap_or_default();
-    i32::from_ne_bytes(low_bits.to_ne_bytes())
 }
 
 /// A loaded Windows program and the process handle used to wait for it.
