@@ -57,6 +57,14 @@ pub(crate) struct BrokerTcpConnFd<P: RawSyncPrimitivesProvider + litebox::platfo
     provider: Arc<dyn BrokerTcpConnProvider>,
     common: BrokerBackedCommon<P>,
     status: AtomicU32,
+    /// `shutdown(fd, SHUT_RD)` was called on this `BrokerTcpConnFd`
+    /// instance. Short-circuits `read()` to EOF without an RPC.
+    ///
+    /// **Known divergence from Linux:** same hazard as
+    /// `BrokerSocketPairFd::read_shutdown` — per-instance flag rather
+    /// than broker-held state, so dup'd fds can diverge. See
+    /// `files/cache-audit.md` (item C); proper fix moves the state to
+    /// `TcpConnState` on the broker and queries it synchronously.
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
     pollee: Arc<Pollee<P>>,

@@ -1246,14 +1246,45 @@ fn handle_control_connection_inner(
                     | Opcode::WriteTcpConn
                     | Opcode::ShutdownTcpConn
                     | Opcode::PollTcpConnEvents
-                    | Opcode::DupHandle
-                    | Opcode::QueryEvents => {
+                    | Opcode::DupHandle => {
                         // State-object opcodes: route to state_service on the fd-state registry.
                         let state_result =
                             state_handle_request(state_registry, conn_state, &frame, in_fds);
                         SocketHandlerResult {
                             frame: state_result.frame,
                             out_fd: state_result.out_fd,
+                        }
+                    }
+                    Opcode::QueryEvents => {
+                        // QueryEvents is registry-agnostic: handles can live in
+                        // state_registry (Pty / Eventfd / Pipe / SocketPair / Tcp /
+                        // Signalfd / Pidfd) or process_registry (Process). Try
+                        // state first; on UnknownHandle fall back to process. Same
+                        // cross-registry shape as Opcode::Release.
+                        let state_result = state_handle_request(
+                            state_registry,
+                            conn_state,
+                            &frame,
+                            in_fds,
+                        );
+                        if state_result.frame.status
+                            == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
+                        {
+                            let proc_result = state_handle_request(
+                                process_registry,
+                                conn_state,
+                                &frame,
+                                Vec::new(),
+                            );
+                            SocketHandlerResult {
+                                frame: proc_result.frame,
+                                out_fd: proc_result.out_fd,
+                            }
+                        } else {
+                            SocketHandlerResult {
+                                frame: state_result.frame,
+                                out_fd: state_result.out_fd,
+                            }
                         }
                     }
                     Opcode::PtyWrite => {

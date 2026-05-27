@@ -726,16 +726,52 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                 }
             }
             EventFileInner::Pidfd {
+                target_pid,
                 exited,
                 broker_subscription,
                 ..
             } => {
-                if exited.load(Ordering::Acquire)
-                    || broker_subscription
-                        .as_ref()
-                        .is_some_and(BrokerProcessExitWake::is_exited)
-                {
+                // Local exit (set by the in-process registry's
+                // prepare_for_exit) is in-process truth; no broker
+                // round-trip needed.
+                if exited.load(Ordering::Acquire) {
                     events |= Events::IN | Events::HUP;
+                } else if let Some(sub) = broker_subscription.as_ref() {
+                    // Cross-worker target. Two correct sources:
+                    //
+                    //   (a) the broker, via a synchronous QueryEvents
+                    //       RPC on the process_registry handle —
+                    //       authoritative *now*. This is the Phase H
+                    //       invariant: never let the shim's mirror
+                    //       lead the broker.
+                    //   (b) the subscription's `exited` flag, set by
+                    //       the broker dispatcher callback. Monotone:
+                    //       only the broker can flip it to true, so
+                    //       `is_exited()==true` proves the broker
+                    //       already reported exit at some earlier
+                    //       moment. It can lag the broker becoming-
+                    //       true, never lead it.
+                    //
+                    // OR-combine. Phase H gain: when the cache lags
+                    // (race window between MarkProcessExited and
+                    // dispatcher catch-up), the broker query catches
+                    // it. Inherited-pidfd-in-non-PIE-child gain: when
+                    // the local broker provider has gone away or
+                    // can't resolve the pid in process_registry from
+                    // this connection, the cache's already-true bit
+                    // still surfaces exit readiness.
+                    let cache_says_exited = sub.is_exited();
+                    let broker_says_exited = super::guest_pid::broker_guest_pid_provider()
+                        .and_then(|p| p.query_process_exit(target_pid.0).ok())
+                        .is_some_and(|bits| {
+                            use litebox_common_linux::cwfd::notification_frame::{
+                                NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN,
+                            };
+                            bits & (NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP) != 0
+                        });
+                    if cache_says_exited || broker_says_exited {
+                        events |= Events::IN | Events::HUP;
+                    }
                 }
             }
             EventFileInner::BrokerBacked { common, .. } => {
