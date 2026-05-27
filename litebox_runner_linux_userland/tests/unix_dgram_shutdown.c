@@ -163,13 +163,8 @@ static void test_pre_connect_shutdown_write_blocks_future_sends(void) {
     errno = 0;
     ssize_t n = sendto(sender, "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL,
                        (struct sockaddr *)&server_addr, sizeof(server_addr));
-    if (n != -1) {
-        fprintf(stderr, "FAIL: sendto after pre-connect SHUT_WR expected failure, got %zd\n", n);
-        exit(1);
-    }
-    if (errno != EPIPE) {
-        fail_errno("sendto after pre-connect SHUT_WR", EPIPE);
-    }
+    TEST_ASSERT(n == -1, "sendto after pre-connect SHUT_WR");
+    TEST_ASSERT(errno == EPIPE, "sendto after pre-connect SHUT_WR");
 
     if (connect(sender, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
         die("connect after pre-connect SHUT_WR");
@@ -209,13 +204,8 @@ static void test_shutdown_invalid_how_returns_einval(void) {
 
     errno = 0;
     long ret = syscall(SYS_shutdown, sv[0], 99);
-    if (ret != -1) {
-        fprintf(stderr, "FAIL: shutdown(invalid how) expected failure, got %ld\n", ret);
-        exit(1);
-    }
-    if (errno != EINVAL) {
-        fail_errno("shutdown(invalid how)", EINVAL);
-    }
+    TEST_ASSERT(ret == -1, "shutdown(invalid how)");
+    TEST_ASSERT(errno == EINVAL, "shutdown(invalid how)");
 
     close_pair(sv);
 }

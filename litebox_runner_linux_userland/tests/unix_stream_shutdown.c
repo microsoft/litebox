@@ -199,13 +199,8 @@ static void test_listen_shutdown_nonblocking_accept_returns_eagain(void) {
 
     errno = 0;
     int a = accept(fd, NULL, NULL);
-    if (a != -1) {
-        fprintf(stderr, "FAIL: nonblocking accept on shut-down listen expected -1, got %d\n", a);
-        exit(1);
-    }
-    if (errno != EAGAIN) {
-        fail_errno("nonblocking accept on shut-down listen", EAGAIN);
-    }
+    TEST_ASSERT(a == -1, "nonblocking accept on shut-down listen");
+    TEST_ASSERT(errno == EAGAIN, "nonblocking accept on shut-down listen");
 
     close(fd);
     unlink(sa.sun_path);
@@ -305,13 +300,9 @@ static void test_listen_shutdown_read_preserves_queued_connections(void) {
         die("socket(refused client)");
     }
     errno = 0;
-    if (connect(refused_client, (struct sockaddr *)&sa, sizeof(sa)) != -1) {
-        fprintf(stderr, "FAIL: connect after listen SHUT_RD expected failure\n");
-        exit(1);
-    }
-    if (errno != ECONNREFUSED) {
-        fail_errno("connect after listen SHUT_RD", ECONNREFUSED);
-    }
+    TEST_ASSERT(connect(refused_client, (struct sockaddr *)&sa, sizeof(sa)) == -1,
+                "connect after listen SHUT_RD");
+    TEST_ASSERT(errno == ECONNREFUSED, "connect after listen SHUT_RD");
 
     int accepted = accept(fd, NULL, NULL);
     if (accepted < 0) {
@@ -320,13 +311,8 @@ static void test_listen_shutdown_read_preserves_queued_connections(void) {
 
     errno = 0;
     int drained = accept(fd, NULL, NULL);
-    if (drained != -1) {
-        fprintf(stderr, "FAIL: drained accept after listen SHUT_RD expected -1, got %d\n", drained);
-        exit(1);
-    }
-    if (errno != EAGAIN) {
-        fail_errno("drained accept after listen SHUT_RD", EAGAIN);
-    }
+    TEST_ASSERT(drained == -1, "drained accept after listen SHUT_RD");
+    TEST_ASSERT(errno == EAGAIN, "drained accept after listen SHUT_RD");
 
     close(accepted);
     close(refused_client);

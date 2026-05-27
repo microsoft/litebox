@@ -19,14 +19,17 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#define TEST_ASSERT(cond, msg)                                                \
+    do {                                                                      \
+        if (!(cond)) {                                                        \
+            fprintf(stderr, "FAIL: %s (line %d): %s (errno=%d: %s)\n",        \
+                    __func__, __LINE__, msg, errno, strerror(errno));         \
+            exit(1);                                                          \
+        }                                                                     \
+    } while (0)
+
 static inline void die(const char *msg) {
     perror(msg);
-    exit(1);
-}
-
-static inline void fail_errno(const char *op, int expected_errno) {
-    fprintf(stderr, "FAIL: %s expected errno=%d (%s), got errno=%d (%s)\n",
-            op, expected_errno, strerror(expected_errno), errno, strerror(errno));
     exit(1);
 }
 
@@ -40,25 +43,15 @@ static inline void expect_sys_shutdown(int fd, int how, const char *op) {
 static inline void expect_sys_shutdown_errno(int fd, int how, int expected_errno, const char *op) {
     errno = 0;
     long ret = syscall(SYS_shutdown, fd, how);
-    if (ret != -1) {
-        fprintf(stderr, "FAIL: %s expected failure, got %ld\n", op, ret);
-        exit(1);
-    }
-    if (errno != expected_errno) {
-        fail_errno(op, expected_errno);
-    }
+    TEST_ASSERT(ret == -1, op);
+    TEST_ASSERT(errno == expected_errno, op);
 }
 
 static inline void expect_send_errno(int fd, int expected_errno, const char *op) {
     errno = 0;
     ssize_t n = send(fd, "x", 1, MSG_DONTWAIT | MSG_NOSIGNAL);
-    if (n != -1) {
-        fprintf(stderr, "FAIL: %s expected failure, got %zd\n", op, n);
-        exit(1);
-    }
-    if (errno != expected_errno) {
-        fail_errno(op, expected_errno);
-    }
+    TEST_ASSERT(n == -1, op);
+    TEST_ASSERT(errno == expected_errno, op);
 }
 
 // Blocking recv (no MSG_DONTWAIT) that we expect to time out via SO_RCVTIMEO. Distinct from
@@ -69,13 +62,8 @@ static inline void expect_blocking_recv_eagain(int fd, const char *op) {
 
     errno = 0;
     ssize_t n = recv(fd, buf, sizeof(buf), 0);
-    if (n != -1) {
-        fprintf(stderr, "FAIL: %s expected timeout failure, got %zd\n", op, n);
-        exit(1);
-    }
-    if (errno != EAGAIN) {
-        fail_errno(op, EAGAIN);
-    }
+    TEST_ASSERT(n == -1, op);
+    TEST_ASSERT(errno == EAGAIN, op);
 }
 
 static inline void expect_recv_errno(int fd, int expected_errno, const char *op) {
@@ -83,13 +71,8 @@ static inline void expect_recv_errno(int fd, int expected_errno, const char *op)
 
     errno = 0;
     ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-    if (n != -1) {
-        fprintf(stderr, "FAIL: %s expected failure, got %zd\n", op, n);
-        exit(1);
-    }
-    if (errno != expected_errno) {
-        fail_errno(op, expected_errno);
-    }
+    TEST_ASSERT(n == -1, op);
+    TEST_ASSERT(errno == expected_errno, op);
 }
 
 static inline void expect_recv_eof(int fd, const char *op) {
