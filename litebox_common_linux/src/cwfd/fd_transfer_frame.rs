@@ -837,7 +837,16 @@ mod tests {
             assert!(!tag.is_known(), "raw {raw:#x} should be Unknown");
             match tag {
                 SubsystemTag::Unknown(v) => assert_eq!(v, raw),
-                other => panic!("expected Unknown({raw:#x}), got {other:?}"),
+                SubsystemTag::Eventfd
+                | SubsystemTag::TcpSocket
+                | SubsystemTag::Pidfd
+                | SubsystemTag::UnixSocket
+                | SubsystemTag::Signalfd
+                | SubsystemTag::Timerfd
+                | SubsystemTag::Inotify
+                | SubsystemTag::Process
+                | SubsystemTag::Pipe
+                | SubsystemTag::Pty => panic!("expected Unknown({raw:#x}), got {tag:?}"),
             }
         }
     }

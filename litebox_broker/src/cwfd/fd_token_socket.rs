@@ -8,9 +8,6 @@
 //! [`crate::fd_token_service`] (host-fd ops) and — once Phase B-Step6
 //! lands — `crate::state_service` (eventfd and other state-object ops).
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_request};
 use crate::fd_tokens::BrokerFdTokenRegistry;
 use crate::pgrp_signal_inbox::PgrpSignalInbox;
@@ -447,6 +444,8 @@ fn update_tracker_from_response(
     if response.status != StatusCode::Ok {
         return;
     }
+    // reason: unsupported variants intentionally share this fallback path.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match request_opcode {
         // State-registry creators: response body is one or two handle ids.
         Opcode::CreateEventfd | Opcode::CreatePidfd | Opcode::CreateSignalfd => {
@@ -933,6 +932,8 @@ fn handle_control_connection_inner(
                         );
                     }
                 }
+                // reason: unsupported protocol opcodes intentionally close the control connection.
+                #[allow(clippy::wildcard_enum_match_arm)]
                 let result = match frame.opcode {
                     Opcode::Register | Opcode::Materialize => {
                         // Host-fd opcodes: route to fd_token_service.
@@ -1261,6 +1262,8 @@ fn handle_control_connection_inner(
                         // Phase F.5+ PE.1 Step D: parse pid, release every
                         // (pid, *) entry tracked on this connection across
                         // both registries, and return the count.
+                        // reason: unsupported variants intentionally share this fallback path.
+                        #[allow(clippy::wildcard_enum_match_arm)]
                         match litebox_common_linux::fd_token_protocol::parse_release_all_for_pid_body(
                             &request_body,
                         ) {

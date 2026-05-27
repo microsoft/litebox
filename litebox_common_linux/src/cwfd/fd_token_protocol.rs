@@ -70,9 +70,6 @@
 //! is 24 bytes (Subscribe), so this is comfortably generous; the
 //! cap exists primarily to bound memory on a malformed peer.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use alloc::vec::Vec;
 
 /// Wire-format magic ("LBFD" — LiteBox FD).
@@ -314,6 +311,8 @@ impl Opcode {
     /// Returns the matching response opcode for a request opcode, or
     /// `None` if `self` is itself a response.
     pub fn response_for(self) -> Option<Opcode> {
+        // reason: large protocol enum; response opcodes intentionally have no paired response.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match self {
             Opcode::Register => Some(Opcode::RegisterResponse),
             Opcode::Materialize => Some(Opcode::MaterializeResponse),
@@ -412,6 +411,8 @@ impl Opcode {
     /// this opcode (request side for `Register`/`RegisterNotificationRing`,
     /// response side for `MaterializeResponse`).
     pub fn expected_fd_count(self) -> usize {
+        // reason: large protocol enum; most opcodes intentionally carry no SCM_RIGHTS fds.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match self {
             // RegisterNotificationRing sends both memfds of a
             // ShmemRingPair (we use only the writer side; the unused
