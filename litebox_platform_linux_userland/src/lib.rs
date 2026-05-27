@@ -19,6 +19,8 @@
 //! **All new fd allocation must respect these ranges.** Use the named
 //! constants below — never hardcode fd minimums.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
 // Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
@@ -4690,6 +4692,21 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 }
 
+impl LinuxUserland {
+    fn send_port_listen_action(
+        &self,
+        port: u16,
+        action: u8,
+    ) -> Result<(), litebox::platform::SendError> {
+        if self.network_transport.read().unwrap().is_none() {
+            return Ok(());
+        }
+        let port_bytes = port.to_be_bytes();
+        let msg: [u8; 6] = [0x00, b'P', b'L', port_bytes[0], port_bytes[1], action];
+        litebox::platform::IPInterfaceProvider::send_ip_packet(self, &msg)
+    }
+}
+
 impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
         let transport = self.network_transport.read().unwrap();
@@ -4810,16 +4827,11 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         port: u16,
         listen: bool,
     ) -> Result<(), litebox::platform::SendError> {
-        // Check if network transport is available (it won't be during
-        // shutdown or when running without a broker).
-        if self.network_transport.read().unwrap().is_none() {
-            return Ok(());
-        }
-        // LBPL control message: [0x00, 'P', 'L', port_hi, port_lo, action]
-        let port_bytes = port.to_be_bytes();
-        let msg: [u8; 6] = [0x00, b'P', b'L', port_bytes[0], port_bytes[1], listen as u8];
-        // Send through the same IPC framing as IP packets.
-        self.send_ip_packet(&msg)
+        self.send_port_listen_action(port, listen as u8)
+    }
+
+    fn send_port_listen_transfer(&self, port: u16) -> Result<(), litebox::platform::SendError> {
+        self.send_port_listen_action(port, 2)
     }
 
     fn on_rst_transmitted(
@@ -5091,6 +5103,10 @@ impl litebox::platform::TimeProvider for LinuxUserland {
                 t.tv_nsec.reinterpret_as_unsigned().truncate(),
             ),
         }
+    }
+
+    fn monotonic_timestamp(&self) -> Option<Duration> {
+        Some(self.now().inner)
     }
 }
 

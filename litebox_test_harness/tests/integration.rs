@@ -502,6 +502,7 @@ fn docker_run_base_args() -> Vec<String> {
     // invocations can flip runtime gates without a rebuild.
     for var in [
         "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+        "LITEBOX_BROKER_TCP_CONN",
         "LITEBOX_PE10_DIAG",
         "LITEBOX_PE5_DIAG",
         "LITEBOX_CLEANUP_DELAY_MS",

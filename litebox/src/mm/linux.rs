@@ -603,6 +603,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
+        #[allow(clippy::wildcard_enum_match_arm)]
+        // AllocationError is non_exhaustive; future variants pass through unchanged.
         let ret = self
             .platform
             .allocate_pages(

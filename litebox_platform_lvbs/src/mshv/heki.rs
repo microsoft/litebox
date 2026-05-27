@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::{
     host::linux::ListHead,
     mshv::{HvPageProtFlags, error::VsmError, vtl1_mem_layout::PAGE_SIZE},

@@ -305,6 +305,8 @@ pub enum BrokerHandleKind {
     /// distinguishes endpoints: 1=A, 2=B (mirroring Pipe's 1=Read,
     /// 2=Write encoding).
     UnixSocket = 6,
+    /// Broker-hosted connected TCP socket.
+    TcpConn = 7,
 }
 
 impl BrokerHandleKind {
@@ -323,6 +325,7 @@ impl BrokerHandleKind {
             4 => Self::Pty,
             5 => Self::Pipe,
             6 => Self::UnixSocket,
+            7 => Self::TcpConn,
             _ => return None,
         })
     }
@@ -364,7 +367,7 @@ impl core::fmt::Debug for ForkSnapshotBrokerTransit {
 /// Classification of a file descriptor for export/import decisions.
 ///
 /// The first version supports only a narrow set; unsupported classes cause
-/// `fork()` to return `ENOSYS`.
+/// `fork()` to panic with an ENOSYS-audit todo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FdClass {
     /// Regular file or directory opened by path.
@@ -2193,6 +2196,7 @@ mod tests {
                 BrokerHandleKind::Pty,
                 BrokerHandleKind::Pipe,
                 BrokerHandleKind::UnixSocket,
+                BrokerHandleKind::TcpConn,
             ];
             for k in &kinds {
                 match k {
@@ -2201,7 +2205,8 @@ mod tests {
                     | BrokerHandleKind::Signalfd
                     | BrokerHandleKind::Pty
                     | BrokerHandleKind::Pipe
-                    | BrokerHandleKind::UnixSocket => {}
+                    | BrokerHandleKind::UnixSocket
+                    | BrokerHandleKind::TcpConn => {}
                 }
             }
             kinds
@@ -2282,8 +2287,8 @@ mod tests {
                 }
             }
         }
-        // 6 kinds × 3 dir options × 3 endpoint options × 8 ids = 432 cases.
-        assert_eq!(total_cases, 432, "expected to cover 432 combinations");
+        // 7 kinds × 3 dir options × 3 endpoint options × 8 ids = 504 cases.
+        assert_eq!(total_cases, 504, "expected to cover 504 combinations");
     }
 
     #[test]
@@ -2294,6 +2299,7 @@ mod tests {
             BrokerHandleKind::Signalfd,
             BrokerHandleKind::Pty,
             BrokerHandleKind::UnixSocket,
+            BrokerHandleKind::TcpConn,
         ] {
             let meta = FdMetadataSnapshot {
                 broker_handle: Some(BrokerHandleSnapshot {

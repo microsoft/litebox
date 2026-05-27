@@ -5,6 +5,8 @@
 
 #![no_std]
 #![allow(non_camel_case_types)]
+#![allow(clippy::wildcard_enum_match_arm)]
+// Legacy enum pass-throughs in submodules are intentionally left for incremental cleanup.
 
 use core::time::Duration;
 use int_enum::IntEnum;
@@ -32,8 +34,8 @@ pub mod vmap;
 pub use cwfd::{
     broker_eventfd_provider, broker_pgrp_signal_provider, broker_pidfd_provider,
     broker_pipe_provider, broker_pty_provider, broker_signalfd_provider,
-    broker_socketpair_provider, fd_token_protocol, fd_transfer_frame, guest_pid_provider,
-    notification_frame,
+    broker_socketpair_provider, broker_tcp_conn_provider, fd_token_protocol, fd_transfer_frame,
+    guest_pid_provider, notification_frame,
 };
 
 #[cfg(feature = "std")]
@@ -257,6 +259,7 @@ pub enum InodeType {
 }
 
 impl From<litebox::fs::FileType> for InodeType {
+    #[allow(clippy::wildcard_enum_match_arm)] // FileType is non_exhaustive; future variants cannot be named here.
     fn from(value: litebox::fs::FileType) -> Self {
         match value {
             litebox::fs::FileType::RegularFile => InodeType::File,
@@ -289,6 +292,7 @@ pub enum DirentType {
 }
 
 impl From<litebox::fs::FileType> for DirentType {
+    #[allow(clippy::wildcard_enum_match_arm)] // FileType is non_exhaustive; future variants cannot be named here.
     fn from(value: litebox::fs::FileType) -> Self {
         match value {
             litebox::fs::FileType::RegularFile => DirentType::Regular,
@@ -931,7 +935,7 @@ impl SocketOptionName {
             SocketOptionLevel::IP => Some(Self::IP(IpOption::try_from(optname).ok()?)),
             SocketOptionLevel::SOCKET => Some(Self::Socket(SocketOption::try_from(optname).ok()?)),
             SocketOptionLevel::TCP => Some(Self::TCP(TcpOption::try_from(optname).ok()?)),
-            _ => None,
+            SocketOptionLevel::UDP | SocketOptionLevel::RAW => None,
         }
     }
 }
@@ -3439,7 +3443,38 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         PrctlOption::CapAmbient => SyscallRequest::Prctl {
                             args: PrctlArg::CapAmbient(ctx.sys_req_arg(1)),
                         },
-                        _ => {
+                        PrctlOption::SetPDeathSig
+                        | PrctlOption::GetPDeathSig
+                        | PrctlOption::GetDumpable
+                        | PrctlOption::GetUnalign
+                        | PrctlOption::SetUnalign
+                        | PrctlOption::GetKeepCaps
+                        | PrctlOption::SetKeepCaps
+                        | PrctlOption::GetFpEmu
+                        | PrctlOption::SetFpEmu
+                        | PrctlOption::GetFpExc
+                        | PrctlOption::SetFpExc
+                        | PrctlOption::GetTiming
+                        | PrctlOption::SetTiming
+                        | PrctlOption::GetEndian
+                        | PrctlOption::SetEndian
+                        | PrctlOption::GetSeccomp
+                        | PrctlOption::CapBSetDrop
+                        | PrctlOption::GetTSC
+                        | PrctlOption::SetTSC
+                        | PrctlOption::SetSecureBits
+                        | PrctlOption::SetTimerSlack
+                        | PrctlOption::GetTimerSlack
+                        | PrctlOption::TaskPerfEventsDisable
+                        | PrctlOption::TaskPerfEventsEnable
+                        | PrctlOption::MCEKill
+                        | PrctlOption::MCEKillGet
+                        | PrctlOption::SetMM
+                        | PrctlOption::SetChildSubreaper
+                        | PrctlOption::GetChildSubreaper
+                        | PrctlOption::GetTidAddress
+                        | PrctlOption::SetFpMode
+                        | PrctlOption::GetFpMode => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
                         }
                     }

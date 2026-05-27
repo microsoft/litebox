@@ -3,6 +3,9 @@
 
 //! An layered file system, layering on [`FileSystem`](super::FileSystem) on top of another.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -2698,5 +2701,6 @@ crate::fd::enable_fds_for_subsystem! {
     FileSystem<Platform, Upper, Lower>;
     @Upper: { super::FileSystem + 'static }, Lower: { super::FileSystem + 'static };
     Descriptor<Upper, Lower>;
+    crate::fd::SubsystemKind::Fs;
     -> FileFd<Platform, Upper, Lower>;
 }

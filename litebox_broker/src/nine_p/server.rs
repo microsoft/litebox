@@ -15,6 +15,9 @@
 //! - Path containment: all walks are rooted and cannot escape the root directory.
 //! - Incoming message sizes are bounded by the negotiated msize.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;

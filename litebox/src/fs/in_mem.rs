@@ -950,7 +950,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 .iter()
                 .find_map(|(path, entry)| match entry {
                     Entry::Dir(d) if alloc::sync::Arc::ptr_eq(d, dir) => Some(path.clone()),
-                    _ => None,
+                    Entry::Dir(_) | Entry::File(_) | Entry::Symlink(_) => None,
                 })
                 .unwrap_or(String::new())
         };
@@ -1489,5 +1489,6 @@ crate::fd::enable_fds_for_subsystem! {
     FileSystem<Platform>;
     @ Platform: { sync::RawSyncPrimitivesProvider };
     Descriptor<Platform>;
+    crate::fd::SubsystemKind::Fs;
     -> FileFd<Platform>;
 }

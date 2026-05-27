@@ -17,6 +17,9 @@
 //! `BASH.*` (bash fork/exec), `FWE.*` (fork+exec from non-PIE worker-exec
 //! hosts), `SK.*` (SIGKILL subtree teardown).
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -2033,10 +2036,11 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
 // On native this is sub-second; under litebox with the platform bug
 // unfixed the wait will not return and these tests time out (FAIL).
 //
-// No `xfail` is recorded: a real FAIL on litebox is the desired
-// signal that the underlying platform bug needs fixing. The test
-// harness's own teardown is wrapped in a 10-s timeout (commit
-// f99cac06), so a FAIL here does not stall the docker container.
+// No expected-fail annotation is recorded: a real FAIL on litebox
+// is the desired signal that the underlying platform bug needs
+// fixing. The test harness's own teardown is wrapped in a 10-s
+// timeout (commit f99cac06), so a FAIL here does not stall the
+// docker container.
 // ═══════════════════════════════════════════════════════════════════
 
 /// Wall-clock budget for `Child::wait()` after SIGKILL. Native

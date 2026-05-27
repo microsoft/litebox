@@ -203,7 +203,16 @@ impl Policy for GlobPolicy {
         let Some(p) = path else {
             return match action {
                 Action::Seek | Action::Close => Decision::Allow,
-                _ => Decision::Allow,
+                Action::Open
+                | Action::Read
+                | Action::Write
+                | Action::Stat
+                | Action::Chmod
+                | Action::Mkdir
+                | Action::Rmdir
+                | Action::Unlink
+                | Action::ReadDir
+                | Action::Truncate => Decision::Allow,
             };
         };
 

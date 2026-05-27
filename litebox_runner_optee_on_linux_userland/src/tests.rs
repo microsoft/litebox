@@ -5,6 +5,9 @@
 //! OP-TEE TAs need clients to work with that this Linux userland runner lacks.
 //! Instead, these tests use pre-defined JSON-formatted command sequences to test TAs.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use litebox::platform::RawConstPointer;
 use litebox::utils::TruncateExt;
 use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};

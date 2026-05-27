@@ -70,6 +70,9 @@
 //! is 24 bytes (Subscribe), so this is comfortably generous; the
 //! cap exists primarily to bound memory on a malformed peer.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use alloc::vec::Vec;
 
 /// Wire-format magic ("LBFD" — LiteBox FD).
@@ -106,7 +109,8 @@ pub const BODY_MAX: u32 = 65536;
 /// | `0x40`–`0x4F`    | Signalfd state (P2.C)       |
 /// | `0x50`–`0x5F`    | Pipe state (Phase C)        |
 /// | `0x60`–`0x6F`    | Pty state (Phase E)         |
-/// | `0x70`–`0x7F`    | Process state (Phase G)     |
+/// | `0x70`–`0x78`    | Process state (Phase G)     |
+/// | `0x79`–`0x7C`    | TCP conn state (BrokerTcpConn) |
 ///
 /// Within a kind's range, follow the eventfd template:
 /// `0xN0` = create, `0xN1` = read-like primary op, `0xN2` = write-like
@@ -170,6 +174,10 @@ pub enum Opcode {
     SetPgid = 0x77,
     /// Stamp session creation in the broker before the shim cache mutates.
     SetSid = 0x78,
+    ReadTcpConn = 0x79,
+    WriteTcpConn = 0x7A,
+    ShutdownTcpConn = 0x7B,
+    PollTcpConnEvents = 0x7C,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -209,6 +217,10 @@ pub enum Opcode {
     DeliverSignalInboxResponse = 0xF6,
     SetPgidResponse = 0xF7,
     SetSidResponse = 0xF8,
+    ReadTcpConnResponse = 0xF9,
+    WriteTcpConnResponse = 0xFA,
+    ShutdownTcpConnResponse = 0xFB,
+    PollTcpConnEventsResponse = 0xFC,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -241,6 +253,10 @@ pub mod opcode_ranges {
     /// 0x72 MarkProcessExited.
     pub const PROCESS_BASE: u8 = 0x70;
     pub const PROCESS_RESPONSE_BASE: u8 = 0xF0;
+
+    /// Connected TCP state: read / write / shutdown / poll-events.
+    pub const TCP_CONN_BASE: u8 = 0x79;
+    pub const TCP_CONN_RESPONSE_BASE: u8 = 0xF9;
 }
 
 /// Endpoint side for a broker-hosted PTY handle.
@@ -336,6 +352,10 @@ impl Opcode {
             Opcode::DeliverSignalInbox => Some(Opcode::DeliverSignalInboxResponse),
             Opcode::SetPgid => Some(Opcode::SetPgidResponse),
             Opcode::SetSid => Some(Opcode::SetSidResponse),
+            Opcode::ReadTcpConn => Some(Opcode::ReadTcpConnResponse),
+            Opcode::WriteTcpConn => Some(Opcode::WriteTcpConnResponse),
+            Opcode::ShutdownTcpConn => Some(Opcode::ShutdownTcpConnResponse),
+            Opcode::PollTcpConnEvents => Some(Opcode::PollTcpConnEventsResponse),
             _ => None,
         }
     }
@@ -381,6 +401,10 @@ impl Opcode {
                 | Opcode::DeliverSignalInbox
                 | Opcode::SetPgid
                 | Opcode::SetSid
+                | Opcode::ReadTcpConn
+                | Opcode::WriteTcpConn
+                | Opcode::ShutdownTcpConn
+                | Opcode::PollTcpConnEvents
         )
     }
 
@@ -441,6 +465,10 @@ impl TryFrom<u8> for Opcode {
             0x76 => Ok(Opcode::DeliverSignalInbox),
             0x77 => Ok(Opcode::SetPgid),
             0x78 => Ok(Opcode::SetSid),
+            0x79 => Ok(Opcode::ReadTcpConn),
+            0x7A => Ok(Opcode::WriteTcpConn),
+            0x7B => Ok(Opcode::ShutdownTcpConn),
+            0x7C => Ok(Opcode::PollTcpConnEvents),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -478,6 +506,10 @@ impl TryFrom<u8> for Opcode {
             0xF6 => Ok(Opcode::DeliverSignalInboxResponse),
             0xF7 => Ok(Opcode::SetPgidResponse),
             0xF8 => Ok(Opcode::SetSidResponse),
+            0xF9 => Ok(Opcode::ReadTcpConnResponse),
+            0xFA => Ok(Opcode::WriteTcpConnResponse),
+            0xFB => Ok(Opcode::ShutdownTcpConnResponse),
+            0xFC => Ok(Opcode::PollTcpConnEventsResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -1983,6 +2015,206 @@ pub fn build_shutdown_socketpair_write_response_ok() -> OwnedFrame {
         caller_pid: 0,
         body: Vec::new(),
     }
+}
+
+// =====================================================================
+// BrokerTcpConn wire format.
+// =====================================================================
+
+pub fn build_read_tcp_conn_request(handle_id: u64, max_len: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::ReadTcpConn,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_read_tcp_conn_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadTcpConn,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+    ))
+}
+
+pub fn build_read_tcp_conn_response_ok(bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + bytes.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::ReadTcpConnResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_read_tcp_conn_response_body(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadTcpConnResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadTcpConnResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
+}
+
+pub fn build_write_tcp_conn_request(handle_id: u64, bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + bytes.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::WriteTcpConn,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_write_tcp_conn_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::WriteTcpConn,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let len = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 16 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::WriteTcpConn,
+            got: body.len(),
+            want: 16 + len,
+        });
+    }
+    Ok((handle, body[16..].to_vec()))
+}
+
+pub fn build_write_tcp_conn_response_ok(written: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::WriteTcpConnResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: written.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_write_tcp_conn_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::WriteTcpConnResponse)
+}
+
+pub fn build_shutdown_tcp_conn_request(handle_id: u64, read: bool, write: bool) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.push(u8::from(read));
+    body.push(u8::from(write));
+    body.extend_from_slice(&[0u8; 6]);
+    OwnedFrame {
+        opcode: Opcode::ShutdownTcpConn,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_shutdown_tcp_conn_body(body: &[u8]) -> Result<(u64, bool, bool), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ShutdownTcpConn,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    if body[10..16].iter().any(|&b| b != 0) || body[8] > 1 || body[9] > 1 {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        body[8] != 0,
+        body[9] != 0,
+    ))
+}
+
+pub fn build_shutdown_tcp_conn_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::ShutdownTcpConnResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_poll_tcp_conn_events_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::PollTcpConnEvents,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_poll_tcp_conn_events_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::PollTcpConnEvents)
+}
+
+pub fn build_poll_tcp_conn_events_response_ok(events: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&events.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::PollTcpConnEventsResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_poll_tcp_conn_events_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PollTcpConnEventsResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
 }
 
 /// Body for [`Opcode::CreatePty`]: empty (allocates one master/slave pair).

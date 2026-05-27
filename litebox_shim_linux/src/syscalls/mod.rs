@@ -7,6 +7,7 @@ pub(crate) mod broker_backed;
 pub(crate) mod broker_pipe;
 pub(crate) mod broker_pty;
 pub(crate) mod broker_socketpair;
+pub(crate) mod broker_tcp_conn;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub(crate) mod guest_pid;
@@ -20,6 +21,9 @@ pub use broker_pty::{broker_pty_provider, set_broker_pty_provider};
 pub use broker_socketpair::{
     broker_socketpair_provider, eager_broker_socketpair_enabled, set_broker_socketpair_provider,
     set_eager_broker_socketpair_enabled,
+};
+pub use broker_tcp_conn::{
+    broker_tcp_conn_provider, set_broker_tcp_conn_accept_enabled, set_broker_tcp_conn_provider,
 };
 pub use eventfd::broker_eventfd_provider;
 pub use eventfd::broker_pgrp_signal_provider;

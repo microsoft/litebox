@@ -3,6 +3,9 @@
 
 //! VTL1 kernel boot parameters (compatible with Linux kernel's boot_params structure and command line)
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::mshv::vtl1_mem_layout::{
     VTL1_BOOT_PARAMS_PAGE, VTL1_CMDLINE_PAGE, VtlMemoryError, get_address_of_special_page,
 };

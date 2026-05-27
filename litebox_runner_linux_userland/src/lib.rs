@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
@@ -18,6 +21,7 @@ pub mod broker_pipe_provider;
 pub mod broker_pty_provider;
 pub mod broker_signalfd_provider;
 pub mod broker_socketpair_provider;
+pub mod broker_tcp_conn_provider;
 pub mod guest_pid_provider;
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -223,7 +227,9 @@ pub struct CliArgs {
     /// broker-backed fd at `fd` referencing broker handle `handle_id` of
     /// `kind` (eventfd | pidfd | signalfd | pty | pipe). The optional
     /// `direction` ('r' or 'w') is required for `kind=pipe` and identifies
-    /// which end of the broker `PipeState` this fd represents.
+    /// which end of the broker `PipeState` this fd represents. Signalfd uses
+    /// `fd:signalfd:handle_id:mask_bits:nonblock`; brokerfile uses
+    /// `fd:brokerfile:status_flags:position:path_hex`.
     ///
     /// Used by the runner during worker-exec startup to seed broker-backed
     /// shim fd entries at the right fd slots before the worker binary
@@ -290,6 +296,7 @@ type BrokerFdBridgeParsed = (
 /// `fd:kind:handle_id[:subkind]` and returns the components.
 ///
 /// `subkind` is required for pipe direction, unix socketpair endpoint, and PTY role.
+#[deny(clippy::wildcard_enum_match_arm)]
 fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
     use litebox_common_linux::broker_pty_provider::BrokerPtyRole;
@@ -309,6 +316,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         "pty" => BrokerHandleKind::Pty,
         "pipe" => BrokerHandleKind::Pipe,
         "unix_socket" => BrokerHandleKind::UnixSocket,
+        "tcp_conn" => BrokerHandleKind::TcpConn,
         other => anyhow::bail!("broker-fd-bridge: bad kind {other:?}"),
     };
     let handle_id: u64 = parts[2]
@@ -349,13 +357,19 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Pty, None) => {
             anyhow::bail!("broker-fd-bridge: pty kind requires :m or :s suffix (spec {spec:?})")
         }
-        (_, Some(extra)) => {
+        (BrokerHandleKind::Eventfd, Some(extra))
+        | (BrokerHandleKind::Pidfd, Some(extra))
+        | (BrokerHandleKind::Signalfd, Some(extra))
+        | (BrokerHandleKind::TcpConn, Some(extra)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
                 parts[1]
             )
         }
-        (_, None) => (None, None, None),
+        (BrokerHandleKind::Eventfd, None)
+        | (BrokerHandleKind::Pidfd, None)
+        | (BrokerHandleKind::Signalfd, None)
+        | (BrokerHandleKind::TcpConn, None) => (None, None, None),
     };
     let pty_id = if kind == BrokerHandleKind::Pty {
         match parts.get(4) {
@@ -374,6 +388,190 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     Ok((
         guest_fd, kind, handle_id, direction, endpoint, pty_role, pty_id,
     ))
+}
+
+fn decode_brokerfile_bridge_path(encoded: &str) -> Result<String> {
+    if encoded.len() % 2 != 0 {
+        anyhow::bail!("broker-fd-bridge: odd-length brokerfile path");
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for chunk in encoded.as_bytes().chunks_exact(2) {
+        let hex = std::str::from_utf8(chunk)
+            .map_err(|e| anyhow!("broker-fd-bridge: bad brokerfile path hex: {e}"))?;
+        bytes.push(
+            u8::from_str_radix(hex, 16)
+                .map_err(|e| anyhow!("broker-fd-bridge: bad brokerfile path hex {hex:?}: {e}"))?,
+        );
+    }
+    String::from_utf8(bytes).map_err(|e| anyhow!("broker-fd-bridge: bad brokerfile path utf8: {e}"))
+}
+
+fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
+    entrypoints: &litebox_shim_linux::LinuxShimEntrypoints<FS>,
+    spec: &str,
+) -> Result<()> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.get(1) == Some(&"tcp_listen") {
+        if parts.len() != 4 {
+            anyhow::bail!("broker-fd-bridge: bad tcp_listen spec {spec:?}");
+        }
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let port: u16 = parts[2]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad port {:?}: {e}", parts[2]))?;
+        let reuse_port = match parts[3] {
+            "0" => false,
+            "1" => true,
+            other => anyhow::bail!("broker-fd-bridge: bad reuse flag {other:?}"),
+        };
+        return entrypoints
+            .install_tcp_listen_bridge_fd(guest_fd, port, reuse_port)
+            .map_err(|err| anyhow!("broker-fd-bridge: tcp_listen {spec:?}: {err:?}"));
+    }
+
+    if parts.get(1) == Some(&"tcp_conn") && parts.len() == 3 {
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let handle_id: u64 = parts[2]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad handle {:?}: {e}", parts[2]))?;
+        return entrypoints
+            .install_broker_tcp_conn_bridge_fd(guest_fd, handle_id)
+            .map_err(|err| anyhow!("broker-fd-bridge: tcp_conn {spec:?}: {err:?}"));
+    }
+
+    if parts.get(1) == Some(&"signalfd") && parts.len() == 5 {
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let handle_id: u64 = parts[2]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad handle {:?}: {e}", parts[2]))?;
+        let mask_bits: u64 = parts[3]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad signalfd mask {:?}: {e}", parts[3]))?;
+        let nonblock = match parts[4] {
+            "0" => false,
+            "1" => true,
+            other => anyhow::bail!("broker-fd-bridge: bad signalfd nonblock flag {other:?}"),
+        };
+        return entrypoints
+            .install_signalfd_bridge_fd(guest_fd, handle_id, mask_bits, nonblock)
+            .map_err(|err| anyhow!("broker-fd-bridge: signalfd {spec:?}: {err:?}"));
+    }
+
+    if parts.get(1) == Some(&"brokerfile") && parts.len() == 5 {
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let status_flags_bits: u32 = parts[2].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad brokerfile status flags {:?}: {e}",
+                parts[2]
+            )
+        })?;
+        let position: usize = parts[3].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad brokerfile position {:?}: {e}",
+                parts[3]
+            )
+        })?;
+        let path = decode_brokerfile_bridge_path(parts[4])?;
+        return entrypoints
+            .install_brokerfile_bridge_fd(guest_fd, &path, position, status_flags_bits)
+            .map_err(|err| anyhow!("broker-fd-bridge: brokerfile {spec:?}: {err:?}"));
+    }
+
+    if parts.get(1) == Some(&"timerfd") && parts.len() == 10 {
+        // spec format: {raw_fd}:timerfd:{clockid_u32}:{nonblock_u8}:{value_sec}:{value_nsec}:{interval_sec}:{interval_nsec}:{pending}:{snapshot_now_ns}
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let clockid_u32: u32 = parts[2]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad timerfd clockid {:?}: {e}", parts[2]))?;
+        let clockid = litebox_common_linux::ClockId::try_from(clockid_u32 as i32)
+            .map_err(|_| anyhow!("broker-fd-bridge: unknown timerfd clockid {clockid_u32}"))?;
+        let nonblock = match parts[3] {
+            "0" => false,
+            "1" => true,
+            other => anyhow::bail!("broker-fd-bridge: bad timerfd nonblock flag {other:?}"),
+        };
+        let value_sec: i64 = parts[4].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad timerfd value_sec {:?}: {e}",
+                parts[4]
+            )
+        })?;
+        let value_nsec: i64 = parts[5].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad timerfd value_nsec {:?}: {e}",
+                parts[5]
+            )
+        })?;
+        let interval_sec: i64 = parts[6].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad timerfd interval_sec {:?}: {e}",
+                parts[6]
+            )
+        })?;
+        let interval_nsec: i64 = parts[7].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad timerfd interval_nsec {:?}: {e}",
+                parts[7]
+            )
+        })?;
+        let pending_expirations: u64 = parts[8]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad timerfd pending {:?}: {e}", parts[8]))?;
+        let snapshot_now_ns: u64 = parts[9].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad timerfd snapshot_now_ns {:?}: {e}",
+                parts[9]
+            )
+        })?;
+        let spec_val = litebox_common_linux::ItimerSpec {
+            value: litebox_common_linux::Timespec {
+                tv_sec: value_sec,
+                tv_nsec: value_nsec
+                    .try_into()
+                    .map_err(|_| anyhow!("broker-fd-bridge: timerfd value_nsec negative"))?,
+            },
+            interval: litebox_common_linux::Timespec {
+                tv_sec: interval_sec,
+                tv_nsec: interval_nsec
+                    .try_into()
+                    .map_err(|_| anyhow!("broker-fd-bridge: timerfd interval_nsec negative"))?,
+            },
+        };
+        return entrypoints
+            .install_timerfd_bridge_fd(
+                guest_fd,
+                clockid,
+                nonblock,
+                spec_val,
+                pending_expirations,
+                snapshot_now_ns,
+            )
+            .map_err(|err| anyhow!("broker-fd-bridge: timerfd {spec:?}: {err:?}"));
+    }
+
+    let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
+        parse_broker_fd_bridge_spec(spec)?;
+    entrypoints
+        .install_broker_bridge_fd(
+            guest_fd,
+            kind,
+            handle_id,
+            pipe_direction,
+            socketpair_endpoint,
+            pty_role,
+            pty_id,
+        )
+        .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))
 }
 
 fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
@@ -508,7 +706,22 @@ fn initial_program_data(
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
+fn guest_env_present(cli_args: &CliArgs, key: &str) -> bool {
+    cli_args.environment_variables.iter().any(|kv| {
+        kv == key
+            || kv
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+fn should_force_worker_panic(cli_args: &CliArgs) -> bool {
+    guest_env_present(cli_args, "LITEBOX_FORCE_PANIC_TEST")
+        && (cli_args.worker_exec || cli_args.fork_restore || cli_args.guest_pid.is_some())
+}
+
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    litebox_panic_hook::install("runner");
     litebox_timing::init_from_env();
     litebox_timing::emit("runner_started_ns");
     // Open audit log file if specified. Must happen before any early-return
@@ -559,6 +772,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
     }
 
+    // Stage 3a: broker-backed TCP accept is opt-in while the matrix is
+    // validated. The broker process reads the same environment variable.
+    {
+        let enabled = std::env::var("LITEBOX_BROKER_TCP_CONN")
+            .ok()
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        litebox_shim_linux::syscalls::set_broker_tcp_conn_accept_enabled(enabled);
+    }
+
     // Phase B-Step8c: if --fd-token-broker is supplied, connect to
     // the broker's fd-token control socket and register a
     // BrokerEventfdProvider so subsequent sys_eventfd2 calls produce
@@ -604,6 +827,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // SSH retries.
     #[cfg(feature = "audit_log")]
     litebox_shim_linux::audit::set_worker_id(std::process::id() as i32);
+
+    if should_force_worker_panic(&cli_args) {
+        panic!("LITEBOX_PANIC_HOOK_TEST");
+    }
 
     // When running as a worker host for a non-PIE child exec, take the
     // simplified worker path that skips VA partitioning.
@@ -1078,20 +1305,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
-                parse_broker_fd_bridge_spec(spec)?;
-            program
-                .entrypoints
-                .install_broker_bridge_fd(
-                    guest_fd,
-                    kind,
-                    handle_id,
-                    pipe_direction,
-                    socketpair_endpoint,
-                    pty_role,
-                    pty_id,
-                )
-                .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+            install_broker_fd_bridge_spec(&program.entrypoints, spec)?;
         }
 
         if let Some(pty_id) = cli_args.controlling_pty {
@@ -1187,20 +1401,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // extended in Phase C.3 to handle pipe).
     let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
     for spec in &cli_args.broker_fd_bridge {
-        let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
-            parse_broker_fd_bridge_spec(spec)?;
-        program
-            .entrypoints
-            .install_broker_bridge_fd(
-                guest_fd,
-                kind,
-                handle_id,
-                pipe_direction,
-                socketpair_endpoint,
-                pty_role,
-                pty_id,
-            )
-            .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+        install_broker_fd_bridge_spec(&program.entrypoints, spec)?;
     }
 
     if let Some(pty_id) = cli_args.controlling_pty {
@@ -2503,20 +2704,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         // extended in Phase C.3 to handle pipe).
         let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(guest_task);
         for spec in &cli_args.broker_fd_bridge {
-            let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
-                parse_broker_fd_bridge_spec(spec)?;
-            program
-                .entrypoints
-                .install_broker_bridge_fd(
-                    guest_fd,
-                    kind,
-                    handle_id,
-                    pipe_direction,
-                    socketpair_endpoint,
-                    pty_role,
-                    pty_id,
-                )
-                .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))?;
+            install_broker_fd_bridge_spec(&program.entrypoints, spec)?;
         }
 
         // Stage B: restore parent's controlling PTY so /dev/tty resolves
@@ -3234,6 +3422,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_socketpair_provider(socketpair_provider)
         .map_err(|_| anyhow!("socketpair provider already set"))?;
+
+    let tcp_conn_provider = Arc::new(
+        crate::broker_tcp_conn_provider::RunnerBrokerTcpConnProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_tcp_conn_provider(tcp_conn_provider)
+        .map_err(|_| anyhow!("tcp conn provider already set"))?;
 
     let pgrp_signal_provider = Arc::new(
         crate::broker_pgrp_signal_provider::RunnerBrokerPgrpSignalProvider::new(

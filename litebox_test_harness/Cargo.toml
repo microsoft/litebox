@@ -18,8 +18,5 @@ name = "integration"
 path = "tests/integration.rs"
 harness = false
 
-[lints.rust]
-warnings = "deny"
-
-[lints.clippy]
-pedantic = { level = "deny", priority = -1 }
+[lints]
+workspace = true

@@ -22,29 +22,35 @@
 //! worker that needs throughput beyond a single round-trip per call
 //! opens multiple clients to the broker.
 
+#![allow(clippy::wildcard_enum_match_arm)]
+// StatusCode pass-through arms deliberately preserve broker statuses; converting every RPC remains incremental.
+
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
     build_create_eventfd_request, build_create_pidfd_request, build_create_pipe_request,
     build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
     build_deliver_signal_inbox_request, build_mark_process_exited_request,
     build_materialize_request, build_open_pty_slave_request, build_pidfd_exited_request,
-    build_pty_ioctl_request, build_pty_read_request, build_pty_write_request,
-    build_push_siginfo_request, build_read_eventfd_request, build_read_pipe_request,
-    build_read_siginfo_request, build_read_socketpair_request,
-    build_register_notification_ring_request, build_register_process_request,
-    build_register_request, build_release_request, build_set_pgid_request, build_set_sid_request,
-    build_shutdown_socketpair_write_request, build_subscribe_eventfd_request,
+    build_poll_tcp_conn_events_request, build_pty_ioctl_request, build_pty_read_request,
+    build_pty_write_request, build_push_siginfo_request, build_read_eventfd_request,
+    build_read_pipe_request, build_read_siginfo_request, build_read_socketpair_request,
+    build_read_tcp_conn_request, build_register_notification_ring_request,
+    build_register_process_request, build_register_request, build_release_request,
+    build_set_pgid_request, build_set_sid_request, build_shutdown_socketpair_write_request,
+    build_shutdown_tcp_conn_request, build_subscribe_eventfd_request,
     build_subscribe_process_exit_request, build_subscribe_pty_request,
     build_subscribe_signal_inbox_request, build_unsubscribe_request,
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
-    build_write_socketpair_request, decode, parse_create_pidfd_response_ok,
-    parse_create_pty_response_ok, parse_create_socketpair_response_body, parse_handle_body,
-    parse_open_pty_slave_response_ok, parse_pidfd_exited_response_ok,
+    build_write_socketpair_request, build_write_tcp_conn_request, decode,
+    parse_create_pidfd_response_ok, parse_create_pty_response_ok,
+    parse_create_socketpair_response_body, parse_handle_body, parse_open_pty_slave_response_ok,
+    parse_pidfd_exited_response_ok, parse_poll_tcp_conn_events_response_ok,
     parse_pty_ioctl_response_body, parse_pty_read_response_body, parse_pty_write_response_ok,
     parse_read_pipe_response_body, parse_read_siginfo_response_body,
-    parse_read_socketpair_response_body, parse_set_sid_response_ok,
-    parse_subscribe_process_exit_response_ok, parse_write_pipe_response_ok,
-    parse_write_socketpair_response_ok,
+    parse_read_socketpair_response_body, parse_read_tcp_conn_response_body,
+    parse_set_sid_response_ok, parse_subscribe_process_exit_response_ok,
+    parse_write_pipe_response_ok, parse_write_socketpair_response_ok,
+    parse_write_tcp_conn_response_ok,
 };
 use std::format;
 use std::io;
@@ -1025,6 +1031,108 @@ impl FdTokenClient {
         }
         match resp.status {
             StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn read_tcp_conn(&self, handle_id: u64, max_len: u64) -> Result<Vec<u8>, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_read_tcp_conn_request(handle_id, max_len),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::ReadTcpConnResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_read_tcp_conn_response_body(resp.body).map_err(ClientError::Protocol)
+            }
+            StatusCode::WouldBlock => Err(ClientError::WouldBlock),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn write_tcp_conn(&self, handle_id: u64, bytes: &[u8]) -> Result<usize, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_write_tcp_conn_request(handle_id, bytes),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::WriteTcpConnResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_write_tcp_conn_response_ok(resp.body)
+                .map(|n| n as usize)
+                .map_err(ClientError::Protocol),
+            StatusCode::WouldBlock => Err(ClientError::WouldBlock),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: 0 }),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn shutdown_tcp_conn(
+        &self,
+        handle_id: u64,
+        read: bool,
+        write: bool,
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_shutdown_tcp_conn_request(handle_id, read, write),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::ShutdownTcpConnResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn poll_tcp_conn_events(&self, handle_id: u64) -> Result<u32, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_poll_tcp_conn_events_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::PollTcpConnEventsResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_poll_tcp_conn_events_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }

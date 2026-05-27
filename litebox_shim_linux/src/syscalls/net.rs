@@ -3,6 +3,9 @@
 
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use core::{
     ffi::CStr,
     mem::offset_of,
@@ -10,7 +13,7 @@ use core::{
 };
 
 use alloc::sync::Arc;
-use alloc::{string::ToString, vec::Vec};
+use alloc::{string::String, string::ToString, vec::Vec};
 use litebox::{
     event::{
         Events, IOPollable,
@@ -23,6 +26,7 @@ use litebox::{
         errors::AcceptError,
         socket_channel::{NetworkProxy, SocketState},
     },
+    platform::IPInterfaceProvider as _,
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt as _,
 };
@@ -65,6 +69,8 @@ type BrokerSocketPairHandle = litebox::fd::EntryHandle<
     Platform,
     crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem,
 >;
+type BrokerTcpConnTypedFd =
+    litebox::fd::TypedFd<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>;
 
 impl<FS: ShimFS> super::file::FilesState<FS> {
     /// Helper to dispatch socket operations based on socket type (INET vs Unix).
@@ -916,6 +922,12 @@ impl<FS: ShimFS> GlobalState<FS> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
+    fn send_listen_route_transfer(&self, port: u16) -> Result<(), Errno> {
+        self.platform
+            .send_port_listen_transfer(port)
+            .map_err(|_| Errno::EIO)
+    }
+
     fn shutdown(&self, fd: &SocketFd, read: bool, write: bool) -> Result<(), Errno> {
         let result = self
             .net
@@ -1248,6 +1260,26 @@ impl<FS: ShimFS> Task<FS> {
             .descriptor_table()
             .entry_handle(typed)
             .ok_or(Errno::EBADF)
+    }
+
+    fn try_with_broker_tcp_conn<R>(
+        &self,
+        sockfd: u32,
+        op: impl FnOnce(&BrokerTcpConnTypedFd) -> Result<R, Errno>,
+    ) -> Option<Result<R, Errno>> {
+        let raw_fd = match usize::try_from(sockfd) {
+            Ok(raw_fd) => raw_fd,
+            Err(_) => return Some(Err(Errno::EBADF)),
+        };
+        let broker_tcp = {
+            let files = self.files.borrow();
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
+                .ok()
+        };
+        broker_tcp.map(|typed| op(typed.as_ref()))
     }
 }
 
@@ -1799,6 +1831,67 @@ impl<FS: ShimFS> Task<FS> {
         }
         Ok(fd)
     }
+    fn try_install_broker_tcp_accept(
+        &self,
+        accepted_file: &SocketFd,
+        peer_addr: Option<&SocketAddress>,
+        flags: SockFlags,
+        files: &crate::syscalls::file::FilesState<FS>,
+    ) -> Result<Option<usize>, Errno> {
+        if !crate::syscalls::broker_tcp_conn::broker_tcp_conn_accept_enabled() {
+            return Ok(None);
+        }
+        let peer_addr = match peer_addr.cloned() {
+            Some(addr) => Some(addr),
+            None => self
+                .global
+                .net
+                .lock()
+                .get_remote_addr(accepted_file)
+                .ok()
+                .map(SocketAddress::Inet),
+        };
+        let Some(SocketAddress::Inet(SocketAddr::V4(peer))) = peer_addr else {
+            return Ok(None);
+        };
+        if peer.port() == 0 {
+            return Ok(None);
+        }
+        let handle_id = u64::from(peer.port());
+        let Some(provider) = crate::syscalls::broker_tcp_conn::broker_tcp_conn_provider() else {
+            return Ok(None);
+        };
+        if provider.poll_tcp_conn_events(handle_id).is_err() {
+            return Ok(None);
+        }
+
+        let _ = self
+            .global
+            .net
+            .lock()
+            .close(accepted_file, CloseBehavior::Immediate);
+        let status = if flags.contains(SockFlags::NONBLOCK) {
+            OFlags::NONBLOCK
+        } else {
+            OFlags::empty()
+        };
+        let tcp_fd = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+            provider, handle_id, status,
+        );
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let typed = dt.insert::<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(tcp_fd);
+        if flags.contains(SockFlags::CLOEXEC) {
+            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        drop(dt);
+        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+            let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+            Errno::EMFILE
+        })?;
+        Ok(Some(raw_fd))
+    }
+
     pub(super) fn do_accept(
         &self,
         sockfd: u32,
@@ -1818,6 +1911,15 @@ impl<FS: ShimFS> Task<FS> {
                     self.global
                         .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Inet);
+
+                if let Some(raw_fd) = self.try_install_broker_tcp_accept(
+                    &accepted_file,
+                    peer_addr.as_ref(),
+                    flags,
+                    files.as_ref(),
+                )? {
+                    return Ok((raw_fd, peer_addr));
+                }
 
                 let proxy = self
                     .global
@@ -1937,6 +2039,96 @@ impl<FS: ShimFS> Task<FS> {
         )
     }
 
+    pub(crate) fn tcp_listen_worker_exec_bridge_spec(&self, raw_fd: usize) -> Option<String> {
+        let fd = {
+            let files = self.files.borrow();
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
+                .ok()?
+        };
+        let dt = self.global.litebox.descriptor_table();
+        let sock_type = dt.with_metadata(&fd, |ty: &SockType| *ty).ok()?;
+        if sock_type != SockType::Stream {
+            return None;
+        }
+        let reuse_port = self
+            .global
+            .with_socket_options(&fd, |options| options.reuse_port);
+        if !reuse_port {
+            return None;
+        }
+        let port = self.global.net.lock().get_local_addr(&fd).ok()?.port();
+        if port == 0 {
+            return None;
+        }
+        Some(alloc::format!("{raw_fd}:tcp_listen:{port}:1"))
+    }
+
+    pub(crate) fn install_tcp_listen_bridge_fd(
+        &self,
+        guest_fd: usize,
+        port: u16,
+        reuse_port: bool,
+    ) -> Result<(), Errno> {
+        let created_fd = self.do_socket(
+            AddressFamily::INET,
+            SockType::Stream,
+            SockFlags::empty(),
+            IPProtocol::TCP as u8,
+        )? as usize;
+        if created_fd != guest_fd {
+            let typed = {
+                let files = self.files.borrow();
+                files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(created_fd)
+                    .map_err(|_| Errno::EBADF)?
+            };
+            let dup = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .duplicate(&typed)
+                .ok_or(Errno::EBADF)?;
+            if self
+                .files
+                .borrow()
+                .raw_descriptor_store
+                .read()
+                .is_alive(guest_fd)
+            {
+                self.do_close(guest_fd)?;
+            }
+            {
+                let files = self.files.borrow();
+                let mut rds = files.raw_descriptor_store.write();
+                if !rds.fd_into_specific_raw_integer(dup, guest_fd) {
+                    return Err(Errno::EBADF);
+                }
+            }
+            self.do_close(created_fd)?;
+        }
+        let fd = {
+            let files = self.files.borrow();
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(guest_fd)
+                .map_err(|_| Errno::EBADF)?
+        };
+        self.global
+            .with_socket_options_mut(&fd, |options| options.reuse_port = reuse_port);
+        self.global.bind(
+            &fd,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+        )?;
+        self.global.listen(&fd, 16)?;
+        self.global.send_listen_route_transfer(port)
+    }
+
     /// Get the local port for an INET socket. Returns None if not bound.
     pub(super) fn do_getsockname_inet_port(&self, sockfd: u32) -> Option<u16> {
         self.files
@@ -1973,23 +2165,45 @@ impl<FS: ShimFS> Task<FS> {
         };
         self.do_shutdown(sockfd, read, write)
     }
+    #[deny(clippy::wildcard_enum_match_arm)]
     fn do_shutdown(&self, sockfd: u32, read: bool, write: bool) -> Result<(), Errno> {
-        if let Some(result) = self.try_with_broker_sp(sockfd, |typed| {
-            let handle = self.broker_sp_handle(typed)?;
-            handle.with_entry(|entry| entry.shutdown(read, write))
-        }) {
-            return result;
-        }
-
-        self.files.borrow().with_socket(
-            &self.global,
-            sockfd,
-            |fd| self.global.shutdown(fd, read, write),
-            |file| {
-                file.shutdown(read, write);
-                Ok(())
-            },
-        )
+        let files = self.files.borrow();
+        files.run_on_raw_fd(sockfd as usize, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Net(fd) => self.global.shutdown(fd, read, write),
+            crate::RawFdRef::Pipes(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Epoll(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Unix(fd) => {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|entry| {
+                    entry.shutdown(read, write);
+                    Ok(())
+                })
+            }
+            crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::BrokerSocketPair(fd) => {
+                let handle = self.broker_sp_handle(fd)?;
+                handle.with_entry(|entry| entry.shutdown(read, write))
+            }
+            crate::RawFdRef::BrokerTcpConn(fd) => {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|entry| entry.shutdown(read, write))
+            }
+            crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTSOCK),
+        })?
     }
 
     /// Handle syscall `sendto`
@@ -2038,6 +2252,29 @@ impl<FS: ShimFS> Task<FS> {
                 Err(Errno::EISCONN)
             } else {
                 let handle = self.broker_sp_handle(typed)?;
+                handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
+            }
+        }) {
+            if let Err(Errno::EPIPE) = ret
+                && !flags.contains(SendFlags::NOSIGNAL)
+            {
+                self.send_signal(
+                    litebox_common_linux::signal::Signal::SIGPIPE,
+                    super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+                );
+            }
+            return ret;
+        }
+        if let Some(ret) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            if sockaddr.is_some() {
+                Err(Errno::EISCONN)
+            } else {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(typed)
+                    .ok_or(Errno::EBADF)?;
                 handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
             }
         }) {
@@ -2254,72 +2491,87 @@ impl<FS: ShimFS> Task<FS> {
                 let files = self.files.borrow();
                 let rds = files.raw_descriptor_store.read();
 
-                // Peek at the entry to extract a broker handle if present.
-                // This is done before duplicate_for_passing so we hold the
-                // rds read lock once.
-                let broker_token = rds
-                    .fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-                    .ok()
-                    .and_then(|typed| {
-                        // Note: with_entry is the typed-fd's entry accessor;
-                        // we re-fetch the typed fd because fd_from_raw_integer
-                        // consumed it via .ok().
-                        let typed = rds
-                            .fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-                            .ok()?;
-                        drop(typed); // we already have what we need via the closure below
-                        let _ = typed;
-                        None::<litebox_common_linux::fd_transfer_frame::PassedToken>
-                    });
-                // The dance above doesn't quite work — see comments. Use
-                // entry_handle (which is on dt, not rds) and peek through
-                // it. Simpler approach: after duplicate_for_passing, the
-                // PassedFd is in our hand; if its type_id matches
-                // EventfdSubsystem we can look it up in dt.
-                let _ = broker_token; // discard the failed attempt
-
                 let passed = rds
                     .duplicate_for_passing(raw_fd, &mut dt)
                     .ok_or(Errno::EBADF)?;
                 drop(rds);
                 drop(files);
 
-                // Now peek at the entry via dt's typed-fd API for the
-                // EventfdSubsystem and check if it's BrokerBacked.
-                // The PassedFd carries the OwnedFd we just duplicated;
-                // the type_id is recorded inside but we can also detect
-                // by trying to fetch the entry handle for EventfdSubsystem
-                // at the same raw_fd via the worker's files (still valid
-                // because we haven't given the PassedFd to anyone yet).
                 let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
-                let mut sent_broker_token = false;
-                if let Ok(typed) =
-                    rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-                {
-                    if let Some(handle_id) = dt
-                        .entry_handle::<super::eventfd::EventfdSubsystem>(&typed)
-                        .and_then(|h| h.with_entry(|e| e.broker_backed_handle()))
-                    {
-                        // Found a broker-backed eventfd. Ask the broker
-                        // to dup a transit ref so the handle survives
-                        // until the receiver materialises its own ref.
-                        let provider = dt
-                            .entry_handle::<super::eventfd::EventfdSubsystem>(&typed)
-                            .and_then(|h| h.with_entry(|e| e.broker_backed_provider()))
-                            .ok_or(Errno::EIO)?;
-                        provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
-                        passed_tokens.push(
-                            litebox_common_linux::fd_transfer_frame::PassedToken::new(
-                                litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd,
-                                handle_id,
-                            )
-                            .map_err(|_| Errno::EINVAL)?,
-                        );
-                        sent_broker_token = true;
+                let sent_broker_token = files.run_on_raw_fd(raw_fd, |raw_fd_ref| -> Result<bool, Errno> {
+                    match raw_fd_ref {
+                        crate::RawFdRef::Fs(_) => {
+                            // Filesystem descriptors are kernel-backed and transfer as PassedFd.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::Net(_) => {
+                            // Network descriptors are kernel-backed and transfer as PassedFd.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::Pipes(_) => {
+                            // Pipes are kernel-backed and transfer as PassedFd.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::Eventfd(typed) => {
+                            if let Some(handle_id) = dt
+                                .entry_handle::<super::eventfd::EventfdSubsystem>(typed)
+                                .and_then(|h| h.with_entry(|e| e.broker_backed_handle()))
+                            {
+                                // Found a broker-backed eventfd. Ask the broker
+                                // to dup a transit ref so the handle survives
+                                // until the receiver materialises its own ref.
+                                let provider = dt
+                                    .entry_handle::<super::eventfd::EventfdSubsystem>(typed)
+                                    .and_then(|h| h.with_entry(|e| e.broker_backed_provider()))
+                                    .ok_or(Errno::EIO)?;
+                                provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                                passed_tokens.push(
+                                    litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                        litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd,
+                                        handle_id,
+                                    )
+                                    .map_err(|_| Errno::EINVAL)?,
+                                );
+                                Ok(true)
+                            } else {
+                                // Kernel-backed eventfds transfer as PassedFd.
+                                Ok(false)
+                            }
+                        }
+                        crate::RawFdRef::Epoll(_) => {
+                            // Epoll descriptors are not broker-token-transferable yet.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::Unix(_) => {
+                            // Unix sockets are kernel-backed and transfer as PassedFd.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::ExternalFd(_) => {
+                            // External fds are sealed host fds and transfer as PassedFd.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::BrokerPipe(_) => {
+                            // Broker pipes are not broker-token-transferable over SCM yet.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::BrokerSocketPair(_) => {
+                            // Broker socketpairs are not broker-token-transferable over SCM yet.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::BrokerTcpConn(_) => {
+                            // Broker TCP connections are not broker-token-transferable over SCM yet.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::BrokerPty(_) => {
+                            // Broker ptys are not broker-token-transferable over SCM yet.
+                            Ok(false)
+                        }
+                        crate::RawFdRef::Signalfd(_) => {
+                            // Signalfds are not broker-token-transferable yet.
+                            Ok(false)
+                        }
                     }
-                }
-                drop(rds);
+                })??;
                 drop(files);
 
                 if !sent_broker_token {
@@ -3026,6 +3278,21 @@ impl<FS: ShimFS> Task<FS> {
                 let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))?;
                 return Ok(size);
             }
+            let broker_tcp_conn = files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
+                .ok();
+            if let Some(typed) = broker_tcp_conn {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(&typed)
+                    .ok_or(Errno::EBADF)?;
+                let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))?;
+                return Ok(size);
+            }
         }
 
         let (size, addr) = {
@@ -3109,7 +3376,7 @@ impl<FS: ShimFS> Task<FS> {
         if self.netlink_sockets.borrow().contains_key(&sockfd) {
             return Ok(());
         }
-        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| match optname {
+        let broker_sockopt = |optname| match optname {
             SocketOptionName::Socket(
                 SocketOption::RCVTIMEO
                 | SocketOption::SNDTIMEO
@@ -3126,7 +3393,13 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(())
             }
             _ => Err(Errno::ENOPROTOOPT),
-        }) {
+        };
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| broker_sockopt(optname)) {
+            return result;
+        }
+        if let Some(result) =
+            self.try_with_broker_tcp_conn(sockfd, |_typed| broker_sockopt(optname))
+        {
             return result;
         }
         self.files.borrow().with_socket(
@@ -3188,7 +3461,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             return Ok(0);
         }
-        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| match optname {
+        let broker_getsockopt = |optname| match optname {
             SocketOptionName::Socket(
                 SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER,
             ) => self
@@ -3217,7 +3490,13 @@ impl<FS: ShimFS> Task<FS> {
                 super::write_to_user(0u32, optval, len)
             }
             _ => Err(Errno::ENOPROTOOPT),
-        }) {
+        };
+        if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| broker_getsockopt(optname)) {
+            return result;
+        }
+        if let Some(result) =
+            self.try_with_broker_tcp_conn(sockfd, |_typed| broker_getsockopt(optname))
+        {
             return result;
         }
         self.files.borrow().with_socket(
@@ -3271,6 +3550,11 @@ impl<FS: ShimFS> Task<FS> {
         }) {
             return result;
         }
+        if let Some(result) =
+            self.try_with_broker_tcp_conn(sockfd, |_typed| Ok(SocketAddress::default()))
+        {
+            return result;
+        }
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -3308,6 +3592,11 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| {
             Ok(SocketAddress::Unix(super::unix::UnixSocketAddr::Unnamed))
         }) {
+            return result;
+        }
+        if let Some(result) =
+            self.try_with_broker_tcp_conn(sockfd, |_typed| Ok(SocketAddress::default()))
+        {
             return result;
         }
         self.files.borrow().with_socket(

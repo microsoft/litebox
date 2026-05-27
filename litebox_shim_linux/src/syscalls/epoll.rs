@@ -30,6 +30,8 @@ use crate::{GlobalState, ShimFS};
 
 pub(crate) struct EpollSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
 impl<FS: ShimFS> FdEnabledSubsystem for EpollSubsystem<FS> {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::Epoll;
+
     type Entry = EpollFile<FS>;
 }
 impl<FS: ShimFS> FdEnabledSubsystemEntry for EpollFile<FS> {}
@@ -46,6 +48,7 @@ bitflags::bitflags! {
 }
 
 const MAX_NESTED_EPOLL_DEPTH: usize = 5;
+const MAX_SOCKET_SETTLE_POLLS: usize = 16;
 
 pub(crate) enum EpollDescriptor<FS: ShimFS> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
@@ -59,93 +62,41 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
     BrokerPipe(Arc<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
     BrokerPty(Arc<TypedFd<super::broker_pty::BrokerPtySubsystem>>),
     BrokerSocketPair(Arc<TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>),
+    BrokerTcpConn(Arc<TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>>),
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
+    #[deny(clippy::wildcard_enum_match_arm)]
     pub fn try_from(
         global: &GlobalState<FS>,
         files: &FilesState<FS>,
         raw_fd: usize,
     ) -> Result<Self, Errno> {
-        enum ResolvedFd<FS: ShimFS> {
-            File(Arc<crate::FileFd<FS>>),
-            Socket(Arc<super::net::SocketFd>),
-            Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
-            Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
-            Signalfd(Arc<TypedFd<super::signalfd::SignalfdSubsystem>>),
-            Epoll(Arc<TypedFd<EpollSubsystem<FS>>>),
-            Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
-            ExternalFd(Arc<TypedFd<super::external_fd::ExternalFdSubsystem>>),
-            BrokerPipe(Arc<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
-            BrokerPty(Arc<TypedFd<super::broker_pty::BrokerPtySubsystem>>),
-            BrokerSocketPair(Arc<TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>),
-        }
-
-        let resolved = {
-            let rds = files.raw_descriptor_store.read();
-            if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-                ResolvedFd::File(fd)
-            } else if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<Platform>>(raw_fd) {
-                ResolvedFd::Socket(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd)
-            {
-                ResolvedFd::Pipe(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-            {
-                ResolvedFd::Eventfd(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
-            {
-                ResolvedFd::Signalfd(fd)
-            } else if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<FS>>(raw_fd) {
-                ResolvedFd::Epoll(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
-            {
-                ResolvedFd::Unix(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::external_fd::ExternalFdSubsystem>(raw_fd)
-            {
-                ResolvedFd::ExternalFd(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
-            {
-                ResolvedFd::BrokerPipe(fd)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
-            {
-                ResolvedFd::BrokerPty(fd)
-            } else if let Ok(fd) = rds
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
-            {
-                ResolvedFd::BrokerSocketPair(fd)
-            } else {
-                return Err(Errno::EBADF);
-            }
-        };
-
-        Ok(match resolved {
-            ResolvedFd::File(fd) => EpollDescriptor::File(fd),
-            ResolvedFd::Socket(fd) => EpollDescriptor::Socket(fd),
-            ResolvedFd::Pipe(fd) => EpollDescriptor::Pipe(fd),
-            ResolvedFd::Eventfd(fd) => EpollDescriptor::Eventfd(fd),
-            ResolvedFd::Signalfd(fd) => EpollDescriptor::Signalfd(fd),
-            ResolvedFd::Epoll(fd) => {
+        files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Fs(fd) => Ok(EpollDescriptor::File(Arc::clone(fd))),
+            crate::RawFdRef::Net(fd) => Ok(EpollDescriptor::Socket(Arc::clone(fd))),
+            crate::RawFdRef::Pipes(fd) => Ok(EpollDescriptor::Pipe(Arc::clone(fd))),
+            crate::RawFdRef::Eventfd(fd) => Ok(EpollDescriptor::Eventfd(Arc::clone(fd))),
+            crate::RawFdRef::Epoll(fd) => {
                 let handle = global
                     .litebox
                     .descriptor_table()
-                    .entry_handle(&fd)
+                    .entry_handle(fd)
                     .ok_or(Errno::EBADF)?;
-                EpollDescriptor::Epoll(handle)
+                Ok(EpollDescriptor::Epoll(handle))
             }
-            ResolvedFd::Unix(fd) => EpollDescriptor::Unix(fd),
-            ResolvedFd::ExternalFd(fd) => EpollDescriptor::ExternalFd(fd),
-            ResolvedFd::BrokerPipe(fd) => EpollDescriptor::BrokerPipe(fd),
-            ResolvedFd::BrokerPty(fd) => EpollDescriptor::BrokerPty(fd),
-            ResolvedFd::BrokerSocketPair(fd) => EpollDescriptor::BrokerSocketPair(fd),
-        })
+            crate::RawFdRef::Unix(fd) => Ok(EpollDescriptor::Unix(Arc::clone(fd))),
+            crate::RawFdRef::ExternalFd(fd) => Ok(EpollDescriptor::ExternalFd(Arc::clone(fd))),
+            crate::RawFdRef::BrokerPipe(fd) => Ok(EpollDescriptor::BrokerPipe(Arc::clone(fd))),
+            crate::RawFdRef::BrokerSocketPair(fd) => {
+                Ok(EpollDescriptor::BrokerSocketPair(Arc::clone(fd)))
+            }
+            crate::RawFdRef::BrokerTcpConn(fd) => {
+                Ok(EpollDescriptor::BrokerTcpConn(Arc::clone(fd)))
+            }
+            crate::RawFdRef::BrokerPty(fd) => Ok(EpollDescriptor::BrokerPty(Arc::clone(fd))),
+            crate::RawFdRef::Signalfd(fd) => Ok(EpollDescriptor::Signalfd(Arc::clone(fd))),
+        })?
     }
 }
 
@@ -161,6 +112,7 @@ enum DescriptorRef<FS: ShimFS> {
     BrokerPipe(Weak<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
     BrokerPty(Weak<TypedFd<super::broker_pty::BrokerPtySubsystem>>),
     BrokerSocketPair(Weak<TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>),
+    BrokerTcpConn(Weak<TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>>),
 }
 
 impl<FS: ShimFS> DescriptorRef<FS> {
@@ -177,6 +129,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             EpollDescriptor::BrokerPipe(bp) => Self::BrokerPipe(Arc::downgrade(bp)),
             EpollDescriptor::BrokerPty(pty) => Self::BrokerPty(Arc::downgrade(pty)),
             EpollDescriptor::BrokerSocketPair(sp) => Self::BrokerSocketPair(Arc::downgrade(sp)),
+            EpollDescriptor::BrokerTcpConn(tcp) => Self::BrokerTcpConn(Arc::downgrade(tcp)),
         }
     }
 
@@ -195,6 +148,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerSocketPair(sp) => {
                 sp.upgrade().map(EpollDescriptor::BrokerSocketPair)
             }
+            DescriptorRef::BrokerTcpConn(tcp) => tcp.upgrade().map(EpollDescriptor::BrokerTcpConn),
         }
     }
 
@@ -211,6 +165,24 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerPipe(_) => "BrokerPipe",
             DescriptorRef::BrokerPty(_) => "BrokerPty",
             DescriptorRef::BrokerSocketPair(_) => "BrokerSocketPair",
+            DescriptorRef::BrokerTcpConn(_) => "BrokerTcpConn",
+        }
+    }
+
+    fn needs_network_drive(&self) -> bool {
+        match self {
+            DescriptorRef::Socket(socket) => socket.upgrade().is_some(),
+            DescriptorRef::BrokerTcpConn(tcp_conn) => tcp_conn.upgrade().is_some(),
+            DescriptorRef::Eventfd(_)
+            | DescriptorRef::Signalfd(_)
+            | DescriptorRef::Epoll(_)
+            | DescriptorRef::File(_)
+            | DescriptorRef::Pipe(_)
+            | DescriptorRef::Unix(_)
+            | DescriptorRef::ExternalFd(_)
+            | DescriptorRef::BrokerPipe(_)
+            | DescriptorRef::BrokerPty(_)
+            | DescriptorRef::BrokerSocketPair(_) => false,
         }
     }
 }
@@ -288,6 +260,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
+            EpollDescriptor::BrokerTcpConn(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
         }
     }
 
@@ -313,7 +289,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             EpollDescriptor::BrokerPipe(_) => false,
             EpollDescriptor::BrokerPty(_) => false,
             EpollDescriptor::BrokerSocketPair(_) => false,
-            _ => false,
+            EpollDescriptor::BrokerTcpConn(_) => false,
+            EpollDescriptor::Socket(_) => false,
+            EpollDescriptor::Pipe(_) => false,
+            EpollDescriptor::Unix(_) => false,
         }
     }
 }
@@ -484,8 +463,7 @@ impl<FS: ShimFS> EpollFile<FS> {
         maxevents: usize,
         events: &mut Vec<EpollEvent>,
     ) {
-        const MAX_SOCKET_SETTLE_POLLS: usize = 16;
-        let target = self.socket_interest_count().min(maxevents);
+        let target = self.network_drive_interest_count().min(maxevents);
         if target <= 1 || events.len() >= target {
             return;
         }
@@ -513,7 +491,7 @@ impl<FS: ShimFS> EpollFile<FS> {
             if events.len() >= maxevents {
                 return;
             }
-            if !matches!(&entry.desc, DescriptorRef::Socket(socket) if socket.upgrade().is_some()) {
+            if !entry.desc.needs_network_drive() {
                 continue;
             }
             if let Some((Some(event), _)) = entry.poll(global, fs, false)
@@ -531,16 +509,14 @@ impl<FS: ShimFS> EpollFile<FS> {
     }
 
     fn has_socket_interests(&self) -> bool {
-        self.socket_interest_count() != 0
+        self.network_drive_interest_count() != 0
     }
 
-    fn socket_interest_count(&self) -> usize {
+    fn network_drive_interest_count(&self) -> usize {
         let interests = self.interests.lock();
         interests
             .values()
-            .filter(|entry| {
-                matches!(&entry.desc, DescriptorRef::Socket(socket) if socket.upgrade().is_some())
-            })
+            .filter(|entry| entry.desc.needs_network_drive())
             .count()
     }
 
@@ -840,6 +816,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                 EpollDescriptor::BrokerPipe(_) => "BrokerPipe",
                 EpollDescriptor::BrokerPty(_) => "BrokerPty",
                 EpollDescriptor::BrokerSocketPair(_) => "BrokerSocketPair",
+                EpollDescriptor::BrokerTcpConn(_) => "BrokerTcpConn",
             };
             let msg = alloc::format!(
                 "[epoll-diag] ADD fd={fd} type={fd_type} mask={mask:?} events={events:?} host_poll={is_host_poll} ready={}\n",
@@ -931,6 +908,7 @@ impl EpollEntryKey {
             EpollDescriptor::BrokerPipe(bp) => bp.object_id(),
             EpollDescriptor::BrokerPty(pty) => pty.object_id(),
             EpollDescriptor::BrokerSocketPair(sp) => sp.object_id(),
+            EpollDescriptor::BrokerTcpConn(tcp) => tcp.object_id(),
         };
         Self(fd, object_id)
     }
@@ -1145,6 +1123,12 @@ struct PollEntry {
 #[derive(Clone)]
 struct PollEntryObserver(Waker<Platform>);
 
+fn should_settle_socket_rdhup(mask: Events, revents: Events) -> bool {
+    mask.contains(Events::RDHUP)
+        && revents.contains(Events::IN)
+        && !revents.intersects(Events::RDHUP | Events::HUP)
+}
+
 impl PollSet {
     /// Returns a new empty `PollSet` with the given interest capacity.
     pub fn with_capacity(capacity: usize) -> Self {
@@ -1176,6 +1160,10 @@ impl PollSet {
         files: &FilesState<FS>,
         waker: Option<&Waker<Platform>>,
     ) -> bool {
+        if self.has_socket_entries(global, files) {
+            EpollFile::<FS>::drive_network_until_idle(global);
+        }
+
         let mut is_ready = false;
         for entry in &mut self.entries {
             entry.revents = if entry.fd < 0 {
@@ -1203,9 +1191,22 @@ impl PollSet {
                     None
                 };
                 // TODO: add machinery to unregister the observer to avoid leaks.
-                poll_descriptor
+                let is_socket = matches!(poll_descriptor, EpollDescriptor::Socket(_));
+                let mut revents = poll_descriptor
                     .poll(global, &*files.fs, entry.mask, observer)
-                    .unwrap_or(Events::NVAL)
+                    .unwrap_or(Events::NVAL);
+                if is_socket && should_settle_socket_rdhup(entry.mask, revents) {
+                    for _ in 0..MAX_SOCKET_SETTLE_POLLS {
+                        EpollFile::<FS>::drive_network_until_idle(global);
+                        revents = poll_descriptor
+                            .poll(global, &*files.fs, entry.mask, None)
+                            .unwrap_or(Events::NVAL);
+                        if !should_settle_socket_rdhup(entry.mask, revents) {
+                            break;
+                        }
+                    }
+                }
+                revents
             } else {
                 Events::NVAL
             };
@@ -1286,6 +1287,23 @@ impl PollSet {
                 other => other,
             }
         }
+    }
+
+    fn has_socket_entries<FS: ShimFS>(
+        &self,
+        global: &GlobalState<FS>,
+        files: &FilesState<FS>,
+    ) -> bool {
+        self.entries.iter().any(|entry| {
+            if entry.fd < 0 {
+                return false;
+            }
+            let raw_fd = entry.fd.reinterpret_as_unsigned() as usize;
+            matches!(
+                EpollDescriptor::try_from(global, files, raw_fd),
+                Ok(EpollDescriptor::Socket(_) | EpollDescriptor::BrokerTcpConn(_))
+            )
+        })
     }
 
     /// Returns true if any entry in the poll set requires host polling.

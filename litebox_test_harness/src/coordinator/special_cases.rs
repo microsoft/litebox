@@ -8,6 +8,9 @@
 //! on the state left by the previous exec on the same agent (e.g., "run
 //! non-PIE, then run PIE — does the PIE see clean output?").
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
 use super::common::{BASH, BashArgs, EXEC_BIN, ExecBinArgs};
 // pipe_bridge import removed — US3.bidirectional now uses the
@@ -52,6 +55,7 @@ mod net;
 mod netlink;
 mod pipe_lifecycle;
 mod proc;
+mod readiness;
 mod term;
 mod unix_socket;
 
@@ -544,6 +548,10 @@ pub(super) fn register_capture_pipe(reg: &mut Registry<'_>) {
 
 pub(super) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
     proc::register_proc_filesystem_tests(reg);
+}
+
+pub(super) fn register_readiness_tests(reg: &mut Registry<'_>) {
+    readiness::register_readiness_tests(reg);
 }
 
 pub(super) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {

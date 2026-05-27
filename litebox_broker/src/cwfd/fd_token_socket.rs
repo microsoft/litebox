@@ -8,6 +8,9 @@
 //! [`crate::fd_token_service`] (host-fd ops) and — once Phase B-Step6
 //! lands — `crate::state_service` (eventfd and other state-object ops).
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_request};
 use crate::fd_tokens::BrokerFdTokenRegistry;
 use crate::pgrp_signal_inbox::PgrpSignalInbox;
@@ -22,6 +25,7 @@ use litebox_common_linux::fd_token_protocol::{
     decode, parse_create_pidfd_response_ok, parse_create_pty_response_ok, parse_handle_body,
     parse_open_pty_slave_response_ok,
 };
+use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroU32;
@@ -1016,6 +1020,23 @@ fn handle_control_connection_inner(
                                 frame: proc_result.frame,
                                 out_fd: proc_result.out_fd,
                             }
+                        } else if state_registry
+                            .resolve(StateHandle::from_id(release_id), SubsystemTag::TcpSocket)
+                            .is_ok()
+                        {
+                            // Broker TCP accept currently registers the accepted stream from
+                            // the network proxy before the worker control connection owns it.
+                            // Let the accepting worker's close consume that handoff ref.
+                            let state_result = state_handle_request(
+                                state_registry,
+                                conn_state,
+                                &frame,
+                                Vec::new(),
+                            );
+                            SocketHandlerResult {
+                                frame: state_result.frame,
+                                out_fd: state_result.out_fd,
+                            }
                         } else {
                             // This conn doesn't own a state or process ref. Is the handle
                             // even known to the broker, or is it just bogus?
@@ -1199,6 +1220,10 @@ fn handle_control_connection_inner(
                     | Opcode::PtyRead
                     | Opcode::SubscribePty
                     | Opcode::SubscribeEventfd
+                    | Opcode::ReadTcpConn
+                    | Opcode::WriteTcpConn
+                    | Opcode::ShutdownTcpConn
+                    | Opcode::PollTcpConnEvents
                     | Opcode::DupHandle => {
                         // State-object opcodes: route to state_service on the fd-state registry.
                         let state_result =

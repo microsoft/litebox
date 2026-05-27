@@ -3,6 +3,9 @@
 
 //! Process/thread related syscalls.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use crate::syscalls::file::{get_file_descriptor_flags, proc_cmdline_from_argv};
 use crate::{ConstPtr, MutPtr, ShimFS, Task, multihost::ExecRoute};
 use alloc::boxed::Box;
@@ -1919,11 +1922,11 @@ impl<FS: ShimFS> Task<FS> {
 
         if set_tid != 0 || set_tid_size != 0 {
             log_unsupported!("clone with set_tid");
-            return Err(Errno::ENOSYS);
+            todo!("ENOSYS audit: clone set_tid array; reachable but not implemented");
         }
         if clone3 && flags.contains(CloneFlags::PIDFD) {
             log_unsupported!("clone3 with pidfd");
-            return Err(Errno::ENOSYS);
+            todo!("ENOSYS audit: clone3 CLONE_PIDFD; reachable but not implemented");
         }
 
         // Note `exit_signal` is ignored for threads; validated for fork.
@@ -1972,6 +1975,9 @@ impl<FS: ShimFS> Task<FS> {
         if is_fork {
             if clone3 && stack == 0 && stack_size == 0 {
                 log_unsupported!("clone3 fork without child stack");
+                // Real Linux: ENOSYS when clone3 is unsupported on this
+                // architecture/kernel. Litebox reports this unsupported
+                // clone3 shape as absent so libc can fall back to clone.
                 return Err(Errno::ENOSYS);
             }
 
@@ -2089,6 +2095,9 @@ impl<FS: ShimFS> Task<FS> {
         }
         if clone3 && stack == 0 {
             log_unsupported!("clone3 thread without child stack");
+            // Real Linux: ENOSYS when clone3 is unsupported on this
+            // architecture/kernel. Litebox reports this unsupported
+            // clone3 shape as absent so libc can fall back to clone.
             return Err(Errno::ENOSYS);
         }
         let sp = if stack != 0 {
@@ -4351,7 +4360,9 @@ impl<FS: ShimFS> Task<FS> {
                 reject,
             );
             put_fc_back(self, fc);
-            return Err(Errno::ENOSYS);
+            todo!(
+                "ENOSYS audit: delayed fork rejected snapshot state; reachable but not implemented"
+            );
         }
 
         #[cfg(feature = "trace_syscalls")]
@@ -4398,7 +4409,7 @@ impl<FS: ShimFS> Task<FS> {
             use super::external_fd::ExternalFdDirection;
 
             let files = self.files.borrow();
-            let rds = files.raw_descriptor_store.read();
+            let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
 
             // Gather child's pipe FDs with their directions and pair IDs.
             let mut child_pipes: Vec<(usize, ExternalFdDirection, usize)> = Vec::new();
@@ -4407,28 +4418,43 @@ impl<FS: ShimFS> Task<FS> {
                 usize,
                 alloc::sync::Arc<litebox::fd::TypedFd<super::external_fd::ExternalFdSubsystem>>,
             )> = Vec::new();
-            for raw_fd in rds.iter_alive() {
-                if let Ok(typed) =
-                    rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                {
-                    let direction = match self.global.pipes.half_pipe_type(&typed) {
-                        Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => ExternalFdDirection::Read,
-                        Ok(litebox::pipes::HalfPipeType::SenderHalf) => ExternalFdDirection::Write,
-                        Err(_) => continue,
-                    };
-                    let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) else {
-                        continue;
-                    };
-                    child_pipes.push((raw_fd, direction, pair_id));
-                } else if let Ok(typed) =
-                    rds.fd_from_raw_integer::<super::external_fd::ExternalFdSubsystem>(raw_fd)
-                {
-                    // Already host-backed — collect for later extraction
-                    // (need descriptor_table lock which we acquire after rds).
-                    child_external_fd_fds.push((raw_fd, typed));
-                }
+            for raw_fd in alive_fds {
+                let _ = files.run_on_raw_fd(raw_fd, |raw_fd_ref| {
+                    #[deny(clippy::wildcard_enum_match_arm)]
+                    match raw_fd_ref {
+                        crate::RawFdRef::Fs(_)
+                        | crate::RawFdRef::Net(_)
+                        | crate::RawFdRef::Eventfd(_)
+                        | crate::RawFdRef::Epoll(_)
+                        | crate::RawFdRef::Unix(_)
+                        | crate::RawFdRef::BrokerPipe(_)
+                        | crate::RawFdRef::BrokerSocketPair(_)
+                        | crate::RawFdRef::BrokerTcpConn(_)
+                        | crate::RawFdRef::BrokerPty(_)
+                        | crate::RawFdRef::Signalfd(_) => {}
+                        crate::RawFdRef::Pipes(typed) => {
+                            let direction = match self.global.pipes.half_pipe_type(typed) {
+                                Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
+                                    ExternalFdDirection::Read
+                                }
+                                Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
+                                    ExternalFdDirection::Write
+                                }
+                                Err(_) => return,
+                            };
+                            let Ok(pair_id) = self.global.pipes.pipe_pair_id(typed) else {
+                                return;
+                            };
+                            child_pipes.push((raw_fd, direction, pair_id));
+                        }
+                        crate::RawFdRef::ExternalFd(typed) => {
+                            // Already host-backed — collect for later extraction
+                            // (need descriptor_table lock which we acquire after rds).
+                            child_external_fd_fds.push((raw_fd, Arc::clone(typed)));
+                        }
+                    }
+                });
             }
-            drop(rds);
             drop(files);
 
             // Filter out mux-managed pipes inherited from the parent.
@@ -5076,7 +5102,9 @@ impl<FS: ShimFS> Task<FS> {
                                 self.global.platform.close_host_fd(pr.host_fd);
                             }
                             put_fc_back(self, fc);
-                            return Err(Errno::ENOSYS);
+                            todo!(
+                                "ENOSYS audit: delayed fork bidirectional unix socket stdio bridge; reachable but not implemented"
+                            );
                         }
                     }
                 }
@@ -5208,7 +5236,9 @@ impl<FS: ShimFS> Task<FS> {
                                     self.global.platform.close_host_fd(pr.host_fd);
                                 }
                                 put_fc_back(self, fc);
-                                return Err(Errno::ENOSYS);
+                                todo!(
+                                    "ENOSYS audit: delayed fork queued SCM_RIGHTS transfer; reachable but not implemented"
+                                );
                             }
                         }
 
@@ -5918,7 +5948,9 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 fc.vfork_done.mux_parent_streams.lock().clear();
                 put_fc_back(self, fc);
-                return Err(Errno::ENOSYS);
+                todo!(
+                    "ENOSYS audit: delayed fork worker stdio bindings; reachable but not implemented"
+                );
             }
         };
 
@@ -6122,7 +6154,7 @@ impl<FS: ShimFS> Task<FS> {
     ///   1. Snapshot the parent's state at the fork trap.
     ///   2. Restore that snapshot in a new worker host process.
     ///
-    /// Currently unimplemented — returns `ENOSYS`.
+    /// Currently unimplemented — panics when reached so missing true-fork support is loud.
     #[allow(unused_variables)]
     #[allow(dead_code)]
     fn do_true_fork(
@@ -6203,7 +6235,7 @@ impl<FS: ShimFS> Task<FS> {
                 let _ = transit.client.release(transit.token_id);
             }
             cleanup(self, child_as_id, child_process_id);
-            return Err(Errno::ENOSYS);
+            todo!("ENOSYS audit: true fork rejected snapshot state; reachable but not implemented");
         }
 
         let snapshot = super::fork_snapshot::ForkSnapshot {
@@ -6245,7 +6277,9 @@ impl<FS: ShimFS> Task<FS> {
                     let _ = transit.client.release(transit.token_id);
                 }
                 cleanup(self, child_as_id, child_process_id);
-                return Err(Errno::ENOSYS);
+                todo!(
+                    "ENOSYS audit: true fork worker stdio bindings; reachable but not implemented"
+                );
             }
         };
 
@@ -6572,7 +6606,6 @@ impl<FS: ShimFS> Task<FS> {
         // Acquire descriptor table BEFORE raw_descriptor_store to preserve
         // the established dt → rds lock order.
         let dt = self.global.litebox.descriptor_table();
-        let rds = files.raw_descriptor_store.read();
 
         let mut entries = Vec::new();
         let mut open_file_descriptions = Vec::new();
@@ -6590,103 +6623,100 @@ impl<FS: ShimFS> Task<FS> {
             // the descriptor's object_id matches the original host stdio.
             // For filesystem fds, also probe terminal metadata markers so we
             // can accept terminal fds through the snapshot gate.
-            let (subsystem_class, object_id, terminal_meta, _socket_pair_id) = if let Ok(fd) =
-                rds.fd_from_raw_integer::<FS>(raw_fd)
-            {
-                let oid = Some(fd.object_id());
-                // Probe terminal metadata markers on this filesystem fd.
-                // HostStdioSourceFd only counts as terminal when the
-                // underlying host stream is actually a tty.
-                let host_stdio_source = dt
-                    .with_metadata(&fd, |m: &crate::HostStdioSourceFd| m.0)
-                    .ok()
-                    .filter(|&source_fd| {
-                        let stream = match source_fd {
-                            0 => litebox::platform::StdioStream::Stdin,
-                            1 => litebox::platform::StdioStream::Stdout,
-                            _ => litebox::platform::StdioStream::Stderr,
-                        };
-                        self.global.platform.is_a_tty(stream)
-                    });
-                let is_tty_alias = dt.with_metadata(&fd, |_: &crate::HostTtyAlias| ()).is_ok();
-                let is_pty_device = dt
-                    .with_metadata(&fd, |_: &super::file::HostPtyDeviceFd| ())
-                    .is_ok();
+            let (subsystem_class, object_id, terminal_meta, _socket_pair_id) = files
+                .run_on_raw_fd(raw_fd, |raw_fd_ref| {
+                    #[deny(clippy::wildcard_enum_match_arm)]
+                    match raw_fd_ref {
+                        crate::RawFdRef::Fs(fd) => {
+                            let oid = Some(fd.object_id());
+                            // Probe terminal metadata markers on this filesystem fd.
+                            // HostStdioSourceFd only counts as terminal when the
+                            // underlying host stream is actually a tty.
+                            let host_stdio_source = dt
+                                .with_metadata(fd, |m: &crate::HostStdioSourceFd| m.0)
+                                .ok()
+                                .filter(|&source_fd| {
+                                    let stream = match source_fd {
+                                        0 => litebox::platform::StdioStream::Stdin,
+                                        1 => litebox::platform::StdioStream::Stdout,
+                                        _ => litebox::platform::StdioStream::Stderr,
+                                    };
+                                    self.global.platform.is_a_tty(stream)
+                                });
+                            let is_tty_alias =
+                                dt.with_metadata(fd, |_: &crate::HostTtyAlias| ()).is_ok();
+                            let is_pty_device = dt
+                                .with_metadata(fd, |_: &super::file::HostPtyDeviceFd| ())
+                                .is_ok();
 
-                let meta = if host_stdio_source.is_some() || is_tty_alias || is_pty_device {
-                    Some(FdMetadataSnapshot {
-                        host_stdio_source_fd: host_stdio_source,
-                        is_host_tty_alias: is_tty_alias,
-                        is_host_pty_device: is_pty_device,
-                        ..Default::default()
-                    })
-                } else {
-                    None
-                };
-                (FdClass::FilesystemFd, oid, meta, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
-            {
-                (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-            {
-                (FdClass::Pipe, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::external_fd::ExternalFdSubsystem>(raw_fd)
-            {
-                // Host-backed pipe (from a prior delayed-fork bridge).
-                (FdClass::Pipe, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
-            {
-                // Broker-backed pipe. Classify as Pipe so the
-                // broker-handle metadata is emitted below and the restored
-                // worker can re-attach to the same broker `PipeState`.
-                (FdClass::Pipe, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) = rds
-                .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
-            {
-                // Phase F: eager-broker socketpair. Classify as
-                // UnixSocket so the broker-handle metadata is emitted
-                // below and the restored worker can re-attach to the
-                // same broker `SocketPairState` endpoint.
-                (FdClass::UnixSocket, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
-            {
-                (
-                    FdClass::FilesystemFd,
-                    Some(fd.object_id()),
-                    Some(FdMetadataSnapshot::default()),
-                    None,
-                )
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-            {
-                (FdClass::EventFd, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
-            {
-                (FdClass::Signalfd, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
-            {
-                (FdClass::Epoll, Some(fd.object_id()), None, None)
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
-            {
-                let dt_inner = self.global.litebox.descriptor_table();
-                let pair_id = dt_inner
-                    .with_entry(&fd, |sock: &super::unix::UnixSocket<FS>| {
-                        sock.socket_pair_id()
-                    })
-                    .flatten();
-                drop(dt_inner);
-                (FdClass::UnixSocket, Some(fd.object_id()), None, pair_id)
-            } else {
-                (FdClass::Other, None, None, None)
-            };
+                            let meta =
+                                if host_stdio_source.is_some() || is_tty_alias || is_pty_device {
+                                    Some(FdMetadataSnapshot {
+                                        host_stdio_source_fd: host_stdio_source,
+                                        is_host_tty_alias: is_tty_alias,
+                                        is_host_pty_device: is_pty_device,
+                                        ..Default::default()
+                                    })
+                                } else {
+                                    None
+                                };
+                            (FdClass::FilesystemFd, oid, meta, None)
+                        }
+                        crate::RawFdRef::Net(fd) => {
+                            (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::Pipes(fd) => {
+                            (FdClass::Pipe, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::Eventfd(fd) => {
+                            (FdClass::EventFd, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::Epoll(fd) => {
+                            (FdClass::Epoll, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::Unix(fd) => {
+                            let pair_id = dt
+                                .with_entry(fd, |sock: &super::unix::UnixSocket<FS>| {
+                                    sock.socket_pair_id()
+                                })
+                                .flatten();
+                            (FdClass::UnixSocket, Some(fd.object_id()), None, pair_id)
+                        }
+                        crate::RawFdRef::ExternalFd(fd) => {
+                            // Host-backed pipe (from a prior delayed-fork bridge).
+                            (FdClass::Pipe, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerPipe(fd) => {
+                            // Broker-backed pipe. Classify as Pipe so the
+                            // broker-handle metadata is emitted below and the restored
+                            // worker can re-attach to the same broker `PipeState`.
+                            (FdClass::Pipe, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerSocketPair(fd) => {
+                            // Phase F: eager-broker socketpair. Classify as
+                            // UnixSocket so the broker-handle metadata is emitted
+                            // below and the restored worker can re-attach to the
+                            // same broker `SocketPairState` endpoint.
+                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerTcpConn(fd) => {
+                            // Broker-hosted connected TCP is fork-bridged via
+                            // broker_handle metadata; keep the existing UnixSocket
+                            // migratable class bucket until FdClass grows a TCP arm.
+                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerPty(fd) => (
+                            FdClass::FilesystemFd,
+                            Some(fd.object_id()),
+                            Some(FdMetadataSnapshot::default()),
+                            None,
+                        ),
+                        crate::RawFdRef::Signalfd(fd) => {
+                            (FdClass::Signalfd, Some(fd.object_id()), None, None)
+                        }
+                    }
+                })
+                .unwrap_or((FdClass::Other, None, None, None));
 
             // Promote to StdioFd only if this fd sits at a stdio slot AND
             // its object_id matches ANY of the original host stdio descriptors.
@@ -6741,6 +6771,8 @@ impl<FS: ShimFS> Task<FS> {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
             }
+
+            let rds = files.raw_descriptor_store.read();
 
             // Per-fd diagnostic trace for delayed-fork analysis.
             #[cfg(feature = "trace_syscalls")]
@@ -6825,6 +6857,11 @@ impl<FS: ShimFS> Task<FS> {
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
                                 BrokerHandleKind::UnixSocket => {
                                     super::broker_socketpair::broker_socketpair_provider()
+                                        .as_ref()
+                                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                                }
+                                BrokerHandleKind::TcpConn => {
+                                    super::broker_tcp_conn::broker_tcp_conn_provider()
                                         .as_ref()
                                         .map(|p| alloc::sync::Arc::clone(p) as _)
                                 }
@@ -7059,6 +7096,48 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         None => None,
                     }
+                } else if let Ok(typed) = rds
+                    .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
+                {
+                    let tcp_provider = super::broker_tcp_conn::broker_tcp_conn_provider();
+                    let entry_result = dt.with_entry(
+                        &typed,
+                        |tcp_fd: &super::broker_tcp_conn::BrokerTcpConnFd<crate::Platform>| {
+                            tcp_fd.fork_snapshot_handle()
+                        },
+                    );
+                    match entry_result {
+                        Some((kind, handle_id)) => {
+                            let releaser_opt: Option<
+                                alloc::sync::Arc<
+                                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                                >,
+                            > = tcp_provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
+                            if let Some(releaser) = releaser_opt {
+                                match releaser.dup_handle(handle_id) {
+                                    Ok(()) => {
+                                        broker_transit.push(ForkSnapshotBrokerTransit {
+                                            releaser,
+                                            handle_id,
+                                            kind,
+                                        });
+                                        Some(BrokerHandleSnapshot {
+                                            kind,
+                                            handle_id,
+                                            pipe_direction: None,
+                                            socketpair_endpoint: None,
+                                            pty_role: None,
+                                            pty_id: None,
+                                        })
+                                    }
+                                    Err(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
                 } else {
                     None
                 }
@@ -7122,7 +7201,6 @@ impl<FS: ShimFS> Task<FS> {
                 });
             }
         }
-        drop(rds);
         drop(dt);
 
         let stdio_object_ids = [
@@ -8929,12 +9007,19 @@ impl<FS: ShimFS> Task<FS> {
             >,
             u64,
         )> = alloc::vec::Vec::new();
+        let mut broker_tcp_conn_transit_release: alloc::vec::Vec<(
+            alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            >,
+            u64,
+        )> = alloc::vec::Vec::new();
         // Process-token pidfd bridges need an in-transit exit subscription:
         // the source pidfd can close before the remote exec'd child installs
         // its own subscription, but the target may exit in that window.
         let mut broker_pidfd_process_transit: alloc::vec::Vec<
             super::guest_pid::BrokerProcessExitWake,
         > = alloc::vec::Vec::new();
+        let mut remote_signalfd_entries = alloc::vec::Vec::new();
         {
             // Collect EventfdSubsystem fds (non-stdio) and promote each to
             // broker-backed if not already. Skip on broker-provider absence
@@ -8981,6 +9066,7 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Pty => "pty",
                         BrokerHandleKind::Pipe => "pipe",
                         BrokerHandleKind::UnixSocket => "unix_socket",
+                        BrokerHandleKind::TcpConn => "tcp_conn",
                     };
                     let releaser: Option<
                         alloc::sync::Arc<
@@ -9002,6 +9088,11 @@ impl<FS: ShimFS> Task<FS> {
                             .map(|p| alloc::sync::Arc::clone(p) as _),
                         BrokerHandleKind::UnixSocket => {
                             super::broker_socketpair::broker_socketpair_provider()
+                                .as_ref()
+                                .map(|p| alloc::sync::Arc::clone(p) as _)
+                        }
+                        BrokerHandleKind::TcpConn => {
+                            super::broker_tcp_conn::broker_tcp_conn_provider()
                                 .as_ref()
                                 .map(|p| alloc::sync::Arc::clone(p) as _)
                         }
@@ -9213,6 +9304,220 @@ impl<FS: ShimFS> Task<FS> {
                     ));
                 }
             }
+
+            let broker_tcp_conn_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<
+                    litebox::fd::TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>,
+                >,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) = rds
+                        .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                            raw_fd,
+                        )
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in broker_tcp_conn_fds {
+                let tcp_provider = super::broker_tcp_conn::broker_tcp_conn_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let handle_id = dt_local.with_entry(
+                    &typed,
+                    |tcp_fd: &super::broker_tcp_conn::BrokerTcpConnFd<crate::Platform>| {
+                        tcp_fd.handle()
+                    },
+                );
+                drop(dt_local);
+                if let (Some(provider), Some(handle_id)) = (tcp_provider, handle_id) {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
+                    broker_eventfd_specs.push(alloc::format!("{raw_fd}:tcp_conn:{handle_id}"));
+                    broker_tcp_conn_transit_release.push((releaser, handle_id));
+                }
+            }
+
+            let fs_fds: alloc::vec::Vec<(usize, alloc::sync::Arc<litebox::fd::TypedFd<FS>>)> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if raw_fd <= 2 || !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in fs_fds {
+                let bridge_info = {
+                    let files = self.files.borrow();
+                    files.fs.fd_path(&typed).and_then(|path| {
+                        let position = files
+                            .fs
+                            .seek(&typed, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
+                            .ok()?;
+                        let status_flags_bits = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(&typed, |crate::StdioStatusFlags(flags)| flags.bits())
+                            .unwrap_or(OFlags::RDONLY.bits());
+                        Some((path, position, status_flags_bits))
+                    })
+                };
+                if let Some((path, position, status_flags_bits)) = bridge_info {
+                    broker_eventfd_specs.push(alloc::format!(
+                        "{raw_fd}:brokerfile:{status_flags_bits}:{position}:{}",
+                        brokerfile_bridge_encode_path(&path)
+                    ));
+                }
+            }
+
+            let signalfd_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::signalfd::SignalfdSubsystem>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in signalfd_fds {
+                let signalfd_provider = super::signalfd::broker_signalfd_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let bridge_info = dt_local
+                    .with_entry(&typed, |sfd: &super::signalfd::SignalfdFile| {
+                        sfd.worker_exec_bridge_snapshot()
+                    });
+                drop(dt_local);
+                if let (Some(provider), Some((handle_id, mask_bits, nonblock))) =
+                    (signalfd_provider, bridge_info)
+                {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
+                    broker_eventfd_specs.push(alloc::format!(
+                        "{raw_fd}:signalfd:{handle_id}:{mask_bits}:{}",
+                        u8::from(nonblock)
+                    ));
+                    remote_signalfd_entries.push(crate::RemoteSignalfdEntry {
+                        handle_id,
+                        mask_bits,
+                    });
+                    broker_eventfd_transit_release.push((releaser, handle_id));
+                }
+            }
+
+            let network_fds: alloc::vec::Vec<usize> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if rds
+                        .fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
+                        .is_ok()
+                    {
+                        out.push(raw_fd);
+                    }
+                }
+                out
+            };
+            for raw_fd in network_fds {
+                if let Some(spec) = self.tcp_listen_worker_exec_bridge_spec(raw_fd) {
+                    broker_eventfd_specs.push(spec);
+                }
+            }
+
+            // Non-PIE worker-exec timerfd snapshot. Timerfd shares the
+            // EventfdSubsystem storage (see `EventFile::new_timer`); we
+            // identify timerfd entries via `is_timerfd()` then snapshot
+            // their state for reconstruction in the child.
+            let timerfd_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::eventfd::EventfdSubsystem>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                    {
+                        let dt_local = self.global.litebox.descriptor_table();
+                        let is_timer = dt_local
+                            .with_entry(
+                                &typed,
+                                |evf: &super::eventfd::EventFile<crate::Platform>| evf.is_timerfd(),
+                            )
+                            .unwrap_or(false);
+                        drop(dt_local);
+                        if is_timer {
+                            out.push((raw_fd, typed));
+                        }
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in timerfd_fds {
+                let dt_local = self.global.litebox.descriptor_table();
+                let snapshot = dt_local
+                    .with_entry(
+                        &typed,
+                        |evf: &super::eventfd::EventFile<crate::Platform>| {
+                            evf.timerfd_worker_exec_bridge_snapshot()
+                        },
+                    )
+                    .flatten();
+                drop(dt_local);
+                if let Some((clockid, nonblock, spec, pending, snapshot_now_ns)) = snapshot {
+                    broker_eventfd_specs.push(alloc::format!(
+                        "{raw_fd}:timerfd:{}:{}:{}:{}:{}:{}:{}:{}",
+                        clockid as u32,
+                        u8::from(nonblock),
+                        spec.value.tv_sec,
+                        spec.value.tv_nsec,
+                        spec.interval.tv_sec,
+                        spec.interval.tv_nsec,
+                        pending,
+                        snapshot_now_ns,
+                    ));
+                }
+            }
         }
 
         // Resolve the worker load path through the current guest filesystem so
@@ -9269,6 +9574,9 @@ impl<FS: ShimFS> Task<FS> {
                 for (releaser, handle_id) in &broker_pty_transit_release {
                     releaser.release(*handle_id);
                 }
+                for (releaser, handle_id) in &broker_tcp_conn_transit_release {
+                    releaser.release(*handle_id);
+                }
                 signal_on_error(&vfork_info);
                 Errno::ENOMEM
             })?;
@@ -9283,6 +9591,15 @@ impl<FS: ShimFS> Task<FS> {
             .fork_child_host_pids
             .write()
             .insert(self.process_id.0, host_pid);
+        if !remote_signalfd_entries.is_empty() {
+            self.global.remote_signalfd_targets.write().insert(
+                self.process_id.0,
+                crate::RemoteSignalfdTarget {
+                    blocked_mask: self.signals.get_blocked().as_u64(),
+                    signalfds: remote_signalfd_entries,
+                },
+            );
+        }
 
         if let Some((vd, parent_pipe_fds, _parent_socket_fds)) = &vfork_info {
             for direct in spawn_result.direct_pipes {
@@ -9357,6 +9674,10 @@ impl<FS: ShimFS> Task<FS> {
             .fork_child_host_pids
             .write()
             .remove(&self.process_id.0);
+        self.global
+            .remote_signalfd_targets
+            .write()
+            .remove(&self.process_id.0);
         let broker_exit_status = if exit_code > 255 {
             (exit_code - 256) + 128
         } else {
@@ -9373,7 +9694,7 @@ impl<FS: ShimFS> Task<FS> {
         // worker itself exits — which is too late, the parent's
         // reader times out.
         //
-        // Pipe and PTY transit refs are drained here. Eventfd/signalfd
+        // Pipe, PTY, and TCP connection transit refs are drained here. Eventfd/signalfd
         // refs stay alive (they're cleaned via worker-conn cleanup);
         // releasing them here breaks PIDF tests where the pidfd subscription
         // needs the broker state alive past exec.
@@ -9381,6 +9702,9 @@ impl<FS: ShimFS> Task<FS> {
             releaser.release(handle_id);
         }
         for (releaser, handle_id) in broker_pty_transit_release.drain(..) {
+            releaser.release(handle_id);
+        }
+        for (releaser, handle_id) in broker_tcp_conn_transit_release.drain(..) {
             releaser.release(handle_id);
         }
 
@@ -9411,9 +9735,8 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // The syscall handler loop will stop the local shim task before it can
-        // resume guest code. Return ENOSYS as a placeholder — this path should
-        // not be reached in practice.
-        Err(Errno::ENOSYS)
+        // resume guest code.
+        unreachable!("remote exec worker returned to the local shim task")
     }
 
     fn worker_exec_stdio_bindings(&self) -> Result<WorkerExecStdioBindings<FS, Platform>, Errno> {
@@ -9524,9 +9847,8 @@ impl<FS: ShimFS> Task<FS> {
             ExecRoute::RemoteHost { .. } => {
                 // A previous route_exec call determined this process needs a
                 // remote host. This shouldn't happen on the first exec call
-                // since we check needs_remote_host below; this arm exists for
-                // completeness and future re-routing scenarios.
-                return Err(Errno::ENOSYS);
+                // since we check needs_remote_host below.
+                unreachable!("initial execve was already routed to a remote host")
             }
         }
         let loader = crate::loader::elf::ElfLoader::new(self, &path).map_err(Errno::from)?;
@@ -10083,6 +10405,16 @@ fn worker_exec_fd_survives_exec<FS: ShimFS>(
             .unwrap_or(false)
 }
 
+fn brokerfile_bridge_encode_path(path: &str) -> alloc::string::String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = alloc::string::String::with_capacity(path.len() * 2);
+    for byte in path.as_bytes() {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
 fn worker_exec_has_unsupported_stdio<FS: ShimFS>(
     global: &crate::GlobalState<FS>,
     files: &crate::syscalls::file::FilesState<FS>,
@@ -10301,6 +10633,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 // the actual inherited/closed stdio behavior later.
                 crate::RawFdRef::BrokerPipe(_broker_pipe) => false,
                 crate::RawFdRef::BrokerSocketPair(_broker_socketpair) => false,
+                crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => false,
                 crate::RawFdRef::BrokerPty(_broker_pty) => false,
                 crate::RawFdRef::Signalfd(_signalfd) => false,
             })
@@ -10470,6 +10803,7 @@ fn worker_exec_input_binding<FS: ShimFS>(
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::BrokerSocketPair(_broker_pipe) => WorkerExecInputBinding::Close,
+            crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => WorkerExecInputBinding::Close,
 
             // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
             // before exec; the --broker-fd-bridge install path will install
@@ -10622,6 +10956,7 @@ fn worker_exec_output_binding<FS: ShimFS>(
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::BrokerSocketPair(_broker_pipe) => WorkerExecOutputBinding::Close,
+            crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => WorkerExecOutputBinding::Close,
 
             // BrokerPipeSubsystem (Phase C.3): close the worker's output slot
             // before exec; the --broker-fd-bridge install path will install

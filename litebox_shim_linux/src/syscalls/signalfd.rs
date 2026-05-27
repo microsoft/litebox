@@ -18,6 +18,8 @@ use litebox_platform_multiplex::Platform;
 
 pub(crate) struct SignalfdSubsystem;
 impl FdEnabledSubsystem for SignalfdSubsystem {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::Signalfd;
+
     type Entry = SignalfdFile;
 }
 impl FdEnabledSubsystemEntry for SignalfdFile {}
@@ -72,6 +74,14 @@ impl SignalfdFile {
         (
             super::fork_snapshot::BrokerHandleKind::Signalfd,
             self.common.handle(),
+        )
+    }
+
+    pub(crate) fn worker_exec_bridge_snapshot(&self) -> (u64, u64, bool) {
+        (
+            self.common.handle(),
+            self.mask.as_u64(),
+            self.get_status().contains(OFlags::NONBLOCK),
         )
     }
 
@@ -175,7 +185,7 @@ impl<FS: crate::ShimFS> crate::Task<FS> {
         use litebox::platform::RawConstPointer as _;
         let mask = mask.read_at_offset(0).ok_or(Errno::EFAULT)?;
         let Some(provider) = broker_signalfd_provider() else {
-            return Err(Errno::ENOSYS);
+            todo!("ENOSYS audit: signalfd without broker provider; reachable but not implemented");
         };
         let handle = provider
             .create_signalfd(mask.as_u64(), 0)
@@ -207,9 +217,50 @@ impl<FS: crate::ShimFS> crate::Task<FS> {
         })?;
         Ok(raw_fd.try_into().unwrap())
     }
+
+    pub(crate) fn install_signalfd_bridge_fd(
+        &self,
+        guest_fd: usize,
+        handle_id: u64,
+        mask_bits: u64,
+        nonblock: bool,
+    ) -> Result<(), Errno> {
+        let Some(provider) = broker_signalfd_provider() else {
+            unreachable!("installing signalfd bridge requires the broker signalfd provider");
+        };
+        let file = SignalfdFile::new_broker_backed(
+            provider,
+            handle_id,
+            nonblock,
+            SigSet::from_u64(mask_bits),
+        );
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<SignalfdSubsystem>(file);
+
+        if self
+            .files
+            .borrow()
+            .raw_descriptor_store
+            .read()
+            .is_alive(guest_fd)
+        {
+            self.do_close(guest_fd)?;
+        }
+
+        let files = self.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+        if rds.fd_into_specific_raw_integer(typed, guest_fd) {
+            Ok(())
+        } else {
+            Err(Errno::EBADF)
+        }
+    }
 }
 
-fn signalfd_siginfo_payload(siginfo: &Siginfo, sender_pid: i32) -> Vec<u8> {
+pub(crate) fn signalfd_siginfo_payload(siginfo: &Siginfo, sender_pid: i32) -> Vec<u8> {
     let mut payload = Vec::with_capacity(128);
     payload.resize(128, 0);
     payload[0..4].copy_from_slice(&(siginfo.signo as u32).to_ne_bytes());

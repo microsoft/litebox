@@ -29,6 +29,8 @@ use crate::sandbox_policy::SandboxPolicy;
 use crate::sock_compat::{
     self, AsRawSock, IpcListener, IpcStream, POLLERR, POLLHUP, POLLIN, POLLOUT, PollFd, RawSock,
 };
+use crate::state_registry::BrokerStateRegistry;
+use crate::tcp_conn_state::TcpConnState;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -168,6 +170,65 @@ pub struct RoutedStream {
     pub stream: std::net::TcpStream,
     pub guest_ip: Ipv4Addr,
     pub guest_port: u16,
+    pub broker_tcp_conn_handle: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferListenRouteOutcome {
+    Transferred,
+    AlreadyOwnedByTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferListenRouteError {
+    PortNotRegistered,
+    SourceNotOwner { actual_owner: u64 },
+}
+
+fn broker_tcp_conn_accept_enabled() -> bool {
+    std::env::var("LITEBOX_BROKER_TCP_CONN")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn broker_tcp_conn_source_port(handle: u64) -> Option<u16> {
+    let port = u16::try_from(handle).ok()?;
+    (port > 0).then_some(port)
+}
+
+fn make_routed_stream(
+    stream: std::net::TcpStream,
+    guest_ip: Ipv4Addr,
+    guest_port: u16,
+    state_registry: Option<&BrokerStateRegistry>,
+) -> RoutedStream {
+    if broker_tcp_conn_accept_enabled()
+        && let Some(registry) = state_registry
+        && let Ok(state_stream) = stream.try_clone()
+    {
+        let handle = u64::from(alloc_inbound_src_port());
+        if let Ok((dummy_peer, dummy_worker_end)) = create_tcp_pair() {
+            let state = TcpConnState::new(state_stream);
+            if registry.register_with_id(handle, state).is_ok() {
+                let _ = dummy_peer.set_nonblocking(true);
+                std::mem::forget(dummy_peer);
+                return RoutedStream {
+                    stream: dummy_worker_end,
+                    guest_ip,
+                    guest_port,
+                    broker_tcp_conn_handle: Some(handle),
+                };
+            }
+        }
+    }
+
+    RoutedStream {
+        stream,
+        guest_ip,
+        guest_port,
+        broker_tcp_conn_handle: None,
+    }
 }
 
 impl Default for PortRouter {
@@ -237,6 +298,62 @@ impl PortRouter {
         }
     }
 
+    /// Transfer a TCP listen route from one worker proxy to another.
+    pub fn transfer_listen_route(
+        &self,
+        port: u16,
+        from_worker_id: u64,
+        to_worker_id: u64,
+        to_sender: std::sync::mpsc::Sender<RoutedStream>,
+    ) -> Result<TransferListenRouteOutcome, TransferListenRouteError> {
+        let mut routes = self.routes.lock().unwrap();
+        let Some((owner, sender)) = routes.get_mut(&port) else {
+            return Err(TransferListenRouteError::PortNotRegistered);
+        };
+
+        if *owner == to_worker_id {
+            return Ok(TransferListenRouteOutcome::AlreadyOwnedByTarget);
+        }
+        if *owner != from_worker_id {
+            return Err(TransferListenRouteError::SourceNotOwner {
+                actual_owner: *owner,
+            });
+        }
+
+        *owner = to_worker_id;
+        *sender = to_sender;
+        info!(
+            "port router: transferred port {port} from worker {from_worker_id} to worker {to_worker_id}"
+        );
+        Ok(TransferListenRouteOutcome::Transferred)
+    }
+
+    /// Transfer a TCP listen route to `to_worker_id`, inferring the source from
+    /// the current route owner.
+    pub fn transfer_listen_route_from_current(
+        &self,
+        port: u16,
+        to_worker_id: u64,
+        to_sender: std::sync::mpsc::Sender<RoutedStream>,
+    ) -> Result<TransferListenRouteOutcome, TransferListenRouteError> {
+        let mut routes = self.routes.lock().unwrap();
+        let Some((owner, sender)) = routes.get_mut(&port) else {
+            return Err(TransferListenRouteError::PortNotRegistered);
+        };
+
+        if *owner == to_worker_id {
+            return Ok(TransferListenRouteOutcome::AlreadyOwnedByTarget);
+        }
+
+        let from_worker_id = *owner;
+        *owner = to_worker_id;
+        *sender = to_sender;
+        info!(
+            "port router: transferred port {port} from worker {from_worker_id} to worker {to_worker_id}"
+        );
+        Ok(TransferListenRouteOutcome::Transferred)
+    }
+
     /// Try to route an accepted TCP stream to the worker that owns `guest_port`.
     /// Returns `Some(stream)` if no worker is registered (caller should handle it).
     pub fn try_route(
@@ -244,14 +361,11 @@ impl PortRouter {
         guest_port: u16,
         guest_ip: Ipv4Addr,
         stream: std::net::TcpStream,
+        state_registry: Option<&BrokerStateRegistry>,
     ) -> Option<std::net::TcpStream> {
         let routes = self.routes.lock().unwrap();
         if let Some((_, sender)) = routes.get(&guest_port) {
-            let routed = RoutedStream {
-                stream,
-                guest_ip,
-                guest_port,
-            };
+            let routed = make_routed_stream(stream, guest_ip, guest_port, state_registry);
             match sender.send(routed) {
                 Ok(()) => {
                     debug!("port router: forwarded connection to worker on port {guest_port}");
@@ -259,7 +373,15 @@ impl PortRouter {
                 }
                 Err(e) => {
                     warn!("port router: worker channel closed for port {guest_port}");
-                    Some(e.0.stream) // return the stream
+                    if let Some(handle) = e.0.broker_tcp_conn_handle
+                        && let Some(registry) = state_registry
+                    {
+                        let _ =
+                            registry.release(crate::state_registry::StateHandle::from_id(handle));
+                        None
+                    } else {
+                        Some(e.0.stream)
+                    }
                 }
             }
         } else {
@@ -768,6 +890,7 @@ pub fn run(
     sandbox_policy: Option<Arc<SandboxPolicy>>,
     audit_log: Option<AuditLog>,
     inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
+    state_registry: Option<Arc<BrokerStateRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_with_session_slots(
         ipc_fd,
@@ -778,6 +901,7 @@ pub fn run(
         sandbox_policy,
         audit_log,
         inbound_forwards,
+        state_registry,
     )
 }
 
@@ -790,6 +914,7 @@ pub fn run_with_session_slots(
     sandbox_policy: Option<Arc<SandboxPolicy>>,
     audit_log: Option<AuditLog>,
     inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
+    state_registry: Option<Arc<BrokerStateRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port_router = Arc::new(PortRouter::new());
     let (init_routed_tx, init_routed_rx) = std::sync::mpsc::channel::<RoutedStream>();
@@ -803,6 +928,7 @@ pub fn run_with_session_slots(
         audit_log,
         inbound_forwards,
         port_router,
+        state_registry,
         Some(init_routed_rx),
         Some(init_routed_tx),
     )
@@ -818,6 +944,7 @@ fn run_inner(
     audit_log: Option<AuditLog>,
     inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
     port_router: Arc<PortRouter>,
+    state_registry: Option<Arc<BrokerStateRegistry>>,
     // Receiver for inbound TCP streams routed to this proxy by the port router.
     inbound_routed_rx: Option<std::sync::mpsc::Receiver<RoutedStream>>,
     // Sender for this proxy's inbound channel — registered with port_router
@@ -918,39 +1045,71 @@ fn run_inner(
         // Step 1b: Check for port-listen control messages.
         // Workers send these when they call listen(port) to register
         // their interest in receiving inbound connections.
-        if let Some((port, is_listen)) = device.take_port_listen_msg() {
-            if is_listen {
-                if let Some(ref tx) = inbound_routed_tx {
-                    port_router.register(port, worker_id, tx.clone());
-                    registered_ports.push(port);
-                    info!("worker registered listen on port {port}");
-                    // File-based diagnostic
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/rst-diag.log")
-                    {
-                        let _ =
-                            writeln!(f, "BROKER PORT REGISTER: port={port} worker_id={worker_id}");
-                    }
-                } else {
-                    // Init proxy received a listen notification — register
-                    // but no routing needed (init handles its own inbound).
-                    info!("init proxy listen on port {port} (local)");
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/rst-diag.log")
-                    {
-                        let _ = writeln!(f, "BROKER PORT REGISTER (init, local): port={port}");
+        if let Some((port, action)) = device.take_port_listen_msg() {
+            match action {
+                device::PortListenAction::Listen => {
+                    if let Some(ref tx) = inbound_routed_tx {
+                        port_router.register(port, worker_id, tx.clone());
+                        registered_ports.push(port);
+                        info!("worker registered listen on port {port}");
+                        // File-based diagnostic
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/rst-diag.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "BROKER PORT REGISTER: port={port} worker_id={worker_id}"
+                            );
+                        }
+                    } else {
+                        // Init proxy received a listen notification — register
+                        // but no routing needed (init handles its own inbound).
+                        info!("init proxy listen on port {port} (local)");
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/rst-diag.log")
+                        {
+                            let _ = writeln!(f, "BROKER PORT REGISTER (init, local): port={port}");
+                        }
                     }
                 }
-            } else {
-                port_router.unregister(port);
-                registered_ports.retain(|p| *p != port);
-                info!("unregistered listen on port {port}");
+                device::PortListenAction::Unlisten => {
+                    port_router.unregister(port);
+                    registered_ports.retain(|p| *p != port);
+                    info!("unregistered listen on port {port}");
+                }
+                device::PortListenAction::Transfer => {
+                    if let Some(ref tx) = inbound_routed_tx {
+                        match port_router.transfer_listen_route_from_current(
+                            port,
+                            worker_id,
+                            tx.clone(),
+                        ) {
+                            Ok(TransferListenRouteOutcome::Transferred) => {
+                                if !registered_ports.contains(&port) {
+                                    registered_ports.push(port);
+                                }
+                                info!("worker transferred listen route for port {port}");
+                            }
+                            Ok(TransferListenRouteOutcome::AlreadyOwnedByTarget) => {
+                                if !registered_ports.contains(&port) {
+                                    registered_ports.push(port);
+                                }
+                                info!("listen route for port {port} already owned by worker");
+                            }
+                            Err(err) => {
+                                warn!("failed to transfer listen route for port {port}: {err:?}");
+                            }
+                        }
+                    } else {
+                        warn!("init proxy cannot transfer listen route for port {port}");
+                    }
+                }
             }
         }
 
@@ -1041,7 +1200,12 @@ fn run_inner(
                                 // guest (10.0.0.2), not to the broker IP.
                                 let guest_ip = Ipv4Addr::new(10, 0, 0, 2);
                                 if port_router
-                                    .try_route(dst_port, guest_ip, remote_end)
+                                    .try_route(
+                                        dst_port,
+                                        guest_ip,
+                                        remote_end,
+                                        state_registry.as_deref(),
+                                    )
                                     .is_some()
                                 {
                                     warn!("port_router rejected routed stream for port {dst_port}");
@@ -1474,6 +1638,7 @@ fn run_inner(
                 let sandbox_policy = sandbox_policy.clone();
                 let audit_log = audit_log.clone();
                 let port_router = Arc::clone(&port_router);
+                let state_registry_for_session = state_registry.clone();
                 let (inbound_tx, inbound_rx) = std::sync::mpsc::channel::<RoutedStream>();
                 std::thread::spawn(move || {
                     let _session_permit = session_permit;
@@ -1482,7 +1647,7 @@ fn run_inner(
                         return;
                     }
                     info!("accepted additional LBNP client, handshake complete");
-                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy, audit_log, vec![], port_router, Some(inbound_rx), Some(inbound_tx)) {
+                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy, audit_log, vec![], port_router, state_registry_for_session, Some(inbound_rx), Some(inbound_tx)) {
                         tracing::error!("network proxy error: {e}");
                     }
                 });
@@ -1547,11 +1712,15 @@ fn run_inner(
 
                         // Check if a worker has registered for this port.
                         // If so, route the stream to the worker's proxy.
-                        let stream =
-                            match port_router.try_route(fwd.guest_port, fwd.guest_ip, stream) {
-                                None => continue, // routed to worker, they handle it
-                                Some(s) => s,     // no worker, we handle it
-                            };
+                        let stream = match port_router.try_route(
+                            fwd.guest_port,
+                            fwd.guest_ip,
+                            stream,
+                            state_registry.as_deref(),
+                        ) {
+                            None => continue, // routed to worker, they handle it
+                            Some(s) => s,     // no worker, we handle it
+                        };
 
                         // Create a smoltcp TCP socket that connects to the guest.
                         let tcp_rx =
@@ -1616,7 +1785,10 @@ fn run_inner(
                 tcp_socket.set_nagle_enabled(false);
                 let handle = sockets.add(tcp_socket);
 
-                let src_port = alloc_inbound_src_port();
+                let src_port = routed
+                    .broker_tcp_conn_handle
+                    .and_then(broker_tcp_conn_source_port)
+                    .unwrap_or_else(alloc_inbound_src_port);
 
                 let sock = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
                 let local = smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(BROKER_IP), src_port);
@@ -2316,10 +2488,8 @@ fn promote_established(
             let mut found_host_stream = false;
             if let Some(remote) = remote {
                 #[allow(unreachable_patterns)]
-                let src_ip = match remote.addr {
-                    IpAddress::Ipv4(ip) => ip.octets(),
-                    _ => [0; 4],
-                };
+                let IpAddress::Ipv4(ip) = remote.addr;
+                let src_ip = ip.octets();
                 let flow_key = (src_ip, remote.port, dest_ip.octets(), dest_port);
                 if let Some((stream, _)) = ready_host_streams.remove(&flow_key) {
                     stream.set_nonblocking(true).ok();
@@ -2401,15 +2571,8 @@ fn promote_established(
 
         if let Some(remote) = remote {
             #[allow(unreachable_patterns)]
-            let src_ip = match remote.addr {
-                IpAddress::Ipv4(a) => a.octets(),
-                _ => {
-                    let socket: &mut tcp::Socket = sockets.get_mut(handle);
-                    socket.abort();
-                    sockets.remove(handle);
-                    continue;
-                }
-            };
+            let IpAddress::Ipv4(a) = remote.addr;
+            let src_ip = a.octets();
             let flow_key = (src_ip, remote.port, dest_ip.octets(), dest_port);
 
             if let Some((stream, _created)) = ready_host_streams.remove(&flow_key) {
@@ -2569,7 +2732,15 @@ fn relay_tcp(sockets: &mut SocketSet<'_>, bridges: &mut Vec<TcpBridge>) {
                 );
                 to_remove.push(i);
             }
-            _ => {}
+            tcp::State::Listen
+            | tcp::State::SynSent
+            | tcp::State::SynReceived
+            | tcp::State::Established
+            | tcp::State::FinWait1
+            | tcp::State::FinWait2
+            | tcp::State::CloseWait
+            | tcp::State::Closing
+            | tcp::State::LastAck => {}
         }
     }
 
@@ -2614,7 +2785,7 @@ fn relay_local(sockets: &mut SocketSet<'_>, bridges: &mut Vec<LocalBridge>) {
                         continue;
                     }
                 },
-                _ => {}
+                Ok(_) | Err(_) => {}
             }
         }
 
@@ -2660,7 +2831,15 @@ fn relay_local(sockets: &mut SocketSet<'_>, bridges: &mut Vec<LocalBridge>) {
                 debug!("local bridge closed for port {}", bridge.dest_port);
                 to_remove.push(i);
             }
-            _ => {}
+            tcp::State::Listen
+            | tcp::State::SynSent
+            | tcp::State::SynReceived
+            | tcp::State::Established
+            | tcp::State::FinWait1
+            | tcp::State::FinWait2
+            | tcp::State::CloseWait
+            | tcp::State::Closing
+            | tcp::State::LastAck => {}
         }
     }
 
@@ -2847,11 +3026,67 @@ fn discover_host_dns() -> Ipv4Addr {
 mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
+    #[cfg(windows)]
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    fn routed_stream_sender() -> std::sync::mpsc::Sender<RoutedStream> {
+        std::sync::mpsc::channel().0
+    }
+
+    #[test]
+    fn transfer_listen_route_swaps_owner() {
+        let router = PortRouter::new();
+        router.register(12345, 1, routed_stream_sender());
+
+        let result = router.transfer_listen_route(12345, 1, 2, routed_stream_sender());
+        assert_eq!(result, Ok(TransferListenRouteOutcome::Transferred));
+        assert_eq!(router.routes.lock().unwrap().get(&12345).unwrap().0, 2);
+    }
+
+    #[test]
+    fn transfer_listen_route_is_idempotent_for_target_owner() {
+        let router = PortRouter::new();
+        router.register(12345, 2, routed_stream_sender());
+
+        let result = router.transfer_listen_route(12345, 1, 2, routed_stream_sender());
+        assert_eq!(result, Ok(TransferListenRouteOutcome::AlreadyOwnedByTarget));
+        assert_eq!(router.routes.lock().unwrap().get(&12345).unwrap().0, 2);
+    }
+
+    #[test]
+    fn transfer_listen_route_reports_missing_port() {
+        let router = PortRouter::new();
+
+        let result = router.transfer_listen_route(12345, 1, 2, routed_stream_sender());
+        assert_eq!(result, Err(TransferListenRouteError::PortNotRegistered));
+    }
+
+    #[test]
+    fn transfer_listen_route_rejects_unexpected_source() {
+        let router = PortRouter::new();
+        router.register(12345, 3, routed_stream_sender());
+
+        let result = router.transfer_listen_route(12345, 1, 2, routed_stream_sender());
+        assert_eq!(
+            result,
+            Err(TransferListenRouteError::SourceNotOwner { actual_owner: 3 })
+        );
+        assert_eq!(router.routes.lock().unwrap().get(&12345).unwrap().0, 3);
+    }
+
+    #[test]
+    fn transfer_listen_route_from_current_swaps_owner() {
+        let router = PortRouter::new();
+        router.register(12345, 1, routed_stream_sender());
+
+        let result = router.transfer_listen_route_from_current(12345, 2, routed_stream_sender());
+        assert_eq!(result, Ok(TransferListenRouteOutcome::Transferred));
+        assert_eq!(router.routes.lock().unwrap().get(&12345).unwrap().0, 2);
+    }
 
     #[test]
     fn test_build_udp_packet_valid() {

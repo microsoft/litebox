@@ -216,47 +216,9 @@ fn build_local_services(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    litebox_panic_hook::install("broker");
     litebox_timing::init_from_env();
     litebox_timing::emit("broker_main_started_ns");
-    // PE.14 diag: global panic hook so panics in ANY broker thread
-    // are captured with location + payload + backtrace to the shared
-    // /tmp/rst-diag.log. Strong hypothesis for eager-pipe races is
-    // a panic in a conn handler thread that poisons one of the
-    // broker registries' mutexes, indirectly killing other conns
-    // via `.expect("...poisoned")`.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        use std::io::Write;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let bt = std::backtrace::Backtrace::force_capture();
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let payload = if let Some(s) = info.payload().downcast_ref::<&'static str>() {
-            (*s).to_string()
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "<non-string panic payload>".to_string()
-        };
-        let thread = std::thread::current();
-        let thread_name = thread.name().unwrap_or("<unnamed>");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/rst-diag.log")
-        {
-            let _ = writeln!(
-                f,
-                "[PE.14-diag] ts={ts} BROKER PANIC thread={thread_name} at {location}: {payload}\nbacktrace:\n{bt}"
-            );
-        }
-        default_hook(info);
-    }));
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -275,12 +237,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handles for cross-worker SCM_RIGHTS transfer. The two registries
     // are constructed here and shared with the listener thread; their
     // Arc clones survive for the lifetime of the broker process.
+    let shared_state_registry = cli
+        .fd_token_broker_listen
+        .as_ref()
+        .map(|_| std::sync::Arc::new(litebox_broker::state_registry::BrokerStateRegistry::new()));
     let _fd_token_listener: Option<std::thread::JoinHandle<()>> =
         if let Some(path) = cli.fd_token_broker_listen.as_ref() {
             let fd_registry =
                 std::sync::Arc::new(litebox_broker::fd_tokens::BrokerFdTokenRegistry::new());
-            let state_registry =
-                std::sync::Arc::new(litebox_broker::state_registry::BrokerStateRegistry::new());
+            let state_registry = shared_state_registry
+                .as_ref()
+                .expect("state registry exists when fd-token listener is configured")
+                .clone();
             // Process registry: dedicated BrokerStateRegistry instance for
             // ProcessState entries. Disjoint id space from state_registry
             // keeps allocated guest pids sequential u32s (suitable for
@@ -357,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sandbox_policy,
             audit_log,
             forwards,
+            shared_state_registry.clone(),
         );
     }
     #[cfg(not(unix))]
@@ -456,6 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sandbox_policy.clone(),
                 audit_log.clone(),
                 forwards,
+                shared_state_registry.clone(),
             ) {
                 tracing::error!("network proxy error: {e}");
             }

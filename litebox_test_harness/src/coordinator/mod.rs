@@ -4,6 +4,9 @@
 //! Test coordinator. Runs as the init process, drives all test
 //! operations through pipes to child agents.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 pub(crate) mod agents;
 pub(crate) mod clone3_matrix;
 pub(crate) mod common;
@@ -13,6 +16,7 @@ pub(crate) mod eventfd;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
 pub(crate) mod getrandom_tests;
+pub(crate) mod inherit_matrix;
 pub(crate) mod inotify;
 pub(crate) mod iouring_discovery;
 pub mod leaf_subcommand;
@@ -280,8 +284,6 @@ pub struct TestRunner {
 }
 
 impl TestRunner {
-    /// Record a test result. The only outcomes are `pass` and `FAIL`;
-    /// there is no expected-failure path.
     fn record(&mut self, test: &str, agent: &str, pass: bool, detail: &str) {
         use std::io::Write as _;
         let key = format!("{test} {agent}");
@@ -965,6 +967,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     epoll_pidfd::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
     eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
     inotify::register_inotify_tests(&mut registry::Registry::new(&mut tests));
+    inherit_matrix::register_inherit_matrix_tests(&mut registry::Registry::new(&mut tests));
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
     pidfd_inherit::register_pidfd_inherit_tests(&mut registry::Registry::new(&mut tests));
     pidfd_tests::register_pidfd_tests(&mut registry::Registry::new(&mut tests));
@@ -973,6 +976,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     clone3_matrix::register_clone3_matrix(&mut registry::Registry::new(&mut tests));
     scm_rights::register_scm_rights_tests(&mut registry::Registry::new(&mut tests));
     sockopt::register_sockopt_tests(&mut registry::Registry::new(&mut tests));
+    special_cases::register_readiness_tests(&mut registry::Registry::new(&mut tests));
     tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));
     tcp_state::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     tcp_state::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
@@ -1222,6 +1226,43 @@ pub(crate) fn spawn_child(self_exe: &str) -> Result<Child, String> {
     })
 }
 
+fn latest_litebox_panic_block() -> Option<String> {
+    let contents = std::fs::read_to_string("/tmp/rst-diag.log").ok()?;
+    let mut blocks = Vec::new();
+    let mut current = String::new();
+    for line in contents.lines() {
+        if line.starts_with("[litebox-panic]") && !current.is_empty() {
+            blocks.push(std::mem::take(&mut current));
+        }
+        if line.starts_with("[litebox-panic]") || !current.is_empty() {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    // Future refinement: compare the `ts=<ns>` field to the per-trial start
+    // window. Today the coordinator and host-side runner use different timing
+    // domains in some paths, so attach the most recent panic block.
+    blocks.pop()
+}
+
+fn append_sigabrt_panic_diag(error: &str, child: &mut Child) -> String {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    match child.process.try_wait() {
+        Ok(Some(status)) if status.signal() == Some(libc::SIGABRT) => {
+            if let Some(block) = latest_litebox_panic_block() {
+                format!("{error}; worker exited with SIGABRT; latest panic diagnostic:\n{block}")
+            } else {
+                format!("{error}; worker exited with SIGABRT; no litebox panic diagnostic found")
+            }
+        }
+        _ => error.to_string(),
+    }
+}
+
 pub(crate) async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
     // Use a longer response timeout for Exec commands with custom timeouts
     // and for Spawn/SpawnRemote commands which may trigger broker syscall
@@ -1257,7 +1298,7 @@ pub(crate) async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
         .is_err()
     {
         return Response::Error {
-            error: "write failed".to_string(),
+            error: append_sigabrt_panic_diag("write failed", child),
         };
     }
     let _ = child.stdin.flush().await;
@@ -1271,10 +1312,10 @@ pub(crate) async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
             },
         },
         Ok(Ok(_)) => Response::Error {
-            error: "EOF".into(),
+            error: append_sigabrt_panic_diag("EOF", child),
         },
         Ok(Err(e)) => Response::Error {
-            error: format!("read: {e}"),
+            error: append_sigabrt_panic_diag(&format!("read: {e}"), child),
         },
         Err(_) => Response::Error {
             error: "timeout".into(),

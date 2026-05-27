@@ -3,6 +3,8 @@
 
 //! Common elements to enable OP-TEE-like functionalities
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 

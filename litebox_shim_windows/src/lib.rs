@@ -19,6 +19,8 @@
 //!
 //! The shim reads arguments from: r10, rdx, r8, r9, then stack.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
 #![no_std]
 #![allow(
     // Skeleton code has unused fields and stub methods.

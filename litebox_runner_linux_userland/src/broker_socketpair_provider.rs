@@ -110,6 +110,19 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
         ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
         ClientError::Protocol(_) => BrokerOpError::InvalidValue,
-        _ => BrokerOpError::Io,
+        ClientError::Io(_)
+        | ClientError::InvalidValue { .. }
+        | ClientError::UnexpectedOpcode { .. }
+        | ClientError::BrokerRejectedProtocol
+        | ClientError::DuplicateSubscription(_)
+        | ClientError::UnknownSubscription(_)
+        | ClientError::SubsystemMismatch
+        | ClientError::NoNotificationRing
+        | ClientError::BrokerInternal { .. }
+        | ClientError::OtherStatus { .. }
+        | ClientError::UnexpectedFdAttachment { .. }
+        | ClientError::MissingFdAttachment { .. }
+        | ClientError::ShortRead { .. }
+        | ClientError::CmsgTruncated => BrokerOpError::Io,
     }
 }

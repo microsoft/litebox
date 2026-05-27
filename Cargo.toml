@@ -23,6 +23,7 @@ members = [
     "litebox_util_log",
     "litebox_util_log_macros",
     "litebox_broker",
+    "litebox_panic_hook",
     "litebox_tool_executor",
     "litebox_test_harness",
     "litebox_timing",
@@ -64,6 +65,7 @@ default-members = [
 # but not _too_ ridiculous.
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+wildcard_enum_match_arm = "deny"
 unreadable_literal = "allow"
 doc_markdown = "allow"
 missing_errors_doc = "allow"

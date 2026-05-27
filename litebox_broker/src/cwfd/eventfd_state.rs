@@ -470,13 +470,12 @@ mod tests {
     }
 
     #[test]
-    fn state_object_downcasts_to_concrete_type() {
+    fn state_object_enum_carries_concrete_type() {
         let s = EventfdState::new(7, false);
-        let dyn_ref: &dyn StateObject = &*s;
-        let concrete = dyn_ref
-            .as_any()
-            .downcast_ref::<EventfdState>()
-            .expect("downcast");
+        let object = crate::cwfd::state_registry::StateObjectEnum::from(s);
+        let crate::cwfd::state_registry::StateObjectEnum::Eventfd(concrete) = object else {
+            panic!("expected Eventfd variant");
+        };
         assert_eq!(concrete.current_value(), 7);
     }
 }

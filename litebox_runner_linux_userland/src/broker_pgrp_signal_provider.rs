@@ -121,14 +121,25 @@ impl BrokerPgrpSignalProvider for RunnerBrokerPgrpSignalProvider {
 fn client_err_to_broker_err(
     err: litebox_common_linux::fd_token_client::ClientError,
 ) -> BrokerOpError {
+    use litebox_common_linux::fd_token_client::ClientError;
+
     match err {
-        litebox_common_linux::fd_token_client::ClientError::WouldBlock => BrokerOpError::WouldBlock,
-        litebox_common_linux::fd_token_client::ClientError::InvalidValue { .. } => {
-            BrokerOpError::InvalidValue
-        }
-        litebox_common_linux::fd_token_client::ClientError::UnknownHandle { .. } => {
-            BrokerOpError::UnknownHandle
-        }
-        _ => BrokerOpError::Io,
+        ClientError::WouldBlock => BrokerOpError::WouldBlock,
+        ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
+        ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
+        ClientError::Io(_)
+        | ClientError::Protocol(_)
+        | ClientError::UnexpectedOpcode { .. }
+        | ClientError::BrokerRejectedProtocol
+        | ClientError::DuplicateSubscription(_)
+        | ClientError::UnknownSubscription(_)
+        | ClientError::SubsystemMismatch
+        | ClientError::NoNotificationRing
+        | ClientError::BrokerInternal { .. }
+        | ClientError::OtherStatus { .. }
+        | ClientError::UnexpectedFdAttachment { .. }
+        | ClientError::MissingFdAttachment { .. }
+        | ClientError::ShortRead { .. }
+        | ClientError::CmsgTruncated => BrokerOpError::Io,
     }
 }

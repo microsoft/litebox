@@ -59,7 +59,7 @@ pub fn inherit_bridge() -> &'static Mutex<HashMap<u16, OwnedFd>> {
 // test setup (`tests/integration.rs::ensure_binaries_built`).
 
 /// One leg of the binary-type axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BinaryType {
     /// `ET_DYN`, dynamically linked, glibc. The default `cargo build`
     /// output.

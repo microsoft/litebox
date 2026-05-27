@@ -7,6 +7,9 @@
 //! NtSetInformationFile. For Phase 2, file operations pass through to the
 //! host OS. A proper sandboxed VFS will be added in later phases.
 
+// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
