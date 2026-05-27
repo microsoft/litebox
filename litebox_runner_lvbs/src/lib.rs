@@ -522,7 +522,6 @@ fn handle_open_session(
             msg_args_phys_addr,
             instance,
             params,
-            ta_uuid,
             &ta_req_info,
         ),
         None => open_session_new_instance(
@@ -546,10 +545,10 @@ fn open_session_single_instance(
     msg_args_phys_addr: u64,
     instance: &TaInstance,
     params: &[litebox_common_optee::UteeParamOwned],
-    ta_uuid: litebox_common_optee::TeeUuid,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let task_pt_id = instance.task_page_table_id();
+    let ta_uuid = instance.uuid();
 
     // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID.
     // Use SessionIdGuard to ensure the ID is recycled on any error path
@@ -633,9 +632,9 @@ fn open_session_single_instance(
         if return_code == TeeResult::TargetDead {
             debug_serial_println!("Single-instance TA panicked during OpenSession, cleaning up");
 
-            // Mark-then-evict ordering: see SessionManager::remove_single_instance_if_same.
+            // Mark-then-evict ordering: see SessionManager::evict_cached_instance.
             session_manager().mark_sessions_dead_for_instance(instance);
-            let _ = session_manager().remove_single_instance_if_same(&ta_uuid, instance);
+            let _ = session_manager().evict_cached_instance(instance);
             // SAFETY: no references to user-space memory will be held after this call.
             unsafe {
                 teardown_ta_page_table(instance.shim(), task_pt_id);
@@ -672,7 +671,7 @@ fn open_session_single_instance(
     if let Err(e) = write_result {
         if !ta_flags.is_keep_alive() && session_manager().count_sessions_for_instance(instance) == 0
         {
-            let _ = session_manager().remove_single_instance_if_same(&ta_uuid, instance);
+            let _ = session_manager().evict_cached_instance(instance);
             // SAFETY: no references to user-space memory will be held after this call.
             unsafe {
                 teardown_ta_page_table(instance.shim(), task_pt_id);
@@ -684,7 +683,7 @@ fn open_session_single_instance(
     }
 
     // Success: register a sibling session pointing at the existing instance.
-    session_manager().register_sibling_session(runner_session_id, instance, ta_uuid, ta_flags)?;
+    session_manager().register_sibling_session(runner_session_id, instance)?;
     session_id_guard.disarm();
 
     debug_serial_println!(
@@ -898,7 +897,6 @@ fn open_session_new_instance(
         loaded_program,
         task_pt_id,
         ta_uuid,
-        ta_flags,
     );
     session_id_guard.disarm();
 
@@ -952,8 +950,8 @@ fn handle_invoke_command(
     let params = &ta_req_info.params;
     let session_id = ta_req_info.session;
 
-    session_manager().with_session(session_id, |session| {
-        let Some(instance) = session.live() else {
+    session_manager().with_session(session_id, |instance| {
+        let Some(instance) = instance else {
             return finalize_dead_session(
                 session_id,
                 msg_args,
@@ -1026,13 +1024,10 @@ fn handle_invoke_command(
                 session_id
             );
 
-            let ta_uuid = session.ta_uuid;
-            let ta_flags = session.ta_flags;
-
-            if ta_flags.is_single_instance() {
-                // Mark-then-evict ordering: see SessionManager::remove_single_instance_if_same.
+            if instance.loaded_program().ta_flags.is_single_instance() {
+                // Mark-then-evict ordering: see SessionManager::evict_cached_instance.
                 session_manager().mark_sessions_dead_for_instance(instance);
-                let _ = session_manager().remove_single_instance_if_same(&ta_uuid, instance);
+                let _ = session_manager().evict_cached_instance(instance);
             }
 
             session_manager().unregister_session(session_id);
@@ -1073,9 +1068,8 @@ fn handle_close_session(
 
     debug_serial_println!("CloseSession: session_id={}", session_id);
 
-    session_manager().with_session(session_id, |session| {
-        let ta_uuid = session.ta_uuid;
-        let Some(instance) = session.live() else {
+    session_manager().with_session(session_id, |instance| {
+        let Some(instance) = instance else {
             return finalize_dead_session(
                 session_id,
                 msg_args,
@@ -1148,7 +1142,7 @@ fn handle_close_session(
             // we confirm no sibling sessions remain. We don't need to mark anything `Dead` first.
             if flags.is_single_instance() {
                 let _ = session_manager()
-                    .remove_single_instance_if_same(&ta_uuid, instance);
+                    .evict_cached_instance(instance);
             }
             // SAFETY: no references to user-space memory will be held after this call.
             unsafe {
