@@ -198,8 +198,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_platform_multiplex::set_platform(platform);
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
+    let task_params = platform.init_task();
+    let fs_user = litebox::fs::UserInfo {
+        user: task_params.euid.try_into()?,
+        group: task_params.egid.try_into()?,
+    };
     let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new_with_user(litebox, fs_user);
 
         // When loading the program from the tar, we don't need to create ancestor
         // directories or write the program binary into the in-memory FS -- the program
@@ -207,6 +212,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         if let Some(prog_data) = prog_data {
             let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
             let ancestors: Vec<_> = prog.ancestors().collect();
+            let chown_to_initial_user = |fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
+                                         path: &Path| {
+                fs.chown(
+                    path.to_str().unwrap(),
+                    Some(fs_user.user),
+                    Some(fs_user.group),
+                )
+                .unwrap();
+            };
             let mut prev_user = 0;
             for (path, &mode_and_user) in ancestors
                 .into_iter()
@@ -220,9 +234,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     in_mem.with_root_privileges(|fs| {
                         fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
                         if mode_and_user.1 != 0 {
-                            // This file is owned by a non-root user, so we need to set the ownership to our default user
-                            fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
-                                .unwrap();
+                            chown_to_initial_user(fs, path);
                         }
                     });
                 } else {
@@ -254,9 +266,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 in_mem.with_root_privileges(|fs| {
                     open_file(fs, prog.to_str().unwrap(), last.0);
                     if last.1 != 0 {
-                        // This file is owned by a non-root user, so we need to set the ownership to our default user
-                        fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
-                            .unwrap();
+                        chown_to_initial_user(fs, &prog);
                     }
                 });
             } else {
@@ -356,8 +366,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     } else {
         envp
     };
-
-    let task_params = platform.init_task();
 
     #[cfg(target_arch = "x86_64")]
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter();

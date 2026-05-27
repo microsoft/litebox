@@ -1093,18 +1093,17 @@ impl<FS: ShimFS> Task<FS> {
         Ok(())
     }
 
-    fn access_user(&self, flags: &AtFlags, owner: AccessUserInfo) -> AccessUserInfo {
+    fn access_user(&self, flags: &AtFlags) -> AccessUserInfo {
         if flags.contains(AtFlags::AT_EACCESS) {
             AccessUserInfo {
                 user: self.credentials.euid,
                 group: self.credentials.egid,
             }
         } else {
-            // TODO: the check supposes to use the calling process's UID and GID.
-            // However, our FS currently uses fixed UID and GID that might be different from
-            // the ones we use (i.e., the real UID/GID from host).
-            // Here we assume the caller owns the file.
-            owner
+            AccessUserInfo {
+                user: self.credentials.uid,
+                group: self.credentials.gid,
+            }
         }
     }
 
@@ -1112,11 +1111,11 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         pathname: impl path::Arg,
         mode: AccessFlags,
-        flags: &AtFlags,
+        caller: AccessUserInfo,
     ) -> Result<(), Errno> {
         let status = self.files.borrow().fs.file_status(pathname)?;
         let owner = status.owner.into();
-        Self::do_access_mode(status.mode, owner, self.access_user(flags, owner), &mode)
+        Self::do_access_mode(status.mode, owner, caller, &mode)
     }
 
     /// Handle syscall `faccessat`
@@ -1134,12 +1133,13 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         Self::validate_access_mode(&mode)?;
+        let caller = self.access_user(&flags);
         let cwd = self.fs.borrow().cwd.read().clone();
         let fs_path = FsPath::new(dirfd, pathname, || cwd.clone())?;
         match fs_path {
-            FsPath::Absolute { path } => self.do_access(path, mode, &flags),
+            FsPath::Absolute { path } => self.do_access(path, mode, caller),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                self.do_access(cwd, mode, &flags)
+                self.do_access(cwd, mode, caller)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 let stat = descriptor_stat(fd as usize, self)?;
@@ -1147,12 +1147,7 @@ impl<FS: ShimFS> Task<FS> {
                     user: stat.st_uid,
                     group: stat.st_gid,
                 };
-                Self::do_access_mode(
-                    Mode::from_bits_retain(stat.st_mode),
-                    owner,
-                    self.access_user(&flags, owner),
-                    &mode,
-                )
+                Self::do_access_mode(Mode::from_bits_retain(stat.st_mode), owner, caller, &mode)
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
             FsPath::FdRelative { .. } => {
