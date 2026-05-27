@@ -38,10 +38,7 @@ pub mod msg_handler;
 pub mod ptr;
 
 // Re-export session management types for convenience
-pub use session::{
-    InstanceRef, MAX_TA_INSTANCES, SessionManager, SessionView, TaInstance, TargetView,
-    allocate_session_id,
-};
+pub use session::{MAX_TA_INSTANCES, SessionManager, TaInstance, allocate_session_id};
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 

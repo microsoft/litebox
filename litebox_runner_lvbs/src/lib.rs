@@ -43,7 +43,7 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{
-    InstanceRef, SessionIdGuard, SessionManager, TaInstance, TargetView, allocate_session_id,
+    SessionIdGuard, SessionManager, TaInstance, allocate_session_id,
 };
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
@@ -544,7 +544,7 @@ fn handle_open_session(
 fn open_session_single_instance(
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
-    instance: InstanceRef<'_>,
+    instance: &TaInstance,
     params: &[litebox_common_optee::UteeParamOwned],
     ta_uuid: litebox_common_optee::TeeUuid,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
@@ -689,7 +689,7 @@ fn open_session_single_instance(
     }
 
     // Success: register a sibling session pointing at the existing instance.
-    session_manager().register_sibling_session(runner_session_id, instance, ta_uuid, ta_flags);
+    session_manager().register_sibling_session(runner_session_id, instance, ta_uuid, ta_flags)?;
     session_id_guard.disarm();
 
     debug_serial_println!(
@@ -900,14 +900,16 @@ fn open_session_new_instance(
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
     })?;
 
-    // Success: hand the instance to the session manager. `register_new_session`
-    // wraps it in an `Arc` owned solely by the manager (no clone returned),
-    // and — for single-instance TAs — also inserts it into the cache. The
-    // runner never holds an `Arc<TaInstance>`, so it cannot violate the
-    // `unsafe impl Send/Sync for TaInstance` invariant.
+    // Success: hand the three parts to the session manager. It wraps them
+    // in an `Arc<TaInstance>` owned solely by itself (no clone returned),
+    // and — for single-instance TAs — also caches that `Arc`. The runner
+    // never holds a `TaInstance` or `Arc<TaInstance>`, which is what makes
+    // the internal `unsafe impl Send/Sync for TaInstance` enforceable.
     session_manager().register_new_session(
         runner_session_id,
-        TaInstance::new(shim, loaded_program, task_pt_id),
+        shim,
+        loaded_program,
+        task_pt_id,
         ta_uuid,
         ta_flags,
     );
@@ -963,8 +965,8 @@ fn handle_invoke_command(
     let params = &ta_req_info.params;
     let session_id = ta_req_info.session;
 
-    session_manager().with_session(session_id, |session_entry| {
-        let TargetView::Live(instance) = session_entry.target else {
+    session_manager().with_session(session_id, |session| {
+        let Some(instance) = session.live() else {
             return finalize_dead_session(
                 session_id,
                 msg_args,
@@ -1037,8 +1039,8 @@ fn handle_invoke_command(
                 session_id
             );
 
-            let ta_uuid = session_entry.ta_uuid;
-            let ta_flags = session_entry.ta_flags;
+            let ta_uuid = session.ta_uuid;
+            let ta_flags = session.ta_flags;
 
             if ta_flags.is_single_instance() {
                 // Mark siblings dead BEFORE evicting the cached single instance.
@@ -1087,9 +1089,9 @@ fn handle_close_session(
 
     debug_serial_println!("CloseSession: session_id={}", session_id);
 
-    session_manager().with_session(session_id, |session_entry| {
-        let ta_uuid = session_entry.ta_uuid;
-        let TargetView::Live(instance) = session_entry.target else {
+    session_manager().with_session(session_id, |session| {
+        let ta_uuid = session.ta_uuid;
+        let Some(instance) = session.live() else {
             return finalize_dead_session(
                 session_id,
                 msg_args,
