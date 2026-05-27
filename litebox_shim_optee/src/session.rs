@@ -775,6 +775,9 @@ impl SessionManager {
     where
         F: for<'a> FnOnce(Option<&'a TaInstance>) -> Result<(), OpteeSmcReturnCode>,
     {
+        // Snapshot: was this UUID already known? If unknown and stays unknown after
+        // a failed load (i.e., invalid UUID), we'll evict the lock entry below.
+        let was_unknown = self.get_known_flags(uuid).is_none();
         let token = self.try_acquire_for_open(*uuid)?;
         let is_single_instance = token.uuid_lock.is_some();
 
@@ -798,6 +801,11 @@ impl SessionManager {
         {
             let mut pending = self.pending_count.lock();
             *pending = pending.saturating_sub(1);
+        }
+
+        if result.is_err() && was_unknown && self.get_known_flags(uuid).is_none() {
+            // Remove while still holding the lock (via `token`).
+            self.single_instance_locks.lock().remove(uuid);
         }
 
         result
