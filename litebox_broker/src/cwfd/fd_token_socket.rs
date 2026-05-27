@@ -174,8 +174,9 @@ impl ConnRefTracker {
     ///
     /// [`CallerScope::Ambient`] falls back to "owned by ANY scope on
     /// this conn" (including an Ambient bucket from an unscoped acquire).
-    /// This preserves correctness for asynchronous Drop paths in the shim
-    /// that release a broker-backed fd from a non-syscall thread.
+    /// [`CallerScope::Owned`] also accepts an Ambient bucket for state refs:
+    /// bridge installs can acquire before the syscall loop has a pid scope,
+    /// while the later fd close is pid-scoped.
     fn owns_state(&self, caller_scope: CallerScope, id: u64) -> bool {
         match caller_scope {
             CallerScope::Ambient => self.state_refs.iter().any(|((_, h), c)| *h == id && *c > 0),
@@ -185,6 +186,12 @@ impl ConnRefTracker {
                     .copied()
                     .unwrap_or(0)
                     > 0
+                    || self
+                        .state_refs
+                        .get(&(CallerScope::Ambient, id))
+                        .copied()
+                        .unwrap_or(0)
+                        > 0
             }
         }
     }
@@ -211,8 +218,9 @@ impl ConnRefTracker {
     /// the invariant "key present ⇒ count > 0" holds.
     ///
     /// [`CallerScope::Ambient`] falls back to "decrement an arbitrary
-    /// scope bucket holding this id" (see [`owns_state`]). This handles
-    /// the shim's asynchronous Drop paths where caller_pid isn't stamped.
+    /// scope bucket holding this id" (see [`owns_state`]). Owned state
+    /// releases first use their exact pid bucket, then an Ambient bridge
+    /// bucket if one exists for the same handle on this connection.
     fn record_release(&mut self, caller_scope: CallerScope, id: u64) {
         if caller_scope == CallerScope::Ambient {
             // Ambient release: preserve the historical HashMap iteration
@@ -256,6 +264,19 @@ impl ConnRefTracker {
                 *c -= 1;
                 if *c == 0 {
                     self.state_refs.remove(&(caller_scope, id));
+                }
+                return;
+            }
+        }
+        if let Some(c) = self.state_refs.get_mut(&(CallerScope::Ambient, id)) {
+            debug_assert!(
+                *c > 0,
+                "ConnRefTracker invariant: zero-count ambient state_refs entry present for id={id}"
+            );
+            if *c > 0 {
+                *c -= 1;
+                if *c == 0 {
+                    self.state_refs.remove(&(CallerScope::Ambient, id));
                 }
                 return;
             }
@@ -1763,6 +1784,24 @@ mod tests {
         assert_eq!(state_registry.live_handle_count(), 0);
 
         let _ = (h7a, h7b, h8);
+    }
+
+    #[test]
+    fn owned_release_can_close_ambient_bridge_ref() {
+        use litebox_common_linux::fd_token_client::set_caller_pid_scope;
+
+        let (_dir, path, _fdr, state_registry, _proc) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        let handle = client.create_eventfd(0, false).expect("create ambient");
+        assert_eq!(state_registry.live_handle_count(), 1);
+
+        {
+            let _guard = set_caller_pid_scope(7);
+            client.release(handle).expect("release ambient under pid");
+        }
+
+        assert_eq!(state_registry.live_handle_count(), 0);
     }
 
     #[test]
