@@ -633,14 +633,10 @@ fn open_session_single_instance(
         if return_code == TeeResult::TargetDead {
             debug_serial_println!("Single-instance TA panicked during OpenSession, cleaning up");
 
-            // Mark sibling sessions dead BEFORE evicting the cached single
-            // instance. Otherwise a racing handler that subsequently
-            // acquires its own session token for the UUID could walk past
-            // a still-Live session entry.
+            // Mark-then-evict ordering: see SessionManager::remove_single_instance_if_same.
             session_manager().mark_sessions_dead_for_instance(instance);
             let _ = session_manager().remove_single_instance_if_same(&ta_uuid, instance);
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
+            // SAFETY: no references to user-space memory will be held after this call.
             unsafe {
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };
@@ -677,8 +673,7 @@ fn open_session_single_instance(
         if !ta_flags.is_keep_alive() && session_manager().count_sessions_for_instance(instance) == 0
         {
             let _ = session_manager().remove_single_instance_if_same(&ta_uuid, instance);
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
+            // SAFETY: no references to user-space memory will be held after this call.
             unsafe {
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };
@@ -750,8 +745,7 @@ fn open_session_new_instance(
             runner_session_id,
         )
         .map_err(|_| {
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
+            // SAFETY: no references to user-space memory will be held after this call.
             unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::ENomem
         })?,
@@ -794,8 +788,7 @@ fn open_session_new_instance(
             Some(ta_req_info),
         );
 
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
+        // SAFETY: no references to user-space memory will be held after this call.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         write_result?;
@@ -804,8 +797,7 @@ fn open_session_new_instance(
 
     // Load TA context with parameters for OpenSession - pass actual session_id
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
+        // SAFETY: no references to user-space memory will be held after this call.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::EBadCmd
     })?;
@@ -820,8 +812,7 @@ fn open_session_new_instance(
             None,
         )
         .map_err(|_| {
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
+            // SAFETY: no references to user-space memory will be held after this call.
             unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::EBadCmd
         })?;
@@ -837,16 +828,14 @@ fn open_session_new_instance(
 
     // Read TA output parameters from the stack buffer
     let params_address = loaded_program.params_address.ok_or_else(|| {
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
+        // SAFETY: no references to user-space memory will be held after this call.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::EBadAddr
     })?;
     let ta_params = UserConstPtr::<UteeParams>::from_usize(params_address)
         .read_at_offset(0)
         .ok_or_else(|| {
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
+            // SAFETY: no references to user-space memory will be held after this call.
             unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::EBadAddr
         })?;
@@ -873,8 +862,7 @@ fn open_session_new_instance(
             Some(ta_req_info),
         );
 
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
+        // SAFETY: no references to user-space memory will be held after this call.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         write_result?;
@@ -895,8 +883,7 @@ fn open_session_new_instance(
         Some(ta_req_info),
     )
     .inspect_err(|_| {
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
+        // SAFETY: no references to user-space memory will be held after this call.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
     })?;
 
@@ -1043,17 +1030,14 @@ fn handle_invoke_command(
             let ta_flags = session.ta_flags;
 
             if ta_flags.is_single_instance() {
-                // Mark siblings dead BEFORE evicting the cached single instance.
-                // Otherwise a racing handler entering with_session/with_ta
-                // for the UUID could walk past a still-Live session entry.
+                // Mark-then-evict ordering: see SessionManager::remove_single_instance_if_same.
                 session_manager().mark_sessions_dead_for_instance(instance);
                 let _ = session_manager().remove_single_instance_if_same(&ta_uuid, instance);
             }
 
             session_manager().unregister_session(session_id);
 
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
+            // SAFETY: no references to user-space memory will be held after this call.
             unsafe {
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };
@@ -1166,8 +1150,7 @@ fn handle_close_session(
                 let _ = session_manager()
                     .remove_single_instance_if_same(&ta_uuid, instance);
             }
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
+            // SAFETY: no references to user-space memory will be held after this call.
             unsafe {
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };

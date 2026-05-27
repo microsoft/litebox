@@ -48,13 +48,9 @@
 //! the waiting logic in normal world (where scheduling is appropriate), without
 //! requiring RPCs that would give untrusted code control over secure world execution.
 //!
-//! On panic teardown or last-session close, sibling sessions of a single-instance
-//! TA are flipped to `Dead` *before* the cached instance is
-//! evicted (see [`SessionManager::remove_single_instance_if_same`]). A racing
-//! handler that subsequently enters [`SessionManager::with_ta`] or
-//! [`SessionManager::with_session`] for the UUID will therefore observe `Dead`
-//! on its re-read of the session entry and short-circuit through the
-//! dead-target path.
+//! Cleanup paths flip sibling sessions to `Dead` before evicting the
+//! cached instance; see [`SessionManager::remove_single_instance_if_same`]
+//! for the ordering rationale.
 //!
 //! Reference: <https://optee.readthedocs.io/en/latest/architecture/trusted_applications.html#multi-session>
 //!
@@ -187,12 +183,8 @@ pub(crate) enum SessionTarget {
 }
 
 /// Closure-bound snapshot of a session, delivered by
-/// [`SessionManager::with_session`].
-///
-/// Holds the session's `ta_uuid` / `ta_flags` and, for live sessions, a
-/// borrow of the [`TaInstance`]. The borrow's lifetime is pinned to the
-/// `SessionToken` held internally by `with_session` via HRTB on the
-/// closure type, so the closure cannot smuggle it out.
+/// [`SessionManager::with_session`]. Holds `ta_uuid` / `ta_flags` and,
+/// for live sessions, a borrow of the [`TaInstance`].
 pub struct Session<'a> {
     pub ta_uuid: TeeUuid,
     pub ta_flags: TaFlags,
@@ -466,11 +458,9 @@ impl SessionManager {
         }
     }
 
-    /// Mark every session currently pointing at `instance` as `Dead`.
-    ///
-    /// Must be called before evicting `instance` from the single-instance
-    /// cache (see [`SessionManager::remove_single_instance_if_same`]) so
-    /// a racing handler re-reads `Dead` on its sibling session entry.
+    /// Mark every session currently pointing at `instance` as `Dead`. Must
+    /// be paired with [`SessionManager::remove_single_instance_if_same`]
+    /// in the documented order — see that function for the rationale.
     pub fn mark_sessions_dead_for_instance(&self, instance: &TaInstance) {
         self.sessions
             .mark_sessions_dead_for_pt(instance.task_page_table_id);
@@ -551,7 +541,7 @@ impl SessionManager {
     }
 
     /// Acquire a token + validated entry for an Invoke/Close on an existing
-    /// session. Returns the entry that survived the post-marker re-read so
+    /// session. Returns the entry that survived the post-lock re-read so
     /// callers don't need to look it up again.
     ///
     /// Always reserves the per-session-id slot in `active_sessions`. For
@@ -563,13 +553,22 @@ impl SessionManager {
     /// holds the per-UUID lock for the same single-instance TA. On failure
     /// any partial acquisition is released via the token's `Drop`.
     ///
-    /// Defense in depth: after the per-session-id marker is held, the entry
-    /// is re-read and its `(uuid, flags)` validated against the pre-marker
-    /// snapshot used to decide whether to take the per-UUID lock. If they
-    /// diverge (the id was recycled and reused under a different TA between
-    /// our first read and the marker insert), `Err(EThreadLimit)` is
-    /// returned so the Linux driver retries — a fresh acquisition will see
-    /// the new entry from the start.
+    /// # Ordering
+    ///
+    /// The per-UUID lock is acquired *before* the final session-map
+    /// re-read. This excludes concurrent `mark_sessions_dead_for_instance`
+    /// and cache eviction (both of which require the UUID lock), so the
+    /// `Live` / `Dead` state observed in the re-read remains authoritative
+    /// for the lifetime of the returned token. Reading the entry before
+    /// taking the UUID lock would let a sibling complete the entire
+    /// mark-dead / evict / teardown sequence between our read and our
+    /// lock acquisition, leaving us holding a stale `Live` entry pointing
+    /// at a torn-down page table.
+    ///
+    /// Defense in depth: the entry's `(uuid, flags)` are validated against
+    /// the pre-marker snapshot. If they diverge (the id was recycled and
+    /// reused under a different TA between our first read and the marker
+    /// insert), we return `EThreadLimit` so the Linux driver retries.
     fn try_acquire_for_session(
         &self,
         session_id: u32,
@@ -590,9 +589,18 @@ impl SessionManager {
             active_session_id: Some(session_id),
         };
 
-        // Validate the snapshot under the marker. If the entry has changed
-        // identity (or vanished), our snapshot is stale; bail so the caller
-        // retries with a fresh view. Token's `Drop` releases the marker.
+        // Take the per-UUID lock BEFORE the final re-read for single-
+        // instance TAs. This blocks any concurrent mark-dead / cache
+        // eviction so the re-read result is stable. On failure, the
+        // token's `Drop` releases the marker we already took.
+        if snapshot_single {
+            token.uuid_lock = Some(
+                self.try_acquire_uuid_lock(snapshot_uuid)
+                    .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
+            );
+        }
+
+        // Re-read under both locks and validate against the snapshot.
         let entry_now = self
             .sessions
             .get_entry(session_id)
@@ -603,18 +611,6 @@ impl SessionManager {
             return Err(OpteeSmcReturnCode::EThreadLimit);
         }
 
-        // Only take the per-UUID lock for `Live` single-instance sessions.
-        // A `Dead` entry needs no sibling serialization — its instance is
-        // already gone, and contending with live siblings (or a freshly
-        // created instance for the same UUID) just to call
-        // `finalize_dead_session` would needlessly delay them.
-        if snapshot_single && matches!(entry_now.target, SessionTarget::Live(_)) {
-            // On failure, dropping `token` releases the marker we just took.
-            token.uuid_lock = Some(
-                self.try_acquire_uuid_lock(snapshot_uuid)
-                    .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
-            );
-        }
         Ok((token, entry_now))
     }
 
@@ -731,11 +727,7 @@ impl SessionManager {
     /// the UUID will observe `Dead` on its re-read of the session entry.
     /// Callers on the last-session-close path may skip the mark step — by
     /// that point there are no sibling sessions to fence out.
-    pub fn remove_single_instance_if_same(
-        &self,
-        uuid: &TeeUuid,
-        instance: &TaInstance,
-    ) -> bool {
+    pub fn remove_single_instance_if_same(&self, uuid: &TeeUuid, instance: &TaInstance) -> bool {
         self.single_instance_cache
             .remove_if_pt(uuid, instance.task_page_table_id)
     }
