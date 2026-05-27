@@ -63,6 +63,12 @@ impl BrokerSubscribable for RunnerBrokerSocketPairProvider {
             .dup_handle(handle)
             .map_err(client_err_to_broker_err)
     }
+
+    fn query_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
+        self.client
+            .query_events(handle)
+            .map_err(client_err_to_broker_err)
+    }
 }
 
 impl BrokerSocketPairProvider for RunnerBrokerSocketPairProvider {

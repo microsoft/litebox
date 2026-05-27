@@ -142,6 +142,15 @@ pub trait StateObject: Any + Send + Sync + core::fmt::Debug {
     /// Kind-agnostic unsubscribe. Removes the subscription previously
     /// installed via [`Self::subscribe`].
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError>;
+
+    /// Returns the broker's authoritative current view of which
+    /// `NOTIFY_EVENT_*` bits are set for this state object.
+    /// Used by [`Opcode::QueryEvents`][crate::cwfd::fd_token_protocol::Opcode::QueryEvents]
+    /// so worker-side `poll`/`select`/`epoll_wait` paths can fetch
+    /// readiness synchronously rather than relying on a stale
+    /// subscription-mirror cache — the broker is the single source of
+    /// truth for broker-held resources.
+    fn current_events(&self) -> u32;
 }
 
 /// Closed set of broker-hosted state object variants.
@@ -247,6 +256,20 @@ impl StateObjectEnum {
             StateObjectEnum::Process(state) => state.unsubscribe(subscription_id),
         }
     }
+
+    pub fn current_events(&self) -> u32 {
+        match self {
+            StateObjectEnum::Eventfd(state) => state.current_events(),
+            StateObjectEnum::PipeReadEnd(state) => state.current_events(),
+            StateObjectEnum::PipeWriteEnd(state) => state.current_events(),
+            StateObjectEnum::SocketPairEnd(state) => state.current_events(),
+            StateObjectEnum::TcpConn(state) => state.current_events(),
+            StateObjectEnum::Signalfd(state) => state.current_events(),
+            StateObjectEnum::Pty(state) => state.current_events(),
+            StateObjectEnum::Pidfd(state) => state.current_events(),
+            StateObjectEnum::Process(state) => state.current_events(),
+        }
+    }
 }
 
 impl StateObject for StateObjectEnum {
@@ -269,6 +292,10 @@ impl StateObject for StateObjectEnum {
 
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         StateObjectEnum::unsubscribe(self, subscription_id)
+    }
+
+    fn current_events(&self) -> u32 {
+        StateObjectEnum::current_events(self)
     }
 }
 

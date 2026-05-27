@@ -513,6 +513,10 @@ impl StateObject for SocketPairEnd {
         };
         subject.remove(subscription_id)
     }
+
+    fn current_events(&self) -> u32 {
+        self.inner.current_events(self.endpoint)
+    }
 }
 
 #[cfg(test)]

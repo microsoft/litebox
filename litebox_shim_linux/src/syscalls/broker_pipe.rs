@@ -216,7 +216,6 @@ impl BrokerPipeFd<Platform> {
                         let n = bytes.len().min(buf.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
                         if n == 0 {
-                            self.common.set_readable(false);
                         }
                         Ok(n)
                     }
@@ -229,7 +228,6 @@ impl BrokerPipeFd<Platform> {
                         // pipe wakes on write, reader drains, pollee
                         // state stayed "readable" because only n==0
                         // (EOF) cleared it).
-                        self.common.set_readable(false);
                         Err(litebox::event::polling::TryOpError::TryAgain)
                     }
                     Err(e) => Err(litebox::event::polling::TryOpError::Other(

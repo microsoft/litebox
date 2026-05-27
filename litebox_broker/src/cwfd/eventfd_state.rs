@@ -271,6 +271,10 @@ impl StateObject for EventfdState {
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         EventfdState::unsubscribe(self, subscription_id)
     }
+
+    fn current_events(&self) -> u32 {
+        EventfdState::current_events(self)
+    }
 }
 
 #[cfg(test)]

@@ -142,6 +142,13 @@ pub enum Opcode {
     PtyIoctl = 0x64,
     Unsubscribe = 0x14,
     DupHandle = 0x15,
+    /// Synchronous "what events are currently set" query on a
+    /// broker-held state handle. Body: `handle_id: u64`. Response:
+    /// `events: u32` (a bitmask of `NOTIFY_EVENT_*` bits computed
+    /// from the broker's current authoritative state). Designed for
+    /// shim-side `poll`/`select`/`epoll_wait` readiness checks so the
+    /// worker never relies on a stale local cache of broker state.
+    QueryEvents = 0x16,
     CreatePidfd = 0x20,
     PidfdExited = 0x21,
     /// Broker-hosted process registration. Allocates a globally-
@@ -202,6 +209,8 @@ pub enum Opcode {
     PtyIoctlResponse = 0xE4,
     UnsubscribeResponse = 0x94,
     DupHandleResponse = 0x95,
+    /// Response for [`Opcode::QueryEvents`]. Body: `events: u32`.
+    QueryEventsResponse = 0x96,
     CreatePidfdResponse = 0xA0,
     PidfdExitedResponse = 0xA1,
     RegisterProcessResponse = 0xF0,
@@ -340,6 +349,7 @@ impl Opcode {
             Opcode::PtyIoctl => Some(Opcode::PtyIoctlResponse),
             Opcode::Unsubscribe => Some(Opcode::UnsubscribeResponse),
             Opcode::DupHandle => Some(Opcode::DupHandleResponse),
+            Opcode::QueryEvents => Some(Opcode::QueryEventsResponse),
             Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
             Opcode::PidfdExited => Some(Opcode::PidfdExitedResponse),
             Opcode::RegisterProcess => Some(Opcode::RegisterProcessResponse),
@@ -389,6 +399,7 @@ impl Opcode {
                 | Opcode::PtyIoctl
                 | Opcode::Unsubscribe
                 | Opcode::DupHandle
+                | Opcode::QueryEvents
                 | Opcode::CreatePidfd
                 | Opcode::PidfdExited
                 | Opcode::RegisterProcess
@@ -455,6 +466,7 @@ impl TryFrom<u8> for Opcode {
             0x64 => Ok(Opcode::PtyIoctl),
             0x14 => Ok(Opcode::Unsubscribe),
             0x15 => Ok(Opcode::DupHandle),
+            0x16 => Ok(Opcode::QueryEvents),
             0x20 => Ok(Opcode::CreatePidfd),
             0x21 => Ok(Opcode::PidfdExited),
             0x70 => Ok(Opcode::RegisterProcess),
@@ -496,6 +508,7 @@ impl TryFrom<u8> for Opcode {
             0xE4 => Ok(Opcode::PtyIoctlResponse),
             0x94 => Ok(Opcode::UnsubscribeResponse),
             0x95 => Ok(Opcode::DupHandleResponse),
+            0x96 => Ok(Opcode::QueryEventsResponse),
             0xA0 => Ok(Opcode::CreatePidfdResponse),
             0xA1 => Ok(Opcode::PidfdExitedResponse),
             0xF0 => Ok(Opcode::RegisterProcessResponse),
@@ -2595,6 +2608,45 @@ pub fn build_dup_handle_response_ok() -> OwnedFrame {
     }
 }
 
+/// Body for [`Opcode::QueryEvents`]: handle id.
+pub fn build_query_events_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::QueryEvents,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Decodes the body of a [`Opcode::QueryEvents`] request frame.
+pub fn parse_query_events_request(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::QueryEvents)
+}
+
+/// Body for [`Opcode::QueryEventsResponse`]: `events: u32` LE — the
+/// broker's current view of which `NOTIFY_EVENT_*` bits are set on
+/// the queried handle. The caller filters with its own event mask.
+pub fn build_query_events_response_ok(events: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::QueryEventsResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: events.to_le_bytes().to_vec(),
+    }
+}
+
+/// Decodes the body of a [`Opcode::QueryEventsResponse`] success frame.
+pub fn parse_query_events_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::QueryEventsResponse,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+}
+
 /// Constructs an error response. The caller supplies the response
 /// opcode (derived from the request via [`Opcode::response_for`]) and
 /// a non-`Ok` status.
@@ -2657,6 +2709,8 @@ mod tests {
             Opcode::MarkProcessExited,
             Opcode::SubscribeProcessExitResponse,
             Opcode::MarkProcessExitedResponse,
+            Opcode::QueryEvents,
+            Opcode::QueryEventsResponse,
         ] {
             assert_eq!(Opcode::try_from(op as u8).unwrap(), op);
         }
@@ -2719,6 +2773,8 @@ mod tests {
             Opcode::PidfdExitedResponse,
             Opcode::SubscribeProcessExitResponse,
             Opcode::MarkProcessExitedResponse,
+            Opcode::QueryEvents,
+            Opcode::QueryEventsResponse,
         ] {
             assert_eq!(op.expected_fd_count(), 0, "{op:?}");
         }

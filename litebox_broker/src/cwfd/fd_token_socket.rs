@@ -1246,7 +1246,8 @@ fn handle_control_connection_inner(
                     | Opcode::WriteTcpConn
                     | Opcode::ShutdownTcpConn
                     | Opcode::PollTcpConnEvents
-                    | Opcode::DupHandle => {
+                    | Opcode::DupHandle
+                    | Opcode::QueryEvents => {
                         // State-object opcodes: route to state_service on the fd-state registry.
                         let state_result =
                             state_handle_request(state_registry, conn_state, &frame, in_fds);

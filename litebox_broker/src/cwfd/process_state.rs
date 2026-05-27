@@ -161,6 +161,14 @@ impl StateObject for ProcessState {
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         ProcessState::unsubscribe(self, subscription_id)
     }
+
+    fn current_events(&self) -> u32 {
+        if self.exit_state().is_some() {
+            PROCESS_EXIT_EVENTS
+        } else {
+            0
+        }
+    }
 }
 
 #[cfg(test)]

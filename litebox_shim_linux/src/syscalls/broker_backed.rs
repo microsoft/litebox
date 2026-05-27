@@ -9,19 +9,25 @@
 //!
 //! 1. An `Arc<Pollee>` whose observers fire from the runner's
 //!    notification-dispatcher thread when a peer worker pushes events.
-//! 2. A cached "readable" flag the dispatcher thread can update
-//!    without acquiring per-kind state locks.
-//! 3. Lazy `subscribe` on first observer registration and
+//! 2. Lazy `subscribe` on first observer registration and
 //!    `unsubscribe` on drop, talking to the broker through the
 //!    kind-agnostic [`BrokerSubscribable`] trait.
-//! 4. `release` on drop to balance the initial broker handle.
+//! 3. `release` on drop to balance the initial broker handle.
 //!
 //! Kind-specific code (read / write / sendmsg / etc.) lives outside
 //! this struct on the embedding variant; this module owns just the
 //! cross-worker wake-up plumbing.
+//!
+//! **No readiness cache.** The broker is the single source of truth
+//! for broker-held resources, so [`BrokerBackedCommon::check_io_events`]
+//! always issues a synchronous `QueryEvents` RPC. Notifications still
+//! serve to *wake* blocked pollees, but they no longer write any local
+//! state that polls read — eliminating the "stale mirror" race in
+//! which a worker queries readiness *between* a broker-side event and
+//! the dispatcher thread processing the corresponding frame.
 
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox::event::{Events, polling::Pollee};
 use litebox::platform::TimeProvider;
@@ -46,18 +52,17 @@ struct BrokerSubscription {
 /// Callback the runner's NotificationDispatcher invokes when a
 /// broker NotificationFrame arrives for this subscription.
 ///
-/// Translates broker event bits (NOTIFY_EVENT_IN / OUT) into shim
-/// `Events`, updates the local readable cache, and fires local
-/// `Pollee` observers — waking any `epoll_wait` waiter even though
-/// the writer lived in a different worker process.
+/// Pure wake-up signal: translates broker event bits to shim
+/// `Events` and fires local `Pollee` observers so any blocked
+/// `epoll_wait` / `poll` / `select` re-runs `scan_once`, which
+/// queries the broker via `check_io_events`. No local cache is
+/// touched — the broker is authoritative.
 ///
-/// Holds **`Weak`** references to the owner's pollee and
-/// local_readable flag so a delayed callback after the owner has
-/// dropped is a no-op rather than a dangling reference.
+/// Holds a **`Weak`** reference to the owner's pollee so a delayed
+/// callback after the owner has dropped is a no-op rather than a
+/// dangling reference.
 struct BrokerSubscriptionWaker<P: RawSyncPrimitivesProvider + TimeProvider> {
     pollee: Weak<Pollee<P>>,
-    local_readable: Weak<AtomicBool>,
-    local_events: Weak<AtomicU32>,
 }
 
 impl<P> BrokerEventCallback for BrokerSubscriptionWaker<P>
@@ -68,29 +73,31 @@ where
         let Some(pollee) = self.pollee.upgrade() else {
             return;
         };
-        let mut shim_events = Events::empty();
-        if events & NOTIFY_EVENT_IN != 0 {
-            shim_events |= Events::IN;
-            if let Some(flag) = self.local_readable.upgrade() {
-                flag.store(true, Ordering::SeqCst);
-            }
-        }
-        if events & NOTIFY_EVENT_OUT != 0 {
-            shim_events |= Events::OUT;
-        }
-        if events & NOTIFY_EVENT_HUP != 0 {
-            shim_events |= Events::HUP;
-        }
-        if events & NOTIFY_EVENT_ERR != 0 {
-            shim_events |= Events::ERR;
-        }
-        if let Some(bits) = self.local_events.upgrade() {
-            bits.fetch_or(shim_events.bits(), Ordering::SeqCst);
-        }
+        let shim_events = broker_events_to_shim_events(events);
         if !shim_events.is_empty() {
             pollee.notify_observers(shim_events);
         }
     }
+}
+
+/// Translates a broker-side `NOTIFY_EVENT_*` bitmask to the shim's
+/// `Events` enum.
+#[inline]
+fn broker_events_to_shim_events(events: u32) -> Events {
+    let mut shim_events = Events::empty();
+    if events & NOTIFY_EVENT_IN != 0 {
+        shim_events |= Events::IN;
+    }
+    if events & NOTIFY_EVENT_OUT != 0 {
+        shim_events |= Events::OUT;
+    }
+    if events & NOTIFY_EVENT_HUP != 0 {
+        shim_events |= Events::HUP;
+    }
+    if events & NOTIFY_EVENT_ERR != 0 {
+        shim_events |= Events::ERR;
+    }
+    shim_events
 }
 
 /// Scaffolding shared by every shim-side broker-backed file variant.
@@ -108,8 +115,6 @@ where
 pub(crate) struct BrokerBackedCommon<P: RawSyncPrimitivesProvider + TimeProvider> {
     provider: Arc<dyn BrokerSubscribable>,
     handle: u64,
-    local_readable: Arc<AtomicBool>,
-    local_events: Arc<AtomicU32>,
     sub: litebox::sync::Mutex<P, Option<BrokerSubscription>>,
     events_mask: u32,
     /// If `false`, `Drop` skips calling `provider.release(handle)`.
@@ -131,8 +136,6 @@ where
         Self {
             provider,
             handle,
-            local_readable: Arc::new(AtomicBool::new(false)),
-            local_events: Arc::new(AtomicU32::new(0)),
             sub: litebox::sync::Mutex::new(None),
             events_mask,
             release_on_drop: AtomicBool::new(true),
@@ -165,46 +168,18 @@ where
         self.handle
     }
 
-    /// Returns a cloned `Arc` to the cached readable flag. Useful
-    /// when the embedding variant needs to update the flag after
-    /// dropping the per-kind state lock.
-    #[inline]
-    pub(crate) fn readable_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.local_readable)
-    }
-
-    /// Sets the cached "readable" flag.
-    #[inline]
-    pub(crate) fn set_readable(&self, value: bool) {
-        self.local_readable.store(value, Ordering::SeqCst);
-        if value {
-            self.local_events
-                .fetch_or(Events::IN.bits(), Ordering::SeqCst);
-        } else {
-            self.local_events
-                .fetch_and(!Events::IN.bits(), Ordering::SeqCst);
-        }
-    }
-
-    /// Reads the cached "readable" flag.
-    #[inline]
-    pub(crate) fn is_readable(&self) -> bool {
-        self.local_readable.load(Ordering::SeqCst)
-    }
-
-    /// Computes the `Events` bits to report from `check_io_events`
-    /// based on the cached readable flag. Broker-backed kinds are
-    /// typically writable in practice; `OUT` is unconditional here.
-    /// Caller-specific bits (e.g. HUP for closed-peer unix sockets)
-    /// should be ORed in by the embedding variant.
+    /// Synchronously asks the broker for the current `Events` bitmask
+    /// on this handle. Replaces the previous local-cache mirror; the
+    /// broker is the single source of truth for broker-held resources,
+    /// so every readiness query goes to it. On RPC failure returns
+    /// `Events::empty()` (treat as "no events ready" — the caller will
+    /// retry, and a hard failure surfaces on the next read/write).
     #[inline]
     pub(crate) fn check_io_events(&self) -> Events {
-        let mut events = Events::from_bits_truncate(self.local_events.load(Ordering::SeqCst));
-        if self.is_readable() {
-            events |= Events::IN;
+        match self.provider.query_events(self.handle) {
+            Ok(events) => broker_events_to_shim_events(events),
+            Err(_) => Events::empty(),
         }
-        events |= Events::OUT;
-        events
     }
 }
 
@@ -228,8 +203,6 @@ where
         }
         let waker: Arc<BrokerSubscriptionWaker<P>> = Arc::new(BrokerSubscriptionWaker {
             pollee: Arc::downgrade(pollee),
-            local_readable: Arc::downgrade(&self.local_readable),
-            local_events: Arc::downgrade(&self.local_events),
         });
         let callback: Arc<dyn BrokerEventCallback> = waker;
         match self

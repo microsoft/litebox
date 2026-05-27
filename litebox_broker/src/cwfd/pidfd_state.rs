@@ -172,6 +172,13 @@ impl StateObject for PidfdState {
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         PidfdState::unsubscribe(self, subscription_id)
     }
+    fn current_events(&self) -> u32 {
+        if self.exited() {
+            NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP
+        } else {
+            0
+        }
+    }
 }
 
 /// Opens a pidfd watching `target_host_pid` via the `pidfd_open(2)`

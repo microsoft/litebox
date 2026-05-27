@@ -210,6 +210,7 @@ pub fn handle_request(
         Opcode::Unsubscribe => handle_unsubscribe(registry, conn, request, in_fds),
         Opcode::Release => handle_release_state(registry, request, in_fds),
         Opcode::DupHandle => handle_dup_handle(registry, request, in_fds),
+        Opcode::QueryEvents => handle_query_events(registry, request, in_fds),
         Opcode::RegisterProcess => handle_register_process(registry, request, in_fds),
         Opcode::SubscribeProcessExit => {
             handle_subscribe_process_exit(registry, conn, request, in_fds)
@@ -1601,6 +1602,35 @@ fn handle_dup_handle(
             status_err(Opcode::DupHandleResponse, StatusCode::UnknownHandle)
         }
         Err(_) => status_err(Opcode::DupHandleResponse, StatusCode::Internal),
+    }
+}
+
+/// Resolves `handle_id` to its registered [`StateObjectEnum`] and
+/// returns the broker's authoritative current event mask via
+/// [`StateObjectEnum::current_events`]. Read-only and safe to call at
+/// arbitrary cadence; no refcount mutation.
+fn handle_query_events(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::QueryEventsResponse);
+    }
+    let handle_id =
+        match litebox_common_linux::fd_token_protocol::parse_query_events_request(request.body) {
+            Ok(id) => id,
+            Err(_) => return protocol_err(Opcode::QueryEventsResponse),
+        };
+    let state = match registry.resolve_untyped(StateHandle::from_id(handle_id)) {
+        Ok(state) => state,
+        Err(_) => return status_err(Opcode::QueryEventsResponse, StatusCode::UnknownHandle),
+    };
+    HandlerResult {
+        frame: litebox_common_linux::fd_token_protocol::build_query_events_response_ok(
+            state.current_events(),
+        ),
+        out_fd: None,
     }
 }
 

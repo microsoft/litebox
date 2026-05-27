@@ -469,31 +469,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             } => {
                 let provider = Arc::clone(provider);
                 let handle = common.handle();
-                let semaphore = *semaphore;
-                let readable = common.readable_flag();
+                let _ = semaphore;
                 drop(inner);
                 // reason: unsupported variants intentionally share this fallback path.
                 #[allow(clippy::wildcard_enum_match_arm)]
                 match provider.read_eventfd(handle) {
                     Ok(v) => {
-                        // Update local readability cache: if we read
-                        // in semaphore mode we just took 1; broker
-                        // counter may still be > 0. If non-semaphore,
-                        // we drained the entire counter to 0.
-                        // Without a separate "peek" RPC, the safe
-                        // assumption for semaphore is that more data
-                        // MAY exist (set readable=true). For
-                        // non-semaphore, we drained → not readable.
-                        // The next epoll wake from a broker write
-                        // will re-set it to true via try_write_eventfd.
-                        readable.store(semaphore, Ordering::SeqCst);
+                        // Wake in-process pollee observers; readiness
+                        // is then re-derived synchronously via
+                        // `check_io_events` -> broker. No local cache.
                         self.pollee.notify_observers(Events::OUT);
                         Ok(v)
                     }
-                    Err(BrokerOpError::WouldBlock) => {
-                        readable.store(false, Ordering::SeqCst);
-                        Err(TryOpError::TryAgain)
-                    }
+                    Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
                     Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
                     Err(BrokerOpError::InvalidValue) => Err(TryOpError::Other(Errno::EINVAL)),
                     Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
@@ -593,17 +581,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             } => {
                 let provider = Arc::clone(provider);
                 let handle = common.handle();
-                let readable = common.readable_flag();
                 drop(inner);
                 // reason: unsupported variants intentionally share this fallback path.
                 #[allow(clippy::wildcard_enum_match_arm)]
                 match provider.write_eventfd(handle, value) {
                     Ok(()) => {
-                        // Mark locally readable so check_io_events
-                        // reports Events::IN. This is what unblocks
-                        // an in-process epoll observer that was woken
-                        // by notify_observers below.
-                        readable.store(true, Ordering::SeqCst);
+                        // In-process observers still need a wake-up
+                        // for this same-process write (the broker
+                        // notification path covers cross-process
+                        // wakes). Readiness is then queried back via
+                        // `check_io_events` -> broker.
                         self.pollee.notify_observers(Events::IN);
                         Ok(8)
                     }
@@ -752,21 +739,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                 }
             }
             EventFileInner::BrokerBacked { common, .. } => {
-                // Cached local readiness — updated by:
-                //   - try_write_eventfd (local write success → true)
-                //   - try_read_eventfd (drain-to-zero → false)
-                //   - BrokerSubscriptionWaker::on_events (broker push
-                //     with NOTIFY_EVENT_IN → true) — for cross-worker
-                //     wake-ups from a peer worker's write.
+                // Broker is the single source of truth for broker-held
+                // resources. `check_io_events` issues a synchronous
+                // `QueryEvents` RPC so we never report stale state.
                 events |= common.check_io_events();
             }
             EventFileInner::PidfdBrokerBacked { provider, common } => {
-                if common.is_readable()
-                    || provider
-                        .pidfd_exited(common.handle())
-                        .inspect(|exited| common.set_readable(*exited))
-                        .unwrap_or(false)
-                {
+                if provider.pidfd_exited(common.handle()).unwrap_or(false) {
                     events |= Events::IN | Events::HUP;
                 }
             }
@@ -1160,6 +1139,9 @@ mod tests {
             fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
                 Ok(())
             }
+            fn query_events(&self, _handle: u64) -> Result<u32, BrokerOpError> {
+                Ok(0)
+            }
         }
 
         impl BrokerEventfdProvider for MockProvider {
@@ -1264,6 +1246,9 @@ mod tests {
             fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
                 Ok(())
             }
+            fn query_events(&self, _handle: u64) -> Result<u32, BrokerOpError> {
+                Ok(0)
+            }
         }
 
         impl BrokerEventfdProvider for ReleaseCountingProvider {
@@ -1359,6 +1344,13 @@ mod tests {
                     .lock()
                     .unwrap()
                     .dup_handle(handle)
+                    .map_err(client_err_to_broker_err)
+            }
+            fn query_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .query_events(handle)
                     .map_err(client_err_to_broker_err)
             }
         }
@@ -1520,6 +1512,13 @@ mod tests {
                     .dup_handle(handle)
                     .map_err(|_| BrokerOpError::Io)
             }
+            fn query_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .query_events(handle)
+                    .map_err(|_| BrokerOpError::Io)
+            }
         }
         impl BrokerEventfdProvider for RealProviderForTest {
             fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
@@ -1658,6 +1657,13 @@ mod tests {
                     .lock()
                     .unwrap()
                     .dup_handle(handle)
+                    .map_err(|_| BrokerOpError::Io)
+            }
+            fn query_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .query_events(handle)
                     .map_err(|_| BrokerOpError::Io)
             }
         }

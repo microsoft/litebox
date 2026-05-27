@@ -1225,6 +1225,30 @@ impl FdTokenClient {
         }
     }
 
+    /// Asks the broker for the current `NOTIFY_EVENT_*` bitmask on
+    /// `handle_id`. Synchronous; the broker's response is the
+    /// authoritative current view of which events are set, computed
+    /// from broker-side state. Used by worker-side `poll`/`select`/
+    /// `epoll_wait` readiness queries so callers never depend on a
+    /// stale subscription-mirror cache.
+    pub fn query_events(&self, handle_id: u64) -> Result<u32, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &crate::fd_token_protocol::build_query_events_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, _) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::QueryEventsResponse)?;
+        match resp.status {
+            StatusCode::Ok => crate::fd_token_protocol::parse_query_events_response_ok(resp.body)
+                .map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, UnixStream> {
         self.stream.lock().expect("FdTokenClient mutex poisoned")
     }

@@ -186,14 +186,12 @@ impl BrokerSocketPairFd<Platform> {
                         let n = bytes.len().min(buf.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
                         if n == 0 {
-                            self.common.set_readable(false);
                         }
                         Ok(n)
                     }
                     Err(BrokerOpError::WouldBlock) => {
                         // Mirror C.5k pipe fix: clear pollee readable
                         // so ppoll doesn't livelock without fresh IN.
-                        self.common.set_readable(false);
                         Err(litebox::event::polling::TryOpError::TryAgain)
                     }
                     Err(e) => Err(litebox::event::polling::TryOpError::Other(
@@ -211,7 +209,6 @@ impl BrokerSocketPairFd<Platform> {
     pub(crate) fn shutdown(&self, read: bool, write: bool) -> Result<(), Errno> {
         if read {
             self.read_shutdown.store(true, Ordering::Release);
-            self.common.set_readable(false);
         }
         if write && !self.write_shutdown.swap(true, Ordering::AcqRel) {
             self.provider

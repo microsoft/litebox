@@ -93,4 +93,11 @@ pub trait BrokerSubscribable: Send + Sync {
     /// peer (e.g. cross-worker SCM_RIGHTS) — the peer's eventual
     /// release balances this dup.
     fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError>;
+
+    /// Asks the broker for the current `NOTIFY_EVENT_*` bitmask on
+    /// `handle`. Used by worker-side `poll`/`select`/`epoll_wait`
+    /// readiness checks to consult the broker's authoritative current
+    /// state rather than relying on a cached subscription mirror.
+    /// Synchronous; one round-trip.
+    fn query_events(&self, handle: u64) -> Result<u32, BrokerOpError>;
 }
