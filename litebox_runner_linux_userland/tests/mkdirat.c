@@ -3,6 +3,9 @@
 
 #include "helpers.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+
 #ifndef SYS_mkdirat
 #error SYS_mkdirat is not defined on this build host
 #endif
@@ -15,35 +18,30 @@ static void expect_mkdirat_success(int dirfd, const char *pathname, mode_t mode,
                                    const char *msg) {
     errno = 0;
     long ret = raw_mkdirat(dirfd, pathname, mode);
-    if (ret != 0) {
-        FAIL(msg);
-    }
+    TEST_ASSERT(ret == 0, msg);
 }
 
 static void expect_mkdirat_errno(int dirfd, const char *pathname, mode_t mode,
                                  int expected_errno, const char *msg) {
     errno = 0;
     long ret = raw_mkdirat(dirfd, pathname, mode);
-    if (ret != -1) {
-        fprintf(stderr, "FAIL: %s expected failure, got %ld\n", msg, ret);
-        exit(1);
-    }
-    if (errno != expected_errno) {
-        fail_errno(msg, expected_errno);
-    }
+    TEST_ASSERT(ret == -1, msg);
+    TEST_ASSERT(errno == expected_errno, msg);
 }
 
 static void expect_directory_mode(const char *path, mode_t mode, const char *msg) {
     struct stat st;
 
     errno = 0;
-    EXPECT(stat(path, &st) == 0, msg);
-    EXPECT(S_ISDIR(st.st_mode), "stat should observe a directory");
-    if ((st.st_mode & 0777) != mode) {
-        fprintf(stderr, "FAIL: %s expected mode %03o, got %03o\n", msg,
-                (unsigned)mode, (unsigned)(st.st_mode & 0777));
-        exit(1);
-    }
+    TEST_ASSERT(stat(path, &st) == 0, msg);
+    TEST_ASSERT(S_ISDIR(st.st_mode), "stat should observe a directory");
+    TEST_ASSERT((st.st_mode & 0777) == mode, msg);
+}
+
+static void create_regular_file(const char *path) {
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    TEST_ASSERT(fd >= 0, "create test file failed");
+    TEST_ASSERT(close(fd) == 0, "close test file failed");
 }
 
 static void test_at_fdcwd_relative_success(void) {
@@ -52,16 +50,16 @@ static void test_at_fdcwd_relative_success(void) {
     char old_cwd[4096];
 
     rmdir(path);
-    EXPECT(getcwd(old_cwd, sizeof(old_cwd)) != NULL, "getcwd failed");
-    EXPECT(chdir("/tmp") == 0, "chdir /tmp failed");
+    TEST_ASSERT(getcwd(old_cwd, sizeof(old_cwd)) != NULL, "getcwd failed");
+    TEST_ASSERT(chdir("/tmp") == 0, "chdir /tmp failed");
 
     expect_mkdirat_success(AT_FDCWD, name, 0777,
                            "mkdirat AT_FDCWD relative should succeed");
     expect_directory_mode(path, 0755,
                           "stat should observe mkdirat AT_FDCWD relative result");
 
-    EXPECT(chdir(old_cwd) == 0, "restore cwd failed");
-    EXPECT(rmdir(path) == 0, "cleanup relative directory failed");
+    TEST_ASSERT(chdir(old_cwd) == 0, "restore cwd failed");
+    TEST_ASSERT(rmdir(path) == 0, "cleanup relative directory failed");
 }
 
 static void test_absolute_path_ignores_dirfd(void) {
@@ -72,17 +70,17 @@ static void test_absolute_path_ignores_dirfd(void) {
                            "mkdirat absolute path should ignore invalid dirfd");
     expect_directory_mode(path, 0700,
                           "stat should observe mkdirat absolute path result");
-    EXPECT(rmdir(path) == 0, "cleanup absolute directory failed");
+    TEST_ASSERT(rmdir(path) == 0, "cleanup absolute directory failed");
 }
 
 static void test_existing_path_eexist(void) {
     const char *path = "/tmp/lb_mkdirat_existing";
 
     rmdir(path);
-    EXPECT(mkdir(path, 0700) == 0, "setup existing directory failed");
+    TEST_ASSERT(mkdir(path, 0700) == 0, "setup existing directory failed");
     expect_mkdirat_errno(AT_FDCWD, path, 0700, EEXIST,
                          "mkdirat existing path should fail with EEXIST");
-    EXPECT(rmdir(path) == 0, "cleanup existing directory failed");
+    TEST_ASSERT(rmdir(path) == 0, "cleanup existing directory failed");
 }
 
 static void test_missing_parent_enoent(void) {
@@ -100,10 +98,10 @@ static void test_component_not_directory_enotdir(void) {
     const char *path = "/tmp/lb_mkdirat_file/child";
 
     unlink(file);
-    create_test_file(file, 0600);
+    create_regular_file(file);
     expect_mkdirat_errno(AT_FDCWD, path, 0700, ENOTDIR,
                          "mkdirat through regular file should fail with ENOTDIR");
-    EXPECT(unlink(file) == 0, "cleanup regular file failed");
+    TEST_ASSERT(unlink(file) == 0, "cleanup regular file failed");
 }
 
 static void test_empty_path_enoent(void) {
