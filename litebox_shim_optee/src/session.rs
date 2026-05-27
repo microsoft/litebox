@@ -49,7 +49,7 @@
 //! requiring RPCs that would give untrusted code control over secure world execution.
 //!
 //! On panic teardown or last-session close, sibling sessions of a single-instance
-//! TA are flipped to [`SessionTarget::Dead`] *before* the cached instance is
+//! TA are flipped to `Dead` *before* the cached instance is
 //! evicted (see [`SessionManager::remove_single_instance_if_same`]). A racing
 //! handler that subsequently enters [`SessionManager::with_ta`] or
 //! [`SessionManager::with_session`] for the UUID will therefore observe `Dead`
@@ -130,15 +130,51 @@ pub const MAX_TA_INSTANCES: usize = 16;
 /// the last session closes (or with `TA_FLAG_INSTANCE_KEEP_ALIVE`, until explicit destroy).
 ///
 /// Each instance has its own task page table that provides memory isolation from other TAs.
+///
+/// Fields are private; external callers obtain instances through
+/// [`SessionManager::with_ta`] / [`SessionManager::with_session`] closures
+/// (which run under a `SessionToken` that serializes access) and reach the
+/// internals via the accessor methods on this type.
 pub struct TaInstance {
     /// The shim must be kept alive to keep the loaded program's memory mappings valid.
-    pub shim: OpteeShim,
+    shim: OpteeShim,
     /// The loaded TA program state including entrypoints.
     /// Boxed to keep it at a fixed heap address - the Task inside must not be moved
     /// after initialization because it contains internal state that may not survive moves.
-    pub loaded_program: alloc::boxed::Box<LoadedProgram>,
+    loaded_program: alloc::boxed::Box<LoadedProgram>,
     /// The task page table ID associated with this TA instance.
-    pub task_page_table_id: usize,
+    task_page_table_id: usize,
+}
+
+impl TaInstance {
+    /// Construct a new instance from its three constituent parts.
+    pub fn new(
+        shim: OpteeShim,
+        loaded_program: alloc::boxed::Box<LoadedProgram>,
+        task_page_table_id: usize,
+    ) -> Self {
+        Self {
+            shim,
+            loaded_program,
+            task_page_table_id,
+        }
+    }
+
+    /// Task page table ID associated with this instance.
+    pub fn task_page_table_id(&self) -> usize {
+        self.task_page_table_id
+    }
+
+    /// Reference to the underlying shim (needed for releasing user mappings
+    /// during teardown).
+    pub fn shim(&self) -> &OpteeShim {
+        &self.shim
+    }
+
+    /// Reference to the loaded program (entry points, parameter address, TA flags).
+    pub fn loaded_program(&self) -> &LoadedProgram {
+        &self.loaded_program
+    }
 }
 
 // SAFETY: `TaInstance`'s interior (`shim`, `loaded_program`) is not
@@ -150,17 +186,77 @@ unsafe impl Send for TaInstance {}
 unsafe impl Sync for TaInstance {}
 
 /// The target associated with a normal-world session ID.
+///
+/// This is the in-map representation, kept private to the module. External
+/// callers see [`TargetView`] inside a [`SessionView`] delivered by the
+/// session-token-bound closure APIs ([`SessionManager::with_ta`],
+/// [`SessionManager::with_session`]).
 #[derive(Clone)]
-pub enum SessionTarget {
+pub(crate) enum SessionTarget {
     /// The session still targets a live TA instance.
     Live(Arc<TaInstance>),
     /// The TA died, but normal world may still issue Invoke/Close for this ID.
     Dead,
 }
 
-/// Per-session entry in the session map.
+/// Borrowed view of a [`TaInstance`], valid only inside the
+/// [`SessionManager::with_ta`] / [`SessionManager::with_session`] closure
+/// that received it.
+///
+/// The lifetime ties the view to the `SessionToken` held internally by
+/// the closure; the closure cannot smuggle this borrow out (HRTB on the
+/// closure forces it to be valid for any lifetime the manager picks),
+/// cannot clone it into an owned `Arc<TaInstance>`, and cannot extract
+/// the wrapped `Arc`. All mutation paths that need instance identity
+/// (sibling marking, count, cache eviction, sibling-session registration)
+/// take an `InstanceRef<'_>`. `Copy` is fine — it just produces another
+/// borrow with the same lifetime, not an escape.
+#[derive(Clone, Copy)]
+pub struct InstanceRef<'a> {
+    arc: &'a Arc<TaInstance>,
+}
+
+impl<'a> InstanceRef<'a> {
+    fn new(arc: &'a Arc<TaInstance>) -> Self {
+        Self { arc }
+    }
+
+    /// Task page table ID associated with this instance.
+    pub fn task_page_table_id(&self) -> usize {
+        self.arc.task_page_table_id()
+    }
+
+    /// Reference to the underlying shim.
+    pub fn shim(&self) -> &OpteeShim {
+        self.arc.shim()
+    }
+
+    /// Reference to the loaded program (entry points, parameter address, TA flags).
+    pub fn loaded_program(&self) -> &LoadedProgram {
+        self.arc.loaded_program()
+    }
+}
+
+/// Closure-bound view of a session's target. Mirrors the internal
+/// `SessionTarget` enum but exposes [`InstanceRef`] instead of
+/// `Arc<TaInstance>`.
+pub enum TargetView<'a> {
+    Live(InstanceRef<'a>),
+    Dead,
+}
+
+/// Closure-bound view of a session entry. Delivered by
+/// [`SessionManager::with_session`].
+pub struct SessionView<'a> {
+    pub ta_uuid: TeeUuid,
+    pub ta_flags: TaFlags,
+    pub target: TargetView<'a>,
+}
+
+/// Per-session entry in the session map. Module-private; the closure-bound
+/// public view is [`SessionView`].
 #[derive(Clone)]
-pub struct SessionEntry {
+pub(crate) struct SessionEntry {
     /// The TA target (may be shared with other sessions for single-instance TAs).
     pub target: SessionTarget,
     /// The TA UUID (needed for cleanup of single-instance TAs).
@@ -172,33 +268,25 @@ pub struct SessionEntry {
 /// Session map for tracking active sessions.
 ///
 /// Maps runner-allocated session IDs to session entries.
-pub struct SessionMap {
+pub(crate) struct SessionMap {
     inner: SpinMutex<HashMap<u32, SessionEntry>>,
 }
 
 impl SessionMap {
     /// Create a new empty session map.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: SpinMutex::new(HashMap::new()),
         }
     }
 
-    /// Get a session's TA instance by session ID.
-    pub fn get(&self, session_id: u32) -> Option<Arc<TaInstance>> {
-        match self.inner.lock().get(&session_id).map(|e| &e.target) {
-            Some(SessionTarget::Live(instance)) => Some(instance.clone()),
-            Some(SessionTarget::Dead) | None => None,
-        }
-    }
-
     /// Get full session entry by session ID.
-    pub fn get_entry(&self, session_id: u32) -> Option<SessionEntry> {
+    pub(crate) fn get_entry(&self, session_id: u32) -> Option<SessionEntry> {
         self.inner.lock().get(&session_id).cloned()
     }
 
     /// Insert a session into the map.
-    pub fn insert(
+    pub(crate) fn insert(
         &self,
         session_id: u32,
         instance: Arc<TaInstance>,
@@ -216,22 +304,12 @@ impl SessionMap {
     }
 
     /// Remove a session from the map.
-    pub fn remove(&self, session_id: u32) -> Option<SessionEntry> {
+    pub(crate) fn remove(&self, session_id: u32) -> Option<SessionEntry> {
         self.inner.lock().remove(&session_id)
     }
 
-    /// Get the number of active sessions.
-    pub fn len(&self) -> usize {
-        self.inner.lock().len()
-    }
-
-    /// Check if the session map is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.lock().is_empty()
-    }
-
     /// Count sessions for a specific TA instance (by Arc pointer equality).
-    pub fn count_sessions_for_instance(&self, instance: &Arc<TaInstance>) -> usize {
+    pub(crate) fn count_sessions_for_instance(&self, instance: &Arc<TaInstance>) -> usize {
         self.inner
             .lock()
             .values()
@@ -243,7 +321,7 @@ impl SessionMap {
     }
 
     /// Mark all sessions pointing at `instance` as dead.
-    pub fn mark_sessions_dead_for_instance(&self, instance: &Arc<TaInstance>) {
+    pub(crate) fn mark_sessions_dead_for_instance(&self, instance: &Arc<TaInstance>) {
         for entry in self.inner.lock().values_mut() {
             if matches!(&entry.target, SessionTarget::Live(current) if Arc::ptr_eq(current, instance))
             {
@@ -263,25 +341,25 @@ impl Default for SessionMap {
 ///
 /// Single-instance TAs (with `TA_FLAG_SINGLE_INSTANCE`) share a single TA instance
 /// across all sessions. This cache stores instances by UUID for fast reuse lookup.
-pub struct SingleInstanceCache {
+pub(crate) struct SingleInstanceCache {
     inner: SpinMutex<HashMap<TeeUuid, Arc<TaInstance>>>,
 }
 
 impl SingleInstanceCache {
     /// Create a new empty cache.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: SpinMutex::new(HashMap::new()),
         }
     }
 
     /// Get a cached single-instance TA by UUID.
-    pub fn get(&self, uuid: &TeeUuid) -> Option<Arc<TaInstance>> {
+    pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<Arc<TaInstance>> {
         self.inner.lock().get(uuid).cloned()
     }
 
     /// Cache a single-instance TA by UUID.
-    pub fn insert(&self, uuid: TeeUuid, instance: Arc<TaInstance>) {
+    pub(crate) fn insert(&self, uuid: TeeUuid, instance: Arc<TaInstance>) {
         self.inner.lock().insert(uuid, instance);
     }
 
@@ -298,13 +376,8 @@ impl SingleInstanceCache {
     }
 
     /// Get the number of cached single-instance TAs.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.inner.lock().len()
-    }
-
-    /// Check if the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.lock().is_empty()
     }
 }
 
@@ -325,14 +398,15 @@ pub fn allocate_session_id() -> Option<u32> {
 /// Recycle a session ID for potential future reuse.
 ///
 /// Delegates to `SessionIdPool::recycle`.
-pub fn recycle_session_id(session_id: u32) {
+fn recycle_session_id(session_id: u32) {
     SessionIdPool::recycle(session_id);
 }
 
 /// RAII guard that recycles a session ID on drop unless disarmed.
 ///
 /// Session IDs are allocated before the TA is invoked and only registered on
-/// success via [`SessionManager::register_session`]. This guard ensures it is
+/// success via [`SessionManager::register_new_session`] or
+/// [`SessionManager::register_sibling_session`]. This guard ensures it is
 /// recycled on all error paths before this registration.
 pub struct SessionIdGuard {
     session_id: Option<u32>,
@@ -450,29 +524,19 @@ impl SessionManager {
         }
     }
 
-    /// Get the session map.
-    pub fn sessions(&self) -> &SessionMap {
-        &self.sessions
+    /// Mark every session currently pointing at `instance` as `Dead`.
+    ///
+    /// Must be called before evicting `instance` from the single-instance
+    /// cache (see [`SessionManager::remove_single_instance_if_same`]) so
+    /// a racing handler re-reads `Dead` on its sibling session entry.
+    pub fn mark_sessions_dead_for_instance(&self, instance: InstanceRef<'_>) {
+        self.sessions.mark_sessions_dead_for_instance(instance.arc);
     }
 
-    /// Get the single-instance cache.
-    pub fn single_instance_cache(&self) -> &SingleInstanceCache {
-        &self.single_instance_cache
-    }
-
-    /// Cache a single-instance TA.
-    pub fn cache_single_instance(&self, uuid: TeeUuid, instance: Arc<TaInstance>) {
-        self.single_instance_cache.insert(uuid, instance);
-    }
-
-    /// Get a session by ID.
-    pub fn get_session(&self, session_id: u32) -> Option<Arc<TaInstance>> {
-        self.sessions.get(session_id)
-    }
-
-    /// Get full session entry by ID.
-    pub fn get_session_entry(&self, session_id: u32) -> Option<SessionEntry> {
-        self.sessions.get_entry(session_id)
+    /// Count sessions currently pointing at `instance`. Used by the
+    /// last-close path to detect whether teardown is appropriate.
+    pub fn count_sessions_for_instance(&self, instance: InstanceRef<'_>) -> usize {
+        self.sessions.count_sessions_for_instance(instance.arc)
     }
 
     /// Look up previously observed TA flags for a UUID.
@@ -625,51 +689,88 @@ impl SessionManager {
     /// retries `EThreadLimit` transparently.
     pub fn with_session<F>(&self, session_id: u32, f: F) -> Result<(), OpteeSmcReturnCode>
     where
-        F: FnOnce(SessionEntry) -> Result<(), OpteeSmcReturnCode>,
+        F: for<'a> FnOnce(SessionView<'a>) -> Result<(), OpteeSmcReturnCode>,
     {
         let (_token, entry) = self.try_acquire_for_session(session_id)?;
-        f(entry)
+        let view = SessionView {
+            ta_uuid: entry.ta_uuid,
+            ta_flags: entry.ta_flags,
+            target: match &entry.target {
+                SessionTarget::Live(arc) => TargetView::Live(InstanceRef::new(arc)),
+                SessionTarget::Dead => TargetView::Dead,
+            },
+        };
+        f(view)
     }
 
-    /// Register a new session.
-    pub fn register_session(
+    /// Register a session for a freshly-loaded TA instance.
+    ///
+    /// Takes `TaInstance` by value, wraps it in an `Arc` owned solely by the
+    /// manager (no clone returned to the caller), and — for single-instance
+    /// TAs — caches that `Arc` under `ta_uuid`. The caller therefore cannot
+    /// retain an `Arc<TaInstance>` past this call, which is what makes the
+    /// `unsafe impl Send/Sync for TaInstance` invariant enforceable.
+    pub fn register_new_session(
         &self,
         session_id: u32,
-        instance: Arc<TaInstance>,
+        instance: TaInstance,
+        ta_uuid: TeeUuid,
+        ta_flags: TaFlags,
+    ) {
+        let arc = Arc::new(instance);
+        self.known_flags.lock().entry(ta_uuid).or_insert(ta_flags);
+        self.sessions
+            .insert(session_id, arc.clone(), ta_uuid, ta_flags);
+        if ta_flags.is_single_instance() {
+            self.single_instance_cache.insert(ta_uuid, arc);
+        }
+    }
+
+    /// Register a session that re-uses an existing single-instance TA.
+    ///
+    /// `instance` is the borrow handed to the [`SessionManager::with_ta`]
+    /// closure on the cache-hit branch.
+    pub fn register_sibling_session(
+        &self,
+        session_id: u32,
+        instance: InstanceRef<'_>,
         ta_uuid: TeeUuid,
         ta_flags: TaFlags,
     ) {
         self.known_flags.lock().entry(ta_uuid).or_insert(ta_flags);
         self.sessions
-            .insert(session_id, instance, ta_uuid, ta_flags);
+            .insert(session_id, instance.arc.clone(), ta_uuid, ta_flags);
     }
 
-    /// Unregister a session, recycle its session ID, and return the entry.
-    pub fn unregister_session(&self, session_id: u32) -> Option<SessionEntry> {
+    /// Unregister a session and recycle its session ID. Returns whether
+    /// the session was registered and what flags it had (the latter for
+    /// callers that need to dispatch on `is_single_instance` /
+    /// `is_keep_alive` after removal).
+    pub fn unregister_session(&self, session_id: u32) -> Option<TaFlags> {
         let entry = self.sessions.remove(session_id);
         if entry.is_some() {
             recycle_session_id(session_id);
         }
-        entry
+        entry.map(|e| e.ta_flags)
     }
 
     /// Remove a single-instance TA from the cache only if the currently
-    /// cached `Arc` is the same as `expected`.
+    /// cached `Arc` is the same as `instance`.
     ///
     /// Callers tearing down on TA panic must have already called
-    /// [`SessionMap::mark_sessions_dead_for_instance`] before invoking this,
-    /// so any handler that subsequently enters
-    /// [`SessionManager::with_ta`] or
-    /// [`SessionManager::with_session`] for the UUID will observe `Dead`
-    /// on its re-read of the session entry. Callers on the last-session-
-    /// close path may skip the mark step — by that point there are no
-    /// sibling sessions to fence out.
+    /// [`SessionManager::mark_sessions_dead_for_instance`] before invoking
+    /// this, so any handler that subsequently enters
+    /// [`SessionManager::with_ta`] or [`SessionManager::with_session`] for
+    /// the UUID will observe `Dead` on its re-read of the session entry.
+    /// Callers on the last-session-close path may skip the mark step — by
+    /// that point there are no sibling sessions to fence out.
     pub fn remove_single_instance_if_same(
         &self,
         uuid: &TeeUuid,
-        expected: &Arc<TaInstance>,
+        instance: InstanceRef<'_>,
     ) -> bool {
-        self.single_instance_cache.remove_if_same(uuid, expected)
+        self.single_instance_cache
+            .remove_if_same(uuid, instance.arc)
     }
 
     /// Get the total count of unique TA instances (for limit checking).
@@ -723,7 +824,7 @@ impl SessionManager {
     /// the cache and create rival instances.
     pub fn with_ta<F>(&self, uuid: &TeeUuid, f: F) -> Result<(), OpteeSmcReturnCode>
     where
-        F: FnOnce(Option<Arc<TaInstance>>) -> Result<(), OpteeSmcReturnCode>,
+        F: for<'a> FnOnce(Option<InstanceRef<'a>>) -> Result<(), OpteeSmcReturnCode>,
     {
         let token = self.try_acquire_for_open(*uuid)?;
         let is_single_instance = token.uuid_lock.is_some();
@@ -731,7 +832,7 @@ impl SessionManager {
         // For single-instance TAs the per-UUID lock above keeps our UUID's
         // cache entry stable. For multi-instance we don't consult the cache.
         if is_single_instance && let Some(existing) = self.single_instance_cache.get(uuid) {
-            return f(Some(existing));
+            return f(Some(InstanceRef::new(&existing)));
         }
 
         {
