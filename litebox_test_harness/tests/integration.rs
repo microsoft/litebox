@@ -2581,21 +2581,32 @@ mod copilot {
         );
         let pid = pty.fork_exec(&argv, /* ctrl_tty = */ true)?;
         // Wait for the first quiet window (the TUI has rendered its prompt).
-        let _initial = read_until_idle(&pty, Duration::from_secs(20), Duration::from_millis(1200))?;
-        // Send the prompt.
+        let initial = read_until_idle(&pty, Duration::from_secs(20), Duration::from_millis(1200))?;
+        // Send the prompt. The TUI runs in raw input mode, so Enter is
+        // \r (CR, what a real keyboard sends), not \n (LF). Writing \n
+        // here would be interpreted as a literal character, not as the
+        // "submit" key.
         pty.write_all(prompt.as_bytes())?;
-        pty.write_all(b"\n")?;
+        pty.write_all(b"\r")?;
         // Read the response (longer idle window for model latency).
         let response = read_until_idle(
             &pty,
             Duration::from_secs(timeout_secs),
             Duration::from_millis(2500),
         )?;
-        // Best-effort clean exit.
-        let _ = pty.write_all(b"/exit\n");
-        let _ = read_with_deadline(&pty, Duration::from_secs(5));
+        // Best-effort clean exit. Use CR for the same TUI-raw-input
+        // reason as the prompt above; \n wouldn't trigger /exit.
+        let _ = pty.write_all(b"/exit\r");
+        let post_exit = read_with_deadline(&pty, Duration::from_secs(5))?;
         let _ = wait_pid(pid, Duration::from_secs(5));
-        Ok(response)
+        // Return everything we observed (initial render + model response +
+        // post-exit drain) so the canary check sees the full conversation
+        // and the persisted transcript is useful for forensics. Previously
+        // only `response` was returned, hiding the TUI initial render and
+        // any model output that arrived during the post-exit window.
+        Ok(format!(
+            "{initial}\n--- [drive_tui prompt sent] ---\n{response}\n--- [drive_tui /exit sent] ---\n{post_exit}"
+        ))
     }
 
     /// POSIX shell single-quote escaping: wrap in '...' and replace
