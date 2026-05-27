@@ -356,6 +356,20 @@ pub fn build_audit_event(
         }
     }
 
+    fn record_clone_args(ev: &mut AuditEvent, args: &litebox_common_linux::CloneArgs) {
+        ev.int(args.flags.bits());
+        ev.int(args.pidfd);
+        ev.int(args.child_tid);
+        ev.int(args.parent_tid);
+        ev.int(args.exit_signal);
+        ev.int(args.stack);
+        ev.int(args.stack_size);
+        ev.int(args.tls);
+        ev.int(args.set_tid);
+        ev.int(args.set_tid_size);
+        ev.int(args.cgroup);
+    }
+
     // Canonical syscall name is determined exhaustively up-front so that even
     // variants we don't unpack arguments for still get the right name (instead
     // of falling through to a generic "other" bucket).
@@ -725,7 +739,19 @@ pub fn build_audit_event(
             ev.int(*status as u64);
             ev
         }
-        SyscallRequest::Clone { .. } | SyscallRequest::Clone3 { .. } => AuditEvent::new(name),
+        SyscallRequest::Clone { args } => {
+            let mut ev = AuditEvent::new(name);
+            record_clone_args(&mut ev, args);
+            ev
+        }
+        SyscallRequest::Clone3 { args } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(args.as_usize() as u64);
+            if let Some(args) = args.read_at_offset(0) {
+                record_clone_args(&mut ev, &args);
+            }
+            ev
+        }
         SyscallRequest::Kill { pid, sig } => {
             let mut ev = AuditEvent::new(name);
             ev.int(*pid as u64);

@@ -58,6 +58,8 @@ const WITH_SET_TID: HandlerToken<Clone3ExecArgs, Clone3Out> =
 const WITH_CGROUP: HandlerToken<Clone3ExecArgs, Clone3Out> =
     HandlerToken::new("clone3.with_cgroup");
 const VFORK: HandlerToken<(), Clone3Out> = HandlerToken::new("clone3.vfork");
+const DROPBEAR_VFORK: HandlerToken<(), Clone3Out> = HandlerToken::new("clone3.dropbear_vfork");
+const DROPBEAR_CLONE: HandlerToken<(), Clone3Out> = HandlerToken::new("clone.dropbear_vfork");
 
 // ─── Handlers ───────────────────────────────────────────────────────
 
@@ -111,6 +113,24 @@ async fn handle_vfork(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<Clone3Out,
         .map_err(|e| HandlerError(format!("clone3 vfork task join: {e}")))
 }
 
+async fn handle_dropbear_vfork(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Clone3Out, HandlerError> {
+    tokio::task::spawn_blocking(run_clone3_dropbear_vfork)
+        .await
+        .map_err(|e| HandlerError(format!("clone3 dropbear vfork task join: {e}")))
+}
+
+async fn handle_dropbear_clone(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Clone3Out, HandlerError> {
+    tokio::task::spawn_blocking(run_clone_dropbear_vfork)
+        .await
+        .map_err(|e| HandlerError(format!("clone dropbear vfork task join: {e}")))
+}
+
 // ─── Registration ──────────────────────────────────────────────────
 
 pub(crate) fn register_clone3_matrix(reg: &mut Registry<'_>) {
@@ -120,6 +140,8 @@ pub(crate) fn register_clone3_matrix(reg: &mut Registry<'_>) {
     register_handler!(WITH_SET_TID, handle_with_set_tid);
     register_handler!(WITH_CGROUP, handle_with_cgroup);
     register_handler!(VFORK, handle_vfork);
+    register_handler!(DROPBEAR_VFORK, handle_dropbear_vfork);
+    register_handler!(DROPBEAR_CLONE, handle_dropbear_clone);
 
     for &agent in CL3_AGENTS {
         reg.single_agent_handler_test(
@@ -159,6 +181,22 @@ pub(crate) fn register_clone3_matrix(reg: &mut Registry<'_>) {
             agent,
             &VFORK,
             check_vfork_success,
+        );
+        reg.single_agent_handler_test(
+            "vscode",
+            "clone3",
+            format!("CL3.dropbear_vfork.{agent}"),
+            agent,
+            &DROPBEAR_VFORK,
+            check_success_without_pidfd,
+        );
+        reg.single_agent_handler_test(
+            "vscode",
+            "clone3",
+            format!("CL3.dropbear_clone.{agent}"),
+            agent,
+            &DROPBEAR_CLONE,
+            check_dropbear_clone_success,
         );
     }
 }
@@ -205,6 +243,20 @@ fn check_success_without_pidfd(out: &Clone3Out) -> Result<String, String> {
 fn check_vfork_success(out: &Clone3Out) -> Result<String, String> {
     expect_vfork_success(out)?;
     Ok(format!("{out:?}"))
+}
+
+fn check_dropbear_clone_success(out: &Clone3Out) -> Result<String, String> {
+    match out {
+        Clone3Out {
+            pid,
+            pidfd: None,
+            ok: true,
+            error: None,
+        } if *pid > 0 => Ok(format!("{out:?}")),
+        other => Err(format!(
+            "expected dropbear-shaped clone/vfork child marker, got {other:?}"
+        )),
+    }
 }
 
 fn check_success_with_pidfd(out: &Clone3Out) -> Result<String, String> {
@@ -361,6 +413,7 @@ static CLONE3_THREAD_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic:
 static CLONE3_THREAD_TID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static CLONE3_THREAD_SIGNAL: u8 = 1;
 static CLONE3_VFORK_STAGE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static CLONE3_DROPBEAR_MARKER: u8 = 0x48;
 
 fn clone_result_error(error: impl Into<String>) -> Clone3Out {
     Clone3Out {
@@ -442,6 +495,189 @@ fn run_clone3_with_cgroup(cgroup_fd: u64, exec_target: Option<String>) -> Clone3
     // SAFETY: `fd` was just returned by `open` and is uniquely owned here.
     let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
     run_clone3_process(false, None, Some(owned.as_raw_fd()), exec_target)
+}
+
+fn run_clone_dropbear_vfork() -> Clone3Out {
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: `pipe_fds` points to two writable i32 slots for pipe2 to fill.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return clone_result_error(format!("pipe2:{}", last_errno_name()));
+    }
+    let flags = (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as usize;
+    // SAFETY: This issues the legacy clone syscall shape captured from
+    // dropbear: CLONE_VM | CLONE_VFORK, SIGCHLD, and no child stack/TID/TLS
+    // pointers. Inline syscalls avoid libc's deprecated `vfork` wrapper and
+    // avoid perturbing the shared vfork stack between clone and child exit.
+    #[cfg(target_arch = "x86_64")]
+    let rc: isize = unsafe {
+        let mut rax = libc::SYS_clone as usize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") rax,
+            in("rdi") flags,
+            in("rsi") 0usize,
+            in("rdx") 0usize,
+            in("r10") 0usize,
+            in("r8") 0usize,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        rax as isize
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let rc = unsafe { libc::vfork() } as isize;
+    if rc == 0 {
+        // SAFETY: In the vfork child, use only raw syscalls and immutable
+        // static data, then terminate with SYS_exit to release the parent.
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                core::arch::asm!(
+                    "mov rax, rsp",
+                    "mov r10, 16",
+                    "2:",
+                    "sub rax, 4096",
+                    "mov byte ptr [rax], 0x5a",
+                    "dec r10",
+                    "jnz 2b",
+                    out("rax") _,
+                    out("r10") _,
+                    options(nostack),
+                );
+                core::arch::asm!(
+                    "syscall",
+                    in("rax") libc::SYS_write as usize,
+                    in("rdi") pipe_fds[1] as usize,
+                    in("rsi") std::ptr::addr_of!(CLONE3_DROPBEAR_MARKER) as usize,
+                    in("rdx") 1usize,
+                    lateout("rcx") _,
+                    lateout("r11") _,
+                    options(nostack),
+                );
+                core::arch::asm!(
+                    "syscall",
+                    in("rax") libc::SYS_exit as usize,
+                    in("rdi") 0usize,
+                    options(noreturn),
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = libc::syscall(
+                    libc::SYS_write,
+                    pipe_fds[1],
+                    std::ptr::addr_of!(CLONE3_DROPBEAR_MARKER).cast::<libc::c_void>(),
+                    1usize,
+                );
+                libc::_exit(0i32);
+            }
+        }
+    }
+    close_fd(pipe_fds[1]);
+    if rc < 0 {
+        close_fd(pipe_fds[0]);
+        return clone_result_error(last_errno_name());
+    }
+    read_marker_and_wait(pipe_fds[0], rc as libc::pid_t, "dropbear_clone")
+}
+
+fn read_marker_and_wait(read_fd: i32, pid: libc::pid_t, label: &str) -> Clone3Out {
+    let mut byte = [0u8; 1];
+    // SAFETY: `byte` is a valid one-byte output buffer and `read_fd` is a
+    // live read end created by the caller.
+    let read_rc = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), byte.len()) };
+    close_fd(read_fd);
+    if read_rc != 1 || byte[0] != CLONE3_DROPBEAR_MARKER {
+        let _ = wait_for_child(pid);
+        return clone_result_error(format!(
+            "{label}_marker_failed:read={read_rc},byte={}",
+            byte[0]
+        ));
+    }
+    if let Err(error) = wait_for_child(pid) {
+        return Clone3Out {
+            pid: pid as u64,
+            pidfd: None,
+            ok: false,
+            error: Some(format!("wait:{error}")),
+        };
+    }
+    Clone3Out {
+        pid: pid as u64,
+        pidfd: None,
+        ok: true,
+        error: None,
+    }
+}
+
+fn run_clone3_dropbear_vfork() -> Clone3Out {
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: `pipe_fds` points to two writable i32 slots for pipe2 to fill.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return clone_result_error(format!("pipe2:{}", last_errno_name()));
+    }
+    let mut args = CloneArgs {
+        flags: (libc::CLONE_VM | libc::CLONE_VFORK) as u64,
+        exit_signal: libc::SIGCHLD as u64,
+        ..CloneArgs::default()
+    };
+    // SAFETY: `args` is a clone_args-compatible struct and lives for the
+    // syscall. The vfork child performs only raw syscalls, then exits via
+    // SYS_exit so the parent resumes before Rust code continues.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &raw mut args,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if rc == 0 {
+        // SAFETY: In the vfork child, use only raw syscalls and immutable
+        // static data, then terminate with SYS_exit to release the parent.
+        unsafe {
+            let _ = libc::syscall(
+                libc::SYS_write,
+                pipe_fds[1],
+                std::ptr::addr_of!(CLONE3_DROPBEAR_MARKER).cast::<libc::c_void>(),
+                1usize,
+            );
+            libc::syscall(libc::SYS_exit, 0i32);
+        }
+        unreachable!();
+    }
+    close_fd(pipe_fds[1]);
+    if rc < 0 {
+        close_fd(pipe_fds[0]);
+        return clone_result_error(last_errno_name());
+    }
+    let pid = rc as libc::pid_t;
+    let mut byte = [0u8; 1];
+    // SAFETY: `byte` is a valid one-byte output buffer and `pipe_fds[0]` is a
+    // live read end created above.
+    let read_rc = unsafe { libc::read(pipe_fds[0], byte.as_mut_ptr().cast(), byte.len()) };
+    close_fd(pipe_fds[0]);
+    if read_rc != 1 || byte[0] != CLONE3_DROPBEAR_MARKER {
+        let _ = wait_for_child(pid);
+        return clone_result_error(format!(
+            "dropbear_vfork_marker_failed:read={read_rc},byte={}",
+            byte[0]
+        ));
+    }
+    if let Err(error) = wait_for_child(pid) {
+        return Clone3Out {
+            pid: pid as u64,
+            pidfd: None,
+            ok: false,
+            error: Some(format!("wait:{error}")),
+        };
+    }
+    Clone3Out {
+        pid: pid as u64,
+        pidfd: None,
+        ok: true,
+        error: None,
+    }
 }
 
 fn run_clone3_vfork() -> Clone3Out {
