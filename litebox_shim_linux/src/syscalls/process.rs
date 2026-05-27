@@ -9741,9 +9741,12 @@ impl<FS: ShimFS> Task<FS> {
             self.exit_thread(exit_code.truncate());
         }
 
-        // The syscall handler loop will stop the local shim task before it can
-        // resume guest code.
-        unreachable!("remote exec worker returned to the local shim task")
+        // The remote worker completed; stop the local placeholder before it can
+        // resume guest code. `exit_thread` can return for non-vfork exec
+        // placeholders; panicking here tears down the parent worker that is still
+        // waiting for the child result.
+        self.local_task_terminated.set(true);
+        Ok(0)
     }
 
     fn worker_exec_stdio_bindings(&self) -> Result<WorkerExecStdioBindings<FS, Platform>, Errno> {
