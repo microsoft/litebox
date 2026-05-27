@@ -3,7 +3,7 @@
 
 use alloc::{sync::Arc, vec::Vec};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
-use litebox::utils::TruncateExt;
+use litebox::utils::TruncateExt as _;
 use litebox::{
     fs::{Mode, OFlags},
     mm::linux::{
@@ -23,14 +23,6 @@ use crate::ShimFS;
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32/ntdll.dll"];
-const NTDLL_EXPORT_NAMES: &[&str] = &[
-    "LdrInitializeThunk",
-    "RtlUserThreadStart",
-    "KiUserInvertedFunctionTable",
-];
-const NTDLL_LDR_INITIALIZE_THUNK_EXPORT: usize = 0;
-const NTDLL_RTL_USER_THREAD_START_EXPORT: usize = 1;
-const NTDLL_KI_USER_INVERTED_FUNCTION_TABLE_EXPORT: usize = 2;
 const RUNTIME_FUNCTION_ENTRY_SIZE: usize = 12;
 const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
@@ -236,26 +228,27 @@ fn load_image_with_writable_sections<FS: ShimFS>(
 }
 
 fn ntdll_exports(image: &LoadedImage) -> Result<NtDllExports, WindowsLoadError> {
+    let export_names = [
+        "LdrInitializeThunk",
+        "RtlUserThreadStart",
+        "KiUserInvertedFunctionTable",
+    ];
     let mut memory = PeImageMemory;
     let addresses = image
         .parsed
-        .find_export_addresses(image.mapping.base_addr, &mut memory, NTDLL_EXPORT_NAMES)
+        .find_export_addresses(image.mapping.base_addr, &mut memory, &export_names)
         .map_err(WindowsLoadError::Export)?;
+    let [
+        ldr_initialize_thunk,
+        rtl_user_thread_start,
+        ki_user_inverted_function_table,
+    ]: [Option<usize>; 3] = addresses
+        .try_into()
+        .map_err(|_| WindowsLoadError::MissingNtDllInvertedFunctionTable)?;
 
-    addresses
-        .get(NTDLL_LDR_INITIALIZE_THUNK_EXPORT)
-        .copied()
-        .flatten()
-        .ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
-    addresses
-        .get(NTDLL_RTL_USER_THREAD_START_EXPORT)
-        .copied()
-        .flatten()
-        .ok_or(WindowsLoadError::MissingNtDllThreadEntrypoint)?;
-    let ki_user_inverted_function_table = addresses
-        .get(NTDLL_KI_USER_INVERTED_FUNCTION_TABLE_EXPORT)
-        .copied()
-        .flatten()
+    ldr_initialize_thunk.ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
+    rtl_user_thread_start.ok_or(WindowsLoadError::MissingNtDllThreadEntrypoint)?;
+    let ki_user_inverted_function_table = ki_user_inverted_function_table
         .ok_or(WindowsLoadError::MissingNtDllInvertedFunctionTable)?;
 
     Ok(NtDllExports {
@@ -681,8 +674,7 @@ mod tests {
     fn module_inverted_function_table_entry(
         module: *mut core::ffi::c_void,
     ) -> KiUserInvertedFunctionTableEntry {
-        let loaded_module = loaded_module_image(module);
-        loaded_module
+        loaded_module_image(module)
             .inverted_function_table_entry()
             .expect("failed to build inverted function table entry")
             .expect("loaded PE image has no exception directory")
@@ -734,10 +726,10 @@ mod tests {
         current_size: u32,
     ) -> Vec<KiUserInvertedFunctionTableEntry> {
         let entries = table.wrapping_add(core::mem::size_of::<KiUserInvertedFunctionTableHeader>());
+        let entry_size = core::mem::size_of::<KiUserInvertedFunctionTableEntry>();
         (0..current_size as usize)
             .map(|index| {
-                let entry_address = entries
-                    .wrapping_add(index * core::mem::size_of::<KiUserInvertedFunctionTableEntry>());
+                let entry_address = entries.wrapping_add(index * entry_size);
                 // SAFETY: The header just read from ntdll says `current_size` entries are
                 // initialized immediately after the header in this same exported table.
                 unsafe { read_table_value::<KiUserInvertedFunctionTableEntry>(entry_address) }

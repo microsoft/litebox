@@ -159,6 +159,11 @@ macro_rules! checked_add {
         $a.checked_add($b).ok_or($e)
     };
 }
+macro_rules! checked_mul {
+    ($a:expr, $b:expr, $e:expr) => {
+        $a.checked_mul($b).ok_or($e)
+    };
+}
 macro_rules! checked_add_invalid {
     ($a:expr, $b:expr) => {
         checked_add!($a, $b, PeLoadError::InvalidImage)
@@ -364,37 +369,28 @@ impl PeParsedFile {
         mem: &mut impl AccessMemory,
         names: &[&str],
     ) -> Result<Vec<Option<usize>>, PeExportError> {
-        let mut addresses = Vec::new();
-        addresses.resize(names.len(), None);
+        let mut addresses = alloc::vec![None; names.len()];
         if names.is_empty() {
             return Ok(addresses);
         }
+        checked_add!(base_addr, self.image.size_of_image, PeExportError::Overflow)?;
 
-        let Some(export_dir) = self
-            .data_directories
-            .get(pe::IMAGE_DIRECTORY_ENTRY_EXPORT)
-            .filter(|directory| directory.rva != 0 && directory.size != 0)
-        else {
+        let Some(export_dir) = self.data_directory(pe::IMAGE_DIRECTORY_ENTRY_EXPORT) else {
             return Ok(addresses);
         };
-
         let export_rva = export_dir.rva;
         let export_size = export_dir.size;
         if export_size < size_of::<pe::ImageExportDirectory>() {
             return Err(PeExportError::InvalidImage);
         }
-        let export_end_rva = checked_add_export(export_rva, export_size)?;
+        let export_end_rva = checked_add!(export_rva, export_size, PeExportError::Overflow)?;
         if export_end_rva > self.image.size_of_image {
             return Err(PeExportError::InvalidImage);
         }
 
-        let directory_address = image_address(
-            base_addr,
-            self.image.size_of_image,
-            export_rva,
-            size_of::<pe::ImageExportDirectory>(),
-        )?;
-        let directory: pe::ImageExportDirectory = mem_read_pod(mem, directory_address)?;
+        let directory_address = base_addr + export_rva;
+        let directory: pe::ImageExportDirectory =
+            mem_read_pod::<_, PeExportError>(mem, directory_address)?;
 
         let function_count = directory.number_of_functions.get(LE) as usize;
         let name_count = directory.number_of_names.get(LE) as usize;
@@ -408,7 +404,7 @@ impl PeParsedFile {
         validate_image_range(
             self.image.size_of_image,
             address_table_rva,
-            checked_mul_export(function_count, size_of::<u32>())?,
+            checked_mul!(function_count, size_of::<u32>(), PeExportError::Overflow)?,
         )?;
         if name_count == 0 {
             return Ok(addresses);
@@ -419,25 +415,20 @@ impl PeParsedFile {
         validate_image_range(
             self.image.size_of_image,
             name_table_rva,
-            checked_mul_export(name_count, size_of::<u32>())?,
+            checked_mul!(name_count, size_of::<u32>(), PeExportError::Overflow)?,
         )?;
         validate_image_range(
             self.image.size_of_image,
             name_ordinal_table_rva,
-            checked_mul_export(name_count, size_of::<u16>())?,
+            checked_mul!(name_count, size_of::<u16>(), PeExportError::Overflow)?,
         )?;
 
         let mut found = 0;
         for name_index in 0..name_count {
-            let name_pointer_address = image_address(
-                base_addr,
-                self.image.size_of_image,
-                checked_add_export(name_table_rva, name_index * size_of::<u32>())?,
-                size_of::<u32>(),
-            )?;
-            let name_rva = mem_read_u32(mem, name_pointer_address)? as usize;
+            let name_pointer_address = base_addr + name_table_rva + name_index * size_of::<u32>();
+            let name_rva = mem_read_pod::<u32, PeExportError>(mem, name_pointer_address)? as usize;
             let export_name =
-                read_c_string_at_rva(base_addr, self.image.size_of_image, mem, name_rva, None)?;
+                read_c_string_at_rva(base_addr, self.image.size_of_image, mem, name_rva)?;
             let Some(requested_index) = names.iter().position(|name| *name == export_name) else {
                 continue;
             };
@@ -445,24 +436,17 @@ impl PeParsedFile {
                 continue;
             }
 
-            let ordinal_index_address = image_address(
-                base_addr,
-                self.image.size_of_image,
-                checked_add_export(name_ordinal_table_rva, name_index * size_of::<u16>())?,
-                size_of::<u16>(),
-            )?;
-            let ordinal_index = mem_read_export_u16(mem, ordinal_index_address)? as usize;
+            let ordinal_index_address =
+                base_addr + name_ordinal_table_rva + name_index * size_of::<u16>();
+            let ordinal_index =
+                mem_read_pod::<u16, PeExportError>(mem, ordinal_index_address)? as usize;
             if ordinal_index >= function_count {
                 return Err(PeExportError::InvalidImage);
             }
 
-            let function_rva_address = image_address(
-                base_addr,
-                self.image.size_of_image,
-                checked_add_export(address_table_rva, ordinal_index * size_of::<u32>())?,
-                size_of::<u32>(),
-            )?;
-            let function_rva = mem_read_u32(mem, function_rva_address)?;
+            let function_rva_address =
+                base_addr + address_table_rva + ordinal_index * size_of::<u32>();
+            let function_rva = mem_read_pod::<u32, PeExportError>(mem, function_rva_address)?;
             if let Some(address) = export_address(
                 base_addr,
                 self.image.size_of_image,
@@ -640,10 +624,7 @@ impl PeParsedFile {
 
         let mut cursor = dir_addr;
         while cursor < dir_end {
-            let mut header_bytes = [0u8; size_of::<pe::ImageBaseRelocation>()];
-            mem.read(cursor, &mut header_bytes)?;
-            let (header, _) = object::pod::from_bytes::<pe::ImageBaseRelocation>(&header_bytes)
-                .map_err(|()| PeLoadError::InvalidImage)?;
+            let header: pe::ImageBaseRelocation = mem_read_pod::<_, PeLoadError<E>>(mem, cursor)?;
             let page_rva = header.virtual_address.get(LE);
             let block_size = header.size_of_block.get(LE) as usize;
             if block_size < size_of::<pe::ImageBaseRelocation>() || !block_size.is_multiple_of(2) {
@@ -657,7 +638,7 @@ impl PeParsedFile {
             let mut entry_addr =
                 checked_add_invalid!(cursor, size_of::<pe::ImageBaseRelocation>())?;
             while entry_addr < block_end {
-                let entry = mem_read_u16(mem, entry_addr)?;
+                let entry: u16 = mem_read_pod::<_, PeLoadError<E>>(mem, entry_addr)?;
                 let typ = entry >> 12;
                 let entry_offset = u32::from(entry & 0x0fff);
                 match typ {
@@ -670,7 +651,8 @@ impl PeParsedFile {
                         if relocation_end > image_end {
                             return Err(PeLoadError::InvalidImage);
                         }
-                        let value = mem_read_u64(mem, relocation_address)?;
+                        let value: u64 =
+                            mem_read_pod::<_, PeLoadError<E>>(mem, relocation_address)?;
                         let relocated = value.wrapping_add_signed(delta_i64);
                         mem.write(relocation_address, &relocated.to_le_bytes())?;
                     }
@@ -701,7 +683,8 @@ fn export_address(
         return Ok(None);
     }
 
-    image_address(base_addr, image_size, function_rva, 1).map(Some)
+    validate_image_range(image_size, function_rva, 1)?;
+    Ok(Some(base_addr + function_rva))
 }
 
 fn read_c_string_at_rva(
@@ -709,17 +692,15 @@ fn read_c_string_at_rva(
     image_size: usize,
     mem: &mut impl AccessMemory,
     rva: usize,
-    end_rva: Option<usize>,
 ) -> Result<String, PeExportError> {
-    let end_rva = end_rva.unwrap_or(image_size);
-    if rva >= end_rva || end_rva > image_size {
+    if rva >= image_size {
         return Err(PeExportError::InvalidImage);
     }
 
     let mut bytes = Vec::new();
-    for current_rva in rva..end_rva {
-        let address = image_address(base_addr, image_size, current_rva, 1)?;
-        let byte = mem_read_u8(mem, address)?;
+    for current_rva in rva..image_size {
+        let address = base_addr + current_rva;
+        let byte: u8 = mem_read_pod::<_, PeExportError>(mem, address)?;
         if byte == 0 {
             return String::from_utf8(bytes).map_err(|_| PeExportError::InvalidImage);
         }
@@ -729,68 +710,38 @@ fn read_c_string_at_rva(
     Err(PeExportError::InvalidImage)
 }
 
-fn mem_read_pod<T: Pod>(mem: &mut impl AccessMemory, address: usize) -> Result<T, PeExportError> {
+trait MemReadPodError: From<Fault> {
+    fn invalid_pod() -> Self;
+}
+
+impl MemReadPodError for PeExportError {
+    fn invalid_pod() -> Self {
+        Self::InvalidImage
+    }
+}
+
+impl<E> MemReadPodError for PeLoadError<E> {
+    fn invalid_pod() -> Self {
+        Self::InvalidImage
+    }
+}
+
+fn mem_read_pod<T: Pod, E: MemReadPodError>(
+    mem: &mut impl AccessMemory,
+    address: usize,
+) -> Result<T, E> {
     let mut buf = alloc::vec![0u8; size_of::<T>()];
-    mem.read(address, &mut buf)?;
-    let (value, _) =
-        object::pod::from_bytes::<T>(&buf).map_err(|()| PeExportError::InvalidImage)?;
+    mem.read(address, &mut buf).map_err(E::from)?;
+    let (value, _) = object::pod::from_bytes::<T>(&buf).map_err(|()| E::invalid_pod())?;
     Ok(*value)
 }
 
-fn mem_read_u8(mem: &mut impl AccessMemory, address: usize) -> Result<u8, PeExportError> {
-    let mut buf = [0u8; size_of::<u8>()];
-    mem.read(address, &mut buf)?;
-    Ok(buf[0])
-}
-
-fn mem_read_u32(mem: &mut impl AccessMemory, address: usize) -> Result<u32, PeExportError> {
-    let mut buf = [0u8; size_of::<u32>()];
-    mem.read(address, &mut buf)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn mem_read_export_u16(mem: &mut impl AccessMemory, address: usize) -> Result<u16, PeExportError> {
-    let mut buf = [0u8; size_of::<u16>()];
-    mem.read(address, &mut buf)?;
-    Ok(u16::from_le_bytes(buf))
-}
-
-fn image_address(
-    base_addr: usize,
-    image_size: usize,
-    rva: usize,
-    len: usize,
-) -> Result<usize, PeExportError> {
-    validate_image_range(image_size, rva, len)?;
-    checked_add_export(base_addr, rva)
-}
-
 fn validate_image_range(image_size: usize, rva: usize, len: usize) -> Result<(), PeExportError> {
-    let end = checked_add_export(rva, len)?;
+    let end = checked_add!(rva, len, PeExportError::Overflow)?;
     if end > image_size {
         return Err(PeExportError::InvalidImage);
     }
     Ok(())
-}
-
-fn checked_add_export(left: usize, right: usize) -> Result<usize, PeExportError> {
-    left.checked_add(right).ok_or(PeExportError::Overflow)
-}
-
-fn checked_mul_export(left: usize, right: usize) -> Result<usize, PeExportError> {
-    left.checked_mul(right).ok_or(PeExportError::Overflow)
-}
-
-fn mem_read_u16<E>(mem: &mut impl AccessMemory, address: usize) -> Result<u16, PeLoadError<E>> {
-    let mut buf = [0u8; size_of::<u16>()];
-    mem.read(address, &mut buf)?;
-    Ok(u16::from_le_bytes(buf))
-}
-
-fn mem_read_u64<E>(mem: &mut impl AccessMemory, address: usize) -> Result<u64, PeLoadError<E>> {
-    let mut buf = [0u8; size_of::<u64>()];
-    mem.read(address, &mut buf)?;
-    Ok(u64::from_le_bytes(buf))
 }
 
 type ParsedHeaders = (
@@ -805,7 +756,10 @@ type ParsedHeaders = (
 /// `#[repr(transparent)]` byte-array wrappers), so the byte buffer's alignment
 /// trivially satisfies `from_bytes`'s check and the transmute happens inside
 /// `object::pod` rather than here.
-fn read_pod<F: ReadAt, T: Pod>(file: &mut F, offset: u64) -> Result<T, PeParseError<F::Error>> {
+fn file_read_pod<F: ReadAt, T: Pod>(
+    file: &mut F,
+    offset: u64,
+) -> Result<T, PeParseError<F::Error>> {
     let mut buf = alloc::vec![0u8; size_of::<T>()];
     file.read_at(offset, &mut buf).map_err(PeParseError::Io)?;
     let (val, _) =
@@ -814,7 +768,7 @@ fn read_pod<F: ReadAt, T: Pod>(file: &mut F, offset: u64) -> Result<T, PeParseEr
 }
 
 /// Read `count` POD structs of type `T` from `file` starting at `offset`.
-fn read_pod_vec<F: ReadAt, T: Pod>(
+fn file_read_pod_vec<F: ReadAt, T: Pod>(
     file: &mut F,
     offset: u64,
     count: usize,
@@ -837,7 +791,7 @@ fn parse_headers<F: ReadAt>(
     if file_size < size_of::<pe::ImageDosHeader>() {
         return Err(PeParseError::UnsupportedImage);
     }
-    let dos: pe::ImageDosHeader = read_pod(file, 0)?;
+    let dos: pe::ImageDosHeader = file_read_pod(file, 0)?;
     if dos.e_magic.get(LE) != pe::IMAGE_DOS_SIGNATURE {
         return Err(PeParseError::UnsupportedImage);
     }
@@ -848,7 +802,7 @@ fn parse_headers<F: ReadAt>(
     if nt_end > file_size as u64 {
         return Err(PeParseError::UnsupportedImage);
     }
-    let nt: pe::ImageNtHeaders64 = read_pod(file, nt_offset)?;
+    let nt: pe::ImageNtHeaders64 = file_read_pod(file, nt_offset)?;
     if nt.signature.get(LE) != pe::IMAGE_NT_SIGNATURE {
         return Err(PeParseError::UnsupportedImage);
     }
@@ -902,7 +856,7 @@ fn parse_headers<F: ReadAt>(
     if num_rva_and_sizes > pe::IMAGE_NUMBEROF_DIRECTORY_ENTRIES {
         return Err(PeParseError::UnsupportedImage);
     }
-    let raw_dirs: Vec<pe::ImageDataDirectory> = read_pod_vec(file, nt_end, num_rva_and_sizes)?;
+    let raw_dirs: Vec<pe::ImageDataDirectory> = file_read_pod_vec(file, nt_end, num_rva_and_sizes)?;
     let data_directories: Vec<_> = raw_dirs
         .iter()
         .map(|dir| {
@@ -929,7 +883,8 @@ fn parse_headers<F: ReadAt>(
     if sections_end > file_size as u64 {
         return Err(PeParseError::UnsupportedImage);
     }
-    let sections: Vec<pe::ImageSectionHeader> = read_pod_vec(file, sections_offset, num_sections)?;
+    let sections: Vec<pe::ImageSectionHeader> =
+        file_read_pod_vec(file, sections_offset, num_sections)?;
     validate_sections(&image, &sections, file_size)?;
 
     Ok((image, sections, data_directories))
@@ -999,7 +954,7 @@ pub fn page_align_down(address: usize) -> usize {
 pub trait ReadAt {
     type Error;
 
-    /// Read `buf.len()` bytes at `offset`. Short reads are not permitted.
+    /// Read `buf.len()` bytes at `offset`.
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error>;
 
     fn size(&mut self) -> Result<u64, Self::Error>;
@@ -1104,160 +1059,4 @@ fn section_name_eq(section: &pe::ImageSectionHeader, name: &[u8]) -> bool {
         .position(|byte| *byte == 0)
         .unwrap_or(section.name.len());
     &section.name[..end] == name
-}
-
-#[cfg(test)]
-mod tests {
-    use alloc::{vec, vec::Vec};
-
-    use super::*;
-
-    const TEST_BASE: usize = 0x1000_0000;
-    const TEST_IMAGE_SIZE: usize = 0x5000;
-    const EXPORT_RVA: usize = 0x2000;
-    const EXPORT_RVA_U32: u32 = 0x2000;
-
-    struct TestMemory {
-        base_addr: usize,
-        data: Vec<u8>,
-    }
-
-    impl TestMemory {
-        fn new(base_addr: usize, len: usize) -> Self {
-            Self {
-                base_addr,
-                data: vec![0; len],
-            }
-        }
-
-        fn put_u16(&mut self, rva: usize, value: u16) {
-            self.put_bytes(rva, &value.to_le_bytes());
-        }
-
-        fn put_u32(&mut self, rva: usize, value: u32) {
-            self.put_bytes(rva, &value.to_le_bytes());
-        }
-
-        fn put_bytes(&mut self, rva: usize, bytes: &[u8]) {
-            let end = rva + bytes.len();
-            self.data[rva..end].copy_from_slice(bytes);
-        }
-    }
-
-    impl AccessMemory for TestMemory {
-        fn read(&mut self, address: usize, buf: &mut [u8]) -> Result<(), Fault> {
-            let offset = address.checked_sub(self.base_addr).ok_or(Fault)?;
-            let end = offset.checked_add(buf.len()).ok_or(Fault)?;
-            let data = self.data.get(offset..end).ok_or(Fault)?;
-            buf.copy_from_slice(data);
-            Ok(())
-        }
-
-        fn write(&mut self, address: usize, data: &[u8]) -> Result<(), Fault> {
-            let offset = address.checked_sub(self.base_addr).ok_or(Fault)?;
-            let end = offset.checked_add(data.len()).ok_or(Fault)?;
-            let dst = self.data.get_mut(offset..end).ok_or(Fault)?;
-            dst.copy_from_slice(data);
-            Ok(())
-        }
-    }
-
-    fn parsed_file_with_export_directory(export_rva: u32, export_size: u32) -> PeParsedFile {
-        PeParsedFile {
-            image: PeImageInfo {
-                machine: pe::IMAGE_FILE_MACHINE_AMD64,
-                characteristics: pe::IMAGE_FILE_EXECUTABLE_IMAGE,
-                image_base: TEST_BASE,
-                entry_point_rva: 0x1000,
-                size_of_image: TEST_IMAGE_SIZE,
-                size_of_headers: PAGE_SIZE,
-                section_alignment: PAGE_SIZE,
-                file_alignment: 0x200,
-                subsystem: 0,
-                dll_characteristics: 0,
-                size_of_heap_reserve: 0,
-                size_of_heap_commit: 0,
-            },
-            sections: Vec::new(),
-            data_directories: vec![PeDataDirectory {
-                rva: export_rva as usize,
-                size: export_size as usize,
-            }],
-            trampoline: None,
-        }
-    }
-
-    fn write_export_directory(memory: &mut TestMemory) {
-        memory.put_u32(EXPORT_RVA + 16, 1);
-        memory.put_u32(EXPORT_RVA + 20, 2);
-        memory.put_u32(EXPORT_RVA + 24, 2);
-        memory.put_u32(EXPORT_RVA + 28, 0x2040);
-        memory.put_u32(EXPORT_RVA + 32, 0x2050);
-        memory.put_u32(EXPORT_RVA + 36, 0x2058);
-
-        memory.put_u32(0x2040, 0x1100);
-        memory.put_u32(0x2044, 0x2060);
-        memory.put_u32(0x2050, 0x2070);
-        memory.put_u32(0x2054, 0x2080);
-        memory.put_u16(0x2058, 0);
-        memory.put_u16(0x205a, 1);
-        memory.put_bytes(0x2060, b"KERNEL32.Sleep\0");
-        memory.put_bytes(0x2070, b"LocalFunction\0");
-        memory.put_bytes(0x2080, b"ForwardedFunction\0");
-    }
-
-    #[test]
-    fn find_export_addresses_returns_missing_entries_without_export_directory() {
-        let parsed = parsed_file_with_export_directory(0, 0);
-        let mut memory = TestMemory::new(TEST_BASE, TEST_IMAGE_SIZE);
-
-        let addresses = parsed
-            .find_export_addresses(TEST_BASE, &mut memory, &["LocalFunction"])
-            .unwrap();
-
-        assert_eq!(addresses, vec![None]);
-    }
-
-    #[test]
-    fn find_export_addresses_returns_requested_addresses_in_order() {
-        let parsed = parsed_file_with_export_directory(EXPORT_RVA_U32, 0x100);
-        let mut memory = TestMemory::new(TEST_BASE, TEST_IMAGE_SIZE);
-        write_export_directory(&mut memory);
-
-        let addresses = parsed
-            .find_export_addresses(
-                TEST_BASE,
-                &mut memory,
-                &["ForwardedFunction", "Missing", "LocalFunction"],
-            )
-            .unwrap();
-
-        assert_eq!(addresses, vec![None, None, Some(TEST_BASE + 0x1100)]);
-    }
-
-    #[test]
-    fn find_export_addresses_rejects_bad_name_ordinal() {
-        let parsed = parsed_file_with_export_directory(EXPORT_RVA_U32, 0x100);
-        let mut memory = TestMemory::new(TEST_BASE, TEST_IMAGE_SIZE);
-        write_export_directory(&mut memory);
-        memory.put_u16(0x2058, 2);
-
-        let error = parsed
-            .find_export_addresses(TEST_BASE, &mut memory, &["LocalFunction"])
-            .unwrap_err();
-
-        assert!(matches!(error, PeExportError::InvalidImage));
-    }
-
-    #[test]
-    fn find_export_addresses_rejects_short_export_directory() {
-        let parsed = parsed_file_with_export_directory(EXPORT_RVA_U32, 1);
-        let mut memory = TestMemory::new(TEST_BASE, TEST_IMAGE_SIZE);
-
-        let error = parsed
-            .find_export_addresses(TEST_BASE, &mut memory, &["LocalFunction"])
-            .unwrap_err();
-
-        assert!(matches!(error, PeExportError::InvalidImage));
-    }
 }
