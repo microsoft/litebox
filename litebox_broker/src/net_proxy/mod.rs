@@ -3378,6 +3378,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                None,
             )
             .expect("proxy thread should run")
         });

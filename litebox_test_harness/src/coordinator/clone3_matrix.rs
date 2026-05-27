@@ -59,6 +59,7 @@ enum DropbearSessionStage {
     Tiocsctty,
     Full,
     FullBash,
+    FullBashPostSleep,
     FullSetidNetwork,
 }
 
@@ -71,6 +72,7 @@ impl DropbearSessionStage {
             DropbearSessionStage::Tiocsctty => "tiocsctty",
             DropbearSessionStage::Full => "full",
             DropbearSessionStage::FullBash => "full_bash",
+            DropbearSessionStage::FullBashPostSleep => "full_bash_post_sleep",
             DropbearSessionStage::FullSetidNetwork => "full_setid_network",
         }
     }
@@ -82,7 +84,8 @@ impl DropbearSessionStage {
             | DropbearSessionStage::Tiocsctty => false,
             DropbearSessionStage::DupStdio
             | DropbearSessionStage::Full
-            | DropbearSessionStage::FullBash => true,
+            | DropbearSessionStage::FullBash
+            | DropbearSessionStage::FullBashPostSleep => true,
             DropbearSessionStage::FullSetidNetwork => false,
         }
     }
@@ -267,6 +270,7 @@ fn register_dropbear_session_setup_cases(reg: &mut Registry<'_>, agent: AgentNam
         DropbearSessionStage::Tiocsctty,
         DropbearSessionStage::Full,
         DropbearSessionStage::FullBash,
+        DropbearSessionStage::FullBashPostSleep,
         DropbearSessionStage::FullSetidNetwork,
     ] {
         let label = agent.to_string();
@@ -740,11 +744,18 @@ fn run_clone_dropbear_session_setup(stage: DropbearSessionStage) -> Clone3Out {
     let arg1 = c"HELLO_CL3";
     let bash_arg1 = c"-c";
     let bash_arg2 = c"echo HELLO_CL3";
+    let bash_post_sleep_arg2 = c"echo PRE; /bin/sleep 0.1; echo POST";
     let echo_argv = [echo_arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
     let bash_argv = [
         bash_arg0.as_ptr(),
         bash_arg1.as_ptr(),
         bash_arg2.as_ptr(),
+        std::ptr::null(),
+    ];
+    let bash_post_sleep_argv = [
+        bash_arg0.as_ptr(),
+        bash_arg1.as_ptr(),
+        bash_post_sleep_arg2.as_ptr(),
         std::ptr::null(),
     ];
     let true_argv = [true_arg0.as_ptr(), std::ptr::null()];
@@ -786,6 +797,7 @@ fn run_clone_dropbear_session_setup(stage: DropbearSessionStage) -> Clone3Out {
                 | DropbearSessionStage::Tiocsctty
                 | DropbearSessionStage::Full
                 | DropbearSessionStage::FullBash
+                | DropbearSessionStage::FullBashPostSleep
                 | DropbearSessionStage::FullSetidNetwork => {
                     if libc::syscall(libc::SYS_setsid) < 0 {
                         libc::syscall(libc::SYS_exit, 111i32);
@@ -799,6 +811,7 @@ fn run_clone_dropbear_session_setup(stage: DropbearSessionStage) -> Clone3Out {
                 DropbearSessionStage::Tiocsctty
                 | DropbearSessionStage::Full
                 | DropbearSessionStage::FullBash
+                | DropbearSessionStage::FullBashPostSleep
                 | DropbearSessionStage::FullSetidNetwork => {
                     if libc::syscall(libc::SYS_ioctl, slave_fd, libc::TIOCSCTTY, 0usize) < 0 {
                         libc::syscall(libc::SYS_exit, 112i32);
@@ -812,6 +825,7 @@ fn run_clone_dropbear_session_setup(stage: DropbearSessionStage) -> Clone3Out {
                 DropbearSessionStage::DupStdio
                 | DropbearSessionStage::Full
                 | DropbearSessionStage::FullBash
+                | DropbearSessionStage::FullBashPostSleep
                 | DropbearSessionStage::FullSetidNetwork => {
                     for target in 0..=2 {
                         if libc::syscall(libc::SYS_dup2, slave_fd, target) < 0 {
@@ -851,6 +865,14 @@ fn run_clone_dropbear_session_setup(stage: DropbearSessionStage) -> Clone3Out {
                         envp.as_ptr(),
                     );
                 }
+                DropbearSessionStage::FullBashPostSleep => {
+                    libc::syscall(
+                        libc::SYS_execve,
+                        bash.as_ptr(),
+                        bash_post_sleep_argv.as_ptr(),
+                        envp.as_ptr(),
+                    );
+                }
                 DropbearSessionStage::ExecOnly
                 | DropbearSessionStage::Setsid
                 | DropbearSessionStage::Tiocsctty
@@ -880,10 +902,21 @@ fn run_clone_dropbear_session_setup(stage: DropbearSessionStage) -> Clone3Out {
     let pid = rc as libc::pid_t;
     if stage.uses_pty_stdio() {
         match pty.read(None) {
-            Ok(data) if data.contains("HELLO_CL3") => {}
+            Ok(data)
+                if matches!(stage, DropbearSessionStage::FullBashPostSleep)
+                    && data.contains("PRE")
+                    && data.contains("POST") => {}
+            Ok(data)
+                if !matches!(stage, DropbearSessionStage::FullBashPostSleep)
+                    && data.contains("HELLO_CL3") => {}
             Ok(data) => {
                 let _ = wait_child_timeout(pid, Duration::from_secs(1));
-                return clone_result_error(format!("missing HELLO_CL3 in pty data {data:?}"));
+                let expected = if matches!(stage, DropbearSessionStage::FullBashPostSleep) {
+                    "PRE and POST"
+                } else {
+                    "HELLO_CL3"
+                };
+                return clone_result_error(format!("missing {expected} in pty data {data:?}"));
             }
             Err(error) => {
                 let _ = wait_child_timeout(pid, Duration::from_secs(1));
