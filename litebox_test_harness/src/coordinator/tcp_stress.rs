@@ -10,9 +10,6 @@
 //! - TRR: rapid reconnect stress
 //! - TW: cross-worker concurrent TCP
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;

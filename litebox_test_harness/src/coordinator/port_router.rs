@@ -12,9 +12,6 @@
 //! The port router ownership fix (`worker_id` tracking) prevents a
 //! re-registering child from deregistering the parent's route on exit.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use serde::{Deserialize, Serialize};
 
 use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};

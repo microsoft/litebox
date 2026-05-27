@@ -25,9 +25,6 @@
 //! shim-side Pollee) is part of Phase B-Step7e — for now, callbacks
 //! supplied by the shim are simply invoked when notifications fire.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use litebox_common_linux::broker_eventfd::NotificationDispatcher;
 use litebox_common_linux::broker_eventfd_provider::{
     BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,

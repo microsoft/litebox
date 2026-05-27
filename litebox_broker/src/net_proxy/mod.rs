@@ -15,9 +15,6 @@
 //! handshake. Once a connection is ESTABLISHED, a host-side `TcpStream` is
 //! opened and data is relayed bidirectionally.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 mod device;
 pub mod dns_tracker;
 
@@ -2491,10 +2488,8 @@ fn promote_established(
             let mut found_host_stream = false;
             if let Some(remote) = remote {
                 #[allow(unreachable_patterns)]
-                let src_ip = match remote.addr {
-                    IpAddress::Ipv4(ip) => ip.octets(),
-                    _ => [0; 4],
-                };
+                let IpAddress::Ipv4(ip) = remote.addr;
+                let src_ip = ip.octets();
                 let flow_key = (src_ip, remote.port, dest_ip.octets(), dest_port);
                 if let Some((stream, _)) = ready_host_streams.remove(&flow_key) {
                     stream.set_nonblocking(true).ok();
@@ -2576,15 +2571,8 @@ fn promote_established(
 
         if let Some(remote) = remote {
             #[allow(unreachable_patterns)]
-            let src_ip = match remote.addr {
-                IpAddress::Ipv4(a) => a.octets(),
-                _ => {
-                    let socket: &mut tcp::Socket = sockets.get_mut(handle);
-                    socket.abort();
-                    sockets.remove(handle);
-                    continue;
-                }
-            };
+            let IpAddress::Ipv4(a) = remote.addr;
+            let src_ip = a.octets();
             let flow_key = (src_ip, remote.port, dest_ip.octets(), dest_port);
 
             if let Some((stream, _created)) = ready_host_streams.remove(&flow_key) {
@@ -2744,7 +2732,15 @@ fn relay_tcp(sockets: &mut SocketSet<'_>, bridges: &mut Vec<TcpBridge>) {
                 );
                 to_remove.push(i);
             }
-            _ => {}
+            tcp::State::Listen
+            | tcp::State::SynSent
+            | tcp::State::SynReceived
+            | tcp::State::Established
+            | tcp::State::FinWait1
+            | tcp::State::FinWait2
+            | tcp::State::CloseWait
+            | tcp::State::Closing
+            | tcp::State::LastAck => {}
         }
     }
 
@@ -2789,7 +2785,7 @@ fn relay_local(sockets: &mut SocketSet<'_>, bridges: &mut Vec<LocalBridge>) {
                         continue;
                     }
                 },
-                _ => {}
+                Ok(_) | Err(_) => {}
             }
         }
 
@@ -2835,7 +2831,15 @@ fn relay_local(sockets: &mut SocketSet<'_>, bridges: &mut Vec<LocalBridge>) {
                 debug!("local bridge closed for port {}", bridge.dest_port);
                 to_remove.push(i);
             }
-            _ => {}
+            tcp::State::Listen
+            | tcp::State::SynSent
+            | tcp::State::SynReceived
+            | tcp::State::Established
+            | tcp::State::FinWait1
+            | tcp::State::FinWait2
+            | tcp::State::CloseWait
+            | tcp::State::Closing
+            | tcp::State::LastAck => {}
         }
     }
 

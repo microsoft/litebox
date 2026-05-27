@@ -3,9 +3,6 @@
 
 //! An in-memory file system, not backed by any physical device.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::sync::Arc;
@@ -953,7 +950,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 .iter()
                 .find_map(|(path, entry)| match entry {
                     Entry::Dir(d) if alloc::sync::Arc::ptr_eq(d, dir) => Some(path.clone()),
-                    _ => None,
+                    Entry::Dir(_) | Entry::File(_) | Entry::Symlink(_) => None,
                 })
                 .unwrap_or(String::new())
         };
