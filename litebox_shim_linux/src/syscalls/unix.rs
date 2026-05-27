@@ -3,9 +3,6 @@
 
 //! Unix domain socket implementation for the Linux shim layer.
 
-#![allow(clippy::wildcard_enum_match_arm)]
-// Remaining Unix-socket fallback arms are deferred; several involve non_exhaustive public enums.
-
 use core::{
     sync::atomic::{AtomicU16, AtomicU32, Ordering},
     time::Duration,
@@ -131,9 +128,13 @@ impl UnixSocketAddr {
                         flags,
                         Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                     )
-                    .map_err(|err| match err {
-                        OpenError::AlreadyExists => Errno::EADDRINUSE,
-                        other => Errno::from(other),
+                    .map_err(|err| {
+                        // reason: unsupported variants intentionally share this fallback path.
+                        #[allow(clippy::wildcard_enum_match_arm)]
+                        match err {
+                            OpenError::AlreadyExists => Errno::EADDRINUSE,
+                            other => Errno::from(other),
+                        }
                     })?;
                 Ok(UnixBoundSocketAddr::Path((
                     path,
@@ -1217,6 +1218,8 @@ impl<FS: ShimFS> UnixStream<FS> {
             UnixSocketAddr::Unnamed => return Err(Errno::ECONNREFUSED),
         };
 
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         self.with_state(|state| match state {
             UnixStreamState::Init(init) => {
                 let connected = UnixConnectedStream {
@@ -1878,6 +1881,8 @@ impl<FS: ShimFS> UnixSocket<FS> {
     }
 
     pub(crate) fn new(sock_type: SockType, flags: SockFlags) -> Option<Self> {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let inner = match sock_type {
             // SeqPacket uses stream transport. This does not preserve message
             // boundaries (reads can coalesce/split), but suffices for current
@@ -2160,12 +2165,13 @@ impl<FS: ShimFS> UnixSocket<FS> {
         }
     }
 
-    #[allow(clippy::wildcard_enum_match_arm)] // SockType is non_exhaustive; unknown socket kinds cannot be named here.
     pub(super) fn new_connected_pair(
         ty: SockType,
         flags: SockFlags,
         peer_cred: Ucred,
     ) -> Option<(UnixSocket<FS>, UnixSocket<FS>)> {
+        // reason: SockType is non_exhaustive; unknown socket kinds cannot be named here.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match ty {
             SockType::Stream | SockType::SeqPacket => {
                 let (conn1, conn2) =
