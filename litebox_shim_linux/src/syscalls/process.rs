@@ -4361,9 +4361,7 @@ impl<FS: ShimFS> Task<FS> {
                 reject,
             );
             put_fc_back(self, fc);
-            todo!(
-                "ENOSYS audit: delayed fork rejected snapshot state; reachable but not implemented"
-            );
+            return Err(Errno::ENOSYS);
         }
 
         #[cfg(feature = "trace_syscalls")]
