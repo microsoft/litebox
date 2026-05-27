@@ -603,8 +603,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
-        #[allow(clippy::wildcard_enum_match_arm)]
-        // AllocationError is non_exhaustive; future variants pass through unchanged.
         let ret = self
             .platform
             .allocate_pages(
@@ -615,9 +613,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 noreserve,
                 platform_fixed_address_behavior,
             )
-            .map_err(|err| match err {
-                AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-                other => other,
+            .map_err(|err| {
+                // reason: AllocationError is non_exhaustive; future variants pass through unchanged.
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match err {
+                    AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+                    other => other,
+                }
             })?;
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();

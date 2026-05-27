@@ -126,6 +126,8 @@ fn map_client_error(
     pid: u32,
     err: litebox_common_linux::fd_token_client::ClientError,
 ) -> GuestPidProviderError {
+    // reason: unsupported variants intentionally share this fallback path.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match err {
         litebox_common_linux::fd_token_client::ClientError::UnknownHandle { .. } => {
             tracing::warn!(pid, "process-exit RPC returned UnknownHandle");

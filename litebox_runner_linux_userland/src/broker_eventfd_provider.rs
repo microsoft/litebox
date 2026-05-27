@@ -136,6 +136,8 @@ impl litebox_common_linux::broker_eventfd::NotificationCallback for CallbackBrid
 }
 
 fn client_err_to_broker_err(err: ClientError) -> BrokerOpError {
+    // reason: unsupported variants intentionally share this fallback path.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match err {
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
         ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
