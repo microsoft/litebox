@@ -433,7 +433,7 @@ fn test_umask_behavior() {
     // 3. Create a directory with mode 0o777; with umask 0o077 should become 0o700.
     let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
     let test_dir = "/umask_rs_test_dir";
-    task.sys_mkdir(test_dir, dir_mode)
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, test_dir, dir_mode)
         .expect("Failed to create test directory");
 
     let stat_dir = task
@@ -536,7 +536,7 @@ fn test_unlinkat() {
     // 2. Create a directory and attempt to unlink without AT_REMOVEDIR -> EISDIR.
     let dir_path = "/unlink_dir";
     let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
-    task.sys_mkdir(dir_path, dir_mode)
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, dir_path, dir_mode)
         .expect("Failed to create directory");
     assert_eq!(
         task.sys_unlinkat(0, dir_path, AtFlags::empty()),
@@ -546,7 +546,7 @@ fn test_unlinkat() {
 
     // 3. Create a non-empty directory and remove with AT_REMOVEDIR -> ENOTEMPTY.
     let nonempty_dir = "/unlink_dir_nonempty";
-    task.sys_mkdir(nonempty_dir, dir_mode)
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, nonempty_dir, dir_mode)
         .expect("Failed to create non-empty directory");
     let inner_file_fd = task
         .sys_open(
@@ -585,7 +585,7 @@ fn test_unlinkat() {
 
     // 6. Create and remove another empty directory to ensure repeatability.
     let empty_dir2 = "/unlink_empty_dir";
-    task.sys_mkdir(empty_dir2, dir_mode)
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, empty_dir2, dir_mode)
         .expect("Failed to create second empty directory");
     task.sys_unlinkat(0, empty_dir2, AtFlags::AT_REMOVEDIR)
         .expect("Should remove second empty directory");

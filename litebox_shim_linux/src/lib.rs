@@ -593,9 +593,13 @@ impl<FS: ShimFS> Task<FS> {
                     .map_err(|_| Errno::EINVAL)
                     .and_then(|seekwhence| self.sys_lseek(fd, offset, seekwhence))
             }
-            SyscallRequest::Mkdir { pathname, mode } => pathname
-                .to_cstring()
-                .map_or(Err(Errno::EINVAL), |path| syscall!(sys_mkdir(path, mode))),
+            SyscallRequest::Mkdirat {
+                dirfd,
+                pathname,
+                mode,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                syscall!(sys_mkdirat(dirfd, path, mode))
+            }),
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
