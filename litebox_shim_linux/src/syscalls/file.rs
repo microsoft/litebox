@@ -18,9 +18,8 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, InodeType,
-    IoReadVec, IoWriteVec, IoctlArg, TimeParam, errno::Errno, signal::Signal,
+    IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno, signal::Signal,
 };
-use litebox_common_linux::{Statx, StatxMask};
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
@@ -1121,7 +1120,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: AtFlags,
     ) -> Result<FileStat, Errno> {
         let current_support_flags = AtFlags::AT_EMPTY_PATH;
-        if flags.contains(current_support_flags.complement()) {
+        if flags.intersects(current_support_flags.complement()) {
             log_unsupported!("unsupported flags: {flags:?}");
             return Err(Errno::EINVAL);
         }
@@ -1150,6 +1149,9 @@ impl<FS: ShimFS> Task<FS> {
             | AtFlags::AT_STATX_DONT_SYNC;
         if flags.intersects(allowed.complement()) {
             log_unsupported!("unsupported statx flags: {flags:?}");
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(AtFlags::AT_STATX_FORCE_SYNC | AtFlags::AT_STATX_DONT_SYNC) {
             return Err(Errno::EINVAL);
         }
 
@@ -1442,7 +1444,8 @@ impl<FS: ShimFS> Task<FS> {
         let (pipe_flags, cloexec) = {
             use litebox::pipes::Flags;
             let mut f = Flags::empty();
-            if flags.contains((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
+            if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement())
+            {
                 return Err(Errno::EINVAL);
             }
             f.set(Flags::NON_BLOCKING, flags.contains(OFlags::NONBLOCK));
@@ -1504,7 +1507,7 @@ impl<FS: ShimFS> Task<FS> {
 
     pub fn sys_eventfd2(&self, initval: u32, flags: EfdFlags) -> Result<u32, Errno> {
         if flags
-            .contains((EfdFlags::SEMAPHORE | EfdFlags::CLOEXEC | EfdFlags::NONBLOCK).complement())
+            .intersects((EfdFlags::SEMAPHORE | EfdFlags::CLOEXEC | EfdFlags::NONBLOCK).complement())
         {
             return Err(Errno::EINVAL);
         }
@@ -1735,7 +1738,7 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `epoll_create` and `epoll_create1`
     pub fn sys_epoll_create(&self, flags: EpollCreateFlags) -> Result<u32, Errno> {
-        if flags.contains(EpollCreateFlags::EPOLL_CLOEXEC.complement()) {
+        if flags.intersects(EpollCreateFlags::EPOLL_CLOEXEC.complement()) {
             return Err(Errno::EINVAL);
         }
 

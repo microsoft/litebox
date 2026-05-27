@@ -909,11 +909,15 @@ impl<FS: ShimFS> Task<FS> {
                 mask,
                 statxbuf,
             } => {
-                match pathname {
-                    None => Ok(c"".into()), // empty path means stat the dirfd itself
-                    Some(p) => p.to_cstring().ok_or(Errno::EFAULT),
-                }
-                .and_then(|path| {
+                let (path, flags) = match pathname {
+                    // Linux 6.11+ treats a NULL statx path as a request to stat dirfd.
+                    None => (
+                        Ok(c"".into()),
+                        flags | litebox_common_linux::AtFlags::AT_EMPTY_PATH,
+                    ),
+                    Some(p) => (p.to_cstring().ok_or(Errno::EFAULT), flags),
+                };
+                path.and_then(|path| {
                     self.sys_statx(dirfd, path, flags, mask).and_then(|sx| {
                         statxbuf
                             .write_at_offset(0, sx)

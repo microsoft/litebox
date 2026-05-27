@@ -508,10 +508,18 @@ impl From<litebox::fs::FileStatus> for Statx {
     }
 }
 
+fn statx_timestamp(seconds: i64, nanoseconds: i64) -> StatxTimestamp {
+    StatxTimestamp {
+        tv_sec: seconds,
+        tv_nsec: u32::try_from(nanoseconds).unwrap_or(u32::MAX),
+        ..Default::default()
+    }
+}
+
 impl From<FileStat> for Statx {
     fn from(value: FileStat) -> Self {
         Self {
-            stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
+            stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
             stx_blksize: value.st_blksize.truncate(),
             stx_nlink: value.st_nlink.truncate(),
             stx_uid: value.st_uid,
@@ -520,12 +528,46 @@ impl From<FileStat> for Statx {
             stx_ino: value.st_ino,
             stx_size: value.st_size as u64,
             stx_blocks: value.st_blocks.reinterpret_as_unsigned(),
+            stx_atime: statx_timestamp(value.st_atime, value.st_atime_nsec),
+            stx_ctime: statx_timestamp(value.st_ctime, value.st_ctime_nsec),
+            stx_mtime: statx_timestamp(value.st_mtime, value.st_mtime_nsec),
             stx_rdev_major: dev_major(value.st_rdev),
             stx_rdev_minor: dev_minor(value.st_rdev),
             stx_dev_major: dev_major(value.st_dev),
             stx_dev_minor: dev_minor(value.st_dev),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statx_from_file_stat_preserves_timestamps() {
+        let file_stat = FileStat {
+            st_atime: 10,
+            st_atime_nsec: 11,
+            st_mtime: 20,
+            st_mtime_nsec: 21,
+            st_ctime: 30,
+            st_ctime_nsec: 31,
+            ..Default::default()
+        };
+
+        let statx = Statx::from(file_stat);
+        let mask = StatxMask::from_bits_retain(statx.stx_mask);
+
+        assert!(mask.contains(StatxMask::STATX_ATIME));
+        assert!(mask.contains(StatxMask::STATX_MTIME));
+        assert!(mask.contains(StatxMask::STATX_CTIME));
+        assert_eq!(statx.stx_atime.tv_sec, 10);
+        assert_eq!(statx.stx_atime.tv_nsec, 11);
+        assert_eq!(statx.stx_mtime.tv_sec, 20);
+        assert_eq!(statx.stx_mtime.tv_nsec, 21);
+        assert_eq!(statx.stx_ctime.tv_sec, 30);
+        assert_eq!(statx.stx_ctime.tv_nsec, 31);
     }
 }
 
