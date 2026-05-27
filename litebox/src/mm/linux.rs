@@ -5,9 +5,6 @@
 //! backed by a memory [backend](PageManagementProvider). It provides functionality to create, remove, resize,
 //! move, and protect memory mappings within a process's virtual address space.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use core::ops::Range;
 
 use alloc::vec::Vec;
@@ -606,6 +603,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
+        #[allow(clippy::wildcard_enum_match_arm)]
+        // AllocationError is non_exhaustive; future variants pass through unchanged.
         let ret = self
             .platform
             .allocate_pages(

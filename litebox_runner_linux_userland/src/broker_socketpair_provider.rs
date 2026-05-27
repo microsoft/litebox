@@ -3,9 +3,6 @@
 
 //! Runner-side implementation of [`BrokerSocketPairProvider`].
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use litebox_common_linux::broker_eventfd::{NotificationCallback, NotificationDispatcher};
 use litebox_common_linux::broker_socketpair_provider::{
     BrokerEventCallback, BrokerOpError, BrokerSocketPairProvider,
@@ -113,6 +110,19 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
         ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
         ClientError::Protocol(_) => BrokerOpError::InvalidValue,
-        _ => BrokerOpError::Io,
+        ClientError::Io(_)
+        | ClientError::InvalidValue { .. }
+        | ClientError::UnexpectedOpcode { .. }
+        | ClientError::BrokerRejectedProtocol
+        | ClientError::DuplicateSubscription(_)
+        | ClientError::UnknownSubscription(_)
+        | ClientError::SubsystemMismatch
+        | ClientError::NoNotificationRing
+        | ClientError::BrokerInternal { .. }
+        | ClientError::OtherStatus { .. }
+        | ClientError::UnexpectedFdAttachment { .. }
+        | ClientError::MissingFdAttachment { .. }
+        | ClientError::ShortRead { .. }
+        | ClientError::CmsgTruncated => BrokerOpError::Io,
     }
 }

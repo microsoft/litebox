@@ -133,7 +133,9 @@ fn check_flags(
             assert_eq!(offset, 0);
             assert_eq!(flags, f);
         }
-        other => panic!("unexpected: {other:?}"),
+        other @ (TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_)) => {
+            panic!("unexpected: {other:?}")
+        }
     }
 }
 

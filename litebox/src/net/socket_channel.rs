@@ -44,9 +44,6 @@
 //! - **No lock contention**: User read/write operations and network processing can proceed
 //!   concurrently without blocking each other.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use alloc::boxed::Box;
 use core::{
     net::SocketAddr,
@@ -438,7 +435,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
                     }
                     // Fall through to read the remaining data.
                 }
-                _ => return Err(ReceiveError::SocketInInvalidState),
+                SocketState::Connecting | SocketState::Listening | SocketState::Error => {
+                    return Err(ReceiveError::SocketInInvalidState);
+                }
             }
         }
 
@@ -477,7 +476,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
 
         match self.state() {
             SocketState::Connected => {}
-            _ => return Err(SendError::SocketInInvalidState),
+            SocketState::Closed
+            | SocketState::Connecting
+            | SocketState::Listening
+            | SocketState::Error => return Err(SendError::SocketInInvalidState),
         }
 
         if buf.is_empty() {
@@ -550,7 +552,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
             SocketState::Closed => events |= Events::HUP | Events::OUT,
             SocketState::Error => events |= Events::ERR | Events::OUT,
             SocketState::Connected if self.is_writable() => events |= Events::OUT,
-            _ => {}
+            SocketState::Connected | SocketState::Connecting | SocketState::Listening => {}
         }
 
         events
@@ -720,7 +722,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
             SocketState::Error => {
                 self.inner.pollee.notify_observers(Events::ERR);
             }
-            _ => {}
+            SocketState::Connecting | SocketState::Listening => {}
         }
     }
 

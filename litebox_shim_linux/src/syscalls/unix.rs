@@ -3,8 +3,8 @@
 
 //! Unix domain socket implementation for the Linux shim layer.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
 #![allow(clippy::wildcard_enum_match_arm)]
+// Remaining Unix-socket fallback arms are deferred; several involve non_exhaustive public enums.
 
 use core::{
     sync::atomic::{AtomicU16, AtomicU32, Ordering},
@@ -477,7 +477,7 @@ impl<FS: ShimFS> UnixListenStream<FS> {
         // Get the assigned port.
         let port = match task.do_getsockname_inet_port(raw_fd) {
             Some(p) if p != 0 => p,
-            _ => return 0,
+            Some(_) | None => return 0,
         };
 
         let msg = alloc::format!("UNIX TCP LISTENER: port={} started\n", port);
@@ -759,7 +759,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                         Ok(_) => Err((msg, Errno::EAGAIN)),
                         Err(_) => Err((msg, Errno::EPIPE)),
                     },
-                    _ => Err((msg, Errno::EINVAL)),
+                    NetworkProxy::Datagram(_) | NetworkProxy::Raw => Err((msg, Errno::EINVAL)),
                 }
             }
         }
@@ -798,7 +798,9 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                         Err(litebox::net::errors::ReceiveError::Eof) => 0,
                         Err(_) => return Err(TryOpError::Other(Errno::ECONNRESET)),
                     },
-                    _ => return Err(TryOpError::Other(Errno::EINVAL)),
+                    NetworkProxy::Datagram(_) | NetworkProxy::Raw => {
+                        return Err(TryOpError::Other(Errno::EINVAL));
+                    }
                 };
 
                 if read_n > 0 {
@@ -974,13 +976,13 @@ impl<FS: ShimFS> UnixStreamState<FS> {
     fn connected(&self) -> Option<&UnixConnectedStream<FS>> {
         match self {
             UnixStreamState::Connected(conn) => Some(conn),
-            _ => None,
+            UnixStreamState::Init(_) | UnixStreamState::Listen(_) => None,
         }
     }
     fn listen(&self) -> Option<&UnixListenStream<FS>> {
         match self {
             UnixStreamState::Listen(listen) => Some(listen),
-            _ => None,
+            UnixStreamState::Init(_) | UnixStreamState::Connected(_) => None,
         }
     }
 }
@@ -2158,6 +2160,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         }
     }
 
+    #[allow(clippy::wildcard_enum_match_arm)] // SockType is non_exhaustive; unknown socket kinds cannot be named here.
     pub(super) fn new_connected_pair(
         ty: SockType,
         flags: SockFlags,
@@ -2187,6 +2190,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                     UnixSocket::new_with_inner(UnixSocketInner::Datagram(datagram2), ty, flags),
                 ))
             }
+            SockType::Raw => None,
             _ => None,
         }
     }
@@ -2221,7 +2225,18 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
                     self.options.lock().broadcast = val != 0;
                 }
-                _ => unreachable!(),
+                (SocketOption::RCVTIMEO, SocketOptionValue::U32(_))
+                | (SocketOption::SNDTIMEO, SocketOptionValue::U32(_))
+                | (SocketOption::LINGER, SocketOptionValue::U32(_))
+                | (SocketOption::REUSEADDR, SocketOptionValue::Timeout(_))
+                | (SocketOption::REUSEPORT, SocketOptionValue::Timeout(_))
+                | (SocketOption::KEEPALIVE, SocketOptionValue::Timeout(_))
+                | (SocketOption::BROADCAST, SocketOptionValue::Timeout(_))
+                | (SocketOption::TYPE, _)
+                | (SocketOption::PEERCRED, _)
+                | (SocketOption::ERROR, _)
+                | (SocketOption::RCVBUF, _)
+                | (SocketOption::SNDBUF, _) => unreachable!(),
             }
             Ok(())
         }) {
@@ -2281,7 +2296,11 @@ impl<FS: ShimFS> UnixSocket<FS> {
             SocketOption::BROADCAST => {
                 SocketOptionValue::U32(u32::from(self.options.lock().broadcast))
             }
-            _ => unreachable!(),
+            SocketOption::TYPE
+            | SocketOption::PEERCRED
+            | SocketOption::ERROR
+            | SocketOption::RCVBUF
+            | SocketOption::SNDBUF => unreachable!(),
         }) {
             Err(Errno::ENOPROTOOPT) => {} // continue to handle unix
             other => return other,

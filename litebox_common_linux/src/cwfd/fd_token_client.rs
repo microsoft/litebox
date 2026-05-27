@@ -22,8 +22,8 @@
 //! worker that needs throughput beyond a single round-trip per call
 //! opens multiple clients to the broker.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
 #![allow(clippy::wildcard_enum_match_arm)]
+// StatusCode pass-through arms deliberately preserve broker statuses; converting every RPC remains incremental.
 
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
