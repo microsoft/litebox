@@ -2733,6 +2733,42 @@ mod dropbear_bash {
                     "echo L1\necho L2\nsleep 0.1\necho L3\n",
                 )],
             },
+            // Phase-H triangulation probes (added 2026-05-27).
+            // These distinguish "bash internally fork+execs another binary"
+            // from "bash takes real wallclock time" from "two sequential
+            // writes with anything between them". Together with the existing
+            // echo_two_lines (no separator) and echo_after_sleep (fork+exec
+            // sleep with non-zero duration), they isolate the trigger.
+            Scenario {
+                // Pure bash builtins, no fork. If FAIL: bug is in any
+                // sequence of two writes with anything between them, even
+                // a no-op. If PASS: bash builtins are fine; trigger needs
+                // a fork.
+                id: "echo_builtin_true",
+                command: "echo PRE; true; echo POST",
+                expected: &["PRE", "POST"],
+                fixtures: &[],
+            },
+            Scenario {
+                // fork+exec /bin/true (no sleep). If FAIL: bug is in
+                // fork+exec of a child between two writes, not in the
+                // sleep itself. If PASS: bug needs real wallclock time
+                // or specific sleep behavior.
+                id: "echo_fork_true",
+                command: "echo PRE; /bin/true; echo POST",
+                expected: &["PRE", "POST"],
+                fixtures: &[],
+            },
+            Scenario {
+                // fork+exec /bin/sleep with 0 duration. Isolates "is it
+                // /bin/sleep specifically?" If FAIL: bug needs sleep.
+                // If PASS but echo_fork_true PASSES: bug is the wallclock
+                // delay in sleep with non-zero arg.
+                id: "echo_sleep_zero",
+                command: "echo PRE; /bin/sleep 0; echo POST",
+                expected: &["PRE", "POST"],
+                fixtures: &[],
+            },
         ]
     }
 
