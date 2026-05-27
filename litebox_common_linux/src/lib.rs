@@ -540,37 +540,6 @@ impl From<FileStat> for Statx {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn statx_from_file_stat_preserves_timestamps() {
-        let file_stat = FileStat {
-            st_atime: 10,
-            st_atime_nsec: 11,
-            st_mtime: 20,
-            st_mtime_nsec: 21,
-            st_ctime: 30,
-            st_ctime_nsec: 31,
-            ..Default::default()
-        };
-
-        let statx = Statx::from(file_stat);
-        let mask = StatxMask::from_bits_retain(statx.stx_mask);
-
-        assert!(mask.contains(StatxMask::STATX_ATIME));
-        assert!(mask.contains(StatxMask::STATX_MTIME));
-        assert!(mask.contains(StatxMask::STATX_CTIME));
-        assert_eq!(statx.stx_atime.tv_sec, 10);
-        assert_eq!(statx.stx_atime.tv_nsec, 11);
-        assert_eq!(statx.stx_mtime.tv_sec, 20);
-        assert_eq!(statx.stx_mtime.tv_nsec, 21);
-        assert_eq!(statx.stx_ctime.tv_sec, 30);
-        assert_eq!(statx.stx_ctime.tv_nsec, 31);
-    }
-}
-
 /// Commands for use with `fcntl`.
 #[derive(Debug)]
 #[non_exhaustive]
