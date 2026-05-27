@@ -3,9 +3,6 @@
 
 //! Event file for notification, pid-backed polling, and timer-backed polling.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use alloc::sync::Arc;
 use core::{
     convert::Infallible,
@@ -322,6 +319,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     /// path to extract the handle for transport in an LBFD frame
     /// (Phase B-Step8e).
     pub(crate) fn broker_backed_handle(&self) -> Option<u64> {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &*self.inner.lock() {
             EventFileInner::BrokerBacked { common, .. }
             | EventFileInner::PidfdBrokerBacked { common, .. } => Some(common.handle()),
@@ -333,6 +332,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     /// eventfd. Used by the cross-worker SCM_RIGHTS sender to call
     /// `dup_handle` on the same provider that owns this eventfd.
     pub(crate) fn broker_backed_provider(&self) -> Option<Arc<dyn BrokerEventfdProvider>> {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &*self.inner.lock() {
             EventFileInner::BrokerBacked { provider, .. } => Some(Arc::clone(provider)),
             _ => None,
@@ -343,6 +344,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     /// pidfd. Used by the fork-snapshot rollback path to call
     /// `release` on a dup'd transit handle.
     pub(crate) fn broker_backed_pidfd_provider(&self) -> Option<Arc<dyn BrokerPidfdProvider>> {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &*self.inner.lock() {
             EventFileInner::PidfdBrokerBacked { provider, .. } => Some(Arc::clone(provider)),
             _ => None,
@@ -469,6 +472,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 let semaphore = *semaphore;
                 let readable = common.readable_flag();
                 drop(inner);
+                // reason: unsupported variants intentionally share this fallback path.
+                #[allow(clippy::wildcard_enum_match_arm)]
                 match provider.read_eventfd(handle) {
                     Ok(v) => {
                         // Update local readability cache: if we read
@@ -494,7 +499,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                     Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
                 }
             }
-            _ => Err(TryOpError::Other(Errno::EINVAL)),
+            EventFileInner::Pidfd { .. }
+            | EventFileInner::Timerfd(_)
+            | EventFileInner::PidfdBrokerBacked { .. } => Err(TryOpError::Other(Errno::EINVAL)),
         }
     }
 
@@ -588,6 +595,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 let handle = common.handle();
                 let readable = common.readable_flag();
                 drop(inner);
+                // reason: unsupported variants intentionally share this fallback path.
+                #[allow(clippy::wildcard_enum_match_arm)]
                 match provider.write_eventfd(handle, value) {
                     Ok(()) => {
                         // Mark locally readable so check_io_events
@@ -604,7 +613,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                     Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
                 }
             }
-            _ => Err(TryOpError::Other(Errno::EINVAL)),
+            EventFileInner::Pidfd { .. }
+            | EventFileInner::Timerfd(_)
+            | EventFileInner::PidfdBrokerBacked { .. } => Err(TryOpError::Other(Errno::EINVAL)),
         }
     }
 
@@ -818,6 +829,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
     /// subscription is only set up lazily by the epoll path.
     pub(crate) fn pre_subscribe_for_broker_blocking_read(&self) {
         let inner = self.inner.lock();
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &*inner {
             EventFileInner::BrokerBacked { common, .. }
             | EventFileInner::PidfdBrokerBacked { common, .. } => {
@@ -850,6 +863,8 @@ impl EventFile<Platform> {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> TimerFileState<Platform> {
     fn current_time(&self) -> Result<Duration, Errno> {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match self.clockid {
             ClockId::Monotonic | ClockId::MonotonicCoarse | ClockId::MonotonicRaw | ClockId::Boottime => {
                 Ok(self.platform.now().duration_since(&self.boot_time))
@@ -869,6 +884,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> TimerFileState<Platform
         &self,
         duration: Duration,
     ) -> Result<Option<Platform::Instant>, Errno> {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match self.clockid {
             ClockId::Monotonic
             | ClockId::MonotonicCoarse
@@ -1373,6 +1390,8 @@ mod tests {
             e: litebox_common_linux::fd_token_client::ClientError,
         ) -> BrokerOpError {
             use litebox_common_linux::fd_token_client::ClientError;
+            // reason: unsupported variants intentionally share this fallback path.
+            #[allow(clippy::wildcard_enum_match_arm)]
             match e {
                 ClientError::WouldBlock => BrokerOpError::WouldBlock,
                 ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
@@ -1516,9 +1535,13 @@ mod tests {
                     .lock()
                     .unwrap()
                     .read_eventfd(handle)
-                    .map_err(|e| match e {
-                        ClientError::WouldBlock => BrokerOpError::WouldBlock,
-                        _ => BrokerOpError::Io,
+                    .map_err(|e| {
+                        // reason: unsupported variants intentionally share this fallback path.
+                        #[allow(clippy::wildcard_enum_match_arm)]
+                        match e {
+                            ClientError::WouldBlock => BrokerOpError::WouldBlock,
+                            _ => BrokerOpError::Io,
+                        }
                     })
             }
             fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError> {

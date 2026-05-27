@@ -5,8 +5,6 @@
 
 #![no_std]
 #![allow(non_camel_case_types)]
-#![allow(clippy::wildcard_enum_match_arm)]
-// Legacy enum pass-throughs in submodules are intentionally left for incremental cleanup.
 
 use core::time::Duration;
 use int_enum::IntEnum;
@@ -259,8 +257,9 @@ pub enum InodeType {
 }
 
 impl From<litebox::fs::FileType> for InodeType {
-    #[allow(clippy::wildcard_enum_match_arm)] // FileType is non_exhaustive; future variants cannot be named here.
     fn from(value: litebox::fs::FileType) -> Self {
+        // reason: FileType is non_exhaustive; future variants cannot be named here.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match value {
             litebox::fs::FileType::RegularFile => InodeType::File,
             litebox::fs::FileType::Directory => InodeType::Dir,
@@ -292,8 +291,9 @@ pub enum DirentType {
 }
 
 impl From<litebox::fs::FileType> for DirentType {
-    #[allow(clippy::wildcard_enum_match_arm)] // FileType is non_exhaustive; future variants cannot be named here.
     fn from(value: litebox::fs::FileType) -> Self {
+        // reason: FileType is non_exhaustive; future variants cannot be named here.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match value {
             litebox::fs::FileType::RegularFile => DirentType::Regular,
             litebox::fs::FileType::Directory => DirentType::Directory,

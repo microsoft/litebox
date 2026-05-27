@@ -120,6 +120,8 @@ impl NotificationCallback for CallbackBridge {
 }
 
 fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
+    // reason: unsupported variants intentionally share this fallback path.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match e {
         ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
         ClientError::WouldBlock => BrokerOpError::WouldBlock,

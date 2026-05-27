@@ -3,9 +3,6 @@
 
 //! Process/thread related syscalls.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use crate::syscalls::file::{get_file_descriptor_flags, proc_cmdline_from_argv};
 use crate::{ConstPtr, MutPtr, ShimFS, Task, multihost::ExecRoute};
 use alloc::boxed::Box;
@@ -726,6 +723,8 @@ impl<FS: ShimFS> Task<FS> {
                     .platform
                     .get_punchthrough_token_for(punchthrough)
                     .expect("Failed to get punchthrough token for SET_FS");
+                // reason: unsupported variants intentionally share this fallback path.
+                #[allow(clippy::wildcard_enum_match_arm)]
                 token.execute().map(|_| ()).map_err(|e| match e {
                     litebox::platform::PunchthroughError::Failure(errno) => errno,
                     _ => unimplemented!("Unsupported punchthrough error {:?}", e),
@@ -739,6 +738,8 @@ impl<FS: ShimFS> Task<FS> {
                     .platform
                     .get_punchthrough_token_for(punchthrough)
                     .expect("Failed to get punchthrough token for GET_FS");
+                // reason: unsupported variants intentionally share this fallback path.
+                #[allow(clippy::wildcard_enum_match_arm)]
                 let fsbase = token.execute().map_err(|e| match e {
                     litebox::platform::PunchthroughError::Failure(errno) => errno,
                     _ => unimplemented!("Unsupported punchthrough error {:?}", e),
@@ -7708,6 +7709,8 @@ impl<FS: ShimFS> Task<FS> {
             if new_limit.rlim_max > old_rlimit.rlim_max {
                 return Err(Errno::EPERM);
             }
+            // reason: unsupported variants intentionally share this fallback path.
+            #[allow(clippy::wildcard_enum_match_arm)]
             match resource {
                 litebox_common_linux::RlimitResource::NOFILE => {
                     let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
@@ -7946,6 +7949,8 @@ impl<FS: ShimFS> Task<FS> {
         clock_id: litebox_common_linux::ClockId,
         duration: Duration,
     ) -> Result<Option<<Platform as TimeProvider>::Instant>, Errno> {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match clock_id {
             litebox_common_linux::ClockId::Monotonic
             | litebox_common_linux::ClockId::MonotonicCoarse => {
@@ -7983,6 +7988,8 @@ impl<FS: ShimFS> Task<FS> {
         res: TimeParam<Platform>,
     ) -> Result<(), Errno> {
         // Return the resolution of the clock
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let resolution = match clockid {
             litebox_common_linux::ClockId::MonotonicCoarse => {
                 // Coarse clocks typically have lower resolution (e.g., 4 millisecond)
@@ -12565,6 +12572,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("stdio bindings should succeed");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stdout {
             WorkerExecOutputBinding::Pipe { .. } => {}
             _ => panic!("stdout should be proxied through a worker pipe binding"),
@@ -12600,6 +12609,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("nonblocking stdout pipe should be preserved for remote exec");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stdout {
             WorkerExecOutputBinding::Pipe { .. } => {}
             _ => panic!("nonblocking stdout should still be proxied through a worker pipe binding"),
@@ -12619,6 +12630,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("stdio bindings should succeed");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stdin {
             WorkerExecInputBinding::Pipe { .. } => {}
             _ => panic!("stdin should be proxied through a worker pipe binding"),
@@ -12731,6 +12744,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("stdio bindings should succeed");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stderr {
             WorkerExecOutputBinding::HostStdio { fd } => {
                 assert_eq!(
@@ -12755,6 +12770,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("stdio bindings should succeed");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stdin {
             WorkerExecInputBinding::Inherit => {}
             _ => panic!("reopened /dev/tty stdin should preserve host stdin"),
@@ -12774,6 +12791,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("stdio bindings should succeed");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stderr {
             WorkerExecOutputBinding::HostStdio { fd } => {
                 assert_eq!(fd, 1, "reopened /dev/tty should still write to host stdout");
@@ -12852,6 +12871,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("sandbox PTY stdout should be accepted");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stdout {
             WorkerExecOutputBinding::Fs { .. } => {}
             _ => panic!("sandbox PTY stdout should be proxied via the guest FS"),
@@ -12871,6 +12892,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("stdio bindings should succeed");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stdout {
             WorkerExecOutputBinding::Fs { .. } => {}
             _ => panic!("stdout redirected to /dev/null should be proxied via the guest FS"),
@@ -12890,6 +12913,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("stdio bindings should succeed");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stdin {
             WorkerExecInputBinding::Fs { .. } => {}
             _ => panic!("stdin redirected from /dev/null should be proxied via the guest FS"),
@@ -12909,6 +12934,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("stdio bindings should succeed");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stdin {
             WorkerExecInputBinding::Fs { .. } => {}
             _ => panic!("stdin redirected from /dev/urandom should be proxied via the guest FS"),
@@ -12948,6 +12975,8 @@ mod tests {
         let bindings = task
             .worker_exec_stdio_bindings()
             .expect("sandbox PTY stdin should be accepted");
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match bindings.stdin {
             WorkerExecInputBinding::Fs { .. } => {}
             _ => panic!("sandbox PTY stdin should be proxied via the guest FS"),

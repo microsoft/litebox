@@ -3,9 +3,6 @@
 
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use core::{
     ffi::CStr,
     mem::offset_of,
@@ -220,6 +217,8 @@ impl Default for SocketAddress {
 
 impl SocketAddress {
     pub(crate) fn inet(self) -> Option<SocketAddr> {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match self {
             SocketAddress::Inet(addr) => Some(addr),
             _ => None,
@@ -227,6 +226,8 @@ impl SocketAddress {
     }
 
     pub(crate) fn unix(self) -> Option<UnixSocketAddr> {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match self {
             SocketAddress::Unix(addr) => Some(addr),
             _ => None,
@@ -287,6 +288,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
 
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let proxy = match sock_type {
             SockType::Stream => {
                 let proxy = litebox::net::socket_channel::StreamSocketChannel::new();
@@ -357,6 +360,8 @@ impl<FS: ShimFS> GlobalState<FS> {
     where
         F: FnOnce(SocketOption, SocketOptionValue) -> Result<(), Errno>,
     {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match optname {
             SocketOptionName::Socket(sopt) => match sopt {
                 SocketOption::RCVTIMEO | SocketOption::SNDTIMEO => {
@@ -616,6 +621,8 @@ impl<FS: ShimFS> GlobalState<FS> {
     where
         F: FnOnce(SocketOption) -> SocketOptionValue,
     {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match optname {
             SocketOptionName::Socket(sopt) => match sopt {
                 SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER => {
@@ -650,6 +657,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         len: u32,
     ) -> Result<usize, Errno> {
         match self.getsockopt_common(optname, optval, len, |sopt| {
+            // reason: unsupported variants intentionally share this fallback path.
+            #[allow(clippy::wildcard_enum_match_arm)]
             self.with_socket_options(fd, |options| match sopt {
                 SocketOption::RCVTIMEO => SocketOptionValue::Timeout(options.recv_timeout),
                 SocketOption::SNDTIMEO => SocketOptionValue::Timeout(options.send_timeout),
@@ -861,6 +870,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         // (10.0.0.2 in smoltcp) should be treated as loopback.
         // Apply these mappings here so the Network::connect redirect
         // (which converts loopback to the gateway) handles them correctly.
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let sockaddr = match sockaddr {
             SocketAddr::V4(v4)
                 if v4.ip().is_unspecified()
@@ -914,7 +925,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         )
         .map_err(|err| match err {
             TryOpError::TryAgain => Errno::EINPROGRESS,
-            err => err.into(),
+            TryOpError::WaitError(_) => Errno::EINTR,
+            TryOpError::Other(err) => err.into(),
         })
     }
 
@@ -1057,6 +1069,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         );
         // `MSG_TRUNC` behavior depends on the socket type
         if flags.contains(ReceiveFlags::TRUNC) {
+            // reason: unsupported variants intentionally share this fallback path.
+            #[allow(clippy::wildcard_enum_match_arm)]
             match self.get_socket_type(fd)? {
                 SockType::Datagram | SockType::Raw => {
                     new_flags.insert(litebox::net::ReceiveFlags::TRUNC);
@@ -1312,6 +1326,8 @@ impl<FS: ShimFS> Task<FS> {
                     log_unsupported!("protocol = {protocol}");
                     Errno::EPROTONOSUPPORT
                 })?;
+                // reason: unsupported variants intentionally share this fallback path.
+                #[allow(clippy::wildcard_enum_match_arm)]
                 let protocol = match ty {
                     SockType::Stream => {
                         if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
@@ -1397,6 +1413,8 @@ impl<FS: ShimFS> Task<FS> {
                     log_unsupported!("protocol = {protocol}");
                     Errno::EPROTONOSUPPORT
                 })?;
+                // reason: unsupported variants intentionally share this fallback path.
+                #[allow(clippy::wildcard_enum_match_arm)]
                 let protocol = match ty {
                     SockType::Stream => {
                         if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
@@ -1772,6 +1790,8 @@ fn write_sockaddr_v6_mapped_to_user(
     addrlen: crate::MutPtr<u32>,
 ) -> Result<(), Errno> {
     let addrlen_val = addrlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
+    // reason: unsupported variants intentionally share this fallback path.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match sock_addr {
         SocketAddress::Inet(SocketAddr::V4(v4_addr)) => {
             // struct sockaddr_in6 = 28 bytes
@@ -3376,6 +3396,8 @@ impl<FS: ShimFS> Task<FS> {
         if self.netlink_sockets.borrow().contains_key(&sockfd) {
             return Ok(());
         }
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let broker_sockopt = |optname| match optname {
             SocketOptionName::Socket(
                 SocketOption::RCVTIMEO
@@ -3448,6 +3470,8 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         // Netlink socket: return reasonable defaults.
         if self.netlink_sockets.borrow().contains_key(&sockfd) {
+            // reason: unsupported variants intentionally share this fallback path.
+            #[allow(clippy::wildcard_enum_match_arm)]
             let val: u32 = match optname {
                 SocketOptionName::Socket(SocketOption::ERROR) => 0,
                 SocketOptionName::Socket(SocketOption::RCVBUF)
@@ -3461,6 +3485,8 @@ impl<FS: ShimFS> Task<FS> {
             }
             return Ok(0);
         }
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let broker_getsockopt = |optname| match optname {
             SocketOptionName::Socket(
                 SocketOption::RCVTIMEO | SocketOption::SNDTIMEO | SocketOption::LINGER,

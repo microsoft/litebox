@@ -3,9 +3,6 @@
 
 //! Implementation of file related syscalls, e.g., `open`, `read`, `write`, etc.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
@@ -2259,6 +2256,8 @@ impl<FS: ShimFS> Task<FS> {
         need_write: bool,
     ) -> Result<litebox::fs::FileStatus, Errno> {
         let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match status.file_type {
             litebox::fs::FileType::RegularFile => {}
             litebox::fs::FileType::Directory => return Err(Errno::EISDIR),
@@ -4254,6 +4253,8 @@ impl<FS: ShimFS> Task<FS> {
             Ok(target) => Ok(target),
             Err(e) => {
                 use litebox::fs::errors::ReadLinkError;
+                // reason: unsupported variants intentionally share this fallback path.
+                #[allow(clippy::wildcard_enum_match_arm)]
                 match e {
                     ReadLinkError::PathError(pe) => Err(Errno::from(pe)),
                     ReadLinkError::ClosedFd => Err(Errno::EBADF),
@@ -4316,6 +4317,8 @@ impl<FS: ShimFS> Task<FS> {
                 let files = self.files.borrow();
                 files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                     crate::RawFdRef::Fs(dirfd) => {
+                        // reason: unsupported variants intentionally share this fallback path.
+                        #[allow(clippy::wildcard_enum_match_arm)]
                         files.fs.readlink_at(dirfd, path).map_err(|e| match e {
                             litebox::fs::errors::ReadLinkError::NotASymlink
                             | litebox::fs::errors::ReadLinkError::NotSupported => Errno::EINVAL,
@@ -5006,6 +5009,8 @@ impl<FS: ShimFS> Task<FS> {
         let get_cwd = || self.fs.borrow().cwd.read().clone();
 
         #[cfg(feature = "trace_syscalls")]
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &fs_path {
             FsPath::Absolute { path } => {
                 litebox::log_println!(
@@ -5885,6 +5890,8 @@ impl<FS: ShimFS> Task<FS> {
         if flags.intersects((TimerfdFlags::CLOEXEC | TimerfdFlags::NONBLOCK).complement()) {
             return Err(Errno::EINVAL);
         }
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match clockid {
             ClockId::RealTime
             | ClockId::RealtimeCoarse
@@ -6053,6 +6060,8 @@ impl<FS: ShimFS> Task<FS> {
 
         /// Map a `StdioIoctlError` to an `Errno`.
         fn ioctl_err_to_errno(e: StdioIoctlError) -> Errno {
+            // reason: unsupported variants intentionally share this fallback path.
+            #[allow(clippy::wildcard_enum_match_arm)]
             match e {
                 StdioIoctlError::NotATerminal => Errno::ENOTTY,
                 _ => Errno::EIO,
@@ -6061,6 +6070,8 @@ impl<FS: ShimFS> Task<FS> {
 
         let stream = self.host_stdio_stream_for_fd(fs, fd)?;
 
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match arg {
             IoctlArg::TCGETS(termios_ptr) => {
                 // Non-init processes may have a shadow termios from a
@@ -6204,6 +6215,8 @@ impl<FS: ShimFS> Task<FS> {
         entry: &super::broker_pty::BrokerPtyFd<Platform>,
         arg: &IoctlArg<litebox_platform_multiplex::Platform>,
     ) -> Result<u32, Errno> {
+        // reason: unsupported variants intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match arg {
             IoctlArg::TCGETS(termios) => {
                 let payload = entry.ioctl(PtyIoctlOp::Tcgets, &[])?;
@@ -6354,6 +6367,8 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         if desc <= 2 {
+            // reason: unsupported variants intentionally share this fallback path.
+            #[allow(clippy::wildcard_enum_match_arm)]
             match &arg {
                 IoctlArg::TIOCGPGRP(pgrp) => {
                     pgrp.write_at_offset(0, self.pid).ok_or(Errno::EFAULT)?;
@@ -6378,6 +6393,8 @@ impl<FS: ShimFS> Task<FS> {
                 .ok()
         };
         if let Some(ptyfd) = ptyfd_opt {
+            // reason: unsupported variants intentionally share this fallback path.
+            #[allow(clippy::wildcard_enum_match_arm)]
             match &arg {
                 IoctlArg::FIONREAD(_) => return Err(Errno::ENOTTY),
                 IoctlArg::FIONBIO(v) => {
@@ -6451,6 +6468,8 @@ impl<FS: ShimFS> Task<FS> {
                 _ => {}
             }
         }
+        // reason: IoctlArg is non_exhaustive; unknown ioctls intentionally return ENOTTY.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match arg {
             IoctlArg::FIONREAD(out) => {
                 // Return the number of bytes available to read.
@@ -6993,6 +7012,8 @@ impl<FS: ShimFS> Task<FS> {
                             return Err(Errno::ENOTTY);
                         }
 
+                        // reason: unsupported variants intentionally share this fallback path.
+                        #[allow(clippy::wildcard_enum_match_arm)]
                         match arg {
                             IoctlArg::TIOCGPGRP(pgrp) => {
                                 pgrp.write_at_offset(0, self.pid).ok_or(Errno::EFAULT)?;
@@ -7053,6 +7074,8 @@ impl<FS: ShimFS> Task<FS> {
                     },
                 })?
             }
+            // reason: IoctlArg is non_exhaustive; unknown terminal ioctls intentionally return ENOTTY.
+            #[allow(clippy::wildcard_enum_match_arm)]
             _ => {
                 // Return ENOTTY for unsupported ioctls rather than panicking.
                 // Complex programs (e.g., bash) probe terminal capabilities and

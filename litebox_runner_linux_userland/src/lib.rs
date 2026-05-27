@@ -1,9 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// TODO(#15): convert legacy wildcard enum dispatch in this file to explicit arms.
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
@@ -1060,6 +1057,8 @@ fn build_initial_fs(
     in_mem.with_root_privileges(|fs| {
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
         if let Err(err) = fs.mkdir("/tmp", mode) {
+            // reason: unsupported variants intentionally share this fallback path.
+            #[allow(clippy::wildcard_enum_match_arm)]
             match err {
                 litebox::fs::errors::MkdirError::AlreadyExists => {
                     fs.chmod("/tmp", mode).expect("Failed to call chmod");

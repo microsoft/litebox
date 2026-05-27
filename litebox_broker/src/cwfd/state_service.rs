@@ -19,9 +19,6 @@
 //! its ring once via `RegisterNotificationRing`; subsequent
 //! `SubscribeEventfd` calls use that sender.
 
-#![allow(clippy::wildcard_enum_match_arm)]
-// State-service opcode fallback dispatch remains incremental cleanup.
-
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
 use crate::eventfd_state::{EventfdError, EventfdState};
 use crate::pgrp_signal_inbox::{
@@ -176,6 +173,8 @@ pub fn handle_request(
     request: &Frame<'_>,
     in_fds: Vec<OwnedFd>,
 ) -> HandlerResult {
+    // reason: unsupported variants intentionally share this fallback path.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match request.opcode {
         Opcode::RegisterNotificationRing => {
             handle_register_notification_ring(conn, request, in_fds)
