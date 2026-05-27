@@ -1203,6 +1203,10 @@ fn main() {
         Ok(())
     }));
 
+    // Phase H dropbear + bash red-gate scenarios. These are token-free
+    // and always registered so regular filters can select them.
+    dropbear_bash::register_trials(&mut trials);
+
     // Copilot CLI integration scenarios — only register when explicitly
     // requested via filter or env. See `mod copilot` below for the full
     // contract and the documented FAIL-today scenarios.
@@ -2340,13 +2344,13 @@ mod copilot {
     }
 
     /// Owned container that destroys itself on Drop.
-    struct ContainerHandle {
+    pub(super) struct ContainerHandle {
         name: String,
-        ssh_port: u16,
+        pub(super) ssh_port: u16,
     }
 
     impl ContainerHandle {
-        fn spawn(
+        pub(super) fn spawn(
             pass: &str,
             scenario_id: &str,
             mode: &str,
@@ -2453,34 +2457,31 @@ mod copilot {
         }
     }
 
-    fn wait_for_sshd(port: u16, timeout: Duration) -> Result<(), String> {
-        use std::io::Read;
+    pub(super) fn wait_for_sshd(port: u16, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if let Ok(mut s) = std::net::TcpStream::connect_timeout(
+            if std::net::TcpStream::connect_timeout(
                 &format!("127.0.0.1:{port}").parse().unwrap(),
                 Duration::from_millis(500),
-            ) {
-                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut buf = [0u8; 8];
-                if let Ok(n) = s.read(&mut buf) {
-                    if n >= 4 && &buf[..4] == b"SSH-" {
-                        // Banner received — sshd is fully up.
-                        return Ok(());
-                    }
-                }
+            )
+            .is_ok()
+            {
+                // dropbear under litebox can accept TCP before its SSH
+                // handshake path is ready; mirror the ssh_mode smoke tests.
+                std::thread::sleep(Duration::from_secs(3));
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(250));
         }
         Err(format!(
-            "sshd on 127.0.0.1:{port} did not emit SSH banner within {timeout:?}"
+            "sshd on 127.0.0.1:{port} did not accept TCP within {timeout:?}"
         ))
     }
 
     /// Common ssh argv (host-side options). Caller appends the remote
     /// command. `sshpass -p ""` provides empty-password auth for
     /// dropbear's `-B` flag.
-    fn ssh_argv_base(port: u16) -> Vec<String> {
+    pub(super) fn ssh_argv_base(port: u16) -> Vec<String> {
         vec![
             "sshpass".into(),
             "-p".into(),
@@ -2558,7 +2559,7 @@ mod copilot {
 
     /// POSIX shell single-quote escaping: wrap in '...' and replace
     /// any internal `'` with `'\''`.
-    fn shell_quote(s: &str) -> String {
+    pub(super) fn shell_quote(s: &str) -> String {
         let mut out = String::with_capacity(s.len() + 2);
         out.push('\'');
         for c in s.chars() {
@@ -2573,7 +2574,7 @@ mod copilot {
     }
 
     /// Read everything from `pty` until EOF or `deadline` elapses.
-    fn read_with_deadline(pty: &Pty, deadline: Duration) -> Result<String, String> {
+    pub(super) fn read_with_deadline(pty: &Pty, deadline: Duration) -> Result<String, String> {
         let start = Instant::now();
         let mut out = String::new();
         while start.elapsed() < deadline {
@@ -2619,7 +2620,7 @@ mod copilot {
         Ok(out)
     }
 
-    fn wait_pid(pid: libc::pid_t, _timeout: Duration) -> Result<(), String> {
+    pub(super) fn wait_pid(pid: libc::pid_t, _timeout: Duration) -> Result<(), String> {
         let mut status: libc::c_int = 0;
         // SAFETY: standard waitpid usage.
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
@@ -2682,6 +2683,156 @@ mod copilot {
             i += 1;
         }
         out
+    }
+}
+
+mod dropbear_bash {
+    use super::{Failed, Trial, copilot};
+    use litebox_test_harness::os::pty::Pty;
+    use std::time::Duration;
+
+    struct Scenario {
+        id: &'static str,
+        command: &'static str,
+        expected: &'static [&'static str],
+        fixtures: &'static [(&'static str, &'static str)],
+    }
+
+    fn scenarios() -> &'static [Scenario] {
+        &[
+            Scenario {
+                id: "echo_one_line",
+                command: "echo HELLO_PHASE_H",
+                expected: &["HELLO_PHASE_H"],
+                fixtures: &[],
+            },
+            Scenario {
+                id: "echo_two_lines",
+                command: "echo PRE; echo POST",
+                expected: &["PRE", "POST"],
+                fixtures: &[],
+            },
+            Scenario {
+                id: "echo_after_sleep",
+                command: "echo PRE; sleep 0.1; echo POST",
+                expected: &["PRE", "POST"],
+                fixtures: &[],
+            },
+            Scenario {
+                id: "exec_chain",
+                command: "exec bash -c 'echo CHILD'",
+                expected: &["CHILD"],
+                fixtures: &[],
+            },
+            Scenario {
+                id: "script_file",
+                command: "bash /workspace/phase-h-test-script.sh",
+                expected: &["L1", "L2", "L3"],
+                fixtures: &[(
+                    "phase-h-test-script.sh",
+                    "echo L1\necho L2\nsleep 0.1\necho L3\n",
+                )],
+            },
+        ]
+    }
+
+    pub(super) fn register_trials(trials: &mut Vec<Trial>) {
+        for scn in scenarios() {
+            for pass in ["native", "litebox"] {
+                let name = format!("{pass}::dropbear_bash.{}", scn.id);
+                let pass_owned = pass.to_string();
+                let scenario_id = scn.id;
+                trials.push(Trial::test(name, move || {
+                    run_scenario(&pass_owned, scenario_id)
+                }));
+            }
+        }
+    }
+
+    fn run_scenario(pass: &str, scenario_id: &str) -> Result<(), Failed> {
+        let scn = scenarios()
+            .iter()
+            .find(|s| s.id == scenario_id)
+            .expect("scenario lookup");
+
+        let fixture_dir = super::fixture_dir(pass, "dropbear_bash", scenario_id);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir)
+            .map_err(|e| format!("create fixture dir {}: {e}", fixture_dir.display()))?;
+        for (rel, content) in scn.fixtures {
+            let path = fixture_dir.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+            }
+            std::fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
+        }
+
+        if pass == "litebox" {
+            let _ = super::setup();
+        }
+        super::ensure_copilot_image(&super::workspace_root());
+        let container = copilot::ContainerHandle::spawn(
+            pass,
+            scenario_id,
+            "dropbear_bash",
+            &fixture_dir,
+            false,
+        )?;
+        let port = container.ssh_port;
+        copilot::wait_for_sshd(port, Duration::from_secs(30))?;
+
+        let response = drive_bash(port, scn.command)?;
+        let stripped = copilot::strip_ansi(&response);
+        persist_transcript(pass, scenario_id, &response, &stripped);
+
+        let missing: Vec<&str> = scn
+            .expected
+            .iter()
+            .copied()
+            .filter(|expected| !stripped.contains(expected))
+            .collect();
+        if !missing.is_empty() {
+            let preview: String = stripped.chars().take(800).collect();
+            return Err(format!(
+                "{pass}::dropbear_bash.{scenario_id} missing expected output {:?}.\n\
+                 transcript: {}\n\
+                 first 800 chars of ANSI-stripped response:\n{preview}",
+                missing,
+                super::log_dir()
+                    .join(format!("dropbear_bash-{pass}-{scenario_id}.stripped.log"))
+                    .display(),
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
+    fn drive_bash(port: u16, command: &str) -> Result<String, String> {
+        let first = drive_bash_once(port, command)?;
+        if first.contains("kex_exchange_identification") {
+            std::thread::sleep(Duration::from_secs(7));
+            return drive_bash_once(port, command);
+        }
+        Ok(first)
+    }
+
+    fn drive_bash_once(port: u16, command: &str) -> Result<String, String> {
+        let pty = Pty::open()?;
+        let mut argv = copilot::ssh_argv_base(port);
+        argv.push(format!("exec bash -c {}", copilot::shell_quote(command)));
+        let pid = pty.fork_exec(&argv, /* ctrl_tty = */ true)?;
+        let result = copilot::read_with_deadline(&pty, Duration::from_secs(20))?;
+        let _ = copilot::wait_pid(pid, Duration::from_secs(10));
+        Ok(result)
+    }
+
+    fn persist_transcript(pass: &str, scenario_id: &str, raw: &str, stripped: &str) {
+        let log_dir = super::log_dir();
+        let _ = std::fs::create_dir_all(log_dir);
+        let safe = format!("dropbear_bash-{pass}-{scenario_id}");
+        let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), raw);
+        let _ = std::fs::write(log_dir.join(format!("{safe}.stripped.log")), stripped);
     }
 }
 
