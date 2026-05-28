@@ -5,8 +5,7 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
-use alloc::vec;
+use alloc::{boxed::Box, vec};
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     mm::linux::PAGE_SIZE,
@@ -550,11 +549,12 @@ fn open_session_single_instance(
     let task_pt_id = instance.task_page_table_id();
     let ta_uuid = instance.uuid();
 
-    // Allocate the session ID up front so the TA sees the right one in
-    // OpenSession. The guard recycles it on every error path until we
-    // either disarm it (on successful registration) or it drops.
+    // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID.
+    // Use SessionIdGuard to ensure the ID is recycled on any error path
+    // (before it is registered with the session manager).
     let session_id_guard =
         SessionIdGuard::new(allocate_session_id().ok_or(OpteeSmcReturnCode::EBusy)?);
+    // Safe to unwrap: guard was just created with Some(id).
     let runner_session_id = session_id_guard.id().unwrap();
 
     debug_serial_println!(
@@ -610,7 +610,7 @@ fn open_session_single_instance(
             return_code
         );
 
-        // Write error response BEFORE switching page tables — accesses user
+        // Write error response BEFORE switching page tables. Accesses user
         // memory, which requires the TA's page table to still be active.
         // `with_ta`'s serialization prevents another core from tearing down
         // the instance underneath us while we copy TA outputs.
@@ -706,6 +706,7 @@ fn open_session_new_instance(
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_bin = find_ta_binary(ta_uuid).ok_or(OpteeSmcReturnCode::ENotAvail)?;
 
+    // Create and switch to new page table
     let task_pt_id = create_task_page_table()?;
     debug_serial_println!("Created task page table ID: {}", task_pt_id);
 
@@ -722,6 +723,7 @@ fn open_session_new_instance(
     let session_id_guard = SessionIdGuard::new(session_id);
     let runner_session_id = session_id_guard.id().unwrap();
 
+    // Load ldelf and TA - Box immediately to keep at fixed heap address
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
     let loaded_program = Box::new(
         shim.load_ldelf(
@@ -746,7 +748,7 @@ fn open_session_new_instance(
         ta_flags.is_single_instance()
     );
 
-    // Run ldelf, which loads the TA and calls TA_CreateEntryPoint.
+    // Run ldelf to load the TA using reference-based run to avoid moving the shim
     let mut ldelf_ctx = litebox_common_linux::PtRegs::default();
     unsafe {
         litebox_platform_lvbs::run_thread_ref(
@@ -782,7 +784,7 @@ fn open_session_new_instance(
         return Ok(());
     }
 
-    // Set up the entry-point parameters for OpenSession.
+    // Load TA context with parameters for OpenSession - pass actual session_id
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
         // SAFETY: no references to user-space memory will be held after this call.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
@@ -804,6 +806,8 @@ fn open_session_new_instance(
             OpteeSmcReturnCode::EBadCmd
         })?;
 
+    // Run the TA's OpenSession entry point using reference-based reenter to
+    // avoid moving the shim
     let mut ctx = litebox_common_linux::PtRegs::default();
     unsafe {
         litebox_platform_lvbs::reenter_thread_ref(
@@ -812,6 +816,7 @@ fn open_session_new_instance(
         );
     }
 
+    // Read TA output parameters from the stack buffer
     let params_address = loaded_program.params_address.ok_or_else(|| {
         // SAFETY: no references to user-space memory will be held after this call.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
