@@ -11,6 +11,7 @@ pub(crate) mod broker_tcp_conn;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub(crate) mod guest_pid;
+pub(crate) mod inotify;
 
 /// Public re-export of the broker-eventfd-provider setter. The runner
 /// calls this at bootstrap if a broker fd-token control socket is
@@ -31,6 +32,7 @@ pub use eventfd::broker_pidfd_provider;
 pub use eventfd::set_broker_eventfd_provider;
 pub use eventfd::set_broker_pgrp_signal_provider;
 pub use eventfd::set_broker_pidfd_provider;
+pub use inotify::{broker_inotify_provider, set_broker_inotify_provider};
 pub use guest_pid::{
     broker_guest_pid_provider, set_broker_guest_pid_provider, try_mark_broker_process_exited,
     try_register_broker_guest_pid, try_release_all_broker_for_pid, try_release_broker_guest_pid,
