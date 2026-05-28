@@ -512,6 +512,8 @@ fn docker_run_base_args() -> Vec<String> {
     for var in [
         "LITEBOX_EAGER_BROKER_SOCKETPAIR",
         "LITEBOX_BROKER_TCP_CONN",
+        "LITEBOX_BROKER_INET_LISTENER",
+        "LITEBOX_BROKER_INET_DELAY_NS",
         "LITEBOX_PE10_DIAG",
         "LITEBOX_PE5_DIAG",
         "LITEBOX_CLEANUP_DELAY_MS",
@@ -2613,6 +2615,8 @@ mod copilot {
             for var in [
                 "LITEBOX_EAGER_BROKER_SOCKETPAIR",
                 "LITEBOX_BROKER_TCP_CONN",
+                "LITEBOX_BROKER_INET_LISTENER",
+                "LITEBOX_BROKER_INET_DELAY_NS",
                 "LITEBOX_PE10_DIAG",
                 "LITEBOX_PE5_DIAG",
                 "LITEBOX_CLEANUP_DELAY_MS",
