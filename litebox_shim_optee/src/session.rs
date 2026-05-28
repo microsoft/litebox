@@ -491,17 +491,21 @@ impl SessionManager {
     ///
     /// # Errors
     /// - `EBusy` if the id pool is exhausted.
-    /// - `EThreadLimit` for the rare race where the just-allocated id's
-    ///   marker slot is still held by a not-yet-dropped Close token (the
-    ///   driver retries transparently via its wait queue).
+    /// - `EThreadLimit` only if the just-allocated id's marker slot is
+    ///   already held — unreachable under normal flow (the id pool's
+    ///   hint+wrap defers reuse), and present as a defensive bail-out
+    ///   when a caller has taken the slot out-of-band via
+    ///   [`Self::try_acquire_session_marker`].
     pub fn try_acquire_open_session_token(&self) -> Result<SessionToken<'_>, OpteeSmcReturnCode> {
         let session_id = allocate_session_id().ok_or(OpteeSmcReturnCode::EBusy)?;
         if !self.active_sessions.lock().insert(session_id) {
-            // Rare race: previous Close on this id recycled it via
-            // `unregister_session` but its `SessionToken` hasn't dropped
-            // yet, so the marker slot is still held. Roll back the alloc;
-            // the driver's retry will allocate again (likely a different
-            // id, or this one after the previous Close fully releases).
+            // Defensive: the id pool's hint+wrap guarantees a
+            // freshly-allocated id won't collide with a recently-recycled
+            // one, so under normal `allocate → mark → unregister` flow
+            // this branch is unreachable. It exists to handle the corner
+            // case where a caller has inserted the slot out-of-band via
+            // [`Self::try_acquire_session_marker`]. Roll back the alloc
+            // and let the driver retry.
             recycle_session_id(session_id);
             return Err(OpteeSmcReturnCode::EThreadLimit);
         }

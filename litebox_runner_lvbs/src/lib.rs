@@ -407,9 +407,12 @@ unsafe fn teardown_ta_page_table(shim: &litebox_shim_optee::OpteeShim, task_pt_i
 /// For TA requests (OpenSession, InvokeCommand, CloseSession), it uses `decode_ta_request`
 /// to extract the TA request information and load/run it using `OpteeShim`.
 ///
-/// OpenSession for multi-instance TAs creates a new task page table and a
-/// new TA instance and registers it with the session manager. OpenSession
-/// for single-instance TAs reuses the cached instance if available,
+/// OpenSession for multi-instance TA creates:
+/// - A new task page table for memory isolation
+/// - A new TA instance with its own state
+/// - An entry in the global session map
+///
+/// OpenSession for single-instance TA reuses existing TA instance if available,
 /// otherwise creates a new one.
 ///
 /// InvokeCommand looks up the session and switches to its page table.
@@ -611,10 +614,9 @@ fn open_session_single_instance(
             return_code
         );
 
-        // Write error response BEFORE switching page tables. Accesses user
-        // memory, which requires the TA's page table to still be active.
-        // `with_ta`'s serialization prevents another core from tearing down
-        // the instance underneath us while we copy TA outputs.
+        // Write error response BEFORE switching page tables (accesses user memory).
+        // `with_ta`'s serialization keeps the instance alive so another core cannot
+        // tear down the active page table while this core is copying TA outputs.
         let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
@@ -633,7 +635,8 @@ fn open_session_single_instance(
             // Mark-then-evict ordering: see SessionManager::evict_cached_instance.
             session_manager().mark_sessions_dead_for_instance(instance);
             let _ = session_manager().evict_cached_instance(instance);
-            // SAFETY: no references to user-space memory will be held after this call.
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
             unsafe {
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };
@@ -669,7 +672,8 @@ fn open_session_single_instance(
         if !ta_flags.is_keep_alive() && session_manager().count_sessions_for_instance(instance) == 0
         {
             let _ = session_manager().evict_cached_instance(instance);
-            // SAFETY: no references to user-space memory will be held after this call.
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
             unsafe {
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };
@@ -731,7 +735,8 @@ fn open_session_new_instance(
             runner_session_id,
         )
         .map_err(|_| {
-            // SAFETY: no references to user-space memory will be held after this call.
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
             unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::ENomem
         })?,
@@ -774,7 +779,8 @@ fn open_session_new_instance(
             Some(ta_req_info),
         );
 
-        // SAFETY: no references to user-space memory will be held after this call.
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         write_result?;
@@ -783,7 +789,8 @@ fn open_session_new_instance(
 
     // Load TA context with parameters for OpenSession - pass actual session_id
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
-        // SAFETY: no references to user-space memory will be held after this call.
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::EBadCmd
     })?;
@@ -798,13 +805,13 @@ fn open_session_new_instance(
             None,
         )
         .map_err(|_| {
-            // SAFETY: no references to user-space memory will be held after this call.
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
             unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::EBadCmd
         })?;
 
-    // Run the TA's OpenSession entry point using reference-based reenter to
-    // avoid moving the shim
+    // Run the TA entry function using reference-based reenter to avoid moving the shim
     let mut ctx = litebox_common_linux::PtRegs::default();
     unsafe {
         litebox_platform_lvbs::reenter_thread_ref(
@@ -815,14 +822,16 @@ fn open_session_new_instance(
 
     // Read TA output parameters from the stack buffer
     let params_address = loaded_program.params_address.ok_or_else(|| {
-        // SAFETY: no references to user-space memory will be held after this call.
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::EBadAddr
     })?;
     let ta_params = UserConstPtr::<UteeParams>::from_usize(params_address)
         .read_at_offset(0)
         .ok_or_else(|| {
-            // SAFETY: no references to user-space memory will be held after this call.
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
             unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::EBadAddr
         })?;
@@ -849,7 +858,8 @@ fn open_session_new_instance(
             Some(ta_req_info),
         );
 
-        // SAFETY: no references to user-space memory will be held after this call.
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         write_result?;
@@ -857,8 +867,8 @@ fn open_session_new_instance(
     }
 
     // Write back BEFORE publishing the instance. If the write fails, the
-    // session is neither registered nor cached; we tear down the local
-    // resources and `session_token`'s drop recycles the id.
+    // session is neither registered nor cached, so we just tear down the
+    // local resources and let `session_token` recycle the ID on drop.
     write_msg_args_to_normal_world(
         msg_args,
         msg_args_phys_addr,
@@ -868,7 +878,8 @@ fn open_session_new_instance(
         Some(ta_req_info),
     )
     .inspect_err(|_| {
-        // SAFETY: no references to user-space memory will be held after this call.
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
     })?;
 
@@ -984,8 +995,9 @@ fn handle_invoke_command(
         let return_code: u32 = ctx.rax.trunc();
         let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
-        // Write response BEFORE switching page tables — accesses user memory,
-        // which requires the TA's page table to still be active.
+        // Write response BEFORE switching page tables (accesses user memory).
+        // `with_session`'s marker keeps the entry stable so another core cannot
+        // tear down the active page table while this core is copying TA outputs.
         let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
@@ -1012,7 +1024,8 @@ fn handle_invoke_command(
 
             session_manager().unregister_session(session_id);
 
-            // SAFETY: no references to user-space memory will be held after this call.
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
             unsafe {
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };
@@ -1118,7 +1131,8 @@ fn handle_close_session(
                 let _ = session_manager()
                     .evict_cached_instance(instance);
             }
-            // SAFETY: no references to user-space memory will be held after this call.
+            // Safety: We are about to tear down this TA instance;
+            // no references to user-space memory will be held afterwards.
             unsafe {
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };
