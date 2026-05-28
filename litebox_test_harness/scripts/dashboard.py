@@ -162,6 +162,82 @@ def short_sha(sha: Optional[str]) -> str:
     return (sha or "?")[:8]
 
 
+# ─── Trend helpers ───────────────────────────────────────────────────
+
+
+def state_verdicts(
+    conn: sqlite3.Connection, commit_sha: str, dirty_hash: Optional[str],
+) -> dict[tuple[str, str], str]:
+    """Return `{(test_id, pass): verdict}` for the freshest verdict
+    per (test_id, pass) at this `(commit_sha, dirty_hash)` state.
+
+    Handles dirty_hash NULL semantics correctly (`IS NULL` vs `= ?`)
+    so a clean-state lookup doesn't accidentally include dirty runs.
+
+    Used by Result groups + Commit-delta rendering. Computing the
+    freshest verdict per (test_id, pass) within a state means counts
+    are always consistent (`cov = pass + fail`, no double-count when
+    the same test ran twice at the same sha with different outcomes).
+    """
+    if dirty_hash is None:
+        sql = (
+            "SELECT rr.test_id, rr.pass, rr.verdict, rr.finished_ts_ms "
+            "  FROM run_results rr "
+            "  JOIN runs r ON r.run_id = rr.run_id "
+            " WHERE r.commit_sha = ? AND r.dirty_hash IS NULL"
+        )
+        params = (commit_sha,)
+    else:
+        sql = (
+            "SELECT rr.test_id, rr.pass, rr.verdict, rr.finished_ts_ms "
+            "  FROM run_results rr "
+            "  JOIN runs r ON r.run_id = rr.run_id "
+            " WHERE r.commit_sha = ? AND r.dirty_hash = ?"
+        )
+        params = (commit_sha, dirty_hash)
+    freshest: dict[tuple[str, str], tuple[str, int]] = {}
+    for r in conn.execute(sql, params):
+        key = (r["test_id"], r["pass"])
+        if key not in freshest or r["finished_ts_ms"] > freshest[key][1]:
+            freshest[key] = (r["verdict"], r["finished_ts_ms"])
+    return {k: v[0] for k, v in freshest.items()}
+
+
+def state_delta(
+    prev: dict[tuple[str, str], str],
+    this: dict[tuple[str, str], str],
+) -> tuple[set, set, set]:
+    """Compare two states, return (regressions, fixes, newly_covered)
+    as sets of (test_id, pass) tuples.
+
+    * regressions = passed in prev → not-pass in this
+    * fixes      = not-pass in prev → passed in this
+    * newly      = absent in prev → present in this (any verdict)
+    """
+    regressions = {k for k in this if k in prev and prev[k] == "pass" and this[k] != "pass"}
+    fixes      = {k for k in this if k in prev and prev[k] != "pass" and this[k] == "pass"}
+    newly      = {k for k in this if k not in prev}
+    return regressions, fixes, newly
+
+
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values: list[int]) -> str:
+    """Render a list of ints as a unicode-block sparkline."""
+    if not values:
+        return ""
+    lo = min(values)
+    hi = max(values)
+    if hi == lo:
+        return _SPARK_CHARS[-1] * len(values)
+    out = []
+    for v in values:
+        idx = int((v - lo) / (hi - lo) * (len(_SPARK_CHARS) - 1))
+        out.append(_SPARK_CHARS[idx])
+    return "".join(out)
+
+
 # ─── Render ──────────────────────────────────────────────────────────
 
 
@@ -178,6 +254,7 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     """
     parts: list[str] = ["# litebox integration-test dashboard\n"]
     parts.append(_render_meta(conn, state_dir))
+    parts.append(_render_velocity(conn))
     parts.append(_render_tracked_refs(conn))
     parts.append(_render_result_groups(conn))
     parts.append(_render_suite_group_breakdown(conn))
@@ -185,6 +262,54 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     parts.append(_render_recent_runs(conn))
     parts.append(_render_footer(conn, state_dir))
     return "\n".join(p for p in parts if p)
+
+
+def _render_velocity(conn: sqlite3.Connection) -> str:
+    """One-line throughput pulse: runs / newly-covered tests /
+    verdict flips in the last 24h. Surfaces "are we making progress
+    in real time" without having to scan history.
+    """
+    now = now_ms()
+    cutoff = now - 24 * 3600 * 1000
+    n_runs = conn.execute(
+        "SELECT COUNT(*) FROM runs WHERE started_ts_ms > ?", (cutoff,)
+    ).fetchone()[0] or 0
+
+    # Newly covered = (test_id, pass) whose FIRST EVER finished_ts_ms
+    # falls in the 24h window. Honest "tests we'd never seen before."
+    newly_covered = conn.execute(
+        """
+        SELECT COUNT(*) FROM (
+            SELECT test_id, pass, MIN(finished_ts_ms) AS first_ts
+              FROM run_results
+             GROUP BY test_id, pass
+        ) WHERE first_ts > ?
+        """,
+        (cutoff,),
+    ).fetchone()[0] or 0
+
+    # Verdict flips = (test_id, pass) that have BOTH a pass AND a
+    # non-pass row inside the 24h window. Picks up flakes + real
+    # regressions/fixes that landed today.
+    flips = conn.execute(
+        """
+        SELECT COUNT(*) FROM (
+            SELECT test_id, pass
+              FROM run_results
+             WHERE finished_ts_ms > ?
+             GROUP BY test_id, pass
+            HAVING SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) > 0
+               AND SUM(CASE WHEN verdict <> 'pass' THEN 1 ELSE 0 END) > 0
+        )
+        """,
+        (cutoff,),
+    ).fetchone()[0] or 0
+
+    return (
+        "## Velocity (last 24h)\n\n"
+        f"_{n_runs} runs · +{newly_covered} newly covered "
+        f"(test_id, pass) pairs · {flips} verdict flips_\n"
+    )
 
 
 def _render_meta(conn: sqlite3.Connection, state_dir: Path) -> str:
@@ -224,10 +349,10 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
     universe_n = (universe[0] if universe else 0) or 0
 
     lines = ["## Tracked refs\n",
-             "| Ref | Worktree | Pass | HEAD "
+             "| Ref | Worktree | Pass | HEAD | Coverage trend "
              "| native total | native cov | native pass | native fail "
              "| litebox total | litebox cov | litebox pass | litebox fail |",
-             "|---|---|---|---"
+             "|---|---|---|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|"]
     for r in refs:
@@ -236,7 +361,7 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
         head_sha = _git_head(ci_wt)
         if head_sha is None:
             lines.append(
-                f"| `{ref}` | `{ci_wt}` | — | _missing_ "
+                f"| `{ref}` | `{ci_wt}` | — | _missing_ | — "
                 f"| — | — | — | — | — | — | — | — |"
             )
             continue
@@ -252,11 +377,33 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
                 str(n_fail),
             ])
         last_run_age = _last_run_age_for_ci_worktree(conn, ci_wt)
+        spark = _coverage_sparkline_for_worktree(conn, ci_wt)
         lines.append(
             f"| `{ref}` | `{Path(ci_wt).name}` | {last_run_age} | "
-            f"`{short_sha(head_sha)}` | " + " | ".join(cells) + " |"
+            f"`{short_sha(head_sha)}` | `{spark}` | "
+            + " | ".join(cells) + " |"
         )
     return "\n".join(lines) + "\n"
+
+
+def _coverage_sparkline_for_worktree(
+    conn: sqlite3.Connection, ci_worktree: str, n: int = 10,
+) -> str:
+    """Per-tracked-ref coverage trend: last `n` clean runs from this
+    CI worktree, plotted as a unicode sparkline of pass_count. Tells
+    you "are we going up, flat, or falling" without needing a chart.
+    """
+    rows = conn.execute(
+        "SELECT pass_count FROM runs"
+        " WHERE worktree_path = ? AND dirty_hash IS NULL"
+        "   AND pass_count IS NOT NULL"
+        " ORDER BY started_ts_ms DESC LIMIT ?",
+        (ci_worktree, n),
+    ).fetchall()
+    values = [r[0] for r in reversed(rows)]  # chronological for display
+    if not values:
+        return ""
+    return f"{sparkline(values)}  {values[0]}→{values[-1]}"
 
 
 def _git_head(worktree: str) -> Optional[str]:
@@ -331,49 +478,48 @@ def _last_run_age_for_ci_worktree(conn: sqlite3.Connection, wt: str) -> str:
 
 def _render_result_groups(conn: sqlite3.Connection) -> str:
     """One row per `(commit_sha, dirty_hash)` partition that has any
-    results. Avoids the "latest-across-all-commits" pollution: each
-    test-state stands on its own, so a pass on branch A can't mask a
-    FAIL on branch B.
+    results. Per-pass cov/pass/fail use the freshest verdict per
+    (test_id, pass) within the state (so `cov = pass + fail` always
+    holds even when the same test ran twice with different outcomes).
 
-    Per partition: per-pass coverage + pass/FAIL counts, contributing
-    worktree(s), age.
+    Adds a `Δ vs prior` column showing
+    `+P passing · −R regressions · +N newly covered` against the
+    state directly older than this row.
+
+    Sorted newest-first so the current state is on top.
     """
-    rows = conn.execute(
+    # Discover all (commit_sha, dirty_hash) states + their newest_ms
+    # and contributing worktrees.
+    state_rows = conn.execute(
         """
-        SELECT r.commit_sha, r.dirty_hash, rr.pass,
-               COUNT(DISTINCT rr.test_id) AS covered,
-               COUNT(DISTINCT CASE WHEN rr.verdict = 'pass' THEN rr.test_id END) AS n_pass,
-               COUNT(DISTINCT CASE WHEN rr.verdict <> 'pass' THEN rr.test_id END) AS n_fail,
+        SELECT r.commit_sha, r.dirty_hash,
                MAX(rr.finished_ts_ms) AS newest_ms,
                GROUP_CONCAT(DISTINCT r.worktree_path) AS worktrees
           FROM run_results rr
           JOIN runs r ON r.run_id = rr.run_id
-         GROUP BY r.commit_sha, r.dirty_hash, rr.pass
-         ORDER BY MAX(rr.finished_ts_ms) DESC, rr.pass
+         GROUP BY r.commit_sha, r.dirty_hash
         """
     ).fetchall()
-    if not rows:
+    if not state_rows:
         return ""
 
-    # Collapse per-pass rows into one row per (sha, dirty_hash).
-    groups: dict[tuple[str, Optional[str]], dict] = {}
-    for r in rows:
+    # Build the per-state verdicts dict once per (sha, dirty_hash).
+    # Use freshest-per-(test_id, pass)-within-state semantics so
+    # counts and delta computations agree.
+    states: dict[tuple[str, Optional[str]], dict] = {}
+    for r in state_rows:
         key = (r["commit_sha"], r["dirty_hash"])
-        g = groups.setdefault(key, {
-            "newest_ms": 0,
-            "worktrees": set(),
-            "by_pass": {},
-        })
-        g["newest_ms"] = max(g["newest_ms"], r["newest_ms"] or 0)
-        for wt in (r["worktrees"] or "").split(","):
-            if wt:
-                g["worktrees"].add(wt)
-        g["by_pass"][r["pass"]] = (
-            r["covered"] or 0, r["n_pass"] or 0, r["n_fail"] or 0
-        )
+        verdicts = state_verdicts(conn, r["commit_sha"], r["dirty_hash"])
+        states[key] = {
+            "newest_ms": r["newest_ms"] or 0,
+            "worktrees": set(
+                w for w in (r["worktrees"] or "").split(",") if w
+            ),
+            "verdicts": verdicts,
+        }
 
     # Tracked-ref overlay so the table can mark which partitions are
-    # tracked by the autonomous driver (vs ad-hoc / agent-worktree runs).
+    # produced by the autonomous driver vs ad-hoc / agent runs.
     tracked: dict[str, str] = {}  # commit_sha → ref label
     for r in conn.execute("SELECT ref, ci_worktree FROM tracked_refs"):
         head = _git_head(r["ci_worktree"])
@@ -390,16 +536,18 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     lines = ["## Result groups (per commit × dirty-state)\n",
              "| Tracked ref | Sha | Dirty | Worktree(s) "
              "| native total | native cov | native pass | native fail "
-             "| litebox total | litebox cov | litebox pass | litebox fail | Newest |",
+             "| litebox total | litebox cov | litebox pass | litebox fail "
+             "| Newest | Δ vs prior |",
              "|---|---|---|---"
              "|---:|---:|---:|---:"
-             "|---:|---:|---:|---:|---|"]
+             "|---:|---:|---:|---:|---|---|"]
 
-    # Sort by newest first so the active state is on top.
-    ordered = sorted(
-        groups.items(), key=lambda kv: kv[1]["newest_ms"], reverse=True
+    # Sort newest-first; for each row, the "prior" state is the
+    # next entry in the list (one older in time).
+    ordered: list[tuple[tuple[str, Optional[str]], dict]] = sorted(
+        states.items(), key=lambda kv: kv[1]["newest_ms"], reverse=True
     )
-    for (sha, dirty_hash), g in ordered:
+    for i, ((sha, dirty_hash), g) in enumerate(ordered):
         tag = f"_{tracked[sha]}_" if sha in tracked else ""
         dirty = "⚠" if dirty_hash else ""
         wt_short = ", ".join(
@@ -407,19 +555,43 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
         )
         cells: list[str] = []
         for pass_name in ("native", "litebox"):
-            covered, n_pass, n_fail = g["by_pass"].get(pass_name, (0, 0, 0))
+            cov, n_pass, n_fail = _counts_from_verdicts(g["verdicts"], pass_name)
             cells.extend([
                 str(universe_n) if universe_n else "?",
-                str(covered),
+                str(cov),
                 str(n_pass),
                 str(n_fail),
             ])
         age = fmt_age_ms(now - g["newest_ms"]) if g["newest_ms"] else "—"
+        # Δ vs the immediately-older state in the sort order.
+        if i + 1 < len(ordered):
+            prior = ordered[i + 1][1]["verdicts"]
+            regressions, fixes, newly = state_delta(prior, g["verdicts"])
+            delta = (
+                f"+{len(fixes)} fixed · −{len(regressions)} regressed · "
+                f"+{len(newly)} new"
+            )
+        else:
+            delta = "_(oldest)_"
         lines.append(
             f"| {tag} | `{short_sha(sha)}` | {dirty} | `{wt_short}` | "
-            + " | ".join(cells) + f" | {age} |"
+            + " | ".join(cells) + f" | {age} | {delta} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def _counts_from_verdicts(
+    verdicts: dict[tuple[str, str], str], pass_name: str,
+) -> tuple[int, int, int]:
+    """Reduce a state's verdicts dict to `(cov, pass, fail)` for the
+    given pass. cov = number of (test_id) covered for that pass;
+    cov = pass + fail (invariant, since one verdict per (test_id, pass)).
+    """
+    pass_subset = {k: v for k, v in verdicts.items() if k[1] == pass_name}
+    cov = len(pass_subset)
+    n_pass = sum(1 for v in pass_subset.values() if v == "pass")
+    n_fail = cov - n_pass
+    return cov, n_pass, n_fail
 
 
 def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
@@ -491,26 +663,55 @@ def _render_current_fails(conn: sqlite3.Connection) -> str:
                r.commit_sha, r.dirty_hash, r.worktree_path
           FROM latest_results lr
           JOIN runs r ON r.run_id = lr.run_id
-         WHERE lr.verdict = 'FAIL'
+         WHERE lr.verdict <> 'pass'
          ORDER BY lr.pass, lr.suite, lr."group", lr.test_id
         """
     ).fetchall()
     if not rows:
         return "## Current FAILs\n\n_None._\n"
     lines = ["## Current FAILs\n",
-             "| Pass | Suite | Group | Test | Worktree | Sha | Dirty | Age |",
-             "|---|---|---|---|---|---|---:|---|"]
+             "| Pass | Suite | Group | Test | Worktree | Sha | Dirty "
+             "| Last 10 | Age |",
+             "|---|---|---|---|---|---|---:|---|---|"]
     now = now_ms()
     for r in rows:
         dirty = "⚠" if r["dirty_hash"] else ""
         wt_short = os.path.basename(r["worktree_path"] or "?")
+        history = _verdict_history(conn, r["test_id"], r["pass"], n=10)
         lines.append(
             f"| `{r['pass']}` | {r['suite']} | {r['group']} | "
             f"`{r['test_id']}` | `{wt_short}` | "
             f"`{short_sha(r['commit_sha'])}` | {dirty} | "
-            f"{fmt_age_ms(now - r['finished_ts_ms'])} |"
+            f"`{history}` | {fmt_age_ms(now - r['finished_ts_ms'])} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def _verdict_history(
+    conn: sqlite3.Connection, test_id: str, pass_name: str, n: int = 10,
+) -> str:
+    """Most-recent → least-recent (left → right reversed) verdict
+    history for a single (test_id, pass). One char per run:
+    ✓ = pass, ✗ = FAIL, · = other/no_result. Distinguishes a fresh
+    regression (`✓✓✓✗`) from a flake (`✓✗✓✗`) at a glance.
+    """
+    rows = conn.execute(
+        "SELECT verdict FROM run_results"
+        " WHERE test_id = ? AND pass = ?"
+        " ORDER BY finished_ts_ms DESC LIMIT ?",
+        (test_id, pass_name, n),
+    ).fetchall()
+    # rows[0] is the most recent; reverse so newest is on the right.
+    chars: list[str] = []
+    for r in reversed(rows):
+        v = r["verdict"]
+        if v == "pass":
+            chars.append("✓")
+        elif v == "FAIL":
+            chars.append("✗")
+        else:
+            chars.append("·")
+    return "".join(chars) or "—"
 
 
 def _render_recent_runs(conn: sqlite3.Connection) -> str:
