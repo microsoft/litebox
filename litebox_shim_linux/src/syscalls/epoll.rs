@@ -172,7 +172,6 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerPty(_) => "BrokerPty",
             DescriptorRef::BrokerSocketPair(_) => "BrokerSocketPair",
             DescriptorRef::BrokerTcpConn(_) => "BrokerTcpConn",
-            DescriptorRef::Inotify(_) => "Inotify",
         }
     }
 

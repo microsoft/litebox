@@ -470,7 +470,10 @@ fn update_tracker_from_response(
     #[allow(clippy::wildcard_enum_match_arm)]
     match request_opcode {
         // State-registry creators: response body is one or two handle ids.
-        Opcode::CreateEventfd | Opcode::CreatePidfd | Opcode::CreateSignalfd => {
+        Opcode::CreateEventfd
+        | Opcode::CreatePidfd
+        | Opcode::CreateSignalfd
+        | Opcode::InotifyInit1 => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
                 tracker.record_state(caller_scope, id);
             }
