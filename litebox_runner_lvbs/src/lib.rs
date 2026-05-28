@@ -410,12 +410,9 @@ unsafe fn teardown_ta_page_table(shim: &litebox_shim_optee::OpteeShim, task_pt_i
 /// For TA requests (OpenSession, InvokeCommand, CloseSession), it uses `decode_ta_request`
 /// to extract the TA request information and load/run it using `OpteeShim`.
 ///
-/// OpenSession for multi-instance TA creates:
-/// - A new task page table for memory isolation
-/// - A new TA instance with its own state
-/// - An entry in the global session map
-///
-/// OpenSession for single-instance TA reuses existing TA instance if available,
+/// OpenSession for multi-instance TAs creates a new task page table and a
+/// new TA instance and registers it with the session manager. OpenSession
+/// for single-instance TAs reuses the cached instance if available,
 /// otherwise creates a new one.
 ///
 /// InvokeCommand looks up the session and switches to its page table.
@@ -616,10 +613,10 @@ fn open_session_single_instance(
             return_code
         );
 
-        // Write error response BEFORE switching page tables (accesses user memory).
-        // The session token held by `with_ta` keeps another core
-        // from tearing down the active page table while this core is copying
-        // TA outputs.
+        // Write error response BEFORE switching page tables — accesses user
+        // memory, which requires the TA's page table to still be active.
+        // `with_ta`'s serialization prevents another core from tearing down
+        // the instance underneath us while we copy TA outputs.
         let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
@@ -697,10 +694,8 @@ fn open_session_single_instance(
     Ok(())
 }
 
-/// Create a new TA instance for a session.
-///
-/// The caller must invoke this inside [`SessionManager::with_ta`]
-/// to ensure a creation slot is held during execution and released afterward.
+/// Create a new TA instance for a session. Must be called from within a
+/// [`SessionManager::with_ta`] closure.
 ///
 /// If ldelf loading or OpenSession entry point fails, the page table is torn down.
 /// Per OP-TEE OS semantics: if OpenSession returns non-success, cleanup happens.
@@ -889,11 +884,8 @@ fn open_session_new_instance(
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
     })?;
 
-    // Success: hand the three parts to the session manager. It wraps them
-    // in an `Arc<TaInstance>` owned solely by itself (no clone returned),
-    // and — for single-instance TAs — also caches that `Arc`. The runner
-    // never holds a `TaInstance` or `Arc<TaInstance>`, which is what makes
-    // the internal `unsafe impl Send/Sync for TaInstance` enforceable.
+    // Success: hand the three parts to the session manager. The manager
+    // takes ownership; this runner never retains a handle to the instance.
     session_manager().register_new_session(
         runner_session_id,
         shim,
@@ -914,8 +906,8 @@ fn open_session_new_instance(
 
 /// Tear down a `Dead` session entry observed at Invoke/Close handler entry.
 ///
-/// Runs inside `with_session`'s closure, so the session token is alive for
-/// the duration of this call and released when the closure returns.
+/// Must be called from within a `with_session` closure so its serialization
+/// covers the cleanup.
 fn finalize_dead_session(
     session_id: u32,
     msg_args: &mut OpteeMsgArgs,
@@ -1006,9 +998,8 @@ fn handle_invoke_command(
         let return_code: u32 = ctx.rax.trunc();
         let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
-        // Write response BEFORE switching page tables (accesses user memory).
-        // The session token prevents another core from tearing down the active
-        // page table while this core is copying TA outputs.
+        // Write response BEFORE switching page tables — accesses user memory,
+        // which requires the TA's page table to still be active.
         let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
@@ -1118,8 +1109,6 @@ fn handle_close_session(
             None,
         );
 
-        // Remove the session entry from the map. The session token drops
-        // when the enclosing `with_session` closure returns.
         let removed_flags = session_manager().unregister_session(session_id);
 
         // Check if this was the last session using the TA instance by counting
