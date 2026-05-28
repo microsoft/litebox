@@ -40,6 +40,11 @@ use crate::policy::{Action, Decision, Policy};
 
 /// Maximum number of FIDs per connection to prevent resource exhaustion.
 const MAX_FIDS: usize = 8192;
+const IN_MODIFY: u32 = 0x0000_0002;
+const IN_MOVED_FROM: u32 = 0x0000_0040;
+const IN_MOVED_TO: u32 = 0x0000_0080;
+const IN_CREATE: u32 = 0x0000_0100;
+const IN_DELETE: u32 = 0x0000_0200;
 
 /// Linux `AT_REMOVEDIR` flag for `Tunlinkat`.
 const AT_REMOVEDIR: u32 = 0x200;
@@ -361,6 +366,36 @@ impl Server {
             }
         } else {
             self.resolve_and_check(path)
+        }
+    }
+
+
+    fn guest_path_for_host(&self, path: &Path) -> String {
+        let stripped = path.strip_prefix(&self.root).unwrap_or(path);
+        let s = stripped.to_string_lossy();
+        if s.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", s.trim_start_matches('/'))
+        }
+    }
+
+    fn notify_inotify_parent(&self, parent: &Path, mask: u32, cookie: u32, name: &str) {
+        let guest_parent = self.guest_path_for_host(parent);
+        self.inotify_dispatcher
+            .dispatch(&guest_parent, mask, cookie, name);
+    }
+
+    fn notify_inotify_path(&self, path: &Path, mask: u32, cookie: u32) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let parent = path.parent().unwrap_or(&self.root);
+        self.notify_inotify_parent(parent, mask, cookie, name);
+        if mask == IN_MODIFY {
+            let guest_path = self.guest_path_for_host(path);
+            self.inotify_dispatcher.dispatch(&guest_path, mask, cookie, "");
         }
     }
 
@@ -1190,6 +1225,7 @@ impl Server {
 
                 let msize = self.msize.load(Ordering::Acquire);
                 self.invalidate_canonical_cache(&resolved_target);
+                self.notify_inotify_parent(&resolved_parent, IN_CREATE, 0, &name);
                 Fcall::Rlcreate(fcall::Rlcreate {
                     qid,
                     iounit: msize - fcall::IOHDRSZ,
@@ -1340,7 +1376,12 @@ impl Server {
         };
 
         match file.write_at(&data, offset) {
-            Ok(n) => Fcall::Rwrite(fcall::Rwrite { count: n as u32 }),
+            Ok(n) => {
+                if n > 0 {
+                    self.notify_inotify_path(&path, IN_MODIFY, 0);
+                }
+                Fcall::Rwrite(fcall::Rwrite { count: n as u32 })
+            }
             Err(e) => io_error_response(e),
         }
     }
@@ -1474,6 +1515,7 @@ impl Server {
                     return io_error_response(e);
                 }
             }
+            self.notify_inotify_path(&resolved, IN_MODIFY, 0);
         }
 
         Fcall::Rsetattr(fcall::Rsetattr {})
@@ -1603,6 +1645,7 @@ impl Server {
         match path_to_qid(&target) {
             Ok(qid) => {
                 self.invalidate_canonical_cache(&target);
+                self.notify_inotify_parent(&resolved_parent, IN_CREATE, 0, &name);
                 Fcall::Rmkdir(fcall::Rmkdir { qid })
             }
             Err(errno) => error_response(errno),
@@ -1654,6 +1697,7 @@ impl Server {
         match result {
             Ok(()) => {
                 self.invalidate_canonical_cache(&target);
+                self.notify_inotify_parent(&resolved_parent, IN_DELETE, 0, &name);
                 Fcall::Runlinkat(fcall::Runlinkat {})
             }
             Err(e) => io_error_response(e),
@@ -1721,6 +1765,8 @@ impl Server {
                 state.path = dst.clone();
                 self.invalidate_canonical_cache(&resolved_src);
                 self.invalidate_canonical_cache(&dst);
+                self.notify_inotify_path(&resolved_src, IN_MOVED_FROM, 0);
+                self.notify_inotify_parent(&resolved_dst_dir, IN_MOVED_TO, 0, &name);
                 Fcall::Rrename(fcall::Rrename {})
             }
             Err(e) => io_error_response(e),
@@ -1793,6 +1839,8 @@ impl Server {
             Ok(()) => {
                 self.invalidate_canonical_cache(&src);
                 self.invalidate_canonical_cache(&dst);
+                self.notify_inotify_parent(&resolved_old_dir, IN_MOVED_FROM, 0, &oldname);
+                self.notify_inotify_parent(&resolved_new_dir, IN_MOVED_TO, 0, &newname);
                 Fcall::Rrenameat(fcall::Rrenameat {})
             }
             Err(e) => io_error_response(e),
@@ -1893,7 +1941,11 @@ impl Server {
         };
 
         match result {
-            Ok(()) => Fcall::Rremove(fcall::Rremove {}),
+            Ok(()) => {
+                self.invalidate_canonical_cache(&resolved);
+                self.notify_inotify_path(&resolved, IN_DELETE, 0);
+                Fcall::Rremove(fcall::Rremove {})
+            },
             Err(e) => io_error_response(e),
         }
     }
