@@ -3228,6 +3228,7 @@ impl<FS: ShimFS> Task<FS> {
                     | SubsystemTag::Signalfd
                     | SubsystemTag::Timerfd
                     | SubsystemTag::Inotify
+                    | SubsystemTag::InetListener
                     | SubsystemTag::Pipe
                     | SubsystemTag::Pty => {
                         // Reserved for P2.A/B/C and later phases.
