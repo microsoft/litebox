@@ -244,7 +244,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handles for cross-worker SCM_RIGHTS transfer. The two registries
     // are constructed here and shared with the listener thread; their
     // Arc clones survive for the lifetime of the broker process.
-    let inotify_dispatcher = std::sync::Arc::new(litebox_broker::inotify_dispatcher::InotifyDispatcher::new());
+    let inotify_dispatcher =
+        std::sync::Arc::new(litebox_broker::inotify_dispatcher::InotifyDispatcher::new());
     let shared_state_registry = cli
         .fd_token_broker_listen
         .as_ref()
@@ -324,7 +325,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd_num) };
         let ipc = IpcStream::from_owned_fd(fd);
         let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
-        let registry = build_local_services(&cli, elf_cache, &sandbox_policy, Arc::clone(&inotify_dispatcher));
+        let registry = build_local_services(
+            &cli,
+            elf_cache,
+            &sandbox_policy,
+            Arc::clone(&inotify_dispatcher),
+        );
         let forwards = parse_forward_specs(&cli.forward_port);
         return litebox_broker::net_proxy::run(
             ipc,

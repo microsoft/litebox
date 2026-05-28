@@ -1684,27 +1684,42 @@ pub fn parse_push_siginfo_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolEr
     Ok((handle, body[16..].to_vec()))
 }
 
-
 /// Body for [`Opcode::InotifyInit1`]: flags (u32) + reserved (u32).
 pub fn build_inotify_init1_request(flags: u32) -> OwnedFrame {
     let mut body = Vec::with_capacity(8);
     body.extend_from_slice(&flags.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
-    OwnedFrame { opcode: Opcode::InotifyInit1, status: StatusCode::Ok, caller_pid: 0, body }
+    OwnedFrame {
+        opcode: Opcode::InotifyInit1,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
 }
 
 pub fn parse_inotify_init1_body(body: &[u8]) -> Result<u32, ProtocolError> {
     if body.len() != 8 {
-        return Err(ProtocolError::WrongBodyLen { opcode: Opcode::InotifyInit1, got: body.len(), want: 8 });
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyInit1,
+            got: body.len(),
+            want: 8,
+        });
     }
     let flags = u32::from_le_bytes(body[0..4].try_into().unwrap());
     let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
-    if reserved != 0 { return Err(ProtocolError::NonZeroReserved { reserved }); }
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
     Ok(flags)
 }
 
 pub fn build_inotify_init1_response_ok(handle_id: u64) -> OwnedFrame {
-    OwnedFrame { opcode: Opcode::InotifyInit1Response, status: StatusCode::Ok, caller_pid: 0, body: handle_id.to_le_bytes().to_vec() }
+    OwnedFrame {
+        opcode: Opcode::InotifyInit1Response,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
 }
 
 pub fn build_inotify_add_watch_request(handle_id: u64, path: &str, mask: u32) -> OwnedFrame {
@@ -1715,20 +1730,37 @@ pub fn build_inotify_add_watch_request(handle_id: u64, path: &str, mask: u32) ->
     body.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(path_bytes);
-    OwnedFrame { opcode: Opcode::InotifyAddWatch, status: StatusCode::Ok, caller_pid: 0, body }
+    OwnedFrame {
+        opcode: Opcode::InotifyAddWatch,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
 }
 
-pub fn parse_inotify_add_watch_body(body: &[u8]) -> Result<(u64, u32, alloc::string::String), ProtocolError> {
+pub fn parse_inotify_add_watch_body(
+    body: &[u8],
+) -> Result<(u64, u32, alloc::string::String), ProtocolError> {
     if body.len() < 20 {
-        return Err(ProtocolError::WrongBodyLen { opcode: Opcode::InotifyAddWatch, got: body.len(), want: 20 });
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyAddWatch,
+            got: body.len(),
+            want: 20,
+        });
     }
     let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
     let mask = u32::from_le_bytes(body[8..12].try_into().unwrap());
     let len = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
     let reserved = u32::from_le_bytes(body[16..20].try_into().unwrap());
-    if reserved != 0 { return Err(ProtocolError::NonZeroReserved { reserved }); }
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
     if body.len() != 20 + len {
-        return Err(ProtocolError::WrongBodyLen { opcode: Opcode::InotifyAddWatch, got: body.len(), want: 20 + len });
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyAddWatch,
+            got: body.len(),
+            want: 20 + len,
+        });
     }
     alloc::string::String::from_utf8(body[20..].to_vec())
         .map(|path| (handle, mask, path))
@@ -1739,16 +1771,27 @@ pub fn build_inotify_add_watch_response_ok(wd: i32) -> OwnedFrame {
     let mut body = Vec::with_capacity(8);
     body.extend_from_slice(&wd.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
-    OwnedFrame { opcode: Opcode::InotifyAddWatchResponse, status: StatusCode::Ok, caller_pid: 0, body }
+    OwnedFrame {
+        opcode: Opcode::InotifyAddWatchResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
 }
 
 pub fn parse_inotify_add_watch_response_ok(body: &[u8]) -> Result<i32, ProtocolError> {
     if body.len() != 8 {
-        return Err(ProtocolError::WrongBodyLen { opcode: Opcode::InotifyAddWatchResponse, got: body.len(), want: 8 });
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyAddWatchResponse,
+            got: body.len(),
+            want: 8,
+        });
     }
     let wd = i32::from_le_bytes(body[0..4].try_into().unwrap());
     let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
-    if reserved != 0 { return Err(ProtocolError::NonZeroReserved { reserved }); }
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
     Ok(wd)
 }
 
@@ -1757,22 +1800,38 @@ pub fn build_inotify_rm_watch_request(handle_id: u64, wd: i32) -> OwnedFrame {
     body.extend_from_slice(&handle_id.to_le_bytes());
     body.extend_from_slice(&wd.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
-    OwnedFrame { opcode: Opcode::InotifyRmWatch, status: StatusCode::Ok, caller_pid: 0, body }
+    OwnedFrame {
+        opcode: Opcode::InotifyRmWatch,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
 }
 
 pub fn parse_inotify_rm_watch_body(body: &[u8]) -> Result<(u64, i32), ProtocolError> {
     if body.len() != 16 {
-        return Err(ProtocolError::WrongBodyLen { opcode: Opcode::InotifyRmWatch, got: body.len(), want: 16 });
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyRmWatch,
+            got: body.len(),
+            want: 16,
+        });
     }
     let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
     let wd = i32::from_le_bytes(body[8..12].try_into().unwrap());
     let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
-    if reserved != 0 { return Err(ProtocolError::NonZeroReserved { reserved }); }
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
     Ok((handle, wd))
 }
 
 pub fn build_inotify_rm_watch_response_ok() -> OwnedFrame {
-    OwnedFrame { opcode: Opcode::InotifyRmWatchResponse, status: StatusCode::Ok, caller_pid: 0, body: Vec::new() }
+    OwnedFrame {
+        opcode: Opcode::InotifyRmWatchResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
 }
 
 pub fn build_inotify_read_request(handle_id: u64, max_len: u32) -> OwnedFrame {
@@ -1780,17 +1839,28 @@ pub fn build_inotify_read_request(handle_id: u64, max_len: u32) -> OwnedFrame {
     body.extend_from_slice(&handle_id.to_le_bytes());
     body.extend_from_slice(&max_len.to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
-    OwnedFrame { opcode: Opcode::InotifyRead, status: StatusCode::Ok, caller_pid: 0, body }
+    OwnedFrame {
+        opcode: Opcode::InotifyRead,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
 }
 
 pub fn parse_inotify_read_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
     if body.len() != 16 {
-        return Err(ProtocolError::WrongBodyLen { opcode: Opcode::InotifyRead, got: body.len(), want: 16 });
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyRead,
+            got: body.len(),
+            want: 16,
+        });
     }
     let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
     let max_len = u32::from_le_bytes(body[8..12].try_into().unwrap());
     let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
-    if reserved != 0 { return Err(ProtocolError::NonZeroReserved { reserved }); }
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
     Ok((handle, max_len))
 }
 
@@ -1799,18 +1869,33 @@ pub fn build_inotify_read_response_ok(payload: &[u8]) -> OwnedFrame {
     body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(payload);
-    OwnedFrame { opcode: Opcode::InotifyReadResponse, status: StatusCode::Ok, caller_pid: 0, body }
+    OwnedFrame {
+        opcode: Opcode::InotifyReadResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
 }
 
 pub fn parse_inotify_read_response_body(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     if body.len() < 8 {
-        return Err(ProtocolError::WrongBodyLen { opcode: Opcode::InotifyReadResponse, got: body.len(), want: 8 });
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyReadResponse,
+            got: body.len(),
+            want: 8,
+        });
     }
     let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
     let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
-    if reserved != 0 { return Err(ProtocolError::NonZeroReserved { reserved }); }
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
     if body.len() != 8 + len {
-        return Err(ProtocolError::WrongBodyLen { opcode: Opcode::InotifyReadResponse, got: body.len(), want: 8 + len });
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyReadResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
     }
     Ok(body[8..].to_vec())
 }

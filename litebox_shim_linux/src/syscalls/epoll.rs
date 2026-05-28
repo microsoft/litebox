@@ -53,6 +53,7 @@ const MAX_SOCKET_SETTLE_POLLS: usize = 16;
 pub(crate) enum EpollDescriptor<FS: ShimFS> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
     Signalfd(Arc<TypedFd<super::signalfd::SignalfdSubsystem>>),
+    Inotify(Arc<TypedFd<super::inotify::InotifySubsystem>>),
     Epoll(EntryHandle<Platform, super::epoll::EpollSubsystem<FS>>),
     File(Arc<crate::FileFd<FS>>),
     Socket(Arc<super::net::SocketFd>),
@@ -96,6 +97,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             }
             crate::RawFdRef::BrokerPty(fd) => Ok(EpollDescriptor::BrokerPty(Arc::clone(fd))),
             crate::RawFdRef::Signalfd(fd) => Ok(EpollDescriptor::Signalfd(Arc::clone(fd))),
+            crate::RawFdRef::Inotify(fd) => Ok(EpollDescriptor::Inotify(Arc::clone(fd))),
         })?
     }
 }
@@ -103,6 +105,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
 enum DescriptorRef<FS: ShimFS> {
     Eventfd(Weak<TypedFd<super::eventfd::EventfdSubsystem>>),
     Signalfd(Weak<TypedFd<super::signalfd::SignalfdSubsystem>>),
+    Inotify(Weak<TypedFd<super::inotify::InotifySubsystem>>),
     Epoll(WeakEntryHandle<Platform, super::epoll::EpollSubsystem<FS>>),
     File(Weak<crate::FileFd<FS>>),
     Socket(Weak<super::net::SocketFd>),
@@ -120,6 +123,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
         match value {
             EpollDescriptor::Eventfd(file) => Self::Eventfd(Arc::downgrade(file)),
             EpollDescriptor::Signalfd(file) => Self::Signalfd(Arc::downgrade(file)),
+            EpollDescriptor::Inotify(file) => Self::Inotify(Arc::downgrade(file)),
             EpollDescriptor::Epoll(file) => Self::Epoll(file.downgrade()),
             EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
@@ -137,6 +141,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
         match self {
             DescriptorRef::Eventfd(eventfd) => eventfd.upgrade().map(EpollDescriptor::Eventfd),
             DescriptorRef::Signalfd(signalfd) => signalfd.upgrade().map(EpollDescriptor::Signalfd),
+            DescriptorRef::Inotify(inotify) => inotify.upgrade().map(EpollDescriptor::Inotify),
             DescriptorRef::Epoll(epoll) => epoll.upgrade().map(EpollDescriptor::Epoll),
             DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
@@ -156,6 +161,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
         match self {
             DescriptorRef::Eventfd(_) => "Eventfd",
             DescriptorRef::Signalfd(_) => "Signalfd",
+            DescriptorRef::Inotify(_) => "Inotify",
             DescriptorRef::Epoll(_) => "Epoll",
             DescriptorRef::File(_) => "File",
             DescriptorRef::Socket(_) => "Socket",
@@ -166,6 +172,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerPty(_) => "BrokerPty",
             DescriptorRef::BrokerSocketPair(_) => "BrokerSocketPair",
             DescriptorRef::BrokerTcpConn(_) => "BrokerTcpConn",
+            DescriptorRef::Inotify(_) => "Inotify",
         }
     }
 
@@ -175,6 +182,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerTcpConn(tcp_conn) => tcp_conn.upgrade().is_some(),
             DescriptorRef::Eventfd(_)
             | DescriptorRef::Signalfd(_)
+            | DescriptorRef::Inotify(_)
             | DescriptorRef::Epoll(_)
             | DescriptorRef::File(_)
             | DescriptorRef::Pipe(_)
@@ -209,6 +217,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 Some(handle.with_entry(|entry| poll(entry)))
             }
             EpollDescriptor::Signalfd(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
+            EpollDescriptor::Inotify(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
@@ -272,6 +284,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
     fn needs_host_poll(&self, global: &GlobalState<FS>, fs: &FS) -> bool {
         match self {
             EpollDescriptor::Signalfd(_) => false,
+            EpollDescriptor::Inotify(_) => false,
             EpollDescriptor::Eventfd(fd) => global
                 .litebox
                 .descriptor_table()
@@ -807,6 +820,7 @@ impl<FS: ShimFS> EpollFile<FS> {
             let fd_type = match file {
                 EpollDescriptor::Eventfd(_) => "Eventfd",
                 EpollDescriptor::Signalfd(_) => "Signalfd",
+                EpollDescriptor::Inotify(_) => "Inotify",
                 EpollDescriptor::Epoll(_) => "Epoll",
                 EpollDescriptor::File(_) => "File",
                 EpollDescriptor::Socket(_) => "Socket",
@@ -899,6 +913,7 @@ impl EpollEntryKey {
         let object_id = match desc {
             EpollDescriptor::Eventfd(file) => file.object_id(),
             EpollDescriptor::Signalfd(file) => file.object_id(),
+            EpollDescriptor::Inotify(file) => file.object_id(),
             EpollDescriptor::Epoll(file) => file.object_id(),
             EpollDescriptor::File(file) => file.object_id(),
             EpollDescriptor::Socket(socket_fd) => socket_fd.object_id(),

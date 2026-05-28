@@ -58,17 +58,23 @@ impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable
     }
 
     fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
-        self.client.dup_handle(handle).map_err(client_err_to_broker_err)
+        self.client
+            .dup_handle(handle)
+            .map_err(client_err_to_broker_err)
     }
 
     fn query_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
-        self.client.query_events(handle).map_err(client_err_to_broker_err)
+        self.client
+            .query_events(handle)
+            .map_err(client_err_to_broker_err)
     }
 }
 
 impl BrokerInotifyProvider for RunnerBrokerInotifyProvider {
     fn inotify_init1(&self, flags: u32) -> Result<u64, BrokerOpError> {
-        self.client.inotify_init1(flags).map_err(client_err_to_broker_err)
+        self.client
+            .inotify_init1(flags)
+            .map_err(client_err_to_broker_err)
     }
 
     fn inotify_add_watch(&self, handle: u64, path: &str, mask: u32) -> Result<i32, BrokerOpError> {

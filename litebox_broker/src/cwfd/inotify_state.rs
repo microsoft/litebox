@@ -74,13 +74,19 @@ impl InotifyState {
         if path.is_empty() || mask == 0 {
             return Err(());
         }
-        let mut next = self.next_watch_descriptor.lock().expect("InotifyState poisoned");
+        let mut next = self
+            .next_watch_descriptor
+            .lock()
+            .expect("InotifyState poisoned");
         let wd = *next;
         *next = next.checked_add(1).ok_or(())?;
-        self.watches
-            .lock()
-            .expect("InotifyState poisoned")
-            .insert(wd, InotifyWatch { path: path.clone(), mask });
+        self.watches.lock().expect("InotifyState poisoned").insert(
+            wd,
+            InotifyWatch {
+                path: path.clone(),
+                mask,
+            },
+        );
         if let Some(state) = self.self_ref.upgrade() {
             self.dispatcher.register(path, wd, mask, &state);
         }
@@ -105,7 +111,12 @@ impl InotifyState {
         self.queue
             .lock()
             .expect("InotifyState poisoned")
-            .push_back(InotifyEventRecord { wd, mask, cookie, name });
+            .push_back(InotifyEventRecord {
+                wd,
+                mask,
+                cookie,
+                name,
+            });
         self.subscriptions.notify(NOTIFY_EVENT_IN);
     }
 
@@ -162,7 +173,8 @@ impl StateObject for InotifyState {
         events_mask: u32,
         sender: Arc<Mutex<NotificationSender>>,
     ) -> Result<(), SubscribeError> {
-        self.subscriptions.add(subscription_id, events_mask, sender)?;
+        self.subscriptions
+            .add(subscription_id, events_mask, sender)?;
         let initial = self.current_events() & events_mask;
         if initial != 0 {
             self.subscriptions.notify(initial);

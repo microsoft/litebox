@@ -763,7 +763,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerSocketPair(_fd) => None, // non-PTY descriptor has no PTY rdev
                 crate::RawFdRef::BrokerTcpConn(_fd) => None, // non-PTY descriptor has no PTY rdev
                 crate::RawFdRef::BrokerPty(_fd) => None, // direct BrokerPty lookup is handled above
-                crate::RawFdRef::Signalfd(_fd) => None,  // non-PTY descriptor has no PTY rdev,
+                crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => None, // non-PTY descriptor has no PTY rdev,
             })
             .ok()
             .flatten()
@@ -1437,7 +1437,9 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                        Err(Errno::ENOTDIR)
+                    } // real Linux: ENOTDIR for non-directory fd
                 })?;
                 let file = file?;
                 {
@@ -1525,7 +1527,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerSocketPair(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::BrokerTcpConn(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
                 crate::RawFdRef::BrokerPty(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
-                crate::RawFdRef::Signalfd(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
             })
             .flatten()
     }
@@ -1613,7 +1615,9 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                        Err(Errno::ENOTDIR)
+                    } // real Linux: ENOTDIR for non-directory fd
                 })?
             }
         }
@@ -1685,7 +1689,9 @@ impl<FS: ShimFS> Task<FS> {
                         crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                         crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                         crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                        crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                            Err(Errno::ENOTDIR)
+                        } // real Linux: ENOTDIR for non-directory fd
                     })?
                 }
             }
@@ -1805,6 +1811,20 @@ impl<FS: ShimFS> Task<FS> {
                     result => return result,
                 }
             }
+        }
+
+        if let Ok(inofd) = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<super::inotify::InotifySubsystem>(raw_fd)
+        {
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&inofd)
+                .ok_or(Errno::EBADF)?;
+            return handle.with_entry(|file| file.read(buf));
         }
 
         if let Some(instance) = files.inotify_instances.lock().get(&raw_fd).cloned() {
@@ -2022,6 +2042,7 @@ impl<FS: ShimFS> Task<FS> {
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|entry| entry.read(&mut buf.borrow_mut()))
                 }
+                crate::RawFdRef::Inotify(_fd) => Err(Errno::EINVAL),
             })
             .flatten()
     }
@@ -2207,7 +2228,7 @@ impl<FS: ShimFS> Task<FS> {
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
                 }
-                crate::RawFdRef::Signalfd(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
             })
             .flatten();
         if let Err(Errno::EPIPE) = res {
@@ -2583,7 +2604,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
                 crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
                 crate::RawFdRef::BrokerPty(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
-                crate::RawFdRef::Signalfd(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
             })
             .flatten()
     }
@@ -2780,7 +2801,9 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                        Err(Errno::ENOTDIR)
+                    } // real Linux: ENOTDIR for non-directory fd
                 })?
             }
         }
@@ -2804,7 +2827,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::BrokerSocketPair(_) => (),
             crate::RawFdRef::BrokerTcpConn(_) => (),
             crate::RawFdRef::BrokerPty(_) => (),
-            crate::RawFdRef::Signalfd(_) => (),
+            crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => (),
         })?;
         Ok(())
     }
@@ -2884,7 +2907,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-            crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
         })?
     }
 
@@ -3050,6 +3073,15 @@ impl<FS: ShimFS> Task<FS> {
                     fd.object_id().as_u64(),
                 );
             }
+            drop(rds);
+            let entry = {
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                dt.remove(&fd)
+            };
+            drop(entry);
+            return Ok(());
+        }
+        if let Ok(fd) = rds.fd_consume_raw_integer::<super::inotify::InotifySubsystem>(raw_fd) {
             drop(rds);
             let entry = {
                 let mut dt = self.global.litebox.descriptor_table_mut();
@@ -3281,6 +3313,13 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
             }
             crate::RawFdRef::Signalfd(fd) => {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            }
+            crate::RawFdRef::Inotify(fd) => {
                 let _old = self
                     .global
                     .litebox
@@ -3551,6 +3590,7 @@ impl<FS: ShimFS> Task<FS> {
                         read_once_to_iovecs(iovs, || self.park_if_deferred(), |buf| entry.read(buf))
                     })
                 }
+                crate::RawFdRef::Inotify(_fd) => Err(Errno::EINVAL),
             })
             .flatten()
     }
@@ -3649,6 +3689,7 @@ fn fcntl_status_flags<FS: ShimFS>(
             crate::RawFdRef::BrokerTcpConn(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::BrokerPty(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::Signalfd(fd) => getfl_from_handle!(fd),
+            crate::RawFdRef::Inotify(fd) => getfl_from_handle!(fd),
         })
         .flatten()
         .map(|flags| flags & OFlags::STATUS_FLAGS_MASK)
@@ -3943,7 +3984,7 @@ impl<FS: ShimFS> Task<FS> {
                         write_once_from_iovecs(iovs, |buf| entry.write(&self.wait_cx(), buf))
                     })
                 }
-                crate::RawFdRef::Signalfd(_fd) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
             })
             .flatten();
         if let Err(Errno::EPIPE) = res {
@@ -4020,7 +4061,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerSocketPair(_) => Ok(()),
                     crate::RawFdRef::BrokerTcpConn(_) => Ok(()),
                     crate::RawFdRef::BrokerPty(_) => Ok(()),
-                    crate::RawFdRef::Signalfd(_) => Ok(()),
+                    crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Ok(()),
                 })?;
             }
             FsPath::FdRelative { fd, path } => {
@@ -4044,7 +4085,9 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                        Err(Errno::ENOTDIR)
+                    } // real Linux: ENOTDIR for non-directory fd
                 })?;
             }
         };
@@ -4305,7 +4348,7 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerSocketPair(_) => (),
                     crate::RawFdRef::BrokerTcpConn(_) => (),
                     crate::RawFdRef::BrokerPty(_) => (),
-                    crate::RawFdRef::Signalfd(_) => (),
+                    crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => (),
                 })?;
                 Err(Errno::ENOENT)
             }
@@ -4338,7 +4381,9 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                        Err(Errno::ENOTDIR)
+                    } // real Linux: ENOTDIR for non-directory fd
                 })?
             }
         }?;
@@ -4639,16 +4684,32 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
             }
             crate::RawFdRef::Signalfd(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
-                // Phase F: broker-backed socketpair endpoint. Reports
-                // as AF_UNIX socket (S_IFSOCK) with RDWR mode. No
-                // direction byte — both endpoints are bidirectional.
                 let read_write_mode = Mode::RUSR | Mode::WUSR;
                 Ok(FileStat {
-                    st_dev: PIPEFS_DEV.truncate(),
+                    st_dev: ANON_INODE_DEV.truncate(),
                     st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (read_write_mode.bits()
-                        | litebox_common_linux::InodeType::Socket as u32)
+                        | litebox_common_linux::InodeType::File as u32)
+                        .truncate(),
+                    st_uid: uid,
+                    st_gid: gid,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            }
+            crate::RawFdRef::Inotify(fd) => {
+                let ino = get_or_assign_anon_ino(task, fd);
+                let read_write_mode = Mode::RUSR;
+                Ok(FileStat {
+                    st_dev: ANON_INODE_DEV.truncate(),
+                    st_ino: ino.truncate(),
+                    st_nlink: 1,
+                    st_mode: (read_write_mode.bits()
+                        | litebox_common_linux::InodeType::File as u32)
                         .truncate(),
                     st_uid: uid,
                     st_gid: gid,
@@ -4713,7 +4774,7 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
             crate::RawFdRef::BrokerSocketPair(_) => false, // host-PTY stat override only applies to FS aliases
             crate::RawFdRef::BrokerTcpConn(_) => false, // host-PTY stat override only applies to FS aliases
             crate::RawFdRef::BrokerPty(_) => false, // broker PTYs report their own synthetic stat
-            crate::RawFdRef::Signalfd(_) => false, // host-PTY stat override only applies to FS aliases,
+            crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => false, // host-PTY stat override only applies to FS aliases,
         })?;
         if should_override {
             fstat.st_dev = info.dev.truncate();
@@ -4783,6 +4844,7 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
         crate::RawFdRef::BrokerTcpConn(fd) => get_flags(global, fd),
         crate::RawFdRef::BrokerPty(fd) => get_flags(global, fd),
         crate::RawFdRef::Signalfd(fd) => get_flags(global, fd),
+        crate::RawFdRef::Inotify(fd) => get_flags(global, fd),
     })
 }
 
@@ -4816,6 +4878,7 @@ fn set_file_descriptor_flags<FS: ShimFS>(
         crate::RawFdRef::BrokerTcpConn(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::BrokerPty(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::Signalfd(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::Inotify(fd) => set_flags(global, fd, flags),
     })?;
     Ok(())
 }
@@ -5073,7 +5136,9 @@ impl<FS: ShimFS> Task<FS> {
                     crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-                    crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                        Err(Errno::ENOTDIR)
+                    } // real Linux: ENOTDIR for non-directory fd
                 })??
             }
         };
@@ -5486,6 +5551,22 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(())
                         })
                     }
+                    crate::RawFdRef::Inotify(fd) => {
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| {
+                            let diff = (file.get_status() & setfl_mask) ^ flags;
+                            if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                                log_unsupported!("unsupported flags");
+                            }
+                            file.set_status(flags);
+                            Ok(())
+                        })
+                    }
                 })??;
                 Ok(0)
             }
@@ -5602,7 +5683,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-            crate::RawFdRef::Signalfd(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
         })??;
 
         let mut new_cwd = dir_path;
@@ -5821,28 +5902,20 @@ impl<FS: ShimFS> Task<FS> {
         if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK).complement()) {
             return Err(Errno::EINVAL);
         }
-
-        let mut eventfd_flags = EfdFlags::empty();
-        if flags.contains(OFlags::CLOEXEC) {
-            eventfd_flags |= EfdFlags::CLOEXEC;
-        }
-        if flags.contains(OFlags::NONBLOCK) {
-            eventfd_flags |= EfdFlags::NONBLOCK;
-        }
-
-        let eventfd = super::eventfd::EventFile::new(0, eventfd_flags);
+        let Some(provider) = super::inotify::broker_inotify_provider() else {
+            return Err(Errno::ENOSYS);
+        };
+        let handle = provider
+            .inotify_init1(flags.bits() as u32)
+            .map_err(super::broker_backed::broker_err_to_errno)?;
+        let file = super::inotify::InotifyFile::new(provider, handle, flags);
         let mut dt = self.global.litebox.descriptor_table_mut();
-        let typed = dt.insert::<super::eventfd::EventfdSubsystem>(eventfd);
+        let typed = dt.insert::<super::inotify::InotifySubsystem>(file);
         if flags.contains(OFlags::CLOEXEC) {
             let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        let eventfd_handle = dt.entry_handle(&typed).ok_or(Errno::EBADF)?;
         drop(dt);
-
-        let state = Arc::new(litebox::sync::Mutex::new(InotifyInstanceState::new(
-            eventfd_handle,
-        )));
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
             self.global
@@ -5852,8 +5925,6 @@ impl<FS: ShimFS> Task<FS> {
                 .unwrap();
             Errno::EMFILE
         })?;
-        files.register_inotify_fd(raw_fd, state.clone());
-        self.global.inotify_instances.lock().push(state);
         Ok(raw_fd.try_into().unwrap())
     }
 
@@ -5869,10 +5940,20 @@ impl<FS: ShimFS> Task<FS> {
         let resolved = self.resolve_path(pathname)?;
         self.do_stat(resolved.clone(), true)?;
         let resolved = resolved.into_string().map_err(|_| Errno::EINVAL)?;
-        let entries = self.inotify_dir_snapshot(&resolved);
-        self.files.borrow().with_inotify_fd(raw_fd, |state| {
-            state
-                .add_watch(resolved.clone(), mask, entries)
+        let files = self.files.borrow();
+        let fd = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<super::inotify::InotifySubsystem>(raw_fd)
+            .map_err(|_| Errno::EBADF)?;
+        let handle = self
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&fd)
+            .ok_or(Errno::EBADF)?;
+        handle.with_entry(|file| {
+            file.add_watch(&resolved, mask)
                 .and_then(|wd| u32::try_from(wd).map_err(|_| Errno::EINVAL))
         })
     }
@@ -5881,9 +5962,19 @@ impl<FS: ShimFS> Task<FS> {
         let raw_fd = u32::try_from(fd)
             .map_err(|_| Errno::EBADF)
             .and_then(|fd| usize::try_from(fd).map_err(|_| Errno::EBADF))?;
-        self.files
-            .borrow()
-            .with_inotify_fd(raw_fd, |state| state.remove_watch(wd))
+        let files = self.files.borrow();
+        let fd = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<super::inotify::InotifySubsystem>(raw_fd)
+            .map_err(|_| Errno::EBADF)?;
+        let handle = self
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&fd)
+            .ok_or(Errno::EBADF)?;
+        handle.with_entry(|file| file.rm_watch(wd))
     }
 
     pub fn sys_timerfd_create(&self, clockid: ClockId, flags: TimerfdFlags) -> Result<u32, Errno> {
@@ -6638,8 +6729,8 @@ impl<FS: ShimFS> Task<FS> {
                         crate::RawFdRef::BrokerPty(_fd) => {
                             todo!("FIONREAD on broker PTY: real Linux returns queued terminal input byte count")
                         }
-                        crate::RawFdRef::Signalfd(_fd) => {
-                            Err(Errno::ENOTTY) // real Linux: ENOTTY for FIONREAD on signalfd
+                        crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                            Err(Errno::ENOTTY)
                         },
                     })
                     .flatten()
@@ -6820,10 +6911,20 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(())
                         }
                         crate::RawFdRef::Signalfd(fd) => {
-                            // Signalfd: O_NONBLOCK lives in the shim-side
-                            // `status` AtomicU32; read paths consult
-                            // `get_status().contains(NONBLOCK)` before issuing
-                            // broker RPCs. No host fd to toggle.
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                let mut flags = file.get_status();
+                                flags.set(OFlags::NONBLOCK, val != 0);
+                                file.set_status(flags);
+                            });
+                            Ok(())
+                        }
+                        crate::RawFdRef::Inotify(fd) => {
                             let handle = self
                                 .global
                                 .litebox
@@ -6938,6 +7039,14 @@ impl<FS: ShimFS> Task<FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
                     Ok(0)
                 }
+                crate::RawFdRef::Inotify(fd) => {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                }
             })?,
             IoctlArg::FIONCLEX => files.run_on_raw_fd(desc, |raw_fd_ref| match raw_fd_ref {
                 crate::RawFdRef::Fs(fd) => {
@@ -7036,6 +7145,14 @@ impl<FS: ShimFS> Task<FS> {
                         .set_fd_metadata(fd, FileDescriptorFlags::empty());
                     Ok(0)
                 }
+                crate::RawFdRef::Inotify(fd) => {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                }
             })?,
             IoctlArg::TIOCGPTPEER(open_flags) => {
                 // TIOCGPTPEER: open the slave side of a PTY master, returning a new fd.
@@ -7065,8 +7182,8 @@ impl<FS: ShimFS> Task<FS> {
                             "BrokerPty descriptors are handled by the direct TIOCGPTPEER branch before run_on_raw_fd"
                         )
                     }
-                    crate::RawFdRef::Signalfd(_) => {
-                        Err(Errno::ENOTTY) // real Linux: ENOTTY for TIOCGPTPEER on signalfd
+                    crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                        Err(Errno::ENOTTY)
                     },
                 })??;
                 // Drop borrows before opening (which needs write access).
@@ -7169,8 +7286,8 @@ impl<FS: ShimFS> Task<FS> {
                             "BrokerPty descriptors are handled by the direct terminal-ioctl branch before run_on_raw_fd"
                         )
                     }
-                    crate::RawFdRef::Signalfd(_fd) => {
-                        Err(Errno::ENOTTY) // real Linux: ENOTTY for terminal ioctls on signalfd
+                    crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                        Err(Errno::ENOTTY)
                     },
                 })?
             }
@@ -7890,6 +8007,16 @@ impl<FS: ShimFS> Task<FS> {
                 target,
                 min_fd,
             ),
+            crate::RawFdRef::Inotify(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
         });
         let new_fd = match new_fd {
             Ok(Ok(fd)) => fd,
@@ -8049,6 +8176,13 @@ impl<FS: ShimFS> Task<FS> {
                                 .set_fd_metadata(fd, FileDescriptorFlags::empty());
                             Ok(())
                         }
+                        crate::RawFdRef::Inotify(fd) => {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        }
                     })
                     .flatten()?;
                 return Ok(oldfd);
@@ -8185,7 +8319,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::BrokerSocketPair(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerTcpConn(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
             crate::RawFdRef::BrokerPty(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
-            crate::RawFdRef::Signalfd(_fd) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
         })?
     }
 }

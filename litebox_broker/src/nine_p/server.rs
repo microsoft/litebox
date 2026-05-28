@@ -369,7 +369,6 @@ impl Server {
         }
     }
 
-
     fn guest_path_for_host(&self, path: &Path) -> String {
         let stripped = path.strip_prefix(&self.root).unwrap_or(path);
         let s = stripped.to_string_lossy();
@@ -395,7 +394,8 @@ impl Server {
         self.notify_inotify_parent(parent, mask, cookie, name);
         if mask == IN_MODIFY {
             let guest_path = self.guest_path_for_host(path);
-            self.inotify_dispatcher.dispatch(&guest_path, mask, cookie, "");
+            self.inotify_dispatcher
+                .dispatch(&guest_path, mask, cookie, "");
         }
     }
 
@@ -1945,7 +1945,7 @@ impl Server {
                 self.invalidate_canonical_cache(&resolved);
                 self.notify_inotify_path(&resolved, IN_DELETE, 0);
                 Fcall::Rremove(fcall::Rremove {})
-            },
+            }
             Err(e) => io_error_response(e),
         }
     }

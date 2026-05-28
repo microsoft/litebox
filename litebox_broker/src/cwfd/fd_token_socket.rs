@@ -1197,8 +1197,13 @@ fn handle_control_connection_inner(
                     }
                     Opcode::Unsubscribe => {
                         // Unsubscribe is kind-agnostic: try fd-state first, then process-state.
-                        let state_result =
-                            state_handle_request(state_registry, inotify_dispatcher, conn_state, &frame, in_fds);
+                        let state_result = state_handle_request(
+                            state_registry,
+                            inotify_dispatcher,
+                            conn_state,
+                            &frame,
+                            in_fds,
+                        );
                         if matches!(
                             state_result.frame.status,
                             litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
@@ -1261,8 +1266,13 @@ fn handle_control_connection_inner(
                     | Opcode::PollTcpConnEvents
                     | Opcode::DupHandle => {
                         // State-object opcodes: route to state_service on the fd-state registry.
-                        let state_result =
-                            state_handle_request(state_registry, inotify_dispatcher, conn_state, &frame, in_fds);
+                        let state_result = state_handle_request(
+                            state_registry,
+                            inotify_dispatcher,
+                            conn_state,
+                            &frame,
+                            in_fds,
+                        );
                         SocketHandlerResult {
                             frame: state_result.frame,
                             out_fd: state_result.out_fd,
