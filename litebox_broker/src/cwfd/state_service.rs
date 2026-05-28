@@ -237,6 +237,8 @@ pub fn handle_request(
         Opcode::Release => handle_release_state(registry, request, in_fds),
         Opcode::DupHandle => handle_dup_handle(registry, request, in_fds),
         Opcode::QueryEvents => handle_query_events(registry, request, in_fds),
+        #[cfg(debug_assertions)]
+        Opcode::DebugQueryStateObject => handle_debug_query_state_object(registry, request, in_fds),
         Opcode::RegisterProcess => handle_register_process(registry, request, in_fds),
         Opcode::SubscribeProcessExit => {
             handle_subscribe_process_exit(registry, conn, request, in_fds)
@@ -1976,6 +1978,41 @@ fn protocol_err(response_opcode: Opcode) -> HandlerResult {
 fn status_err(response_opcode: Opcode, status: StatusCode) -> HandlerResult {
     HandlerResult {
         frame: build_error_response(response_opcode, status),
+        out_fd: None,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn handle_debug_query_state_object(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::DebugQueryStateObjectResponse);
+    }
+    let handle_id =
+        match litebox_common_linux::fd_token_protocol::parse_debug_query_state_object_request(
+            request.body,
+        ) {
+            Ok(id) => id,
+            Err(_) => return protocol_err(Opcode::DebugQueryStateObjectResponse),
+        };
+    let (tag, refcount, debug_info) = match registry.debug_query(StateHandle::from_id(handle_id)) {
+        Ok(info) => info,
+        Err(_) => {
+            return status_err(
+                Opcode::DebugQueryStateObjectResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    HandlerResult {
+        frame: litebox_common_linux::fd_token_protocol::build_debug_query_state_object_response_ok(
+            tag.as_u8(),
+            refcount,
+            &debug_info,
+        ),
         out_fd: None,
     }
 }

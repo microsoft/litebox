@@ -31,8 +31,107 @@ use litebox_platform_multiplex::Platform;
 
 use crate::syscalls::signal::siginfo_kernel;
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
-use core::fmt::Write as _;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{any::TypeId, fmt::Write as _};
+
+const LITEBOX_IOCTL_KIND_TYPEID_INVARIANT: u32 = 0x4c42_4901;
+const LITEBOX_IOCTL_DEBUG_BUF_LEN: usize = 4096;
+
+impl<FS: ShimFS> Task<FS> {
+    fn expected_descriptor_type(
+        kind: litebox::fd::SubsystemKind,
+    ) -> Option<(TypeId, &'static str)> {
+        Some(match kind {
+            litebox::fd::SubsystemKind::Fs => (
+                TypeId::of::<<FS as FdEnabledSubsystem>::Entry>(),
+                core::any::type_name::<<FS as FdEnabledSubsystem>::Entry>(),
+            ),
+            litebox::fd::SubsystemKind::Net => (
+                TypeId::of::<<litebox::net::Network<Platform> as FdEnabledSubsystem>::Entry>(),
+                core::any::type_name::<
+                    <litebox::net::Network<Platform> as FdEnabledSubsystem>::Entry,
+                >(),
+            ),
+            litebox::fd::SubsystemKind::Pipes => (
+                TypeId::of::<litebox::pipes::DescriptorEntry<Platform>>(),
+                core::any::type_name::<litebox::pipes::DescriptorEntry<Platform>>(),
+            ),
+            litebox::fd::SubsystemKind::Eventfd => (
+                TypeId::of::<super::eventfd::EventFile<Platform>>(),
+                core::any::type_name::<super::eventfd::EventFile<Platform>>(),
+            ),
+            litebox::fd::SubsystemKind::Epoll => (
+                TypeId::of::<super::epoll::EpollFile<FS>>(),
+                core::any::type_name::<super::epoll::EpollFile<FS>>(),
+            ),
+            litebox::fd::SubsystemKind::Unix => (
+                TypeId::of::<super::unix::UnixSocket<FS>>(),
+                core::any::type_name::<super::unix::UnixSocket<FS>>(),
+            ),
+            litebox::fd::SubsystemKind::ExternalFd => (
+                TypeId::of::<super::external_fd::ExternalFd>(),
+                core::any::type_name::<super::external_fd::ExternalFd>(),
+            ),
+            litebox::fd::SubsystemKind::BrokerPipe => (
+                TypeId::of::<super::broker_pipe::BrokerPipeFd<Platform>>(),
+                core::any::type_name::<super::broker_pipe::BrokerPipeFd<Platform>>(),
+            ),
+            litebox::fd::SubsystemKind::BrokerSocketPair => (
+                TypeId::of::<super::broker_socketpair::BrokerSocketPairFd<Platform>>(),
+                core::any::type_name::<super::broker_socketpair::BrokerSocketPairFd<Platform>>(),
+            ),
+            litebox::fd::SubsystemKind::BrokerPty => (
+                TypeId::of::<super::broker_pty::BrokerPtyFd<Platform>>(),
+                core::any::type_name::<super::broker_pty::BrokerPtyFd<Platform>>(),
+            ),
+            litebox::fd::SubsystemKind::Signalfd => (
+                TypeId::of::<super::signalfd::SignalfdFile>(),
+                core::any::type_name::<super::signalfd::SignalfdFile>(),
+            ),
+            litebox::fd::SubsystemKind::Inotify => (
+                TypeId::of::<super::inotify::InotifyFile>(),
+                core::any::type_name::<super::inotify::InotifyFile>(),
+            ),
+            litebox::fd::SubsystemKind::BrokerTcpConn => (
+                TypeId::of::<super::broker_tcp_conn::BrokerTcpConnFd<Platform>>(),
+                core::any::type_name::<super::broker_tcp_conn::BrokerTcpConnFd<Platform>>(),
+            ),
+        })
+    }
+
+    fn debug_kind_typeid_invariant_report(&self) -> String {
+        let dt = self.global.litebox.descriptor_table();
+        let mut mismatches = Vec::new();
+        let mut total = 0usize;
+        for (fd, kind, actual) in dt.iter_with_kind() {
+            total += 1;
+            if kind == litebox::fd::SubsystemKind::Fs {
+                continue;
+            }
+            match Self::expected_descriptor_type(kind) {
+                Some((expected, _expected_name)) if expected == actual => {}
+                Some((expected, expected_name)) => mismatches.push(alloc::format!(
+                    "fd={fd} kind={kind:?} expected={expected:?} ({expected_name}) actual={actual:?}"
+                )),
+                None => mismatches.push(alloc::format!(
+                    "fd={fd} kind={kind:?} has no registered expected TypeId; actual={actual:?}"
+                )),
+            }
+        }
+        if mismatches.is_empty() {
+            alloc::format!("ok: checked {total} descriptors")
+        } else {
+            let mut out = alloc::format!(
+                "kind/typeid mismatches ({} of {total} descriptors):",
+                mismatches.len()
+            );
+            for mismatch in mismatches {
+                let _ = write!(out, "\n{mismatch}");
+            }
+            out
+        }
+    }
+}
 
 fn host_stdio_source_for_path(path: &str) -> Option<i32> {
     match path {
@@ -6549,6 +6648,23 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(desc) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
+
+        if let IoctlArg::Raw { cmd, arg } = &arg
+            && *cmd == LITEBOX_IOCTL_KIND_TYPEID_INVARIANT
+        {
+            let report = self.debug_kind_typeid_invariant_report();
+            let bytes = report.as_bytes();
+            let len = bytes.len().min(LITEBOX_IOCTL_DEBUG_BUF_LEN - 1);
+            arg.write_slice_at_offset(0, &bytes[..len])
+                .ok_or(Errno::EFAULT)?;
+            arg.write_at_offset(len.try_into().unwrap(), 0u8)
+                .ok_or(Errno::EFAULT)?;
+            return if report.starts_with("ok:") {
+                Ok(0)
+            } else {
+                Err(Errno::EIO)
+            };
+        }
 
         if desc <= 2 {
             // reason: unsupported variants intentionally share this fallback path.

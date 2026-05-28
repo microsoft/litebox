@@ -56,6 +56,16 @@ pub(crate) mod signal;
 #[cfg(test)]
 pub(crate) mod tests;
 
+static BROKER_INET_DELAY_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_broker_inet_delay_ns(ns: u64) {
+    BROKER_INET_DELAY_NS.store(ns, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn broker_inet_delay_ns() -> u64 {
+    BROKER_INET_DELAY_NS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 macro_rules! common_functions_for_file_status {
     () => {
         pub(crate) fn get_status(&self) -> litebox::fs::OFlags {
