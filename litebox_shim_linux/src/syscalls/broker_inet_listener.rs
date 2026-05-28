@@ -7,13 +7,18 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use litebox::{
-    event::{Events, IOPollable, observer::Observer, polling::Pollee},
+    event::{
+        Events, IOPollable,
+        observer::Observer,
+        polling::{Pollee, TryOpError},
+        wait::WaitContext,
+    },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::OFlags,
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{
-    broker_inet_listener_provider::BrokerInetListenerProvider,
+    broker_inet_listener_provider::{BrokerInetListenerProvider, BrokerOpError},
     cwfd::{
         broker_subscribable::BrokerSubscribable,
         notification_frame::{NOTIFY_EVENT_ERR, NOTIFY_EVENT_IN},
@@ -21,7 +26,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use super::broker_backed::BrokerBackedCommon;
+use super::broker_backed::{BrokerBackedCommon, broker_err_to_errno};
 
 static BROKER_INET_LISTENER_PROVIDER: once_cell::race::OnceBox<
     Arc<dyn BrokerInetListenerProvider>,
@@ -118,6 +123,47 @@ where
 
     pub(crate) fn bound_addr(&self) -> Option<[u8; 28]> {
         *self.bound_addr.lock()
+    }
+}
+
+impl BrokerInetListenerFd<Platform> {
+    pub(crate) fn bind(
+        &self,
+        sockaddr: &[u8],
+    ) -> Result<[u8; 28], litebox_common_linux::errno::Errno> {
+        let actual = self
+            .provider
+            .bind(self.handle(), sockaddr)
+            .map_err(broker_err_to_errno)?;
+        self.set_bound_addr(actual);
+        Ok(actual)
+    }
+
+    pub(crate) fn listen(&self, backlog: u32) -> Result<(), litebox_common_linux::errno::Errno> {
+        self.provider
+            .listen(self.handle(), backlog)
+            .map_err(broker_err_to_errno)
+    }
+
+    pub(crate) fn accept(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+    ) -> Result<(u64, [u8; 28]), litebox_common_linux::errno::Errno> {
+        self.common.ensure_subscribed(&self.pollee);
+        let nonblock = self.get_status().contains(OFlags::NONBLOCK);
+        self.pollee
+            .wait(cx, nonblock, Events::IN, || {
+                match self.provider.accept(self.handle()) {
+                    Ok(conn) => Ok(conn),
+                    Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
+                    Err(e) => Err(TryOpError::Other(broker_err_to_errno(e))),
+                }
+            })
+            .map_err(|e| match e {
+                TryOpError::TryAgain => litebox_common_linux::errno::Errno::EAGAIN,
+                TryOpError::WaitError(_) => litebox_common_linux::errno::Errno::EINTR,
+                TryOpError::Other(errno) => errno,
+            })
     }
 }
 
