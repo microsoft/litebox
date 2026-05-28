@@ -1922,12 +1922,25 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         if set_tid != 0 || set_tid_size != 0 {
+            // ENOSYS audit: clone set_tid array; reachable but not
+            // implemented. Real Linux supports this when the caller
+            // has CAP_SYS_ADMIN over the target pid namespace; the
+            // shim doesn't yet plumb pid pre-assignment through the
+            // broker, but should report a graceful ENOSYS rather
+            // than crashing the whole worker with todo!() so callers
+            // can detect and fall back to a plain clone3.
             log_unsupported!("clone with set_tid");
-            todo!("ENOSYS audit: clone set_tid array; reachable but not implemented");
+            return Err(Errno::ENOSYS);
         }
         if clone3 && flags.contains(CloneFlags::PIDFD) {
+            // ENOSYS audit: clone3 CLONE_PIDFD; reachable but not
+            // implemented. Real Linux populates the user-supplied
+            // pidfd_ptr with a fresh pidfd for the child; the shim
+            // would need to allocate a broker-backed pidfd up front
+            // and write it back. Return ENOSYS for now so callers
+            // can detect and fall back to clone3 + pidfd_open(child).
             log_unsupported!("clone3 with pidfd");
-            todo!("ENOSYS audit: clone3 CLONE_PIDFD; reachable but not implemented");
+            return Err(Errno::ENOSYS);
         }
 
         // Note `exit_signal` is ignored for threads; validated for fork.
