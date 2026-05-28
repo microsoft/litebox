@@ -29,6 +29,8 @@ use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
     build_create_eventfd_request, build_create_pidfd_request, build_create_pipe_request,
     build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
+    build_inotify_add_watch_request, build_inotify_init1_request, build_inotify_read_request,
+    build_inotify_rm_watch_request,
     build_deliver_signal_inbox_request, build_mark_process_exited_request,
     build_materialize_request, build_open_pty_slave_request, build_pidfd_exited_request,
     build_poll_tcp_conn_events_request, build_pty_ioctl_request, build_pty_read_request,
@@ -43,6 +45,7 @@ use crate::fd_token_protocol::{
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
     build_write_socketpair_request, build_write_tcp_conn_request, decode,
     parse_create_pidfd_response_ok, parse_create_pty_response_ok,
+    parse_inotify_add_watch_response_ok, parse_inotify_read_response_body,
     parse_create_socketpair_response_body, parse_handle_body, parse_open_pty_slave_response_ok,
     parse_pidfd_exited_response_ok, parse_poll_tcp_conn_events_response_ok,
     parse_pty_ioctl_response_body, parse_pty_read_response_body, parse_pty_write_response_ok,
@@ -861,6 +864,86 @@ impl FdTokenClient {
             StatusCode::InvalidValue => Err(ClientError::InvalidValue {
                 value: payload.len() as u64,
             }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+
+    /// Asks the broker to create an inotify state object.
+    pub fn inotify_init1(&self, flags: u32) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_inotify_init1_request(flags), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InotifyInit1Response)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment { opcode: resp.opcode });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_handle_body(resp.body, resp.opcode).map_err(ClientError::Protocol),
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    pub fn inotify_add_watch(
+        &self,
+        handle_id: u64,
+        path: &str,
+        mask: u32,
+    ) -> Result<i32, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inotify_add_watch_request(handle_id, path, mask),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InotifyAddWatchResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment { opcode: resp.opcode });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_inotify_add_watch_response_ok(resp.body).map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: mask as u64 }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inotify_rm_watch(&self, handle_id: u64, wd: i32) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_inotify_rm_watch_request(handle_id, wd), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InotifyRmWatchResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment { opcode: resp.opcode });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: wd as u64 }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inotify_read(&self, handle_id: u64, max_len: u32) -> Result<Option<Vec<u8>>, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_inotify_read_request(handle_id, max_len), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InotifyReadResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment { opcode: resp.opcode });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_inotify_read_response_body(resp.body)
+                .map(Some)
+                .map_err(ClientError::Protocol),
+            StatusCode::WouldBlock => Ok(None),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: max_len as u64 }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }
     }
