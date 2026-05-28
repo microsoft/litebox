@@ -28,6 +28,10 @@
         }                                                                     \
     } while (0)
 
+static inline long itimer_value_us(const struct itimerval *iv) {
+    return (long)iv->it_value.tv_sec * 1000000L + (long)iv->it_value.tv_usec;
+}
+
 static inline void die(const char *msg) {
     perror(msg);
     exit(1);

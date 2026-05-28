@@ -1021,10 +1021,9 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
             SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
             SyscallRequest::Pause => syscall!(sys_pause()),
-            SyscallRequest::GetITimer { which, curr_value } => curr_value
-                .write_at_offset(0, self.sys_getitimer(which))
-                .ok_or(Errno::EFAULT)
-                .map(|()| 0),
+            SyscallRequest::GetITimer { which, curr_value } => {
+                syscall!(sys_getitimer(which, curr_value))
+            }
             SyscallRequest::SetITimer {
                 which,
                 new_value,

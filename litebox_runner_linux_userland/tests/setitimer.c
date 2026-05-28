@@ -7,24 +7,9 @@
 // contract is exercised. Uses syscall(SYS_setitimer, ...) directly to hit the
 // raw kernel surface that LiteBox intercepts.
 
-#define _GNU_SOURCE
-#include <errno.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/syscall.h>
-#include <sys/time.h>
-#include <unistd.h>
+#include "helpers.h"
 
-#define TEST_ASSERT(cond, msg)                                                \
-    do {                                                                      \
-        if (!(cond)) {                                                        \
-            fprintf(stderr, "FAIL: %s (line %d): %s (errno=%d: %s)\n",        \
-                    __func__, __LINE__, msg, errno, strerror(errno));         \
-            exit(1);                                                          \
-        }                                                                     \
-    } while (0)
+#include <stdint.h>
 
 static int raw_setitimer(int which, const struct itimerval *new_value,
                          struct itimerval *old_value) {
@@ -50,7 +35,7 @@ static void test_arm_single_shot(void) {
     struct itimerval gv;
     memset(&gv, 0, sizeof(gv));
     TEST_ASSERT(raw_getitimer(ITIMER_REAL, &gv) == 0, "getitimer after arm");
-    long total_us = (long)gv.it_value.tv_sec * 1000000L + (long)gv.it_value.tv_usec;
+    long total_us = itimer_value_us(&gv);
     TEST_ASSERT(total_us > 0 && total_us <= 10 * 1000000L,
                 "it_value in (0, 10s]");
     TEST_ASSERT(gv.it_interval.tv_sec == 0 && gv.it_interval.tv_usec == 0,
@@ -75,6 +60,24 @@ static void test_disarm(void) {
                 "it_interval zero after disarm");
 }
 
+static void test_disarm_ignores_interval(void) {
+    struct itimerval nv = {{0, 0}, {10, 0}};
+    TEST_ASSERT(raw_setitimer(ITIMER_REAL, &nv, NULL) == 0, "arm precondition");
+
+    struct itimerval disarm = {{1, 0}, {0, 0}};
+    TEST_ASSERT(raw_setitimer(ITIMER_REAL, &disarm, NULL) == 0,
+                "disarm with nonzero interval success");
+
+    struct itimerval gv;
+    memset(&gv, 0xff, sizeof(gv));
+    TEST_ASSERT(raw_getitimer(ITIMER_REAL, &gv) == 0,
+                "getitimer after interval-only disarm");
+    TEST_ASSERT(gv.it_value.tv_sec == 0 && gv.it_value.tv_usec == 0,
+                "it_value zero after interval-only disarm");
+    TEST_ASSERT(gv.it_interval.tv_sec == 0 && gv.it_interval.tv_usec == 0,
+                "it_interval zero after interval-only disarm");
+}
+
 static void test_old_value_returns_previous(void) {
     // Set a 10s timer, then replace with a 5s timer and capture old_value.
     clear_alarm();
@@ -86,7 +89,7 @@ static void test_old_value_returns_previous(void) {
     memset(&old, 0xff, sizeof(old));
     TEST_ASSERT(raw_setitimer(ITIMER_REAL, &second, &old) == 0, "replace returns old");
 
-    long old_us = (long)old.it_value.tv_sec * 1000000L + (long)old.it_value.tv_usec;
+    long old_us = itimer_value_us(&old);
     TEST_ASSERT(old_us > 0 && old_us <= 10 * 1000000L,
                 "old it_value reflects first arm (<= 10s)");
     TEST_ASSERT(old.it_interval.tv_sec == 0 && old.it_interval.tv_usec == 0,
@@ -95,7 +98,7 @@ static void test_old_value_returns_previous(void) {
     // Replacement should be active now.
     struct itimerval gv;
     TEST_ASSERT(raw_getitimer(ITIMER_REAL, &gv) == 0, "getitimer after replace");
-    long now_us = (long)gv.it_value.tv_sec * 1000000L + (long)gv.it_value.tv_usec;
+    long now_us = itimer_value_us(&gv);
     TEST_ASSERT(now_us > 0 && now_us <= 5 * 1000000L,
                 "current it_value reflects replacement (<= 5s)");
     clear_alarm();
@@ -149,7 +152,7 @@ static void test_efault_bad_old_value(void) {
 
     struct itimerval gv;
     TEST_ASSERT(raw_getitimer(ITIMER_REAL, &gv) == 0, "getitimer after EFAULT");
-    long us = (long)gv.it_value.tv_sec * 1000000L + (long)gv.it_value.tv_usec;
+    long us = itimer_value_us(&gv);
     TEST_ASSERT(us > 0 && us <= 5 * 1000000L,
                 "timer was armed before EFAULT write (state mutated, Linux quirk)");
     clear_alarm();
@@ -179,7 +182,7 @@ static void test_alarm_setitimer_share_state(void) {
     memset(&old, 0xff, sizeof(old));
     TEST_ASSERT(raw_setitimer(ITIMER_REAL, &nv2, &old) == 0,
                 "setitimer over alarm-armed state");
-    long us = (long)old.it_value.tv_sec * 1000000L + (long)old.it_value.tv_usec;
+    long us = itimer_value_us(&old);
     TEST_ASSERT(us > 0 && us <= 10 * 1000000L,
                 "old.it_value reflects prior alarm(10)");
     TEST_ASSERT(old.it_interval.tv_sec == 0 && old.it_interval.tv_usec == 0,
@@ -200,6 +203,7 @@ int main(void) {
     printf("setitimer tests starting...\n");
     test_arm_single_shot();
     test_disarm();
+    test_disarm_ignores_interval();
     test_old_value_returns_previous();
     test_old_value_unarmed_returns_zero();
     test_einval_usec_out_of_range();

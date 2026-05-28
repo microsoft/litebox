@@ -6,40 +6,26 @@
 // Goes through syscall(SYS_getitimer, ...) to exercise the raw kernel surface
 // that LiteBox intercepts rather than the libc wrapper.
 
-#define _GNU_SOURCE
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/syscall.h>
-#include <sys/time.h>
-#include <unistd.h>
-
-#define TEST_ASSERT(cond, msg)                                                \
-    do {                                                                      \
-        if (!(cond)) {                                                        \
-            fprintf(stderr, "FAIL: %s (line %d): %s (errno=%d: %s)\n",        \
-                    __func__, __LINE__, msg, errno, strerror(errno));         \
-            exit(1);                                                          \
-        }                                                                     \
-    } while (0)
+#include "helpers.h"
 
 static int raw_getitimer(int which, struct itimerval *curr_value) {
     return (int)syscall(SYS_getitimer, which, curr_value);
 }
 
-static void test_getitimer_no_timer_set(void) {
-    // ITIMER_REAL with no timer armed: both substructures must be zero.
-    // Cancel any inherited alarm first so the slate is clean.
-    alarm(0);
+static void expect_unarmed_timer(int which, const char *op) {
     struct itimerval iv;
+
     memset(&iv, 0xff, sizeof(iv));
-    int rc = raw_getitimer(ITIMER_REAL, &iv);
-    TEST_ASSERT(rc == 0, "getitimer(ITIMER_REAL) success");
+    TEST_ASSERT(raw_getitimer(which, &iv) == 0, op);
     TEST_ASSERT(iv.it_value.tv_sec == 0 && iv.it_value.tv_usec == 0,
-                "it_value zero when no timer armed");
+                "it_value zero when timer is unarmed");
     TEST_ASSERT(iv.it_interval.tv_sec == 0 && iv.it_interval.tv_usec == 0,
-                "it_interval zero when no timer armed");
+                "it_interval zero when timer is unarmed");
+}
+
+static void test_getitimer_no_timer_set(void) {
+    alarm(0);
+    expect_unarmed_timer(ITIMER_REAL, "getitimer(ITIMER_REAL) unarmed");
 }
 
 static void test_getitimer_after_alarm(void) {
@@ -55,11 +41,7 @@ static void test_getitimer_after_alarm(void) {
     int rc = raw_getitimer(ITIMER_REAL, &iv);
     TEST_ASSERT(rc == 0, "getitimer success after alarm");
 
-    // it_value should be in (0, 10] seconds — a tv_sec of 9 or 10 with any
-    // microseconds is acceptable, depending on how much wall-clock time
-    // elapsed between alarm() and getitimer().
-    long total_us =
-        (long)iv.it_value.tv_sec * 1000000L + (long)iv.it_value.tv_usec;
+    long total_us = itimer_value_us(&iv);
     TEST_ASSERT(total_us > 0 && total_us <= 10 * 1000000L,
                 "it_value in (0, 10s] after alarm(10)");
     TEST_ASSERT(iv.it_interval.tv_sec == 0 && iv.it_interval.tv_usec == 0,
@@ -69,36 +51,24 @@ static void test_getitimer_after_alarm(void) {
 }
 
 static void test_getitimer_virtual_and_prof_zero(void) {
-    // ITIMER_VIRTUAL and ITIMER_PROF are valid `which` values. When no
-    // setitimer has armed them (and Linux's per-process default is "not
-    // armed"), getitimer reports zeroed itimerval.
     for (int which = ITIMER_VIRTUAL; which <= ITIMER_PROF; which++) {
-        struct itimerval iv;
-        memset(&iv, 0xff, sizeof(iv));
-        int rc = raw_getitimer(which, &iv);
-        TEST_ASSERT(rc == 0, "getitimer ITIMER_VIRTUAL/PROF success");
-        TEST_ASSERT(iv.it_value.tv_sec == 0 && iv.it_value.tv_usec == 0,
-                    "it_value zero for unarmed ITIMER_VIRTUAL/PROF");
-        TEST_ASSERT(iv.it_interval.tv_sec == 0 && iv.it_interval.tv_usec == 0,
-                    "it_interval zero for unarmed ITIMER_VIRTUAL/PROF");
+        expect_unarmed_timer(which, "getitimer ITIMER_VIRTUAL/PROF unarmed");
     }
 }
 
 static void test_getitimer_einval(void) {
-    // `which` outside {0, 1, 2} → EINVAL.
     struct itimerval iv;
     errno = 0;
     int rc = raw_getitimer(99, &iv);
     TEST_ASSERT(rc == -1 && errno == EINVAL,
-                "getitimer with bogus which → EINVAL");
+                "getitimer with bogus which -> EINVAL");
 }
 
 static void test_getitimer_efault(void) {
-    // NULL curr_value pointer → EFAULT.
     errno = 0;
     int rc = raw_getitimer(ITIMER_REAL, NULL);
     TEST_ASSERT(rc == -1 && errno == EFAULT,
-                "getitimer with NULL curr_value → EFAULT");
+                "getitimer with NULL curr_value -> EFAULT");
 }
 
 int main(void) {

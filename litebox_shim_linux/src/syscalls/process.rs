@@ -1203,12 +1203,15 @@ impl<FS: ShimFS> Task<FS> {
 
         let prev = match which {
             IntervalTimer::Real => {
-                // TODO: support periodic timers
-                if !new_interval.is_zero() {
+                if new_remaining.is_zero() {
+                    ItimerVal::single_shot(self.arm_real_timer(Duration::ZERO)?)
+                } else if !new_interval.is_zero() {
+                    // TODO: support periodic timers
                     log_unsupported!("setitimer: nonzero it_interval not supported");
                     return Err(Errno::ENOSYS);
+                } else {
+                    ItimerVal::single_shot(self.arm_real_timer(new_remaining)?)
                 }
-                ItimerVal::single_shot(self.arm_real_timer(new_remaining)?)
             }
             IntervalTimer::Virtual | IntervalTimer::Prof => {
                 log_unsupported!("setitimer: ITIMER_VIRTUAL/PROF not supported");
@@ -1223,7 +1226,11 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `getitimer`.
-    pub(crate) fn sys_getitimer(&self, which: IntervalTimer) -> ItimerVal {
+    pub(crate) fn sys_getitimer(
+        &self,
+        which: IntervalTimer,
+        curr_value: MutPtr<ItimerVal>,
+    ) -> Result<(), Errno> {
         let value = match which {
             IntervalTimer::Real => {
                 let alarm = self.process().alarm_timer.lock();
@@ -1235,7 +1242,9 @@ impl<FS: ShimFS> Task<FS> {
                 Duration::ZERO
             }
         };
-        ItimerVal::single_shot(value)
+        curr_value
+            .write_at_offset(0, ItimerVal::single_shot(value))
+            .ok_or(Errno::EFAULT)
     }
 
     /// Handle syscall `pause`.
