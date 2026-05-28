@@ -775,9 +775,6 @@ impl SessionManager {
     where
         F: for<'a> FnOnce(Option<&'a TaInstance>) -> Result<(), OpteeSmcReturnCode>,
     {
-        // Snapshot: was this UUID already known? If unknown and stays unknown after
-        // a failed load (i.e., invalid UUID), we'll evict the lock entry below.
-        let was_unknown = self.get_known_flags(uuid).is_none();
         let token = self.try_acquire_for_open(*uuid)?;
         let is_single_instance = token.uuid_lock.is_some();
 
@@ -803,11 +800,8 @@ impl SessionManager {
             *pending = pending.saturating_sub(1);
         }
 
-        if result.is_err() && was_unknown && self.get_known_flags(uuid).is_none() {
-            // Remove while still holding the lock (via `token`).
-            self.single_instance_locks.lock().remove(uuid);
-        }
-
+        // `single_instance_locks` entries are never evicted; safe removal
+        // would need generational tracking. Leak is bounded by distinct UUIDs.
         result
     }
 }
@@ -927,38 +921,15 @@ mod tests {
         manager.with_session(109, |_| Ok(())).unwrap();
     }
 
-    /// For an unknown UUID whose load fails, the per-UUID lock entry must
-    /// be evicted so it doesn't leak across malformed-UUID retries.
+    /// `single_instance_locks` entries are never evicted, even on failure
+    /// of a previously-unknown UUID.
     #[test]
-    fn with_ta_evicts_lock_entry_on_unknown_failure() {
+    fn with_ta_never_evicts_lock_entry() {
         let manager = SessionManager::new();
         let uuid = make_uuid(0xA9);
         assert!(manager.get_known_flags(&uuid).is_none());
 
         let _ = manager.with_ta(&uuid, |_| Err(OpteeSmcReturnCode::ENotAvail));
-
-        assert!(manager.single_instance_locks.lock().get(&uuid).is_none());
-    }
-
-    /// For a *known* UUID, the lock entry must be retained even on failure:
-    /// concurrent threads may already hold the same Arc, and removing it
-    /// would let a fresh entrant create a parallel mutex (split-brain).
-    #[test]
-    fn with_ta_keeps_lock_entry_after_known_uuid_failure() {
-        let manager = SessionManager::new();
-        let uuid = make_uuid(0xAA);
-        manager.register_new_session(
-            111,
-            make_shim(),
-            make_loaded_program(single_instance_flags()),
-            8,
-            uuid,
-        );
-
-        manager.with_ta(&uuid, |_| Ok(())).unwrap();
-        assert!(manager.single_instance_locks.lock().get(&uuid).is_some());
-
-        let _ = manager.with_ta(&uuid, |_| Err(OpteeSmcReturnCode::EBadCmd));
         assert!(manager.single_instance_locks.lock().get(&uuid).is_some());
     }
 
@@ -1037,7 +1008,7 @@ mod tests {
             .unwrap();
         assert_eq!(*manager.pending_count.lock(), 0);
 
-        // Failing create path on an unknown UUID — also evicts the lock entry.
+        // Failing create path on an unknown UUID.
         let _ = manager.with_ta(&uuid_single, |_| Err(OpteeSmcReturnCode::ENotAvail));
         assert_eq!(*manager.pending_count.lock(), 0);
 
