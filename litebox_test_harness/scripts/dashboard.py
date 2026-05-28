@@ -216,8 +216,8 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
 
     lines = ["## Tracked refs\n",
              "| Ref | Worktree | Pass | HEAD "
-             "| n-cov | n-tot | n-pass | n-fail "
-             "| l-cov | l-tot | l-pass | l-fail |",
+             "| native cov | native total | native pass | native fail "
+             "| litebox cov | litebox total | litebox pass | litebox fail |",
              "|---|---|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|"]
@@ -377,8 +377,8 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     now = now_ms()
     lines = ["## Result groups (per commit × dirty-state)\n",
              "| Tag | Sha | Dirty | Worktree(s) "
-             "| n-cov | n-tot | n-pass | n-fail "
-             "| l-cov | l-tot | l-pass | l-fail | Newest |",
+             "| native cov | native total | native pass | native fail "
+             "| litebox cov | litebox total | litebox pass | litebox fail | Newest |",
              "|---|---|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|---|"]
@@ -411,7 +411,7 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
 
 
 def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
-    """Aggregate the same n-cov / n-tot / n-pass / n-fail counts per
+    """Aggregate the same cov / total / pass / fail (per pass) counts per
     (suite, group) for both passes. "Total" here is the observed
     universe per (suite, group) — distinct test_ids seen in either
     pass; the producer doesn't carry a per-suite universe count, so
@@ -459,8 +459,8 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
 
     lines = ["## By suite × group (observed universe)\n",
              "| Suite | Group "
-             "| n-cov | n-tot | n-pass | n-fail "
-             "| l-cov | l-tot | l-pass | l-fail |",
+             "| native cov | native total | native pass | native fail "
+             "| litebox cov | litebox total | litebox pass | litebox fail |",
              "|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|"]
