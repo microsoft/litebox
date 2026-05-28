@@ -316,6 +316,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         "pipe" => BrokerHandleKind::Pipe,
         "unix_socket" => BrokerHandleKind::UnixSocket,
         "tcp_conn" => BrokerHandleKind::TcpConn,
+        "inet_listener" => BrokerHandleKind::InetListener,
         other => anyhow::bail!("broker-fd-bridge: bad kind {other:?}"),
     };
     let handle_id: u64 = parts[2]
@@ -359,7 +360,8 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Eventfd, Some(extra))
         | (BrokerHandleKind::Pidfd, Some(extra))
         | (BrokerHandleKind::Signalfd, Some(extra))
-        | (BrokerHandleKind::TcpConn, Some(extra)) => {
+        | (BrokerHandleKind::TcpConn, Some(extra))
+        | (BrokerHandleKind::InetListener, Some(extra)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
                 parts[1]
@@ -368,7 +370,8 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Eventfd, None)
         | (BrokerHandleKind::Pidfd, None)
         | (BrokerHandleKind::Signalfd, None)
-        | (BrokerHandleKind::TcpConn, None) => (None, None, None),
+        | (BrokerHandleKind::TcpConn, None)
+        | (BrokerHandleKind::InetListener, None) => (None, None, None),
     };
     let pty_id = if kind == BrokerHandleKind::Pty {
         match parts.get(4) {

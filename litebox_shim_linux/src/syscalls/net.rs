@@ -2812,9 +2812,23 @@ impl<FS: ShimFS> Task<FS> {
                             // Broker ptys are not broker-token-transferable over SCM yet.
                             Ok(false)
                         }
-                        crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) | crate::RawFdRef::BrokerInetListener(_) => {
-                            Ok(false)
+                        crate::RawFdRef::BrokerInetListener(typed) => {
+                            let entry_handle = dt
+                                .entry_handle::<super::broker_inet_listener::BrokerInetListenerSubsystem>(typed)
+                                .ok_or(Errno::EBADF)?;
+                            let (handle_id, provider) =
+                                entry_handle.with_entry(|e| (e.handle(), e.provider()));
+                            provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                            passed_tokens.push(
+                                litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::InetListener,
+                                    handle_id,
+                                )
+                                .map_err(|_| Errno::EINVAL)?,
+                            );
+                            Ok(true)
                         }
+                        crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Ok(false),
                     }
                 })??;
                 drop(files);
@@ -3432,6 +3446,50 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                     }
+                    SubsystemTag::InetListener => {
+                        let Some(provider) =
+                            super::broker_inet_listener::broker_inet_listener_provider()
+                        else {
+                            continue;
+                        };
+                        let handle_id = token.id();
+                        if provider.dup_handle(handle_id).is_err() {
+                            continue;
+                        }
+                        let status_flags = litebox::fs::OFlags::empty();
+                        let listener =
+                            super::broker_inet_listener::BrokerInetListenerFd::<Platform>::new(
+                                provider,
+                                handle_id,
+                                0,
+                                status_flags,
+                            );
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed = dt
+                            .insert::<super::broker_inet_listener::BrokerInetListenerSubsystem>(
+                                listener,
+                            );
+                        if cloexec {
+                            let _ = dt.set_fd_metadata(
+                                &typed,
+                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                            );
+                        }
+                        drop(dt);
+                        let files = self.files.borrow();
+                        match files.insert_raw_fd(typed) {
+                            Ok(raw_fd) => {
+                                installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                            }
+                            Err(typed) => {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .remove(&typed)
+                                    .unwrap();
+                            }
+                        }
+                    }
                     SubsystemTag::TcpSocket | SubsystemTag::Process | SubsystemTag::Unknown(_) => {
                         // Unsupported token kind on this worker; drop.
                     }
@@ -3440,7 +3498,6 @@ impl<FS: ShimFS> Task<FS> {
                     | SubsystemTag::Signalfd
                     | SubsystemTag::Timerfd
                     | SubsystemTag::Inotify
-                    | SubsystemTag::InetListener
                     | SubsystemTag::Pipe
                     | SubsystemTag::Pty => {
                         // Reserved for P2.A/B/C and later phases.
