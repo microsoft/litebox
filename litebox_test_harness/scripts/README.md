@@ -33,7 +33,40 @@ dashboard.py track <ref> <ci_worktree>       # register a tracked ref
 dashboard.py untrack <ref>                   # remove a tracked ref
 dashboard.py refs                            # list tracked refs
 dashboard.py auto [--interval SECS]          # autonomous fill driver
+dashboard.py stop                            # stop auto + reap descendants
 ```
+
+### Auto-driver lifecycle & cleanup contract
+
+The `auto` supervisor and the Rust test harness cooperate to
+guarantee no leaked processes or containers on any exit path
+(SIGTERM, cycle timeout, `dashboard.py stop`, even SIGKILL of cargo).
+Each layer cleans up what it started:
+
+| Layer | Owns | Cleanup mechanism |
+|---|---|---|
+| `dashboard.py auto` supervisor | `cargo` + every descendant in its PGID | Launches cargo via `start_new_session=True` → new PGID. On cycle timeout, SIGTERM, or `stop`: `killpg(SIGTERM)` → grace → `killpg(SIGKILL)` → `docker rm -f` containers matching `*-{harness_pid}-*` |
+| Harness (test binary) | in-flight `docker run` children + their named containers | Global `(pid → container_name)` registry; top-level SIGTERM/SIGINT handler iterates it, parallel `docker rm -f`, then `exit(130)` |
+| Each `docker run` child | the container (via `--rm`) | `PR_SET_PDEATHSIG=SIGTERM` set in `pre_exec` — self-terminates if harness dies abruptly |
+| Harness ↔ cargo bridge | parent-death notification | `PR_SET_PDEATHSIG=SIGTERM` on harness self: cargo SIGKILL → kernel SIGTERMs harness → handler fires |
+
+**Container naming.** Every container is named
+`litebox-{pass}-{test_id}-{harness_pid}-{nanos}`. The `{harness_pid}`
+salt uniquely identifies all containers from one harness invocation,
+which is how the supervisor escalates to cleanup-by-name without
+a shared registry.
+
+**Pidfile.** `<state_dir>/auto.pidfile` is JSON: `{supervisor_pid,
+cargo_pid, cargo_pgid, harness_pid}`. Written when the supervisor
+starts, updated when each cycle's harness pid is discovered, removed
+on exit. `dashboard.py stop` reads it.
+
+**Why not just `setsid` everywhere.** Process groups don't compose
+hierarchically — they're a flat label. If both the supervisor and
+the harness `setsid`'d into their own sessions, neither could reach
+the other via `killpg`. So only the supervisor creates a new
+session; the harness stays in cargo's PGID and handles its own
+children via the registry + PDEATHSIG bridge.
 
 ### Sqlite schema (minimal — facts + one config table)
 

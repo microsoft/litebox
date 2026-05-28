@@ -625,6 +625,143 @@ fn drain_backlog() -> &'static Semaphore {
     })
 }
 
+// ── Cleanup infrastructure ───────────────────────────────────────────
+//
+// Two-layer cleanup contract (see also dashboard.py and the plan in
+// docs):
+//
+//   * The dashboard supervisor owns `cargo` and reaps the whole
+//     process-group via `killpg`. It is the sledgehammer.
+//   * The harness (this binary) owns its in-flight `docker run`
+//     children and the containers they launched. Each container is
+//     named `litebox-{pass}-{test_id}-{harness_pid}-{nanos}`, so the
+//     `{harness_pid}` salt uniquely identifies them.
+//
+// Three mechanisms compose to make orphaning impossible in practice:
+//
+//   1. A global registry of (docker_run_pid → container_name) entries
+//      that we maintain via `register_docker_child` /
+//      `deregister_docker_child` around each `spawn_drain`.
+//   2. A top-level SIGTERM/SIGINT handler (installed in `main`) that
+//      iterates the registry and runs `docker rm -f` + SIGTERM in
+//      parallel, then `exit(130)`.
+//   3. `PR_SET_PDEATHSIG=SIGTERM` on (a) the harness itself, so if
+//      cargo dies abruptly the kernel signals us → handler fires; and
+//      (b) each `docker run` child via `pre_exec`, so if the harness
+//      dies abruptly the `docker run` host process self-terminates
+//      (its `--rm` flag then garbage-collects the container).
+//
+// PGIDs are a flat label, not a tree, so we deliberately do NOT call
+// `setsid` here — we stay in cargo's process group so the supervisor's
+// `killpg` continues to reach us.
+mod cleanup {
+    use std::collections::HashMap;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+
+    static CHILDREN: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+
+    fn registry() -> &'static Mutex<HashMap<u32, String>> {
+        CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Register a live `docker run` child + the container name it was
+    /// launched with. Called immediately after `Command::spawn()`.
+    pub(crate) fn register_docker_child(pid: u32, container_name: &str) {
+        if let Ok(mut g) = registry().lock() {
+            g.insert(pid, container_name.to_string());
+        }
+    }
+
+    /// Deregister a `docker run` child after `wait()` returns.
+    pub(crate) fn deregister_docker_child(pid: u32) {
+        if let Ok(mut g) = registry().lock() {
+            g.remove(&pid);
+        }
+    }
+
+    /// Set `PR_SET_PDEATHSIG=SIGTERM` on the current process. Call
+    /// early in `main()`. If the parent (cargo) dies, the kernel
+    /// sends us SIGTERM, which the top-level handler then turns into
+    /// an orderly cleanup of in-flight `docker run` children.
+    pub(crate) fn set_self_pdeathsig() {
+        // SAFETY: `prctl(PR_SET_PDEATHSIG, sig)` is a no-side-effect
+        // single-process self-configuration call; signal is delivered
+        // asynchronously only on parent death and is caught by our
+        // top-level SIGTERM handler.
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+        }
+    }
+
+    /// Snapshot the registry and run `docker rm -f` + SIGTERM on each
+    /// entry in parallel-bounded fashion. Best-effort: any individual
+    /// failure is logged and skipped. Returns when all entries have
+    /// been processed (or 30 s elapsed, whichever first).
+    pub(crate) fn reap_all() {
+        let snapshot: Vec<(u32, String)> = registry()
+            .lock()
+            .map(|g| g.iter().map(|(k, v)| (*k, v.clone())).collect())
+            .unwrap_or_default();
+        if snapshot.is_empty() {
+            return;
+        }
+        eprintln!(
+            "[cleanup] reaping {} in-flight docker run children",
+            snapshot.len()
+        );
+        // Bound parallelism to 8: each `docker rm -f` is a daemon RPC
+        // and we don't want to amplify daemon load during shutdown.
+        let chunk = 8usize;
+        for batch in snapshot.chunks(chunk) {
+            let mut threads = Vec::with_capacity(batch.len());
+            for (pid, name) in batch {
+                let pid = *pid;
+                let name = name.clone();
+                threads.push(std::thread::spawn(move || {
+                    // 5 s timeout on the docker call via timeout(1).
+                    let _ = Command::new("timeout")
+                        .args(["5", "docker", "rm", "-f", &name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    // SAFETY: pid came from std::process::Child::id()
+                    // of a child we own; SIGTERM is the documented
+                    // signal for orderly shutdown.
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                }));
+            }
+            for t in threads {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Install a SIGTERM + SIGINT handler that reaps in-flight docker
+    /// children and exits with code 130. Idempotent (safe to call
+    /// multiple times — only the first call installs).
+    pub(crate) fn install_signal_handler() {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        use signal_hook::iterator::Signals;
+        let mut signals = match Signals::new([SIGTERM, SIGINT]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[cleanup] failed to install signal handler: {e}");
+                return;
+            }
+        };
+        std::thread::spawn(move || {
+            if let Some(sig) = signals.forever().next() {
+                eprintln!("[cleanup] received signal {sig}; reaping");
+                reap_all();
+                std::process::exit(130);
+            }
+        });
+    }
+}
+
 /// Best-effort sanitize a test id into a docker container name suffix.
 fn sanitize_id(id: &str) -> String {
     id.chars()
@@ -660,6 +797,24 @@ fn build_docker_cmd(
 ) -> Command {
     let filter = format!("--filter={test_id}");
     let mut cmd = Command::new("docker");
+    // Set PR_SET_PDEATHSIG=SIGTERM on the docker-run child so it
+    // self-terminates if this harness dies abruptly (e.g. cargo
+    // SIGKILL'd by dashboard timeout escalation, before the harness's
+    // own signal handler ran). With `--rm` set on the run, the
+    // ensuing exit cleans up the container.
+    //
+    // SAFETY: `pre_exec` runs after `fork(2)` and before `execve(2)`
+    // in a single-threaded post-fork context where the only safe
+    // operations are async-signal-safe ones. `prctl(2)` is
+    // async-signal-safe (see signal-safety(7)). The flag is process-
+    // private and has no global side effects beyond this child.
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+            Ok(())
+        });
+    }
     cmd.args(docker_run_base_args())
         .arg("--name")
         .arg(container_name);
@@ -985,9 +1140,10 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     // from the in-container JSON line — so even if the container is
     // reaped before printing (timeout, etc), the dashboard rows are
     // always labeled correctly.
-    let (suite_static, group_static) = test_suite_group(test_id)
-        .expect("test_id missing from registry — emit_timing_main only \
-                 reachable from run_pass_group, which iterates get_test_ids");
+    let (suite_static, group_static) = test_suite_group(test_id).expect(
+        "test_id missing from registry — emit_timing_main only \
+                 reachable from run_pass_group, which iterates get_test_ids",
+    );
 
     // Emit the main timing line synchronously (drain may get cut off
     // if cargo-test exits early).
@@ -1081,17 +1237,21 @@ fn spawn_drain(
         let timeout = Duration::from_secs(drain_timeout_secs());
         let pid = child.id() as i32;
         let cname = container_name;
+        // Register so the top-level SIGTERM handler can reap us if the
+        // harness is asked to shut down before this drain completes.
+        cleanup::register_docker_child(pid as u32, &cname);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let cname_for_watchdog = cname.clone();
         let watchdog = std::thread::spawn(move || {
             if rx.recv_timeout(timeout).is_ok() {
                 return;
             }
             eprintln!(
-                "[drain] timeout after {} s; forcing teardown of {cname}",
+                "[drain] timeout after {} s; forcing teardown of {cname_for_watchdog}",
                 timeout.as_secs()
             );
             let _ = Command::new("docker")
-                .args(["rm", "-f", &cname])
+                .args(["rm", "-f", &cname_for_watchdog])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -1105,6 +1265,7 @@ fn spawn_drain(
         let _ = child.wait();
         let _ = tx.send(());
         let _ = watchdog.join();
+        cleanup::deregister_docker_child(pid as u32);
         let t_drain_ms = t_drain_start.elapsed().as_millis();
         emit_timing_drain(&test_id, pass, t_drain_ms);
     });
@@ -1178,6 +1339,14 @@ fn collect_positionals(argv: &[String]) -> Vec<usize> {
 }
 
 fn main() {
+    // Cleanup-protocol init (see `cleanup` module). Two side-effects:
+    //   * PR_SET_PDEATHSIG=SIGTERM on ourselves, so cargo dying →
+    //     kernel SIGTERMs us → handler reaps in-flight containers.
+    //   * Install the SIGTERM/SIGINT handler thread. Must happen
+    //     before any docker run is dispatched.
+    cleanup::set_self_pdeathsig();
+    cleanup::install_signal_handler();
+
     let argv: Vec<String> = std::env::args().collect();
     let pos_idx = collect_positionals(&argv);
 

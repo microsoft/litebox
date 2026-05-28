@@ -15,6 +15,10 @@ alacritty_terminal = "0.26.0"
 libtest-mimic = "0.8"
 rusqlite = { version = "0.35", features = ["bundled"] }
 sha2 = "0.10"
+# Async-signal-safe SIGTERM/SIGINT handler for top-level cleanup of
+# in-flight `docker run` children. Default features only — we don't
+# need the async/tokio/futures extras.
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
 
 [[test]]
 name = "integration"
