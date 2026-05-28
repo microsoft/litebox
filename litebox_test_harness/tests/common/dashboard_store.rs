@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub struct Ctx {
     pub run_id: i64,
@@ -184,6 +184,25 @@ const DROP_DDL: &str = r#"
 /// one trivial key/value table (`meta` — only `schema_version`).
 /// Producer writes facts; everything derived is a query.
 ///
+/// NOT NULL discipline:
+/// - `runs.commit_sha` / `worktree_path` / `hostname` /
+///   `started_ts_ms` are always known at INSERT time → NOT NULL.
+/// - `runs.finished_ts_ms` / `pass_count` / `fail_count` /
+///   `universe_size` are set at end-of-main `finalize()`. NULL
+///   means the run was interrupted before finishing.
+/// - `runs.branch` is NULL on detached HEAD; `dirty_hash` is
+///   NULL ⇔ clean (that's the predicate).
+/// - `runs.jobs` reflects `LITEBOX_TEST_JOBS`; NULL when env
+///   var unset.
+/// - `run_results.suite` / `group` come from the in-process
+///   registry (every test_id in `run_pass_group` is known) →
+///   NOT NULL.
+/// - `run_results.t_acquire_ms` / `t_docker_start_ms` /
+///   `t_useful_ms` are always set by the producer → NOT NULL.
+/// - Other `t_*_ms` come from optional `litebox_timing` markers
+///   (some absent on native pass, some absent on early exit)
+///   → nullable.
+///
 /// Exposed publicly so `tests/dashboard_store.rs` can apply the
 /// same DDL when exercising the schema, and so `dashboard.py`
 /// can be kept consistent against a single source of truth.
@@ -208,20 +227,20 @@ pub const SCHEMA_DDL: &str = r#"
 
     CREATE TABLE run_results (
         run_id                INTEGER NOT NULL REFERENCES runs(run_id),
-        test_id               TEXT NOT NULL,
-        pass                  TEXT NOT NULL,
-        verdict               TEXT NOT NULL,
+        test_id               TEXT    NOT NULL,
+        pass                  TEXT    NOT NULL,
+        verdict               TEXT    NOT NULL,
         finished_ts_ms        INTEGER NOT NULL,
-        suite                 TEXT,
-        "group"               TEXT,
-        t_acquire_ms          INTEGER,
-        t_docker_start_ms     INTEGER,
+        suite                 TEXT    NOT NULL,
+        "group"               TEXT    NOT NULL,
+        t_acquire_ms          INTEGER NOT NULL,
+        t_docker_start_ms     INTEGER NOT NULL,
         t_docker_spawn_ms     INTEGER,
         t_litebox_init_ms     INTEGER,
         t_harness_load_ms     INTEGER,
         t_harness_args_ms     INTEGER,
         t_harness_dispatch_ms INTEGER,
-        t_useful_ms           INTEGER,
+        t_useful_ms           INTEGER NOT NULL,
         t_drain_ms            INTEGER,
         PRIMARY KEY (run_id, test_id, pass)
     );
@@ -324,30 +343,41 @@ pub fn record_universe_size(n: i64) {
     );
 }
 
-#[derive(Default, Clone, Copy)]
+/// Per-test timings. The three required fields (acquire / docker
+/// start / useful) match the producer's call site, which always
+/// has them. The rest come from optional `litebox_timing` markers
+/// and may legitimately be absent on certain paths (e.g. native
+/// pass has no shim_init marker).
+#[derive(Clone, Copy)]
 pub struct Timings {
-    pub t_acquire_ms: Option<u128>,
-    pub t_docker_start_ms: Option<u128>,
+    pub t_acquire_ms: u128,
+    pub t_docker_start_ms: u128,
+    pub t_useful_ms: u128,
     pub t_docker_spawn_ms: Option<u128>,
     pub t_litebox_init_ms: Option<u128>,
     pub t_harness_load_ms: Option<u128>,
     pub t_harness_args_ms: Option<u128>,
     pub t_harness_dispatch_ms: Option<u128>,
-    pub t_useful_ms: Option<u128>,
 }
 
-fn to_i64(x: Option<u128>) -> Option<i64> {
+fn to_i64_opt(x: Option<u128>) -> Option<i64> {
     x.and_then(|v| i64::try_from(v).ok())
 }
 
-/// Record a finished test result. UPSERTs `latest_results` and
-/// INSERTs `run_results`. No-op when the dashboard is disabled.
+fn to_i64(x: u128) -> i64 {
+    i64::try_from(x).unwrap_or(0)
+}
+
+/// Record a finished test result. INSERTs into the immutable
+/// `run_results` table; the producer-side `latest_results` is a
+/// VIEW so there's no separate UPSERT path. No-op when the
+/// dashboard is disabled.
 pub fn record_result(
     test_id: &str,
     pass: &str,
     verdict: &str,
-    suite: Option<&str>,
-    group: Option<&str>,
+    suite: &str,
+    group: &str,
     timings: Timings,
 ) {
     let Some(ctx) = ctx() else {
@@ -376,11 +406,11 @@ pub fn record_result(
             group,
             to_i64(timings.t_acquire_ms),
             to_i64(timings.t_docker_start_ms),
-            to_i64(timings.t_docker_spawn_ms),
-            to_i64(timings.t_litebox_init_ms),
-            to_i64(timings.t_harness_load_ms),
-            to_i64(timings.t_harness_args_ms),
-            to_i64(timings.t_harness_dispatch_ms),
+            to_i64_opt(timings.t_docker_spawn_ms),
+            to_i64_opt(timings.t_litebox_init_ms),
+            to_i64_opt(timings.t_harness_load_ms),
+            to_i64_opt(timings.t_harness_args_ms),
+            to_i64_opt(timings.t_harness_dispatch_ms),
             to_i64(timings.t_useful_ms),
         ],
     );

@@ -138,8 +138,8 @@ mod dashboard_store;
 fn emit_timing_main(
     test: &str,
     pass: &str,
-    suite: Option<&str>,
-    group: Option<&str>,
+    suite: &str,
+    group: &str,
     t_acquire_ms: u128,
     t_docker_start_ms: u128,
     t_docker_spawn_ms: Option<u128>,
@@ -157,14 +157,14 @@ fn emit_timing_main(
         suite,
         group,
         dashboard_store::Timings {
-            t_acquire_ms: Some(t_acquire_ms),
-            t_docker_start_ms: Some(t_docker_start_ms),
+            t_acquire_ms,
+            t_docker_start_ms,
+            t_useful_ms,
             t_docker_spawn_ms,
             t_litebox_init_ms,
             t_harness_load_ms,
             t_harness_args_ms: sub_phases.field_value("t_harness_args_ms"),
             t_harness_dispatch_ms: sub_phases.field_value("t_harness_dispatch_ms"),
-            t_useful_ms: Some(t_useful_ms),
         },
     );
 }
@@ -982,7 +982,8 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     // reaped before printing (timeout, etc), the dashboard rows are
     // always labeled correctly.
     let (suite_static, group_static) = test_suite_group(test_id)
-        .map_or((None, None), |(s, g)| (Some(s), Some(g)));
+        .expect("test_id missing from registry — emit_timing_main only \
+                 reachable from run_pass_group, which iterates get_test_ids");
 
     // Emit the main timing line synchronously (drain may get cut off
     // if cargo-test exits early).

@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 from typing import Iterable, Optional
 
-SCHEMA_VERSION_EXPECTED = 2
+SCHEMA_VERSION_EXPECTED = 3
 DEFAULT_FILL_BATCH = 300
 
 
@@ -67,21 +67,56 @@ def resolve_state_dir(arg: Optional[str]) -> Path:
     return Path(out.stdout.strip()).parent / ".dashboard"
 
 
-def open_db(state_dir: Path) -> sqlite3.Connection:
+def open_db(state_dir: Path, *, bootstrap: bool = False) -> sqlite3.Connection:
+    """Open the dashboard sqlite store.
+
+    `bootstrap=True` initializes an empty store + schema if the file
+    doesn't exist yet — used by `track` so the user can register a
+    tracked ref before the producer has ever run. Other subcommands
+    pass `bootstrap=False` (the default) and exit with a helpful
+    message instead of silently creating an empty store.
+    """
     db_path = state_dir / "results.sqlite"
     if not db_path.exists():
-        sys.exit(
-            f"dashboard: sqlite store not found at {db_path}\n"
-            "  Run `cargo test -p litebox_test_harness --test integration` "
-            "once to create it,\n"
-            "  or pass --state-dir to point at an existing store."
-        )
+        if not bootstrap:
+            sys.exit(
+                f"dashboard: sqlite store not found at {db_path}\n"
+                "  Run `cargo test -p litebox_test_harness --test integration` "
+                "once to create it,\n"
+                "  or `dashboard.py track …` (auto-creates the store)."
+            )
+        state_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), isolation_level=None)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.row_factory = sqlite3.Row
+    if bootstrap:
+        _ensure_schema(conn)
     check_schema(conn)
     return conn
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Apply the canonical DDL if the store is empty. Read from the
+    shared producer file so there's only one DDL source. Idempotent.
+    """
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='meta'"
+    ).fetchone()
+    if row is not None:
+        return
+    rs = (
+        Path(__file__).resolve().parent.parent
+        / "tests" / "common" / "dashboard_store.rs"
+    ).read_text()
+    start = rs.index("CREATE TABLE runs")
+    end = rs.index('"#;', start)
+    ddl = rs[start:end]
+    conn.executescript(ddl)
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('schema_version', ?)",
+        (str(SCHEMA_VERSION_EXPECTED),),
+    )
 
 
 def check_schema(conn: sqlite3.Connection) -> None:
@@ -125,46 +160,6 @@ def fmt_age_ms(delta_ms: int) -> str:
 
 def short_sha(sha: Optional[str]) -> str:
     return (sha or "?")[:8]
-
-
-# Test-id prefix → suite fallback. Mirrors
-# `dashboard_store::infer_suite_from_name` in the Rust producer so
-# FAIL rows without an inner-harness JSON (suite/group = NULL) still
-# render a useful label. Kept here so the renderer stands alone.
-_SUITE_FALLBACK = {
-    "vscode": ("PIDF", "PIDFI", "PIFH", "EV", "PTY", "SFD", "VS", "CSM"),
-    "fork":   ("X", "BSF", "PIF", "SXF", "BASH", "FWE", "SK", "CF", "CC"),
-    "xworker": ("PB", "PN", "PID", "NPIPE", "BPIPE", "EPIPE", "PXEOF",
-                "CWF", "US6", "P1"),
-    "matrix": ("EP", "POLL", "EPI", "PROC", "KP", "KPX", "FT"),
-    "stress": ("TCS", "THC", "TLB", "XCONN", "FKLC", "PR"),
-    "shell":  ("SP", "SC", "TR", "FR", "BR", "BRS"),
-    "sockopt": ("SOCKOPT", "GSN"),
-}
-
-
-def infer_suite_raw(test_id: Optional[str]) -> str:
-    """Same prefix → suite map as `infer_suite`, but returns the bare
-    suite name with no formatting. Used by `_render_suite_group_breakdown`
-    where the value is a grouping key, not display text.
-    """
-    if not test_id:
-        return "?"
-    prefix = test_id.split(".", 1)[0]
-    for suite, prefixes in _SUITE_FALLBACK.items():
-        if prefix in prefixes:
-            return suite
-    return "?"
-
-
-def infer_suite(test_id: Optional[str]) -> str:
-    if not test_id:
-        return "?"
-    prefix = test_id.split(".", 1)[0]
-    for suite, prefixes in _SUITE_FALLBACK.items():
-        if prefix in prefixes:
-            return f"_{suite}_"  # italicize fallback so it's distinguishable
-    return "?"
 
 
 # ─── Render ──────────────────────────────────────────────────────────
@@ -428,67 +423,39 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
 
 
 def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
-    """Aggregate the same cov / total / pass / fail (per pass) counts per
-    (suite, group) for both passes. "Total" here is the observed
-    universe per (suite, group) — distinct test_ids seen in either
-    pass; the producer doesn't carry a per-suite universe count, so
-    this denominator stabilizes as more tests run.
+    """Aggregate cov / total / pass / fail per (pass, suite, group).
 
-    Reads from `latest_results` (freshest per (test_id, pass)) — so
-    a single regression flipping a row from pass→FAIL moves the
-    numbers immediately, no per-commit filtering.
+    Total = observed universe per (suite, group) — distinct test_ids
+    seen in any pass; the producer doesn't carry a per-suite universe
+    count, so this denominator stabilizes as more tests run.
+
+    Reads from `latest_results` (freshest per (test_id, pass)) — so a
+    single regression flipping a row from pass→FAIL moves the numbers
+    immediately, no per-commit filtering.
+
+    Schema v3+: suite/group are NOT NULL on `run_results`. The
+    producer reads them straight from the in-process registry, so we
+    no longer need cross-row fallback or prefix-map inference here.
     """
-    # Pull raw rows; we infer suite from sibling rows (same test_id,
-    # other pass) when NULL, falling back to the test_id prefix map.
-    # Most NULL-suite rows are FAIL/no_result outcomes where the
-    # in-container coordinator never emitted its JSON line.
-    rows = conn.execute(
-        """
-        SELECT test_id, pass, verdict, suite, "group"
-          FROM latest_results
-        """
-    ).fetchall()
-    if not rows:
-        return ""
-
-    # Cross-row lookup: test_id → first observed non-NULL (suite, group).
-    # Lets a litebox no_result row inherit the suite/group from its
-    # native sibling instead of falling through to the prefix map.
-    known: dict[str, tuple[Optional[str], Optional[str]]] = {}
-    for r in rows:
-        if r["suite"] or r["group"]:
-            prev = known.get(r["test_id"])
-            if prev is None:
-                known[r["test_id"]] = (r["suite"], r["group"])
-            else:
-                known[r["test_id"]] = (prev[0] or r["suite"], prev[1] or r["group"])
-
-    def resolve_suite_group(r) -> tuple[str, str]:
-        suite = r["suite"]
-        group = r["group"]
-        if not suite or not group:
-            k_suite, k_group = known.get(r["test_id"], (None, None))
-            suite = suite or k_suite
-            group = group or k_group
-        suite = suite or infer_suite_raw(r["test_id"])
-        group = group or "?"
-        return suite, group
-
     from collections import defaultdict
     per_bucket_pass: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
         lambda: {"covered": 0, "pass": 0, "fail": 0}
     )
     per_bucket_ids: dict[tuple[str, str], set] = defaultdict(set)
-    for r in rows:
-        suite, group = resolve_suite_group(r)
-        pass_name = r["pass"]
-        key = (suite, group, pass_name)
+    for r in conn.execute(
+        'SELECT test_id, pass, verdict, suite, "group" FROM latest_results'
+    ):
+        suite = r["suite"]
+        group = r["group"]
+        key = (suite, group, r["pass"])
         per_bucket_pass[key]["covered"] += 1
         if r["verdict"] == "pass":
             per_bucket_pass[key]["pass"] += 1
         else:
             per_bucket_pass[key]["fail"] += 1
         per_bucket_ids[(suite, group)].add(r["test_id"])
+    if not per_bucket_pass:
+        return ""
 
     totals = {k: len(v) for k, v in per_bucket_ids.items()}
     buckets: dict[tuple[str, str], dict] = {}
@@ -538,8 +505,8 @@ def _render_current_fails(conn: sqlite3.Connection) -> str:
         dirty = "⚠" if r["dirty_hash"] else ""
         wt_short = os.path.basename(r["worktree_path"] or "?")
         lines.append(
-            f"| `{r['pass']}` | {r['suite'] or infer_suite(r['test_id'])} | "
-            f"{r['group'] or '?'} | `{r['test_id']}` | `{wt_short}` | "
+            f"| `{r['pass']}` | {r['suite']} | {r['group']} | "
+            f"`{r['test_id']}` | `{wt_short}` | "
             f"`{short_sha(r['commit_sha'])}` | {dirty} | "
             f"{fmt_age_ms(now - r['finished_ts_ms'])} |"
         )
@@ -636,7 +603,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_track(args: argparse.Namespace) -> int:
     state_dir = resolve_state_dir(args.state_dir)
-    conn = open_db(state_dir)
+    conn = open_db(state_dir, bootstrap=True)
     wt = Path(args.ci_worktree).expanduser().resolve()
     main_wt = state_dir.parent
     # Resolve the ref eagerly so we fail loudly on typos. Run from the

@@ -111,8 +111,10 @@ fn dashboard_schema_initializes_and_view_returns_latest() {
 
     let insert_result = |run_id: i64, verdict: &str, ts: i64| {
         conn.execute(
-            "INSERT INTO run_results(run_id, test_id, pass, verdict, finished_ts_ms, suite, \"group\")
-             VALUES (?1, 'X.id', 'native', ?2, ?3, 'fork', 'fork_matrix')",
+            "INSERT INTO run_results(run_id, test_id, pass, verdict, finished_ts_ms,
+                                     suite, \"group\",
+                                     t_acquire_ms, t_docker_start_ms, t_useful_ms)
+             VALUES (?1, 'X.id', 'native', ?2, ?3, 'fork', 'fork_matrix', 0, 0, 100)",
             params![run_id, verdict, ts],
         )
         .unwrap()

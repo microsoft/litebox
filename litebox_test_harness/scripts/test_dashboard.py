@@ -44,7 +44,7 @@ def _init_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_DDL)
-    conn.execute("INSERT INTO meta(key, value) VALUES('schema_version','2')")
+    conn.execute("INSERT INTO meta(key, value) VALUES('schema_version','3')")
     return conn
 
 
@@ -62,7 +62,9 @@ def _add_result(conn, *, run_id, test_id, pass_, verdict, ts_ms,
                 suite="vscode", group="pidfd"):
     conn.execute(
         "INSERT INTO run_results(run_id, test_id, pass, verdict,"
-        " finished_ts_ms, suite, \"group\") VALUES (?,?,?,?,?,?,?)",
+        " finished_ts_ms, suite, \"group\","
+        " t_acquire_ms, t_docker_start_ms, t_useful_ms)"
+        " VALUES (?,?,?,?,?,?,?, 0, 0, 100)",
         (run_id, test_id, pass_, verdict, ts_ms, suite, group),
     )
 
