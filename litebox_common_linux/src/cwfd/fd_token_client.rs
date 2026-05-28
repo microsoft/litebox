@@ -795,6 +795,33 @@ impl FdTokenClient {
         }
     }
 
+    #[cfg(debug_assertions)]
+    pub fn debug_query_state_object(
+        &self,
+        handle_id: u64,
+    ) -> Result<proto::DebugStateObjectInfo, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_debug_query_state_object_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::DebugQueryStateObjectResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => proto::parse_debug_query_state_object_response_body(resp.body)
+                .map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
     /// Asks the broker to create a signalfd state with the given mask.
     pub fn create_signalfd(&self, sigmask_lo: u64, sigmask_hi: u64) -> Result<u64, ClientError> {
         let stream = self.lock();

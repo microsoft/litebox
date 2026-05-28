@@ -62,6 +62,8 @@
 
 use core::any::Any;
 use std::collections::HashMap;
+#[cfg(debug_assertions)]
+use std::string::{String, ToString as _};
 use std::sync::{Arc, Mutex};
 
 use litebox_common_linux::cwfd::fd_transfer_frame::SubsystemTag;
@@ -152,6 +154,11 @@ pub trait StateObject: Any + Send + Sync + core::fmt::Debug {
     /// subscription-mirror cache — the broker is the single source of
     /// truth for broker-held resources.
     fn current_events(&self) -> u32;
+
+    #[cfg(debug_assertions)]
+    fn debug_repr(&self) -> String {
+        core::any::type_name::<Self>().to_string()
+    }
 }
 
 /// Closed set of broker-hosted state object variants.
@@ -280,6 +287,22 @@ impl StateObjectEnum {
             StateObjectEnum::Process(state) => state.current_events(),
         }
     }
+
+    #[cfg(debug_assertions)]
+    pub fn debug_repr(&self) -> String {
+        match self {
+            StateObjectEnum::Eventfd(state) => state.debug_repr(),
+            StateObjectEnum::PipeReadEnd(state) => state.debug_repr(),
+            StateObjectEnum::PipeWriteEnd(state) => state.debug_repr(),
+            StateObjectEnum::SocketPairEnd(state) => state.debug_repr(),
+            StateObjectEnum::TcpConn(state) => state.debug_repr(),
+            StateObjectEnum::Signalfd(state) => state.debug_repr(),
+            StateObjectEnum::Inotify(state) => state.debug_repr(),
+            StateObjectEnum::Pty(state) => state.debug_repr(),
+            StateObjectEnum::Pidfd(state) => state.debug_repr(),
+            StateObjectEnum::Process(state) => state.debug_repr(),
+        }
+    }
 }
 
 impl StateObject for StateObjectEnum {
@@ -306,6 +329,11 @@ impl StateObject for StateObjectEnum {
 
     fn current_events(&self) -> u32 {
         StateObjectEnum::current_events(self)
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_repr(&self) -> String {
+        StateObjectEnum::debug_repr(self)
     }
 }
 
@@ -462,6 +490,23 @@ impl BrokerStateRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn debug_query(
+        &self,
+        handle: StateHandle,
+    ) -> Result<(SubsystemTag, u32, String), StateRegistryError> {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        let entry = s
+            .table
+            .get(&handle.0)
+            .ok_or(StateRegistryError::UnknownHandle(handle))?;
+        Ok((
+            entry.state.subsystem_tag(),
+            entry.refcount,
+            entry.state.debug_repr(),
+        ))
     }
 
     /// Returns a per-entry snapshot suitable for diagnostic logging.

@@ -70,6 +70,8 @@
 //! is 24 bytes (Subscribe), so this is comfortably generous; the
 //! cap exists primarily to bound memory on a malformed peer.
 
+#[cfg(debug_assertions)]
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Wire-format magic ("LBFD" — LiteBox FD).
@@ -187,6 +189,8 @@ pub enum Opcode {
     WriteTcpConn = 0x7A,
     ShutdownTcpConn = 0x7B,
     PollTcpConnEvents = 0x7C,
+    #[cfg(debug_assertions)]
+    DebugQueryStateObject = 0x7D,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -237,6 +241,8 @@ pub enum Opcode {
     WriteTcpConnResponse = 0xFA,
     ShutdownTcpConnResponse = 0xFB,
     PollTcpConnEventsResponse = 0xFC,
+    #[cfg(debug_assertions)]
+    DebugQueryStateObjectResponse = 0xFD,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -380,12 +386,18 @@ impl Opcode {
             Opcode::WriteTcpConn => Some(Opcode::WriteTcpConnResponse),
             Opcode::ShutdownTcpConn => Some(Opcode::ShutdownTcpConnResponse),
             Opcode::PollTcpConnEvents => Some(Opcode::PollTcpConnEventsResponse),
+            #[cfg(debug_assertions)]
+            Opcode::DebugQueryStateObject => Some(Opcode::DebugQueryStateObjectResponse),
             _ => None,
         }
     }
 
     /// True if this opcode is a request.
     pub fn is_request(self) -> bool {
+        #[cfg(debug_assertions)]
+        if matches!(self, Opcode::DebugQueryStateObject) {
+            return true;
+        }
         matches!(
             self,
             Opcode::Register
@@ -507,6 +519,8 @@ impl TryFrom<u8> for Opcode {
             0x7A => Ok(Opcode::WriteTcpConn),
             0x7B => Ok(Opcode::ShutdownTcpConn),
             0x7C => Ok(Opcode::PollTcpConnEvents),
+            #[cfg(debug_assertions)]
+            0x7D => Ok(Opcode::DebugQueryStateObject),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -554,6 +568,8 @@ impl TryFrom<u8> for Opcode {
             0xFA => Ok(Opcode::WriteTcpConnResponse),
             0xFB => Ok(Opcode::ShutdownTcpConnResponse),
             0xFC => Ok(Opcode::PollTcpConnEventsResponse),
+            #[cfg(debug_assertions)]
+            0xFD => Ok(Opcode::DebugQueryStateObjectResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -2891,6 +2907,84 @@ pub fn parse_query_events_response_ok(body: &[u8]) -> Result<u32, ProtocolError>
         });
     }
     Ok(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugStateObjectInfo {
+    pub kind_tag: u8,
+    pub refcount: u32,
+    pub debug_info: String,
+}
+
+#[cfg(debug_assertions)]
+pub fn build_debug_query_state_object_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::DebugQueryStateObject,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+#[cfg(debug_assertions)]
+pub fn parse_debug_query_state_object_request(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::DebugQueryStateObject)
+}
+
+#[cfg(debug_assertions)]
+pub fn build_debug_query_state_object_response_ok(
+    kind_tag: u8,
+    refcount: u32,
+    debug_info: &str,
+) -> OwnedFrame {
+    let info = debug_info.as_bytes();
+    let len = info.len().min(u16::MAX as usize);
+    let mut body = Vec::with_capacity(7 + len);
+    body.push(kind_tag);
+    body.extend_from_slice(&refcount.to_le_bytes());
+    body.extend_from_slice(&(len as u16).to_le_bytes());
+    body.extend_from_slice(&info[..len]);
+    OwnedFrame {
+        opcode: Opcode::DebugQueryStateObjectResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+#[cfg(debug_assertions)]
+pub fn parse_debug_query_state_object_response_body(
+    body: &[u8],
+) -> Result<DebugStateObjectInfo, ProtocolError> {
+    if body.len() < 7 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::DebugQueryStateObjectResponse,
+            got: body.len(),
+            want: 7,
+        });
+    }
+    let kind_tag = body[0];
+    let refcount = u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
+    let len = u16::from_le_bytes([body[5], body[6]]) as usize;
+    if body.len() != 7 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::DebugQueryStateObjectResponse,
+            got: body.len(),
+            want: 7 + len,
+        });
+    }
+    let debug_info =
+        String::from_utf8(body[7..].to_vec()).map_err(|_| ProtocolError::WrongBodyLen {
+            opcode: Opcode::DebugQueryStateObjectResponse,
+            got: body.len(),
+            want: 7 + len,
+        })?;
+    Ok(DebugStateObjectInfo {
+        kind_tag,
+        refcount,
+        debug_info,
+    })
 }
 
 /// Constructs an error response. The caller supplies the response
