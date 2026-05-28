@@ -2138,15 +2138,57 @@ impl<FS: ShimFS> Task<FS> {
     }
     pub(super) fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         if let Some(result) = self.try_with_broker_inet_listener(sockfd, |_typed| {
-            let _ = sockaddr;
-            Err(Errno::EOPNOTSUPP)
-        }) {
-            return result;
-        }
-        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
-            let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
-            let handle = self.broker_inet_listener_handle(typed)?;
-            handle.with_entry(|entry| entry.bind(&raw)).map(|_| ())
+            let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
+            let SocketAddr::V4(addr) = addr else {
+                return Err(Errno::EAFNOSUPPORT);
+            };
+            let raw_fd = usize::try_from(sockfd).map_err(|_| Errno::EBADF)?;
+            const SOCK_CLOEXEC: usize = 0o2000000;
+            let host_fd = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::socket,
+                    AddressFamily::INET as usize,
+                    SockType::Stream as usize | SOCK_CLOEXEC,
+                    IPProtocol::TCP as usize,
+                )
+            }
+            .map_err(|_| Errno::EIO)? as i32;
+            let mut host_addr = [0u8; 16];
+            host_addr[0..2].copy_from_slice(&(AddressFamily::INET as u16).to_ne_bytes());
+            host_addr[2..4].copy_from_slice(&addr.port().to_be_bytes());
+            host_addr[4..8].copy_from_slice(&addr.ip().octets());
+            let connect_result = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::connect,
+                    host_fd as usize,
+                    host_addr.as_ptr() as usize,
+                    host_addr.len(),
+                )
+            };
+            if connect_result.is_err() {
+                let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, host_fd as usize) };
+                return Err(Errno::ECONNREFUSED);
+            }
+            let external = super::external_fd::ExternalFd::new(
+                host_fd,
+                super::external_fd::ExternalFdDirection::ReadWrite,
+            );
+            let typed_external = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .insert::<super::external_fd::ExternalFdSubsystem>(external);
+            {
+                let files = self.files.borrow();
+                let mut rds = files.raw_descriptor_store.write();
+                let _old_fd = rds
+                    .fd_consume_raw_integer::<
+                        super::broker_inet_listener::BrokerInetListenerSubsystem,
+                    >(raw_fd)
+                    .map_err(|_| Errno::EBADF)?;
+                assert!(rds.fd_into_specific_raw_integer(typed_external, raw_fd));
+            }
+            Ok(())
         }) {
             return result;
         }
@@ -2186,6 +2228,13 @@ impl<FS: ShimFS> Task<FS> {
                 .unwrap()
                 .bind();
             return Ok(());
+        }
+        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
+            let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
+            let handle = self.broker_inet_listener_handle(typed)?;
+            handle.with_entry(|entry| entry.bind(&raw)).map(|_| ())
+        }) {
+            return result;
         }
         self.files.borrow().with_socket(
             &self.global,
@@ -2387,9 +2436,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             crate::RawFdRef::BrokerInetListener(_) => Err(Errno::EINVAL),
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTSOCK),
-            crate::RawFdRef::Signalfd(_)
-            | crate::RawFdRef::Inotify(_)
-            | crate::RawFdRef::BrokerInetListener(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::ENOTSOCK),
         })?
     }
 

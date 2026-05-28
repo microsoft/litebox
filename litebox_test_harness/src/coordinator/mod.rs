@@ -8,6 +8,7 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
 pub(crate) mod agents;
+pub(crate) mod broker_listener_tests;
 pub(crate) mod clone3_matrix;
 pub(crate) mod common;
 pub(crate) mod concurrent_fork;
@@ -1010,6 +1011,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     epoll_pidfd::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
     eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
     inotify::register_inotify_tests(&mut registry::Registry::new(&mut tests));
+    broker_listener_tests::register_broker_listener_tests(&mut registry::Registry::new(&mut tests));
     invariants::register_invariant_tests(&mut registry::Registry::new(&mut tests));
     inherit_matrix::register_inherit_matrix_tests(&mut registry::Registry::new(&mut tests));
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
