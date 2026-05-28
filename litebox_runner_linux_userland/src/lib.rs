@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
+pub mod broker_inotify_provider;
 pub mod broker_pgrp_signal_provider;
 pub mod broker_pidfd_provider;
 pub mod broker_pipe_provider;
@@ -3457,6 +3458,17 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_signalfd_provider(signalfd_provider)
         .map_err(|_| anyhow!("signalfd provider already set"))?;
+
+    let inotify_provider: Arc<
+        dyn litebox_common_linux::broker_inotify_provider::BrokerInotifyProvider,
+    > = Arc::new(
+        crate::broker_inotify_provider::RunnerBrokerInotifyProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_inotify_provider(inotify_provider)
+        .map_err(|_| anyhow!("inotify provider already set"))?;
 
     // Install the guest-pid provider against the same fd-token client.
     // The shim's `do_fork` consults it; if missing, do_fork falls back

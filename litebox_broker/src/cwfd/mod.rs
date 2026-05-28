@@ -21,6 +21,8 @@ pub mod eventfd_state;
 pub mod fd_token_service;
 pub mod fd_token_socket;
 pub mod fd_tokens;
+pub mod inotify_dispatcher;
+pub mod inotify_state;
 pub mod pgrp_signal_inbox;
 pub mod pidfd_state;
 pub mod pipe_state;

@@ -21,6 +21,7 @@ pub(crate) mod inotify;
 pub(crate) mod iouring_discovery;
 pub mod leaf_subcommand;
 pub(crate) mod matrix;
+pub(crate) mod perf_probes;
 pub(crate) mod pid_uniqueness;
 pub(crate) mod pidfd_inherit;
 pub(crate) mod pidfd_tests;
@@ -985,6 +986,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     special_cases::register_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     iouring_discovery::register_iouring_discovery_tests(&mut registry::Registry::new(&mut tests));
     getrandom_tests::register_getrandom_tests(&mut registry::Registry::new(&mut tests));
+    perf_probes::register_perf_probes(&mut registry::Registry::new(&mut tests));
     special_cases::register_cross_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     shell::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     vscode_shape::register_cli_startup_mimic_tests(&mut registry::Registry::new(&mut tests));

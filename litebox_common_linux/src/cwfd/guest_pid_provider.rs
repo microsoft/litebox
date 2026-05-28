@@ -100,6 +100,17 @@ pub trait GuestPidProvider: Send + Sync {
     /// Remove a process-exit subscription. Best-effort during drop.
     fn unsubscribe_process_exit(&self, pid: u32, subscription_id: u64);
 
+    /// Synchronously asks the broker for the current event bits on
+    /// `pid`'s process-exit state. Returns a `NOTIFY_EVENT_*` bitmask:
+    /// `IN | HUP` once the process is exited, `0` while it's still
+    /// running. Issued by readiness-query paths (poll/select/epoll
+    /// with timeout=0) so the broker — the single source of truth —
+    /// is consulted directly rather than reading the shim's cached
+    /// `BrokerProcessExitWake::exited` AtomicBool. Same property as
+    /// [`BrokerSubscribable::query_events`] but on the process_registry
+    /// side of the broker.
+    fn query_process_exit(&self, pid: u32) -> Result<u32, GuestPidProviderError>;
+
     /// Phase F.5+ PE.1 Step D: release every (pid, *) entry the broker
     /// is tracking on this connection. Used during shim
     /// `prepare_for_exit` to release non-fd broker state and serve as

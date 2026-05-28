@@ -105,6 +105,17 @@ impl GuestPidProvider for RunnerGuestPidProvider {
         }
     }
 
+    fn query_process_exit(&self, pid: u32) -> Result<u32, GuestPidProviderError> {
+        // The Process state handle in the broker's process_registry is
+        // identified by the guest pid (see RegisterProcess shape). The
+        // `QueryEvents` opcode falls through state_registry -> process_registry
+        // on UnknownHandle, so passing `u64::from(pid)` as the handle id
+        // reaches the right state object.
+        self.client
+            .query_events(u64::from(pid))
+            .map_err(|e| map_client_error(pid, e))
+    }
+
     fn release_all_for_pid(&self, pid: u32) -> Result<u32, GuestPidProviderError> {
         self.client
             .release_all_for_pid(pid)

@@ -11,6 +11,7 @@ litebox_timing = { version = "0.1.0", path = "../litebox_timing" }
 tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "time", "macros", "fs", "process", "sync"] }
 
 [dev-dependencies]
+alacritty_terminal = "0.26.0"
 libtest-mimic = "0.8"
 rusqlite = { version = "0.35", features = ["bundled"] }
 sha2 = "0.10"

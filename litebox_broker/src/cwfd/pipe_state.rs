@@ -368,6 +368,10 @@ impl StateObject for PipeReadEnd {
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         self.inner.read_subject.remove(subscription_id)
     }
+
+    fn current_events(&self) -> u32 {
+        self.inner.current_read_end_events()
+    }
 }
 
 impl StateObject for PipeWriteEnd {
@@ -397,5 +401,9 @@ impl StateObject for PipeWriteEnd {
 
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         self.inner.write_subject.remove(subscription_id)
+    }
+
+    fn current_events(&self) -> u32 {
+        self.inner.current_write_end_events()
     }
 }

@@ -127,6 +127,11 @@ pub enum Opcode {
     CreateSignalfd = 0x40,
     ReadSiginfo = 0x41,
     PushSiginfo = 0x42,
+    InotifyInit1 = 0x43,
+    InotifyAddWatch = 0x44,
+    InotifyRmWatch = 0x45,
+    InotifyRead = 0x46,
+    InotifyQueryEvents = 0x47,
     CreatePipe = 0x50,
     ReadPipe = 0x51,
     WritePipe = 0x52,
@@ -142,6 +147,13 @@ pub enum Opcode {
     PtyIoctl = 0x64,
     Unsubscribe = 0x14,
     DupHandle = 0x15,
+    /// Synchronous "what events are currently set" query on a
+    /// broker-held state handle. Body: `handle_id: u64`. Response:
+    /// `events: u32` (a bitmask of `NOTIFY_EVENT_*` bits computed
+    /// from the broker's current authoritative state). Designed for
+    /// shim-side `poll`/`select`/`epoll_wait` readiness checks so the
+    /// worker never relies on a stale local cache of broker state.
+    QueryEvents = 0x16,
     CreatePidfd = 0x20,
     PidfdExited = 0x21,
     /// Broker-hosted process registration. Allocates a globally-
@@ -187,6 +199,11 @@ pub enum Opcode {
     CreateSignalfdResponse = 0xC0,
     ReadSiginfoResponse = 0xC1,
     PushSiginfoResponse = 0xC2,
+    InotifyInit1Response = 0xC3,
+    InotifyAddWatchResponse = 0xC4,
+    InotifyRmWatchResponse = 0xC5,
+    InotifyReadResponse = 0xC6,
+    InotifyQueryEventsResponse = 0xC7,
     CreatePipeResponse = 0xD0,
     ReadPipeResponse = 0xD1,
     WritePipeResponse = 0xD2,
@@ -202,6 +219,8 @@ pub enum Opcode {
     PtyIoctlResponse = 0xE4,
     UnsubscribeResponse = 0x94,
     DupHandleResponse = 0x95,
+    /// Response for [`Opcode::QueryEvents`]. Body: `events: u32`.
+    QueryEventsResponse = 0x96,
     CreatePidfdResponse = 0xA0,
     PidfdExitedResponse = 0xA1,
     RegisterProcessResponse = 0xF0,
@@ -325,6 +344,11 @@ impl Opcode {
             Opcode::CreateSignalfd => Some(Opcode::CreateSignalfdResponse),
             Opcode::ReadSiginfo => Some(Opcode::ReadSiginfoResponse),
             Opcode::PushSiginfo => Some(Opcode::PushSiginfoResponse),
+            Opcode::InotifyInit1 => Some(Opcode::InotifyInit1Response),
+            Opcode::InotifyAddWatch => Some(Opcode::InotifyAddWatchResponse),
+            Opcode::InotifyRmWatch => Some(Opcode::InotifyRmWatchResponse),
+            Opcode::InotifyRead => Some(Opcode::InotifyReadResponse),
+            Opcode::InotifyQueryEvents => Some(Opcode::InotifyQueryEventsResponse),
             Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
             Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
             Opcode::WritePipe => Some(Opcode::WritePipeResponse),
@@ -340,6 +364,7 @@ impl Opcode {
             Opcode::PtyIoctl => Some(Opcode::PtyIoctlResponse),
             Opcode::Unsubscribe => Some(Opcode::UnsubscribeResponse),
             Opcode::DupHandle => Some(Opcode::DupHandleResponse),
+            Opcode::QueryEvents => Some(Opcode::QueryEventsResponse),
             Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
             Opcode::PidfdExited => Some(Opcode::PidfdExitedResponse),
             Opcode::RegisterProcess => Some(Opcode::RegisterProcessResponse),
@@ -374,6 +399,11 @@ impl Opcode {
                 | Opcode::CreateSignalfd
                 | Opcode::ReadSiginfo
                 | Opcode::PushSiginfo
+                | Opcode::InotifyInit1
+                | Opcode::InotifyAddWatch
+                | Opcode::InotifyRmWatch
+                | Opcode::InotifyRead
+                | Opcode::InotifyQueryEvents
                 | Opcode::CreatePipe
                 | Opcode::ReadPipe
                 | Opcode::WritePipe
@@ -389,6 +419,7 @@ impl Opcode {
                 | Opcode::PtyIoctl
                 | Opcode::Unsubscribe
                 | Opcode::DupHandle
+                | Opcode::QueryEvents
                 | Opcode::CreatePidfd
                 | Opcode::PidfdExited
                 | Opcode::RegisterProcess
@@ -440,6 +471,11 @@ impl TryFrom<u8> for Opcode {
             0x40 => Ok(Opcode::CreateSignalfd),
             0x41 => Ok(Opcode::ReadSiginfo),
             0x42 => Ok(Opcode::PushSiginfo),
+            0x43 => Ok(Opcode::InotifyInit1),
+            0x44 => Ok(Opcode::InotifyAddWatch),
+            0x45 => Ok(Opcode::InotifyRmWatch),
+            0x46 => Ok(Opcode::InotifyRead),
+            0x47 => Ok(Opcode::InotifyQueryEvents),
             0x50 => Ok(Opcode::CreatePipe),
             0x51 => Ok(Opcode::ReadPipe),
             0x52 => Ok(Opcode::WritePipe),
@@ -455,6 +491,7 @@ impl TryFrom<u8> for Opcode {
             0x64 => Ok(Opcode::PtyIoctl),
             0x14 => Ok(Opcode::Unsubscribe),
             0x15 => Ok(Opcode::DupHandle),
+            0x16 => Ok(Opcode::QueryEvents),
             0x20 => Ok(Opcode::CreatePidfd),
             0x21 => Ok(Opcode::PidfdExited),
             0x70 => Ok(Opcode::RegisterProcess),
@@ -481,6 +518,11 @@ impl TryFrom<u8> for Opcode {
             0xC0 => Ok(Opcode::CreateSignalfdResponse),
             0xC1 => Ok(Opcode::ReadSiginfoResponse),
             0xC2 => Ok(Opcode::PushSiginfoResponse),
+            0xC3 => Ok(Opcode::InotifyInit1Response),
+            0xC4 => Ok(Opcode::InotifyAddWatchResponse),
+            0xC5 => Ok(Opcode::InotifyRmWatchResponse),
+            0xC6 => Ok(Opcode::InotifyReadResponse),
+            0xC7 => Ok(Opcode::InotifyQueryEventsResponse),
             0xD0 => Ok(Opcode::CreatePipeResponse),
             0xD1 => Ok(Opcode::ReadPipeResponse),
             0xD2 => Ok(Opcode::WritePipeResponse),
@@ -496,6 +538,7 @@ impl TryFrom<u8> for Opcode {
             0xE4 => Ok(Opcode::PtyIoctlResponse),
             0x94 => Ok(Opcode::UnsubscribeResponse),
             0x95 => Ok(Opcode::DupHandleResponse),
+            0x96 => Ok(Opcode::QueryEventsResponse),
             0xA0 => Ok(Opcode::CreatePidfdResponse),
             0xA1 => Ok(Opcode::PidfdExitedResponse),
             0xF0 => Ok(Opcode::RegisterProcessResponse),
@@ -1641,6 +1684,222 @@ pub fn parse_push_siginfo_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolEr
     Ok((handle, body[16..].to_vec()))
 }
 
+/// Body for [`Opcode::InotifyInit1`]: flags (u32) + reserved (u32).
+pub fn build_inotify_init1_request(flags: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&flags.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InotifyInit1,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inotify_init1_body(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyInit1,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let flags = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok(flags)
+}
+
+pub fn build_inotify_init1_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InotifyInit1Response,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn build_inotify_add_watch_request(handle_id: u64, path: &str, mask: u32) -> OwnedFrame {
+    let path_bytes = path.as_bytes();
+    let mut body = Vec::with_capacity(24 + path_bytes.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&mask.to_le_bytes());
+    body.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(path_bytes);
+    OwnedFrame {
+        opcode: Opcode::InotifyAddWatch,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inotify_add_watch_body(
+    body: &[u8],
+) -> Result<(u64, u32, alloc::string::String), ProtocolError> {
+    if body.len() < 20 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyAddWatch,
+            got: body.len(),
+            want: 20,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mask = u32::from_le_bytes(body[8..12].try_into().unwrap());
+    let len = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[16..20].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 20 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyAddWatch,
+            got: body.len(),
+            want: 20 + len,
+        });
+    }
+    alloc::string::String::from_utf8(body[20..].to_vec())
+        .map(|path| (handle, mask, path))
+        .map_err(|_| ProtocolError::NonZeroReserved { reserved: 1 })
+}
+
+pub fn build_inotify_add_watch_response_ok(wd: i32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&wd.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InotifyAddWatchResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inotify_add_watch_response_ok(body: &[u8]) -> Result<i32, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyAddWatchResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let wd = i32::from_le_bytes(body[0..4].try_into().unwrap());
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok(wd)
+}
+
+pub fn build_inotify_rm_watch_request(handle_id: u64, wd: i32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&wd.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InotifyRmWatch,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inotify_rm_watch_body(body: &[u8]) -> Result<(u64, i32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyRmWatch,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let wd = i32::from_le_bytes(body[8..12].try_into().unwrap());
+    let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok((handle, wd))
+}
+
+pub fn build_inotify_rm_watch_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InotifyRmWatchResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_inotify_read_request(handle_id: u64, max_len: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InotifyRead,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inotify_read_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyRead,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let max_len = u32::from_le_bytes(body[8..12].try_into().unwrap());
+    let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok((handle, max_len))
+}
+
+pub fn build_inotify_read_response_ok(payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + payload.len());
+    body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(payload);
+    OwnedFrame {
+        opcode: Opcode::InotifyReadResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inotify_read_response_body(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyReadResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InotifyReadResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
+}
+
 /// Body for [`Opcode::CreatePipe`]: (capacity: u64, atomic_write_size: u64).
 pub fn build_create_pipe_request(capacity: u64, atomic_write_size: u64) -> OwnedFrame {
     let mut body = Vec::with_capacity(16);
@@ -2595,6 +2854,45 @@ pub fn build_dup_handle_response_ok() -> OwnedFrame {
     }
 }
 
+/// Body for [`Opcode::QueryEvents`]: handle id.
+pub fn build_query_events_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::QueryEvents,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Decodes the body of a [`Opcode::QueryEvents`] request frame.
+pub fn parse_query_events_request(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::QueryEvents)
+}
+
+/// Body for [`Opcode::QueryEventsResponse`]: `events: u32` LE — the
+/// broker's current view of which `NOTIFY_EVENT_*` bits are set on
+/// the queried handle. The caller filters with its own event mask.
+pub fn build_query_events_response_ok(events: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::QueryEventsResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: events.to_le_bytes().to_vec(),
+    }
+}
+
+/// Decodes the body of a [`Opcode::QueryEventsResponse`] success frame.
+pub fn parse_query_events_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::QueryEventsResponse,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+}
+
 /// Constructs an error response. The caller supplies the response
 /// opcode (derived from the request via [`Opcode::response_for`]) and
 /// a non-`Ok` status.
@@ -2657,6 +2955,8 @@ mod tests {
             Opcode::MarkProcessExited,
             Opcode::SubscribeProcessExitResponse,
             Opcode::MarkProcessExitedResponse,
+            Opcode::QueryEvents,
+            Opcode::QueryEventsResponse,
         ] {
             assert_eq!(Opcode::try_from(op as u8).unwrap(), op);
         }
@@ -2719,6 +3019,8 @@ mod tests {
             Opcode::PidfdExitedResponse,
             Opcode::SubscribeProcessExitResponse,
             Opcode::MarkProcessExitedResponse,
+            Opcode::QueryEvents,
+            Opcode::QueryEventsResponse,
         ] {
             assert_eq!(op.expected_fd_count(), 0, "{op:?}");
         }
