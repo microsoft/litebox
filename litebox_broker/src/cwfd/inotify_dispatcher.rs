@@ -4,6 +4,7 @@
 //! Broker-global inotify subscription fan-out for 9P filesystem mutations.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::cwfd::inotify_state::InotifyState;
@@ -19,11 +20,33 @@ struct WatchRegistration {
 #[derive(Debug, Default)]
 pub struct InotifyDispatcher {
     watches: Mutex<BTreeMap<String, Vec<WatchRegistration>>>,
+    /// Monotonic counter for paired-event cookies (e.g. linking
+    /// `IN_MOVED_FROM` to `IN_MOVED_TO` for the same rename). Real
+    /// inotify reserves `cookie == 0` to mean "no pairing"; we always
+    /// return a non-zero u32, wrapping past `u32::MAX` back to 1.
+    next_cookie: AtomicU32,
 }
 
 impl InotifyDispatcher {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Allocate a unique non-zero cookie for an event pair. Callers
+    /// pass the same cookie to both halves of the pair (e.g. the
+    /// `IN_MOVED_FROM` and `IN_MOVED_TO` for one rename) so guest
+    /// watchers can correlate them; standalone events should pass
+    /// `0`.
+    pub fn next_cookie(&self) -> u32 {
+        loop {
+            let raw = self.next_cookie.fetch_add(1, Ordering::Relaxed);
+            // Skip 0: real inotify uses cookie==0 to mean "this event
+            // is not part of a pair", so an allocated cookie must
+            // always be non-zero.
+            if raw != u32::MAX {
+                return raw.wrapping_add(1);
+            }
+        }
     }
 
     pub fn register(&self, path: String, wd: i32, mask: u32, state: &Arc<InotifyState>) {

@@ -1765,8 +1765,9 @@ impl Server {
                 state.path = dst.clone();
                 self.invalidate_canonical_cache(&resolved_src);
                 self.invalidate_canonical_cache(&dst);
-                self.notify_inotify_path(&resolved_src, IN_MOVED_FROM, 0);
-                self.notify_inotify_parent(&resolved_dst_dir, IN_MOVED_TO, 0, &name);
+                let cookie = self.inotify_dispatcher.next_cookie();
+                self.notify_inotify_path(&resolved_src, IN_MOVED_FROM, cookie);
+                self.notify_inotify_parent(&resolved_dst_dir, IN_MOVED_TO, cookie, &name);
                 Fcall::Rrename(fcall::Rrename {})
             }
             Err(e) => io_error_response(e),
@@ -1839,8 +1840,9 @@ impl Server {
             Ok(()) => {
                 self.invalidate_canonical_cache(&src);
                 self.invalidate_canonical_cache(&dst);
-                self.notify_inotify_parent(&resolved_old_dir, IN_MOVED_FROM, 0, &oldname);
-                self.notify_inotify_parent(&resolved_new_dir, IN_MOVED_TO, 0, &newname);
+                let cookie = self.inotify_dispatcher.next_cookie();
+                self.notify_inotify_parent(&resolved_old_dir, IN_MOVED_FROM, cookie, &oldname);
+                self.notify_inotify_parent(&resolved_new_dir, IN_MOVED_TO, cookie, &newname);
                 Fcall::Rrenameat(fcall::Rrenameat {})
             }
             Err(e) => io_error_response(e),
