@@ -73,7 +73,7 @@ pub fn num_to_buf(buf: &mut [u8; 40], mut n: u64, base: u64) -> usize {
         i += 1;
     }
     while n > 0 {
-        buf[i] = num_to_char((n % base).truncate());
+        buf[i] = num_to_char((n % base).trunc());
         n /= base;
         i += 1;
     }
@@ -163,8 +163,8 @@ impl GhcbPage {
 
     /// GHCB page-based communication must set bitmap correctly.
     fn set_offset_valid(&mut self, offset: u64) {
-        let idx: u8 = ((offset / 8) / 8).truncate();
-        let bit: u8 = ((offset / 8) % 8).truncate();
+        let idx: u8 = ((offset / 8) / 8).trunc();
+        let bit: u8 = ((offset / 8) % 8).trunc();
         let oldv: u8 = self.valid_bitmap[idx as usize];
         let newv = oldv | (1u8 << (bit));
         self.valid_bitmap[idx as usize] = newv;
@@ -202,8 +202,8 @@ impl GhcbProtocol {
 
         ghcb_page.set_rcx(u64::from(reg));
 
-        let low_val: u32 = val.truncate();
-        let high_val: u32 = (val >> 32).truncate();
+        let low_val: u32 = val.trunc();
+        let high_val: u32 = (val >> 32).trunc();
         ghcb_page.set_rax(u64::from(low_val));
         ghcb_page.set_rdx(u64::from(high_val));
 

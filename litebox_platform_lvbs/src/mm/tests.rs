@@ -82,7 +82,7 @@ impl super::MemoryProvider for MockKernel {
 
     fn pa_to_va(pa: PhysAddr) -> VirtAddr {
         let mapping = MAPPING.lock();
-        let idx: usize = ((pa.as_u64() - 0x1000_0000) / PAGE_SIZE as u64).truncate();
+        let idx: usize = ((pa.as_u64() - 0x1000_0000) / PAGE_SIZE as u64).trunc();
         let va = mapping.get(idx);
         assert!(va.is_some());
         let va = *va.unwrap();

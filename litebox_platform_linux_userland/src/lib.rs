@@ -224,9 +224,7 @@ impl LinuxUserland {
 
                 // By taking ownership, we are letting the drop handler automatically run `libc::close`
                 // when necessary.
-                unsafe {
-                    std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().truncate())
-                }
+                unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().trunc()) }
             })
             .into();
 
@@ -1061,7 +1059,7 @@ impl litebox::platform::TimerHandle for TimerHandle {
                 tv_nsec: 0,
             },
             it_value: libc::timespec {
-                tv_sec: duration.as_secs().cast_signed().truncate(),
+                tv_sec: duration.as_secs().cast_signed().trunc(),
                 tv_nsec: duration.subsec_nanos().cast_signed().into(),
             },
         };
@@ -1235,7 +1233,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
-                t.tv_nsec.reinterpret_as_unsigned().truncate(),
+                t.tv_nsec.reinterpret_as_unsigned().trunc(),
             ),
         }
     }
@@ -1248,7 +1246,7 @@ impl litebox::platform::TimeProvider for LinuxUserland {
             #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
-                t.tv_nsec.reinterpret_as_unsigned().truncate(),
+                t.tv_nsec.reinterpret_as_unsigned().trunc(),
             ),
         }
     }
@@ -2054,7 +2052,7 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
     ] {
         *reg = context.uc_mcontext.gregs[sig_reg.reinterpret_as_unsigned() as usize]
             .reinterpret_as_unsigned()
-            .truncate();
+            .trunc();
     }
     *orig_rax = *rax;
 }
@@ -2126,9 +2124,9 @@ unsafe extern "C" fn exception_signal_handler(
     let sigctx = &context.uc_mcontext;
     #[cfg(target_arch = "x86_64")]
     let (trapno, err, cr2) = (
-        sigctx.gregs[libc::REG_TRAPNO as usize].truncate(),
-        sigctx.gregs[libc::REG_ERR as usize].truncate(),
-        sigctx.gregs[libc::REG_CR2 as usize].truncate(),
+        sigctx.gregs[libc::REG_TRAPNO as usize].trunc(),
+        sigctx.gregs[libc::REG_ERR as usize].trunc(),
+        sigctx.gregs[libc::REG_CR2 as usize].trunc(),
     );
     set_signal_return(context, exception_callback, 0, trapno, err, cr2);
 }
@@ -2145,7 +2143,7 @@ unsafe fn next_signal_handler(
             {
                 context.uc_mcontext.gregs[libc::REG_RIP as usize]
                     .reinterpret_as_unsigned()
-                    .truncate()
+                    .trunc()
             }
         };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
@@ -2306,7 +2304,7 @@ unsafe fn interrupt_signal_handler(
     #[cfg(target_arch = "x86_64")]
     let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize]
         .reinterpret_as_unsigned()
-        .truncate();
+        .trunc();
 
     // Case 1: at the beginning of the syscall handler.
     //

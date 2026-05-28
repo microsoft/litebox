@@ -1565,7 +1565,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                     UnixSocketInner::Stream(_) => SockType::Stream as u32,
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,
                 },
-                SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.truncate(),
+                SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.trunc(),
                 SocketOption::PEERCRED => match &self.inner {
                     UnixSocketInner::Stream(stream) => {
                         let ucred = stream.with_state_ref(|state| match state {

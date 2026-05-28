@@ -78,10 +78,7 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_sysinfo(&self) -> litebox_common_linux::Sysinfo {
         let now = self.global.platform.now();
         litebox_common_linux::Sysinfo {
-            uptime: now
-                .duration_since(&self.global.boot_time)
-                .as_secs()
-                .truncate(),
+            uptime: now.duration_since(&self.global.boot_time).as_secs().trunc(),
             // TODO: Populate these fields with actual values
             loads: [0; 3],
             #[cfg(target_arch = "x86_64")]
@@ -91,7 +88,7 @@ impl<FS: ShimFS> Task<FS> {
             bufferram: 0,
             totalswap: 0,
             freeswap: 0,
-            procs: self.process().nr_threads().truncate(),
+            procs: self.process().nr_threads().trunc(),
             totalhigh: 0,
             freehigh: 0,
             mem_unit: 1,

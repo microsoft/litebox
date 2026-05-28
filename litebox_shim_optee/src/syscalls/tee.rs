@@ -99,7 +99,7 @@ impl Task {
                 prop_buf[..core::mem::size_of::<TeeIdentity>()]
                     .copy_from_slice(identity.as_bytes());
                 prop_len
-                    .write_at_offset(0, core::mem::size_of::<TeeIdentity>().truncate())
+                    .write_at_offset(0, core::mem::size_of::<TeeIdentity>().trunc())
                     .ok_or(TeeResult::AccessDenied)?;
                 prop_type
                     .write_at_offset(0, UserTaPropType::Identity as u32)
@@ -116,7 +116,7 @@ impl Task {
                 let ta_uuid = self.ta_app_id;
                 prop_buf[..core::mem::size_of::<TeeUuid>()].copy_from_slice(ta_uuid.as_bytes());
                 prop_len
-                    .write_at_offset(0, core::mem::size_of::<TeeUuid>().truncate())
+                    .write_at_offset(0, core::mem::size_of::<TeeUuid>().trunc())
                     .ok_or(TeeResult::AccessDenied)?;
                 prop_type
                     .write_at_offset(0, UserTaPropType::Uuid as u32)

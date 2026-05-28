@@ -113,7 +113,7 @@ macro_rules! read_fn {
             // FUTURE: use a `label` like with the write functions once Rust
             // supports them with `out` operands.
             if failed == 0 {
-                Ok((value as u64).truncate())
+                Ok((value as u64).trunc())
             } else {
                 Err(Fault)
             }
@@ -135,7 +135,7 @@ macro_rules! write_fn {
         /// `dest` must be valid for writes or a pointer that's guaranteed to be
         /// in non-Rust memory.
         pub unsafe fn $name(dest: *mut $ty, value: $ty) -> Result<(), Fault> {
-            let value: usize = (u64::from(value)).truncate();
+            let value: usize = (u64::from(value)).trunc();
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 core::arch::asm! {

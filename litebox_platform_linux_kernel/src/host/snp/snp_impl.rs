@@ -60,7 +60,7 @@ mod alloc {
                 (
                     Self::pa_to_va(crate::arch::PhysAddr::new_truncate(addr as u64))
                         .as_u64()
-                        .truncate(),
+                        .trunc(),
                     size,
                 )
             })
@@ -565,7 +565,7 @@ impl HostInterface for HostSnpInterface {
             ],
         });
         assert!(ret.is_ok(), "clock_gettime failed");
-        core::time::Duration::new(t.tv_sec.reinterpret_as_unsigned(), t.tv_nsec.truncate())
+        core::time::Duration::new(t.tv_sec.reinterpret_as_unsigned(), t.tv_nsec.trunc())
     }
 
     fn terminate_process(code: i32) -> ! {

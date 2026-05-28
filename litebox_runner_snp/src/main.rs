@@ -72,7 +72,7 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
             .as_ref()
             .unwrap()
             .page_manager()
-            .handle_page_fault(addr.truncate(), code as u64)
+            .handle_page_fault(addr.trunc(), code as u64)
     } {
         Ok(()) => (),
         Err(e) => {
@@ -82,7 +82,7 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
                 // Only check the exception table for kernel-space addresses (high canonical addresses).
                 if pt_regs.rip >= <litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel as litebox::platform::PageManagementProvider<4096>>::TASK_ADDR_MAX
                     && let Some(fixup_addr) =
-                        litebox::mm::exception_table::search_exception_tables(pt_regs.rip.truncate())
+                        litebox::mm::exception_table::search_exception_tables(pt_regs.rip.trunc())
                     {
                         pt_regs.rip = fixup_addr;
                         return;

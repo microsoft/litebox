@@ -823,7 +823,7 @@ impl Task {
         if let Some(ldelf_arg_address) = ldelf_arg_address {
             let ldelf_arg_ptr = UserConstPtr::<LdelfArg>::from_usize(ldelf_arg_address);
             if let Some(ldef_arg) = ldelf_arg_ptr.read_at_offset(0) {
-                let entry_func = ldef_arg.entry_func.truncate();
+                let entry_func = ldef_arg.entry_func.trunc();
                 // If `ldelf` has been successfully executed, it loads the given TA and stores the TA's entry
                 // point into `ldelf_arg.entry_func`.
                 self.set_ta_entry_point(entry_func);
@@ -881,7 +881,7 @@ where
         && let Some(length) = dst_len.read_at_offset(0)
         && length <= MAX_KERNEL_BUF_SIZE as u64
     {
-        let mut length: usize = length.truncate();
+        let mut length: usize = length.trunc();
         let mut kernel_buf = vec![0u8; length];
         syscall_fn(task, state, &src_slice, &mut kernel_buf, &mut length).and_then(|()| {
             let _ = dst_len.write_at_offset(0, length as u64);
@@ -990,8 +990,8 @@ impl TeeObjMap {
 
             // TODO: support multiple attributes (e.g., two-key crypto algorithms like AES-XTS)
             if user_attrs[0].attribute_id == TeeAttributeType::SecretValue {
-                let key_addr: usize = user_attrs[0].a.truncate();
-                let key_len: usize = user_attrs[0].b.truncate();
+                let key_addr: usize = user_attrs[0].a.trunc();
+                let key_len: usize = user_attrs[0].b.trunc();
                 // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
                 if key_len > MAX_KERNEL_BUF_SIZE {
                     return Err(TeeResult::BadParameters);

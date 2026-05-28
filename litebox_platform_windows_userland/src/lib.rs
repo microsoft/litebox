@@ -116,7 +116,7 @@ unsafe extern "system" fn vectored_exception_handler(
         // recover.
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
             && let Some(recover) =
-                litebox::mm::exception_table::search_exception_tables(context.Rip.truncate())
+                litebox::mm::exception_table::search_exception_tables(context.Rip.trunc())
         {
             // Found a matching exception table entry.
             context.Rip = recover as u64;
@@ -191,25 +191,25 @@ fn save_guest_context(
         rsp,
         ss: _,
     } = guest_context;
-    *r15 = context.R15.truncate();
-    *r14 = context.R14.truncate();
-    *r13 = context.R13.truncate();
-    *r12 = context.R12.truncate();
-    *rbp = context.Rbp.truncate();
-    *rbx = context.Rbx.truncate();
-    *r11 = context.R11.truncate();
-    *r10 = context.R10.truncate();
-    *r9 = context.R9.truncate();
-    *r8 = context.R8.truncate();
-    *rax = context.Rax.truncate();
-    *rcx = context.Rcx.truncate();
-    *rdx = context.Rdx.truncate();
-    *rsi = context.Rsi.truncate();
-    *rdi = context.Rdi.truncate();
-    *orig_rax = context.Rax.truncate();
-    *rip = context.Rip.truncate();
+    *r15 = context.R15.trunc();
+    *r14 = context.R14.trunc();
+    *r13 = context.R13.trunc();
+    *r12 = context.R12.trunc();
+    *rbp = context.Rbp.trunc();
+    *rbx = context.Rbx.trunc();
+    *r11 = context.R11.trunc();
+    *r10 = context.R10.trunc();
+    *r9 = context.R9.trunc();
+    *r8 = context.R8.trunc();
+    *rax = context.Rax.trunc();
+    *rcx = context.Rcx.trunc();
+    *rdx = context.Rdx.trunc();
+    *rsi = context.Rsi.trunc();
+    *rdi = context.Rdi.trunc();
+    *orig_rax = context.Rax.trunc();
+    *rip = context.Rip.trunc();
     *eflags = context.EFlags as usize;
-    *rsp = context.Rsp.truncate();
+    *rsp = context.Rsp.trunc();
 }
 
 impl WindowsUserland {
@@ -709,7 +709,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         unsafe {
             win_ctx.write(CONTEXT {
                 ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
-                EFlags: ctx.eflags.truncate(),
+                EFlags: ctx.eflags.trunc(),
                 Rax: ctx.rax as u64,
                 Rcx: ctx.rcx as u64,
                 Rdx: ctx.rdx as u64,
@@ -899,8 +899,8 @@ impl litebox::platform::TimerHandle for TimerHandle {
             -(i64::try_from(intervals).unwrap_or(i64::MAX))
         };
         let due_time = FILETIME {
-            dwLowDateTime: due_time_100ns.cast_unsigned().truncate(),
-            dwHighDateTime: (due_time_100ns >> 32).cast_unsigned().truncate(),
+            dwLowDateTime: due_time_100ns.cast_unsigned().trunc(),
+            dwHighDateTime: (due_time_100ns >> 32).cast_unsigned().trunc(),
         };
 
         // Arm the threadpool timer. The callback registered at creation
@@ -1161,12 +1161,12 @@ impl ThreadHandle {
 
         let run_interrupt_callback = if (switch_to_guest_start as *const () as usize
             ..switch_to_guest_end as *const () as usize)
-            .contains(&(context.Rip.truncate()))
+            .contains(&(context.Rip.trunc()))
         {
             // Case 1: jump to interrupt callback without saving the guest
             // context, since it's already saved.
             true
-        } else if is_in_ntdll_or_this(context.Rip.truncate()) {
+        } else if is_in_ntdll_or_this(context.Rip.trunc()) {
             // Case 2/3: we can't distinguish between them. For case 2 we don't
             // need to do anything, but for case 3 we need to update the
             // NtContinue context to point to the interrupt callback (the guest
@@ -1303,7 +1303,7 @@ impl RawMutex {
             None => Win32_Threading::INFINITE, // no timeout
             Some(timeout) => {
                 let ms = timeout.as_millis();
-                ms.min(u128::from(Win32_Threading::INFINITE - 1)).truncate()
+                ms.min(u128::from(Win32_Threading::INFINITE - 1)).trunc()
             }
         };
 

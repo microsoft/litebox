@@ -583,7 +583,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
-                syscalls::file::try_into_whence(whence.truncate())
+                syscalls::file::try_into_whence(whence.trunc())
                     .map_err(|_| Errno::EINVAL)
                     .and_then(|seekwhence| self.sys_lseek(fd, offset, seekwhence))
             }

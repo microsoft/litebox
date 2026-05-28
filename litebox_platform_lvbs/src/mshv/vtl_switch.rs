@@ -397,7 +397,7 @@ pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), VsmError> {
     let value = hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS)
         .map_err(VsmError::HypercallFailed)?;
     let code_page_offsets = HvRegisterVsmCodePageOffsets::from_u64(value);
-    let hvcall_page: usize = hv_hypercall_page_address().truncate();
+    let hvcall_page: usize = hv_hypercall_page_address().trunc();
     let vtl_return_address = hvcall_page
         .checked_add(usize::from(code_page_offsets.vtl_return_offset()))
         .ok_or(VsmError::CodePageOffsetOverflow)?;

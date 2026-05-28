@@ -213,7 +213,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     let _ = unmap_one(page);
                 }
                 let count =
-                    ((end.start_address() - start.start_address()) / Size4KiB::SIZE).truncate();
+                    ((end.start_address() - start.start_address()) / Size4KiB::SIZE).trunc();
                 flush_tlb_range(start, count);
             }
             (true, false) => {
@@ -251,7 +251,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 if !unmapped_frames.is_empty() {
                     let count = ((end.start_address() - flush_start.start_address())
                         / Size4KiB::SIZE)
-                        .truncate();
+                        .trunc();
                     flush_tlb_range(flush_start, count);
                     for frame in unmapped_frames.drain(..) {
                         unsafe { allocator.deallocate_frame(frame) };
@@ -357,7 +357,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         // Flush old (unmapped) addresses — other cores may hold stale entries.
         let page_count = (end.start_address() - flush_start.start_address()) / Size4KiB::SIZE;
-        flush_tlb_range(flush_start, page_count.truncate());
+        flush_tlb_range(flush_start, page_count.trunc());
 
         Ok(UserMutPtr::from_ptr(new_range.start as *mut u8))
     }
@@ -417,7 +417,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         let page_count = (end.start_address() - start.start_address()) / Size4KiB::SIZE + 1;
         // Permission change: other cores may hold stale (wider) permissions.
-        flush_tlb_range(start, page_count.truncate());
+        flush_tlb_range(start, page_count.trunc());
 
         Ok(())
     }
@@ -527,7 +527,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             Page::<Size4KiB>::containing_address(pa_to_va(frame_range.start.start_address()));
         let count =
             (frame_range.end.start_address() - frame_range.start.start_address()) / Size4KiB::SIZE;
-        flush_tlb_range(start_page, count.truncate());
+        flush_tlb_range(start_page, count.trunc());
 
         Ok(pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
@@ -633,7 +633,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         let start = pages.start;
         let end = pages.end; // inclusive
         let count = (end.start_address() - start.start_address()) / Size4KiB::SIZE + 1;
-        flush_tlb_range(start, count.truncate());
+        flush_tlb_range(start, count.trunc());
 
         // Safety: all leaf entries in `pages` have been unmapped above while
         // holding `self.inner`, so any P1/P2/P3 frames that became empty can

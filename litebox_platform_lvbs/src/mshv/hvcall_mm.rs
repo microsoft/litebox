@@ -62,8 +62,8 @@ pub fn hv_modify_vtl_protection_mask(
             while total_protected < num_pages {
                 let remaining: usize = (num_pages - total_protected)
                     .min(HvInputModifyVtlProtectionMask::MAX_PAGES_PER_REQUEST as u64)
-                    .truncate();
-                let pages_to_protect: u16 = remaining.truncate();
+                    .trunc();
+                let pages_to_protect: u16 = remaining.trunc();
 
                 for i in 0..remaining {
                     hvin.gpa_page_list[i] = (start >> PAGE_SHIFT) + (total_protected + i as u64);

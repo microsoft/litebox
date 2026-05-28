@@ -51,7 +51,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::ReadAt for &'_ ElfFile<'_, FS> {
                 return Ok(());
             }
             // Try to read the remaining bytes
-            let bytes_read = self.task.sys_read(self.fd, buf, Some(offset.truncate()))?;
+            let bytes_read = self.task.sys_read(self.fd, buf, Some(offset.trunc()))?;
             if bytes_read == 0 {
                 // reached the end of the file
                 return Err(Errno::ENODATA);
@@ -115,7 +115,7 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
             prot.flags(),
             MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
             self.fd,
-            offset.truncate(),
+            offset.trunc(),
         )?;
         Ok(())
     }

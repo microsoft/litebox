@@ -124,7 +124,7 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, VsmError> 
 pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Boot APs");
     let cpu_online_mask_page_addr = cpu_online_mask_pfn
-        .checked_shl(PAGE_SHIFT.truncate())
+        .checked_shl(PAGE_SHIFT.trunc())
         .and_then(|pa| PhysAddr::try_new(pa).ok())
         .ok_or(VsmError::InvalidPhysicalAddress)?;
 
@@ -147,7 +147,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64) -> Result<i64, VsmError> {
 
     // Initialize VTL for each online CPU and update its boot signal byte
     cpu_mask.for_each_cpu(|cpu_id| {
-        let cpu_id_u32: u32 = cpu_id.truncate();
+        let cpu_id_u32: u32 = cpu_id.trunc();
         if let Err(e) = init_vtl_ap(cpu_id_u32) {
             error = Some(e);
         }
@@ -834,7 +834,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
         core::cmp::min(PAGE_SIZE, core::mem::size_of::<HekiPatch>())
     } else {
         core::cmp::min(
-            (patch_pa_0.align_up(Size4KiB::SIZE) - patch_pa_0).truncate(),
+            (patch_pa_0.align_up(Size4KiB::SIZE) - patch_pa_0).trunc(),
             core::mem::size_of::<HekiPatch>(),
         )
     };
@@ -883,7 +883,7 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
     let heki_patch_pa_1 = PhysAddr::new(heki_patch.pa[1]);
 
     let patch_target_page_offset: usize =
-        (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).truncate();
+        (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).trunc();
     let bytes_in_first_page = PAGE_SIZE - patch_target_page_offset;
 
     if heki_patch_pa_1.is_null()
@@ -973,7 +973,7 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
         VsmFunction::KexecValidate => mshv_vsm_kexec_validate(params[0], params[1], params[2]),
         VsmFunction::PatchText => mshv_vsm_patch_text(params[0], params[1]),
         VsmFunction::AllocateRingbufferMemory => {
-            let size: usize = params[1].truncate();
+            let size: usize = params[1].trunc();
             mshv_vsm_allocate_ringbuffer_memory(params[0], size)
         }
         VsmFunction::SetPlatformRootKey => mshv_vsm_set_platform_root_key(params[0]),
@@ -1364,7 +1364,7 @@ impl<'a> ModuleMemoryMetadataIters<'a> {
 /// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
 /// `pa` and `nranges` specify the physical address range containing one or more than one `HekiPage` structures.
 fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
-    let mut heki_pages = Vec::with_capacity(nranges.truncate());
+    let mut heki_pages = Vec::with_capacity(nranges.trunc());
     let mut visited_pages = HashSet::new();
     let mut range: u64 = 0;
 
@@ -1617,7 +1617,7 @@ impl MemoryContainer {
         let mut len: usize = 0;
         if self.buf.is_empty() {
             for range in &self.range {
-                let range_len: usize = range.len.truncate();
+                let range_len: usize = range.len.trunc();
                 len = len
                     .checked_add(range_len)
                     .ok_or(MemoryContainerError::Overflow)?;
@@ -1644,7 +1644,7 @@ impl MemoryContainer {
         phys_start: PhysAddr,
         phys_end: PhysAddr,
     ) -> Result<(), MemoryContainerError> {
-        let mut bytes_to_copy: usize = (phys_end - phys_start).truncate();
+        let mut bytes_to_copy: usize = (phys_end - phys_start).trunc();
         let mut phys_cur = phys_start;
 
         while phys_cur < phys_end {
@@ -1655,7 +1655,7 @@ impl MemoryContainer {
                 return Err(MemoryContainerError::CopyFromVtl0Failed);
             };
 
-            let src_offset: usize = (phys_cur - phys_aligned).truncate();
+            let src_offset: usize = (phys_cur - phys_aligned).trunc();
             let src_len = core::cmp::min(bytes_to_copy, PAGE_SIZE - src_offset);
             let src = &page.0[src_offset..src_offset + src_len];
 
@@ -1898,7 +1898,7 @@ impl PatchDataMap {
                 break;
             };
 
-            let patch_index: usize = patch_info.patch_index.truncate();
+            let patch_index: usize = patch_info.patch_index.trunc();
             let total_patch_size = core::mem::size_of::<HekiPatch>()
                 .checked_mul(patch_index)
                 .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
@@ -2073,12 +2073,12 @@ impl SymbolTable {
             return Err(VsmError::SymbolTableOutOfRange);
         }
 
-        let kinfo_len: usize = (end - start).truncate();
+        let kinfo_len: usize = (end - start).trunc();
         if !kinfo_len.is_multiple_of(HekiKernelSymbol::KSYM_LEN) {
             return Err(VsmError::SymbolTableLengthInvalid);
         }
 
-        let mut kinfo_offset: usize = (start - range.start).truncate();
+        let mut kinfo_offset: usize = (start - range.start).trunc();
         let mut kinfo_addr = start;
         let ksym_count = kinfo_len / HekiKernelSymbol::KSYM_LEN;
         let mut inner = self.inner.write();

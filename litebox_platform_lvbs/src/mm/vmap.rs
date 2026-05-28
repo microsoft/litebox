@@ -123,7 +123,7 @@ impl VmapRegionAllocatorInner {
             return;
         }
         let start_vpn =
-            <u64 as litebox::utils::TruncateExt<usize>>::truncate(start.as_u64()) / PAGE_SIZE;
+            <u64 as litebox::utils::TruncateExt<usize>>::trunc(start.as_u64()) / PAGE_SIZE;
         let total_pages = num_pages + GUARD_PAGES;
         self.free_set.insert(start_vpn..start_vpn + total_pages);
     }
@@ -131,7 +131,7 @@ impl VmapRegionAllocatorInner {
 
 /// Checks if a virtual address is within the vmap region.
 pub fn is_vmap_address(va: VirtAddr) -> bool {
-    (VMAP_START..VMAP_END).contains(&va.as_u64().truncate())
+    (VMAP_START..VMAP_END).contains(&va.as_u64().trunc())
 }
 
 /// Vmap region allocator that manages virtual address allocation and PA↔VA mappings.

@@ -81,7 +81,7 @@ fn checked_memref_size(size: u64) -> Result<usize, OpteeSmcReturnCode> {
     if size > MAX_SHM_MEMREF_SIZE as u64 {
         return Err(OpteeSmcReturnCode::ENomem);
     }
-    Ok(size.truncate())
+    Ok(size.trunc())
 }
 
 fn parse_optee_msg_args(
@@ -172,9 +172,9 @@ pub fn read_optee_msg_args_from_phys(
     has_rpc_arg: bool,
 ) -> Result<(Box<OpteeMsgArgs>, Option<Box<OpteeRpcArgs>>), OpteeSmcReturnCode> {
     // Compute copy size from known-good upper bounds — no untrusted data involved.
-    let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.truncate());
+    let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.trunc());
     let copy_size = if has_rpc_arg {
-        main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.truncate())
+        main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.trunc())
     } else {
         main_max
     };
@@ -206,7 +206,7 @@ pub fn handle_optee_smc_args(
     match func_id {
         OpteeSmcFunction::CallWithArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
-            let msg_args_addr: usize = msg_args_addr.truncate();
+            let msg_args_addr: usize = msg_args_addr.trunc();
             let (msg_args, _) = read_optee_msg_args_from_phys(msg_args_addr, false)?;
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
@@ -216,7 +216,7 @@ pub fn handle_optee_smc_args(
         }
         OpteeSmcFunction::CallWithRpcArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
-            let msg_args_addr: usize = msg_args_addr.truncate();
+            let msg_args_addr: usize = msg_args_addr.trunc();
             let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
@@ -232,9 +232,9 @@ pub fn handle_optee_smc_args(
                 .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
             // Compute copy size from known-good upper bounds — no untrusted data involved.
-            let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.truncate());
-            let copy_size = main_max
-                + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.truncate());
+            let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.trunc());
+            let copy_size =
+                main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.trunc());
 
             let mut blob = alloc::vec![0u8; copy_size];
             shm_info.read_at(offset, &mut blob)?;
@@ -412,7 +412,7 @@ pub fn decode_ta_request(
 
             let param1 = msg_args.get_param_value(1)?;
             let client_data = [param1.a, param1.b];
-            let login: u32 = param1.c.truncate();
+            let login: u32 = param1.c.trunc();
             let login = TeeLogin::try_from(login).unwrap_or(TeeLogin::Public);
 
             // Skip the first two parameters as they convey TA and client UUIDs
@@ -602,7 +602,7 @@ pub fn update_optee_msg_args(
                     // SAFETY
                     // `addr` is expected to be a valid address of a TA and `addr + len` does not
                     // exceed the TA's memory region.
-                    let ptr = crate::UserConstPtr::<u8>::from_usize(addr.truncate());
+                    let ptr = crate::UserConstPtr::<u8>::from_usize(addr.trunc());
                     let slice = ptr
                         .to_owned_slice(len)
                         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
@@ -770,15 +770,15 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         if page_offset >= ALIGN as u64 || aligned_size == 0 {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
-        let size: usize = size.truncate();
-        let aligned_size_usize: usize = aligned_size.truncate();
+        let size: usize = size.trunc();
+        let aligned_size_usize: usize = aligned_size.trunc();
         if aligned_size_usize > MAX_SHM_MEMREF_SIZE {
             return Err(OpteeSmcReturnCode::ENomem);
         }
         let num_pages = aligned_size_usize / ALIGN;
         let mut pages = Vec::with_capacity(num_pages);
         let mut visited_pages_data = HashSet::new();
-        let mut cur_addr: usize = shm_ref_pages_data_phys_addr.truncate();
+        let mut cur_addr: usize = shm_ref_pages_data_phys_addr.trunc();
         loop {
             if visited_pages_data.contains(&cur_addr) {
                 return Err(OpteeSmcReturnCode::EBadAddr);
@@ -794,8 +794,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
                     break;
                 } else {
                     pages.push(
-                        PhysPageAddr::new((*page).truncate())
-                            .ok_or(OpteeSmcReturnCode::EBadAddr)?,
+                        PhysPageAddr::new((*page).trunc()).ok_or(OpteeSmcReturnCode::EBadAddr)?,
                     );
                 }
             }
@@ -806,7 +805,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
                 return Err(OpteeSmcReturnCode::EBadAddr);
             }
             if pages_data.next_page_data.is_multiple_of(ALIGN as u64) {
-                cur_addr = pages_data.next_page_data.truncate();
+                cur_addr = pages_data.next_page_data.trunc();
             } else {
                 return Err(OpteeSmcReturnCode::EBadAddr);
             }
@@ -814,7 +813,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
 
         self.insert(
             shm_ref,
-            ShmInfo::new(pages.into_boxed_slice(), page_offset.truncate(), size)?,
+            ShmInfo::new(pages.into_boxed_slice(), page_offset.trunc(), size)?,
         )?;
         Ok(())
     }
@@ -839,10 +838,10 @@ fn get_shm_info_from_optee_msg_param_tmem(
     }
 
     let phys_addr = tmem.buf_ptr;
-    let size: usize = tmem.size.truncate();
+    let size: usize = tmem.size.trunc();
 
     // Calculate page-aligned address and offset
-    let phys_addr_usize: usize = phys_addr.truncate();
+    let phys_addr_usize: usize = phys_addr.trunc();
     let page_offset = phys_addr_usize % PAGE_SIZE;
     let aligned_addr = phys_addr - page_offset as u64;
 
@@ -861,8 +860,7 @@ fn get_shm_info_from_optee_msg_param_tmem(
                     .ok_or(OpteeSmcReturnCode::EBadAddr)? as u64,
             )
             .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-        page_addrs
-            .push(PhysPageAddr::new(page_addr.truncate()).ok_or(OpteeSmcReturnCode::EBadAddr)?);
+        page_addrs.push(PhysPageAddr::new(page_addr.trunc()).ok_or(OpteeSmcReturnCode::EBadAddr)?);
     }
 
     ShmInfo::new(page_addrs.into_boxed_slice(), page_offset, size)
@@ -879,9 +877,9 @@ fn get_shm_info_from_optee_msg_param_rmem(
         return Err(OpteeSmcReturnCode::ENotAvail);
     };
     let page_offset = shm_info.page_offset;
-    let rmem_offs: usize = rmem.offs.truncate();
+    let rmem_offs: usize = rmem.offs.trunc();
     let view_end = rmem_offs
-        .checked_add(rmem.size.truncate())
+        .checked_add(rmem.size.trunc())
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
     if view_end > shm_info.len() {
         return Err(OpteeSmcReturnCode::EBadAddr);
@@ -890,7 +888,7 @@ fn get_shm_info_from_optee_msg_param_rmem(
         .checked_add(rmem_offs)
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
     let end = start
-        .checked_add(rmem.size.truncate())
+        .checked_add(rmem.size.trunc())
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
     let start_page_index = start / PAGE_SIZE;
     let end_page_index = end.div_ceil(PAGE_SIZE);
@@ -902,6 +900,6 @@ fn get_shm_info_from_optee_msg_param_rmem(
     ShmInfo::new(
         page_addrs.into_boxed_slice(),
         start % PAGE_SIZE,
-        rmem.size.truncate(),
+        rmem.size.trunc(),
     )
 }

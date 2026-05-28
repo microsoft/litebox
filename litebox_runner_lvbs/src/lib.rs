@@ -57,7 +57,7 @@ pub fn seed_initial_heap() {
     let vtl1_start = Platform::va_to_pa(x86_64::VirtAddr::new(vtl1_base_va));
 
     let mem_fill_start =
-        TruncateExt::<usize>::truncate(vtl1_base_va) + VTL1_INIT_HEAP_START_PAGE * PAGE_SIZE;
+        TruncateExt::<usize>::trunc(vtl1_base_va) + VTL1_INIT_HEAP_START_PAGE * PAGE_SIZE;
     unsafe {
         Platform::mem_fill_pages(mem_fill_start, VTL1_INIT_HEAP_SIZE);
     }
@@ -71,9 +71,9 @@ pub fn seed_initial_heap() {
 
     // Add pre-populated region (_heap_start .. end of Phase 1 mapping).
     let heap_va = get_heap_start_address();
-    let mem_fill_start: usize = heap_va.truncate();
+    let mem_fill_start: usize = heap_va.trunc();
     let heap_phys = Platform::va_to_pa(x86_64::VirtAddr::new(heap_va)).as_u64();
-    let heap_offset: usize = TruncateExt::<usize>::truncate(heap_phys - vtl1_start.as_u64());
+    let heap_offset: usize = TruncateExt::<usize>::trunc(heap_phys - vtl1_start.as_u64());
     let mem_fill_size = VTL1_PRE_POPULATED_MEMORY_SIZE - heap_offset;
     unsafe {
         Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
@@ -115,9 +115,9 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
         // Re-compute the pre-populated region bounds needed for the
         // remaining-memory add after `Platform::new()` below.
         let heap_va = get_heap_start_address();
-        let mem_fill_start: usize = heap_va.truncate();
+        let mem_fill_start: usize = heap_va.trunc();
         let heap_phys = Platform::va_to_pa(x86_64::VirtAddr::new(heap_va)).as_u64();
-        let heap_offset: usize = TruncateExt::<usize>::truncate(heap_phys - start);
+        let heap_offset: usize = TruncateExt::<usize>::trunc(heap_phys - start);
         let mem_fill_size = VTL1_PRE_POPULATED_MEMORY_SIZE - heap_offset;
 
         // Text section boundaries. These are used by the platform to mark
@@ -132,9 +132,9 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
         // After two-phase relocation, `get_rela_start/end_address()` return
         // high-canonical VAs. Use directly for the allocator.
         let rela_va = get_rela_start_address();
-        let rela_size: usize = (get_rela_end_address() - rela_va).truncate();
+        let rela_size: usize = (get_rela_end_address() - rela_va).trunc();
         if rela_size > 0 {
-            let rela_virt: usize = rela_va.truncate();
+            let rela_virt: usize = rela_va.trunc();
             unsafe {
                 Platform::mem_fill_pages(rela_virt, rela_size);
             }
@@ -155,7 +155,7 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
             // Reclaim pages 2–12 (PML4, PDPT, PDE, 8 PTE pages)
             let early_pt_pa = vtl1_start + (VTL1_PML4E_PAGE * PAGE_SIZE) as u64;
             let early_pt_start: usize =
-                TruncateExt::<usize>::truncate(Platform::pa_to_va(early_pt_pa).as_u64());
+                TruncateExt::<usize>::trunc(Platform::pa_to_va(early_pt_pa).as_u64());
             let early_pt_size: usize =
                 (VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT - VTL1_PML4E_PAGE) * PAGE_SIZE;
             // Safety: the early page table frames are no longer referenced
@@ -178,7 +178,7 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
             // Reclaim Phase 1 PDPT and PDE pages
             let remap_pt_pa = vtl1_start + (VTL1_REMAP_PDPT_PAGE * PAGE_SIZE) as u64;
             let remap_pt_start: usize =
-                TruncateExt::<usize>::truncate(Platform::pa_to_va(remap_pt_pa).as_u64());
+                TruncateExt::<usize>::trunc(Platform::pa_to_va(remap_pt_pa).as_u64());
             let remap_pt_size: usize = (VTL1_REMAP_PDE_PAGE - VTL1_REMAP_PDPT_PAGE + 1) * PAGE_SIZE;
             unsafe {
                 Platform::mem_fill_pages(remap_pt_start, remap_pt_size);
@@ -195,7 +195,7 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
         // Add the rest of the VTL1 memory to the global allocator once they are mapped to the base page table.
         let mem_fill_start = mem_fill_start + mem_fill_size;
         let vtl1_base_va = Platform::pa_to_va(vtl1_start).as_u64();
-        let mem_fill_size = TruncateExt::<usize>::truncate(
+        let mem_fill_size = TruncateExt::<usize>::trunc(
             size.checked_sub((mem_fill_start as u64) - vtl1_base_va)
                 .expect("remaining VTL1 memory size underflow in init()"),
         );
@@ -248,7 +248,7 @@ pub fn run(platform: Option<&'static Platform>) -> ! {
 /// VTL call is Hyper-V specific. However, in general, there is no fundamental difference
 /// between VTL call and TrustZone SMC call, TDX TDCALL, etc.
 fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
-    let func_id: u32 = params[0].truncate();
+    let func_id: u32 = params[0].trunc();
     let Ok(func_id) = VsmFunction::try_from(func_id) else {
         return Errno::EINVAL.as_neg().into();
     };
@@ -272,7 +272,7 @@ fn optee_smc_handler_entry(smc_args_pfn: u64) -> i64 {
 fn optee_smc_handler_entry_inner(
     smc_args_pfn: u64,
 ) -> Result<i64, litebox_common_linux::errno::Errno> {
-    let smc_args_pfn: usize = smc_args_pfn.truncate();
+    let smc_args_pfn: usize = smc_args_pfn.trunc();
     let smc_args_addr = smc_args_pfn
         .checked_mul(1usize << litebox_platform_lvbs::mshv::vtl1_mem_layout::PAGE_SHIFT)
         .ok_or(litebox_common_linux::errno::Errno::EINVAL)?;
@@ -635,7 +635,7 @@ fn open_session_single_instance(
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
     // Check the return code from the TA's OpenSession entry point
-    let return_code: u32 = ctx.rax.truncate();
+    let return_code: u32 = ctx.rax.trunc();
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
     // Per OP-TEE OS: if OpenSession fails, don't register the session
@@ -812,7 +812,7 @@ fn open_session_new_instance(
     }
 
     // Check ldelf return code (TA_CreateEntryPoint result)
-    let ldelf_return_code: u32 = ldelf_ctx.rax.truncate();
+    let ldelf_return_code: u32 = ldelf_ctx.rax.trunc();
     let ldelf_return_code =
         TeeResult::try_from(ldelf_return_code).unwrap_or(TeeResult::GenericError);
     if ldelf_return_code != TeeResult::Success {
@@ -889,7 +889,7 @@ fn open_session_new_instance(
         })?;
 
     // Check the return code from the TA's OpenSession entry point
-    let return_code: u32 = ctx.rax.truncate();
+    let return_code: u32 = ctx.rax.trunc();
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
     // Per OP-TEE OS: if OpenSession fails, tear down the instance
@@ -1045,7 +1045,7 @@ fn handle_invoke_command(
         .read_at_offset(0)
         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
-    let return_code: u32 = ctx.rax.truncate();
+    let return_code: u32 = ctx.rax.trunc();
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
     // Write response BEFORE switching page tables (accesses user memory).
@@ -1298,7 +1298,7 @@ fn write_msg_args_to_normal_world(
     msg_args.serialize(&mut blob)?;
 
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-        msg_args_phys_addr.truncate(),
+        msg_args_phys_addr.trunc(),
         msg_args_size,
     )?;
     // SAFETY: Writing msg_args back to normal world memory at a valid physical address.
@@ -1324,7 +1324,7 @@ fn write_non_ta_msg_args_to_normal_world(
     msg_args.serialize(&mut blob)?;
 
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-        msg_args_phys_addr.truncate(),
+        msg_args_phys_addr.trunc(),
         msg_args_size,
     )?;
     // SAFETY: Writing msg_args back to normal world memory at a valid physical address.
@@ -1352,7 +1352,7 @@ fn write_rpc_args_to_normal_world(
     let mut blob = vec![0u8; rpc_args_size];
     rpc_args.serialize(&mut blob)?;
 
-    let rpc_pa: usize = <u64 as litebox::utils::TruncateExt<usize>>::truncate(msg_args_phys_addr)
+    let rpc_pa: usize = <u64 as litebox::utils::TruncateExt<usize>>::trunc(msg_args_phys_addr)
         .checked_add(msg_args_size)
         .ok_or(OpteeSmcReturnCode::EBadAddr)?; // RPC args are placed right after the main msg_args blob
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(rpc_pa, rpc_args_size)?;

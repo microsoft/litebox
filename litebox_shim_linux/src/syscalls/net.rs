@@ -559,7 +559,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 }
                 SocketOption::TYPE => self.get_socket_type(fd)? as u32,
                 SocketOption::RCVBUF | SocketOption::SNDBUF => {
-                    litebox::net::SOCKET_BUFFER_SIZE.truncate()
+                    litebox::net::SOCKET_BUFFER_SIZE.trunc()
                 }
                 SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
             },
@@ -1154,7 +1154,7 @@ pub(crate) fn write_sockaddr_to_user(
         }
         SocketAddress::Inet(SocketAddr::V6(_)) => todo!("copy_sockaddr_to_user for IPv6"),
     }
-    .truncate();
+    .trunc();
     addrlen.write_at_offset(0, len).ok_or(Errno::EFAULT)
 }
 
@@ -1504,7 +1504,7 @@ impl<FS: ShimFS> Task<FS> {
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
             files.with_socket(
                 &self.global,
-                raw_fd.truncate(),
+                raw_fd.trunc(),
                 |fd| {
                     let mut addr = None;
                     let size = self.global.receive(
@@ -1715,7 +1715,7 @@ impl<FS: ShimFS> Task<FS> {
         }
         let new_len = self.do_getsockopt(sockfd, optname, optval, len)?;
         optlen
-            .write_at_offset(0, new_len.truncate())
+            .write_at_offset(0, new_len.trunc())
             .ok_or(Errno::EFAULT)?;
         Ok(())
     }
@@ -1879,7 +1879,7 @@ mod tests {
                 sockfd,
                 SocketOptionName::Socket(SocketOption::ERROR),
                 MutPtr::from_usize((&raw mut optval).cast::<u8>() as usize),
-                core::mem::size_of::<u32>().truncate(),
+                core::mem::size_of::<u32>().trunc(),
             )
             .expect("getsockopt SO_ERROR failed");
         assert_eq!(len, core::mem::size_of::<u32>());
@@ -1913,7 +1913,7 @@ mod tests {
         events: &mut [litebox_common_linux::EpollEvent],
     ) -> usize {
         let events_ptr = crate::MutPtr::from_usize(events.as_mut_ptr() as usize);
-        task.sys_epoll_pwait(epfd, events_ptr, events.len().truncate(), -1, None, 0)
+        task.sys_epoll_pwait(epfd, events_ptr, events.len().trunc(), -1, None, 0)
             .expect("epoll_wait failed")
     }
 
@@ -2368,7 +2368,7 @@ mod tests {
                 msg_hdr.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
                 msg_hdr.msg_iovlen = iovec.len();
                 msg_hdr.msg_name = MutPtr::from_usize(source_addr.as_ptr() as usize);
-                msg_hdr.msg_namelen = source_addr.len().truncate();
+                msg_hdr.msg_namelen = source_addr.len().trunc();
                 let msg_ptr = MutPtr::from_usize(&raw mut msg_hdr as usize);
                 let n = task
                     .sys_recvmsg(i32::try_from(server_fd).unwrap(), msg_ptr, recv_flags)
@@ -2494,7 +2494,7 @@ mod tests {
                 sockfd,
                 SocketOptionName::TCP(TcpOption::CONGESTION),
                 MutPtr::from_usize(congestion_name.as_mut_ptr() as usize),
-                congestion_name.len().truncate(),
+                congestion_name.len().trunc(),
             )
             .expect("Failed to get TCP_CONGESTION");
         assert_eq!(optlen, 4);
@@ -2540,7 +2540,7 @@ mod tests {
                 sockfd,
                 SocketOptionName::Socket(SocketOption::KEEPALIVE),
                 optval_out,
-                core::mem::size_of::<u32>().truncate(),
+                core::mem::size_of::<u32>().trunc(),
             )
             .expect("failed to get SO_KEEPALIVE");
         assert_eq!(len, core::mem::size_of::<u32>());

@@ -284,7 +284,7 @@ impl HekiPatch {
             core::cmp::min(PAGE_SIZE, usize::from(self.size))
         } else {
             core::cmp::min(
-                (pa_0.align_up(Size4KiB::SIZE) - pa_0).truncate(),
+                (pa_0.align_up(Size4KiB::SIZE) - pa_0).trunc(),
                 usize::from(self.size),
             )
         };

@@ -129,7 +129,7 @@ fn handle_ta_command_output(params: &UteeParams) {
             }
             TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
                 if let Ok(Some((addr, len))) = params.get_values(idx) {
-                    let len: usize = len.truncate();
+                    let len: usize = len.trunc();
                     let ptr: UserConstPtr<u8> = UserConstPtr::from_ptr(addr as *const u8);
                     let slice = ptr.to_owned_slice(len).unwrap_or_default();
                     if slice.is_empty() {

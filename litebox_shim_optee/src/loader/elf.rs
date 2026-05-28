@@ -41,7 +41,7 @@ fn read_at(elf: &ElfFileInMemory, offset: u64, buf: &mut [u8]) -> Result<(), Err
     if buf.is_empty() {
         return Ok(());
     }
-    let offset = offset.truncate();
+    let offset = offset.trunc();
     if offset >= elf.buffer.len() {
         return Err(Errno::ENODATA);
     }
@@ -128,13 +128,13 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
                     // the kernel-mode demand paging infrastructure.
                     | MapFlags::MAP_POPULATE,
                 -1,
-                offset.truncate(),
+                offset.trunc(),
             )?
             .as_usize();
 
         // Copy ELF data directly to user memory without intermediate buffer.
         // MAP_ANONYMOUS ensures remaining bytes are zero if src is shorter than len.
-        let offset: usize = offset.truncate();
+        let offset: usize = offset.trunc();
         if len > 0 && offset < self.buffer.len() {
             let end = core::cmp::min(offset + len, self.buffer.len());
             let src = &self.buffer[offset..end];

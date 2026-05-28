@@ -520,12 +520,12 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_exit(&self, status: i32) {
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.
-        self.exit_thread(status.truncate());
+        self.exit_thread(status.trunc());
     }
 
     pub(crate) fn sys_exit_group(&self, status: i32) {
         // Tear down occurs similarly to `sys_exit`.
-        self.exit_group(ExitStatus::Exit(status.truncate()));
+        self.exit_group(ExitStatus::Exit(status.trunc()));
     }
 }
 
@@ -653,7 +653,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let tls = if flags.contains(CloneFlags::SETTLS) {
-            let addr = tls.truncate();
+            let addr = tls.trunc();
             #[cfg(target_arch = "x86_64")]
             let desc = MutPtr::from_usize(addr);
             Some(desc)
@@ -664,7 +664,7 @@ impl<FS: ShimFS> Task<FS> {
         let child_tid = if child_tid == 0 {
             None
         } else {
-            Some(MutPtr::from_usize(child_tid.truncate()))
+            Some(MutPtr::from_usize(child_tid.trunc()))
         };
         let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) {
             child_tid
@@ -677,7 +677,7 @@ impl<FS: ShimFS> Task<FS> {
             None
         };
         let set_parent_tid = if flags.contains(CloneFlags::PARENT_SETTID) && parent_tid != 0 {
-            Some(MutPtr::from_usize(parent_tid.truncate()))
+            Some(MutPtr::from_usize(parent_tid.trunc()))
         } else {
             None
         };
@@ -697,8 +697,8 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
         let sp = if stack != 0 {
-            let stack: usize = stack.truncate();
-            Some(stack.wrapping_add(stack_size.truncate()))
+            let stack: usize = stack.trunc();
+            Some(stack.wrapping_add(stack_size.trunc()))
         } else {
             None
         };

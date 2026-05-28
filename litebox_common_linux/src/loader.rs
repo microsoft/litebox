@@ -349,7 +349,7 @@ impl ElfParsedFile {
             return Ok(None);
         };
         // Bound the interpreter length like Linux.
-        let len: usize = ph.p_filesz.truncate();
+        let len: usize = ph.p_filesz.trunc();
         if !(2..4096).contains(&len) {
             return Err(ElfParseError::BadInterp);
         }
@@ -384,15 +384,15 @@ impl ElfParsedFile {
             let mut max = 0usize;
             let mut align = PAGE_SIZE;
             for ph in self.pt_loads() {
-                min = min.min(ph.p_vaddr.truncate());
+                min = min.min(ph.p_vaddr.trunc());
                 max = max.max(
                     (ph.p_vaddr
                         .checked_add(ph.p_memsz)
                         .ok_or(ElfLoadError::InvalidProgramHeader)?)
-                    .truncate(),
+                    .trunc(),
                 );
                 if ph.p_align.is_power_of_two() {
-                    align = align.max(ph.p_align.truncate());
+                    align = align.max(ph.p_align.trunc());
                 }
             }
             if let Some(trampoline) = &self.trampoline {
@@ -412,9 +412,9 @@ impl ElfParsedFile {
         let mut brk = 0;
         let mut phdrs_addr = 0;
         for ph in self.pt_loads() {
-            let p_vaddr: usize = ph.p_vaddr.truncate();
-            let p_memsz: usize = ph.p_memsz.truncate();
-            let p_filesz: usize = ph.p_filesz.truncate();
+            let p_vaddr: usize = ph.p_vaddr.trunc();
+            let p_memsz: usize = ph.p_memsz.trunc();
+            let p_filesz: usize = ph.p_filesz.trunc();
             if p_memsz < p_filesz
                 || p_vaddr.checked_add(p_memsz).is_none()
                 || ph.p_offset.checked_add(ph.p_filesz).is_none()
@@ -469,7 +469,7 @@ impl ElfParsedFile {
             // for `AT_PHDR`.
             if ph.p_offset <= self.header.e_phoff && self.header.e_phoff < ph.p_offset + ph.p_filesz
             {
-                let offset_in_segment: usize = (self.header.e_phoff - ph.p_offset).truncate();
+                let offset_in_segment: usize = (self.header.e_phoff - ph.p_offset).trunc();
                 phdrs_addr = adjusted_vaddr + offset_in_segment;
             }
         }
@@ -477,7 +477,7 @@ impl ElfParsedFile {
         let mut info = MappingInfo {
             base_addr,
             brk,
-            entry_point: base_addr.wrapping_add(self.header.e_entry.truncate()),
+            entry_point: base_addr.wrapping_add(self.header.e_entry.trunc()),
             phdrs_addr,
             num_phdrs: self.header.e_phnum.into(),
         };
@@ -556,7 +556,7 @@ impl ElfParsedFile {
             return Ok(());
         }
         let base_addr = loaded_entry_point
-            .checked_sub(self.header.e_entry.truncate())
+            .checked_sub(self.header.e_entry.trunc())
             .ok_or(ElfLoadError::InvalidProgramHeader)?;
         let mut info = MappingInfo {
             base_addr,

@@ -82,10 +82,10 @@ impl SignalState {
                     rsp: ctx.rsp as u64,
                     rip: ctx.rip as u64,
                     rflags: ctx.eflags as u64,
-                    cs: ctx.cs.truncate(),
+                    cs: ctx.cs.trunc(),
                     gs: 0,
                     fs: 0,
-                    ss: ctx.ss.truncate(),
+                    ss: ctx.ss.trunc(),
                     err: last_exception.error_code.into(),
                     trapno: last_exception.exception.0.into(),
                     oldmask: self.blocked.get().as_u64(),
@@ -147,24 +147,24 @@ pub(super) fn restore_sigcontext(
         reserved1: _,
     } = *sigctx;
 
-    ctx.r8 = r8.truncate();
-    ctx.r9 = r9.truncate();
-    ctx.r10 = r10.truncate();
-    ctx.r11 = r11.truncate();
-    ctx.r12 = r12.truncate();
-    ctx.r13 = r13.truncate();
-    ctx.r14 = r14.truncate();
-    ctx.r15 = r15.truncate();
-    ctx.rdi = rdi.truncate();
-    ctx.rsi = rsi.truncate();
-    ctx.rbp = rbp.truncate();
-    ctx.rbx = rbx.truncate();
-    ctx.rdx = rdx.truncate();
-    ctx.rax = rax.truncate();
-    ctx.rcx = rcx.truncate();
-    ctx.rsp = rsp.truncate();
-    ctx.rip = rip.truncate();
-    ctx.eflags = rflags.truncate();
+    ctx.r8 = r8.trunc();
+    ctx.r9 = r9.trunc();
+    ctx.r10 = r10.trunc();
+    ctx.r11 = r11.trunc();
+    ctx.r12 = r12.trunc();
+    ctx.r13 = r13.trunc();
+    ctx.r14 = r14.trunc();
+    ctx.r15 = r15.trunc();
+    ctx.rdi = rdi.trunc();
+    ctx.rsi = rsi.trunc();
+    ctx.rbp = rbp.trunc();
+    ctx.rbx = rbx.trunc();
+    ctx.rdx = rdx.trunc();
+    ctx.rax = rax.trunc();
+    ctx.rcx = rcx.trunc();
+    ctx.rsp = rsp.trunc();
+    ctx.rip = rip.trunc();
+    ctx.eflags = rflags.trunc();
 
     // TODO: restore fpstate
 

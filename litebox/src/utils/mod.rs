@@ -12,18 +12,21 @@
 pub mod id_pool;
 pub mod rng;
 
-/// An extension trait that adds `truncate` to truncate integers to a specific size of the same
+/// An extension trait that adds `trunc` to truncate integers to a specific size of the same
 /// signedness.
+///
+/// This avoids a collision with the proposed standard integer `truncate` method:
+/// <https://github.com/rust-lang/rust/issues/154330>.
 pub trait TruncateExt<To> {
     /// Truncate `self` to `To`, taking only lower-order bits.
-    fn truncate(self) -> To;
+    fn trunc(self) -> To;
 }
 
 macro_rules! impl_truncate {
     ($from:ty, $to:ty) => {
         impl TruncateExt<$to> for $from {
             #[inline(always)]
-            fn truncate(self) -> $to {
+            fn trunc(self) -> $to {
                 <$to>::from_le_bytes(
                     self.to_le_bytes()[..const { core::mem::size_of::<$to>() }]
                         .try_into()

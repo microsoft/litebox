@@ -122,13 +122,13 @@ impl Task {
             .get_values(0)
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
-        let extra_data_size: usize = extra_data_size_u64.truncate();
+        let extra_data_size: usize = extra_data_size_u64.trunc();
 
         let (subkey_addr, subkey_size_u64) = params
             .get_values(1)
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
-        let subkey_size: usize = subkey_size_u64.truncate();
+        let subkey_size: usize = subkey_size_u64.trunc();
 
         if extra_data_size > TA_DERIVED_EXTRA_DATA_MAX_SIZE
             || !(TA_DERIVED_KEY_MIN_SIZE..=TA_DERIVED_KEY_MAX_SIZE).contains(&subkey_size)
@@ -141,7 +141,7 @@ impl Task {
         let extra_data = if extra_data_size == 0 {
             Vec::new().into_boxed_slice()
         } else {
-            let extra_data_ptr = UserConstPtr::<u8>::from_usize(extra_data_addr.truncate());
+            let extra_data_ptr = UserConstPtr::<u8>::from_usize(extra_data_addr.trunc());
             extra_data_ptr
                 .to_owned_slice(extra_data_size)
                 .ok_or(TeeResult::BadParameters)?
@@ -150,7 +150,7 @@ impl Task {
         // Unlike OP-TEE OS, `UserMutPtr` (and `UserConstPtr`) in LiteBox ensure this
         // pointer can never be used to access normal-world memory. That is, we don't
         // need extra security check for detecting key leakage here.
-        let subkey_ptr = UserMutPtr::<u8>::from_usize(subkey_addr.truncate());
+        let subkey_ptr = UserMutPtr::<u8>::from_usize(subkey_addr.trunc());
 
         // subkey = KDF(huk, usage || ta_uuid || extra_data)
         let ta_uuid_bytes = self.ta_app_id.to_le_bytes();

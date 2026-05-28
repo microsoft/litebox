@@ -110,7 +110,7 @@ impl HostInterface for MockHostInterface {
             )
         };
         assert!(ret.is_ok(), "clock_gettime failed");
-        core::time::Duration::new(t.tv_sec.reinterpret_as_unsigned(), t.tv_nsec.truncate())
+        core::time::Duration::new(t.tv_sec.reinterpret_as_unsigned(), t.tv_nsec.trunc())
     }
 
     fn return_to_host() -> ! {

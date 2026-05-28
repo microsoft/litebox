@@ -2331,8 +2331,8 @@ pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     for shdr in shdrs {
         let name = strtab.get(shdr.sh_name as usize).ok()?;
         if name == TA_HEAD_SECTION_NAME {
-            let offset: usize = shdr.sh_offset.truncate();
-            let size: usize = shdr.sh_size.truncate();
+            let offset: usize = shdr.sh_offset.trunc();
+            let size: usize = shdr.sh_size.trunc();
 
             if size < size_of::<TaHead>() {
                 return None;

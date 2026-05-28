@@ -577,7 +577,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let e_type = ehdr.e_type.get(ENDIAN);
-        let e_phoff: usize = ehdr.e_phoff.get(ENDIAN).truncate();
+        let e_phoff: usize = ehdr.e_phoff.get(ENDIAN).trunc();
         let e_phentsize = ehdr.e_phentsize.get(ENDIAN) as usize;
         let e_phnum = ehdr.e_phnum.get(ENDIAN) as usize;
 
@@ -611,7 +611,7 @@ impl<FS: ShimFS> Task<FS> {
             if ph.p_type.get(ENDIAN) != PT_LOAD {
                 continue;
             }
-            let p_offset: usize = ph.p_offset.get(ENDIAN).truncate();
+            let p_offset: usize = ph.p_offset.get(ENDIAN).trunc();
             let p_vaddr = ph.p_vaddr.get(ENDIAN);
             let p_memsz = ph.p_memsz.get(ENDIAN);
             let Some(end) = p_vaddr.checked_add(p_memsz) else {
@@ -628,7 +628,7 @@ impl<FS: ShimFS> Task<FS> {
             if base_addr.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
             {
-                base_addr = Some(mapped_addr.wrapping_sub(p_vaddr.truncate()));
+                base_addr = Some(mapped_addr.wrapping_sub(p_vaddr.trunc()));
             }
         }
 
@@ -653,10 +653,10 @@ impl<FS: ShimFS> Task<FS> {
                         "fatal: pre-patched ET_DYN binary but cannot determine load base address"
                     );
                 };
-                let vaddr: usize = tramp_vaddr.truncate();
+                let vaddr: usize = tramp_vaddr.trunc();
                 base + vaddr
             } else {
-                tramp_vaddr.truncate()
+                tramp_vaddr.trunc()
             }
         } else {
             let base = if e_type == ET_DYN {
@@ -664,7 +664,7 @@ impl<FS: ShimFS> Task<FS> {
             } else {
                 0
             };
-            let max_end: usize = max_load_end.truncate();
+            let max_end: usize = max_load_end.trunc();
             base + max_end.next_multiple_of(PAGE_SIZE)
         };
 
@@ -673,7 +673,7 @@ impl<FS: ShimFS> Task<FS> {
         cache.entry(fd).or_insert(ElfPatchState {
             pre_patched,
             trampoline_file_offset: tramp_file_offset,
-            trampoline_file_size: tramp_file_size.truncate(),
+            trampoline_file_size: tramp_file_size.trunc(),
             trampoline_addr: trampoline_vaddr,
             trampoline_cursor: 0,
             trampoline_mapped: false,
@@ -818,7 +818,7 @@ impl<FS: ShimFS> Task<FS> {
 
                 // Read trampoline data from the file.
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
-                let file_off = state.trampoline_file_offset.truncate();
+                let file_off = state.trampoline_file_offset.trunc();
                 let tramp_ptr = MutPtr::<u8>::from_usize(tramp_addr);
                 match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
                     Ok(n) if n == tramp_data.len() => {}

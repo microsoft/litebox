@@ -941,7 +941,7 @@ where
         st_dev: 0,
         st_ino: 0,
         st_nlink: 1,
-        st_mode: mode_bits.truncate(),
+        st_mode: mode_bits.trunc(),
         st_uid: 0,
         st_gid: 0,
         st_rdev: 0,
@@ -1925,7 +1925,7 @@ impl<FS: ShimFS> Task<FS> {
             let revents_ptr = crate::MutPtr::<i16>::from_usize(
                 fd_addr + core::mem::offset_of!(litebox_common_linux::Pollfd, revents),
             );
-            let revents: u16 = revents.bits().truncate();
+            let revents: u16 = revents.bits().trunc();
             revents_ptr
                 .write_at_offset(0, revents.reinterpret_as_signed())
                 .ok_or(Errno::EFAULT)?;
@@ -2284,7 +2284,7 @@ impl<FS: ShimFS> Task<FS> {
                     let dirent64 = litebox_common_linux::LinuxDirent64 {
                         ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino) as u64,
                         off: dir_off as u64,
-                        len: len.truncate(),
+                        len: len.trunc(),
                         typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
                         __name: [0; 0],
                     };

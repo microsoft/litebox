@@ -359,7 +359,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_dev: <_>::try_from(dev).unwrap(),
             st_ino: <_>::try_from(ino).unwrap(),
             st_nlink: 1,
-            st_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
+            st_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
             st_uid: <_>::from(user),
             st_gid: <_>::from(group),
             st_rdev: rdev
@@ -469,11 +469,11 @@ pub struct Statx {
 
 /// Extract the major component from a Linux `dev_t` (matches `major(3)` from glibc).
 fn dev_major(dev: u64) -> u32 {
-    (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)).truncate()
+    (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)).trunc()
 }
 /// Extract the minor component from a Linux `dev_t` (matches `minor(3)`).
 fn dev_minor(dev: u64) -> u32 {
-    ((dev & 0xff) | ((dev >> 12) & !0xff)).truncate()
+    ((dev & 0xff) | ((dev >> 12) & !0xff)).trunc()
 }
 
 impl From<litebox::fs::FileStatus> for Statx {
@@ -491,11 +491,11 @@ impl From<litebox::fs::FileStatus> for Statx {
         let rdev = rdev.map_or(0u64, |r| r.get() as u64);
         Self {
             stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
-            stx_blksize: blksize.truncate(),
+            stx_blksize: blksize.trunc(),
             stx_nlink: 1,
             stx_uid: u32::from(user),
             stx_gid: u32::from(group),
-            stx_mode: (mode.bits() | InodeType::from(file_type) as u32).truncate(),
+            stx_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
             stx_ino: ino as u64,
             stx_size: size as u64,
             stx_blocks: 0,
@@ -520,11 +520,11 @@ impl From<FileStat> for Statx {
     fn from(value: FileStat) -> Self {
         Self {
             stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
-            stx_blksize: value.st_blksize.truncate(),
-            stx_nlink: value.st_nlink.truncate(),
+            stx_blksize: value.st_blksize.trunc(),
+            stx_nlink: value.st_nlink.trunc(),
             stx_uid: value.st_uid,
             stx_gid: value.st_gid,
-            stx_mode: value.st_mode.truncate(),
+            stx_mode: value.st_mode.trunc(),
             stx_ino: value.st_ino,
             stx_size: value.st_size as u64,
             stx_blocks: value.st_blocks.reinterpret_as_unsigned(),
@@ -618,19 +618,19 @@ impl<Platform: litebox::platform::RawPointerProvider> FcntlArg<Platform> {
     pub fn try_from(cmd: i32, arg: usize) -> Option<Self> {
         Some(match cmd {
             F_GETFD => Self::GETFD,
-            F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.truncate())),
+            F_SETFD => Self::SETFD(FileDescriptorFlags::from_bits_truncate(arg.trunc())),
             F_GETFL => Self::GETFL,
-            F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg.truncate())),
+            F_SETFL => Self::SETFL(OFlags::from_bits_truncate(arg.trunc())),
             F_GETLK => Self::GETLK(Platform::RawMutPointer::from_usize(arg)),
             F_SETLK => Self::SETLK(Platform::RawConstPointer::from_usize(arg)),
             F_SETLKW => Self::SETLKW(Platform::RawConstPointer::from_usize(arg)),
             F_DUPFD => Self::DUPFD {
                 cloexec: false,
-                min_fd: arg.truncate(),
+                min_fd: arg.trunc(),
             },
             F_DUPFD_CLOEXEC => Self::DUPFD {
                 cloexec: true,
-                min_fd: arg.truncate(),
+                min_fd: arg.trunc(),
             },
             _ => return None,
         })
@@ -879,13 +879,13 @@ impl TryFrom<Timespec> for Duration {
     fn try_from(value: Timespec) -> Result<Self, Self::Error> {
         // On 32-bit architectures, `tv_nsec` may be defined in user mode as
         // pointer sized. Ignore any high padding bits.
-        let nsec: usize = value.tv_nsec.truncate();
+        let nsec: usize = value.tv_nsec.trunc();
         if nsec >= 1_000_000_000 {
             return Err(errno::Errno::EINVAL);
         }
         Ok(Duration::new(
             u64::try_from(value.tv_sec).map_err(|_| errno::Errno::EINVAL)?,
-            nsec.truncate(),
+            nsec.trunc(),
         ))
     }
 }
@@ -927,7 +927,7 @@ impl From<Duration> for Timespec32 {
     fn from(value: Duration) -> Self {
         Timespec32 {
             // Silently truncate if needed, just like Linux would do.
-            tv_sec: value.as_secs().reinterpret_as_signed().truncate(),
+            tv_sec: value.as_secs().reinterpret_as_signed().trunc(),
             tv_nsec: value.subsec_nanos(),
         }
     }
@@ -952,7 +952,7 @@ impl TryFrom<TimeVal> for Duration {
     type Error = errno::Errno;
 
     fn try_from(value: TimeVal) -> Result<Self, Self::Error> {
-        let usec: u32 = value.tv_usec.truncate();
+        let usec: u32 = value.tv_usec.trunc();
         if usec >= 1_000_000 {
             return Err(errno::Errno::EINVAL);
         }
@@ -967,7 +967,7 @@ impl From<Duration> for TimeVal {
     fn from(value: Duration) -> Self {
         TimeVal {
             // Silently truncate if needed, just like Linux would do.
-            tv_sec: value.as_secs().reinterpret_as_signed().truncate(),
+            tv_sec: value.as_secs().reinterpret_as_signed().trunc(),
             #[cfg_attr(target_pointer_width = "32", expect(clippy::useless_conversion))]
             tv_usec: value.subsec_micros().into(),
         }
@@ -1303,12 +1303,12 @@ pub fn rlimit64_to_rlimit(rlim: Rlimit64) -> Rlimit {
         rlim_cur: if rlim.rlim_cur >= rlim_t::MAX as u64 {
             rlim_t::MAX
         } else {
-            rlim.rlim_cur.truncate()
+            rlim.rlim_cur.trunc()
         },
         rlim_max: if rlim.rlim_max >= rlim_t::MAX as u64 {
             rlim_t::MAX
         } else {
-            rlim.rlim_max.truncate()
+            rlim.rlim_max.trunc()
         },
     }
 }
@@ -3120,14 +3120,14 @@ macro_rules! reinterpret_truncated_from_usize_for {
         $(
             impl ReinterpretTruncatedFromUsize for $uty {
                 fn reinterpret_truncated_from_usize(v: usize) -> Self {
-                    v.truncate()
+                    v.trunc()
                 }
             }
         )*
         $(
             impl ReinterpretTruncatedFromUsize for $sty {
                 fn reinterpret_truncated_from_usize(v: usize) -> Self {
-                    v.reinterpret_as_signed().truncate()
+                    v.reinterpret_as_signed().trunc()
                 }
             }
         )*

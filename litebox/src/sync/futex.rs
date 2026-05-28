@@ -64,7 +64,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
 
     /// Returns the hash table bucket for the given futex address.
     fn bucket(&self, addr: usize) -> &LoanList<Platform, FutexEntry<Platform>> {
-        let hash: usize = self.hash_builder.hash_one(addr).truncate();
+        let hash: usize = self.hash_builder.hash_one(addr).trunc();
         &self.table[hash % HASH_TABLE_ENTRIES]
     }
 
