@@ -356,12 +356,15 @@ unsafe fn delete_task_page_table(task_pt_id: usize) -> Result<(), OpteeSmcReturn
     }
 }
 
-/// Guard that restores the base page table when leaving a TA page table scope.
+/// Enforces the invariant that the core must be on the base (kernel) page
+/// table before returning to VTL0: the guard switches to the TA's task
+/// page table on entry and switches back to the base page table on drop,
+/// regardless of the path out (early return, `?`, panic).
 ///
-/// `switch_to_base_page_table` is an idempotent CR3 write, so it is fine if
-/// teardown paths (which switch to base internally before deleting the task
-/// page table) run before this guard's `Drop` — the redundant write at drop
-/// time is benign.
+/// `switch_to_base_page_table` is an idempotent CR3 write, so teardown
+/// paths that switch to base internally before deleting the task page
+/// table can run before this guard's `Drop` — the redundant write at
+/// drop time is benign.
 struct TaskPageTableGuard;
 
 impl TaskPageTableGuard {
