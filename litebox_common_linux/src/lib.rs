@@ -716,6 +716,26 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
+/// Extended termios used by `TCGETS2`/`TCSETS2`. Layout matches
+/// the kernel `struct termios2`: same prefix as [`Termios`], with
+/// `c_ispeed` and `c_ospeed` (arbitrary baud rates, BOTHER mode)
+/// appended. glibc's `tcgetattr`/`tcsetattr` use these by default
+/// on Linux; legacy `TCGETS`/`TCSETS` are only used when
+/// `TCGETS2` returns ENOTTY. Total size 44 bytes (vs 36 for
+/// `Termios`).
+#[repr(C)]
+#[derive(Debug, Clone, FromBytes, IntoBytes)]
+pub struct Termios2 {
+    pub c_iflag: tcflag_t,
+    pub c_oflag: tcflag_t,
+    pub c_cflag: tcflag_t,
+    pub c_lflag: tcflag_t,
+    pub c_line: cc_t,
+    pub c_cc: [cc_t; 19usize],
+    pub c_ispeed: tcflag_t,
+    pub c_ospeed: tcflag_t,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Winsize {
@@ -729,6 +749,15 @@ pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
 pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
+/// `TCGETS2` — extended `tcgetattr` returning [`Termios2`] (44 B).
+/// glibc uses this by default; falls back to `TCGETS` on ENOTTY.
+pub const TCGETS2: u32 = 0x802C_542A;
+/// `TCSETS2` — extended `tcsetattr` consuming [`Termios2`] (44 B).
+pub const TCSETS2: u32 = 0x402C_542B;
+/// `TCSETSW2` — like `TCSETS2` but drains output first.
+pub const TCSETSW2: u32 = 0x402C_542C;
+/// `TCSETSF2` — like `TCSETSW2` but also flushes pending input.
+pub const TCSETSF2: u32 = 0x402C_542D;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
 pub const TIOCSCTTY: u32 = 0x540e;
@@ -756,6 +785,16 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TCSETSW(Platform::RawConstPointer<Termios>),
     /// Set the serial port settings after all output has drained; also flush pending input.
     TCSETSF(Platform::RawConstPointer<Termios>),
+    /// Get the current serial port settings (extended variant: [`Termios2`]).
+    /// glibc's `tcgetattr` issues this first on Linux; it falls
+    /// back to `TCGETS` only if this returns ENOTTY.
+    TCGETS2(Platform::RawMutPointer<Termios2>),
+    /// Set the current serial port settings (extended variant).
+    TCSETS2(Platform::RawConstPointer<Termios2>),
+    /// `TCSETSW` analogue for [`Termios2`].
+    TCSETSW2(Platform::RawConstPointer<Termios2>),
+    /// `TCSETSF` analogue for [`Termios2`].
+    TCSETSF2(Platform::RawConstPointer<Termios2>),
     /// Get window size.
     TIOCGWINSZ(Platform::RawMutPointer<Winsize>),
     /// Set window size.
@@ -3111,6 +3150,10 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
                         TCSETSW => IoctlArg::TCSETSW(ctx.sys_req_ptr(2)),
                         TCSETSF => IoctlArg::TCSETSF(ctx.sys_req_ptr(2)),
+                        TCGETS2 => IoctlArg::TCGETS2(ctx.sys_req_ptr(2)),
+                        TCSETS2 => IoctlArg::TCSETS2(ctx.sys_req_ptr(2)),
+                        TCSETSW2 => IoctlArg::TCSETSW2(ctx.sys_req_ptr(2)),
+                        TCSETSF2 => IoctlArg::TCSETSF2(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
                         TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),

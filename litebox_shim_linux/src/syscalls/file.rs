@@ -6146,6 +6146,51 @@ impl<FS: ShimFS> Task<FS> {
                 *self.global.host_tty_shadow_termios.lock() = Some(attrs);
                 Ok(0)
             }
+            IoctlArg::TCGETS2(termios2_ptr) => {
+                let shadow = self.global.host_tty_shadow_termios.lock().clone();
+                let is_init =
+                    Some(self.process_id) == self.global.litebox.process_registry().root_pid();
+                let attrs = if !is_init && let Some(ref shadow_attrs) = shadow {
+                    shadow_attrs.clone()
+                } else {
+                    self.global
+                        .platform
+                        .get_terminal_attributes(stream)
+                        .map_err(ioctl_err_to_errno)?
+                };
+                termios2_ptr
+                    .write_at_offset(
+                        0,
+                        litebox_common_linux::Termios2 {
+                            c_iflag: attrs.c_iflag,
+                            c_oflag: attrs.c_oflag,
+                            c_cflag: attrs.c_cflag,
+                            c_lflag: attrs.c_lflag,
+                            c_line: attrs.c_line,
+                            c_cc: attrs.c_cc,
+                            c_ispeed: 0,
+                            c_ospeed: 0,
+                        },
+                    )
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETS2(termios2_ptr)
+            | IoctlArg::TCSETSW2(termios2_ptr)
+            | IoctlArg::TCSETSF2(termios2_ptr) => {
+                let t: litebox_common_linux::Termios2 =
+                    termios2_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let attrs = litebox::platform::TerminalAttributes {
+                    c_iflag: t.c_iflag,
+                    c_oflag: t.c_oflag,
+                    c_cflag: t.c_cflag,
+                    c_lflag: t.c_lflag,
+                    c_line: t.c_line,
+                    c_cc: t.c_cc,
+                };
+                *self.global.host_tty_shadow_termios.lock() = Some(attrs);
+                Ok(0)
+            }
             IoctlArg::TIOCGWINSZ(ws_ptr) => {
                 let size = self
                     .global
@@ -6245,6 +6290,53 @@ impl<FS: ShimFS> Task<FS> {
             | IoctlArg::TCSETSF(termios_ptr) => {
                 let t: litebox_common_linux::Termios =
                     termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let mut payload = Vec::with_capacity(36);
+                payload.extend_from_slice(&t.c_iflag.to_le_bytes());
+                payload.extend_from_slice(&t.c_oflag.to_le_bytes());
+                payload.extend_from_slice(&t.c_cflag.to_le_bytes());
+                payload.extend_from_slice(&t.c_lflag.to_le_bytes());
+                payload.push(t.c_line);
+                payload.extend_from_slice(&t.c_cc);
+                entry.ioctl(PtyIoctlOp::Tcsets, &payload)?;
+                Ok(0)
+            }
+            IoctlArg::TCGETS2(termios2_ptr) => {
+                // Reuse the same broker Tcgets op (which returns the
+                // 36-byte termios payload); fill `c_ispeed`/`c_ospeed`
+                // with 0 — PTYs have no real serial line, so glibc
+                // treats this as "use the CBAUD bits in c_cflag",
+                // which is preserved exactly.
+                let payload = entry.ioctl(PtyIoctlOp::Tcgets, &[])?;
+                if payload.len() != 36 {
+                    return Err(Errno::EIO);
+                }
+                let mut c_cc = [0u8; 19];
+                c_cc.copy_from_slice(&payload[17..36]);
+                termios2_ptr
+                    .write_at_offset(
+                        0,
+                        litebox_common_linux::Termios2 {
+                            c_iflag: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
+                            c_oflag: u32::from_le_bytes(payload[4..8].try_into().unwrap()),
+                            c_cflag: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+                            c_lflag: u32::from_le_bytes(payload[12..16].try_into().unwrap()),
+                            c_line: payload[16],
+                            c_cc,
+                            c_ispeed: 0,
+                            c_ospeed: 0,
+                        },
+                    )
+                    .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TCSETS2(termios2_ptr)
+            | IoctlArg::TCSETSW2(termios2_ptr)
+            | IoctlArg::TCSETSF2(termios2_ptr) => {
+                let t: litebox_common_linux::Termios2 =
+                    termios2_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                // Drop c_ispeed/c_ospeed — the existing broker Tcsets
+                // op takes the 36-byte termios payload; PTYs ignore
+                // arbitrary baud rates anyway.
                 let mut payload = Vec::with_capacity(36);
                 payload.extend_from_slice(&t.c_iflag.to_le_bytes());
                 payload.extend_from_slice(&t.c_oflag.to_le_bytes());
@@ -6448,6 +6540,10 @@ impl<FS: ShimFS> Task<FS> {
                 | IoctlArg::TCSETS(..)
                 | IoctlArg::TCSETSW(..)
                 | IoctlArg::TCSETSF(..)
+                | IoctlArg::TCGETS2(..)
+                | IoctlArg::TCSETS2(..)
+                | IoctlArg::TCSETSW2(..)
+                | IoctlArg::TCSETSF2(..)
                 | IoctlArg::TIOCGPTN(..)
                 | IoctlArg::TIOCSPTLK(..)
                 | IoctlArg::TIOCSCTTY
@@ -6984,6 +7080,10 @@ impl<FS: ShimFS> Task<FS> {
             | IoctlArg::TCSETS(..)
             | IoctlArg::TCSETSW(..)
             | IoctlArg::TCSETSF(..)
+            | IoctlArg::TCGETS2(..)
+            | IoctlArg::TCSETS2(..)
+            | IoctlArg::TCSETSW2(..)
+            | IoctlArg::TCSETSF2(..)
             | IoctlArg::TIOCGPTN(..)
             | IoctlArg::TIOCSPTLK(..)
             | IoctlArg::TIOCSCTTY
