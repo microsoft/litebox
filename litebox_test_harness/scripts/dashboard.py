@@ -171,6 +171,7 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     parts.append(_render_meta(conn, state_dir))
     parts.append(_render_tracked_refs(conn))
     parts.append(_render_result_groups(conn))
+    parts.append(_render_suite_group_breakdown(conn))
     parts.append(_render_current_fails(conn))
     parts.append(_render_recent_runs(conn))
     parts.append(_render_footer(conn, state_dir))
@@ -214,27 +215,33 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
     universe_n = (universe[0] if universe else 0) or 0
 
     lines = ["## Tracked refs\n",
-             "| Ref | Worktree | Pass | HEAD | native cov | native P/F | "
-             "litebox cov | litebox P/F |",
-             "|---|---|---|---|---|---|---|---|"]
+             "| Ref | Worktree | Pass | HEAD "
+             "| n-cov | n-tot | n-pass | n-fail "
+             "| l-cov | l-tot | l-pass | l-fail |",
+             "|---|---|---|---"
+             "|---:|---:|---:|---:"
+             "|---:|---:|---:|---:|"]
     for r in refs:
         ref = r["ref"]
         ci_wt = r["ci_worktree"]
         head_sha = _git_head(ci_wt)
         if head_sha is None:
             lines.append(
-                f"| `{ref}` | `{ci_wt}` | — | _missing_ | — | — | — | — |"
+                f"| `{ref}` | `{ci_wt}` | — | _missing_ "
+                f"| — | — | — | — | — | — | — | — |"
             )
             continue
-        # Coverage + pass/fail per pass at the worktree's current sha.
-        cells = []
+        cells: list[str] = []
         for pass_name in ("native", "litebox"):
             covered, n_pass, n_fail = _coverage_pass_fail(
                 conn, head_sha, pass_name
             )
-            pct = f"{100 * covered / universe_n:.0f}%" if universe_n else "?"
-            cells.append(f"{covered}/{universe_n or '?'} ({pct})")
-            cells.append(f"{n_pass} / {n_fail}")
+            cells.extend([
+                str(covered),
+                str(universe_n) if universe_n else "?",
+                str(n_pass),
+                str(n_fail),
+            ])
         last_run_age = _last_run_age_for_ci_worktree(conn, ci_wt)
         lines.append(
             f"| `{ref}` | `{Path(ci_wt).name}` | {last_run_age} | "
@@ -369,9 +376,12 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
 
     now = now_ms()
     lines = ["## Result groups (per commit × dirty-state)\n",
-             "| Tag | Sha | Dirty | Worktree(s) | native cov · P/F | "
-             "litebox cov · P/F | Newest |",
-             "|---|---|---|---|---|---|---|"]
+             "| Tag | Sha | Dirty | Worktree(s) "
+             "| n-cov | n-tot | n-pass | n-fail "
+             "| l-cov | l-tot | l-pass | l-fail | Newest |",
+             "|---|---|---|---"
+             "|---:|---:|---:|---:"
+             "|---:|---:|---:|---:|---|"]
 
     # Sort by newest first so the active state is on top.
     ordered = sorted(
@@ -383,16 +393,84 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
         wt_short = ", ".join(
             sorted(os.path.basename(w) for w in g["worktrees"])
         )
-        cells = []
+        cells: list[str] = []
         for pass_name in ("native", "litebox"):
             covered, n_pass, n_fail = g["by_pass"].get(pass_name, (0, 0, 0))
-            denom = str(universe_n) if universe_n else "?"
-            cells.append(f"{covered}/{denom} · {n_pass}P/{n_fail}F")
+            cells.extend([
+                str(covered),
+                str(universe_n) if universe_n else "?",
+                str(n_pass),
+                str(n_fail),
+            ])
         age = fmt_age_ms(now - g["newest_ms"]) if g["newest_ms"] else "—"
         lines.append(
             f"| {tag} | `{short_sha(sha)}` | {dirty} | `{wt_short}` | "
-            f"{cells[0]} | {cells[1]} | {age} |"
+            + " | ".join(cells) + f" | {age} |"
         )
+    return "\n".join(lines) + "\n"
+
+
+def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
+    """Aggregate the same n-cov / n-tot / n-pass / n-fail counts per
+    (suite, group) for both passes. "Total" here is the observed
+    universe per (suite, group) — distinct test_ids seen in either
+    pass; the producer doesn't carry a per-suite universe count, so
+    this denominator stabilizes as more tests run.
+
+    Reads from `latest_results` (freshest per (test_id, pass)) — so
+    a single regression flipping a row from pass→FAIL moves the
+    numbers immediately, no per-commit filtering.
+    """
+    # First pass: per-(suite, group, pass) cov / pass / fail.
+    rows = conn.execute(
+        """
+        SELECT COALESCE(suite, '?')        AS suite,
+               COALESCE("group", '?')      AS "group",
+               pass,
+               COUNT(DISTINCT test_id)     AS covered,
+               SUM(CASE WHEN verdict='pass' THEN 1 ELSE 0 END) AS n_pass,
+               SUM(CASE WHEN verdict='FAIL' THEN 1 ELSE 0 END) AS n_fail
+          FROM latest_results
+         GROUP BY suite, "group", pass
+        """
+    ).fetchall()
+    if not rows:
+        return ""
+
+    # Second pass: per-(suite, group) observed universe size = distinct
+    # test_ids ever seen in that bucket across either pass.
+    totals_rows = conn.execute(
+        """
+        SELECT COALESCE(suite, '?')   AS suite,
+               COALESCE("group", '?') AS "group",
+               COUNT(DISTINCT test_id) AS n_total
+          FROM latest_results
+         GROUP BY suite, "group"
+        """
+    ).fetchall()
+    totals = {(r["suite"], r["group"]): r["n_total"] or 0 for r in totals_rows}
+
+    # Collapse rows into per-(suite, group) records.
+    bucket: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        key = (r["suite"], r["group"])
+        b = bucket.setdefault(key, {"native": (0, 0, 0), "litebox": (0, 0, 0)})
+        b[r["pass"]] = (r["covered"] or 0, r["n_pass"] or 0, r["n_fail"] or 0)
+
+    lines = ["## By suite × group (observed universe)\n",
+             "| Suite | Group "
+             "| n-cov | n-tot | n-pass | n-fail "
+             "| l-cov | l-tot | l-pass | l-fail |",
+             "|---|---"
+             "|---:|---:|---:|---:"
+             "|---:|---:|---:|---:|"]
+    for (suite, group), b in sorted(bucket.items()):
+        total = totals.get((suite, group), 0)
+        cells: list[str] = []
+        for pass_name in ("native", "litebox"):
+            cov, p, f = b[pass_name]
+            cells.extend([str(cov), str(total), str(p), str(f)])
+        lines.append(f"| {suite} | {group} | " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
 
 
