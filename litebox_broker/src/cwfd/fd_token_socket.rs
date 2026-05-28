@@ -473,7 +473,8 @@ fn update_tracker_from_response(
         Opcode::CreateEventfd
         | Opcode::CreatePidfd
         | Opcode::CreateSignalfd
-        | Opcode::InotifyInit1 => {
+        | Opcode::InotifyInit1
+        | Opcode::InetListenerCreate => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
                 tracker.record_state(caller_scope, id);
             }
