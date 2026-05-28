@@ -41,9 +41,7 @@ use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
-use litebox_shim_optee::session::{
-    SessionIdGuard, SessionManager, TaInstance, allocate_session_id,
-};
+use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
 use once_cell::race::OnceBox;
 
@@ -515,15 +513,15 @@ fn handle_open_session(
     let client_identity = ta_req_info.client_identity;
     let params = &ta_req_info.params;
 
-    session_manager().with_ta(&ta_uuid, |existing| match existing {
-        Some(instance) => open_session_single_instance(
+    session_manager().with_ta(&ta_uuid, |target| match target {
+        OpenSessionTarget::Sibling(instance) => open_session_single_instance(
             msg_args,
             msg_args_phys_addr,
             instance,
             params,
             &ta_req_info,
         ),
-        None => open_session_new_instance(
+        OpenSessionTarget::NewInstance => open_session_new_instance(
             msg_args,
             msg_args_phys_addr,
             params,
@@ -531,6 +529,15 @@ fn handle_open_session(
             client_identity,
             &ta_req_info,
         ),
+        OpenSessionTarget::Busy => {
+            // Single-instance TA without MULTI_SESSION already has a live
+            // session. Per OP-TEE OS `tee_ta_init_session_with_context`,
+            // return TEE_ERROR_BUSY with origin TEE via msg_args.
+            msg_args.ret = TeeResult::Busy;
+            msg_args.ret_origin = TeeOrigin::Tee;
+            write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
+            Ok(())
+        }
     })
 }
 
@@ -548,14 +555,10 @@ fn open_session_single_instance(
 ) -> Result<(), OpteeSmcReturnCode> {
     let task_pt_id = instance.task_page_table_id();
     let ta_uuid = instance.uuid();
+    let ta_flags = instance.loaded_program().ta_flags;
 
-    // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID.
-    // Use SessionIdGuard to ensure the ID is recycled on any error path
-    // (before it is registered with the session manager).
-    let session_id_guard =
-        SessionIdGuard::new(allocate_session_id().ok_or(OpteeSmcReturnCode::EBusy)?);
-    // Safe to unwrap: guard was just created with Some(id).
-    let runner_session_id = session_id_guard.id().unwrap();
+    let mut session_token = session_manager().try_acquire_open_session_token()?;
+    let runner_session_id = session_token.session_id().unwrap();
 
     debug_serial_println!(
         "Reusing single-instance TA: uuid={:?}, task_pt_id={}, session_id={}",
@@ -563,8 +566,6 @@ fn open_session_single_instance(
         task_pt_id,
         runner_session_id
     );
-
-    let ta_flags = instance.loaded_program().ta_flags;
 
     let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
 
@@ -647,7 +648,6 @@ fn open_session_single_instance(
     }
 
     // Treat write-back failure as OpenSession failure: do not publish the session.
-    let runner_session_id = session_id_guard.id().unwrap();
     let write_result = write_msg_args_to_normal_world(
         msg_args,
         msg_args_phys_addr,
@@ -661,9 +661,9 @@ fn open_session_single_instance(
     // deliver the session id to the normal world, so it will never issue a
     // matching CloseSession. For a non-keep-alive instance with no siblings
     // we tear the whole instance down, reclaiming the TA-side state, and the
-    // session id can be recycled normally. For keep-alive or shared
+    // session id is recycled by the token's drop. For keep-alive or shared
     // instances the TA still holds session-local state tagged with this id,
-    // so we forget the id (disarm the guard) to prevent a future OpenSession
+    // so we forget the id (disarm the token) to prevent a future OpenSession
     // from reusing it and colliding with the orphaned TA-side bookkeeping.
     if let Err(e) = write_result {
         if !ta_flags.is_keep_alive() && session_manager().count_sessions_for_instance(instance) == 0
@@ -674,14 +674,14 @@ fn open_session_single_instance(
                 teardown_ta_page_table(instance.shim(), task_pt_id);
             };
         } else {
-            let _ = session_id_guard.disarm();
+            session_token.disarm();
         }
         return Err(e);
     }
 
     // Success: register a sibling session pointing at the existing instance.
     session_manager().register_sibling_session(runner_session_id, instance)?;
-    session_id_guard.disarm();
+    session_token.disarm();
 
     debug_serial_println!(
         "OpenSession complete on single-instance TA: session_id={}",
@@ -706,22 +706,19 @@ fn open_session_new_instance(
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_bin = find_ta_binary(ta_uuid).ok_or(OpteeSmcReturnCode::ENotAvail)?;
 
-    // Create and switch to new page table
+    // Token is declared before `task_pt_guard` so it drops AFTER it —
+    // marker only releases once CR3 is back to base. See
+    // `try_acquire_open_session_token` for why.
+    let mut session_token = session_manager().try_acquire_open_session_token()?;
+    let runner_session_id = session_token.session_id().unwrap();
+
     let task_pt_id = create_task_page_table()?;
     debug_serial_println!("Created task page table ID: {}", task_pt_id);
 
-    let task_pt_guard = TaskPageTableGuard::enter(task_pt_id).inspect_err(|_| {
+    let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id).inspect_err(|_| {
         // Safety: switch_to_task_page_table failed, so task page table is not active.
         let _ = unsafe { delete_task_page_table(task_pt_id) };
     })?;
-
-    let Some(session_id) = allocate_session_id() else {
-        drop(task_pt_guard);
-        let _ = unsafe { delete_task_page_table(task_pt_id) };
-        return Err(OpteeSmcReturnCode::EBusy);
-    };
-    let session_id_guard = SessionIdGuard::new(session_id);
-    let runner_session_id = session_id_guard.id().unwrap();
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
@@ -860,10 +857,8 @@ fn open_session_new_instance(
     }
 
     // Write back BEFORE publishing the instance. If the write fails, the
-    // session is neither registered nor cached, so we just tear down the
-    // local resources and let `session_id_guard` recycle the ID on drop.
-    // Safe to unwrap: guard has not been disarmed yet.
-    let runner_session_id = session_id_guard.id().unwrap();
+    // session is neither registered nor cached; we tear down the local
+    // resources and `session_token`'s drop recycles the id.
     write_msg_args_to_normal_world(
         msg_args,
         msg_args_phys_addr,
@@ -885,7 +880,7 @@ fn open_session_new_instance(
         task_pt_id,
         ta_uuid,
     );
-    session_id_guard.disarm();
+    session_token.disarm();
 
     debug_serial_println!(
         "OpenSession complete: session_id={}, single_instance={}",

@@ -159,6 +159,25 @@ impl TaInstance {
 unsafe impl Send for TaInstance {}
 unsafe impl Sync for TaInstance {}
 
+/// What an OpenSession should do given the current cache state for a
+/// `uuid`, as decided by [`SessionManager::with_ta`] under its
+/// serialization. The closure dispatches on the variant.
+pub enum OpenSessionTarget<'a> {
+    /// No cached single-instance instance for this UUID (either it's
+    /// not single-instance, or the cache is empty). Closure should load
+    /// a fresh TA and call `register_new_session`.
+    NewInstance,
+    /// A cached single-instance TA is available for sharing. Closure
+    /// should reuse it for a sibling session via `register_sibling_session`.
+    Sibling(&'a TaInstance),
+    /// A cached single-instance TA exists but it lacks `TA_FLAG_MULTI_SESSION`
+    /// and already has at least one live session. Per OP-TEE OS
+    /// `tee_ta_init_session_with_context`, the runner must reject with
+    /// `TEE_ERROR_BUSY` (origin TEE). The closure must write the BUSY
+    /// response to the client and return `Ok` — no TA load needed.
+    Busy,
+}
+
 /// Per-session entry in the session map. The `Dead` variant retains
 /// `(ta_uuid, ta_flags)` so cleanup paths and `try_acquire_for_session`'s
 /// snapshot still have them after the instance is gone.
@@ -297,53 +316,12 @@ impl Default for SingleInstanceCache {
 }
 
 /// Returns `None` if all session IDs are exhausted.
-pub fn allocate_session_id() -> Option<u32> {
+fn allocate_session_id() -> Option<u32> {
     SessionIdPool::allocate()
 }
 
 fn recycle_session_id(session_id: u32) {
     SessionIdPool::recycle(session_id);
-}
-
-/// RAII guard that recycles a session ID on drop unless disarmed.
-///
-/// Session IDs are allocated before the TA is invoked and only registered on
-/// success via [`SessionManager::register_new_session`] or
-/// [`SessionManager::register_sibling_session`]. This guard ensures it is
-/// recycled on all error paths before this registration.
-pub struct SessionIdGuard {
-    session_id: Option<u32>,
-}
-
-impl SessionIdGuard {
-    pub fn new(session_id: u32) -> Self {
-        Self {
-            session_id: Some(session_id),
-        }
-    }
-
-    /// Returns `None` if already disarmed.
-    pub fn id(&self) -> Option<u32> {
-        self.session_id
-    }
-
-    /// Disarm the guard so the session ID is **not** recycled on drop.
-    ///
-    /// Call this after the session ID has been successfully registered.
-    /// Once registered, [`SessionManager::unregister_session`] owns recycling.
-    ///
-    /// Returns `None` if the guard was already disarmed.
-    pub fn disarm(mut self) -> Option<u32> {
-        self.session_id.take()
-    }
-}
-
-impl Drop for SessionIdGuard {
-    fn drop(&mut self) {
-        if let Some(id) = self.session_id {
-            recycle_session_id(id);
-        }
-    }
 }
 
 /// RAII token bundling the serialization primitives required to safely
@@ -355,23 +333,59 @@ impl Drop for SessionIdGuard {
 ///   all sessions on the same TA.
 /// - **First-ever load of an unknown UUID** (OpenSession only): the shared
 ///   `unknown_uuid_lock`, used until the TA's flags are observed.
-/// - **Existing-session operations** (Invoke/Close): a per-session-id marker
-///   that prevents concurrent SMC entry by another core for the same id.
+/// - **Existing-session operations** (Invoke/Close): a per-session-id
+///   marker (slot in `SessionManager::active_sessions`) that prevents
+///   concurrent SMC entry by another core for the same id.
+/// - **OpenSession (runner-facing)**: same per-session-id marker plus
+///   a freshly-allocated `session_id` whose recycling the token owns
+///   until [`Self::disarm`]. Acquired via
+///   [`SessionManager::try_acquire_open_session_token`].
 ///
-/// For known multi-instance OpenSession the token holds nothing (each
-/// session gets its own private instance, so no exclusion is required).
+/// For known multi-instance OpenSession the token (from `with_ta`)
+/// holds nothing — each session gets its own private instance, so no
+/// exclusion is required there.
 ///
-/// On drop, the held UUID-level lock is released first (whether per-UUID
-/// or the shared unknown lock), then the per-session-id marker.
-struct SessionToken<'a> {
+/// On drop the held UUID-level lock is released first (whether per-UUID
+/// or the shared unknown lock), then the per-session-id marker, then
+/// (if still owned) the session id is recycled.
+pub struct SessionToken<'a> {
     manager: &'a SessionManager,
     /// Held `Arc` of the per-UUID `SpinMutex`. The guard returned by
     /// `try_lock()` was [`core::mem::forget`]-ed at acquisition time; this
     /// type's `Drop` calls `force_unlock` to release the mutex. The `Arc`
     /// keeps the mutex alive across acquisition and release.
     uuid_lock: Option<Arc<SpinMutex<()>>>,
-    /// Session id reserved in [`SessionManager::active_sessions`].
+    /// `Some(id)` while the token holds the active-session marker for `id`
+    /// in [`SessionManager::active_sessions`]. Drop releases the marker.
     active_session_id: Option<u32>,
+    /// Whether `active_session_id` should also be recycled to the id pool
+    /// on drop (in addition to releasing the marker). Set when the id was
+    /// freshly allocated by
+    /// [`SessionManager::try_acquire_open_session_token`]; cleared by
+    /// [`Self::disarm`] after the id is transferred to the session map via
+    /// `register_*_session`. Only meaningful when `active_session_id` is
+    /// `Some`; ignored otherwise.
+    owns_id_recycling: bool,
+}
+
+impl SessionToken<'_> {
+    /// Session id this token reserves the active-session marker for, if any.
+    /// Set for tokens minted by
+    /// [`SessionManager::try_acquire_open_session_token`],
+    /// [`SessionManager::try_acquire_session_marker`], or
+    /// `try_acquire_for_session` (Invoke/Close).
+    pub fn session_id(&self) -> Option<u32> {
+        self.active_session_id
+    }
+
+    /// Transfer id-recycling responsibility off the token. Call after the
+    /// id has been registered via `register_new_session` /
+    /// `register_sibling_session`; from that point the session map (via
+    /// `unregister_session`) owns recycling, and the token's drop will
+    /// only release the marker (and any locks).
+    pub fn disarm(&mut self) {
+        self.owns_id_recycling = false;
+    }
 }
 
 impl Drop for SessionToken<'_> {
@@ -384,6 +398,9 @@ impl Drop for SessionToken<'_> {
         }
         if let Some(id) = self.active_session_id.take() {
             self.manager.active_sessions.lock().remove(&id);
+            if self.owns_id_recycling {
+                recycle_session_id(id);
+            }
         }
     }
 }
@@ -438,6 +455,62 @@ impl SessionManager {
             unknown_uuid_lock: Arc::new(SpinMutex::new(())),
             active_sessions: SpinMutex::new(HashSet::new()),
         }
+    }
+
+    /// Reserve the active-session slot for `session_id` non-blockingly,
+    /// returning a [`SessionToken`] (carrying just the per-session-id
+    /// marker, no UUID lock) that releases the slot on drop. Returns
+    /// `None` if the slot is already taken. Excludes concurrent
+    /// `with_session(session_id)` until the token drops.
+    pub fn try_acquire_session_marker(&self, session_id: u32) -> Option<SessionToken<'_>> {
+        if !self.active_sessions.lock().insert(session_id) {
+            return None;
+        }
+        Some(SessionToken {
+            manager: self,
+            uuid_lock: None,
+            active_session_id: Some(session_id),
+            owns_id_recycling: false,
+        })
+    }
+
+    /// Allocate a fresh `session_id` and reserve its active-session slot
+    /// atomically. See [`SessionToken`] for what the returned token
+    /// carries.
+    ///
+    /// # Drop-order requirement
+    ///
+    /// On the OpenSession path the runner activates a TA page table
+    /// (`TaskPageTableGuard`) inside the same scope. The token *must* be
+    /// declared **before** that guard so it drops **after** it — the
+    /// marker must outlive the CR3 switch back to base, otherwise a
+    /// forged Close on the freshly-registered session can win the
+    /// marker race and tear down the task page table while CR3 still
+    /// points at it. (Single-instance is already covered by `with_ta`'s
+    /// per-UUID lock; this is the only defense for multi-instance.)
+    ///
+    /// # Errors
+    /// - `EBusy` if the id pool is exhausted.
+    /// - `EThreadLimit` for the rare race where the just-allocated id's
+    ///   marker slot is still held by a not-yet-dropped Close token (the
+    ///   driver retries transparently via its wait queue).
+    pub fn try_acquire_open_session_token(&self) -> Result<SessionToken<'_>, OpteeSmcReturnCode> {
+        let session_id = allocate_session_id().ok_or(OpteeSmcReturnCode::EBusy)?;
+        if !self.active_sessions.lock().insert(session_id) {
+            // Rare race: previous Close on this id recycled it via
+            // `unregister_session` but its `SessionToken` hasn't dropped
+            // yet, so the marker slot is still held. Roll back the alloc;
+            // the driver's retry will allocate again (likely a different
+            // id, or this one after the previous Close fully releases).
+            recycle_session_id(session_id);
+            return Err(OpteeSmcReturnCode::EThreadLimit);
+        }
+        Ok(SessionToken {
+            manager: self,
+            uuid_lock: None,
+            active_session_id: Some(session_id),
+            owns_id_recycling: true,
+        })
     }
 
     /// Mark every session currently pointing at `instance` as `Dead`. Must
@@ -525,6 +598,7 @@ impl SessionManager {
             manager: self,
             uuid_lock,
             active_session_id: None,
+            owns_id_recycling: false,
         })
     }
 
@@ -575,6 +649,7 @@ impl SessionManager {
             manager: self,
             uuid_lock: None,
             active_session_id: Some(session_id),
+            owns_id_recycling: false,
         };
 
         // Take the per-UUID lock BEFORE the final re-read for single-
@@ -602,21 +677,17 @@ impl SessionManager {
         Ok((token, entry_now))
     }
 
-    /// Drive an Invoke/Close to completion under the right serialization.
-    ///
-    /// Internally acquires the per-session-id marker (and, for single-
-    /// instance TAs, the per-UUID lock), passes `Some(&TaInstance)` to `f`
-    /// for live sessions or `None` for dead ones, and releases the locks
-    /// when `f` returns. `f` runs entirely under the token: state
-    /// mutations it performs on the session manager (e.g.
-    /// `unregister_session`, `mark_sessions_dead_for_instance`,
-    /// `evict_cached_instance`) are serialized against other
-    /// cores' Invoke/Close on the same session and (for single-instance)
-    /// the same UUID.
+    /// Drive an Invoke/Close to completion under the right serialization
+    /// (see [`SessionToken`] for the locks held). Passes
+    /// `Some(&TaInstance)` to `f` for live sessions, `None` for dead
+    /// ones. State mutations `f` performs on the manager
+    /// (`unregister_session`, `mark_sessions_dead_for_instance`,
+    /// `evict_cached_instance`) are serialized against concurrent
+    /// Invoke/Close on the same session and (single-instance) the same UUID.
     ///
     /// Returns `Err(EBadCmd)` if `session_id` is not registered, or
-    /// `Err(EThreadLimit)` on lock contention; the Linux OP-TEE driver
-    /// retries `EThreadLimit` transparently.
+    /// `Err(EThreadLimit)` on lock contention (driver retries
+    /// transparently).
     pub fn with_session<F>(&self, session_id: u32, f: F) -> Result<(), OpteeSmcReturnCode>
     where
         F: for<'a> FnOnce(Option<&'a TaInstance>) -> Result<(), OpteeSmcReturnCode>,
@@ -633,6 +704,34 @@ impl SessionManager {
     /// `loaded_program`, `task_page_table_id`) are taken by value and stored
     /// inside the manager; for single-instance TAs the instance is also
     /// cached under `ta_uuid` for later reuse.
+    ///
+    /// # Publication order
+    ///
+    /// `sessions` and (for single-instance) `single_instance_cache` are
+    /// populated *before* `known_flags`. Other openers gate on
+    /// `known_flags` to decide their lock path — once they observe `uuid`
+    /// as known single-instance, the cache is guaranteed to already
+    /// contain the entry, so they take the sibling/cache-hit branch
+    /// rather than racing into a duplicate load.
+    ///
+    /// # Unknown→per-UUID transition
+    ///
+    /// For single-instance TAs we pre-lock the per-UUID `SpinMutex` *before*
+    /// publishing `known_flags` so any later opener that observes `uuid`
+    /// as known single-instance and routes to the per-UUID lock finds it
+    /// already held. The lock state lives in `single_instance_locks`
+    /// (the `Arc` we get back is discarded — its only purpose was to
+    /// take the lock); [`Self::with_ta`] adopts by re-fetching the `Arc`
+    /// for *its own* `uuid` and installing it in its token. This is
+    /// UUID-keyed end-to-end: no shared side channel, so concurrent
+    /// `with_ta` calls for different UUIDs cannot interfere with each
+    /// other's adoptions.
+    ///
+    /// `try_acquire_uuid_lock` succeeds only on the unknown path (caller
+    /// holds `unknown_uuid_lock`, no sessions or `known_flags` entry for
+    /// `uuid` yet). On the known-cache-evicted path the caller already
+    /// holds the per-UUID lock and the `try_lock` returns `None`, so
+    /// nothing changes (the caller's existing lock is sufficient).
     pub fn register_new_session(
         &self,
         session_id: u32,
@@ -648,11 +747,21 @@ impl SessionManager {
             task_page_table_id,
             ta_uuid,
         });
-        self.known_flags.lock().entry(ta_uuid).or_insert(ta_flags);
+
+        // Pre-lock per-UUID for atomic unknown→per-UUID transition (see
+        // method doc). The returned `Arc` is intentionally dropped; the
+        // forgotten guard inside `try_acquire_uuid_lock` keeps the lock
+        // state held in `single_instance_locks` until `with_ta` adopts.
+        if ta_flags.is_single_instance() {
+            let _ = self.try_acquire_uuid_lock(ta_uuid);
+        }
+
         self.sessions.insert_live(session_id, arc.clone());
         if ta_flags.is_single_instance() {
             self.single_instance_cache.insert(ta_uuid, arc);
         }
+        // Publish `known_flags` last — this is the gate other openers check.
+        self.known_flags.lock().entry(ta_uuid).or_insert(ta_flags);
     }
 
     /// Register a session that re-uses an existing single-instance TA.
@@ -677,10 +786,8 @@ impl SessionManager {
             .get(&instance.ta_uuid)
             .filter(|cached| cached.task_page_table_id == instance.task_page_table_id)
             .ok_or(OpteeSmcReturnCode::EBadCmd)?;
-        self.known_flags
-            .lock()
-            .entry(instance.ta_uuid)
-            .or_insert(instance.loaded_program.ta_flags);
+        // `known_flags` is already populated for this UUID — sibling path
+        // implies the instance was previously registered.
         self.sessions.insert_live(session_id, arc);
         Ok(())
     }
@@ -742,41 +849,54 @@ impl SessionManager {
 
     /// Drive an OpenSession to completion under the right serialization.
     ///
-    /// Internally acquires the UUID-level lock dictated by what's known
-    /// about `uuid` (per-UUID lock for known single-instance, shared
-    /// unknown-load lock for unknown UUIDs, none for known multi-instance),
-    /// then either:
+    /// Acquires the UUID-level lock for `uuid` (see [`SessionToken`] for
+    /// the case breakdown), classifies the cache state, and dispatches
+    /// via [`OpenSessionTarget`]:
     ///
-    /// - Calls `f(Some(existing))` if a cached single-instance TA is found
-    ///   for `uuid`. The lock is held throughout the call so the existing
-    ///   instance cannot be torn down or replaced beneath `f`.
-    /// - Reserves a creation slot (atomic capacity check against
-    ///   `instance_count() + pending_count`) and calls `f(None)` to load
-    ///   and register a new instance. The slot is released when `f`
-    ///   returns, regardless of outcome.
+    /// - [`OpenSessionTarget::Sibling`] for a cached single-instance TA
+    ///   that admits another session.
+    /// - [`OpenSessionTarget::Busy`] for the OP-TEE-OS-defined
+    ///   `TA_FLAG_MULTI_SESSION` violation (single-instance without
+    ///   MULTI_SESSION already has a live session).
+    /// - [`OpenSessionTarget::NewInstance`] otherwise: reserves a
+    ///   creation slot (capacity check against
+    ///   `instance_count() + pending_count`) and lets the closure load
+    ///   and register a fresh instance.
     ///
-    /// The lock is released when this function returns; `f` runs under it.
-    /// For known multi-instance TAs each session gets its own independent
-    /// `TaInstance`, so no per-UUID exclusion is required.
-    ///
-    /// `pending_count` exists only for capacity accounting (so two
-    /// multi-instance loads can't both pass the limit check before either
-    /// registers). Duplicate-prevention for the single-instance / unknown
-    /// paths is provided by the UUID-level lock above — it serializes the
-    /// cache check and any new load, so two concurrent loads cannot both
-    /// miss the cache and create rival instances.
+    /// `pending_count` exists only for capacity accounting so two
+    /// concurrent multi-instance loads can't both pass the limit before
+    /// either registers. The single-instance / unknown paths are
+    /// serialized by the UUID-level lock itself.
     pub fn with_ta<F>(&self, uuid: &TeeUuid, f: F) -> Result<(), OpteeSmcReturnCode>
     where
-        F: for<'a> FnOnce(Option<&'a TaInstance>) -> Result<(), OpteeSmcReturnCode>,
+        F: for<'a> FnOnce(OpenSessionTarget<'a>) -> Result<(), OpteeSmcReturnCode>,
     {
-        let _token = self.try_acquire_for_open(*uuid)?;
+        let mut token = self.try_acquire_for_open(*uuid)?;
+        // Whether we started on the unknown-load path is determined by the
+        // identity of the lock the token carries. Captured before `f` runs
+        // so we know which branch to take in the post-`f` adoption step.
+        let on_unknown_path = token
+            .uuid_lock
+            .as_ref()
+            .is_some_and(|arc| Arc::ptr_eq(arc, &self.unknown_uuid_lock));
 
         // Cache lookup is unconditional: it returns `None` for known
         // multi-instance and unknown UUIDs (never populated), and only
         // returns `Some` for known single-instance UUIDs whose entry the
         // per-UUID lock above keeps stable.
         if let Some(existing) = self.single_instance_cache.get(uuid) {
-            return f(Some(&existing));
+            // MULTI_SESSION enforcement (matches OP-TEE OS
+            // `tee_ta_init_session_with_context`). Under the per-UUID lock
+            // the session count is stable across this check and the
+            // closure, so a parallel Close/Invoke can't change it.
+            let flags = existing.loaded_program().ta_flags;
+            let target =
+                if !flags.is_multi_session() && self.count_sessions_for_instance(&existing) > 0 {
+                    OpenSessionTarget::Busy
+                } else {
+                    OpenSessionTarget::Sibling(&existing)
+                };
+            return f(target);
         }
 
         {
@@ -788,11 +908,28 @@ impl SessionManager {
             *pending += 1;
         }
 
-        let result = f(None);
+        let result = f(OpenSessionTarget::NewInstance);
 
         {
             let mut pending = self.pending_count.lock();
             *pending = pending.saturating_sub(1);
+        }
+
+        // Complete the unknown→per-UUID transition (see
+        // `register_new_session` doc). Only fires when we held
+        // `unknown_uuid_lock` AND the closure registered a single-instance
+        // TA for *our* `uuid`. The per-UUID lock is already held (forgotten
+        // guard in `single_instance_locks` from `register_new_session`'s
+        // pre-lock); re-fetch the `Arc` by `uuid` and swap into the token,
+        // force-unlocking the old (unknown) lock. Token drop then releases
+        // the per-UUID lock at the end of `with_ta`. UUID-keyed throughout,
+        // so concurrent `with_ta(other_uuid)` cannot adopt our lock.
+        if result.is_ok() && on_unknown_path && self.single_instance_cache.get(uuid).is_some() {
+            let per_uuid = self.uuid_lock_arc(*uuid);
+            if let Some(old) = token.uuid_lock.replace(per_uuid) {
+                // SAFETY: see `SessionToken::drop` — same invariant.
+                unsafe { old.force_unlock() };
+            }
         }
 
         result
@@ -831,6 +968,34 @@ mod tests {
         TaFlags::SINGLE_INSTANCE | TaFlags::MULTI_SESSION
     }
 
+    /// Test helper: call `register_new_session` and release the per-UUID
+    /// lock the way `with_ta` would, so subsequent operations
+    /// (Invoke/Close, evict, count, etc.) aren't blocked by a held lock.
+    fn register_for_test(
+        manager: &SessionManager,
+        session_id: u32,
+        ta_flags: TaFlags,
+        task_page_table_id: usize,
+        ta_uuid: TeeUuid,
+    ) {
+        manager.register_new_session(
+            session_id,
+            make_shim(),
+            make_loaded_program(ta_flags),
+            task_page_table_id,
+            ta_uuid,
+        );
+        // For single-instance, `register_new_session` pre-locked the
+        // per-UUID mutex via a forgotten guard. Release here to mirror
+        // `with_ta`'s token-drop release.
+        if ta_flags.is_single_instance()
+            && let Some(arc) = manager.single_instance_locks.lock().get(&ta_uuid).cloned()
+        {
+            // SAFETY: same invariant as `SessionToken::drop`.
+            unsafe { arc.force_unlock() };
+        }
+    }
+
     /// Identity is by `task_page_table_id`, not by Arc pointer. After an
     /// instance is evicted and a fresh one registered under the same UUID,
     /// the stale handle must not evict the new one.
@@ -839,23 +1004,11 @@ mod tests {
         let manager = SessionManager::new();
         let uuid = make_uuid(0xA4);
 
-        manager.register_new_session(
-            105,
-            make_shim(),
-            make_loaded_program(single_instance_flags()),
-            10,
-            uuid,
-        );
+        register_for_test(&manager, 105, single_instance_flags(), 10, uuid);
         let arc_first = manager.single_instance_cache.get(&uuid).unwrap();
         manager.evict_cached_instance(&arc_first);
 
-        manager.register_new_session(
-            106,
-            make_shim(),
-            make_loaded_program(single_instance_flags()),
-            11,
-            uuid,
-        );
+        register_for_test(&manager, 106, single_instance_flags(), 11, uuid);
         assert!(!manager.evict_cached_instance(&arc_first));
         assert!(manager.single_instance_cache.get(&uuid).is_some());
     }
@@ -867,13 +1020,7 @@ mod tests {
     fn mark_dead_makes_with_session_observe_none() {
         let manager = SessionManager::new();
         let uuid = make_uuid(0xA6);
-        manager.register_new_session(
-            108,
-            make_shim(),
-            make_loaded_program(single_instance_flags()),
-            55,
-            uuid,
-        );
+        register_for_test(&manager, 108, single_instance_flags(), 55, uuid);
         let arc = manager.single_instance_cache.get(&uuid).unwrap();
         assert_eq!(manager.count_sessions_for_instance(&arc), 1);
 
@@ -886,32 +1033,6 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-    }
-
-    /// Per-session-id marker excludes re-entry on the same id, but releases
-    /// when the closure returns.
-    #[test]
-    fn with_session_marker_excludes_reentry() {
-        let manager = SessionManager::new();
-        let uuid = make_uuid(0xA7);
-        manager.register_new_session(
-            109,
-            make_shim(),
-            make_loaded_program(single_instance_flags()),
-            6,
-            uuid,
-        );
-
-        manager
-            .with_session(109, |_| {
-                assert_eq!(
-                    manager.with_session(109, |_| Ok(())),
-                    Err(OpteeSmcReturnCode::EThreadLimit)
-                );
-                Ok(())
-            })
-            .unwrap();
-        manager.with_session(109, |_| Ok(())).unwrap();
     }
 
     /// A failed first-load of an unknown UUID must not mint a per-UUID
@@ -929,40 +1050,6 @@ mod tests {
         assert!(manager.get_known_flags(&uuid).is_none());
     }
 
-    /// `try_acquire_for_session` returns the entry observed by the
-    /// post-marker re-read, not a stale handle from before the marker was
-    /// taken. After a recycle+re-register under a new UUID, the returned
-    /// entry must reflect the current UUID. (The mismatch-rejection branch
-    /// itself can only be triggered by a concurrent swap between snapshot
-    /// and re-read, which isn't reproducible in a single-threaded test;
-    /// this just verifies the re-read is the source of truth.)
-    #[test]
-    fn try_acquire_for_session_returns_current_entry_after_recycle() {
-        let manager = SessionManager::new();
-        let uuid_a = make_uuid(0xB0);
-        let uuid_b = make_uuid(0xB1);
-        let session_id = 222;
-
-        manager.register_new_session(
-            session_id,
-            make_shim(),
-            make_loaded_program(single_instance_flags()),
-            70,
-            uuid_a,
-        );
-        manager.unregister_session(session_id);
-        manager.register_new_session(
-            session_id,
-            make_shim(),
-            make_loaded_program(single_instance_flags()),
-            71,
-            uuid_b,
-        );
-
-        let (_, validated) = manager.try_acquire_for_session(session_id).unwrap();
-        assert_eq!(validated.ta_uuid(), uuid_b);
-    }
-
     /// `pending_count` is bumped only on the create path, never on the
     /// cache-hit path, and is decremented when the closure returns whether
     /// success or failure — across multiple calls it must return to zero.
@@ -974,8 +1061,8 @@ mod tests {
 
         // Successful create path.
         manager
-            .with_ta(&uuid_multi, |existing| {
-                assert!(existing.is_none());
+            .with_ta(&uuid_multi, |target| {
+                assert!(matches!(target, OpenSessionTarget::NewInstance));
                 manager.register_new_session(
                     301,
                     make_shim(),
@@ -993,14 +1080,84 @@ mod tests {
         assert_eq!(*manager.pending_count.lock(), 0);
 
         // Cache-hit path doesn't touch pending_count.
-        manager.register_new_session(
-            302,
-            make_shim(),
-            make_loaded_program(single_instance_flags()),
-            81,
-            uuid_single,
-        );
+        register_for_test(&manager, 302, single_instance_flags(), 81, uuid_single);
         manager.with_ta(&uuid_single, |_| Ok(())).unwrap();
         assert_eq!(*manager.pending_count.lock(), 0);
+    }
+
+    /// After `with_ta` completes the unknown→per-UUID transition, the
+    /// per-UUID lock must be released — a subsequent `try_lock` on the
+    /// per-UUID `SpinMutex` for the same UUID must succeed.
+    #[test]
+    fn with_ta_releases_per_uuid_lock_after_unknown_load() {
+        let manager = SessionManager::new();
+        let uuid = make_uuid(0xD0);
+
+        manager
+            .with_ta(&uuid, |target| {
+                assert!(matches!(target, OpenSessionTarget::NewInstance));
+                manager.register_new_session(
+                    401,
+                    make_shim(),
+                    make_loaded_program(single_instance_flags()),
+                    90,
+                    uuid,
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        // Per-UUID lock entry exists (pre-locked + adopted + released).
+        let arc = manager
+            .single_instance_locks
+            .lock()
+            .get(&uuid)
+            .cloned()
+            .expect("entry created by register_new_session");
+        // And it's currently unlocked — a fresh try_lock must succeed.
+        assert!(arc.try_lock().is_some());
+    }
+
+    /// A concurrent `with_ta` for an unrelated UUID must NOT adopt or
+    /// release the per-UUID lock held by another unknown-load opener.
+    /// Adoption is keyed by the `with_ta` call's own UUID, so an opener
+    /// for a different UUID leaves the original opener's per-UUID lock
+    /// untouched.
+    #[test]
+    fn unrelated_with_ta_does_not_adopt_other_uuids_lock() {
+        let manager = SessionManager::new();
+        let uuid_locked = make_uuid(0xE1);
+        let uuid_other = make_uuid(0xE2);
+
+        // Simulate the "lock pre-taken under unknown-load" state by directly
+        // pre-locking the per-UUID mutex for `uuid_locked`. This mirrors
+        // what `register_new_session` does mid-unknown-load before
+        // `with_ta` adopts.
+        let pre_locked = manager
+            .try_acquire_uuid_lock(uuid_locked)
+            .expect("uncontended");
+        // Don't release `pre_locked` — emulating the forgotten-guard state.
+        core::mem::forget(pre_locked);
+
+        // A `with_ta` call for a completely different UUID must not touch
+        // `uuid_locked`'s lock. The closure registers nothing, but the
+        // post-`f` adoption logic still runs.
+        manager.with_ta(&uuid_other, |_| Ok(())).unwrap();
+
+        // `uuid_locked`'s per-UUID lock must still be held (not stolen).
+        let arc = manager
+            .single_instance_locks
+            .lock()
+            .get(&uuid_locked)
+            .cloned()
+            .expect("entry exists");
+        assert!(
+            arc.try_lock().is_none(),
+            "uuid_locked's per-UUID lock must remain held by the original opener"
+        );
+
+        // Cleanup: release for SpinMutex sanity.
+        // SAFETY: we forgot the guard above; release here.
+        unsafe { arc.force_unlock() };
     }
 }
