@@ -18,6 +18,7 @@ pub(crate) mod fork_matrix;
 pub(crate) mod getrandom_tests;
 pub(crate) mod inherit_matrix;
 pub(crate) mod inotify;
+pub(crate) mod invariants;
 pub(crate) mod iouring_discovery;
 pub mod leaf_subcommand;
 pub(crate) mod matrix;
@@ -997,6 +998,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     epoll_pidfd::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
     eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
     inotify::register_inotify_tests(&mut registry::Registry::new(&mut tests));
+    invariants::register_invariant_tests(&mut registry::Registry::new(&mut tests));
     inherit_matrix::register_inherit_matrix_tests(&mut registry::Registry::new(&mut tests));
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
     pidfd_inherit::register_pidfd_inherit_tests(&mut registry::Registry::new(&mut tests));

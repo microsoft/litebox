@@ -1,0 +1,137 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Pre-migration invariant probes for broker-held inet work.
+
+use serde::{Deserialize, Serialize};
+
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::register_handler;
+
+use super::agents::AgentName;
+use super::registry::Registry;
+
+const KIND_TYPEID_MATCH: HandlerToken<(), InvariantOut> =
+    HandlerToken::new("invariants.kind_typeid_match");
+
+const LITEBOX_IOCTL_KIND_TYPEID_INVARIANT: libc::c_ulong = 0x4c42_4901;
+
+#[derive(Serialize, Deserialize, Debug)]
+struct InvariantOut {
+    ok: bool,
+    detail: String,
+}
+
+struct Fd(i32);
+
+impl Fd {
+    fn new(fd: i32, what: &str) -> Result<Self, HandlerError> {
+        if fd < 0 {
+            Err(HandlerError(format!(
+                "{what}: {}",
+                std::io::Error::last_os_error()
+            )))
+        } else {
+            Ok(Self(fd))
+        }
+    }
+}
+
+impl Drop for Fd {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is an fd owned by this RAII wrapper.
+        unsafe { libc::close(self.0) };
+    }
+}
+
+async fn handle_kind_typeid_match(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<InvariantOut, HandlerError> {
+    let mut fds = Vec::new();
+
+    let file = std::ffi::CString::new("/dev/null").unwrap();
+    // SAFETY: C string pointer is valid for the duration of the call.
+    fds.push(Fd::new(
+        unsafe { libc::open(file.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) },
+        "open /dev/null",
+    )?);
+
+    let mut pipefds = [-1; 2];
+    // SAFETY: `pipefds` points to two writable fd slots.
+    let rc = unsafe { libc::pipe2(pipefds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc != 0 {
+        return Err(HandlerError(format!(
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    fds.push(Fd(pipefds[0]));
+    fds.push(Fd(pipefds[1]));
+
+    // SAFETY: eventfd has no pointer arguments.
+    fds.push(Fd::new(
+        unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) },
+        "eventfd",
+    )?);
+
+    // SAFETY: zeroed sigset_t is immediately initialized by sigemptyset.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `mask` is a valid sigset_t pointer.
+    unsafe { libc::sigemptyset(&mut mask) };
+    // SAFETY: `mask` points to a valid initialized sigset_t.
+    fds.push(Fd::new(
+        unsafe { libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) },
+        "signalfd",
+    )?);
+
+    // SAFETY: socket has no pointer arguments.
+    fds.push(Fd::new(
+        unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) },
+        "socket(AF_INET)",
+    )?);
+
+    let probe_fd = fds[0].0;
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: `buf` is a valid writable buffer for the shim debug ioctl.
+    let rc = unsafe {
+        libc::ioctl(
+            probe_fd,
+            LITEBOX_IOCTL_KIND_TYPEID_INVARIANT as _,
+            buf.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOTTY) {
+            return Ok(InvariantOut {
+                ok: true,
+                detail: "native: shim invariant ioctl unavailable".into(),
+            });
+        }
+    }
+    let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let detail = String::from_utf8_lossy(&buf[..nul]).into_owned();
+    Ok(InvariantOut {
+        ok: rc == 0 && detail.starts_with("ok:"),
+        detail,
+    })
+}
+
+pub(crate) fn register_invariant_tests(reg: &mut Registry<'_>) {
+    register_handler!(KIND_TYPEID_MATCH, handle_kind_typeid_match);
+    reg.single_agent_handler_test(
+        "invariants",
+        "broker_inet",
+        "INV.broker_inet.kind_typeid_match.dpg1",
+        AgentName::Dpg1,
+        &KIND_TYPEID_MATCH,
+        |out| {
+            if out.ok {
+                Ok(out.detail.clone())
+            } else {
+                Err(out.detail.clone())
+            }
+        },
+    );
+}
