@@ -358,8 +358,8 @@ unsafe fn delete_task_page_table(task_pt_id: usize) -> Result<(), OpteeSmcReturn
 
 /// Enforces the invariant that the core must be on the base (kernel) page
 /// table before returning to VTL0: the guard switches to the TA's task
-/// page table on entry and switches back to the base page table on drop,
-/// regardless of the path out (early return, `?`, panic).
+/// page table on entry and switches back on drop, covering early-return
+/// and `?` paths.
 ///
 /// `switch_to_base_page_table` is an idempotent CR3 write, so teardown
 /// paths that switch to base internally before deleting the task page
@@ -550,12 +550,11 @@ fn open_session_single_instance(
     let task_pt_id = instance.task_page_table_id();
     let ta_uuid = instance.uuid();
 
-    // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID.
-    // Use SessionIdGuard to ensure the ID is recycled on any error path
-    // (before it is registered with the session manager).
+    // Allocate the session ID up front so the TA sees the right one in
+    // OpenSession. The guard recycles it on every error path until we
+    // either disarm it (on successful registration) or it drops.
     let session_id_guard =
         SessionIdGuard::new(allocate_session_id().ok_or(OpteeSmcReturnCode::EBusy)?);
-    // Safe to unwrap: guard was just created with Some(id).
     let runner_session_id = session_id_guard.id().unwrap();
 
     debug_serial_println!(
@@ -569,7 +568,7 @@ fn open_session_single_instance(
 
     let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
 
-    // Load TA context with parameters for OpenSession - pass actual session_id
+    // Set up the entry-point parameters for OpenSession.
     instance
         .loaded_program()
         .entrypoints
@@ -583,7 +582,6 @@ fn open_session_single_instance(
         )
         .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
-    // Run the TA's OpenSession entry point using reference-based reenter
     let mut ctx = litebox_common_linux::PtRegs::default();
     unsafe {
         litebox_platform_lvbs::reenter_thread_ref(
@@ -592,7 +590,6 @@ fn open_session_single_instance(
         );
     }
 
-    // Read TA output parameters from the stack buffer
     let params_address = instance
         .loaded_program()
         .params_address
@@ -709,9 +706,7 @@ fn open_session_new_instance(
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_bin = find_ta_binary(ta_uuid).ok_or(OpteeSmcReturnCode::ENotAvail)?;
 
-    // Create and switch to new page table
     let task_pt_id = create_task_page_table()?;
-
     debug_serial_println!("Created task page table ID: {}", task_pt_id);
 
     let task_pt_guard = TaskPageTableGuard::enter(task_pt_id).inspect_err(|_| {
@@ -719,19 +714,14 @@ fn open_session_new_instance(
         let _ = unsafe { delete_task_page_table(task_pt_id) };
     })?;
 
-    // Allocate session ID before loading - return EBusy to normal world if exhausted.
-    // Use SessionIdGuard to ensure the ID is recycled on any error path
-    // (before it is registered with the session manager).
     let Some(session_id) = allocate_session_id() else {
         drop(task_pt_guard);
         let _ = unsafe { delete_task_page_table(task_pt_id) };
         return Err(OpteeSmcReturnCode::EBusy);
     };
     let session_id_guard = SessionIdGuard::new(session_id);
-    // Safe to unwrap: guard was just created with Some(id).
     let runner_session_id = session_id_guard.id().unwrap();
 
-    // Load ldelf and TA - Box immediately to keep at fixed heap address
     let shim = litebox_shim_optee::OpteeShimBuilder::new().build();
     let loaded_program = Box::new(
         shim.load_ldelf(
@@ -756,7 +746,7 @@ fn open_session_new_instance(
         ta_flags.is_single_instance()
     );
 
-    // Run ldelf to load the TA using reference-based run to avoid moving the shim
+    // Run ldelf, which loads the TA and calls TA_CreateEntryPoint.
     let mut ldelf_ctx = litebox_common_linux::PtRegs::default();
     unsafe {
         litebox_platform_lvbs::run_thread_ref(
@@ -792,7 +782,7 @@ fn open_session_new_instance(
         return Ok(());
     }
 
-    // Load TA context with parameters for OpenSession - pass actual session_id
+    // Set up the entry-point parameters for OpenSession.
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
         // SAFETY: no references to user-space memory will be held after this call.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
@@ -814,7 +804,6 @@ fn open_session_new_instance(
             OpteeSmcReturnCode::EBadCmd
         })?;
 
-    // Run the TA entry function using reference-based reenter to avoid moving the shim
     let mut ctx = litebox_common_linux::PtRegs::default();
     unsafe {
         litebox_platform_lvbs::reenter_thread_ref(
@@ -823,7 +812,6 @@ fn open_session_new_instance(
         );
     }
 
-    // Read TA output parameters from the stack buffer
     let params_address = loaded_program.params_address.ok_or_else(|| {
         // SAFETY: no references to user-space memory will be held after this call.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
@@ -884,8 +872,7 @@ fn open_session_new_instance(
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
     })?;
 
-    // Success: hand the three parts to the session manager. The manager
-    // takes ownership; this runner never retains a handle to the instance.
+    // Success: register the new session with the manager.
     session_manager().register_new_session(
         runner_session_id,
         shim,
@@ -966,7 +953,7 @@ fn handle_invoke_command(
             cmd_id
         );
 
-        // Load TA context with parameters and cmd_id - pass actual session_id
+        // Set up the entry-point parameters for InvokeCommand.
         let entrypoints_ref = instance.loaded_program().entrypoints.as_ref().unwrap();
         entrypoints_ref
             .load_ta_context(
@@ -977,7 +964,6 @@ fn handle_invoke_command(
             )
             .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
-        // Run the TA entry function using reference-based reenter to avoid moving the shim
         let mut ctx = litebox_common_linux::PtRegs::default();
         unsafe {
             litebox_platform_lvbs::reenter_thread_ref(
@@ -1076,7 +1062,7 @@ fn handle_close_session(
 
         let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
 
-        // Load TA context for CloseSession (no params, no cmd_id) - pass actual session_id
+        // Set up the entry-point parameters for CloseSession.
         instance
             .loaded_program()
             .entrypoints
@@ -1111,17 +1097,13 @@ fn handle_close_session(
 
         let removed_flags = session_manager().unregister_session(session_id);
 
-        // Check if this was the last session using the TA instance by counting
-        // remaining sessions that reference this instance.
-        let remaining_sessions = session_manager()
-                .count_sessions_for_instance(instance);
+        let remaining_sessions = session_manager().count_sessions_for_instance(instance);
 
-        // If this was the last session using the TA instance, clean up (unless keep_alive is set)
+        // Last session on this instance — tear it down unless `keep_alive`
+        // is set (only meaningful for single-instance TAs).
         if remaining_sessions == 0
             && let Some(flags) = removed_flags
         {
-            // If this is a single-instance TA with keep_alive flag, don't remove it from memory.
-            // Note: keep_alive is only meaningful for single-instance TAs.
             if flags.is_single_instance() && flags.is_keep_alive() {
                 debug_serial_println!(
                     "CloseSession complete: session_id={}, TA kept alive (INSTANCE_KEEP_ALIVE flag)",

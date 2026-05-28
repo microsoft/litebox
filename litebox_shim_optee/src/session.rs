@@ -121,13 +121,6 @@ pub const MAX_TA_INSTANCES: usize = 16;
 
 /// A loaded TA instance.
 ///
-/// Fields are private; external callers never construct one (the three
-/// constituent parts are passed to [`SessionManager::register_new_session`],
-/// which builds the instance internally). Closures running under
-/// [`SessionManager::with_ta`] / [`SessionManager::with_session`] observe
-/// the instance through `&TaInstance`, with the borrow lifetime pinned to
-/// the session token via HRTB on the closure type.
-///
 /// For single-instance TAs one instance is shared across all sessions; the
 /// TA stays in memory until the last session closes (or, with
 /// `TA_FLAG_INSTANCE_KEEP_ALIVE`, until explicit destroy). Each instance
@@ -174,17 +167,9 @@ impl TaInstance {
 unsafe impl Send for TaInstance {}
 unsafe impl Sync for TaInstance {}
 
-/// Per-session entry in the session map.
-///
-/// Module-private. External callers see liveness via the
-/// `Option<&TaInstance>` delivered to closures by
-/// [`SessionManager::with_ta`] / [`SessionManager::with_session`]:
-/// `Some` for live, `None` for dead.
-///
-/// Live entries carry the `Arc<TaInstance>` (uuid and flags reachable via
-/// it). Dead entries retain only the historical `(ta_uuid, ta_flags)` —
-/// enough to drive cleanup paths and the `try_acquire_for_session`
-/// snapshot check.
+/// Per-session entry in the session map. The `Dead` variant retains
+/// `(ta_uuid, ta_flags)` so cleanup paths and `try_acquire_for_session`'s
+/// snapshot still have them after the instance is gone.
 #[derive(Clone)]
 pub(crate) enum SessionEntry {
     Live(Arc<TaInstance>),
@@ -372,17 +357,18 @@ impl Drop for SessionIdGuard {
 /// RAII token bundling the serialization primitives required to safely
 /// execute an OP-TEE TA operation.
 ///
-/// Held only inside [`SessionManager::with_ta`] (OpenSession) and
-/// [`SessionManager::with_session`] (Invoke/Close); never exposed to
-/// external callers. Bundles whichever combination of locks is required:
+/// Bundles whichever combination of locks the current operation requires:
 ///
 /// - **Single-instance TAs**: a per-UUID `SpinMutex` that serializes all
 ///   sessions on the same TA.
 /// - **Existing-session operations** (Invoke/Close): a per-session-id marker
 ///   that prevents concurrent SMC entry by another core for the same id.
 ///
-/// For multi-instance OpenSession, the token holds nothing (each session
-/// gets its own private instance, so no exclusion is required).
+/// For multi-instance OpenSession the token holds nothing (each session
+/// gets its own private instance, so no exclusion is required). The
+/// first-ever OpenSession for an unknown UUID is the exception: until the
+/// TA is loaded its flags aren't known, so it's conservatively serialized
+/// under the per-UUID lock until flags are observed.
 ///
 /// On drop, the per-UUID lock is released first, then the per-session-id
 /// marker.
@@ -634,13 +620,8 @@ impl SessionManager {
 
     /// Register a session for a freshly-loaded TA. The three parts (`shim`,
     /// `loaded_program`, `task_page_table_id`) are taken by value and stored
-    /// inside the manager (no handle returned to the caller); for
-    /// single-instance TAs the instance is also cached under `ta_uuid` for
-    /// later reuse.
-    ///
-    /// The caller never retains a `TaInstance`, which is what makes the
-    /// internal `unsafe impl Send/Sync for TaInstance` invariant enforceable
-    /// against the public API.
+    /// inside the manager; for single-instance TAs the instance is also
+    /// cached under `ta_uuid` for later reuse.
     pub fn register_new_session(
         &self,
         session_id: u32,
@@ -933,12 +914,15 @@ mod tests {
         assert!(manager.single_instance_locks.lock().get(&uuid).is_some());
     }
 
-    /// `try_acquire_for_session`'s post-marker re-read must catch the case
-    /// where the entry's identity changed between snapshot and validation
-    /// (id recycled, re-registered under a different UUID). It should
-    /// return `EThreadLimit` so the driver retries with a fresh snapshot.
+    /// `try_acquire_for_session` returns the entry observed by the
+    /// post-marker re-read, not a stale handle from before the marker was
+    /// taken. After a recycle+re-register under a new UUID, the returned
+    /// entry must reflect the current UUID. (The mismatch-rejection branch
+    /// itself can only be triggered by a concurrent swap between snapshot
+    /// and re-read, which isn't reproducible in a single-threaded test;
+    /// this just verifies the re-read is the source of truth.)
     #[test]
-    fn try_acquire_for_session_rejects_uuid_swap_under_marker() {
+    fn try_acquire_for_session_returns_current_entry_after_recycle() {
         let manager = SessionManager::new();
         let uuid_a = make_uuid(0xB0);
         let uuid_b = make_uuid(0xB1);
@@ -951,15 +935,6 @@ mod tests {
             70,
             uuid_a,
         );
-
-        // Simulate the swap: unregister and re-register the same session_id
-        // under a different UUID, then drive try_acquire_for_session by
-        // hand to validate the snapshot path. (The real-world racing
-        // version of this is what the post-marker validation defends
-        // against; here we just verify the validation actually runs.)
-        let entry_before = manager.sessions.get_entry(session_id).expect("registered");
-        assert_eq!(entry_before.ta_uuid(), uuid_a);
-
         manager.unregister_session(session_id);
         manager.register_new_session(
             session_id,
@@ -969,16 +944,6 @@ mod tests {
             uuid_b,
         );
 
-        let entry_after = manager
-            .sessions
-            .get_entry(session_id)
-            .expect("re-registered");
-        assert_ne!(entry_before.ta_uuid(), entry_after.ta_uuid());
-
-        // The validation in `try_acquire_for_session` compares snapshot
-        // uuid/flags against the post-marker re-read; a mismatch returns
-        // `EThreadLimit`. We exercise that comparison directly: with
-        // identical snapshots it succeeds, with mismatched it would not.
         let (_, validated) = manager.try_acquire_for_session(session_id).unwrap();
         assert_eq!(validated.ta_uuid(), uuid_b);
     }
