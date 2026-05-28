@@ -689,7 +689,7 @@ mod tests {
                             // TODO: use poll rather than busy wait
                         }
                         Err(e) => {
-                            panic!("Error writing to channel: {:?}", e);
+                            panic!("Error writing to channel: {e:?}");
                         }
                     }
                 }
@@ -712,7 +712,7 @@ mod tests {
                         // TODO: use poll rather than busy wait
                     }
                     Err(e) => {
-                        panic!("Error reading from channel: {:?}", e);
+                        panic!("Error reading from channel: {e:?}");
                     }
                 }
             }

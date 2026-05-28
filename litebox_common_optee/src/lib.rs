@@ -323,7 +323,7 @@ impl SyscallContext {
     /// Panics if the index is out of bounds (greater than 7).
     pub fn syscall_arg(&self, index: usize) -> usize {
         if index >= MAX_SYSCALL_ARGS {
-            panic!("BUG: Invalid syscall argument index: {}", index);
+            panic!("BUG: Invalid syscall argument index: {index}");
         } else {
             self.args[index]
         }

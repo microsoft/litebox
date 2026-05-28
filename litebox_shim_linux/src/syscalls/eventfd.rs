@@ -230,7 +230,7 @@ mod tests {
                         // busy wait
                         // TODO: use poll rather than busy wait
                     }
-                    Err(e) => panic!("Unexpected error: {:?}", e),
+                    Err(e) => panic!("Unexpected error: {e:?}"),
                 }
                 core::hint::spin_loop();
             }

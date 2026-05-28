@@ -358,7 +358,7 @@ mod in_mem {
                     // Expected behavior
                 }
                 Ok(()) => panic!("Non-owner should not be able to chown"),
-                Err(e) => panic!("Unexpected error: {:?}", e),
+                Err(e) => panic!("Unexpected error: {e:?}"),
             }
         });
 
@@ -370,7 +370,7 @@ mod in_mem {
                 // Expected behavior
             }
             Ok(()) => panic!("Should not be able to chown non-existent file"),
-            Err(e) => panic!("Unexpected error: {:?}", e),
+            Err(e) => panic!("Unexpected error: {e:?}"),
         }
 
         // Test partial chown (change only user, leave group unchanged)

@@ -1070,7 +1070,7 @@ impl<Host: HostInterface> RawMutex<Host> {
                     return Ok(UnblockedOrTimedOut::TimedOut);
                 }
                 Err(e) => {
-                    panic!("Error: {:?}", e);
+                    panic!("Error: {e:?}");
                 }
             }
         }
@@ -2111,10 +2111,9 @@ unsafe extern "C" fn kernel_exception_handler_no_ctx(
     litebox::mm::exception_table::search_exception_tables(faulting_rip).unwrap_or_else(|| {
         panic!(
             "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\
-             Accessed Address: {:#x}\n\
-             Error Code: {:#x}\n\
-             Faulting RIP: {:#x}",
-            cr2, error_code, faulting_rip,
+             Accessed Address: {cr2:#x}\n\
+             Error Code: {error_code:#x}\n\
+             Faulting RIP: {faulting_rip:#x}",
         )
     })
 }

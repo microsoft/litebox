@@ -174,10 +174,7 @@ impl HostInterface for HostLvbsInterface {
     }
 
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        panic!(
-            "dynamic memory allocation is not supported (layout = {:?})",
-            layout
-        );
+        panic!("dynamic memory allocation is not supported (layout = {layout:?})");
     }
 
     unsafe fn free(_addr: usize) {

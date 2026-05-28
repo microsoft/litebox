@@ -102,54 +102,54 @@ pub fn init_idt() {
 /// Kernel-mode handler for divide error exception (vector 0).
 #[unsafe(no_mangle)]
 extern "C" fn divide_error_handler_impl(regs: &PtRegs) {
-    panic!("EXCEPTION: DIVIDE BY ZERO\n{:#x?}", regs);
+    panic!("EXCEPTION: DIVIDE BY ZERO\n{regs:#x?}");
 }
 
 /// Kernel-mode handler for debug exception (vector 1).
 #[unsafe(no_mangle)]
 extern "C" fn debug_handler_impl(regs: &PtRegs) {
-    panic!("EXCEPTION: DEBUG\n{:#x?}", regs);
+    panic!("EXCEPTION: DEBUG\n{regs:#x?}");
 }
 
 /// Kernel-mode handler for breakpoint exception (vector 3).
 #[unsafe(no_mangle)]
 extern "C" fn breakpoint_handler_impl(regs: &PtRegs) {
-    panic!("EXCEPTION: BREAKPOINT\n{:#x?}", regs);
+    panic!("EXCEPTION: BREAKPOINT\n{regs:#x?}");
 }
 
 /// Kernel-mode handler for overflow exception (vector 4).
 #[unsafe(no_mangle)]
 extern "C" fn overflow_handler_impl(regs: &PtRegs) {
-    panic!("EXCEPTION: OVERFLOW\n{:#x?}", regs);
+    panic!("EXCEPTION: OVERFLOW\n{regs:#x?}");
 }
 
 /// Kernel-mode handler for bound range exceeded exception (vector 5).
 #[unsafe(no_mangle)]
 extern "C" fn bound_range_exceeded_handler_impl(regs: &PtRegs) {
-    panic!("EXCEPTION: BOUND RANGE EXCEEDED\n{:#x?}", regs);
+    panic!("EXCEPTION: BOUND RANGE EXCEEDED\n{regs:#x?}");
 }
 
 /// Kernel-mode handler for invalid opcode exception (vector 6).
 #[unsafe(no_mangle)]
 extern "C" fn invalid_opcode_handler_impl(regs: &PtRegs) {
     panic!(
-        "EXCEPTION: INVALID OPCODE at RIP {:#x}\n{:#x?}",
-        regs.rip, regs
+        "EXCEPTION: INVALID OPCODE at RIP {:#x}\n{regs:#x?}",
+        regs.rip
     );
 }
 
 /// Kernel-mode handler for device not available exception (vector 7).
 #[unsafe(no_mangle)]
 extern "C" fn device_not_available_handler_impl(regs: &PtRegs) {
-    panic!("EXCEPTION: DEVICE NOT AVAILABLE (FPU/SSE)\n{:#x?}", regs);
+    panic!("EXCEPTION: DEVICE NOT AVAILABLE (FPU/SSE)\n{regs:#x?}");
 }
 
 /// Kernel-mode handler for double fault exception (vector 8).
 #[unsafe(no_mangle)]
 extern "C" fn double_fault_handler_impl(regs: &PtRegs) {
     panic!(
-        "EXCEPTION: DOUBLE FAULT (Error Code: {:#x})\n{:#x?}",
-        regs.orig_rax, regs
+        "EXCEPTION: DOUBLE FAULT (Error Code: {:#x})\n{regs:#x?}",
+        regs.orig_rax
     );
 }
 
@@ -157,8 +157,8 @@ extern "C" fn double_fault_handler_impl(regs: &PtRegs) {
 #[unsafe(no_mangle)]
 extern "C" fn stack_segment_fault_handler_impl(regs: &PtRegs) {
     panic!(
-        "EXCEPTION: STACK-SEGMENT FAULT (Error Code: {:#x})\n{:#x?}",
-        regs.orig_rax, regs
+        "EXCEPTION: STACK-SEGMENT FAULT (Error Code: {:#x})\n{regs:#x?}",
+        regs.orig_rax
     );
 }
 
@@ -166,30 +166,30 @@ extern "C" fn stack_segment_fault_handler_impl(regs: &PtRegs) {
 #[unsafe(no_mangle)]
 extern "C" fn general_protection_fault_handler_impl(regs: &PtRegs) {
     panic!(
-        "EXCEPTION: GENERAL PROTECTION FAULT (Error Code: {:#x})\n{:#x?}",
-        regs.orig_rax, regs
+        "EXCEPTION: GENERAL PROTECTION FAULT (Error Code: {:#x})\n{regs:#x?}",
+        regs.orig_rax
     );
 }
 
 /// Kernel-mode handler for x87 floating-point exception (vector 16).
 #[unsafe(no_mangle)]
 extern "C" fn x87_floating_point_handler_impl(regs: &PtRegs) {
-    panic!("EXCEPTION: x87 FLOATING-POINT ERROR\n{:#x?}", regs);
+    panic!("EXCEPTION: x87 FLOATING-POINT ERROR\n{regs:#x?}");
 }
 
 /// Kernel-mode handler for alignment check exception (vector 17).
 #[unsafe(no_mangle)]
 extern "C" fn alignment_check_handler_impl(regs: &PtRegs) {
     panic!(
-        "EXCEPTION: ALIGNMENT CHECK (Error Code: {:#x})\n{:#x?}",
-        regs.orig_rax, regs
+        "EXCEPTION: ALIGNMENT CHECK (Error Code: {:#x})\n{regs:#x?}",
+        regs.orig_rax
     );
 }
 
 /// Kernel-mode handler for SIMD floating-point exception (vector 19).
 #[unsafe(no_mangle)]
 extern "C" fn simd_floating_point_handler_impl(regs: &PtRegs) {
-    panic!("EXCEPTION: SIMD FLOATING-POINT ERROR\n{:#x?}", regs);
+    panic!("EXCEPTION: SIMD FLOATING-POINT ERROR\n{regs:#x?}");
 }
 
 // Note: isr_hyperv_sint is defined in interrupts.S as a minimal stub that only

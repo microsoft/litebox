@@ -3062,7 +3062,7 @@ impl PtRegs {
             3 => self.r10,
             4 => self.r8,
             5 => self.r9,
-            _ => panic!("Invalid syscall argument index: {}", idx),
+            _ => panic!("Invalid syscall argument index: {idx}"),
         }
     }
 

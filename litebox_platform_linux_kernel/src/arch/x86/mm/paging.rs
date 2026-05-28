@@ -197,12 +197,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                         todo!("return Err(page_mgmt::RemapError::RemapToHugePage);")
                     }
                     Err(X64UnmapError::InvalidFrameAddress(pa)) => {
-                        panic!("Invalid frame address: {:#x}", pa);
+                        panic!("Invalid frame address: {pa:#x}");
                     }
                 },
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
-                    panic!("Invalid frame address: {:#x}", pa);
+                    panic!("Invalid frame address: {pa:#x}");
                 }
             }
             start += 1;
@@ -262,7 +262,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
-                    panic!("Invalid frame address: {:#x}", pa);
+                    panic!("Invalid frame address: {pa:#x}");
                 }
             }
         }
@@ -358,7 +358,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 }
             }
             TranslateResult::InvalidFrameAddress(pa) => {
-                panic!("Invalid frame address: {:#x}", pa);
+                panic!("Invalid frame address: {pa:#x}");
             }
         }
         Ok(())

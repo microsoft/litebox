@@ -204,7 +204,7 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                         }
                     }
                     Err(AllocationError::InvalidLayout) => {
-                        panic!("Invalid layout: {:?}", layout);
+                        panic!("Invalid layout: {layout:?}");
                     }
                 }
             }

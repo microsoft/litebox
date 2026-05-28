@@ -1973,7 +1973,7 @@ unsafe extern "C-unwind" fn exception_handler(
         Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION => (Exception::INVALID_OPCODE, 0, 0),
         Win32_Foundation::EXCEPTION_BREAKPOINT => (Exception::BREAKPOINT, 0, 0),
         Win32_Foundation::EXCEPTION_INT_DIVIDE_BY_ZERO => (Exception::DIVIDE_ERROR, 0, 0),
-        code => panic!("Unhandled Win32 exception code: {:#x}", code),
+        code => panic!("Unhandled Win32 exception code: {code:#x}"),
     };
 
     let info = litebox::shim::ExceptionInfo {
