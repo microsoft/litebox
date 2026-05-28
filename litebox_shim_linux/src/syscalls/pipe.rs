@@ -122,11 +122,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         setfl_mask: OFlags,
     ) -> Result<(), Errno> {
         self.pipes
-            .update_flags(
-                fd,
-                Flags::NON_BLOCKING,
-                flags.intersects(OFlags::NONBLOCK),
-            )
+            .update_flags(fd, Flags::NON_BLOCKING, flags.intersects(OFlags::NONBLOCK))
             .map_err(Errno::from)?;
 
         self.litebox
