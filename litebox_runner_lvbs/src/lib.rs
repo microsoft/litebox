@@ -561,6 +561,7 @@ fn open_session_single_instance(
     let ta_flags = instance.loaded_program().ta_flags;
 
     let mut session_token = session_manager().try_acquire_open_session_token()?;
+    // Safe to unwrap: session ID has been just created.
     let runner_session_id = session_token.session_id().unwrap();
 
     debug_serial_println!(
@@ -570,9 +571,10 @@ fn open_session_single_instance(
         runner_session_id
     );
 
+    // Switch to the existing TA's page table
     let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
 
-    // Set up the entry-point parameters for OpenSession.
+    // Load TA context with parameters for OpenSession - pass actual session_id
     instance
         .loaded_program()
         .entrypoints
@@ -586,6 +588,7 @@ fn open_session_single_instance(
         )
         .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
 
+    // Run the TA's OpenSession entry point using reference-based reenter
     let mut ctx = litebox_common_linux::PtRegs::default();
     unsafe {
         litebox_platform_lvbs::reenter_thread_ref(
@@ -594,6 +597,7 @@ fn open_session_single_instance(
         );
     }
 
+    // Read TA output parameters from the stack buffer
     let params_address = instance
         .loaded_program()
         .params_address
@@ -710,8 +714,8 @@ fn open_session_new_instance(
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_bin = find_ta_binary(ta_uuid).ok_or(OpteeSmcReturnCode::ENotAvail)?;
 
-    // Token is declared before `task_pt_guard` so it drops AFTER it —
-    // marker only releases once CR3 is back to base. See
+    // Token is declared before `task_pt_guard` so it drops AFTER it.
+    // Marker only releases once CR3 is back to base. See
     // `try_acquire_open_session_token` for why.
     let mut session_token = session_manager().try_acquire_open_session_token()?;
     let runner_session_id = session_token.session_id().unwrap();

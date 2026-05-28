@@ -114,9 +114,9 @@ const MAX_TA_INSTANCES: usize = 16;
 /// A loaded TA instance.
 ///
 /// For single-instance TAs one instance is shared across all sessions; the
-/// TA stays in memory until the last session closes (or, with
-/// `TA_FLAG_INSTANCE_KEEP_ALIVE`, until explicit destroy). Each instance
-/// has its own task page table that provides memory isolation from other TAs.
+/// TA stays in memory until the last session closes (if it does not have the
+/// `TA_FLAG_INSTANCE_KEEP_ALIVE` flag). Each instance has its own task page
+/// table that provides memory isolation from other TAs.
 pub struct TaInstance {
     /// The shim must be kept alive to keep the loaded program's memory mappings valid.
     shim: OpteeShim,
@@ -172,9 +172,8 @@ pub enum OpenSessionTarget<'a> {
     Sibling(&'a TaInstance),
     /// A cached single-instance TA exists but it lacks `TA_FLAG_MULTI_SESSION`
     /// and already has at least one live session. Per OP-TEE OS
-    /// `tee_ta_init_session_with_context`, the runner must reject with
-    /// `TEE_ERROR_BUSY` (origin TEE). The closure must write the BUSY
-    /// response to the client and return `Ok` — no TA load needed.
+    /// `tee_ta_init_session_with_context`, reject with
+    /// `TEE_ERROR_BUSY` (origin TEE).
     Busy,
 }
 
@@ -211,22 +210,26 @@ struct SessionMap {
 }
 
 impl SessionMap {
+    /// Create a new empty session map.
     fn new() -> Self {
         Self {
             inner: SpinMutex::new(HashMap::new()),
         }
     }
 
+    /// Get full session entry by session ID.
     fn get_entry(&self, session_id: u32) -> Option<SessionEntry> {
         self.inner.lock().get(&session_id).cloned()
     }
 
+    /// Insert a live session into the map.
     fn insert_live(&self, session_id: u32, instance: Arc<TaInstance>) {
         self.inner
             .lock()
             .insert(session_id, SessionEntry::Live(instance));
     }
 
+    /// Remove a session from the map.
     fn remove(&self, session_id: u32) -> Option<SessionEntry> {
         self.inner.lock().remove(&session_id)
     }
@@ -276,16 +279,19 @@ struct SingleInstanceCache {
 }
 
 impl SingleInstanceCache {
+    /// Create a new empty cache.
     fn new() -> Self {
         Self {
             inner: SpinMutex::new(HashMap::new()),
         }
     }
 
+    /// Get a cached single-instance TA by UUID.
     fn get(&self, uuid: &TeeUuid) -> Option<Arc<TaInstance>> {
         self.inner.lock().get(uuid).cloned()
     }
 
+    /// Cache a single-instance TA by UUID.
     fn insert(&self, uuid: TeeUuid, instance: Arc<TaInstance>) {
         self.inner.lock().insert(uuid, instance);
     }
@@ -304,6 +310,7 @@ impl SingleInstanceCache {
         }
     }
 
+    /// Get the number of cached single-instance TAs.
     fn len(&self) -> usize {
         self.inner.lock().len()
     }
@@ -315,11 +322,17 @@ impl Default for SingleInstanceCache {
     }
 }
 
+/// Allocate a new unique session ID.
+///
+/// Delegates to `SessionIdPool::allocate` for unified session ID management.
 /// Returns `None` if all session IDs are exhausted.
 fn allocate_session_id() -> Option<u32> {
     SessionIdPool::allocate()
 }
 
+/// Recycle a session ID for potential future reuse.
+///
+/// Delegates to `SessionIdPool::recycle`.
 fn recycle_session_id(session_id: u32) {
     SessionIdPool::recycle(session_id);
 }
@@ -332,7 +345,8 @@ fn recycle_session_id(session_id: u32) {
 /// - **Known single-instance TAs**: a per-UUID `SpinMutex` that serializes
 ///   all sessions on the same TA.
 /// - **First-ever load of an unknown UUID** (OpenSession only): the shared
-///   `unknown_uuid_lock`, used until the TA's flags are observed.
+///   `unknown_uuid_lock`, used until the TA's flags (single-instance vs
+///   multi-instance) are observed.
 /// - **Existing-session operations** (Invoke/Close): a per-session-id
 ///   marker (slot in `SessionManager::active_sessions`) that prevents
 ///   concurrent SMC entry by another core for the same id.
@@ -371,8 +385,7 @@ pub struct SessionToken<'a> {
 impl SessionToken<'_> {
     /// Session id this token reserves the active-session marker for, if any.
     /// Set for tokens minted by
-    /// [`SessionManager::try_acquire_open_session_token`],
-    /// [`SessionManager::try_acquire_session_marker`], or
+    /// [`SessionManager::try_acquire_open_session_token`] or
     /// `try_acquire_for_session` (Invoke/Close).
     pub fn session_id(&self) -> Option<u32> {
         self.active_session_id
@@ -457,26 +470,8 @@ impl SessionManager {
         }
     }
 
-    /// Reserve the active-session slot for `session_id` non-blockingly,
-    /// returning a [`SessionToken`] (carrying just the per-session-id
-    /// marker, no UUID lock) that releases the slot on drop. Returns
-    /// `None` if the slot is already taken. Excludes concurrent
-    /// `with_session(session_id)` until the token drops.
-    pub fn try_acquire_session_marker(&self, session_id: u32) -> Option<SessionToken<'_>> {
-        if !self.active_sessions.lock().insert(session_id) {
-            return None;
-        }
-        Some(SessionToken {
-            manager: self,
-            uuid_lock: None,
-            active_session_id: Some(session_id),
-            owns_id_recycling: false,
-        })
-    }
-
-    /// Allocate a fresh `session_id` and reserve its active-session slot
-    /// atomically. See [`SessionToken`] for what the returned token
-    /// carries.
+    /// Allocate a fresh `session_id` and reserve its active-session slot.
+    /// See [`SessionToken`] for what the returned token carries.
     ///
     /// # Drop-order requirement
     ///
@@ -491,24 +486,16 @@ impl SessionManager {
     ///
     /// # Errors
     /// - `EBusy` if the id pool is exhausted.
-    /// - `EThreadLimit` only if the just-allocated id's marker slot is
-    ///   already held — unreachable under normal flow (the id pool's
-    ///   hint+wrap defers reuse), and present as a defensive bail-out
-    ///   when a caller has taken the slot out-of-band via
-    ///   [`Self::try_acquire_session_marker`].
     pub fn try_acquire_open_session_token(&self) -> Result<SessionToken<'_>, OpteeSmcReturnCode> {
         let session_id = allocate_session_id().ok_or(OpteeSmcReturnCode::EBusy)?;
-        if !self.active_sessions.lock().insert(session_id) {
-            // Defensive: the id pool's hint+wrap guarantees a
-            // freshly-allocated id won't collide with a recently-recycled
-            // one, so under normal `allocate → mark → unregister` flow
-            // this branch is unreachable. It exists to handle the corner
-            // case where a caller has inserted the slot out-of-band via
-            // [`Self::try_acquire_session_marker`]. Roll back the alloc
-            // and let the driver retry.
-            recycle_session_id(session_id);
-            return Err(OpteeSmcReturnCode::EThreadLimit);
-        }
+        // The id pool's hint+wrap allocator defers reuse of recycled ids,
+        // so a freshly-allocated id can never collide with a marker slot
+        // that's still held by a previous owner.
+        let inserted = self.active_sessions.lock().insert(session_id);
+        debug_assert!(
+            inserted,
+            "freshly-allocated session_id collided with an active marker"
+        );
         Ok(SessionToken {
             manager: self,
             uuid_lock: None,
@@ -830,7 +817,7 @@ impl SessionManager {
     /// This counts:
     /// - All single-instance TAs in the cache (each UUID = 1 instance, regardless of session count)
     /// - All multi-instance TA sessions (each session = 1 instance)
-    pub fn instance_count(&self) -> usize {
+    fn instance_count(&self) -> usize {
         let single_instance_count = self.single_instance_cache.len();
         let multi_instance_count = self.count_multi_instance_sessions();
         single_instance_count + multi_instance_count
@@ -844,11 +831,6 @@ impl SessionManager {
             .values()
             .filter(|e| !e.ta_flags().is_single_instance())
             .count()
-    }
-
-    /// Check if instance limit is reached.
-    pub fn is_at_capacity(&self) -> bool {
-        self.instance_count() >= MAX_TA_INSTANCES
     }
 
     /// Drive an OpenSession to completion under the right serialization.
