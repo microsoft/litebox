@@ -135,6 +135,14 @@ fn broker_elf_cache_dir() -> &'static PathBuf {
 #[path = "common/dashboard_store.rs"]
 mod dashboard_store;
 
+// ── Cross-session concurrency lease ──────────────────────────────────
+// Registers this harness invocation in the shared dashboard sqlite so
+// every concurrent `cargo test --test integration` invocation on this
+// host self-coordinates: each takes `GLOBAL_CAP / live_lease_count`
+// of the concurrent docker-dispatch budget. See `tests/common/lease.rs`.
+#[path = "common/lease.rs"]
+mod lease;
+
 fn emit_timing_main(
     test: &str,
     pass: &str,
@@ -574,10 +582,72 @@ impl Drop for SemaphoreGuard {
     }
 }
 
-static ACTIVE_JOBS: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+// ── Lease-aware dispatch gate ────────────────────────────────────────
+//
+// The active-dispatch gate has a dynamic cap that floats with
+// `lease::live_lease_count()`. Concretely:
+//
+//     my_cap_now = max(1, min(default_jobs, GLOBAL_CAP / live_leases))
+//
+// `default_jobs` is the harness's own intrinsic upper bound (today's
+// `LITEBOX_TEST_JOBS` / `default_jobs()` value — dockerd starts to
+// serialize past it). `GLOBAL_CAP` is the host-wide budget on
+// concurrent docker children (default `nproc`, override via
+// `LITEBOX_GLOBAL_JOBS`).
+//
+// When a peer harness appears or exits, the atomic in `lease` is
+// refreshed; the next `acquire()` call sees the new cap. Already
+// in-flight dispatches finish on their own — we never retract.
+struct DispatchGate {
+    in_flight: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl DispatchGate {
+    const fn new() -> Self {
+        Self {
+            in_flight: Mutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(&'static self) -> DispatchGuard {
+        let mut n = self.in_flight.lock().unwrap();
+        loop {
+            let cap = dynamic_dispatch_cap();
+            if *n < cap {
+                *n += 1;
+                return DispatchGuard { gate: self };
+            }
+            // Wait with timeout so we re-check the cap periodically;
+            // the cap can change without any acquire/release event
+            // (e.g. a peer's heartbeat lapses and is pruned).
+            let (n2, _) = self
+                .cv
+                .wait_timeout(n, std::time::Duration::from_secs(2))
+                .unwrap();
+            n = n2;
+        }
+    }
+}
+
+struct DispatchGuard {
+    gate: &'static DispatchGate,
+}
+
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        let mut n = self.gate.in_flight.lock().unwrap();
+        *n -= 1;
+        self.gate.cv.notify_one();
+    }
+}
+
+static ACTIVE_JOBS: DispatchGate = DispatchGate::new();
 static DRAIN_BACKLOG: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
 
 static JOBS_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static GLOBAL_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn default_jobs() -> usize {
     let cpus = std::thread::available_parallelism()
@@ -603,12 +673,31 @@ fn current_jobs_cap() -> usize {
     })
 }
 
-fn active_jobs() -> &'static Semaphore {
-    ACTIVE_JOBS.get_or_init(|| {
-        let n = current_jobs_cap();
-        eprintln!("[integration] LITEBOX_TEST_JOBS={n}");
-        Semaphore::new(n)
+/// Host-wide budget on concurrent docker children, summed across
+/// all live harnesses. Default `nproc`. Override via
+/// `LITEBOX_GLOBAL_JOBS`.
+fn global_cap() -> usize {
+    *GLOBAL_CAP.get_or_init(|| {
+        std::env::var("LITEBOX_GLOBAL_JOBS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+            })
     })
+}
+
+fn dynamic_dispatch_cap() -> usize {
+    let intrinsic = current_jobs_cap();
+    let global = global_cap();
+    let live = lease::live_lease_count();
+    intrinsic.min(global / live).max(1)
+}
+
+fn active_jobs() -> &'static DispatchGate {
+    &ACTIVE_JOBS
 }
 
 fn drain_backlog() -> &'static Semaphore {
@@ -756,6 +845,10 @@ mod cleanup {
             if let Some(sig) = signals.forever().next() {
                 eprintln!("[cleanup] received signal {sig}; reaping");
                 reap_all();
+                // Also deregister our cross-session lease so peers
+                // see the live count drop immediately (rather than
+                // waiting for STALE_THRESHOLD_MS to prune us).
+                crate::lease::deregister();
                 std::process::exit(130);
             }
         });
@@ -1347,6 +1440,17 @@ fn main() {
     cleanup::set_self_pdeathsig();
     cleanup::install_signal_handler();
 
+    // Normal-exit deregister bridge for the cross-session lease.
+    // The signal handler path also deregisters; this guard handles
+    // the clean-exit path (libtest-mimic returns normally).
+    struct LeaseDropGuard;
+    impl Drop for LeaseDropGuard {
+        fn drop(&mut self) {
+            lease::deregister();
+        }
+    }
+    let _lease_drop_guard = LeaseDropGuard;
+
     let argv: Vec<String> = std::env::args().collect();
     let pos_idx = collect_positionals(&argv);
 
@@ -1376,6 +1480,20 @@ fn main() {
     // we don't create empty `runs` rows from discovery passes.
     if !args.list {
         let _ = dashboard_store::init();
+        // Register as a live harness so concurrent `cargo test` runs
+        // on this host share the host-wide GLOBAL_CAP fairly. Skipped
+        // in --list mode (no containers dispatched). Best-effort — if
+        // it fails, we fall back to uncoordinated default.
+        lease::register();
+        // Print the (initial) dispatch cap for visibility — it can
+        // shift during execution as peers come and go.
+        eprintln!(
+            "[integration] dispatch cap: intrinsic={} global={} live_peers={} effective={}",
+            current_jobs_cap(),
+            global_cap(),
+            lease::live_lease_count(),
+            dynamic_dispatch_cap(),
+        );
     }
 
     let mut trials: Vec<Trial> = Vec::new();
@@ -1477,6 +1595,11 @@ fn main() {
 
     let conclusion = libtest_mimic::run(&args, trials);
     dashboard_store::finalize();
+    // Explicit deregister: `conclusion.exit()` below calls
+    // `process::exit()` which bypasses Drop handlers (including our
+    // LeaseDropGuard). The Drop guard still serves the panic-unwind
+    // path; this line covers normal exit.
+    lease::deregister();
     conclusion.exit();
 }
 

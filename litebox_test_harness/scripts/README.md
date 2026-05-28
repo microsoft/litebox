@@ -77,6 +77,7 @@ children via the registry + PDEATHSIG bridge.
 | `tracked_refs` | Config: `(ref, ci_worktree)` pairs the autonomous driver tracks. |
 | `latest_results` | **VIEW** over `run_results` returning the freshest row per `(test_id, pass)`. No UPSERT path in the producer — pure SQL. |
 | `meta` | One key/value row: `schema_version`. |
+| `harness_leases` | Cross-session concurrency coordination — one row per live `cargo test --test integration` invocation (`pid`, `heartbeat_at_ms`). Additive (no SCHEMA_VERSION bump). |
 
 There is no `universe`, `worktree_coverage`, `ci_cycles`, or
 `latest_results`-as-table. The runner enumerates the universe
@@ -84,8 +85,49 @@ in-process; coverage is computed at query time from `run_results
 JOIN runs ON commit_sha = ? WHERE dirty_hash IS NULL`.
 
 Schema-version compatibility: bumped on breaking changes. On
-mismatch the Rust producer recreates the store from scratch (the
-`.dashboard/` directory is local-only and gitignored).
+mismatch the Rust producer panics with a remediation pointer;
+the user is consulted before any bump (stopping every coding-agent
+session is a coordination cost).
+
+### Cross-session concurrency coordination
+
+Multiple `cargo test --test integration` invocations can run
+concurrently on the same host (auto-driver, ad-hoc sessions,
+subagents). The `harness_leases` table makes them self-coordinate
+so total in-flight `docker run` children stay ≤ `GLOBAL_CAP`
+(default = `nproc`, override via `LITEBOX_GLOBAL_JOBS`).
+
+**Mechanism.** Each harness inserts `(pid, heartbeat_at_ms)` on
+startup, heartbeats every 10s, deletes on exit. The dispatch gate
+inside the harness reads the live lease count (atomic, refreshed
+every ~10s) and uses `my_cap_now = max(1, min(intrinsic_jobs,
+GLOBAL_CAP / live_lease_count))`. When peers come or go the cap
+floats on the next dispatch.
+
+**Why no SCHEMA_VERSION bump.** The `harness_leases` table is
+purely additive — old harness binaries don't read or write it, so
+they're not affected by its presence (they fall back to today's
+uncoordinated dispatch). New harnesses use it to cooperate. Once
+the new code lands on the amalgamation branch, sessions
+opt-in organically on their next rebuild.
+
+**Inspect live leases.**
+
+```
+sqlite3 .dashboard/results.sqlite \
+  "SELECT pid, (strftime('%s','now')*1000 - heartbeat_at_ms)/1000 AS age_s
+     FROM harness_leases ORDER BY age_s"
+```
+
+(Rows with `age_s > 30` are stale and get pruned by the next live
+harness that connects.) The renderer also includes a one-line
+summary at the top of `summary.md`.
+
+**Failure modes.** Any error in the lease layer (sqlite locked,
+table missing, etc.) is logged and silently absorbed; the harness
+falls back to its uncoordinated default. The lease layer must
+never block a test run — this is asserted by
+`tests/dashboard_store.rs::harness_leases_table_round_trip_and_prune`.
 
 ### How the autonomous driver works
 

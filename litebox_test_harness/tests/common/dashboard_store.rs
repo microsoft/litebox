@@ -59,7 +59,7 @@ pub struct Ctx {
 #[allow(clippy::option_option)]
 static CTX: OnceLock<Option<Ctx>> = OnceLock::new();
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -69,11 +69,11 @@ fn now_ms() -> i64 {
     .unwrap_or(0)
 }
 
-fn opted_out() -> bool {
+pub fn opted_out() -> bool {
     matches!(std::env::var("LITEBOX_DASHBOARD_DIR"), Ok(s) if s.is_empty())
 }
 
-fn resolve_state_dir() -> PathBuf {
+pub fn resolve_state_dir() -> PathBuf {
     if let Ok(env) = std::env::var("LITEBOX_DASHBOARD_DIR")
         && !env.is_empty()
     {
@@ -137,6 +137,12 @@ pub fn init() -> Option<&'static Ctx> {
         conn.pragma_update(None, "busy_timeout", 5000)
             .expect("dashboard: PRAGMA busy_timeout");
         init_schema(&conn);
+        // Apply the additive leases-table DDL on every connection
+        // (not just fresh DBs). Old harnesses don't touch this table
+        // so we don't bump SCHEMA_VERSION when introducing it — the
+        // IF NOT EXISTS handles the upgrade in place.
+        conn.execute_batch(ENSURE_LEASES_DDL)
+            .expect("dashboard: ensure harness_leases table");
         let run_id = insert_run_row(&conn);
         Some(Ctx {
             run_id,
@@ -312,6 +318,34 @@ pub const SCHEMA_DDL: &str = r#"
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+
+    -- Cross-session concurrency coordination. Each `cargo test
+    -- --test integration` invocation inserts one row at startup and
+    -- heartbeats it; deletes it on exit. Other live harnesses read
+    -- the count to derive their dynamic dispatch cap (GLOBAL_CAP / N).
+    -- See `tests/common/lease.rs` for the protocol.
+    --
+    -- The same `CREATE TABLE IF NOT EXISTS` is also kept in
+    -- `ENSURE_LEASES_DDL` (separate const) so existing DBs created
+    -- before this table existed get it added on first new-harness
+    -- connection. Adding the table is purely additive — old harnesses
+    -- don't read or write it — so no SCHEMA_VERSION bump is required.
+    CREATE TABLE harness_leases (
+        pid             INTEGER PRIMARY KEY,
+        heartbeat_at_ms INTEGER NOT NULL
+    );
+"#;
+
+/// Idempotent DDL to add the `harness_leases` table to a database
+/// that was created by an older harness (predating the table). New
+/// harnesses apply this on every connection. No SCHEMA_VERSION bump
+/// is needed because old harnesses simply never read or write the
+/// table (they fall back to uncoordinated dispatch).
+pub const ENSURE_LEASES_DDL: &str = r#"
+    CREATE TABLE IF NOT EXISTS harness_leases (
+        pid             INTEGER PRIMARY KEY,
+        heartbeat_at_ms INTEGER NOT NULL
+    );
 "#;
 
 fn insert_run_row(conn: &Connection) -> i64 {
@@ -324,8 +358,7 @@ fn insert_run_row(conn: &Connection) -> i64 {
                 .map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|| "unknown".to_string());
-    let commit_sha =
-        git_capture(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    let commit_sha = git_capture(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let branch = git_capture(&["rev-parse", "--abbrev-ref", "HEAD"]);
     let worktree_path =
         git_capture(&["rev-parse", "--show-toplevel"]).unwrap_or_else(|| "unknown".to_string());
@@ -584,8 +617,7 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<S
     // we can prioritize within the candidate set and (for the
     // BudgetSecs cap) estimate accumulated cost.
     let mut stalest: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    let mut suites: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut suites: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut costs: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     {
         let mut stmt = conn
@@ -733,4 +765,3 @@ fn infer_suite_from_name(name: &str) -> String {
     }
     .to_string()
 }
-

@@ -266,6 +266,7 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     """
     parts: list[str] = ["# litebox integration-test dashboard\n"]
     parts.append(_render_meta(conn, state_dir))
+    parts.append(_render_leases(conn))
     parts.append(_render_velocity(conn))
     parts.append(_render_tracked_refs(conn))
     parts.append(_render_result_groups(conn))
@@ -274,6 +275,39 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     parts.append(_render_recent_runs(conn))
     parts.append(_render_footer(conn, state_dir))
     return "\n".join(p for p in parts if p)
+
+
+def _render_leases(conn: sqlite3.Connection) -> str:
+    """One-line summary of live cross-session harness leases.
+
+    Sourced from `harness_leases`, the additive coordination table.
+    Old harnesses that predate the table never INSERT into it and
+    are invisible here — that's expected (they're uncoordinated).
+    """
+    try:
+        rows = conn.execute(
+            "SELECT pid, heartbeat_at_ms FROM harness_leases"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Table doesn't exist (older DB, no new-harness has connected
+        # yet to apply ENSURE_LEASES_DDL). Silently skip.
+        return ""
+    now = now_ms()
+    stale_ms = 30_000
+    live = [r for r in rows if (now - r["heartbeat_at_ms"]) < stale_ms]
+    if not live:
+        return ""
+    n = len(live)
+    # Mirror the harness's dynamic_dispatch_cap rule:
+    #   my_cap_now = max(1, GLOBAL_CAP / live)
+    # We can't know each harness's intrinsic cap or GLOBAL_CAP from
+    # the dashboard side without more metadata. Show just N and the
+    # per-cap rule.
+    return (
+        f"_{n} live harness lease(s)._ Per-harness dispatch cap = "
+        f"`max(1, LITEBOX_GLOBAL_JOBS / {n})` (default global = `nproc`)."
+        "\n"
+    )
 
 
 def _render_velocity(conn: sqlite3.Connection) -> str:
