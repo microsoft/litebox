@@ -119,6 +119,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         flags: OFlags,
         setfl_mask: OFlags,
     ) -> Result<(), Errno> {
+        let flags = flags & setfl_mask;
+
         self.pipes
             .update_flags(
                 fd,
@@ -131,6 +133,9 @@ impl<FS: ShimFS> GlobalState<FS> {
             .descriptor_table_mut()
             .with_metadata_mut(fd, |PipeStatusFlags(current)| {
                 let diff = (*current & setfl_mask) ^ flags;
+                if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                    log_unsupported!("unsupported flags");
+                }
                 current.toggle(diff);
             })
             .map_err(metadata_to_errno)
