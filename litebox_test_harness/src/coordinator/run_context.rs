@@ -210,6 +210,36 @@ impl<'a> RunContext<'a> {
         serde_json::from_value(data).map_err(|e| format!("typed deserialize: {e}"))
     }
 
+    /// Assert that values computed by the same typed handler on two agents are equal.
+    ///
+    /// # Errors
+    /// Returns a clear mismatch or handler-invocation error.
+    pub async fn assert_eq_across_agents<A, T>(
+        &mut self,
+        agent_a: &AgentHandle,
+        agent_b: &AgentHandle,
+        label: &str,
+        token: &crate::handlers::HandlerToken<A, T>,
+        args_a: A,
+        args_b: A,
+    ) -> Result<(), String>
+    where
+        A: serde::Serialize,
+        T: serde::Serialize + serde::de::DeserializeOwned + Eq + std::fmt::Debug,
+    {
+        let val_a = self.send_named_typed(agent_a, token, args_a).await?;
+        let val_b = self.send_named_typed(agent_b, token, args_b).await?;
+        if val_a == val_b {
+            Ok(())
+        } else {
+            Err(format!(
+                "assert_eq_across_agents({label}): {}={val_a:?} but {}={val_b:?}",
+                agent_a.name(),
+                agent_b.name()
+            ))
+        }
+    }
+
     /// Send a typed handler request and convert any infrastructure
     /// error (timeout, malformed JSON, missing handler, ...) into a
     /// `Response::Error`. The handler's own `Result<Response, _>` is

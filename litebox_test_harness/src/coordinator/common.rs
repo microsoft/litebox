@@ -155,7 +155,7 @@ async fn handle_exec_bin(
 #[derive(Serialize, Deserialize)]
 pub(crate) struct EchoTestArgs {}
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub(crate) struct EchoTestOut {
     pub(crate) msg: String,
 }

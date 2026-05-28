@@ -804,24 +804,36 @@ fn register_handler_canary(reg: &mut registry::Registry<'_>) {
         .timeout(30)
         .build(|cx| {
             let a = cx.require(agents::AgentName::Dpg1);
+            let b = cx.require(agents::AgentName::Dpg2);
             Box::new(move |run| {
                 Box::pin(async move {
+                    let cross = run
+                        .assert_eq_across_agents(
+                            &a,
+                            &b,
+                            "handler_canary.echo_test",
+                            &common::ECHO_TEST,
+                            common::EchoTestArgs {},
+                            common::EchoTestArgs {},
+                        )
+                        .await;
                     let r1 = run
                         .send_named(&a, "canary.echo", serde_json::json!({"msg": "hello"}))
                         .await;
                     let r2 = run
                         .send_named(&a, "canary.echo", serde_json::json!({"msg": "world"}))
                         .await;
-                    let pass = matches!(
-                        (&r1, &r2),
-                        (Ok(v1), Ok(v2))
-                            if v1["msg"] == "hello" && v2["msg"] == "world"
-                            && v2["n"].as_u64().unwrap_or(0) > v1["n"].as_u64().unwrap_or(0)
-                    );
+                    let pass = cross.is_ok()
+                        && matches!(
+                            (&r1, &r2),
+                            (Ok(v1), Ok(v2))
+                                if v1["msg"] == "hello" && v2["msg"] == "world"
+                                && v2["n"].as_u64().unwrap_or(0) > v1["n"].as_u64().unwrap_or(0)
+                        );
                     TestOutcome::new(
                         agents::AgentName::Dpg1.name(),
                         pass,
-                        format!("r1={r1:?} r2={r2:?}"),
+                        format!("cross={cross:?} r1={r1:?} r2={r2:?}"),
                     )
                 })
             })
