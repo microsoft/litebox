@@ -178,30 +178,23 @@ fn init_schema(conn: &Connection) {
     }
     let direction = if existing > SCHEMA_VERSION {
         "this binary is OUT OF DATE — somebody else's session has \
-         already bumped the schema and merged it in. \
-         Rebuild this worktree to catch up:\n\
-         \n\
-             cargo build --tests -p litebox_test_harness\n\
-         \n\
-         (incremental, fast). Then re-run."
+         already bumped the schema. Pulling/merging in their \
+         schema-bumping commit + rebuilding catches you up."
     } else {
-        "this binary is NEWER than the rest of the world — your \
-         schema bump hasn't propagated yet. The right discipline:\n\
-         \n\
-           (a) Land your schema-bumping commit on \
-               wportnoy/vscode-server-in-litebox (via --no-ff merge).\n\
-           (b) Each other coding-agent session's next `cargo test` \
-               will rebuild and pick up the new schema naturally.\n\
-         \n\
-         Until both happen, sessions on the old build will panic \
-         here too. That's by design — the alternative (auto-wipe or \
-         silent-skip) loses data."
+        "this binary is NEWER — your session has a schema-bumping \
+         commit that hasn't propagated to other sessions yet. \
+         Landing it on wportnoy/vscode-server-in-litebox is what \
+         lets the other sessions catch up, but that's a merge to the \
+         amalgamation branch — don't do it without user sign-off."
     };
     panic!(
         "dashboard: schema_version mismatch — \
          store has {existing}, this binary expects {SCHEMA_VERSION}.\n\
          \n\
-         {direction}"
+         {direction}\n\
+         \n\
+         Either way: this is a cross-session coordination problem; \
+         consult with the user about how to proceed."
     );
 }
 
