@@ -243,10 +243,22 @@ The strict design still needs a small host-kernel interface for local mechanics,
 | bootstrap | setup-only calls such as mapping broker-created shared memory, installing signal handlers, setting TLS, creating local scratch mappings, and preparing syscall-capture/trampoline state |
 | fast local mode | a small allowlist for performance, such as futex waits/wakes on private locks or broker-ring cursors |
 | strict mode | post-lockdown calls only; on Linux this can target `SECCOMP_MODE_STRICT`-like behavior where only `read`, `write`, `_exit`, and `sigreturn` remain available |
+| arbitrated mode | selected non-delegable syscalls are trapped/validated before execution in the user process context |
 
 Direct guest `mmap`, `mprotect`, `munmap`, `mremap`, `memfd_create`, `open/openat`, `ioctl`, `fcntl`, and similar authority-bearing or mapping-changing calls must not reach the host unrestricted after lockdown. Guest-visible mapping operations must enter the shim/UserLiteBox path and then either be emulated from pre-reserved local memory or mediated by the broker.
 
 If unrestricted `mmap`/`mprotect` remain available to the sandbox, broker mapping policy is bypassable. The design must either block those syscalls after bootstrap, constrain them to anonymous private local mechanics with a host-enforced profile, or route them through UserLiteBox/BrokerHost mediation.
+
+LITESHIELD's useful distinction is between delegable and non-delegable syscalls:
+
+| Class | Meaning for LiteBox |
+|---|---|
+| delegable | translate into BrokerCore/BrokerService operations |
+| local-private | allow directly under the host syscall profile because no LiteBox authority is created |
+| non-delegable/arbitrated | must execute in the process context, but only after trap/validation by UserLiteBox/BrokerHost policy machinery |
+| blocked | never allowed after lockdown |
+
+Memory-management and process-management calls are the hard cases. If they cannot be safely delegated to the broker, the host support layer needs an arbitration mechanism that can validate address ranges, mapping types, permissions, and target objects before allowing the host syscall to complete.
 
 ### Linux userland bootstrap profile
 
@@ -459,6 +471,38 @@ This avoids moving enforcement into UserLiteBox or the runner, avoids cross-OS h
 
 Reintroducing host-handle delegation would require a separate future design note with object-specific proof obligations. It is not assumed by this architecture.
 
+## Trusted data-plane services
+
+The stricter baseline keeps host resources broker-owned and avoids raw host-handle delegation to UserLiteBox. SKernel suggests a future performance direction that preserves this rule: introduce trusted data-plane services inside the broker authority domain.
+
+In that model:
+
+```text
+UserLiteBox:
+  untrusted ABI compatibility, marshalling, local caches
+
+BrokerCore / PolicyEngine:
+  object identity, rights, lifecycle, policy
+
+Broker data-plane service:
+  trusted high-performance implementation of an object family
+
+BrokerPlatform:
+  authorized host/device/backend effects
+```
+
+A trusted data-plane service is not UserLiteBox. It is part of the TCB, like a BrokerService or BrokerPlatform-adjacent component, and can hold backend authority that UserLiteBox must not receive.
+
+Potential examples:
+
+| Service | Inspired by | LiteBox interpretation |
+|---|---|---|
+| filesystem data-plane service | SKernel-D FD/image-based filesystem, EROFS/TMPFS | broker-owned filesystem cache/ring service that reduces per-operation broker IPC without exposing host fds |
+| network data-plane service | SKernel-D high-performance network stack with device passthrough | trusted broker-side network service; UserLiteBox talks via rings while PolicyEngine keeps firewall authority |
+| memory/resource coordination service | SKernel-R/SKernel-V resource calls | BrokerHost/BrokerPlatform resource-call path for memory, CPU, and device-resource elasticity |
+
+This is an optimization path, not the first milestone. The initial implementation should still start with simple broker-owned objects and mediated control/data channels. If performance demands it, move hot object-family data paths into trusted broker-side services rather than expanding untrusted UserLiteBox authority.
+
 ## Network and firewall enforcement
 
 The design can support a network or application-level firewall, but only if the broker is the authoritative network path.
@@ -531,6 +575,8 @@ Authority domain:
 | unauthenticated broker transport | authenticate peers before negotiation and bind `caller_identity` to the authenticated transport endpoint |
 | PolicyEngine becomes a second core | keep it decision/audit focused; authoritative object state remains in BrokerCore/BrokerServices |
 | custom kernel `std` target becomes a distraction | start with `no_std + alloc + traits`; introduce custom `std` only if the host support surface justifies it |
+| non-delegable syscalls bypass broker mapping/resource policy | block, constrain, or trap/arbitrate them before host execution |
+| trusted data-plane services grow too powerful | keep them broker-side, object-family-specific, and PolicyEngine-authorized |
 
 ## Prior-art positioning
 
@@ -546,6 +592,8 @@ LiteBox's proposed design combines ideas from several systems rather than copyin
 | **Capsicum** | capability mode, broker opens resources and passes restricted fds | useful contrast: capability fd passing is powerful, but requires OS support for precise rights |
 | **Lind / Native Client** | POSIX LibOS inside a restricted sandbox with brokered host operations | UserLiteBox should not be a generic syscall escape hatch |
 | **Arrakis / Exokernel** | OS as control plane, application gets direct data path after safe allocation | broker can be the control plane while UserLiteBox uses broker-owned rings/data channels for safe data paths |
+| **LITESHIELD** | userspace microkernel services, shared-memory IPC, delegable vs non-delegable syscall handling | borrow syscall classification and arbitration; keep LiteBox's explicit broker objects and PolicyEngine |
+| **SKernel** | split guest kernel into resource kernel and data kernel; trusted I/O data plane for performance | consider future trusted broker data-plane services, not untrusted UserLiteBox authority expansion |
 | **seL4 / capability microkernels** | explicit unforgeable capabilities define authority | BrokerCore handles should carry object identity, rights, and generation checks |
 | **Qubes OS** | compartmentalized workloads use service VMs for devices/network | isolate rich authority into broker services and policy, especially device/network access |
 | **Nabla / Kata / unikernels** | reduce host syscall surface or use VM-backed isolation | narrow the authority interface; choose stronger isolation per deployment when needed |
