@@ -1154,8 +1154,7 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    /// Arm or disarm the per-process `ITIMER_REAL` timer (the state `alarm()`
-    /// and `setitimer(ITIMER_REAL, ...)` both manipulate). Returns the raw
+    /// Arm or disarm the per-process `ITIMER_REAL` timer. Returns the raw
     /// `Duration` remaining on the previous arming; zero means "was not
     /// armed". `delay = 0` disarms.
     fn arm_real_timer(&self, delay: Duration) -> Result<Duration, Errno> {
