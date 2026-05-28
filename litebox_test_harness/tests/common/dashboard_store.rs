@@ -135,19 +135,19 @@ pub fn ctx() -> Option<&'static Ctx> {
 /// Initialize the schema. Fresh DB (no `meta` table) → create
 /// schema + stamp version. Existing DB at the same version → no-op.
 ///
-/// **Loud-fail on schema_version mismatch.** No automatic wipe and
-/// no silent skip — both are subtle data-loss bugs across
-/// coordinating coding-agent sessions:
+/// **Loud-panic on schema_version mismatch.** No automatic wipe, no
+/// silent skip — both are subtle data-loss bugs across coordinating
+/// coding-agent sessions:
 ///
 /// * Auto-wipe thrashes data on every alternation between sessions
 ///   built against different schema versions.
 /// * Silent-skip leaves writes invisibly going into the void; the
 ///   session "works" but contributes nothing.
 ///
-/// The remediation has to be explicit, so panic. The message names
-/// the three valid actions: rebuild (other session catches up),
-/// wipe (lose history but start fresh), or opt out
-/// (`LITEBOX_DASHBOARD_DIR=""`).
+/// The remediation is **rebuild** so binary and store agree. Schema
+/// bumps are coordinated by merging through the amalgamation; the
+/// next time each session's cargo runs, it picks up the new schema
+/// automatically.
 fn init_schema(conn: &Connection) {
     let meta_exists: bool = conn
         .query_row(
@@ -176,25 +176,32 @@ fn init_schema(conn: &Connection) {
     if existing == SCHEMA_VERSION {
         return;
     }
+    let direction = if existing > SCHEMA_VERSION {
+        "this binary is OUT OF DATE — somebody else's session has \
+         already bumped the schema and merged it in. \
+         Rebuild this worktree to catch up:\n\
+         \n\
+             cargo build --tests -p litebox_test_harness\n\
+         \n\
+         (incremental, fast). Then re-run."
+    } else {
+        "this binary is NEWER than the rest of the world — your \
+         schema bump hasn't propagated yet. The right discipline:\n\
+         \n\
+           (a) Land your schema-bumping commit on \
+               wportnoy/vscode-server-in-litebox (via --no-ff merge).\n\
+           (b) Each other coding-agent session's next `cargo test` \
+               will rebuild and pick up the new schema naturally.\n\
+         \n\
+         Until both happen, sessions on the old build will panic \
+         here too. That's by design — the alternative (auto-wipe or \
+         silent-skip) loses data."
+    };
     panic!(
-        "dashboard: schema_version {existing} in the store does NOT \
-         match this binary's {SCHEMA_VERSION}. No automatic recreate \
-         — that would stomp on data from other coding-agent sessions \
-         running against the shared store. Pick one:\n\
+        "dashboard: schema_version mismatch — \
+         store has {existing}, this binary expects {SCHEMA_VERSION}.\n\
          \n\
-         (1) Rebuild the other session's harness so it catches up to \
-             schema_version {SCHEMA_VERSION} (recommended for bumps \
-             being rolled out across sessions).\n\
-         (2) `rm -rf <dashboard state dir>` (typically \
-             <main-worktree>/.dashboard/) to start fresh (loses all \
-             accumulated history).\n\
-         (3) Set `LITEBOX_DASHBOARD_DIR=\"\"` in this binary's env to \
-             opt out of dashboard writes entirely.\n\
-         \n\
-         Note: option (2) only helps if every other session that will \
-         run cargo test against the same store is at the matching \
-         schema_version, otherwise the next session to run will hit \
-         the same mismatch."
+         {direction}"
     );
 }
 
