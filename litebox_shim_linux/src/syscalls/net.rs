@@ -29,7 +29,9 @@ use litebox::{
 };
 use litebox_common_linux::{
     AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType,
-    SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
+    SocketOption, SocketOptionName, TcpOption, UnixProtocol,
+    errno::Errno,
+    fd_transfer_frame::{FdTransferFrame, FdTransferReader, FrameError},
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -2533,17 +2535,29 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(false)
                         }
                         crate::RawFdRef::Eventfd(typed) => {
-                            if let Some(handle_id) = dt
+                            let entry_handle = dt
                                 .entry_handle::<super::eventfd::EventfdSubsystem>(typed)
-                                .and_then(|h| h.with_entry(|e| e.broker_backed_handle()))
+                                .ok_or(Errno::EBADF)?;
+                            let mut broker_info = entry_handle
+                                .with_entry(|e| e.broker_backed_handle().zip(e.broker_backed_provider()));
+                            if broker_info.is_none()
+                                && let Some(provider) = super::eventfd::broker_eventfd_provider()
                             {
-                                // Found a broker-backed eventfd. Ask the broker
+                                let promoted = entry_handle.with_entry(|e| {
+                                    e.ensure_broker_backed_for_fork(Some(&provider), None)
+                                });
+                                if let Ok(Some((
+                                    super::fork_snapshot::BrokerHandleKind::Eventfd,
+                                    handle_id,
+                                ))) = promoted
+                                {
+                                    broker_info = Some((handle_id, provider));
+                                }
+                            }
+                            if let Some((handle_id, provider)) = broker_info {
+                                // Found or promoted a broker-backed eventfd. Ask the broker
                                 // to dup a transit ref so the handle survives
                                 // until the receiver materialises its own ref.
-                                let provider = dt
-                                    .entry_handle::<super::eventfd::EventfdSubsystem>(typed)
-                                    .and_then(|h| h.with_entry(|e| e.broker_backed_provider()))
-                                    .ok_or(Errno::EIO)?;
                                 provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
                                 passed_tokens.push(
                                     litebox_common_linux::fd_transfer_frame::PassedToken::new(
@@ -2736,11 +2750,24 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(ret) = self.try_with_broker_sp(sockfd, |typed| {
             if sock_addr.is_some() {
                 Err(Errno::EISCONN)
-            } else if msg.msg_controllen != 0 {
-                Err(Errno::EOPNOTSUPP)
             } else {
                 let handle = self.broker_sp_handle(typed)?;
-                if total_len == 0 {
+                if msg.msg_controllen != 0 {
+                    let (passed_fds, passed_tokens) = self.parse_sendmsg_cmsg(msg)?;
+                    if !passed_fds.is_empty() {
+                        return Err(Errno::EOPNOTSUPP);
+                    }
+                    let data = Self::copy_sendmsg_iovs(&iovs)?;
+                    let mut frame = Vec::new();
+                    FdTransferFrame {
+                        tokens: &passed_tokens,
+                        data: &data,
+                    }
+                    .encode(&mut frame)
+                    .map_err(|_| Errno::EMSGSIZE)?;
+                    handle.with_entry(|entry| entry.write(&self.wait_cx(), &frame))?;
+                    Ok(total_len)
+                } else if total_len == 0 {
                     handle.with_entry(|entry| entry.write(&self.wait_cx(), &[]))
                 } else {
                     Self::sendmsg_stream_iovs(&iovs, |chunk| {
@@ -3287,16 +3314,36 @@ impl<FS: ShimFS> Task<FS> {
         // recvmsg semantics (SCM_RIGHTS, peer addr) are deferred
         // until BrokerSocketPair is plumbed through with_socket
         // properly.
-        if !want_source && received_fds.is_empty() && received_tokens.is_empty() {
+        if !want_source {
             let broker_sp = files
                 .raw_descriptor_store
                 .read()
                 .fd_from_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
                 .ok();
             if let Some(typed) = broker_sp {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
                 let handle = self.broker_sp_handle(typed.as_ref())?;
-                let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), buf))?;
-                return Ok(size);
+                let mut staging = alloc::vec![0u8; buf.len()];
+                let size = handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut staging))?;
+                staging.truncate(size);
+                let mut reader = FdTransferReader::new();
+                reader.push(&staging);
+                match reader.take_frame() {
+                    Ok(Some(frame)) => {
+                        received_tokens.extend(frame.tokens);
+                        let n = buf.len().min(frame.data.len());
+                        buf[..n].copy_from_slice(&frame.data[..n]);
+                        return Ok(n);
+                    }
+                    Ok(None) | Err(FrameError::BadMagic { .. }) => {
+                        let n = buf.len().min(staging.len());
+                        buf[..n].copy_from_slice(&staging[..n]);
+                        return Ok(n);
+                    }
+                    Err(_) => return Err(Errno::EPROTO),
+                }
             }
             let broker_tcp_conn = files
                 .raw_descriptor_store
