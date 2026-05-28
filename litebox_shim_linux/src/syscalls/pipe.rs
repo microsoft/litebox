@@ -13,7 +13,7 @@ use litebox::{
     event::{IOPollable, wait::WaitContext},
     fd::MetadataError,
     fs::{Mode, OFlags},
-    pipes::{HalfPipeType, PipeFd},
+    pipes::{Flags, HalfPipeType, PipeFd},
 };
 use litebox_common_linux::{FileDescriptorFlags, InodeType, errno::Errno};
 
@@ -29,6 +29,10 @@ const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
 #[derive(Clone)]
 pub(crate) struct PipeStatusFlags(OFlags);
 
+/// Both ends of a freshly created Linux pipe.
+///
+/// `PipeFd` does not release the pipe on `Drop`; ends must either be inserted
+/// into the fd table or explicitly released via [`GlobalState::close_linux_pipe`].
 pub(crate) struct LinuxPipeEnds {
     pub(crate) reader: PipeFd<Platform>,
     pub(crate) writer: PipeFd<Platform>,
@@ -37,8 +41,6 @@ pub(crate) struct LinuxPipeEnds {
 impl<FS: ShimFS> GlobalState<FS> {
     pub(crate) fn create_linux_pipe(&self, flags: OFlags) -> Result<LinuxPipeEnds, Errno> {
         let (pipe_flags, cloexec) = {
-            use litebox::pipes::Flags;
-
             let mut pipe_flags = Flags::empty();
             if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement())
             {
@@ -119,12 +121,10 @@ impl<FS: ShimFS> GlobalState<FS> {
         flags: OFlags,
         setfl_mask: OFlags,
     ) -> Result<(), Errno> {
-        let flags = flags & setfl_mask;
-
         self.pipes
             .update_flags(
                 fd,
-                litebox::pipes::Flags::NON_BLOCKING,
+                Flags::NON_BLOCKING,
                 flags.intersects(OFlags::NONBLOCK),
             )
             .map_err(Errno::from)?;
