@@ -1257,6 +1257,11 @@ fn handle_control_connection_inner(
                     | Opcode::InotifyRmWatch
                     | Opcode::InotifyRead
                     | Opcode::InotifyQueryEvents
+                    | Opcode::InetListenerCreate
+                    | Opcode::InetListenerBind
+                    | Opcode::InetListenerListen
+                    | Opcode::InetListenerAccept
+                    | Opcode::InetListenerQueryEvents
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe

@@ -3208,6 +3208,12 @@ impl<FS: ShimFS> Task<FS> {
             drop(entry);
             return Ok(());
         }
+        if let Ok(fd) = rds.fd_consume_raw_integer::<super::broker_inet_listener::BrokerInetListenerSubsystem>(raw_fd) {
+            drop(rds);
+            let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
+            drop(entry);
+            return Ok(());
+        }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd) {
             drop(rds);
             // Drop the descriptor-table entry if it's still present.
