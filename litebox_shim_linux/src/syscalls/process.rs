@@ -4443,7 +4443,8 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::BrokerSocketPair(_)
                         | crate::RawFdRef::BrokerTcpConn(_)
                         | crate::RawFdRef::BrokerPty(_)
-                        | crate::RawFdRef::Signalfd(_) => {}
+                        | crate::RawFdRef::Signalfd(_)
+                        | crate::RawFdRef::Inotify(_) => {}
                         crate::RawFdRef::Pipes(typed) => {
                             let direction = match self.global.pipes.half_pipe_type(typed) {
                                 Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
@@ -6590,11 +6591,6 @@ impl<FS: ShimFS> Task<FS> {
 
         let files = self.files.borrow();
 
-        // Check for inotify instances.
-        if files.has_inotify_instances() {
-            reject.push(ForkRejectReason::InotifyPresent);
-        }
-
         // Read stdio object IDs first so we can identify true stdio descriptors
         // by identity rather than by fd number alone.  An fd at slot 0/1/2 that
         // has been closed and reused (via close+open or dup2) will no longer
@@ -6725,6 +6721,9 @@ impl<FS: ShimFS> Task<FS> {
                         ),
                         crate::RawFdRef::Signalfd(fd) => {
                             (FdClass::Signalfd, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::Inotify(fd) => {
+                            (FdClass::Inotify, Some(fd.object_id()), None, None)
                         }
                     }
                 })
@@ -10657,6 +10656,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => false,
                 crate::RawFdRef::BrokerPty(_broker_pty) => false,
                 crate::RawFdRef::Signalfd(_signalfd) => false,
+                crate::RawFdRef::Inotify(_inotify) => false,
             })
         .unwrap_or_else(|_| {
             log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
@@ -10835,6 +10835,7 @@ fn worker_exec_input_binding<FS: ShimFS>(
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::Signalfd(_broker_pipe) => WorkerExecInputBinding::Close,
+            crate::RawFdRef::Inotify(_inotify) => WorkerExecInputBinding::Close,
         })
         .unwrap_or(WorkerExecInputBinding::Close)
 }
@@ -10988,6 +10989,7 @@ fn worker_exec_output_binding<FS: ShimFS>(
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::Signalfd(_broker_pipe) => WorkerExecOutputBinding::Close,
+            crate::RawFdRef::Inotify(_inotify) => WorkerExecOutputBinding::Close,
         })
         .unwrap_or(WorkerExecOutputBinding::Close)
 }

@@ -21,6 +21,8 @@
 
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
 use crate::eventfd_state::{EventfdError, EventfdState};
+use crate::inotify_dispatcher::InotifyDispatcher;
+use crate::inotify_state::InotifyState;
 use crate::pgrp_signal_inbox::{
     PgrpSignalInbox, SubscribeError as PgrpSubscribeError, UnsubscribeError as PgrpUnsubscribeError,
 };
@@ -40,6 +42,8 @@ use litebox_common_linux::fd_token_protocol::{
     build_create_pidfd_response_ok, build_create_pipe_response_ok, build_create_pty_response_ok,
     build_create_signalfd_response_ok, build_create_socketpair_response_ok,
     build_deliver_signal_inbox_response_ok, build_error_response,
+    build_inotify_add_watch_response_ok, build_inotify_init1_response_ok,
+    build_inotify_read_response_ok, build_inotify_rm_watch_response_ok,
     build_mark_process_exited_response_ok, build_open_pty_slave_response_ok,
     build_pidfd_exited_response_ok, build_poll_tcp_conn_events_response_ok,
     build_pty_ioctl_response_ok, build_pty_read_response_ok, build_pty_write_response_ok,
@@ -55,15 +59,17 @@ use litebox_common_linux::fd_token_protocol::{
     build_write_pipe_response_ok, build_write_socketpair_response_ok,
     build_write_tcp_conn_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
     parse_create_pipe_body, parse_create_signalfd_body, parse_create_socketpair_body,
-    parse_deliver_signal_inbox_body, parse_handle_body, parse_mark_process_exited_body,
-    parse_open_pty_slave_body, parse_pidfd_exited_request, parse_poll_tcp_conn_events_body,
-    parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body,
-    parse_read_pipe_body, parse_read_socketpair_body, parse_read_tcp_conn_body,
-    parse_set_pgid_body, parse_set_sid_body, parse_shutdown_socketpair_write_body,
-    parse_shutdown_tcp_conn_body, parse_subscribe_eventfd_body, parse_subscribe_process_exit_body,
-    parse_subscribe_pty_body, parse_subscribe_signal_inbox_body, parse_unsubscribe_body,
-    parse_unsubscribe_signal_inbox_body, parse_write_eventfd_body, parse_write_pipe_body,
-    parse_write_socketpair_body, parse_write_tcp_conn_body,
+    parse_deliver_signal_inbox_body, parse_handle_body, parse_inotify_add_watch_body,
+    parse_inotify_init1_body, parse_inotify_read_body, parse_inotify_rm_watch_body,
+    parse_mark_process_exited_body, parse_open_pty_slave_body, parse_pidfd_exited_request,
+    parse_poll_tcp_conn_events_body, parse_pty_ioctl_body, parse_pty_read_body,
+    parse_pty_write_body, parse_push_siginfo_body, parse_read_pipe_body,
+    parse_read_socketpair_body, parse_read_tcp_conn_body, parse_set_pgid_body, parse_set_sid_body,
+    parse_shutdown_socketpair_write_body, parse_shutdown_tcp_conn_body,
+    parse_subscribe_eventfd_body, parse_subscribe_process_exit_body, parse_subscribe_pty_body,
+    parse_subscribe_signal_inbox_body, parse_unsubscribe_body, parse_unsubscribe_signal_inbox_body,
+    parse_write_eventfd_body, parse_write_pipe_body, parse_write_socketpair_body,
+    parse_write_tcp_conn_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -169,6 +175,7 @@ pub struct HandlerResult {
 /// request frame, and any attached fds.
 pub fn handle_request(
     registry: &BrokerStateRegistry,
+    inotify_dispatcher: &Arc<InotifyDispatcher>,
     conn: &mut ConnState,
     request: &Frame<'_>,
     in_fds: Vec<OwnedFd>,
@@ -185,6 +192,11 @@ pub fn handle_request(
         Opcode::ReadEventfd => handle_read_eventfd(registry, request, in_fds),
         Opcode::WriteEventfd => handle_write_eventfd(registry, request, in_fds),
         Opcode::CreateSignalfd => handle_create_signalfd(registry, request, in_fds),
+        Opcode::InotifyInit1 => handle_inotify_init1(registry, inotify_dispatcher, request, in_fds),
+        Opcode::InotifyAddWatch => handle_inotify_add_watch(registry, request, in_fds),
+        Opcode::InotifyRmWatch => handle_inotify_rm_watch(registry, request, in_fds),
+        Opcode::InotifyRead => handle_inotify_read(registry, request, in_fds),
+        Opcode::InotifyQueryEvents => handle_query_events(registry, request, in_fds),
         Opcode::CreatePipe => handle_create_pipe(registry, request, in_fds),
         Opcode::ReadPipe => handle_read_pipe(registry, request, in_fds),
         Opcode::WritePipe => handle_write_pipe(registry, request, in_fds),
@@ -751,6 +763,7 @@ fn resolve_pipe_read(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::Process(_) => Err(StatusCode::SubsystemMismatch),
@@ -773,6 +786,7 @@ fn resolve_pipe_write(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::Process(_) => Err(StatusCode::SubsystemMismatch),
@@ -888,6 +902,7 @@ fn resolve_socketpair_end(
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::TcpConn(_)
@@ -995,6 +1010,7 @@ fn resolve_tcp_conn(
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::Process(_) => Err(StatusCode::SubsystemMismatch),
@@ -1216,6 +1232,123 @@ fn handle_push_siginfo(
     }
 }
 
+fn handle_inotify_init1(
+    registry: &BrokerStateRegistry,
+    dispatcher: &Arc<InotifyDispatcher>,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InotifyInit1Response);
+    }
+    if parse_inotify_init1_body(request.body).is_err() {
+        return protocol_err(Opcode::InotifyInit1Response);
+    }
+    let state = InotifyState::new(Arc::clone(dispatcher));
+    let handle = registry.register(state);
+    HandlerResult {
+        frame: build_inotify_init1_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn resolve_inotify(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+    response: Opcode,
+) -> Result<Arc<InotifyState>, HandlerResult> {
+    let state = match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Inotify) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return Err(status_err(response, StatusCode::UnknownHandle));
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            return Err(status_err(response, StatusCode::SubsystemMismatch));
+        }
+        Err(_) => return Err(status_err(response, StatusCode::Internal)),
+    };
+    let StateObjectEnum::Inotify(inotify) = state.as_ref() else {
+        return Err(status_err(response, StatusCode::SubsystemMismatch));
+    };
+    Ok(Arc::clone(inotify))
+}
+
+fn handle_inotify_add_watch(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InotifyAddWatchResponse);
+    }
+    let (handle_id, mask, path) = match parse_inotify_add_watch_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InotifyAddWatchResponse),
+    };
+    let state = match resolve_inotify(registry, handle_id, Opcode::InotifyAddWatchResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.add_watch(path, mask) {
+        Ok(wd) => HandlerResult {
+            frame: build_inotify_add_watch_response_ok(wd),
+            out_fd: None,
+        },
+        Err(()) => status_err(Opcode::InotifyAddWatchResponse, StatusCode::InvalidValue),
+    }
+}
+
+fn handle_inotify_rm_watch(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InotifyRmWatchResponse);
+    }
+    let (handle_id, wd) = match parse_inotify_rm_watch_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InotifyRmWatchResponse),
+    };
+    let state = match resolve_inotify(registry, handle_id, Opcode::InotifyRmWatchResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.remove_watch(wd) {
+        Ok(()) => HandlerResult {
+            frame: build_inotify_rm_watch_response_ok(),
+            out_fd: None,
+        },
+        Err(()) => status_err(Opcode::InotifyRmWatchResponse, StatusCode::InvalidValue),
+    }
+}
+
+fn handle_inotify_read(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InotifyReadResponse);
+    }
+    let (handle_id, max_len) = match parse_inotify_read_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InotifyReadResponse),
+    };
+    let state = match resolve_inotify(registry, handle_id, Opcode::InotifyReadResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.read_events(max_len as usize) {
+        Ok(Some(payload)) => HandlerResult {
+            frame: build_inotify_read_response_ok(&payload),
+            out_fd: None,
+        },
+        Ok(None) => status_err(Opcode::InotifyReadResponse, StatusCode::WouldBlock),
+        Err(()) => status_err(Opcode::InotifyReadResponse, StatusCode::InvalidValue),
+    }
+}
+
 fn handle_create_pty(
     registry: &BrokerStateRegistry,
     request: &Frame<'_>,
@@ -1286,6 +1419,7 @@ fn resolve_pty(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::Process(_) => {
                 Err(status_err(response, StatusCode::SubsystemMismatch))
