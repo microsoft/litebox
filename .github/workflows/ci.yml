@@ -150,17 +150,18 @@ jobs:
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland
-      - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland
-      - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland
+      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
+      - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
+      - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
       - run: cargo nextest run --locked --profile ci -p litebox_shim_linux --no-default-features --features platform_windows_userland
+      - run: cargo nextest run --locked --profile ci -p litebox_shim_windows
       - run: |
-          cargo test --locked --verbose --doc -p litebox_runner_linux_on_windows_userland
+          cargo test --locked --verbose --doc -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland
+        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
 
   build_and_test_snp:
     name: Build and Test SNP
