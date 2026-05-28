@@ -28,6 +28,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
+/// Producer/consumer schema version. **DO NOT BUMP WITHOUT USER
+/// CONFIRMATION.** A bump is a hard sync point across every coding
+/// agent session running against the shared sqlite store — until
+/// each session rebuilds their `litebox_test_harness` integration
+/// binary, their `cargo test --test integration` runs will panic
+/// in `init_schema` below. Coordination cost is real.
+///
+/// Acceptable reasons to bump (after asking):
+///   * The on-disk shape genuinely changed (column added with no
+///     default, column removed, type changed, table/view renamed).
+/// Things that DON'T need a bump:
+///   * Renderer-only changes in `scripts/dashboard.py`.
+///   * Adding a new column with a usable default (NULL or sentinel).
+///   * Adding indexes (the producer's `init_schema` doesn't notice).
+///
+/// When you do bump (with user approval), land the bump on the
+/// amalgamation branch promptly so other sessions pick it up on
+/// their next cargo run rather than panicking on an older meta.
 pub const SCHEMA_VERSION: i64 = 3;
 
 pub struct Ctx {
