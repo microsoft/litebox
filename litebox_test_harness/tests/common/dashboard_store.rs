@@ -132,10 +132,40 @@ pub fn ctx() -> Option<&'static Ctx> {
     CTX.get().and_then(|o| o.as_ref())
 }
 
+/// Initialize the schema. Fresh DB (no `meta` table) → create
+/// schema + stamp version. Existing DB at the same version → no-op.
+///
+/// **Loud-fail on schema_version mismatch.** No automatic wipe and
+/// no silent skip — both are subtle data-loss bugs across
+/// coordinating coding-agent sessions:
+///
+/// * Auto-wipe thrashes data on every alternation between sessions
+///   built against different schema versions.
+/// * Silent-skip leaves writes invisibly going into the void; the
+///   session "works" but contributes nothing.
+///
+/// The remediation has to be explicit, so panic. The message names
+/// the three valid actions: rebuild (other session catches up),
+/// wipe (lose history but start fresh), or opt out
+/// (`LITEBOX_DASHBOARD_DIR=""`).
 fn init_schema(conn: &Connection) {
-    // `.dashboard/` is local-only (gitignored); on schema-version
-    // mismatch we recreate the store from scratch instead of
-    // migrating. Saves a lot of fragile DDL.
+    let meta_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !meta_exists {
+        conn.execute_batch(SCHEMA_DDL)
+            .expect("dashboard: schema init on fresh db");
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('schema_version', ?1)",
+            params![SCHEMA_VERSION],
+        )
+        .expect("dashboard: write schema_version");
+        return;
+    }
     let existing: i64 = conn
         .query_row(
             "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
@@ -146,38 +176,27 @@ fn init_schema(conn: &Connection) {
     if existing == SCHEMA_VERSION {
         return;
     }
-    if existing != 0 && existing != SCHEMA_VERSION {
-        eprintln!(
-            "dashboard: schema_version {existing} != current {SCHEMA_VERSION}; \
-             recreating tables (local-only data; no migration)."
-        );
-        conn.execute_batch(DROP_DDL)
-            .expect("dashboard: drop old schema");
-    }
-    conn.execute_batch(SCHEMA_DDL)
-        .expect("dashboard: schema init");
-    conn.execute(
-        "INSERT INTO meta(key,value) VALUES('schema_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![SCHEMA_VERSION],
-    )
-    .expect("dashboard: write schema_version");
+    panic!(
+        "dashboard: schema_version {existing} in the store does NOT \
+         match this binary's {SCHEMA_VERSION}. No automatic recreate \
+         — that would stomp on data from other coding-agent sessions \
+         running against the shared store. Pick one:\n\
+         \n\
+         (1) Rebuild the other session's harness so it catches up to \
+             schema_version {SCHEMA_VERSION} (recommended for bumps \
+             being rolled out across sessions).\n\
+         (2) `rm -rf <dashboard state dir>` (typically \
+             <main-worktree>/.dashboard/) to start fresh (loses all \
+             accumulated history).\n\
+         (3) Set `LITEBOX_DASHBOARD_DIR=\"\"` in this binary's env to \
+             opt out of dashboard writes entirely.\n\
+         \n\
+         Note: option (2) only helps if every other session that will \
+         run cargo test against the same store is at the matching \
+         schema_version, otherwise the next session to run will hit \
+         the same mismatch."
+    );
 }
-
-/// Tables / view / indexes that may exist from a previous
-/// schema_version. Drops are unconditional (`IF EXISTS`) so this
-/// is safe to run on first init too.
-const DROP_DDL: &str = r#"
-    DROP VIEW  IF EXISTS latest_results;
-    DROP TABLE IF EXISTS latest_results;
-    DROP TABLE IF EXISTS run_results;
-    DROP TABLE IF EXISTS runs;
-    DROP TABLE IF EXISTS universe;
-    DROP TABLE IF EXISTS worktree_coverage;
-    DROP TABLE IF EXISTS ci_cycles;
-    DROP TABLE IF EXISTS tracked_refs;
-    DROP TABLE IF EXISTS meta;
-"#;
 
 /// The canonical dashboard schema. Three tables (`runs`,
 /// `run_results`, `tracked_refs`), one view (`latest_results`),
