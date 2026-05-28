@@ -770,6 +770,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
     }
 
+    if let Ok(s) = std::env::var("LITEBOX_BROKER_INET_DELAY_NS")
+        && let Ok(ns) = s.parse::<u64>()
+    {
+        litebox_shim_linux::syscalls::set_broker_inet_delay_ns(ns);
+    }
+
     // Stage 3a: broker-backed TCP accept is opt-in while the matrix is
     // validated. The broker process reads the same environment variable.
     {
