@@ -306,6 +306,7 @@ impl StateObjectEnum {
             StateObjectEnum::PipeWriteEnd(state) => state.debug_repr(),
             StateObjectEnum::SocketPairEnd(state) => state.debug_repr(),
             StateObjectEnum::TcpConn(state) => state.debug_repr(),
+            StateObjectEnum::InetListener(state) => state.debug_repr(),
             StateObjectEnum::Signalfd(state) => state.debug_repr(),
             StateObjectEnum::Inotify(state) => state.debug_repr(),
             StateObjectEnum::Pty(state) => state.debug_repr(),
