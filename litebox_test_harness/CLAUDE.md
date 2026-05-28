@@ -960,17 +960,35 @@ message includes both log paths.
 
 #### Per-test timing telemetry
 
-`target/test-logs/per-test-timing.jsonl` records one or two JSONL
-lines per test:
+Per-test results land in
+**`<main-worktree>/.dashboard/results.sqlite`** — the central
+dashboard store, populated **directly** by the integration test
+binary on every `cargo test --test integration` run.
 
-```json
-{"test":"PB.c2p.pie-glibc.dpg1","pass":"native","t_acquire_ms":12,
- "t_docker_start_ms":810,"t_useful_ms":340,"verdict":"pass","jobs":10}
-{"test":"PB.c2p.pie-glibc.dpg1","pass":"native","t_drain_ms":4500}
+The store is on by default. The path is resolved via
+`dirname(git rev-parse --git-common-dir)`, so any linked worktree
+writes to the main worktree's store. Override with
+`LITEBOX_DASHBOARD_DIR=<abs path>`; opt out with
+`LITEBOX_DASHBOARD_DIR=""`. See
+[`scripts/README.md`](scripts/README.md) for the (deliberately
+minimal) schema, `dashboard.py` subcommands, and agent recipes.
+
+**Selective re-run via `--fill[=N]`**: the runner picks up to N
+trials that have no clean-state result at the current `commit_sha`
+and runs only those. Default N is 300 (sized to amortize
+`setup()`). Used by `dashboard.py auto` to autonomously fill
+coverage of tracked refs.
+
+```sh
+# run only the missing-at-HEAD trials, default batch size 300
+cargo test -p litebox_test_harness --test integration -- --fill
+# explicit batch size
+cargo test -p litebox_test_harness --test integration -- --fill=50
 ```
 
 `litebox_test_harness/scripts/analyze-test-timing.py` summarizes a
-single run or diffs two runs (e.g., before/after a perf change).
+single run or diffs two runs (e.g., before/after a perf change),
+querying `run_results` directly.
 
 The file also keeps the backward-compatible `t_docker_start_ms`
 field and splits it using stable stderr markers of the form

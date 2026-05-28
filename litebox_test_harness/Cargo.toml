@@ -12,11 +12,19 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "time", "
 
 [dev-dependencies]
 libtest-mimic = "0.8"
+rusqlite = { version = "0.35", features = ["bundled"] }
+sha2 = "0.10"
 
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
 harness = false
+
+# `dashboard_store` is auto-discovered. Its impl lives in
+# `tests/common/dashboard_store.rs` (subdirs are NOT auto-compiled
+# as test binaries — standard cargo convention for shared test code)
+# and the smoke tests in `tests/dashboard_store.rs` pull it in via
+# `#[path]`.
 
 [lints]
 workspace = true

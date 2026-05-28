@@ -1,0 +1,178 @@
+"""Unit tests for dashboard.py.
+
+Run with:
+  python3 litebox_test_harness/scripts/test_dashboard.py
+
+Stdlib only — no third-party deps.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS_DIR))
+import dashboard  # type: ignore
+
+
+def _ddl_from_shared_module() -> str:
+    """Extract the canonical DDL string from the shared producer
+    module at `tests/common/dashboard_store.rs`. Same source the
+    Rust producer + Rust test both use, so the Python test exercises
+    identical schema.
+
+    TODO: once both Rust and Python load the DDL from a single
+    `dashboard_schema.sql`, drop this scrape.
+    """
+    rs = (
+        SCRIPTS_DIR.parent / "tests" / "common" / "dashboard_store.rs"
+    ).read_text()
+    start = rs.index("CREATE TABLE runs")
+    end = rs.index('"#;', start)
+    return rs[start:end]
+
+
+SCHEMA_DDL = _ddl_from_shared_module()
+
+
+def _init_db(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_DDL)
+    conn.execute("INSERT INTO meta(key, value) VALUES('schema_version','3')")
+    return conn
+
+
+def _add_run(conn, *, worktree="/wt", commit="sha1", dirty_hash=None,
+             started_ts_ms=1000) -> int:
+    conn.execute(
+        "INSERT INTO runs(started_ts_ms, hostname, worktree_path, commit_sha,"
+        " branch, dirty_hash) VALUES (?,?,?,?,?,?)",
+        (started_ts_ms, "host", worktree, commit, "main", dirty_hash),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def _add_result(conn, *, run_id, test_id, pass_, verdict, ts_ms,
+                suite="vscode", group="pidfd"):
+    conn.execute(
+        "INSERT INTO run_results(run_id, test_id, pass, verdict,"
+        " finished_ts_ms, suite, \"group\","
+        " t_acquire_ms, t_docker_start_ms, t_useful_ms)"
+        " VALUES (?,?,?,?,?,?,?, 0, 0, 100)",
+        (run_id, test_id, pass_, verdict, ts_ms, suite, group),
+    )
+
+
+class LatestResultsViewTests(unittest.TestCase):
+    """The latest_results VIEW replaces the prior UPSERT-maintained
+    table. Verify it returns the freshest row per (test_id, pass).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dash-lr-")
+        self.db = Path(self.tmp) / "results.sqlite"
+        self.conn = _init_db(self.db)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_view_returns_newest_row(self):
+        r1 = _add_run(self.conn, started_ts_ms=1000)
+        r2 = _add_run(self.conn, started_ts_ms=2000)
+        _add_result(self.conn, run_id=r1, test_id="A", pass_="native",
+                    verdict="FAIL", ts_ms=1500)
+        _add_result(self.conn, run_id=r2, test_id="A", pass_="native",
+                    verdict="pass", ts_ms=2500)
+        row = self.conn.execute(
+            "SELECT verdict, finished_ts_ms FROM latest_results"
+            " WHERE test_id='A' AND pass='native'"
+        ).fetchone()
+        self.assertEqual(row["verdict"], "pass")
+        self.assertEqual(row["finished_ts_ms"], 2500)
+
+    def test_view_one_row_per_pass(self):
+        r = _add_run(self.conn)
+        _add_result(self.conn, run_id=r, test_id="A", pass_="native",
+                    verdict="pass", ts_ms=1000)
+        _add_result(self.conn, run_id=r, test_id="A", pass_="litebox",
+                    verdict="FAIL", ts_ms=1000)
+        rows = self.conn.execute(
+            "SELECT pass, verdict FROM latest_results WHERE test_id='A'"
+            " ORDER BY pass"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["pass"], "litebox")
+        self.assertEqual(rows[0]["verdict"], "FAIL")
+        self.assertEqual(rows[1]["pass"], "native")
+        self.assertEqual(rows[1]["verdict"], "pass")
+
+
+class CoverageFiltersDirtyTests(unittest.TestCase):
+    """A dirty run (dirty_hash IS NOT NULL) must not inflate the
+    clean-commit coverage number.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dash-cov-")
+        self.db = Path(self.tmp) / "results.sqlite"
+        self.conn = _init_db(self.db)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_dirty_run_excluded_from_coverage(self):
+        # Clean run records A.
+        clean = _add_run(self.conn, commit="abc", dirty_hash=None,
+                         started_ts_ms=1000)
+        _add_result(self.conn, run_id=clean, test_id="A", pass_="native",
+                    verdict="pass", ts_ms=1500)
+        # Dirty run records B (against the same commit).
+        dirty = _add_run(self.conn, commit="abc",
+                         dirty_hash="deadbeef", started_ts_ms=2000)
+        _add_result(self.conn, run_id=dirty, test_id="B", pass_="native",
+                    verdict="pass", ts_ms=2500)
+        # _coverage_pass_fail filters dirty; only A counts.
+        covered, n_pass, n_fail = dashboard._coverage_pass_fail(
+            self.conn, "abc", "native"
+        )
+        self.assertEqual(covered, 1)
+        self.assertEqual(n_pass, 1)
+        self.assertEqual(n_fail, 0)
+
+
+class TrackedRefsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="dash-tr-")
+        self.db = Path(self.tmp) / "results.sqlite"
+        self.conn = _init_db(self.db)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_tracked_refs_round_trip(self):
+        self.conn.execute(
+            "INSERT INTO tracked_refs(ref, ci_worktree) VALUES (?, ?)",
+            ("origin/main", "/tmp/ci-main"),
+        )
+        rows = self.conn.execute(
+            "SELECT ref, ci_worktree FROM tracked_refs"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ref"], "origin/main")
+        self.assertEqual(rows[0]["ci_worktree"], "/tmp/ci-main")
+
+
+if __name__ == "__main__":
+    unittest.main()
