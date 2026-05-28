@@ -143,7 +143,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 };
                 Some(poll(&proxy))
             }
-            EpollDescriptor::Pipe(fd) => global.pipes.with_iopollable(fd, poll).ok(),
+            EpollDescriptor::Pipe(fd) => global.with_linux_pipe_iopollable(fd, poll).ok(),
             EpollDescriptor::Unix(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))

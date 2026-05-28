@@ -342,10 +342,6 @@ fn default_fs(
 #[derive(Clone)]
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
-/// Status flags for pipes
-#[derive(Clone)]
-pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
-
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {
         use litebox::fs::{Mode, OFlags};

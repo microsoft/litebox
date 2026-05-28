@@ -31,7 +31,11 @@ use crate::{
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 
-/// Support for unidirectional communication channels
+/// Generic in-process support for unidirectional byte channels.
+///
+/// This module owns pipe buffering, endpoint lifetime, and readiness mechanics.
+/// Guest ABI details such as raw fd numbers, `pipe2` flags, and Linux errno
+/// mapping belong in the shim that exposes that ABI.
 pub struct Pipes<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     litebox: LiteBox<Platform>,
 }
