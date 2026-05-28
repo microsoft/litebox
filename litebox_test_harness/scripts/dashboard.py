@@ -143,6 +143,20 @@ _SUITE_FALLBACK = {
 }
 
 
+def infer_suite_raw(test_id: Optional[str]) -> str:
+    """Same prefix → suite map as `infer_suite`, but returns the bare
+    suite name with no formatting. Used by `_render_suite_group_breakdown`
+    where the value is a grouping key, not display text.
+    """
+    if not test_id:
+        return "?"
+    prefix = test_id.split(".", 1)[0]
+    for suite, prefixes in _SUITE_FALLBACK.items():
+        if prefix in prefixes:
+            return suite
+    return "?"
+
+
 def infer_suite(test_id: Optional[str]) -> str:
     if not test_id:
         return "?"
@@ -289,12 +303,15 @@ def _coverage_pass_fail(
     conn: sqlite3.Connection, commit_sha: str, pass_name: str,
 ) -> tuple[int, int, int]:
     """Return (covered_count, n_pass, n_fail) for a (commit_sha, pass).
-    Only counts clean-state runs (dirty_hash IS NULL)."""
+    Only counts clean-state runs (dirty_hash IS NULL). Anything that
+    didn't pass (FAIL, no_result, other) is counted as a fail so the
+    invariant `covered = pass + fail` always holds.
+    """
     row = conn.execute(
         """
         SELECT COUNT(DISTINCT rr.test_id) AS covered,
-               COUNT(DISTINCT CASE WHEN rr.verdict='pass' THEN rr.test_id END) AS n_pass,
-               COUNT(DISTINCT CASE WHEN rr.verdict='FAIL' THEN rr.test_id END) AS n_fail
+               COUNT(DISTINCT CASE WHEN rr.verdict = 'pass' THEN rr.test_id END) AS n_pass,
+               COUNT(DISTINCT CASE WHEN rr.verdict <> 'pass' THEN rr.test_id END) AS n_fail
           FROM run_results rr
           JOIN runs r ON r.run_id = rr.run_id
          WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
@@ -330,8 +347,8 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
         """
         SELECT r.commit_sha, r.dirty_hash, rr.pass,
                COUNT(DISTINCT rr.test_id) AS covered,
-               COUNT(DISTINCT CASE WHEN rr.verdict='pass' THEN rr.test_id END) AS n_pass,
-               COUNT(DISTINCT CASE WHEN rr.verdict='FAIL' THEN rr.test_id END) AS n_fail,
+               COUNT(DISTINCT CASE WHEN rr.verdict = 'pass' THEN rr.test_id END) AS n_pass,
+               COUNT(DISTINCT CASE WHEN rr.verdict <> 'pass' THEN rr.test_id END) AS n_fail,
                MAX(rr.finished_ts_ms) AS newest_ms,
                GROUP_CONCAT(DISTINCT r.worktree_path) AS worktrees
           FROM run_results rr
@@ -421,41 +438,66 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
     a single regression flipping a row from pass→FAIL moves the
     numbers immediately, no per-commit filtering.
     """
-    # First pass: per-(suite, group, pass) cov / pass / fail.
+    # Pull raw rows; we infer suite from sibling rows (same test_id,
+    # other pass) when NULL, falling back to the test_id prefix map.
+    # Most NULL-suite rows are FAIL/no_result outcomes where the
+    # in-container coordinator never emitted its JSON line.
     rows = conn.execute(
         """
-        SELECT COALESCE(suite, '?')        AS suite,
-               COALESCE("group", '?')      AS "group",
-               pass,
-               COUNT(DISTINCT test_id)     AS covered,
-               SUM(CASE WHEN verdict='pass' THEN 1 ELSE 0 END) AS n_pass,
-               SUM(CASE WHEN verdict='FAIL' THEN 1 ELSE 0 END) AS n_fail
+        SELECT test_id, pass, verdict, suite, "group"
           FROM latest_results
-         GROUP BY suite, "group", pass
         """
     ).fetchall()
     if not rows:
         return ""
 
-    # Second pass: per-(suite, group) observed universe size = distinct
-    # test_ids ever seen in that bucket across either pass.
-    totals_rows = conn.execute(
-        """
-        SELECT COALESCE(suite, '?')   AS suite,
-               COALESCE("group", '?') AS "group",
-               COUNT(DISTINCT test_id) AS n_total
-          FROM latest_results
-         GROUP BY suite, "group"
-        """
-    ).fetchall()
-    totals = {(r["suite"], r["group"]): r["n_total"] or 0 for r in totals_rows}
-
-    # Collapse rows into per-(suite, group) records.
-    bucket: dict[tuple[str, str], dict] = {}
+    # Cross-row lookup: test_id → first observed non-NULL (suite, group).
+    # Lets a litebox no_result row inherit the suite/group from its
+    # native sibling instead of falling through to the prefix map.
+    known: dict[str, tuple[Optional[str], Optional[str]]] = {}
     for r in rows:
-        key = (r["suite"], r["group"])
-        b = bucket.setdefault(key, {"native": (0, 0, 0), "litebox": (0, 0, 0)})
-        b[r["pass"]] = (r["covered"] or 0, r["n_pass"] or 0, r["n_fail"] or 0)
+        if r["suite"] or r["group"]:
+            prev = known.get(r["test_id"])
+            if prev is None:
+                known[r["test_id"]] = (r["suite"], r["group"])
+            else:
+                known[r["test_id"]] = (prev[0] or r["suite"], prev[1] or r["group"])
+
+    def resolve_suite_group(r) -> tuple[str, str]:
+        suite = r["suite"]
+        group = r["group"]
+        if not suite or not group:
+            k_suite, k_group = known.get(r["test_id"], (None, None))
+            suite = suite or k_suite
+            group = group or k_group
+        suite = suite or infer_suite_raw(r["test_id"])
+        group = group or "?"
+        return suite, group
+
+    from collections import defaultdict
+    per_bucket_pass: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
+        lambda: {"covered": 0, "pass": 0, "fail": 0}
+    )
+    per_bucket_ids: dict[tuple[str, str], set] = defaultdict(set)
+    for r in rows:
+        suite, group = resolve_suite_group(r)
+        pass_name = r["pass"]
+        key = (suite, group, pass_name)
+        per_bucket_pass[key]["covered"] += 1
+        if r["verdict"] == "pass":
+            per_bucket_pass[key]["pass"] += 1
+        else:
+            per_bucket_pass[key]["fail"] += 1
+        per_bucket_ids[(suite, group)].add(r["test_id"])
+
+    totals = {k: len(v) for k, v in per_bucket_ids.items()}
+    buckets: dict[tuple[str, str], dict] = {}
+    for (suite, group, pass_name), counts in per_bucket_pass.items():
+        b = buckets.setdefault(
+            (suite, group),
+            {"native": (0, 0, 0), "litebox": (0, 0, 0)},
+        )
+        b[pass_name] = (counts["covered"], counts["pass"], counts["fail"])
 
     lines = ["## By suite × group (observed universe)\n",
              "| Suite | Group "
@@ -464,7 +506,7 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
              "|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|"]
-    for (suite, group), b in sorted(bucket.items()):
+    for (suite, group), b in sorted(buckets.items()):
         total = totals.get((suite, group), 0)
         cells: list[str] = []
         for pass_name in ("native", "litebox"):
