@@ -5,17 +5,87 @@ use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::nt_status::NtStatus;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 const FIRST_STACK_ARGUMENT_OFFSET: usize = 0x28;
+const HANDLE_SHIFT: u32 = 2;
+const HANDLE_TAG_MASK: usize = (1usize << HANDLE_SHIFT) - 1;
+
+#[repr(transparent)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub(crate) struct Handle(usize);
+
+impl Handle {
+    #[must_use]
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    #[must_use]
+    pub(crate) fn from_raw_fd(raw_fd: usize) -> Option<Self> {
+        raw_fd
+            .checked_add(1)?
+            .checked_mul(1usize << HANDLE_SHIFT)
+            .map(Self)
+    }
+
+    #[must_use]
+    pub(crate) fn raw_fd(self) -> Option<usize> {
+        if self.0 & HANDLE_TAG_MASK != 0 {
+            return None;
+        }
+        (self.0 >> HANDLE_SHIFT).checked_sub(1)
+    }
+
+    #[must_use]
+    pub(crate) const fn as_raw(self) -> usize {
+        self.0
+    }
+
+    #[must_use]
+    pub(crate) const fn is_null(self) -> bool {
+        self.as_raw() == 0
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProcessHandle(Handle);
+
+impl ProcessHandle {
+    pub(crate) const CURRENT: Self = Self::from_raw(usize::MAX);
+
+    #[must_use]
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(Handle::from_raw(raw))
+    }
+
+    #[must_use]
+    pub(crate) const fn as_raw(self) -> usize {
+        self.0.as_raw()
+    }
+
+    #[must_use]
+    pub(crate) const fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+
+    #[must_use]
+    pub(crate) fn is_current(self) -> bool {
+        self == Self::CURRENT
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtTerminateProcess {
-        process_handle: usize,
+        process_handle: ProcessHandle,
         exit_status: i32,
     },
     NtAllocateVirtualMemory {
-        process_handle: usize,
+        process_handle: ProcessHandle,
         base_address: Platform::RawMutPointer<usize>,
         zero_bits: usize,
         region_size: Platform::RawMutPointer<usize>,
@@ -46,11 +116,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
 
         match NtSysno::from_raw(pt_regs.orig_rax)? {
             NtSysno::NtTerminateProcess => Some(sys_req!(NtTerminateProcess {
-                process_handle,
+                process_handle: { ProcessHandle::from_raw },
                 exit_status,
             })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
-                process_handle,
+                process_handle: { ProcessHandle::from_raw },
                 base_address:*,
                 zero_bits,
                 region_size:*,
@@ -180,5 +250,36 @@ impl<T: zerocopy::FromBytes, P: litebox::platform::RawConstPointer<T>>
         } else {
             Some(P::from_usize(value))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_encodes_raw_fds_and_rejects_invalid_values() {
+        let first_handle = Handle::from_raw_fd(0).expect("raw fd 0 should encode");
+        assert_eq!(first_handle, Handle::from_raw(1usize << HANDLE_SHIFT));
+        assert_eq!(first_handle.raw_fd(), Some(0));
+
+        let max_raw_fd = (usize::MAX >> HANDLE_SHIFT) - 1;
+        for raw_fd in [1, 42, max_raw_fd] {
+            let handle = Handle::from_raw_fd(raw_fd).expect("raw fd should encode");
+            assert_eq!(handle.raw_fd(), Some(raw_fd));
+        }
+
+        assert_eq!(Handle::from_raw(0).raw_fd(), None);
+
+        for tag in 1..=HANDLE_TAG_MASK {
+            assert_eq!(Handle::from_raw(tag).raw_fd(), None);
+            assert_eq!(
+                Handle::from_raw((2usize << HANDLE_SHIFT) | tag).raw_fd(),
+                None
+            );
+        }
+
+        assert_eq!(Handle::from_raw_fd(usize::MAX >> HANDLE_SHIFT), None);
+        assert_eq!(Handle::from_raw_fd(usize::MAX), None);
     }
 }

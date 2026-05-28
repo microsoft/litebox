@@ -33,6 +33,8 @@ mod syscalls;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 
 pub(crate) type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
+pub(crate) type WindowsHandleStore =
+    litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
 
 pub type DefaultFS = WindowsFS;
 
@@ -73,6 +75,57 @@ where
         ptr.write_at_offset(index.try_into().ok()?, value)?;
     }
     Some(())
+}
+
+#[expect(dead_code, reason = "handle helpers are staged for NT object syscalls")]
+pub(crate) fn insert_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore,
+    typed: litebox::fd::TypedFd<Subsystem>,
+) -> Result<syscalls::Handle, NtStatus> {
+    let mut handles = handles.write();
+    let raw_fd = handles.fd_into_raw_integer(typed);
+    let Some(handle) = syscalls::Handle::from_raw_fd(raw_fd) else {
+        let typed = handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok();
+        drop(handles);
+        if let Some(typed) = typed {
+            let _ = litebox.descriptor_table_mut().remove(&typed);
+        }
+        return Err(NtStatus::QUOTA_EXCEEDED);
+    };
+    Ok(handle)
+}
+
+#[expect(dead_code, reason = "handle helpers are staged for NT object syscalls")]
+pub(crate) fn raw_handle_entry<Subsystem: litebox::fd::FdEnabledSubsystem>(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore,
+    handle: syscalls::Handle,
+) -> Option<litebox::fd::EntryHandle<Platform, Subsystem>> {
+    let raw_fd = handle.raw_fd()?;
+    let typed = {
+        let handles = handles.read();
+        handles.fd_from_raw_integer::<Subsystem>(raw_fd).ok()
+    }?;
+    litebox.descriptor_table().entry_handle(&typed)
+}
+
+#[expect(dead_code, reason = "handle helpers are staged for NT object syscalls")]
+pub(crate) fn remove_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore,
+    handle: syscalls::Handle,
+) {
+    let Some(raw_fd) = handle.raw_fd() else {
+        return;
+    };
+    let typed = {
+        let mut handles = handles.write();
+        handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok()
+    };
+    if let Some(typed) = typed {
+        let _ = litebox.descriptor_table_mut().remove(&typed);
+    }
 }
 
 /// Builds a Windows NT shim instance.
@@ -226,14 +279,15 @@ impl<FS: ShimFS> Task<FS> {
                 process_handle,
                 exit_status,
             } => {
-                litebox_util_log::debug!(
-                    syscall_number = ctx.orig_rax,
-                    process_handle:% = format_args!("{:#x}", process_handle),
-                    exit_status:% = format_args!("{:#x}", exit_status);
-                    "Handling NtTerminateProcess syscall"
-                );
-                self.process.exit_code.store(exit_status, Ordering::Relaxed);
-                (NtStatus::SUCCESS, ContinueOperation::Terminate)
+                if !process_handle.is_null() && !process_handle.is_current() {
+                    // TODO: allow terminating other processes
+                    litebox_util_log::error!("Terminating other processes is not yet supported");
+                    (NtStatus::INVALID_HANDLE, ContinueOperation::Resume)
+                } else {
+                    // TODO: Terminate all threads except the calling one if process_handle is zero.
+                    self.process.exit_code.store(exit_status, Ordering::Relaxed);
+                    (NtStatus::SUCCESS, ContinueOperation::Terminate)
+                }
             }
             SyscallRequest::NtAllocateVirtualMemory {
                 process_handle,
@@ -245,7 +299,7 @@ impl<FS: ShimFS> Task<FS> {
             } => {
                 // TODO: placeholder for NtAllocateVirtualMemory
                 litebox_util_log::debug!(
-                    process_handle:% = format_args!("{:#x}", process_handle),
+                    process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
                     base_address:% = format_args!("{:#x}", base_address.as_usize()),
                     zero_bits:% = format_args!("{:#x}", zero_bits),
                     region_size:% = format_args!("{:#x}", region_size.as_usize()),
