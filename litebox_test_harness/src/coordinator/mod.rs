@@ -284,7 +284,15 @@ pub struct TestRunner {
 }
 
 impl TestRunner {
-    fn record(&mut self, test: &str, agent: &str, pass: bool, detail: &str) {
+    fn record(
+        &mut self,
+        test: &str,
+        agent: &str,
+        suite: &str,
+        group: &str,
+        pass: bool,
+        detail: &str,
+    ) {
         use std::io::Write as _;
         let key = format!("{test} {agent}");
         if !self.recorded_ids.insert(key) {
@@ -303,11 +311,17 @@ impl TestRunner {
         // so partial runs survive the integration-test pipeline even if the
         // coordinator process is killed before reaching end-of-main. Native
         // and litebox now produce the same JSON-on-stdout stream.
+        //
+        // suite/group are passed through so the integration-test outer
+        // process (tests/integration.rs) can record them into the
+        // dashboard sqlite store without inferring from test-id prefix.
         println!(
             "{}",
             serde_json::json!({
                 "test": test,
                 "agent": agent,
+                "suite": suite,
+                "group": group,
                 "result": outcome,
                 "detail": detail,
             })
@@ -598,7 +612,14 @@ impl TestRunner {
                 },
             );
             eprintln!("[coord] LAZY MATRIX VALIDATION FAILED (under-spawn): {detail}");
-            self.record("__lazy_matrix.under_spawn", "?", false, &detail);
+            self.record(
+                "__lazy_matrix.under_spawn",
+                "?",
+                "contamination",
+                "lazy_matrix",
+                false,
+                &detail,
+            );
         }
 
         // 2. declared - (contacted ∪ ancestors-of-contacted) (over-spawn)
@@ -632,7 +653,14 @@ impl TestRunner {
                 unused.join(","),
             );
             eprintln!("[coord] LAZY MATRIX VALIDATION FAILED (over-spawn): {detail}");
-            self.record("__lazy_matrix.over_spawn", "?", false, &detail);
+            self.record(
+                "__lazy_matrix.over_spawn",
+                "?",
+                "contamination",
+                "lazy_matrix",
+                false,
+                &detail,
+            );
         }
     }
 }
@@ -1097,12 +1125,21 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
                     "harness:test-end-fail"
                 };
                 crate::pause_points::pause_if_match(tag, &test.id);
-                runner.record(&test.id, &outcome.agent, outcome.pass, &outcome.detail);
+                runner.record(
+                    &test.id,
+                    &outcome.agent,
+                    test.suite,
+                    test.group,
+                    outcome.pass,
+                    &outcome.detail,
+                );
             } else {
                 crate::pause_points::pause_if_match("harness:test-end-fail", &test.id);
                 runner.record(
                     &test.id,
                     "?",
+                    test.suite,
+                    test.group,
                     false,
                     &format!("test timeout ({}s)", test.timeout_secs),
                 );

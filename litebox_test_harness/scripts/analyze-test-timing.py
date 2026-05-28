@@ -1,39 +1,72 @@
 #!/usr/bin/env python3
 """
-Analyze per-test timing JSONL produced by litebox_test_harness integration tests.
+Analyze per-test timing data from the central dashboard sqlite store
+populated by litebox_test_harness's integration test binary
+(``<main-worktree>/.dashboard/results.sqlite`` by default; override
+with ``LITEBOX_DASHBOARD_DIR``).
 
 Usage:
-  ./analyze-test-timing.py target/test-logs/per-test-timing.jsonl
-  ./analyze-test-timing.py run-A.jsonl run-B.jsonl   # diff two runs
+  ./analyze-test-timing.py                        # latest run in default store
+  ./analyze-test-timing.py path/to/results.sqlite # latest run in that store
+  ./analyze-test-timing.py path/to/results.sqlite RUN_ID   # specific run
+  ./analyze-test-timing.py runA.sqlite runB.sqlite         # diff two runs
 
-Each input line is one JSON object with the schema emitted by tests/integration.rs:
-  {"test":..., "pass":..., "t_acquire_ms":..., "t_docker_start_ms":...,
-   "t_docker_spawn_ms":..., "t_litebox_init_ms":..., "t_harness_load_ms":...,
-   "t_useful_ms":..., "t_drain_ms":..., "verdict":..., "jobs":...}
+Rows are loaded by joining ``run_results`` to ``runs``; the rest of
+the script doesn't care where the data came from.
 """
-import json
+import os
+import sqlite3
+import subprocess
 import sys
 from collections import defaultdict
+from pathlib import Path
+
+
+def _resolve_default_sqlite() -> Path:
+    """Mirror dashboard.py's default state-dir resolution."""
+    env = os.environ.get("LITEBOX_DASHBOARD_DIR")
+    if env:
+        return Path(env) / "results.sqlite"
+    out = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True, capture_output=True, text=True,
+    )
+    return Path(out.stdout.strip()).parent / ".dashboard" / "results.sqlite"
+
+
+_TIMING_COLS = [
+    "t_acquire_ms", "t_docker_start_ms", "t_docker_spawn_ms",
+    "t_litebox_init_ms", "t_harness_load_ms", "t_harness_args_ms",
+    "t_harness_dispatch_ms", "t_useful_ms", "t_drain_ms",
+]
+
+
+def _load_sqlite(path: Path, run_id: int | None = None) -> list[dict]:
+    """Query ``run_results`` from sqlite, latest run if ``run_id`` is
+    None. Returns row dicts keyed by ``test``, ``pass``, ``verdict``,
+    each ``t_*_ms`` field, and ``jobs``.
+    """
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    if run_id is None:
+        row = conn.execute("SELECT MAX(run_id) FROM runs").fetchone()
+        if row and row[0] is not None:
+            run_id = int(row[0])
+        else:
+            return []
+    cols = ", ".join(_TIMING_COLS)
+    sql_rows = conn.execute(
+        f"SELECT test_id AS test, pass, verdict, {cols},"
+        f" (SELECT jobs FROM runs WHERE run_id = ?) AS jobs"
+        f" FROM run_results WHERE run_id = ?",
+        (run_id, run_id),
+    ).fetchall()
+    return [{k: r[k] for k in r.keys() if r[k] is not None} for r in sql_rows]
 
 
 def load(path):
-    """Load a JSONL file, merging main + drain lines by (test, pass)."""
-    rows = {}
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as e:
-                print(f"warn: bad line in {path}: {e}", file=sys.stderr)
-                continue
-            k = (obj.get("test"), obj.get("pass"))
-            if k not in rows:
-                rows[k] = {}
-            rows[k].update(obj)
-    return list(rows.values())
+    """Compatibility shim — accepts either a Path or string."""
+    return _load_sqlite(Path(path))
 
 
 def fmt_ms(x):
@@ -160,11 +193,21 @@ def diff(a, b):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__, file=sys.stderr)
-        sys.exit(2)
+    if len(sys.argv) == 1:
+        # No args: query the default sqlite store, latest run.
+        default = _resolve_default_sqlite()
+        if not default.exists():
+            print(__doc__, file=sys.stderr)
+            print(f"\nNo default sqlite store at {default}", file=sys.stderr)
+            sys.exit(2)
+        summary(load(default), str(default))
+        return
     if len(sys.argv) == 2:
         summary(load(sys.argv[1]), sys.argv[1])
+    elif len(sys.argv) == 3 and sys.argv[2].isdigit():
+        # `analyze.py path/results.sqlite 42` — specific run_id.
+        rows = _load_sqlite(Path(sys.argv[1]), run_id=int(sys.argv[2]))
+        summary(rows, f"{sys.argv[1]}@run_id={sys.argv[2]}")
     elif len(sys.argv) == 3:
         a = load(sys.argv[1])
         b = load(sys.argv[2])

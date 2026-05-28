@@ -54,18 +54,12 @@ use libtest_mimic::{Arguments, Failed, Trial};
 
 // ── Per-test timing telemetry ────────────────────────────────────────
 //
-// Each test produces JSONL lines in `target/test-logs/per-test-timing.jsonl`:
-//   * One synchronous line emitted from run_one_test once the JSON
-//     result is observed: includes t_acquire_ms / t_docker_start_ms /
-//     t_useful_ms / verdict. Always present, even if drain gets cut.
-//   * One optional drain line emitted from spawn_drain when the
-//     container actually exits: `{test, pass, t_drain_ms}`. Joined
-//     to the main line by (test, pass) in the analyzer. May be missing
-//     if cargo-test exits before the drain thread completes.
-//
-// Used to verify that subsequent perf optimizations (cgroup limits,
-// docker overhead trims, timeout budgets) actually help. See plan in
-// `~/.copilot/session-state/.../plan.md`.
+// Per-test results land in the central dashboard sqlite at
+// `<main-worktree>/.dashboard/results.sqlite`. The producer writes
+// directly there via the `dashboard_store` module below; there is no
+// JSONL sink. See litebox_test_harness/scripts/dashboard.py and
+// litebox_test_harness/scripts/analyze-test-timing.py for the
+// consumer side.
 
 /// Path to the per-trial timing file (host side). Bind-mounted into the
 /// container at `/tmp/litebox-timing.log`; each in-container process
@@ -135,23 +129,17 @@ fn broker_elf_cache_dir() -> &'static PathBuf {
     })
 }
 
-fn timing_file() -> &'static Mutex<std::fs::File> {
-    static FILE: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
-    FILE.get_or_init(|| {
-        let path = log_dir().join("per-test-timing.jsonl");
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
-        Mutex::new(f)
-    })
-}
+// ── Dashboard sqlite store ───────────────────────────────────────────
+// Producer-side direct writes. See `tests/common/dashboard_store.rs`
+// for the schema, init, record, finalize, and selection logic.
+#[path = "common/dashboard_store.rs"]
+mod dashboard_store;
 
 fn emit_timing_main(
     test: &str,
     pass: &str,
+    suite: Option<&str>,
+    group: Option<&str>,
     t_acquire_ms: u128,
     t_docker_start_ms: u128,
     t_docker_spawn_ms: Option<u128>,
@@ -160,37 +148,25 @@ fn emit_timing_main(
     sub_phases: &SubPhaseMs,
     t_useful_ms: u128,
     verdict: &str,
-    jobs: usize,
+    _jobs: usize,
 ) {
-    use std::io::Write as _;
-    let mut line = format!(
-        "{{\"test\":\"{test}\",\"pass\":\"{pass}\",\
-         \"t_acquire_ms\":{t_acquire_ms},\"t_docker_start_ms\":{t_docker_start_ms}",
+    dashboard_store::record_result(
+        test,
+        pass,
+        verdict,
+        suite,
+        group,
+        dashboard_store::Timings {
+            t_acquire_ms: Some(t_acquire_ms),
+            t_docker_start_ms: Some(t_docker_start_ms),
+            t_docker_spawn_ms,
+            t_litebox_init_ms,
+            t_harness_load_ms,
+            t_harness_args_ms: sub_phases.field_value("t_harness_args_ms"),
+            t_harness_dispatch_ms: sub_phases.field_value("t_harness_dispatch_ms"),
+            t_useful_ms: Some(t_useful_ms),
+        },
     );
-    if let Some(v) = t_docker_spawn_ms {
-        line.push_str(&format!(",\"t_docker_spawn_ms\":{v}"));
-    }
-    if let Some(v) = t_litebox_init_ms {
-        line.push_str(&format!(",\"t_litebox_init_ms\":{v}"));
-    }
-    if let Some(v) = t_harness_load_ms {
-        line.push_str(&format!(",\"t_harness_load_ms\":{v}"));
-    }
-    // Phase A sub-phase split. Each is the delta between adjacent
-    // markers in `litebox_timing`'s file channel; cumulative should
-    // sum to `t_litebox_init_ms`/`t_harness_load_ms` (within rounding).
-    // See `SubPhaseMs::compute` for the full marker order.
-    for (key, value) in sub_phases.fields() {
-        if let Some(v) = value {
-            line.push_str(&format!(",\"{key}\":{v}"));
-        }
-    }
-    line.push_str(&format!(
-        ",\"t_useful_ms\":{t_useful_ms},\"verdict\":\"{verdict}\",\"jobs\":{jobs}}}\n"
-    ));
-    if let Ok(mut f) = timing_file().lock() {
-        let _ = f.write_all(line.as_bytes());
-    }
 }
 
 /// All timing markers we recognise on the file channel + the
@@ -323,6 +299,16 @@ impl SubPhaseMs {
             ("t_harness_dispatch_ms", self.t_harness_dispatch_ms),
         ]
     }
+
+    /// Lookup a single field by its emitted JSON key. Used by the
+    /// dashboard sqlite writer so we don't have to re-derive each
+    /// timing slot at the call site.
+    fn field_value(&self, name: &str) -> Option<u128> {
+        self.fields()
+            .into_iter()
+            .find(|(k, _)| *k == name)
+            .and_then(|(_, v)| v)
+    }
 }
 
 fn record_timing_marker(markers: &mut TimingMarkers, line: &str, pass: &str, arrival_ns: u64) {
@@ -396,11 +382,7 @@ fn ns_delta_ms(start_ns: u64, end_ns: u64) -> Option<u128> {
 }
 
 fn emit_timing_drain(test: &str, pass: &str, t_drain_ms: u128) {
-    use std::io::Write as _;
-    let line = format!("{{\"test\":\"{test}\",\"pass\":\"{pass}\",\"t_drain_ms\":{t_drain_ms}}}\n");
-    if let Ok(mut f) = timing_file().lock() {
-        let _ = f.write_all(line.as_bytes());
-    }
+    dashboard_store::record_drain(test, pass, t_drain_ms);
 }
 
 // ── Per-test docker run model ────────────────────────────────────────
@@ -968,11 +950,28 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
 
     let sub_phases = SubPhaseMs::compute(&markers);
 
+    // Suite / group come from the in-container harness record() JSON
+    // (we extended its emitter to include them). Owned strings so the
+    // outer process can pass them to the dashboard writer without
+    // borrowing from `found`.
+    let suite_owned: Option<String> = found
+        .as_ref()
+        .and_then(|v| v.get("suite"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
+    let group_owned: Option<String> = found
+        .as_ref()
+        .and_then(|v| v.get("group"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
+
     // Emit the main timing line synchronously (drain may get cut off
     // if cargo-test exits early).
     emit_timing_main(
         test_id,
         pass_static,
+        suite_owned.as_deref(),
+        group_owned.as_deref(),
         t_acquire_ms,
         t_docker_start_ms,
         t_docker_spawn_ms,
@@ -1162,18 +1161,29 @@ fn main() {
     // from the argv we hand to libtest-mimic (so its single-positional
     // parser doesn't error). We'll apply OR-filtering ourselves below.
     let positionals: Vec<String> = pos_idx.iter().map(|&i| argv[i].clone()).collect();
-    let args = if positionals.len() >= 2 {
+    // `--fill[=N]` extension: select up to N trials that have no
+    // run_results row at the current clean HEAD (dirty_hash IS NULL).
+    // Parsed and stripped before handing to libtest-mimic.
+    let fill_n: Option<usize> = parse_fill_flag(&argv);
+    let mut args = if positionals.len() >= 2 || fill_n.is_some() {
         let drop: std::collections::HashSet<usize> = pos_idx.iter().skip(1).copied().collect();
         let trimmed: Vec<String> = argv
             .iter()
             .enumerate()
-            .filter(|(i, _)| !drop.contains(i))
+            .filter(|(i, s)| !drop.contains(i) && !is_fill_arg(s))
             .map(|(_, s)| s.clone())
             .collect();
         Arguments::from_iter(trimmed)
     } else {
         Arguments::from_args()
     };
+
+    // Initialize the central dashboard sqlite — but only when the user
+    // is actually going to run trials. `--list` mode bypasses init so
+    // we don't create empty `runs` rows from discovery passes.
+    if !args.list {
+        let _ = dashboard_store::init();
+    }
 
     let mut trials: Vec<Trial> = Vec::new();
 
@@ -1220,12 +1230,37 @@ fn main() {
         copilot::register_trials(&mut trials);
     }
 
+    // Record the universe size on the runs row so the renderer can
+    // show "N covered of M known".
+    if !args.list {
+        dashboard_store::record_universe_size(i64::try_from(trials.len()).unwrap_or(0));
+    }
+
+    // `--fill[=N]`: pick a batch of trials that have no run_results
+    // row at the current clean HEAD. Positional filters take
+    // precedence (manual debugging stays sharp).
+    if let Some(n) = fill_n
+        && positionals.is_empty()
+    {
+        let kept: std::collections::HashSet<String> =
+            dashboard_store::select_fill_batch(&trials, n)
+                .into_iter()
+                .collect();
+        let total = trials.len();
+        trials.retain(|t| kept.contains(t.name()));
+        eprintln!(
+            "[fill] selected {}/{} trials missing for current HEAD",
+            trials.len(),
+            total
+        );
+    }
+
     // OR-of-positionals prefilter. When two or more positional filters
     // were given, we already stripped the extras from libtest-mimic's
     // argv; here we drop trials that don't match ANY positional and
     // null out `args.filter` so libtest-mimic doesn't double-filter
     // with just the first positional.
-    let args = if positionals.len() >= 2 {
+    if positionals.len() >= 2 {
         let exact = args.exact;
         trials.retain(|t| {
             let name = t.name();
@@ -1233,15 +1268,31 @@ fn main() {
                 .iter()
                 .any(|p| if exact { name == p } else { name.contains(p) })
         });
-        Arguments {
-            filter: None,
-            ..args
-        }
-    } else {
-        args
-    };
+        args.filter = None;
+    }
 
-    libtest_mimic::run(&args, trials).exit();
+    let conclusion = libtest_mimic::run(&args, trials);
+    dashboard_store::finalize();
+    conclusion.exit();
+}
+
+/// Parse `--fill` / `--fill=N` from argv. Returns the batch cap (or
+/// the default 300 for bare `--fill`).
+fn parse_fill_flag(argv: &[String]) -> Option<usize> {
+    const DEFAULT_FILL: usize = 300;
+    for a in argv {
+        if a == "--fill" {
+            return Some(DEFAULT_FILL);
+        }
+        if let Some(rest) = a.strip_prefix("--fill=") {
+            return rest.parse().ok().or(Some(DEFAULT_FILL));
+        }
+    }
+    None
+}
+
+fn is_fill_arg(a: &str) -> bool {
+    a == "--fill" || a.starts_with("--fill=")
 }
 
 // ── Per-Trial runner ─────────────────────────────────────────────────

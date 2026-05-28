@@ -197,3 +197,7 @@ litebox_tool_executor/rootfs/litebox_syscall_rewriter
 
 # Session-scoped diagnostic artifacts (audit logs, discovery output)
 /files/
+
+# Test-result dashboard store (sqlite + rendered markdown + CI logs).
+# See litebox_test_harness/scripts/dashboard.py.
+/.dashboard/
