@@ -117,7 +117,7 @@ use litebox_common_optee::{OpteeSmcReturnCode, TaFlags, TeeUuid};
 use spin::mutex::SpinMutex;
 
 /// Maximum number of concurrent TA instances to avoid out of memory situations.
-pub const MAX_TA_INSTANCES: usize = 16;
+const MAX_TA_INSTANCES: usize = 16;
 
 /// A loaded TA instance.
 ///
@@ -171,7 +171,7 @@ unsafe impl Sync for TaInstance {}
 /// `(ta_uuid, ta_flags)` so cleanup paths and `try_acquire_for_session`'s
 /// snapshot still have them after the instance is gone.
 #[derive(Clone)]
-pub(crate) enum SessionEntry {
+enum SessionEntry {
     Live(Arc<TaInstance>),
     Dead { ta_uuid: TeeUuid, ta_flags: TaFlags },
 }
@@ -195,33 +195,33 @@ impl SessionEntry {
 /// Session map for tracking active sessions.
 ///
 /// Maps runner-allocated session IDs to session entries.
-pub(crate) struct SessionMap {
+struct SessionMap {
     inner: SpinMutex<HashMap<u32, SessionEntry>>,
 }
 
 impl SessionMap {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             inner: SpinMutex::new(HashMap::new()),
         }
     }
 
-    pub(crate) fn get_entry(&self, session_id: u32) -> Option<SessionEntry> {
+    fn get_entry(&self, session_id: u32) -> Option<SessionEntry> {
         self.inner.lock().get(&session_id).cloned()
     }
 
-    pub(crate) fn insert_live(&self, session_id: u32, instance: Arc<TaInstance>) {
+    fn insert_live(&self, session_id: u32, instance: Arc<TaInstance>) {
         self.inner
             .lock()
             .insert(session_id, SessionEntry::Live(instance));
     }
 
-    pub(crate) fn remove(&self, session_id: u32) -> Option<SessionEntry> {
+    fn remove(&self, session_id: u32) -> Option<SessionEntry> {
         self.inner.lock().remove(&session_id)
     }
 
     /// Count live sessions whose instance has the given page table id.
-    pub(crate) fn count_sessions_for_pt(&self, task_page_table_id: usize) -> usize {
+    fn count_sessions_for_pt(&self, task_page_table_id: usize) -> usize {
         self.inner
             .lock()
             .values()
@@ -235,7 +235,7 @@ impl SessionMap {
     /// Mark all live sessions whose instance has the given page table id
     /// as `Dead`, capturing the instance's uuid and flags on the way out
     /// so cleanup paths still have them.
-    pub(crate) fn mark_sessions_dead_for_pt(&self, task_page_table_id: usize) {
+    fn mark_sessions_dead_for_pt(&self, task_page_table_id: usize) {
         for entry in self.inner.lock().values_mut() {
             let dead = match entry {
                 SessionEntry::Live(arc) if arc.task_page_table_id == task_page_table_id => {
@@ -260,22 +260,22 @@ impl Default for SessionMap {
 ///
 /// Single-instance TAs (with `TA_FLAG_SINGLE_INSTANCE`) share a single TA instance
 /// across all sessions. This cache stores instances by UUID for fast reuse lookup.
-pub(crate) struct SingleInstanceCache {
+struct SingleInstanceCache {
     inner: SpinMutex<HashMap<TeeUuid, Arc<TaInstance>>>,
 }
 
 impl SingleInstanceCache {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             inner: SpinMutex::new(HashMap::new()),
         }
     }
 
-    pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<Arc<TaInstance>> {
+    fn get(&self, uuid: &TeeUuid) -> Option<Arc<TaInstance>> {
         self.inner.lock().get(uuid).cloned()
     }
 
-    pub(crate) fn insert(&self, uuid: TeeUuid, instance: Arc<TaInstance>) {
+    fn insert(&self, uuid: TeeUuid, instance: Arc<TaInstance>) {
         self.inner.lock().insert(uuid, instance);
     }
 
@@ -293,7 +293,7 @@ impl SingleInstanceCache {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.inner.lock().len()
     }
 }
@@ -372,7 +372,7 @@ impl Drop for SessionIdGuard {
 ///
 /// On drop, the per-UUID lock is released first, then the per-session-id
 /// marker.
-pub(crate) struct SessionToken<'a> {
+struct SessionToken<'a> {
     manager: &'a SessionManager,
     /// Held `Arc` of the per-UUID `SpinMutex`. The guard returned by
     /// `try_lock()` was [`core::mem::forget`]-ed at acquisition time; this
@@ -455,7 +455,7 @@ impl SessionManager {
     ///
     /// Returns `None` if this UUID has never been successfully loaded.
     /// Callers should conservatively assume single-instance when `None`.
-    pub fn get_known_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
+    fn get_known_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
         self.known_flags.lock().get(uuid).copied()
     }
 
