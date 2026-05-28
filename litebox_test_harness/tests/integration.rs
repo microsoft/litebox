@@ -583,11 +583,15 @@ fn default_jobs() -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    // Roughly num_cpus / 1.5, clamped to a reasonable range. Past
-    // jobs=10 dockerd serializes container creation badly enough that
-    // further parallelism gives diminishing returns (verified by
-    // phase-2 measurement: jobs=5→10 cut wall by ~9% on PB.* family).
-    ((cpus as f32 / 1.5) as usize).clamp(2, 10)
+    // Roughly num_cpus / 1.5, clamped to a reasonable range.
+    //
+    // The upper bound was 10 historically — phase-2 measurement on
+    // a smaller dev box found that past jobs=10 dockerd serialized
+    // container creation badly enough that further parallelism gave
+    // diminishing returns. Bumped to 20 in 2026-05 for 32+ core
+    // boxes where the dockerd serialization point is higher. Tune
+    // via LITEBOX_TEST_JOBS env var on a case-by-case basis.
+    ((cpus as f32 / 1.5) as usize).clamp(2, 20)
 }
 
 fn current_jobs_cap() -> usize {
@@ -1184,8 +1188,8 @@ fn main() {
     // `--fill[=N]` extension: select up to N trials that have no
     // run_results row at the current clean HEAD (dirty_hash IS NULL).
     // Parsed and stripped before handing to libtest-mimic.
-    let fill_n: Option<usize> = parse_fill_flag(&argv);
-    let mut args = if positionals.len() >= 2 || fill_n.is_some() {
+    let fill_cap: Option<FillCap> = parse_fill_flag(&argv);
+    let mut args = if positionals.len() >= 2 || fill_cap.is_some() {
         let drop: std::collections::HashSet<usize> = pos_idx.iter().skip(1).copied().collect();
         let trimmed: Vec<String> = argv
             .iter()
@@ -1256,22 +1260,33 @@ fn main() {
         dashboard_store::record_universe_size(i64::try_from(trials.len()).unwrap_or(0));
     }
 
-    // `--fill[=N]`: pick a batch of trials that have no run_results
+    // `--fill[=N|=Ns]`: pick a batch of trials that have no run_results
     // row at the current clean HEAD. Positional filters take
     // precedence (manual debugging stays sharp).
-    if let Some(n) = fill_n
+    if let Some(cap) = fill_cap
         && positionals.is_empty()
     {
+        let cap_for_selector = match cap {
+            FillCap::Count(n) => dashboard_store::FillCap::Count(n),
+            FillCap::BudgetSecs(s) => dashboard_store::FillCap::BudgetSecs {
+                secs: s,
+                jobs: current_jobs_cap() as u64,
+            },
+        };
         let kept: std::collections::HashSet<String> =
-            dashboard_store::select_fill_batch(&trials, n)
+            dashboard_store::select_fill_batch(&trials, cap_for_selector)
                 .into_iter()
                 .collect();
         let total = trials.len();
         trials.retain(|t| kept.contains(t.name()));
+        let cap_str = match cap {
+            FillCap::Count(n) => format!("count={n}"),
+            FillCap::BudgetSecs(s) => format!("budget={s}s"),
+        };
         eprintln!(
-            "[fill] selected {}/{} trials missing for current HEAD",
+            "[fill] selected {}/{} trials missing for current HEAD ({cap_str})",
             trials.len(),
-            total
+            total,
         );
     }
 
@@ -1296,16 +1311,30 @@ fn main() {
     conclusion.exit();
 }
 
-/// Parse `--fill` / `--fill=N` from argv. Returns the batch cap (or
-/// the default 300 for bare `--fill`).
-fn parse_fill_flag(argv: &[String]) -> Option<usize> {
+/// Parsed `--fill` argument: a hard count cap or a wall-time
+/// budget that the selector translates into "as many tests as
+/// fit." `--fill` with no value defaults to 300 count.
+#[derive(Clone, Copy, Debug)]
+enum FillCap {
+    Count(usize),
+    BudgetSecs(u64),
+}
+
+/// Parse `--fill` / `--fill=N` / `--fill=Ns` from argv.
+///   `--fill`     → Count(300)
+///   `--fill=200` → Count(200)
+///   `--fill=600s` → BudgetSecs(600)
+fn parse_fill_flag(argv: &[String]) -> Option<FillCap> {
     const DEFAULT_FILL: usize = 300;
     for a in argv {
         if a == "--fill" {
-            return Some(DEFAULT_FILL);
+            return Some(FillCap::Count(DEFAULT_FILL));
         }
         if let Some(rest) = a.strip_prefix("--fill=") {
-            return rest.parse().ok().or(Some(DEFAULT_FILL));
+            if let Some(secs) = rest.strip_suffix('s') {
+                return Some(FillCap::BudgetSecs(secs.parse().unwrap_or(600)));
+            }
+            return Some(FillCap::Count(rest.parse().unwrap_or(DEFAULT_FILL)));
         }
     }
     None

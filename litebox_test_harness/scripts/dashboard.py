@@ -976,17 +976,29 @@ def _drive_ref(ref: str, ci_worktree: str, args: argparse.Namespace) -> bool:
         )
     except subprocess.CalledProcessError:
         return False
-    # 3. cargo test -- --fill
+    # 3. cargo test -- --fill — time-budget mode by default.
+    # `--fill=Ns` tells the Rust selector to pack as many tests as
+    # will fit in N seconds of estimated wall time (sum t_useful_ms
+    # / jobs); falls back to default 5s per never-run test.
     cargo_args = [
         "cargo", "test", "-p", "litebox_test_harness",
-        "--test", "integration", "--", "--fill",
+        "--test", "integration", "--",
     ]
     if args.batch_size:
-        cargo_args[-1] = f"--fill={args.batch_size}"
+        cargo_args.append(f"--fill={args.batch_size}")
+    else:
+        cargo_args.append(f"--fill={args.cycle_budget_secs}s")
+    # Bump parallelism — defaults to whatever LITEBOX_TEST_JOBS env
+    # was set to before. The auto loop's bigger value than the
+    # harness's intrinsic clamp(2, 20) is fine; the env override
+    # takes priority.
+    if args.jobs:
+        env["LITEBOX_TEST_JOBS"] = str(args.jobs)
     try:
         proc = subprocess.run(
             cargo_args, cwd=ci_worktree, env=env,
-            timeout=args.cycle_budget_secs,
+            # Outer cargo timeout is budget + generous grace.
+            timeout=args.cycle_budget_secs * 2 + 600,
         )
         return proc.returncode == 0
     except subprocess.TimeoutExpired:
@@ -1044,12 +1056,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_refs.set_defaults(func=cmd_refs)
 
     p_auto = sub.add_parser("auto", help="autonomous fill driver")
-    p_auto.add_argument("--interval", type=int, default=60,
-                        help="sleep between full passes (default 60s)")
-    p_auto.add_argument("--batch-size", type=int, default=DEFAULT_FILL_BATCH,
-                        help=f"--fill=N per ref (default {DEFAULT_FILL_BATCH})")
-    p_auto.add_argument("--cycle-budget-secs", type=int, default=3600,
-                        help="outer cargo-test timeout per ref (default 3600)")
+    p_auto.add_argument(
+        "--interval", type=int, default=10,
+        help="sleep between full passes (default 10s — was 60s "
+             "historically; container teardown happens in the "
+             "background so back-to-back cycles are fine)",
+    )
+    p_auto.add_argument(
+        "--cycle-budget-secs", type=int, default=600,
+        help="per-ref cycle wall-time budget passed to "
+             "`--fill=<budget>s` (default 600s = 10min). The Rust "
+             "selector packs as many trials as fit.",
+    )
+    p_auto.add_argument(
+        "--batch-size", type=int, default=None,
+        help="override: hard count of trials per cycle. Mutually "
+             "exclusive with the time-budget mode; sets "
+             "`--fill=N` instead. Default None (use --cycle-budget-secs).",
+    )
+    p_auto.add_argument(
+        "--jobs", type=int, default=None,
+        help="set LITEBOX_TEST_JOBS for cargo (default: use whatever "
+             "the harness derives from num_cpus).",
+    )
     p_auto.add_argument("--once", action="store_true",
                         help="run one pass and exit")
     p_auto.add_argument("--quiet", "-q", action="store_true")

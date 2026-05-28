@@ -460,10 +460,29 @@ pub fn finalize() {
     );
 }
 
-/// Select up to `n` trial *names* (e.g. `native::PIDF.spawn_and_open`)
-/// that have no clean-state result at the current `commit_sha`.
+/// How `select_fill_batch` decides where to stop.
 ///
-/// Priority order:
+/// `Count(N)` — pick up to N trials (hard cap).
+///
+/// `BudgetSecs { secs, jobs }` — keep adding trials until the
+/// estimated wall time (sum of t_useful_ms / jobs) reaches `secs`.
+/// Per-trial cost is read from the most recent `latest_results`
+/// row; trials with no prior cost use `DEFAULT_TEST_COST_MS`.
+pub enum FillCap {
+    Count(usize),
+    BudgetSecs { secs: u64, jobs: u64 },
+}
+
+/// Per-test wall-time estimate used by `BudgetSecs` when we have no
+/// historical t_useful_ms for a trial. 5s is a reasonable median
+/// for litebox docker-run + setup overhead on top of a small test.
+const DEFAULT_TEST_COST_MS: u64 = 5_000;
+
+/// Select trial *names* (e.g. `native::PIDF.spawn_and_open`) that
+/// have no clean-state result at the current `commit_sha`,
+/// capped by `cap`.
+///
+/// Priority order within the candidate set:
 /// 1. Never seen anywhere (`latest_results` has no row).
 /// 2. Stalest by `latest_results.finished_ts_ms` ascending.
 /// 3. The rest, sorted alphabetically.
@@ -473,15 +492,19 @@ pub fn finalize() {
 /// ones. Trial names that don't follow `<pass>::<id>` are
 /// ignored (host::fwd, dropbear_bash trials, etc. — those are
 /// out of scope for the autonomous fill).
-pub fn select_fill_batch(trials: &[libtest_mimic::Trial], n: usize) -> Vec<String> {
-    if n == 0 {
+pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<String> {
+    let count_cap = match cap {
+        FillCap::Count(n) => n,
+        FillCap::BudgetSecs { .. } => usize::MAX, // budget-bound below
+    };
+    if count_cap == 0 {
         return Vec::new();
     }
     let Some(ctx) = ctx() else {
-        // Dashboard disabled — return alphabetically, capped.
+        // Dashboard disabled — return alphabetically, capped by count.
         return trials
             .iter()
-            .take(n)
+            .take(count_cap)
             .map(|t| t.name().to_string())
             .collect();
     };
@@ -520,16 +543,22 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], n: usize) -> Vec<Strin
         }
     }
 
-    // Pull per-(pass, id) staleness so we can prioritize within
-    // the candidate set. Hash map: trial name → finished_ts_ms.
+    // Pull per-(pass, id) staleness AND per-test wall-time cost so
+    // we can prioritize within the candidate set and (for the
+    // BudgetSecs cap) estimate accumulated cost.
     let mut stalest: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut suites: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut costs: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     {
         let mut stmt = conn
             .prepare(
-                "SELECT pass, test_id, finished_ts_ms, suite
-                   FROM latest_results",
+                "SELECT lr.pass, lr.test_id, lr.finished_ts_ms, lr.suite,
+                        rr.t_useful_ms
+                   FROM latest_results lr
+                   JOIN run_results rr ON rr.run_id = lr.run_id
+                                       AND rr.test_id = lr.test_id
+                                       AND rr.pass    = lr.pass",
             )
             .expect("dashboard: prepare latest query");
         let rows = stmt
@@ -538,14 +567,16 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], n: usize) -> Vec<Strin
                 let id: String = r.get(1)?;
                 let ts: i64 = r.get(2)?;
                 let suite: Option<String> = r.get(3)?;
-                Ok((format!("{pass}::{id}"), ts, suite))
+                let cost: i64 = r.get(4)?;
+                Ok((format!("{pass}::{id}"), ts, suite, cost))
             })
             .expect("dashboard: latest query");
         for row in rows.flatten() {
             stalest.insert(row.0.clone(), row.1);
             if let Some(s) = row.2 {
-                suites.insert(row.0, s);
+                suites.insert(row.0.clone(), s);
             }
+            costs.insert(row.0, row.3);
         }
     }
     drop(conn);
@@ -576,7 +607,33 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], n: usize) -> Vec<Strin
     let mut ordered: Vec<String> = round_robin_by_suite(&never_run, &suites);
     let stalest_names: Vec<String> = seen_before.into_iter().map(|(n, _)| n).collect();
     ordered.extend(round_robin_by_suite(&stalest_names, &suites));
-    ordered.truncate(n);
+
+    // Apply the cap.
+    match cap {
+        FillCap::Count(n) => {
+            ordered.truncate(n);
+        }
+        FillCap::BudgetSecs { secs, jobs } => {
+            let budget_ms = secs.saturating_mul(1000);
+            let jobs = jobs.max(1);
+            let mut accumulated_ms: u64 = 0;
+            let mut keep_n = 0usize;
+            for name in &ordered {
+                let cost_ms = costs
+                    .get(name)
+                    .copied()
+                    .map(|c| u64::try_from(c).unwrap_or(DEFAULT_TEST_COST_MS))
+                    .unwrap_or(DEFAULT_TEST_COST_MS);
+                // Wall-time contribution under parallelism `jobs`.
+                accumulated_ms += cost_ms / jobs;
+                keep_n += 1;
+                if accumulated_ms >= budget_ms {
+                    break;
+                }
+            }
+            ordered.truncate(keep_n);
+        }
+    }
     ordered
 }
 
