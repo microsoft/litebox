@@ -225,8 +225,8 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
 
     lines = ["## Tracked refs\n",
              "| Ref | Worktree | Pass | HEAD "
-             "| native cov | native total | native pass | native fail "
-             "| litebox cov | litebox total | litebox pass | litebox fail |",
+             "| native total | native cov | native pass | native fail "
+             "| litebox total | litebox cov | litebox pass | litebox fail |",
              "|---|---|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|"]
@@ -246,8 +246,8 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
                 conn, head_sha, pass_name
             )
             cells.extend([
-                str(covered),
                 str(universe_n) if universe_n else "?",
+                str(covered),
                 str(n_pass),
                 str(n_fail),
             ])
@@ -389,8 +389,8 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     now = now_ms()
     lines = ["## Result groups (per commit × dirty-state)\n",
              "| Tracked ref | Sha | Dirty | Worktree(s) "
-             "| native cov | native total | native pass | native fail "
-             "| litebox cov | litebox total | litebox pass | litebox fail | Newest |",
+             "| native total | native cov | native pass | native fail "
+             "| litebox total | litebox cov | litebox pass | litebox fail | Newest |",
              "|---|---|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|---|"]
@@ -409,8 +409,8 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
         for pass_name in ("native", "litebox"):
             covered, n_pass, n_fail = g["by_pass"].get(pass_name, (0, 0, 0))
             cells.extend([
-                str(covered),
                 str(universe_n) if universe_n else "?",
+                str(covered),
                 str(n_pass),
                 str(n_fail),
             ])
@@ -468,8 +468,8 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
 
     lines = ["## By suite × group (observed universe)\n",
              "| Suite | Group "
-             "| native cov | native total | native pass | native fail "
-             "| litebox cov | litebox total | litebox pass | litebox fail |",
+             "| native total | native cov | native pass | native fail "
+             "| litebox total | litebox cov | litebox pass | litebox fail |",
              "|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|"]
@@ -478,7 +478,7 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
         cells: list[str] = []
         for pass_name in ("native", "litebox"):
             cov, p, f = b[pass_name]
-            cells.extend([str(cov), str(total), str(p), str(f)])
+            cells.extend([str(total), str(cov), str(p), str(f)])
         lines.append(f"| {suite} | {group} | " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
 
