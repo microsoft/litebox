@@ -4444,7 +4444,8 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::BrokerTcpConn(_)
                         | crate::RawFdRef::BrokerPty(_)
                         | crate::RawFdRef::Signalfd(_)
-                        | crate::RawFdRef::Inotify(_) => {}
+                        | crate::RawFdRef::Inotify(_)
+                        | crate::RawFdRef::BrokerInetListener(_) => {}
                         crate::RawFdRef::Pipes(typed) => {
                             let direction = match self.global.pipes.half_pipe_type(typed) {
                                 Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
@@ -6723,6 +6724,9 @@ impl<FS: ShimFS> Task<FS> {
                             (FdClass::Signalfd, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::Inotify(fd) => {
+                            (FdClass::Inotify, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerInetListener(fd) => {
                             (FdClass::Inotify, Some(fd.object_id()), None, None)
                         }
                     }
@@ -10657,6 +10661,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 crate::RawFdRef::BrokerPty(_broker_pty) => false,
                 crate::RawFdRef::Signalfd(_signalfd) => false,
                 crate::RawFdRef::Inotify(_inotify) => false,
+                crate::RawFdRef::BrokerInetListener(_listener) => false,
             })
         .unwrap_or_else(|_| {
             log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
@@ -10836,6 +10841,7 @@ fn worker_exec_input_binding<FS: ShimFS>(
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::Signalfd(_broker_pipe) => WorkerExecInputBinding::Close,
             crate::RawFdRef::Inotify(_inotify) => WorkerExecInputBinding::Close,
+            crate::RawFdRef::BrokerInetListener(_listener) => WorkerExecInputBinding::Close,
         })
         .unwrap_or(WorkerExecInputBinding::Close)
 }
@@ -10990,6 +10996,7 @@ fn worker_exec_output_binding<FS: ShimFS>(
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::Signalfd(_broker_pipe) => WorkerExecOutputBinding::Close,
             crate::RawFdRef::Inotify(_inotify) => WorkerExecOutputBinding::Close,
+            crate::RawFdRef::BrokerInetListener(_listener) => WorkerExecOutputBinding::Close,
         })
         .unwrap_or(WorkerExecOutputBinding::Close)
 }

@@ -2817,6 +2817,10 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             drop(rds);
             return Ok(f(RawFdRef::Inotify(&fd)));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(f(RawFdRef::BrokerInetListener(&fd)));
+        }
         Err(Errno::EBADF)
     }
 }
@@ -2841,6 +2845,9 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     BrokerPty(&'a Arc<TypedFd<syscalls::broker_pty::BrokerPtySubsystem>>),
     Signalfd(&'a Arc<TypedFd<syscalls::signalfd::SignalfdSubsystem>>),
     Inotify(&'a Arc<TypedFd<syscalls::inotify::InotifySubsystem>>),
+    BrokerInetListener(
+        &'a Arc<TypedFd<syscalls::broker_inet_listener::BrokerInetListenerSubsystem>>,
+    ),
 }
 
 /// Planned worker-exec fd-bridge decision for a `RawFdRef`.
@@ -2935,6 +2942,9 @@ impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
                 todo!("encode SignalfdBridgeState from broker-backed signalfd")
             }
             RawFdRef::Inotify(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::BrokerInetListener(_fd) => {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
             }
         }
@@ -3187,6 +3197,9 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerPty(_fd) => alloc::format!("raw={raw_fd} broker_pty"),
                 crate::RawFdRef::Signalfd(_fd) => alloc::format!("raw={raw_fd} signalfd"),
                 crate::RawFdRef::Inotify(_fd) => alloc::format!("raw={raw_fd} inotify"),
+                crate::RawFdRef::BrokerInetListener(_fd) => {
+                    alloc::format!("raw={raw_fd} broker-inet-listener")
+                }
             })
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))
     }

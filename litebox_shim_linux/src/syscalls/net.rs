@@ -2224,7 +2224,9 @@ impl<FS: ShimFS> Task<FS> {
                 handle.with_entry(|entry| entry.shutdown(read, write))
             }
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTSOCK),
-            crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::Signalfd(_)
+            | crate::RawFdRef::Inotify(_)
+            | crate::RawFdRef::BrokerInetListener(_) => Err(Errno::ENOTSOCK),
         })?
     }
 
@@ -2600,7 +2602,7 @@ impl<FS: ShimFS> Task<FS> {
                             // Broker ptys are not broker-token-transferable over SCM yet.
                             Ok(false)
                         }
-                        crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => {
+                        crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) | crate::RawFdRef::BrokerInetListener(_) => {
                             Ok(false)
                         }
                     }

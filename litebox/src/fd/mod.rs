@@ -63,6 +63,8 @@ pub enum SubsystemKind {
     Signalfd,
     /// Inotify descriptors.
     Inotify,
+    /// Broker TCP listener descriptors.
+    BrokerInetListener,
     /// Broker TCP connection descriptors.
     BrokerTcpConn,
 }
