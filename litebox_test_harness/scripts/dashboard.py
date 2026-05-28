@@ -388,7 +388,7 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
 
     now = now_ms()
     lines = ["## Result groups (per commit × dirty-state)\n",
-             "| Tag | Sha | Dirty | Worktree(s) "
+             "| Tracked ref | Sha | Dirty | Worktree(s) "
              "| native cov | native total | native pass | native fail "
              "| litebox cov | litebox total | litebox pass | litebox fail | Newest |",
              "|---|---|---|---"
@@ -720,13 +720,23 @@ def cmd_auto(args: argparse.Namespace) -> int:
             ok = _drive_ref(ref, wt, args)
             if not args.quiet:
                 print(f"[auto] {ref} @ {wt}: {'ok' if ok else 'failed'}")
-        # Re-render after every full pass.
+        # Re-render after every full pass — and again every ~10s
+        # during the sleep window so ad-hoc session runs from other
+        # worktrees show up in summary.md within seconds of finishing,
+        # not at the end of the next cycle.
         conn = open_db(state_dir)
         write_summary(conn, state_dir)
         conn.close()
         if args.once:
             return 0
-        time.sleep(args.interval)
+        slept = 0
+        render_every = 10
+        while slept < args.interval:
+            time.sleep(min(render_every, args.interval - slept))
+            slept += render_every
+            conn = open_db(state_dir)
+            write_summary(conn, state_dir)
+            conn.close()
 
 
 def _drive_ref(ref: str, ci_worktree: str, args: argparse.Namespace) -> bool:
