@@ -11,6 +11,7 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::any::TypeId;
 use core::marker::PhantomData;
 use core::sync::atomic::AtomicBool;
 use thiserror::Error;
@@ -1062,6 +1063,8 @@ impl DescriptorEntry {
     #[must_use]
     fn matches_subsystem<Subsystem: FdEnabledSubsystem>(&self) -> bool {
         self.subsystem_kind == Subsystem::KIND
+            && (self.entry.as_ref() as &dyn core::any::Any).type_id()
+                == TypeId::of::<Subsystem::Entry>()
     }
 
     /// Obtains `self` as the subsystem's entry type.

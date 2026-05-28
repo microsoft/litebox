@@ -648,9 +648,10 @@ impl<FS: ShimFS> Task<FS> {
             watch.entries = current;
 
             if !removed.is_empty()
-                && !added.is_empty()
+                && (!added.is_empty() || !modified.is_empty())
                 && (mask & (IN_MOVED_FROM | IN_MOVED_TO)) != 0
             {
+                let moved_to = added.first().or_else(|| modified.first()).unwrap();
                 let cookie = Self::next_inotify_cookie();
                 if (mask & IN_MOVED_FROM) != 0 {
                     instance.events.push(InotifyEventRecord {
@@ -665,7 +666,7 @@ impl<FS: ShimFS> Task<FS> {
                         wd,
                         mask: IN_MOVED_TO,
                         cookie,
-                        name: added[0].clone(),
+                        name: moved_to.clone(),
                     });
                 }
             } else {
@@ -7421,7 +7422,7 @@ impl<FS: ShimFS> Task<FS> {
         })?;
 
         let mut set = super::epoll::PollSet::with_capacity(nfds);
-        let mut netlink_ready_count: usize = 0;
+        let mut eager_ready_count: usize = 0;
         for i in 0..nfds_signed {
             let mut fd = fds.read_at_offset(i).ok_or_else(|| {
                 if let Some(old) = saved_mask {
@@ -7435,7 +7436,7 @@ impl<FS: ShimFS> Task<FS> {
                 if self.netlink_sockets.borrow().contains_key(&fd_u32) {
                     fd.revents = fd.events; // Mark as ready
                     let _ = fds.write_at_offset(i, fd);
-                    netlink_ready_count += 1;
+                    eager_ready_count += 1;
                     continue;
                 }
             }
@@ -7443,10 +7444,31 @@ impl<FS: ShimFS> Task<FS> {
             let events = litebox::event::Events::from_bits_truncate(
                 fd.events.reinterpret_as_unsigned().into(),
             );
+            if events.contains(litebox::event::Events::IN)
+                && let Ok(raw_fd) = usize::try_from(fd.fd)
+            {
+                let inotify_ready = {
+                    let files = self.files.borrow();
+                    files
+                        .with_inotify_fd(raw_fd, |state| {
+                            if state.events.is_empty() {
+                                self.rescan_inotify_instance(state);
+                            }
+                            Ok(!state.events.is_empty())
+                        })
+                        .unwrap_or(false)
+                };
+                if inotify_ready {
+                    fd.revents = 1;
+                    let _ = fds.write_at_offset(i, fd);
+                    eager_ready_count += 1;
+                    continue;
+                }
+            }
             set.add_fd(fd.fd, events);
         }
 
-        // If there are non-netlink fds, do the normal poll wait.
+        // If there are fds that were not already satisfied above, do the normal poll wait.
         if !set.is_empty() {
             // PE.14: loop to swallow spurious EINTR from default-ignore
             // signals (SIGCHLD with SIG_DFL). Same pattern as
@@ -7486,7 +7508,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // Write just the revents back for non-netlink fds.
         let fds_base_addr = fds.as_usize();
-        let mut ready_count = netlink_ready_count;
+        let mut ready_count = eager_ready_count;
         for (i, revents) in set.revents().enumerate() {
             // TODO: This is not great from a provenance perspective. Consider
             // adding cast+add methods to ConstPtr/MutPtr.
@@ -7499,6 +7521,35 @@ impl<FS: ShimFS> Task<FS> {
                 .write_at_offset(0, revents.reinterpret_as_signed())
                 .ok_or(Errno::EFAULT)?;
             if revents != 0 {
+                ready_count += 1;
+            }
+        }
+
+        for i in 0..nfds_signed {
+            let mut fd = fds.read_at_offset(i).ok_or(Errno::EFAULT)?;
+            let events = litebox::event::Events::from_bits_truncate(
+                fd.events.reinterpret_as_unsigned().into(),
+            );
+            if !events.contains(litebox::event::Events::IN) || fd.revents != 0 {
+                continue;
+            }
+            let Ok(raw_fd) = usize::try_from(fd.fd) else {
+                continue;
+            };
+            let inotify_ready = {
+                let files = self.files.borrow();
+                files
+                    .with_inotify_fd(raw_fd, |state| {
+                        if state.events.is_empty() {
+                            self.rescan_inotify_instance(state);
+                        }
+                        Ok(!state.events.is_empty())
+                    })
+                    .unwrap_or(false)
+            };
+            if inotify_ready {
+                fd.revents = 1;
+                fds.write_at_offset(i, fd).ok_or(Errno::EFAULT)?;
                 ready_count += 1;
             }
         }

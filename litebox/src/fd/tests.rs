@@ -33,6 +33,17 @@ struct MockEntry2 {
 }
 impl FdEnabledSubsystemEntry for MockEntry2 {}
 
+struct MockSubsystemSameKind;
+impl FdEnabledSubsystem for MockSubsystemSameKind {
+    const KIND: crate::fd::SubsystemKind = crate::fd::SubsystemKind::Fs;
+
+    type Entry = MockEntrySameKind;
+}
+struct MockEntrySameKind {
+    other: String,
+}
+impl FdEnabledSubsystemEntry for MockEntrySameKind {}
+
 fn litebox() -> LiteBox<MockPlatform> {
     LiteBox::new_for_test(MockPlatform::new())
 }
@@ -96,6 +107,31 @@ fn test_iter_entries() {
         .map(|(_, e)| e.stuff.clone())
         .collect();
     assert_eq!(entries_subsystem2, vec!["x"]);
+}
+
+#[test]
+fn test_iter_entries_same_kind_different_entry_type() {
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+
+    let _fd1: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+        data: "entry".to_string(),
+    });
+    let _fd2: TypedFd<MockSubsystemSameKind> = descriptors.insert(MockEntrySameKind {
+        other: "same-kind".to_string(),
+    });
+
+    let entries: Vec<String> = descriptors
+        .iter::<MockSubsystem>()
+        .map(|(_, e)| e.data.clone())
+        .collect();
+    assert_eq!(entries, vec!["entry"]);
+
+    let entries_same_kind: Vec<String> = descriptors
+        .iter_mut::<MockSubsystemSameKind>()
+        .map(|(_, e)| e.other.clone())
+        .collect();
+    assert_eq!(entries_same_kind, vec!["same-kind"]);
 }
 
 #[test]
