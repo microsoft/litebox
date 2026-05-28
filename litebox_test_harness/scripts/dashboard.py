@@ -11,6 +11,7 @@ Subcommands (stdlib only — no third-party deps):
     dashboard.py untrack <ref>                   # remove a tracked ref
     dashboard.py refs                            # list tracked refs
     dashboard.py auto [--interval SECS]          # autonomous fill driver
+    dashboard.py stop                            # stop the auto driver + reap descendants
 
 The autonomous `auto` driver iterates round-robin over the rows in
 the `tracked_refs` table. For each ref it does:
@@ -33,7 +34,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -43,6 +46,15 @@ from typing import Iterable, Optional
 
 SCHEMA_VERSION_EXPECTED = 3
 DEFAULT_FILL_BATCH = 300
+
+# Container-name salt prefix the harness uses
+# (see tests/integration.rs build of container_name: "litebox-{pass}-{tid}-{harness_pid}-{nanos}").
+# We sweep by `litebox-*-{harness_pid}-*` on cleanup escalation.
+CONTAINER_NAME_PREFIX = "litebox-"
+
+# Reap timing knobs.
+_PGID_SIGTERM_GRACE_SECS = 10
+_SUPERVISOR_SIGTERM_GRACE_SECS = 30
 
 
 # ─── State directory resolution ──────────────────────────────────────
@@ -254,6 +266,7 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     """
     parts: list[str] = ["# litebox integration-test dashboard\n"]
     parts.append(_render_meta(conn, state_dir))
+    parts.append(_render_leases(conn))
     parts.append(_render_velocity(conn))
     parts.append(_render_tracked_refs(conn))
     parts.append(_render_result_groups(conn))
@@ -262,6 +275,39 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     parts.append(_render_recent_runs(conn))
     parts.append(_render_footer(conn, state_dir))
     return "\n".join(p for p in parts if p)
+
+
+def _render_leases(conn: sqlite3.Connection) -> str:
+    """One-line summary of live cross-session harness leases.
+
+    Sourced from `harness_leases`, the additive coordination table.
+    Old harnesses that predate the table never INSERT into it and
+    are invisible here — that's expected (they're uncoordinated).
+    """
+    try:
+        rows = conn.execute(
+            "SELECT pid, heartbeat_at_ms FROM harness_leases"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Table doesn't exist (older DB, no new-harness has connected
+        # yet to apply ENSURE_LEASES_DDL). Silently skip.
+        return ""
+    now = now_ms()
+    stale_ms = 30_000
+    live = [r for r in rows if (now - r["heartbeat_at_ms"]) < stale_ms]
+    if not live:
+        return ""
+    n = len(live)
+    # Mirror the harness's dynamic_dispatch_cap rule:
+    #   my_cap_now = max(1, GLOBAL_CAP / live)
+    # We can't know each harness's intrinsic cap or GLOBAL_CAP from
+    # the dashboard side without more metadata. Show just N and the
+    # per-cap rule.
+    return (
+        f"_{n} live harness lease(s)._ Per-harness dispatch cap = "
+        f"`max(1, LITEBOX_GLOBAL_JOBS / {n})` (default global = `nproc`)."
+        "\n"
+    )
 
 
 def _render_velocity(conn: sqlite3.Connection) -> str:
@@ -898,51 +944,113 @@ def cmd_refs(args: argparse.Namespace) -> int:
 def cmd_auto(args: argparse.Namespace) -> int:
     """Autonomous driver: for each tracked ref, fetch + checkout +
     cargo test -- --fill, then render. Sleep. Repeat.
+
+    Lifecycle and cleanup (see plan.md and `cleanup` module in the
+    harness):
+
+      * Each cycle launches cargo in a fresh process group (via
+        `start_new_session=True`) so the supervisor can `killpg` the
+        whole cargo + harness + docker-run subtree on any exit path.
+      * State is written to `<state_dir>/auto.pidfile` (JSON) so
+        `dashboard.py stop` can find and reap us out-of-band.
+      * SIGTERM/SIGINT to the supervisor itself triggers an orderly
+        reap of any in-flight cargo PGID (today's bare-Python default
+        would only kill Python, leaking cargo + harness).
+      * On each cycle completion an assertion scans /proc for stragglers
+        in the cargo PGID and escalates if any are still alive.
     """
     state_dir = resolve_state_dir(args.state_dir)
-    while True:
-        conn = open_db(state_dir)
-        refs = conn.execute(
-            "SELECT ref, ci_worktree FROM tracked_refs ORDER BY ref"
-        ).fetchall()
-        conn.close()
-        if not refs:
-            if not args.quiet:
-                print("[auto] no tracked refs — sleeping; "
-                      "register one with `dashboard.py track`.",
-                      file=sys.stderr)
-        for r in refs:
-            ref = r["ref"]
-            wt = r["ci_worktree"]
-            if not Path(wt).is_dir():
-                print(f"[auto] {ref}: worktree {wt} missing, skipping",
-                      file=sys.stderr)
-                continue
-            ok = _drive_ref(ref, wt, args)
-            if not args.quiet:
-                print(f"[auto] {ref} @ {wt}: {'ok' if ok else 'failed'}")
-        # Re-render after every full pass — and again every ~10s
-        # during the sleep window so ad-hoc session runs from other
-        # worktrees show up in summary.md within seconds of finishing,
-        # not at the end of the next cycle.
-        conn = open_db(state_dir)
-        write_summary(conn, state_dir)
-        conn.close()
-        if args.once:
-            return 0
-        slept = 0
-        render_every = 10
-        while slept < args.interval:
-            time.sleep(min(render_every, args.interval - slept))
-            slept += render_every
+    pidfile = state_dir / "auto.pidfile"
+    _supervisor_state: dict = {"cargo_pgid": None, "harness_pid": None}
+
+    def _signal_handler(signum, _frame):
+        sig_name = signal.Signals(signum).name
+        if not args.quiet:
+            print(f"[auto] received {sig_name}; reaping in-flight cargo",
+                  file=sys.stderr)
+        _reap_pgid_and_containers(
+            _supervisor_state.get("cargo_pgid"),
+            _supervisor_state.get("harness_pid"),
+            quiet=args.quiet,
+        )
+        try:
+            pidfile.unlink()
+        except FileNotFoundError:
+            pass
+        # Exit with 128+signum convention.
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    _write_pidfile(pidfile, supervisor_pid=os.getpid())
+
+    try:
+        while True:
+            conn = open_db(state_dir)
+            refs = conn.execute(
+                "SELECT ref, ci_worktree FROM tracked_refs ORDER BY ref"
+            ).fetchall()
+            conn.close()
+            if not refs:
+                if not args.quiet:
+                    print("[auto] no tracked refs — sleeping; "
+                          "register one with `dashboard.py track`.",
+                          file=sys.stderr)
+            for r in refs:
+                ref = r["ref"]
+                wt = r["ci_worktree"]
+                if not Path(wt).is_dir():
+                    print(f"[auto] {ref}: worktree {wt} missing, skipping",
+                          file=sys.stderr)
+                    continue
+                ok = _drive_ref(
+                    ref, wt, args,
+                    pidfile=pidfile,
+                    supervisor_state=_supervisor_state,
+                )
+                if not args.quiet:
+                    print(f"[auto] {ref} @ {wt}: {'ok' if ok else 'failed'}")
+            # Re-render after every full pass — and again every ~10s
+            # during the sleep window so ad-hoc session runs from other
+            # worktrees show up in summary.md within seconds of finishing,
+            # not at the end of the next cycle.
             conn = open_db(state_dir)
             write_summary(conn, state_dir)
             conn.close()
+            if args.once:
+                return 0
+            slept = 0
+            render_every = 10
+            while slept < args.interval:
+                time.sleep(min(render_every, args.interval - slept))
+                slept += render_every
+                conn = open_db(state_dir)
+                write_summary(conn, state_dir)
+                conn.close()
+    finally:
+        try:
+            pidfile.unlink()
+        except FileNotFoundError:
+            pass
 
 
-def _drive_ref(ref: str, ci_worktree: str, args: argparse.Namespace) -> bool:
+def _drive_ref(
+    ref: str,
+    ci_worktree: str,
+    args: argparse.Namespace,
+    *,
+    pidfile: Optional[Path] = None,
+    supervisor_state: Optional[dict] = None,
+) -> bool:
     """Fetch + checkout + cargo test -- --fill for one tracked ref.
     Returns True if cargo exit was clean.
+
+    Launches cargo in its own process group (PGID = cargo PID) so the
+    supervisor can `killpg` the whole subtree on timeout / SIGTERM /
+    `dashboard.py stop`. On any exit (success, timeout, error) the
+    PGID is swept once more to catch any stragglers, and zombie
+    containers tagged with the harness PID are `docker rm -f`'d.
     """
     env = os.environ.copy()
     # Always write into the same dashboard store the auto loop is
@@ -976,21 +1084,284 @@ def _drive_ref(ref: str, ci_worktree: str, args: argparse.Namespace) -> bool:
         )
     except subprocess.CalledProcessError:
         return False
-    # 3. cargo test -- --fill
+    # 3. cargo test -- --fill — time-budget mode by default.
     cargo_args = [
         "cargo", "test", "-p", "litebox_test_harness",
-        "--test", "integration", "--", "--fill",
+        "--test", "integration", "--",
     ]
     if args.batch_size:
-        cargo_args[-1] = f"--fill={args.batch_size}"
-    try:
-        proc = subprocess.run(
-            cargo_args, cwd=ci_worktree, env=env,
-            timeout=args.cycle_budget_secs,
+        cargo_args.append(f"--fill={args.batch_size}")
+    else:
+        cargo_args.append(f"--fill={args.cycle_budget_secs}s")
+    if args.jobs:
+        env["LITEBOX_TEST_JOBS"] = str(args.jobs)
+
+    # Outer wall-time budget: cycle budget + generous grace for
+    # cargo's own startup, drain, etc.
+    deadline = time.monotonic() + (args.cycle_budget_secs * 2 + 600)
+    proc = subprocess.Popen(
+        cargo_args, cwd=ci_worktree, env=env,
+        # New session + process group; PGID = cargo PID.
+        start_new_session=True,
+    )
+    cargo_pgid = proc.pid  # equals PGID after start_new_session
+    if supervisor_state is not None:
+        supervisor_state["cargo_pgid"] = cargo_pgid
+    if pidfile is not None:
+        _write_pidfile(
+            pidfile,
+            supervisor_pid=os.getpid(),
+            cargo_pid=proc.pid,
+            cargo_pgid=cargo_pgid,
         )
-        return proc.returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
+
+    # Discover the harness (test binary) PID as it appears under
+    # cargo. Best-effort; used as container-name salt for sweeps.
+    harness_pid: Optional[int] = None
+    poll_until = time.monotonic() + 30
+    rc: Optional[int] = None
+    try:
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                break
+            if harness_pid is None and time.monotonic() < poll_until:
+                harness_pid = _find_harness_pid(proc.pid)
+                if harness_pid is not None and supervisor_state is not None:
+                    supervisor_state["harness_pid"] = harness_pid
+                    if pidfile is not None:
+                        _write_pidfile(
+                            pidfile,
+                            supervisor_pid=os.getpid(),
+                            cargo_pid=proc.pid,
+                            cargo_pgid=cargo_pgid,
+                            harness_pid=harness_pid,
+                        )
+            if time.monotonic() > deadline:
+                print(f"[auto] cycle exceeded deadline; reaping PGID {cargo_pgid}",
+                      file=sys.stderr)
+                _reap_pgid_and_containers(cargo_pgid, harness_pid,
+                                          quiet=args.quiet)
+                return False
+            time.sleep(0.5)
+    finally:
+        # End-of-cycle assert: nothing should remain in cargo's PGID.
+        # If it does, this is a leak — escalate cleanup.
+        if cargo_pgid is not None:
+            stragglers = _pids_in_pgid(cargo_pgid)
+            if stragglers:
+                print(f"[auto] WARN: {len(stragglers)} stragglers in PGID "
+                      f"{cargo_pgid} after cycle: {stragglers[:5]}…",
+                      file=sys.stderr)
+                _reap_pgid_and_containers(cargo_pgid, harness_pid,
+                                          quiet=args.quiet)
+        if supervisor_state is not None:
+            supervisor_state["cargo_pgid"] = None
+            supervisor_state["harness_pid"] = None
+        if pidfile is not None:
+            _write_pidfile(pidfile, supervisor_pid=os.getpid())
+
+    return rc == 0
+
+
+# ─── Process-group + pidfile helpers ─────────────────────────────────
+
+
+def _write_pidfile(path: Path, **fields) -> None:
+    """Atomically (best-effort) write pidfile JSON."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(fields))
+    tmp.replace(path)
+
+
+def _read_pidfile(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _find_harness_pid(cargo_pid: int) -> Optional[int]:
+    """Scan /proc for the integration test binary spawned by cargo.
+
+    Cargo's test binary is `target/{profile}/deps/integration-<hash>`;
+    walk cargo_pid's task children and look for an executable name
+    starting with `integration-`.
+    """
+    children_path = Path(f"/proc/{cargo_pid}/task/{cargo_pid}/children")
+    try:
+        children = children_path.read_text().split()
+    except FileNotFoundError:
+        return None
+    for cpid_s in children:
+        try:
+            cpid = int(cpid_s)
+        except ValueError:
+            continue
+        try:
+            comm = Path(f"/proc/{cpid}/comm").read_text().strip()
+        except FileNotFoundError:
+            continue
+        if comm.startswith("integration-"):
+            return cpid
+        # cargo may have an intermediate wrapper; recurse one level.
+        sub = _find_harness_pid(cpid)
+        if sub is not None:
+            return sub
+    return None
+
+
+def _pids_in_pgid(pgid: int) -> list[int]:
+    """Return all live PIDs whose PGID matches `pgid`."""
+    out: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat = (entry / "stat").read_text()
+        except FileNotFoundError:
+            continue
+        # /proc/<pid>/stat fields: pid, (comm), state, ppid, pgrp, ...
+        # comm can contain spaces and parens, so split on the last ')'.
+        try:
+            after = stat.rsplit(")", 1)[1]
+            fields = after.split()
+            this_pgid = int(fields[2])  # field 5 overall; index 2 after comm
+        except (IndexError, ValueError):
+            continue
+        if this_pgid == pgid:
+            out.append(pid)
+    return out
+
+
+def _reap_pgid_and_containers(
+    cargo_pgid: Optional[int],
+    harness_pid: Optional[int],
+    *,
+    quiet: bool = False,
+) -> None:
+    """SIGTERM → grace → SIGKILL the cargo process group, then sweep
+    any zombie containers tagged with `harness_pid`."""
+    if cargo_pgid is not None and _pids_in_pgid(cargo_pgid):
+        try:
+            os.killpg(cargo_pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + _PGID_SIGTERM_GRACE_SECS
+        while time.monotonic() < deadline:
+            if not _pids_in_pgid(cargo_pgid):
+                break
+            time.sleep(0.5)
+        if _pids_in_pgid(cargo_pgid):
+            if not quiet:
+                print(f"[reap] PGID {cargo_pgid} did not honor SIGTERM; "
+                      "escalating to SIGKILL", file=sys.stderr)
+            try:
+                os.killpg(cargo_pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    # Sweep containers by harness-pid salt. The harness's own signal
+    # handler does this too, but we re-run here as belt-and-suspenders
+    # in case the harness was SIGKILL'd before it could clean up.
+    if harness_pid is not None:
+        _sweep_containers(harness_pid, quiet=quiet)
+
+
+def _sweep_containers(harness_pid: int, *, quiet: bool = False) -> None:
+    """`docker rm -f` any container whose name embeds `harness_pid`.
+
+    Container names are `litebox-{pass}-{test_id}-{harness_pid}-{nanos}`
+    (see tests/integration.rs build_docker_cmd), so we filter by the
+    middle salt. We use `docker ps -aq --filter` rather than a glob
+    because docker's name filter is a substring match.
+    """
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "-aq", "--filter",
+             f"name=-{harness_pid}-"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return
+    cids = [c for c in out.stdout.split() if c]
+    if not cids:
+        return
+    if not quiet:
+        print(f"[reap] removing {len(cids)} container(s) for "
+              f"harness pid {harness_pid}", file=sys.stderr)
+    # Batched rm to avoid argv overflow + bounded parallelism via the
+    # daemon itself.
+    for i in range(0, len(cids), 50):
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", *cids[i:i + 50]],
+                capture_output=True, timeout=120,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return
+
+
+# ─── stop subcommand ─────────────────────────────────────────────────
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    """Stop a running `dashboard.py auto` supervisor and reap all its
+    descendants + containers.
+
+    Reads `<state_dir>/auto.pidfile`, SIGTERMs the supervisor (which
+    triggers its own in-process cleanup handler), waits up to
+    {_SUPERVISOR_SIGTERM_GRACE_SECS}s, then escalates to a direct
+    PGID reap + container sweep if the supervisor didn't honor it.
+    """
+    state_dir = resolve_state_dir(args.state_dir)
+    pidfile = state_dir / "auto.pidfile"
+    state = _read_pidfile(pidfile)
+    if state is None:
+        print(f"[stop] no pidfile at {pidfile}; nothing to stop",
+              file=sys.stderr)
+        return 0
+    sup = state.get("supervisor_pid")
+    cargo_pgid = state.get("cargo_pgid")
+    harness_pid = state.get("harness_pid")
+    if sup:
+        try:
+            os.kill(sup, signal.SIGTERM)
+            if not args.quiet:
+                print(f"[stop] SIGTERM → supervisor pid {sup}",
+                      file=sys.stderr)
+        except ProcessLookupError:
+            if not args.quiet:
+                print(f"[stop] supervisor {sup} already gone",
+                      file=sys.stderr)
+            sup = None
+    if sup:
+        deadline = time.monotonic() + _SUPERVISOR_SIGTERM_GRACE_SECS
+        while time.monotonic() < deadline:
+            try:
+                os.kill(sup, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.5)
+        else:
+            print(f"[stop] supervisor {sup} did not exit in "
+                  f"{_SUPERVISOR_SIGTERM_GRACE_SECS}s; escalating",
+                  file=sys.stderr)
+            try:
+                os.kill(sup, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    # Belt-and-suspenders: even if the supervisor handler ran, sweep
+    # the PGID and containers in case it missed anything (e.g. it was
+    # SIGKILL'd above before completing).
+    _reap_pgid_and_containers(cargo_pgid, harness_pid, quiet=args.quiet)
+    try:
+        pidfile.unlink()
+    except FileNotFoundError:
+        pass
+    if not args.quiet:
+        print("[stop] done", file=sys.stderr)
+    return 0
 
 
 # ─── argparse ────────────────────────────────────────────────────────
@@ -1044,16 +1415,42 @@ def build_parser() -> argparse.ArgumentParser:
     p_refs.set_defaults(func=cmd_refs)
 
     p_auto = sub.add_parser("auto", help="autonomous fill driver")
-    p_auto.add_argument("--interval", type=int, default=60,
-                        help="sleep between full passes (default 60s)")
-    p_auto.add_argument("--batch-size", type=int, default=DEFAULT_FILL_BATCH,
-                        help=f"--fill=N per ref (default {DEFAULT_FILL_BATCH})")
-    p_auto.add_argument("--cycle-budget-secs", type=int, default=3600,
-                        help="outer cargo-test timeout per ref (default 3600)")
+    p_auto.add_argument(
+        "--interval", type=int, default=10,
+        help="sleep between full passes (default 10s — was 60s "
+             "historically; container teardown happens in the "
+             "background so back-to-back cycles are fine)",
+    )
+    p_auto.add_argument(
+        "--cycle-budget-secs", type=int, default=600,
+        help="per-ref cycle wall-time budget passed to "
+             "`--fill=<budget>s` (default 600s = 10min). The Rust "
+             "selector packs as many trials as fit.",
+    )
+    p_auto.add_argument(
+        "--batch-size", type=int, default=None,
+        help="override: hard count of trials per cycle. Mutually "
+             "exclusive with the time-budget mode; sets "
+             "`--fill=N` instead. Default None (use --cycle-budget-secs).",
+    )
+    p_auto.add_argument(
+        "--jobs", type=int, default=None,
+        help="set LITEBOX_TEST_JOBS for cargo (default: use whatever "
+             "the harness derives from num_cpus).",
+    )
     p_auto.add_argument("--once", action="store_true",
                         help="run one pass and exit")
     p_auto.add_argument("--quiet", "-q", action="store_true")
     p_auto.set_defaults(func=cmd_auto)
+
+    p_stop = sub.add_parser(
+        "stop",
+        help="stop a running `dashboard.py auto` supervisor and reap "
+             "all its descendants (cargo, harness, in-flight docker "
+             "containers).",
+    )
+    p_stop.add_argument("--quiet", "-q", action="store_true")
+    p_stop.set_defaults(func=cmd_stop)
 
     return p
 

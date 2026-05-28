@@ -168,6 +168,89 @@ fn dashboard_schema_initializes_and_view_returns_latest() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[test]
+fn harness_leases_table_round_trip_and_prune() {
+    // Validates the additive `harness_leases` table + the
+    // count-and-prune behavior the `lease` module relies on. We
+    // don't drive the lease module's static state from here (its
+    // `OnceLock<Registered>` is process-singleton); we exercise the
+    // SQL directly against a fresh DB.
+    let tmp = tempdir_marker("leases");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let db = PathBuf::from(&tmp).join("results.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "busy_timeout", 5000).unwrap();
+    conn.execute_batch(dashboard_store::SCHEMA_DDL).unwrap();
+    // ENSURE_LEASES_DDL is idempotent (CREATE TABLE IF NOT EXISTS) —
+    // verify re-applying it on a DB that already has the table is
+    // a no-op, since that's what the producer does on every
+    // connection.
+    conn.execute_batch(dashboard_store::ENSURE_LEASES_DDL)
+        .unwrap();
+
+    let now = dashboard_store::now_ms();
+    let stale_ms: i64 = 30_000;
+
+    conn.execute(
+        "INSERT INTO harness_leases(pid, heartbeat_at_ms) VALUES (?1, ?2)",
+        params![1111_i64, now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO harness_leases(pid, heartbeat_at_ms) VALUES (?1, ?2)",
+        params![2222_i64, now],
+    )
+    .unwrap();
+
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM harness_leases WHERE heartbeat_at_ms >= ?1",
+            params![now - stale_ms],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 2, "both leases should be live");
+
+    // Fudge one heartbeat into the past, then prune-by-cutoff.
+    conn.execute(
+        "UPDATE harness_leases SET heartbeat_at_ms = ?1 WHERE pid = ?2",
+        params![now - (stale_ms + 5_000), 1111_i64],
+    )
+    .unwrap();
+    let deleted = conn
+        .execute(
+            "DELETE FROM harness_leases WHERE heartbeat_at_ms < ?1",
+            params![now - stale_ms],
+        )
+        .unwrap();
+    assert_eq!(deleted, 1, "stale lease should be pruned");
+
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM harness_leases WHERE heartbeat_at_ms >= ?1",
+            params![now - stale_ms],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 1, "remaining lease should still be live");
+
+    // INSERT OR REPLACE on (pid) — pid 2222 re-registers; should
+    // collapse to one row, not duplicate.
+    conn.execute(
+        "INSERT OR REPLACE INTO harness_leases(pid, heartbeat_at_ms)
+         VALUES (?1, ?2)",
+        params![2222_i64, now + 1],
+    )
+    .unwrap();
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM harness_leases", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 1, "pid is PK — INSERT OR REPLACE keeps one row");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn tempdir_marker(tag: &str) -> String {
     let dir = std::env::temp_dir().join(format!(
         "litebox-dashboard-test-{}-{tag}",

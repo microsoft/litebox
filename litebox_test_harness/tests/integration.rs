@@ -135,6 +135,14 @@ fn broker_elf_cache_dir() -> &'static PathBuf {
 #[path = "common/dashboard_store.rs"]
 mod dashboard_store;
 
+// ── Cross-session concurrency lease ──────────────────────────────────
+// Registers this harness invocation in the shared dashboard sqlite so
+// every concurrent `cargo test --test integration` invocation on this
+// host self-coordinates: each takes `GLOBAL_CAP / live_lease_count`
+// of the concurrent docker-dispatch budget. See `tests/common/lease.rs`.
+#[path = "common/lease.rs"]
+mod lease;
+
 fn emit_timing_main(
     test: &str,
     pass: &str,
@@ -574,20 +582,86 @@ impl Drop for SemaphoreGuard {
     }
 }
 
-static ACTIVE_JOBS: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+// ── Lease-aware dispatch gate ────────────────────────────────────────
+//
+// The active-dispatch gate has a dynamic cap that floats with
+// `lease::live_lease_count()`. Concretely:
+//
+//     my_cap_now = max(1, min(default_jobs, GLOBAL_CAP / live_leases))
+//
+// `default_jobs` is the harness's own intrinsic upper bound (today's
+// `LITEBOX_TEST_JOBS` / `default_jobs()` value — dockerd starts to
+// serialize past it). `GLOBAL_CAP` is the host-wide budget on
+// concurrent docker children (default `nproc`, override via
+// `LITEBOX_GLOBAL_JOBS`).
+//
+// When a peer harness appears or exits, the atomic in `lease` is
+// refreshed; the next `acquire()` call sees the new cap. Already
+// in-flight dispatches finish on their own — we never retract.
+struct DispatchGate {
+    in_flight: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl DispatchGate {
+    const fn new() -> Self {
+        Self {
+            in_flight: Mutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(&'static self) -> DispatchGuard {
+        let mut n = self.in_flight.lock().unwrap();
+        loop {
+            let cap = dynamic_dispatch_cap();
+            if *n < cap {
+                *n += 1;
+                return DispatchGuard { gate: self };
+            }
+            // Wait with timeout so we re-check the cap periodically;
+            // the cap can change without any acquire/release event
+            // (e.g. a peer's heartbeat lapses and is pruned).
+            let (n2, _) = self
+                .cv
+                .wait_timeout(n, std::time::Duration::from_secs(2))
+                .unwrap();
+            n = n2;
+        }
+    }
+}
+
+struct DispatchGuard {
+    gate: &'static DispatchGate,
+}
+
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        let mut n = self.gate.in_flight.lock().unwrap();
+        *n -= 1;
+        self.gate.cv.notify_one();
+    }
+}
+
+static ACTIVE_JOBS: DispatchGate = DispatchGate::new();
 static DRAIN_BACKLOG: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
 
 static JOBS_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static GLOBAL_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn default_jobs() -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    // Roughly num_cpus / 1.5, clamped to a reasonable range. Past
-    // jobs=10 dockerd serializes container creation badly enough that
-    // further parallelism gives diminishing returns (verified by
-    // phase-2 measurement: jobs=5→10 cut wall by ~9% on PB.* family).
-    ((cpus as f32 / 1.5) as usize).clamp(2, 10)
+    // Roughly num_cpus / 1.5, clamped to a reasonable range.
+    //
+    // The upper bound was 10 historically — phase-2 measurement on
+    // a smaller dev box found that past jobs=10 dockerd serialized
+    // container creation badly enough that further parallelism gave
+    // diminishing returns. Bumped to 20 in 2026-05 for 32+ core
+    // boxes where the dockerd serialization point is higher. Tune
+    // via LITEBOX_TEST_JOBS env var on a case-by-case basis.
+    ((cpus as f32 / 1.5) as usize).clamp(2, 20)
 }
 
 fn current_jobs_cap() -> usize {
@@ -599,12 +673,31 @@ fn current_jobs_cap() -> usize {
     })
 }
 
-fn active_jobs() -> &'static Semaphore {
-    ACTIVE_JOBS.get_or_init(|| {
-        let n = current_jobs_cap();
-        eprintln!("[integration] LITEBOX_TEST_JOBS={n}");
-        Semaphore::new(n)
+/// Host-wide budget on concurrent docker children, summed across
+/// all live harnesses. Default `nproc`. Override via
+/// `LITEBOX_GLOBAL_JOBS`.
+fn global_cap() -> usize {
+    *GLOBAL_CAP.get_or_init(|| {
+        std::env::var("LITEBOX_GLOBAL_JOBS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+            })
     })
+}
+
+fn dynamic_dispatch_cap() -> usize {
+    let intrinsic = current_jobs_cap();
+    let global = global_cap();
+    let live = lease::live_lease_count();
+    intrinsic.min(global / live).max(1)
+}
+
+fn active_jobs() -> &'static DispatchGate {
+    &ACTIVE_JOBS
 }
 
 fn drain_backlog() -> &'static Semaphore {
@@ -619,6 +712,147 @@ fn drain_backlog() -> &'static Semaphore {
             .unwrap_or_else(|| current_jobs_cap() * 4);
         Semaphore::new(n)
     })
+}
+
+// ── Cleanup infrastructure ───────────────────────────────────────────
+//
+// Two-layer cleanup contract (see also dashboard.py and the plan in
+// docs):
+//
+//   * The dashboard supervisor owns `cargo` and reaps the whole
+//     process-group via `killpg`. It is the sledgehammer.
+//   * The harness (this binary) owns its in-flight `docker run`
+//     children and the containers they launched. Each container is
+//     named `litebox-{pass}-{test_id}-{harness_pid}-{nanos}`, so the
+//     `{harness_pid}` salt uniquely identifies them.
+//
+// Three mechanisms compose to make orphaning impossible in practice:
+//
+//   1. A global registry of (docker_run_pid → container_name) entries
+//      that we maintain via `register_docker_child` /
+//      `deregister_docker_child` around each `spawn_drain`.
+//   2. A top-level SIGTERM/SIGINT handler (installed in `main`) that
+//      iterates the registry and runs `docker rm -f` + SIGTERM in
+//      parallel, then `exit(130)`.
+//   3. `PR_SET_PDEATHSIG=SIGTERM` on (a) the harness itself, so if
+//      cargo dies abruptly the kernel signals us → handler fires; and
+//      (b) each `docker run` child via `pre_exec`, so if the harness
+//      dies abruptly the `docker run` host process self-terminates
+//      (its `--rm` flag then garbage-collects the container).
+//
+// PGIDs are a flat label, not a tree, so we deliberately do NOT call
+// `setsid` here — we stay in cargo's process group so the supervisor's
+// `killpg` continues to reach us.
+mod cleanup {
+    use std::collections::HashMap;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+
+    static CHILDREN: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+
+    fn registry() -> &'static Mutex<HashMap<u32, String>> {
+        CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Register a live `docker run` child + the container name it was
+    /// launched with. Called immediately after `Command::spawn()`.
+    pub(crate) fn register_docker_child(pid: u32, container_name: &str) {
+        if let Ok(mut g) = registry().lock() {
+            g.insert(pid, container_name.to_string());
+        }
+    }
+
+    /// Deregister a `docker run` child after `wait()` returns.
+    pub(crate) fn deregister_docker_child(pid: u32) {
+        if let Ok(mut g) = registry().lock() {
+            g.remove(&pid);
+        }
+    }
+
+    /// Set `PR_SET_PDEATHSIG=SIGTERM` on the current process. Call
+    /// early in `main()`. If the parent (cargo) dies, the kernel
+    /// sends us SIGTERM, which the top-level handler then turns into
+    /// an orderly cleanup of in-flight `docker run` children.
+    pub(crate) fn set_self_pdeathsig() {
+        // SAFETY: `prctl(PR_SET_PDEATHSIG, sig)` is a no-side-effect
+        // single-process self-configuration call; signal is delivered
+        // asynchronously only on parent death and is caught by our
+        // top-level SIGTERM handler.
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+        }
+    }
+
+    /// Snapshot the registry and run `docker rm -f` + SIGTERM on each
+    /// entry in parallel-bounded fashion. Best-effort: any individual
+    /// failure is logged and skipped. Returns when all entries have
+    /// been processed (or 30 s elapsed, whichever first).
+    pub(crate) fn reap_all() {
+        let snapshot: Vec<(u32, String)> = registry()
+            .lock()
+            .map(|g| g.iter().map(|(k, v)| (*k, v.clone())).collect())
+            .unwrap_or_default();
+        if snapshot.is_empty() {
+            return;
+        }
+        eprintln!(
+            "[cleanup] reaping {} in-flight docker run children",
+            snapshot.len()
+        );
+        // Bound parallelism to 8: each `docker rm -f` is a daemon RPC
+        // and we don't want to amplify daemon load during shutdown.
+        let chunk = 8usize;
+        for batch in snapshot.chunks(chunk) {
+            let mut threads = Vec::with_capacity(batch.len());
+            for (pid, name) in batch {
+                let pid = *pid;
+                let name = name.clone();
+                threads.push(std::thread::spawn(move || {
+                    // 5 s timeout on the docker call via timeout(1).
+                    let _ = Command::new("timeout")
+                        .args(["5", "docker", "rm", "-f", &name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    // SAFETY: pid came from std::process::Child::id()
+                    // of a child we own; SIGTERM is the documented
+                    // signal for orderly shutdown.
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                }));
+            }
+            for t in threads {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Install a SIGTERM + SIGINT handler that reaps in-flight docker
+    /// children and exits with code 130. Idempotent (safe to call
+    /// multiple times — only the first call installs).
+    pub(crate) fn install_signal_handler() {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        use signal_hook::iterator::Signals;
+        let mut signals = match Signals::new([SIGTERM, SIGINT]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[cleanup] failed to install signal handler: {e}");
+                return;
+            }
+        };
+        std::thread::spawn(move || {
+            if let Some(sig) = signals.forever().next() {
+                eprintln!("[cleanup] received signal {sig}; reaping");
+                reap_all();
+                // Also deregister our cross-session lease so peers
+                // see the live count drop immediately (rather than
+                // waiting for STALE_THRESHOLD_MS to prune us).
+                crate::lease::deregister();
+                std::process::exit(130);
+            }
+        });
+    }
 }
 
 /// Best-effort sanitize a test id into a docker container name suffix.
@@ -656,6 +890,24 @@ fn build_docker_cmd(
 ) -> Command {
     let filter = format!("--filter={test_id}");
     let mut cmd = Command::new("docker");
+    // Set PR_SET_PDEATHSIG=SIGTERM on the docker-run child so it
+    // self-terminates if this harness dies abruptly (e.g. cargo
+    // SIGKILL'd by dashboard timeout escalation, before the harness's
+    // own signal handler ran). With `--rm` set on the run, the
+    // ensuing exit cleans up the container.
+    //
+    // SAFETY: `pre_exec` runs after `fork(2)` and before `execve(2)`
+    // in a single-threaded post-fork context where the only safe
+    // operations are async-signal-safe ones. `prctl(2)` is
+    // async-signal-safe (see signal-safety(7)). The flag is process-
+    // private and has no global side effects beyond this child.
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
+            Ok(())
+        });
+    }
     cmd.args(docker_run_base_args())
         .arg("--name")
         .arg(container_name);
@@ -981,9 +1233,10 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     // from the in-container JSON line — so even if the container is
     // reaped before printing (timeout, etc), the dashboard rows are
     // always labeled correctly.
-    let (suite_static, group_static) = test_suite_group(test_id)
-        .expect("test_id missing from registry — emit_timing_main only \
-                 reachable from run_pass_group, which iterates get_test_ids");
+    let (suite_static, group_static) = test_suite_group(test_id).expect(
+        "test_id missing from registry — emit_timing_main only \
+                 reachable from run_pass_group, which iterates get_test_ids",
+    );
 
     // Emit the main timing line synchronously (drain may get cut off
     // if cargo-test exits early).
@@ -1077,17 +1330,21 @@ fn spawn_drain(
         let timeout = Duration::from_secs(drain_timeout_secs());
         let pid = child.id() as i32;
         let cname = container_name;
+        // Register so the top-level SIGTERM handler can reap us if the
+        // harness is asked to shut down before this drain completes.
+        cleanup::register_docker_child(pid as u32, &cname);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let cname_for_watchdog = cname.clone();
         let watchdog = std::thread::spawn(move || {
             if rx.recv_timeout(timeout).is_ok() {
                 return;
             }
             eprintln!(
-                "[drain] timeout after {} s; forcing teardown of {cname}",
+                "[drain] timeout after {} s; forcing teardown of {cname_for_watchdog}",
                 timeout.as_secs()
             );
             let _ = Command::new("docker")
-                .args(["rm", "-f", &cname])
+                .args(["rm", "-f", &cname_for_watchdog])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -1101,6 +1358,7 @@ fn spawn_drain(
         let _ = child.wait();
         let _ = tx.send(());
         let _ = watchdog.join();
+        cleanup::deregister_docker_child(pid as u32);
         let t_drain_ms = t_drain_start.elapsed().as_millis();
         emit_timing_drain(&test_id, pass, t_drain_ms);
     });
@@ -1174,6 +1432,25 @@ fn collect_positionals(argv: &[String]) -> Vec<usize> {
 }
 
 fn main() {
+    // Cleanup-protocol init (see `cleanup` module). Two side-effects:
+    //   * PR_SET_PDEATHSIG=SIGTERM on ourselves, so cargo dying →
+    //     kernel SIGTERMs us → handler reaps in-flight containers.
+    //   * Install the SIGTERM/SIGINT handler thread. Must happen
+    //     before any docker run is dispatched.
+    cleanup::set_self_pdeathsig();
+    cleanup::install_signal_handler();
+
+    // Normal-exit deregister bridge for the cross-session lease.
+    // The signal handler path also deregisters; this guard handles
+    // the clean-exit path (libtest-mimic returns normally).
+    struct LeaseDropGuard;
+    impl Drop for LeaseDropGuard {
+        fn drop(&mut self) {
+            lease::deregister();
+        }
+    }
+    let _lease_drop_guard = LeaseDropGuard;
+
     let argv: Vec<String> = std::env::args().collect();
     let pos_idx = collect_positionals(&argv);
 
@@ -1184,8 +1461,8 @@ fn main() {
     // `--fill[=N]` extension: select up to N trials that have no
     // run_results row at the current clean HEAD (dirty_hash IS NULL).
     // Parsed and stripped before handing to libtest-mimic.
-    let fill_n: Option<usize> = parse_fill_flag(&argv);
-    let mut args = if positionals.len() >= 2 || fill_n.is_some() {
+    let fill_cap: Option<FillCap> = parse_fill_flag(&argv);
+    let mut args = if positionals.len() >= 2 || fill_cap.is_some() {
         let drop: std::collections::HashSet<usize> = pos_idx.iter().skip(1).copied().collect();
         let trimmed: Vec<String> = argv
             .iter()
@@ -1203,6 +1480,20 @@ fn main() {
     // we don't create empty `runs` rows from discovery passes.
     if !args.list {
         let _ = dashboard_store::init();
+        // Register as a live harness so concurrent `cargo test` runs
+        // on this host share the host-wide GLOBAL_CAP fairly. Skipped
+        // in --list mode (no containers dispatched). Best-effort — if
+        // it fails, we fall back to uncoordinated default.
+        lease::register();
+        // Print the (initial) dispatch cap for visibility — it can
+        // shift during execution as peers come and go.
+        eprintln!(
+            "[integration] dispatch cap: intrinsic={} global={} live_peers={} effective={}",
+            current_jobs_cap(),
+            global_cap(),
+            lease::live_lease_count(),
+            dynamic_dispatch_cap(),
+        );
     }
 
     let mut trials: Vec<Trial> = Vec::new();
@@ -1256,22 +1547,33 @@ fn main() {
         dashboard_store::record_universe_size(i64::try_from(trials.len()).unwrap_or(0));
     }
 
-    // `--fill[=N]`: pick a batch of trials that have no run_results
+    // `--fill[=N|=Ns]`: pick a batch of trials that have no run_results
     // row at the current clean HEAD. Positional filters take
     // precedence (manual debugging stays sharp).
-    if let Some(n) = fill_n
+    if let Some(cap) = fill_cap
         && positionals.is_empty()
     {
+        let cap_for_selector = match cap {
+            FillCap::Count(n) => dashboard_store::FillCap::Count(n),
+            FillCap::BudgetSecs(s) => dashboard_store::FillCap::BudgetSecs {
+                secs: s,
+                jobs: current_jobs_cap() as u64,
+            },
+        };
         let kept: std::collections::HashSet<String> =
-            dashboard_store::select_fill_batch(&trials, n)
+            dashboard_store::select_fill_batch(&trials, cap_for_selector)
                 .into_iter()
                 .collect();
         let total = trials.len();
         trials.retain(|t| kept.contains(t.name()));
+        let cap_str = match cap {
+            FillCap::Count(n) => format!("count={n}"),
+            FillCap::BudgetSecs(s) => format!("budget={s}s"),
+        };
         eprintln!(
-            "[fill] selected {}/{} trials missing for current HEAD",
+            "[fill] selected {}/{} trials missing for current HEAD ({cap_str})",
             trials.len(),
-            total
+            total,
         );
     }
 
@@ -1293,19 +1595,38 @@ fn main() {
 
     let conclusion = libtest_mimic::run(&args, trials);
     dashboard_store::finalize();
+    // Explicit deregister: `conclusion.exit()` below calls
+    // `process::exit()` which bypasses Drop handlers (including our
+    // LeaseDropGuard). The Drop guard still serves the panic-unwind
+    // path; this line covers normal exit.
+    lease::deregister();
     conclusion.exit();
 }
 
-/// Parse `--fill` / `--fill=N` from argv. Returns the batch cap (or
-/// the default 300 for bare `--fill`).
-fn parse_fill_flag(argv: &[String]) -> Option<usize> {
+/// Parsed `--fill` argument: a hard count cap or a wall-time
+/// budget that the selector translates into "as many tests as
+/// fit." `--fill` with no value defaults to 300 count.
+#[derive(Clone, Copy, Debug)]
+enum FillCap {
+    Count(usize),
+    BudgetSecs(u64),
+}
+
+/// Parse `--fill` / `--fill=N` / `--fill=Ns` from argv.
+///   `--fill`     → Count(300)
+///   `--fill=200` → Count(200)
+///   `--fill=600s` → BudgetSecs(600)
+fn parse_fill_flag(argv: &[String]) -> Option<FillCap> {
     const DEFAULT_FILL: usize = 300;
     for a in argv {
         if a == "--fill" {
-            return Some(DEFAULT_FILL);
+            return Some(FillCap::Count(DEFAULT_FILL));
         }
         if let Some(rest) = a.strip_prefix("--fill=") {
-            return rest.parse().ok().or(Some(DEFAULT_FILL));
+            if let Some(secs) = rest.strip_suffix('s') {
+                return Some(FillCap::BudgetSecs(secs.parse().unwrap_or(600)));
+            }
+            return Some(FillCap::Count(rest.parse().unwrap_or(DEFAULT_FILL)));
         }
     }
     None

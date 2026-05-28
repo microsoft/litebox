@@ -33,7 +33,40 @@ dashboard.py track <ref> <ci_worktree>       # register a tracked ref
 dashboard.py untrack <ref>                   # remove a tracked ref
 dashboard.py refs                            # list tracked refs
 dashboard.py auto [--interval SECS]          # autonomous fill driver
+dashboard.py stop                            # stop auto + reap descendants
 ```
+
+### Auto-driver lifecycle & cleanup contract
+
+The `auto` supervisor and the Rust test harness cooperate to
+guarantee no leaked processes or containers on any exit path
+(SIGTERM, cycle timeout, `dashboard.py stop`, even SIGKILL of cargo).
+Each layer cleans up what it started:
+
+| Layer | Owns | Cleanup mechanism |
+|---|---|---|
+| `dashboard.py auto` supervisor | `cargo` + every descendant in its PGID | Launches cargo via `start_new_session=True` → new PGID. On cycle timeout, SIGTERM, or `stop`: `killpg(SIGTERM)` → grace → `killpg(SIGKILL)` → `docker rm -f` containers matching `*-{harness_pid}-*` |
+| Harness (test binary) | in-flight `docker run` children + their named containers | Global `(pid → container_name)` registry; top-level SIGTERM/SIGINT handler iterates it, parallel `docker rm -f`, then `exit(130)` |
+| Each `docker run` child | the container (via `--rm`) | `PR_SET_PDEATHSIG=SIGTERM` set in `pre_exec` — self-terminates if harness dies abruptly |
+| Harness ↔ cargo bridge | parent-death notification | `PR_SET_PDEATHSIG=SIGTERM` on harness self: cargo SIGKILL → kernel SIGTERMs harness → handler fires |
+
+**Container naming.** Every container is named
+`litebox-{pass}-{test_id}-{harness_pid}-{nanos}`. The `{harness_pid}`
+salt uniquely identifies all containers from one harness invocation,
+which is how the supervisor escalates to cleanup-by-name without
+a shared registry.
+
+**Pidfile.** `<state_dir>/auto.pidfile` is JSON: `{supervisor_pid,
+cargo_pid, cargo_pgid, harness_pid}`. Written when the supervisor
+starts, updated when each cycle's harness pid is discovered, removed
+on exit. `dashboard.py stop` reads it.
+
+**Why not just `setsid` everywhere.** Process groups don't compose
+hierarchically — they're a flat label. If both the supervisor and
+the harness `setsid`'d into their own sessions, neither could reach
+the other via `killpg`. So only the supervisor creates a new
+session; the harness stays in cargo's PGID and handles its own
+children via the registry + PDEATHSIG bridge.
 
 ### Sqlite schema (minimal — facts + one config table)
 
@@ -44,6 +77,7 @@ dashboard.py auto [--interval SECS]          # autonomous fill driver
 | `tracked_refs` | Config: `(ref, ci_worktree)` pairs the autonomous driver tracks. |
 | `latest_results` | **VIEW** over `run_results` returning the freshest row per `(test_id, pass)`. No UPSERT path in the producer — pure SQL. |
 | `meta` | One key/value row: `schema_version`. |
+| `harness_leases` | Cross-session concurrency coordination — one row per live `cargo test --test integration` invocation (`pid`, `heartbeat_at_ms`). Additive (no SCHEMA_VERSION bump). |
 
 There is no `universe`, `worktree_coverage`, `ci_cycles`, or
 `latest_results`-as-table. The runner enumerates the universe
@@ -51,8 +85,49 @@ in-process; coverage is computed at query time from `run_results
 JOIN runs ON commit_sha = ? WHERE dirty_hash IS NULL`.
 
 Schema-version compatibility: bumped on breaking changes. On
-mismatch the Rust producer recreates the store from scratch (the
-`.dashboard/` directory is local-only and gitignored).
+mismatch the Rust producer panics with a remediation pointer;
+the user is consulted before any bump (stopping every coding-agent
+session is a coordination cost).
+
+### Cross-session concurrency coordination
+
+Multiple `cargo test --test integration` invocations can run
+concurrently on the same host (auto-driver, ad-hoc sessions,
+subagents). The `harness_leases` table makes them self-coordinate
+so total in-flight `docker run` children stay ≤ `GLOBAL_CAP`
+(default = `nproc`, override via `LITEBOX_GLOBAL_JOBS`).
+
+**Mechanism.** Each harness inserts `(pid, heartbeat_at_ms)` on
+startup, heartbeats every 10s, deletes on exit. The dispatch gate
+inside the harness reads the live lease count (atomic, refreshed
+every ~10s) and uses `my_cap_now = max(1, min(intrinsic_jobs,
+GLOBAL_CAP / live_lease_count))`. When peers come or go the cap
+floats on the next dispatch.
+
+**Why no SCHEMA_VERSION bump.** The `harness_leases` table is
+purely additive — old harness binaries don't read or write it, so
+they're not affected by its presence (they fall back to today's
+uncoordinated dispatch). New harnesses use it to cooperate. Once
+the new code lands on the amalgamation branch, sessions
+opt-in organically on their next rebuild.
+
+**Inspect live leases.**
+
+```
+sqlite3 .dashboard/results.sqlite \
+  "SELECT pid, (strftime('%s','now')*1000 - heartbeat_at_ms)/1000 AS age_s
+     FROM harness_leases ORDER BY age_s"
+```
+
+(Rows with `age_s > 30` are stale and get pruned by the next live
+harness that connects.) The renderer also includes a one-line
+summary at the top of `summary.md`.
+
+**Failure modes.** Any error in the lease layer (sqlite locked,
+table missing, etc.) is logged and silently absorbed; the harness
+falls back to its uncoordinated default. The lease layer must
+never block a test run — this is asserted by
+`tests/dashboard_store.rs::harness_leases_table_round_trip_and_prune`.
 
 ### How the autonomous driver works
 

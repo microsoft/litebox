@@ -28,6 +28,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
+/// Producer/consumer schema version. **DO NOT BUMP WITHOUT USER
+/// CONFIRMATION.** A bump is a hard sync point across every coding
+/// agent session running against the shared sqlite store — until
+/// each session rebuilds their `litebox_test_harness` integration
+/// binary, their `cargo test --test integration` runs will panic
+/// in `init_schema` below. Coordination cost is real.
+///
+/// Acceptable reasons to bump (after asking):
+///   * The on-disk shape genuinely changed (column added with no
+///     default, column removed, type changed, table/view renamed).
+/// Things that DON'T need a bump:
+///   * Renderer-only changes in `scripts/dashboard.py`.
+///   * Adding a new column with a usable default (NULL or sentinel).
+///   * Adding indexes (the producer's `init_schema` doesn't notice).
+///
+/// When you do bump (with user approval), land the bump on the
+/// amalgamation branch promptly so other sessions pick it up on
+/// their next cargo run rather than panicking on an older meta.
 pub const SCHEMA_VERSION: i64 = 3;
 
 pub struct Ctx {
@@ -41,7 +59,7 @@ pub struct Ctx {
 #[allow(clippy::option_option)]
 static CTX: OnceLock<Option<Ctx>> = OnceLock::new();
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -51,11 +69,11 @@ fn now_ms() -> i64 {
     .unwrap_or(0)
 }
 
-fn opted_out() -> bool {
+pub fn opted_out() -> bool {
     matches!(std::env::var("LITEBOX_DASHBOARD_DIR"), Ok(s) if s.is_empty())
 }
 
-fn resolve_state_dir() -> PathBuf {
+pub fn resolve_state_dir() -> PathBuf {
     if let Ok(env) = std::env::var("LITEBOX_DASHBOARD_DIR")
         && !env.is_empty()
     {
@@ -119,6 +137,12 @@ pub fn init() -> Option<&'static Ctx> {
         conn.pragma_update(None, "busy_timeout", 5000)
             .expect("dashboard: PRAGMA busy_timeout");
         init_schema(&conn);
+        // Apply the additive leases-table DDL on every connection
+        // (not just fresh DBs). Old harnesses don't touch this table
+        // so we don't bump SCHEMA_VERSION when introducing it — the
+        // IF NOT EXISTS handles the upgrade in place.
+        conn.execute_batch(ENSURE_LEASES_DDL)
+            .expect("dashboard: ensure harness_leases table");
         let run_id = insert_run_row(&conn);
         Some(Ctx {
             run_id,
@@ -132,10 +156,40 @@ pub fn ctx() -> Option<&'static Ctx> {
     CTX.get().and_then(|o| o.as_ref())
 }
 
+/// Initialize the schema. Fresh DB (no `meta` table) → create
+/// schema + stamp version. Existing DB at the same version → no-op.
+///
+/// **Loud-panic on schema_version mismatch.** No automatic wipe, no
+/// silent skip — both are subtle data-loss bugs across coordinating
+/// coding-agent sessions:
+///
+/// * Auto-wipe thrashes data on every alternation between sessions
+///   built against different schema versions.
+/// * Silent-skip leaves writes invisibly going into the void; the
+///   session "works" but contributes nothing.
+///
+/// The remediation is **rebuild** so binary and store agree. Schema
+/// bumps are coordinated by merging through the amalgamation; the
+/// next time each session's cargo runs, it picks up the new schema
+/// automatically.
 fn init_schema(conn: &Connection) {
-    // `.dashboard/` is local-only (gitignored); on schema-version
-    // mismatch we recreate the store from scratch instead of
-    // migrating. Saves a lot of fragile DDL.
+    let meta_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !meta_exists {
+        conn.execute_batch(SCHEMA_DDL)
+            .expect("dashboard: schema init on fresh db");
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('schema_version', ?1)",
+            params![SCHEMA_VERSION],
+        )
+        .expect("dashboard: write schema_version");
+        return;
+    }
     let existing: i64 = conn
         .query_row(
             "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
@@ -146,38 +200,27 @@ fn init_schema(conn: &Connection) {
     if existing == SCHEMA_VERSION {
         return;
     }
-    if existing != 0 && existing != SCHEMA_VERSION {
-        eprintln!(
-            "dashboard: schema_version {existing} != current {SCHEMA_VERSION}; \
-             recreating tables (local-only data; no migration)."
-        );
-        conn.execute_batch(DROP_DDL)
-            .expect("dashboard: drop old schema");
-    }
-    conn.execute_batch(SCHEMA_DDL)
-        .expect("dashboard: schema init");
-    conn.execute(
-        "INSERT INTO meta(key,value) VALUES('schema_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![SCHEMA_VERSION],
-    )
-    .expect("dashboard: write schema_version");
+    let direction = if existing > SCHEMA_VERSION {
+        "this binary is OUT OF DATE — somebody else's session has \
+         already bumped the schema. Pulling/merging in their \
+         schema-bumping commit + rebuilding catches you up."
+    } else {
+        "this binary is NEWER — your session has a schema-bumping \
+         commit that hasn't propagated to other sessions yet. \
+         Landing it on wportnoy/vscode-server-in-litebox is what \
+         lets the other sessions catch up, but that's a merge to the \
+         amalgamation branch — don't do it without user sign-off."
+    };
+    panic!(
+        "dashboard: schema_version mismatch — \
+         store has {existing}, this binary expects {SCHEMA_VERSION}.\n\
+         \n\
+         {direction}\n\
+         \n\
+         Either way: this is a cross-session coordination problem; \
+         consult with the user about how to proceed."
+    );
 }
-
-/// Tables / view / indexes that may exist from a previous
-/// schema_version. Drops are unconditional (`IF EXISTS`) so this
-/// is safe to run on first init too.
-const DROP_DDL: &str = r#"
-    DROP VIEW  IF EXISTS latest_results;
-    DROP TABLE IF EXISTS latest_results;
-    DROP TABLE IF EXISTS run_results;
-    DROP TABLE IF EXISTS runs;
-    DROP TABLE IF EXISTS universe;
-    DROP TABLE IF EXISTS worktree_coverage;
-    DROP TABLE IF EXISTS ci_cycles;
-    DROP TABLE IF EXISTS tracked_refs;
-    DROP TABLE IF EXISTS meta;
-"#;
 
 /// The canonical dashboard schema. Three tables (`runs`,
 /// `run_results`, `tracked_refs`), one view (`latest_results`),
@@ -275,6 +318,34 @@ pub const SCHEMA_DDL: &str = r#"
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+
+    -- Cross-session concurrency coordination. Each `cargo test
+    -- --test integration` invocation inserts one row at startup and
+    -- heartbeats it; deletes it on exit. Other live harnesses read
+    -- the count to derive their dynamic dispatch cap (GLOBAL_CAP / N).
+    -- See `tests/common/lease.rs` for the protocol.
+    --
+    -- The same `CREATE TABLE IF NOT EXISTS` is also kept in
+    -- `ENSURE_LEASES_DDL` (separate const) so existing DBs created
+    -- before this table existed get it added on first new-harness
+    -- connection. Adding the table is purely additive — old harnesses
+    -- don't read or write it — so no SCHEMA_VERSION bump is required.
+    CREATE TABLE harness_leases (
+        pid             INTEGER PRIMARY KEY,
+        heartbeat_at_ms INTEGER NOT NULL
+    );
+"#;
+
+/// Idempotent DDL to add the `harness_leases` table to a database
+/// that was created by an older harness (predating the table). New
+/// harnesses apply this on every connection. No SCHEMA_VERSION bump
+/// is needed because old harnesses simply never read or write the
+/// table (they fall back to uncoordinated dispatch).
+pub const ENSURE_LEASES_DDL: &str = r#"
+    CREATE TABLE IF NOT EXISTS harness_leases (
+        pid             INTEGER PRIMARY KEY,
+        heartbeat_at_ms INTEGER NOT NULL
+    );
 "#;
 
 fn insert_run_row(conn: &Connection) -> i64 {
@@ -287,8 +358,7 @@ fn insert_run_row(conn: &Connection) -> i64 {
                 .map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|| "unknown".to_string());
-    let commit_sha =
-        git_capture(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    let commit_sha = git_capture(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let branch = git_capture(&["rev-parse", "--abbrev-ref", "HEAD"]);
     let worktree_path =
         git_capture(&["rev-parse", "--show-toplevel"]).unwrap_or_else(|| "unknown".to_string());
@@ -460,10 +530,29 @@ pub fn finalize() {
     );
 }
 
-/// Select up to `n` trial *names* (e.g. `native::PIDF.spawn_and_open`)
-/// that have no clean-state result at the current `commit_sha`.
+/// How `select_fill_batch` decides where to stop.
 ///
-/// Priority order:
+/// `Count(N)` — pick up to N trials (hard cap).
+///
+/// `BudgetSecs { secs, jobs }` — keep adding trials until the
+/// estimated wall time (sum of t_useful_ms / jobs) reaches `secs`.
+/// Per-trial cost is read from the most recent `latest_results`
+/// row; trials with no prior cost use `DEFAULT_TEST_COST_MS`.
+pub enum FillCap {
+    Count(usize),
+    BudgetSecs { secs: u64, jobs: u64 },
+}
+
+/// Per-test wall-time estimate used by `BudgetSecs` when we have no
+/// historical t_useful_ms for a trial. 5s is a reasonable median
+/// for litebox docker-run + setup overhead on top of a small test.
+const DEFAULT_TEST_COST_MS: u64 = 5_000;
+
+/// Select trial *names* (e.g. `native::PIDF.spawn_and_open`) that
+/// have no clean-state result at the current `commit_sha`,
+/// capped by `cap`.
+///
+/// Priority order within the candidate set:
 /// 1. Never seen anywhere (`latest_results` has no row).
 /// 2. Stalest by `latest_results.finished_ts_ms` ascending.
 /// 3. The rest, sorted alphabetically.
@@ -473,15 +562,19 @@ pub fn finalize() {
 /// ones. Trial names that don't follow `<pass>::<id>` are
 /// ignored (host::fwd, dropbear_bash trials, etc. — those are
 /// out of scope for the autonomous fill).
-pub fn select_fill_batch(trials: &[libtest_mimic::Trial], n: usize) -> Vec<String> {
-    if n == 0 {
+pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<String> {
+    let count_cap = match cap {
+        FillCap::Count(n) => n,
+        FillCap::BudgetSecs { .. } => usize::MAX, // budget-bound below
+    };
+    if count_cap == 0 {
         return Vec::new();
     }
     let Some(ctx) = ctx() else {
-        // Dashboard disabled — return alphabetically, capped.
+        // Dashboard disabled — return alphabetically, capped by count.
         return trials
             .iter()
-            .take(n)
+            .take(count_cap)
             .map(|t| t.name().to_string())
             .collect();
     };
@@ -520,16 +613,21 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], n: usize) -> Vec<Strin
         }
     }
 
-    // Pull per-(pass, id) staleness so we can prioritize within
-    // the candidate set. Hash map: trial name → finished_ts_ms.
+    // Pull per-(pass, id) staleness AND per-test wall-time cost so
+    // we can prioritize within the candidate set and (for the
+    // BudgetSecs cap) estimate accumulated cost.
     let mut stalest: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    let mut suites: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut suites: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut costs: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     {
         let mut stmt = conn
             .prepare(
-                "SELECT pass, test_id, finished_ts_ms, suite
-                   FROM latest_results",
+                "SELECT lr.pass, lr.test_id, lr.finished_ts_ms, lr.suite,
+                        rr.t_useful_ms
+                   FROM latest_results lr
+                   JOIN run_results rr ON rr.run_id = lr.run_id
+                                       AND rr.test_id = lr.test_id
+                                       AND rr.pass    = lr.pass",
             )
             .expect("dashboard: prepare latest query");
         let rows = stmt
@@ -538,14 +636,16 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], n: usize) -> Vec<Strin
                 let id: String = r.get(1)?;
                 let ts: i64 = r.get(2)?;
                 let suite: Option<String> = r.get(3)?;
-                Ok((format!("{pass}::{id}"), ts, suite))
+                let cost: i64 = r.get(4)?;
+                Ok((format!("{pass}::{id}"), ts, suite, cost))
             })
             .expect("dashboard: latest query");
         for row in rows.flatten() {
             stalest.insert(row.0.clone(), row.1);
             if let Some(s) = row.2 {
-                suites.insert(row.0, s);
+                suites.insert(row.0.clone(), s);
             }
+            costs.insert(row.0, row.3);
         }
     }
     drop(conn);
@@ -576,7 +676,33 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], n: usize) -> Vec<Strin
     let mut ordered: Vec<String> = round_robin_by_suite(&never_run, &suites);
     let stalest_names: Vec<String> = seen_before.into_iter().map(|(n, _)| n).collect();
     ordered.extend(round_robin_by_suite(&stalest_names, &suites));
-    ordered.truncate(n);
+
+    // Apply the cap.
+    match cap {
+        FillCap::Count(n) => {
+            ordered.truncate(n);
+        }
+        FillCap::BudgetSecs { secs, jobs } => {
+            let budget_ms = secs.saturating_mul(1000);
+            let jobs = jobs.max(1);
+            let mut accumulated_ms: u64 = 0;
+            let mut keep_n = 0usize;
+            for name in &ordered {
+                let cost_ms = costs
+                    .get(name)
+                    .copied()
+                    .map(|c| u64::try_from(c).unwrap_or(DEFAULT_TEST_COST_MS))
+                    .unwrap_or(DEFAULT_TEST_COST_MS);
+                // Wall-time contribution under parallelism `jobs`.
+                accumulated_ms += cost_ms / jobs;
+                keep_n += 1;
+                if accumulated_ms >= budget_ms {
+                    break;
+                }
+            }
+            ordered.truncate(keep_n);
+        }
+    }
     ordered
 }
 
@@ -639,4 +765,3 @@ fn infer_suite_from_name(name: &str) -> String {
     }
     .to_string()
 }
-
