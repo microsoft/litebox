@@ -149,6 +149,7 @@ fn build_local_services(
     cli: &Cli,
     elf_cache: Arc<Mutex<litebox_broker::nine_p::server::ElfCache>>,
     sandbox_policy: &Option<Arc<litebox_broker::sandbox_policy::SandboxPolicy>>,
+    inotify_dispatcher: Arc<litebox_broker::inotify_dispatcher::InotifyDispatcher>,
 ) -> Option<litebox_broker::net_proxy::LocalServiceRegistry> {
     let root_dir = cli.root_dir.as_ref()?;
     let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
@@ -162,12 +163,14 @@ fn build_local_services(
         let root = root.clone();
         let policy = Arc::clone(&policy);
         let elf_cache = Arc::clone(&elf_cache);
+        let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
         registry.register(
             5640,
             Box::new(move |stream| {
                 let root = root.clone();
                 let policy = Arc::clone(&policy);
                 let elf_cache = Arc::clone(&elf_cache);
+                let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
                 std::thread::spawn(move || {
                     let mut stream = stream;
                     let server = litebox_broker::nine_p::server::Server::with_elf_cache(
@@ -175,6 +178,7 @@ fn build_local_services(
                         policy,
                         rewrite_syscalls,
                         elf_cache,
+                        inotify_dispatcher,
                     );
                     server.serve(&mut stream);
                     info!("9P local service session ended");
@@ -189,18 +193,21 @@ fn build_local_services(
         let root = root.clone();
         let policy = Arc::clone(&policy);
         let elf_cache = Arc::clone(&elf_cache);
+        let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
         registry.register_ring(
             5640,
             Arc::new(move |writer, reader| {
                 let root = root.clone();
                 let policy = Arc::clone(&policy);
                 let elf_cache = Arc::clone(&elf_cache);
+                let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
                 std::thread::spawn(move || {
                     let server = Arc::new(litebox_broker::nine_p::server::Server::with_elf_cache(
                         root,
                         policy,
                         rewrite_syscalls,
                         elf_cache,
+                        inotify_dispatcher,
                     ));
                     litebox_broker::nine_p::server::Server::serve_threaded(
                         server, reader, writer, 8,
@@ -237,6 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handles for cross-worker SCM_RIGHTS transfer. The two registries
     // are constructed here and shared with the listener thread; their
     // Arc clones survive for the lifetime of the broker process.
+    let inotify_dispatcher = std::sync::Arc::new(litebox_broker::inotify_dispatcher::InotifyDispatcher::new());
     let shared_state_registry = cli
         .fd_token_broker_listen
         .as_ref()
@@ -261,6 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fd_registry,
                 state_registry,
                 process_registry,
+                Arc::clone(&inotify_dispatcher),
             ) {
                 Ok(handle) => {
                     info!(path = %path.display(), "fd-token broker listener started");
@@ -315,7 +324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd_num) };
         let ipc = IpcStream::from_owned_fd(fd);
         let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
-        let registry = build_local_services(&cli, elf_cache, &sandbox_policy);
+        let registry = build_local_services(&cli, elf_cache, &sandbox_policy, Arc::clone(&inotify_dispatcher));
         let forwards = parse_forward_specs(&cli.forward_port);
         return litebox_broker::net_proxy::run(
             ipc,
@@ -397,7 +406,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // cannot block the real runner from connecting.
         let mut first_accept = true;
         loop {
-            let registry = build_local_services(&cli, Arc::clone(&elf_cache), &sandbox_policy);
+            let registry = build_local_services(
+                &cli,
+                Arc::clone(&elf_cache),
+                &sandbox_policy,
+                Arc::clone(&inotify_dispatcher),
+            );
             let ipc = match litebox_broker::net_proxy::accept_ipc_client(
                 &listener,
                 registry.as_ref(),
@@ -472,6 +486,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             root.clone(),
             Arc::clone(&policy),
             cli.rewrite_syscalls,
+            Arc::clone(&inotify_dispatcher),
         );
         server.serve(&mut stream);
         info!("9P client disconnected");

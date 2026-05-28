@@ -35,6 +35,7 @@ use tracing::{debug, error, trace, warn};
 
 use super::fcall::{self, Fcall, FcallStr, TaggedFcall};
 use super::transport::{self, Read, Write};
+use crate::inotify_dispatcher::InotifyDispatcher;
 use crate::policy::{Action, Decision, Policy};
 
 /// Maximum number of FIDs per connection to prevent resource exhaustion.
@@ -89,6 +90,8 @@ pub struct Server {
     canonical_cache: Mutex<HashMap<PathBuf, (PathBuf, fcall::Qid)>>,
     /// Optional audit log for structured policy events.
     audit_log: Option<crate::audit::AuditLog>,
+    /// Broker-global inotify fan-out for filesystem mutations.
+    inotify_dispatcher: Arc<InotifyDispatcher>,
 }
 
 impl Server {
@@ -103,12 +106,18 @@ impl Server {
     /// * `root` - Root directory to serve
     /// * `policy` - Policy engine for access control
     /// * `rewrite_syscalls` - Whether to patch ELF files with syscall trampolines
-    pub fn new(root: PathBuf, policy: Arc<dyn Policy>, rewrite_syscalls: bool) -> Self {
+    pub fn new(
+        root: PathBuf,
+        policy: Arc<dyn Policy>,
+        rewrite_syscalls: bool,
+        inotify_dispatcher: Arc<InotifyDispatcher>,
+    ) -> Self {
         Self::with_elf_cache(
             root,
             policy,
             rewrite_syscalls,
             Arc::new(Mutex::new(HashMap::new())),
+            inotify_dispatcher,
         )
     }
 
@@ -121,6 +130,7 @@ impl Server {
         policy: Arc<dyn Policy>,
         rewrite_syscalls: bool,
         elf_cache: Arc<Mutex<ElfCache>>,
+        inotify_dispatcher: Arc<InotifyDispatcher>,
     ) -> Self {
         Self {
             root,
@@ -131,6 +141,7 @@ impl Server {
             elf_cache,
             canonical_cache: Mutex::new(HashMap::new()),
             audit_log: None,
+            inotify_dispatcher,
         }
     }
 

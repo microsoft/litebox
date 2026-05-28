@@ -10,6 +10,7 @@
 
 use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_request};
 use crate::fd_tokens::BrokerFdTokenRegistry;
+use crate::inotify_dispatcher::InotifyDispatcher;
 use crate::pgrp_signal_inbox::PgrpSignalInbox;
 use crate::state_registry::{BrokerStateRegistry, StateHandle};
 use crate::state_service::{
@@ -755,6 +756,7 @@ pub fn handle_control_connection(
     fd_registry: Arc<BrokerFdTokenRegistry>,
     state_registry: Arc<BrokerStateRegistry>,
     process_registry: Arc<BrokerStateRegistry>,
+    inotify_dispatcher: Arc<InotifyDispatcher>,
     pgrp_signal_inbox: Arc<PgrpSignalInbox>,
 ) {
     // PE.12 diag: assign a per-conn id so we can correlate frames
@@ -786,6 +788,7 @@ pub fn handle_control_connection(
             &fd_registry,
             &state_registry,
             &process_registry,
+            &inotify_dispatcher,
             &pgrp_signal_inbox,
             &mut conn_state,
             &mut tracker,
@@ -867,6 +870,7 @@ fn handle_control_connection_inner(
     fd_registry: &Arc<BrokerFdTokenRegistry>,
     state_registry: &Arc<BrokerStateRegistry>,
     process_registry: &Arc<BrokerStateRegistry>,
+    inotify_dispatcher: &Arc<InotifyDispatcher>,
     pgrp_signal_inbox: &Arc<PgrpSignalInbox>,
     conn_state: &mut ConnState,
     tracker: &mut ConnRefTracker,
@@ -1022,6 +1026,7 @@ fn handle_control_connection_inner(
                             // State-registry release. Owner-gated.
                             let state_result = state_handle_request(
                                 state_registry,
+                                inotify_dispatcher,
                                 conn_state,
                                 &frame,
                                 Vec::new(),
@@ -1034,6 +1039,7 @@ fn handle_control_connection_inner(
                             // Process-registry release. Owner-gated.
                             let proc_result = state_handle_request(
                                 process_registry,
+                                inotify_dispatcher,
                                 conn_state,
                                 &frame,
                                 Vec::new(),
@@ -1051,6 +1057,7 @@ fn handle_control_connection_inner(
                             // Let the accepting worker's close consume that handoff ref.
                             let state_result = state_handle_request(
                                 state_registry,
+                                inotify_dispatcher,
                                 conn_state,
                                 &frame,
                                 Vec::new(),
@@ -1191,7 +1198,7 @@ fn handle_control_connection_inner(
                     Opcode::Unsubscribe => {
                         // Unsubscribe is kind-agnostic: try fd-state first, then process-state.
                         let state_result =
-                            state_handle_request(state_registry, conn_state, &frame, in_fds);
+                            state_handle_request(state_registry, inotify_dispatcher, conn_state, &frame, in_fds);
                         if matches!(
                             state_result.frame.status,
                             litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
@@ -1199,6 +1206,7 @@ fn handle_control_connection_inner(
                         ) {
                             let proc_result = state_handle_request(
                                 process_registry,
+                                inotify_dispatcher,
                                 conn_state,
                                 &frame,
                                 Vec::new(),
@@ -1230,6 +1238,11 @@ fn handle_control_connection_inner(
                     | Opcode::CreateSignalfd
                     | Opcode::ReadSiginfo
                     | Opcode::PushSiginfo
+                    | Opcode::InotifyInit1
+                    | Opcode::InotifyAddWatch
+                    | Opcode::InotifyRmWatch
+                    | Opcode::InotifyRead
+                    | Opcode::InotifyQueryEvents
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe
@@ -1249,7 +1262,7 @@ fn handle_control_connection_inner(
                     | Opcode::DupHandle => {
                         // State-object opcodes: route to state_service on the fd-state registry.
                         let state_result =
-                            state_handle_request(state_registry, conn_state, &frame, in_fds);
+                            state_handle_request(state_registry, inotify_dispatcher, conn_state, &frame, in_fds);
                         SocketHandlerResult {
                             frame: state_result.frame,
                             out_fd: state_result.out_fd,
@@ -1263,6 +1276,7 @@ fn handle_control_connection_inner(
                         // cross-registry shape as Opcode::Release.
                         let state_result = state_handle_request(
                             state_registry,
+                            inotify_dispatcher,
                             conn_state,
                             &frame,
                             in_fds,
@@ -1272,6 +1286,7 @@ fn handle_control_connection_inner(
                         {
                             let proc_result = state_handle_request(
                                 process_registry,
+                                inotify_dispatcher,
                                 conn_state,
                                 &frame,
                                 Vec::new(),
@@ -1370,8 +1385,13 @@ fn handle_control_connection_inner(
                         // Process operations: route to state_service on the *process*
                         // registry. RegisterProcess allocates the process handle; Phase G
                         // exit-state RPCs resolve that same handle id (guest pid).
-                        let proc_result =
-                            state_handle_request(process_registry, conn_state, &frame, in_fds);
+                        let proc_result = state_handle_request(
+                            process_registry,
+                            inotify_dispatcher,
+                            conn_state,
+                            &frame,
+                            in_fds,
+                        );
                         SocketHandlerResult {
                             frame: proc_result.frame,
                             out_fd: proc_result.out_fd,
@@ -1464,6 +1484,7 @@ pub fn spawn_control_listener(
     fd_registry: Arc<BrokerFdTokenRegistry>,
     state_registry: Arc<BrokerStateRegistry>,
     process_registry: Arc<BrokerStateRegistry>,
+    inotify_dispatcher: Arc<InotifyDispatcher>,
 ) -> std::io::Result<JoinHandle<()>> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
@@ -1480,6 +1501,7 @@ pub fn spawn_control_listener(
                         let state_registry = Arc::clone(&state_registry);
                         let process_registry = Arc::clone(&process_registry);
                         let pgrp_signal_inbox = Arc::clone(&pgrp_signal_inbox);
+                        let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
                         if let Err(e) =
                             thread::Builder::new()
                                 .name("fd-token-conn".into())
@@ -1489,6 +1511,7 @@ pub fn spawn_control_listener(
                                         fd_registry,
                                         state_registry,
                                         process_registry,
+                                        inotify_dispatcher,
                                         pgrp_signal_inbox,
                                     )
                                 })
