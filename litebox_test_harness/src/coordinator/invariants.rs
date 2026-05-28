@@ -13,6 +13,8 @@ use super::registry::Registry;
 
 const KIND_TYPEID_MATCH: HandlerToken<(), InvariantOut> =
     HandlerToken::new("invariants.kind_typeid_match");
+const BROKER_HANDLE_REFCOUNT: HandlerToken<(), InvariantOut> =
+    HandlerToken::new("invariants.broker_handle_refcount");
 
 const LITEBOX_IOCTL_KIND_TYPEID_INVARIANT: libc::c_ulong = 0x4c42_4901;
 
@@ -118,14 +120,142 @@ async fn handle_kind_typeid_match(
     })
 }
 
+async fn handle_broker_handle_refcount(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<InvariantOut, HandlerError> {
+    let mut fds = Vec::new();
+
+    // SAFETY: eventfd has no pointer arguments.
+    fds.push(Fd::new(
+        unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) },
+        "eventfd",
+    )?);
+
+    let mut pipefds = [-1; 2];
+    // SAFETY: `pipefds` points to two writable fd slots.
+    if unsafe { libc::pipe2(pipefds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(HandlerError(format!(
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    fds.push(Fd(pipefds[0]));
+    fds.push(Fd(pipefds[1]));
+
+    let mut sp = [-1; 2];
+    // SAFETY: `sp` points to two writable fd slots.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sp.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(HandlerError(format!(
+            "socketpair: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    fds.push(Fd(sp[0]));
+    fds.push(Fd(sp[1]));
+
+    // SAFETY: syscall arguments are plain integers.
+    fds.push(Fd::new(
+        unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) as i32 },
+        "pidfd_open(self)",
+    )?);
+
+    let ptmx = std::ffi::CString::new("/dev/ptmx").unwrap();
+    // SAFETY: C string pointer is valid for the duration of the call.
+    fds.push(Fd::new(
+        unsafe {
+            libc::open(
+                ptmx.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        },
+        "open /dev/ptmx",
+    )?);
+
+    // SAFETY: zeroed sigset_t is immediately initialized by sigemptyset.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `mask` is a valid sigset_t pointer.
+    unsafe { libc::sigemptyset(&mut mask) };
+    // SAFETY: `mask` points to a valid initialized sigset_t.
+    fds.push(Fd::new(
+        unsafe { libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) },
+        "signalfd",
+    )?);
+
+    // SAFETY: syscall arguments are plain integers.
+    fds.push(Fd::new(
+        unsafe {
+            libc::syscall(
+                libc::SYS_inotify_init1,
+                libc::IN_CLOEXEC | libc::IN_NONBLOCK,
+            ) as i32
+        },
+        "inotify_init1",
+    )?);
+
+    drop(fds);
+
+    // SAFETY: eventfd has no pointer arguments.
+    let efd = Fd::new(
+        unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) },
+        "post-close eventfd",
+    )?;
+    let value: u64 = 1;
+    // SAFETY: `value` points to a valid 8-byte eventfd payload.
+    let wrote = unsafe {
+        libc::write(
+            efd.0,
+            (&value as *const u64).cast::<libc::c_void>(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    if wrote != std::mem::size_of::<u64>() as isize {
+        return Ok(InvariantOut {
+            ok: false,
+            detail: format!(
+                "post-close eventfd write failed: wrote={wrote} err={}",
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+
+    Ok(InvariantOut {
+        ok: true,
+        detail: "closed broker-backed fds and post-close eventfd RPC succeeded".into(),
+    })
+}
+
 pub(crate) fn register_invariant_tests(reg: &mut Registry<'_>) {
     register_handler!(KIND_TYPEID_MATCH, handle_kind_typeid_match);
+    register_handler!(BROKER_HANDLE_REFCOUNT, handle_broker_handle_refcount);
     reg.single_agent_handler_test(
         "invariants",
         "broker_inet",
         "INV.broker_inet.kind_typeid_match.dpg1",
         AgentName::Dpg1,
         &KIND_TYPEID_MATCH,
+        |out| {
+            if out.ok {
+                Ok(out.detail.clone())
+            } else {
+                Err(out.detail.clone())
+            }
+        },
+    );
+    reg.single_agent_handler_test(
+        "invariants",
+        "broker_handle_refcount",
+        "INV.broker_handle_refcount.dpg1",
+        AgentName::Dpg1,
+        &BROKER_HANDLE_REFCOUNT,
         |out| {
             if out.ok {
                 Ok(out.detail.clone())
