@@ -1,32 +1,30 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Runner-side implementation of [`BrokerSocketPairProvider`].
+//! Runner-side implementation of [`BrokerInotifyProvider`].
 
-use litebox_common_linux::broker_eventfd::{NotificationCallback, NotificationDispatcher};
-use litebox_common_linux::broker_socketpair_provider::{
-    BrokerEventCallback, BrokerOpError, BrokerSocketPairProvider,
+use litebox_common_linux::broker_eventfd::NotificationDispatcher;
+use litebox_common_linux::broker_inotify_provider::{
+    BrokerEventCallback, BrokerInotifyProvider, BrokerOpError,
 };
-use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
 use litebox_common_linux::fd_token_client::{ClientError, FdTokenClient};
 use std::sync::Arc;
 
-pub struct RunnerBrokerSocketPairProvider {
+/// Runner-side concrete impl of [`BrokerInotifyProvider`].
+pub struct RunnerBrokerInotifyProvider {
     client: Arc<FdTokenClient>,
     dispatcher: Arc<NotificationDispatcher>,
 }
 
-impl RunnerBrokerSocketPairProvider {
+impl RunnerBrokerInotifyProvider {
     pub fn new(client: Arc<FdTokenClient>, dispatcher: Arc<NotificationDispatcher>) -> Self {
         Self { client, dispatcher }
     }
 }
 
-impl BrokerSubscribable for RunnerBrokerSocketPairProvider {
-    /// Subscribes to broker events for the socketpair endpoint
-    /// identified by `handle`. Each endpoint has its own broker
-    /// state-registry entry, so the handle uniquely identifies the
-    /// end; no endpoint byte is needed.
+impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable
+    for RunnerBrokerInotifyProvider
+{
     fn subscribe(
         &self,
         handle: u64,
@@ -34,7 +32,8 @@ impl BrokerSubscribable for RunnerBrokerSocketPairProvider {
         callback: Arc<dyn BrokerEventCallback>,
     ) -> Result<u64, BrokerOpError> {
         let subscription_id = self.dispatcher.alloc_subscription_id();
-        let bridge: Arc<dyn NotificationCallback> = Arc::new(CallbackBridge { inner: callback });
+        let bridge: Arc<dyn litebox_common_linux::broker_eventfd::NotificationCallback> =
+            Arc::new(CallbackBridge { inner: callback });
         self.dispatcher.register_callback(subscription_id, bridge);
         match self.client.subscribe(handle, subscription_id, events_mask) {
             Ok(()) => Ok(subscription_id),
@@ -48,13 +47,13 @@ impl BrokerSubscribable for RunnerBrokerSocketPairProvider {
     fn unsubscribe(&self, handle: u64, subscription_id: u64) {
         self.dispatcher.unregister_callback(subscription_id);
         if let Err(e) = self.client.unsubscribe(handle, subscription_id) {
-            tracing::warn!(handle, subscription_id, error = %e, "socketpair unsubscribe failed");
+            tracing::warn!(handle, subscription_id, error = %e, "inotify unsubscribe failed");
         }
     }
 
     fn release(&self, handle: u64) {
         if let Err(e) = self.client.release(handle) {
-            tracing::warn!(handle, error = %e, "socketpair release failed; broker handle may leak");
+            tracing::warn!(handle, error = %e, "inotify release failed; broker handle may leak");
         }
     }
 
@@ -71,32 +70,28 @@ impl BrokerSubscribable for RunnerBrokerSocketPairProvider {
     }
 }
 
-impl BrokerSocketPairProvider for RunnerBrokerSocketPairProvider {
-    fn create_socketpair(
-        &self,
-        capacity: u64,
-        atomic_write_size: u64,
-    ) -> Result<(u64, u64), BrokerOpError> {
+impl BrokerInotifyProvider for RunnerBrokerInotifyProvider {
+    fn inotify_init1(&self, flags: u32) -> Result<u64, BrokerOpError> {
         self.client
-            .create_socketpair(capacity, atomic_write_size)
+            .inotify_init1(flags)
             .map_err(client_err_to_broker_err)
     }
 
-    fn read_socketpair(&self, handle: u64, max_len: u64) -> Result<Vec<u8>, BrokerOpError> {
+    fn inotify_add_watch(&self, handle: u64, path: &str, mask: u32) -> Result<i32, BrokerOpError> {
         self.client
-            .read_socketpair(handle, max_len)
+            .inotify_add_watch(handle, path, mask)
             .map_err(client_err_to_broker_err)
     }
 
-    fn write_socketpair(&self, handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError> {
+    fn inotify_rm_watch(&self, handle: u64, wd: i32) -> Result<(), BrokerOpError> {
         self.client
-            .write_socketpair(handle, bytes)
+            .inotify_rm_watch(handle, wd)
             .map_err(client_err_to_broker_err)
     }
 
-    fn shutdown_socketpair_write(&self, handle: u64) -> Result<(), BrokerOpError> {
+    fn inotify_read(&self, handle: u64, max_len: u32) -> Result<Option<Vec<u8>>, BrokerOpError> {
         self.client
-            .shutdown_socketpair_write(handle)
+            .inotify_read(handle, max_len)
             .map_err(client_err_to_broker_err)
     }
 }
@@ -105,19 +100,19 @@ struct CallbackBridge {
     inner: Arc<dyn BrokerEventCallback>,
 }
 
-impl NotificationCallback for CallbackBridge {
+impl litebox_common_linux::broker_eventfd::NotificationCallback for CallbackBridge {
     fn on_events(&self, events: u32) {
         self.inner.on_events(events);
     }
 }
 
-fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
-    match e {
-        ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
+fn client_err_to_broker_err(err: ClientError) -> BrokerOpError {
+    match err {
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
-        ClientError::Protocol(_) => BrokerOpError::InvalidValue,
+        ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
+        ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
         ClientError::Io(_)
-        | ClientError::InvalidValue { .. }
+        | ClientError::Protocol(_)
         | ClientError::UnexpectedOpcode { .. }
         | ClientError::BrokerRejectedProtocol
         | ClientError::DuplicateSubscription(_)

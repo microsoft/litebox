@@ -127,6 +127,10 @@ impl StateObject for SignalfdState {
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         self.subscriptions.remove(subscription_id)
     }
+
+    fn current_events(&self) -> u32 {
+        SignalfdState::current_events(self)
+    }
 }
 
 fn watcher_loop(weak: Weak<SignalfdState>, fd: RawFd) {

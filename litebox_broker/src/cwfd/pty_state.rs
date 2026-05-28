@@ -469,6 +469,10 @@ impl StateObject for PtyState {
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         PtyState::unsubscribe(self, subscription_id)
     }
+
+    fn current_events(&self) -> u32 {
+        PtyState::current_events(self)
+    }
 }
 
 const IFLAG_INLCR: u32 = 0x0040;

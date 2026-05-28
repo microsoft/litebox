@@ -80,6 +80,20 @@ pub(crate) struct BrokerSocketPairFd<P: RawSyncPrimitivesProvider + litebox::pla
     common: BrokerBackedCommon<P>,
     endpoint: BrokerSocketPairEndpoint,
     status: AtomicU32,
+    /// `shutdown(fd, SHUT_RD)` was called on this `BrokerSocketPairFd`
+    /// instance. Used to short-circuit `read()` to EOF without an RPC.
+    ///
+    /// **Known divergence from Linux:** in real Linux, `shutdown(2)`
+    /// affects the underlying socket, so all dup'd fds observe it on
+    /// subsequent ops. Here the flag lives per-`BrokerSocketPairFd`
+    /// instance — if a guest dup'd this fd and the dup landed in a
+    /// separate `BrokerSocketPairFd`, that dup's reads would not see
+    /// the shutdown. This is the same class of hazard the Phase H fix
+    /// addressed for PTY readiness: shim-side caches of broker-held
+    /// state can drift. Listed in `files/cache-audit.md` (item B);
+    /// proper fix is to push shutdown state into the broker
+    /// `SocketPairEnd` and replace these AtomicBools with synchronous
+    /// queries (parallel to `BrokerBackedCommon::check_io_events`).
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
     pollee: Arc<Pollee<P>>,
@@ -186,14 +200,12 @@ impl BrokerSocketPairFd<Platform> {
                         let n = bytes.len().min(buf.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
                         if n == 0 {
-                            self.common.set_readable(false);
                         }
                         Ok(n)
                     }
                     Err(BrokerOpError::WouldBlock) => {
                         // Mirror C.5k pipe fix: clear pollee readable
                         // so ppoll doesn't livelock without fresh IN.
-                        self.common.set_readable(false);
                         Err(litebox::event::polling::TryOpError::TryAgain)
                     }
                     Err(e) => Err(litebox::event::polling::TryOpError::Other(
@@ -211,7 +223,6 @@ impl BrokerSocketPairFd<Platform> {
     pub(crate) fn shutdown(&self, read: bool, write: bool) -> Result<(), Errno> {
         if read {
             self.read_shutdown.store(true, Ordering::Release);
-            self.common.set_readable(false);
         }
         if write && !self.write_shutdown.swap(true, Ordering::AcqRel) {
             self.provider

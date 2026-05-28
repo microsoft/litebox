@@ -2016,6 +2016,165 @@ mod copilot {
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
+    /// Headless xterm-class terminal emulator backing `drive_tui`.
+    ///
+    /// Wraps [`alacritty_terminal::Term`] so the harness presents a
+    /// real terminal model to the Copilot CLI's TUI library. Without
+    /// this, the TUI's initial capability discovery (OSC color
+    /// queries, kitty keyboard protocol, cursor position) blocks
+    /// forever waiting for replies the raw PTY pair cannot produce.
+    ///
+    /// API:
+    /// - [`Emulator::feed`] pumps PTY-master bytes into the emulator;
+    ///   while parsing, the [`alacritty_terminal::Term`] generates
+    ///   [`Event::PtyWrite`] / [`Event::ColorRequest`] / etc. for
+    ///   sequences that demand a reply. They are collected into the
+    ///   `pending_writes` queue.
+    /// - [`Emulator::take_pty_writes`] drains queued replies for the
+    ///   driver to write back to the PTY master.
+    /// - [`Emulator::screen_text`] returns the visible region as a
+    ///   plain-text snapshot, lines joined with `\n`. Used by the
+    ///   scenario `check` functions and for forensic transcripts.
+    ///
+    /// The emulator is 100 x 30 by default — wide enough for the
+    /// Copilot CLI's panels without scrolling concerns.
+    pub(super) mod term_emu {
+        use alacritty_terminal::event::{Event, EventListener, WindowSize};
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::cell::Flags;
+        use alacritty_terminal::term::test::TermSize;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        use std::sync::Mutex;
+
+        /// `Term::send_event` calls this listener for actions that
+        /// require host-side handling (writes back to PTY, clipboard,
+        /// color queries, window size). The driver only cares about
+        /// `PtyWrite` and `ColorRequest`; everything else is dropped.
+        struct Listener {
+            queue: Mutex<Vec<Vec<u8>>>,
+        }
+
+        impl Listener {
+            fn new() -> Self {
+                Self {
+                    queue: Mutex::new(Vec::new()),
+                }
+            }
+
+            fn push(&self, bytes: Vec<u8>) {
+                self.queue.lock().unwrap().push(bytes);
+            }
+
+            fn drain(&self) -> Vec<Vec<u8>> {
+                std::mem::take(&mut *self.queue.lock().unwrap())
+            }
+        }
+
+        /// Newtype wrapper so we can `impl EventListener` (the trait
+        /// is foreign and `Arc<Listener>` is a foreign type).
+        #[derive(Clone)]
+        struct ListenerHandle(std::sync::Arc<Listener>);
+
+        impl EventListener for ListenerHandle {
+            fn send_event(&self, event: Event) {
+                match event {
+                    Event::PtyWrite(s) => self.0.push(s.into_bytes()),
+                    Event::ColorRequest(idx, fmt) => {
+                        // Reply with a plausible color for the queried
+                        // index. The Copilot CLI just needs *some*
+                        // reply to unblock. We use a fixed gray
+                        // palette — the actual values do not matter
+                        // for headless testing.
+                        let rgb = alacritty_terminal::vte::ansi::Rgb {
+                            r: 0x80,
+                            g: 0x80,
+                            b: 0x80,
+                        };
+                        let _ = idx;
+                        self.0.push(fmt(rgb).into_bytes());
+                    }
+                    Event::TextAreaSizeRequest(fmt) => {
+                        let ws = WindowSize {
+                            num_lines: 30,
+                            num_cols: 100,
+                            cell_width: 10,
+                            cell_height: 20,
+                        };
+                        self.0.push(fmt(ws).into_bytes());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        pub(in super::super) struct Emulator {
+            term: Term<ListenerHandle>,
+            parser: Processor,
+            listener: ListenerHandle,
+            cols: usize,
+            rows: usize,
+        }
+
+        impl Emulator {
+            pub(in super::super) fn new() -> Self {
+                let cols = 100usize;
+                let rows = 30usize;
+                let listener = ListenerHandle(std::sync::Arc::new(Listener::new()));
+                let size = TermSize::new(cols, rows);
+                let term = Term::new(Config::default(), &size, listener.clone());
+                Self {
+                    term,
+                    parser: Processor::new(),
+                    listener,
+                    cols,
+                    rows,
+                }
+            }
+
+            /// Feed bytes received from the PTY master into the
+            /// emulator. Any auto-reply sequences (color, cursor,
+            /// kitty-keyboard, device-status …) are queued by the
+            /// listener.
+            pub(in super::super) fn feed(&mut self, bytes: &[u8]) {
+                self.parser.advance(&mut self.term, bytes);
+            }
+
+            /// Return queued PTY-bound replies, clearing the queue.
+            pub(in super::super) fn take_pty_writes(&mut self) -> Vec<Vec<u8>> {
+                self.listener.0.drain()
+            }
+
+            /// Snapshot the visible region as plain text, lines joined
+            /// with `\n`. Trailing whitespace is preserved on each
+            /// line so callers can detect alignment patterns; empty
+            /// trailing lines are NOT trimmed.
+            pub(in super::super) fn screen_text(&self) -> String {
+                let grid = self.term.grid();
+                let mut out = String::with_capacity(self.cols * self.rows);
+                for row in 0..self.rows {
+                    let line = Line(row as i32);
+                    let mut line_buf = String::with_capacity(self.cols);
+                    for col in 0..self.cols {
+                        let point = Point::new(line, Column(col));
+                        let cell = &grid[point];
+                        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                            continue;
+                        }
+                        line_buf.push(cell.c);
+                    }
+                    // Trim trailing spaces on each line — the grid is
+                    // padded with U+0020 cells, which would dominate
+                    // the snapshot otherwise.
+                    let trimmed = line_buf.trim_end_matches(' ');
+                    out.push_str(trimmed);
+                    out.push('\n');
+                }
+                out
+            }
+        }
+    }
+
     /// Decision: should this `cargo test` invocation register the
     /// Copilot Trials? Reads the env knob and scans the positional
     /// filters (passed in from main()).
@@ -2439,14 +2598,31 @@ mod copilot {
 
             // CMD per pass.
             let mut cmd = Command::new("docker");
-            cmd.args(["run", "-d", "--rm"])
-                .args(["--name", &name])
+            cmd.arg("run").arg("-d");
+            if !super::keep_containers() {
+                cmd.arg("--rm");
+            }
+            cmd.args(["--name", &name])
                 .args(["--cap-add", "SYS_PTRACE"])
                 .args(["-p", "127.0.0.1:0:22"])
                 .arg("-v")
                 .arg(format!("{}:/opt/litebox:ro", bin_dir.display()))
                 .arg("-v")
                 .arg(format!("{}:/workspace", fixture_dir.display()));
+            // Forward selected LITEBOX_* env vars into the container.
+            for var in [
+                "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+                "LITEBOX_BROKER_TCP_CONN",
+                "LITEBOX_PE10_DIAG",
+                "LITEBOX_PE5_DIAG",
+                "LITEBOX_CLEANUP_DELAY_MS",
+                "RUST_LOG",
+                "RUST_BACKTRACE",
+            ] {
+                if let Ok(val) = std::env::var(var) {
+                    cmd.args(["-e", &format!("{var}={val}")]);
+                }
+            }
             if mount_workspace_src {
                 cmd.arg("-v")
                     .arg(format!("{}:/workspace/litebox-src:ro", ws_root.display()));
@@ -2520,6 +2696,9 @@ mod copilot {
 
     impl Drop for ContainerHandle {
         fn drop(&mut self) {
+            if super::keep_containers() {
+                return;
+            }
             let _ = Command::new("docker")
                 .args(["rm", "-f", &self.name])
                 .stdout(Stdio::null())
@@ -2587,6 +2766,18 @@ mod copilot {
     /// because dropbear strips most environment variables when
     /// exec'ing the session command.
     fn drive_pminus(port: u16, prompt: &str, timeout_secs: u64) -> Result<String, String> {
+        // Two-shot kex retry: dropbear under litebox can accept TCP
+        // before its SSH handshake path is fully ready; mirror the
+        // `drive_bash` helper in the dropbear_bash suite.
+        let first = drive_pminus_once(port, prompt, timeout_secs)?;
+        if first.contains("kex_exchange_identification") {
+            std::thread::sleep(Duration::from_secs(7));
+            return drive_pminus_once(port, prompt, timeout_secs);
+        }
+        Ok(first)
+    }
+
+    fn drive_pminus_once(port: u16, prompt: &str, timeout_secs: u64) -> Result<String, String> {
         let pty = Pty::open()?;
         let mut argv = ssh_argv_base(port);
         let remote_cmd = format!(
@@ -2604,28 +2795,161 @@ mod copilot {
     /// the prompt followed by `\n`, then read until quiet, then send
     /// the CLI's exit shortcut.
     fn drive_tui(port: u16, prompt: &str, timeout_secs: u64) -> Result<String, String> {
+        let first = drive_tui_once(port, prompt, timeout_secs)?;
+        if first.contains("kex_exchange_identification") {
+            std::thread::sleep(Duration::from_secs(7));
+            return drive_tui_once(port, prompt, timeout_secs);
+        }
+        Ok(first)
+    }
+
+    fn drive_tui_once(port: u16, prompt: &str, timeout_secs: u64) -> Result<String, String> {
         let pty = Pty::open()?;
+        // Match the headless emulator's 100x30 grid so the TUI lays
+        // out for the right dimensions. Default PTY winsize is 0x0
+        // which makes some TUIs degenerate.
+        let _ = pty.resize(30, 100);
         let mut argv = ssh_argv_base(port);
+        // Force a known TERM so the TUI doesn't probe further than
+        // alacritty_terminal can emulate.
         argv.push(
-            "set -a; . /workspace/.copilot-env; set +a; exec copilot --allow-all".to_string(),
+            "set -a; . /workspace/.copilot-env; set +a; \
+             stty rows 30 cols 100 2>/dev/null; \
+             exec env TERM=xterm-256color COLORTERM=truecolor copilot --allow-all"
+                .to_string(),
         );
         let pid = pty.fork_exec(&argv, /* ctrl_tty = */ true)?;
-        // Wait for the first quiet window (the TUI has rendered its prompt).
-        let _initial = read_until_idle(&pty, Duration::from_secs(20), Duration::from_millis(1200))?;
-        // Send the prompt.
-        pty.write_all(prompt.as_bytes())?;
-        pty.write_all(b"\n")?;
-        // Read the response (longer idle window for model latency).
-        let response = read_until_idle(
-            &pty,
-            Duration::from_secs(timeout_secs),
-            Duration::from_millis(2500),
-        )?;
-        // Best-effort clean exit.
-        let _ = pty.write_all(b"/exit\n");
-        let _ = read_with_deadline(&pty, Duration::from_secs(5));
+
+        let mut emu = term_emu::Emulator::new();
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut trust_answered = false;
+        let mut prompt_sent = false;
+        let mut prompt_sent_at: Option<Instant> = None;
+        let mut idle_since: Option<Instant> = None;
+        const POLL_TICK: Duration = Duration::from_millis(50);
+        const READY_QUIET: Duration = Duration::from_millis(800);
+        const RESPONSE_QUIET: Duration = Duration::from_millis(2500);
+
+        // Run the read/feed/respond loop until either we've sent the
+        // prompt and observed a long-enough quiet window after the
+        // model reply, or the per-scenario deadline elapses.
+        while Instant::now() < deadline {
+            let mut activity = false;
+            // Drain whatever the PTY has produced.
+            loop {
+                match pty.try_read_now(8192) {
+                    Ok(Some(buf)) if buf.is_empty() => break, // EOF
+                    Ok(Some(buf)) => {
+                        emu.feed(&buf);
+                        activity = true;
+                    }
+                    Ok(None) => break, // EAGAIN
+                    Err(e) => return Err(format!("pty read: {e}")),
+                }
+            }
+            // Flush any synthetic replies (color, cursor, keyboard
+            // protocol, device-status, …) the emulator queued in
+            // response to TUI capability queries.
+            for reply in emu.take_pty_writes() {
+                let _ = pty.write_all(&reply);
+            }
+            // State machine.
+            let screen = emu.screen_text();
+            if !trust_answered {
+                if screen.contains("Do you trust") {
+                    pty.write_all(b"\r")?;
+                    trust_answered = true;
+                    idle_since = None;
+                }
+                std::thread::sleep(POLL_TICK);
+                continue;
+            }
+            // After trust is dismissed, wait for the trust modal to
+            // be gone AND the input area to appear.
+            let trust_gone = !screen.contains("Do you trust");
+            let input_ready = trust_gone
+                && (screen.contains("/ commands")
+                    || screen.contains("@ files")
+                    || screen.contains("? help"));
+            if !prompt_sent {
+                let elapsed_idle = idle_since.map(|t| t.elapsed()).unwrap_or_default();
+                if !activity && elapsed_idle >= READY_QUIET && input_ready {
+                    // The TUI has rendered the input prompt and is
+                    // sitting quiet — send the user prompt.
+                    //
+                    // Submit sequence: type the prompt via bracketed
+                    // paste (so the input library treats it as a
+                    // single atomic insert rather than typing
+                    // each character through the kitty keyboard
+                    // protocol), give the TUI a beat to render the
+                    // populated input box, then send bare \r as
+                    // Enter. The Copilot CLI's input box accepts
+                    // \r as submit when the buffer is non-empty and
+                    // the cursor is at end-of-line.
+                    let mut buf = Vec::with_capacity(prompt.len() + 16);
+                    buf.extend_from_slice(b"\x1b[200~"); // start paste
+                    buf.extend_from_slice(prompt.as_bytes());
+                    buf.extend_from_slice(b"\x1b[201~"); // end paste
+                    pty.write_all(&buf)?;
+                    std::thread::sleep(Duration::from_millis(300));
+                    pty.write_all(b"\r")?;
+                    prompt_sent = true;
+                    prompt_sent_at = Some(Instant::now());
+                    idle_since = None;
+                } else if activity {
+                    idle_since = Some(Instant::now());
+                } else if idle_since.is_none() {
+                    idle_since = Some(Instant::now());
+                }
+            } else {
+                let since_prompt = prompt_sent_at.map(|t| t.elapsed()).unwrap_or_default();
+                if activity {
+                    idle_since = Some(Instant::now());
+                } else if let Some(t) = idle_since {
+                    if t.elapsed() >= RESPONSE_QUIET && since_prompt >= RESPONSE_QUIET {
+                        break;
+                    }
+                } else {
+                    idle_since = Some(Instant::now());
+                }
+            }
+            std::thread::sleep(POLL_TICK);
+        }
+
+        // Take a screen snapshot before issuing /exit so the screen
+        // text isn't lost when the TUI tears down its panels.
+        let visible = emu.screen_text();
+
+        // Best-effort clean exit. CR because TUI raw mode treats it
+        // as Enter; LF would be a literal character.
+        let _ = pty.write_all(b"/exit\r");
+        // Drain a little more so any final model output gets into the
+        // grid and any teardown queries get their synthetic reply.
+        let drain_until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < drain_until {
+            match pty.try_read_now(8192) {
+                Ok(Some(buf)) if buf.is_empty() => break,
+                Ok(Some(buf)) => emu.feed(&buf),
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+            for reply in emu.take_pty_writes() {
+                let _ = pty.write_all(&reply);
+            }
+        }
+        let final_visible = emu.screen_text();
         let _ = wait_pid(pid, Duration::from_secs(5));
-        Ok(response)
+
+        // Compose a transcript with the pre-/exit and post-/exit
+        // screen snapshots. The canary check function runs against
+        // this combined text; it's also what gets persisted for
+        // forensics. Pre- and post- snapshots are both useful because
+        // the model response often scrolls partly off the top of the
+        // grid by the time /exit is sent.
+        Ok(format!(
+            "--- [drive_tui screen before /exit] ---\n{visible}\n\
+             --- [drive_tui screen after /exit] ---\n{final_visible}"
+        ))
     }
 
     /// POSIX shell single-quote escaping: wrap in '...' and replace
@@ -2803,6 +3127,42 @@ mod dropbear_bash {
                     "phase-h-test-script.sh",
                     "echo L1\necho L2\nsleep 0.1\necho L3\n",
                 )],
+            },
+            // Phase-H triangulation probes (added 2026-05-27).
+            // These distinguish "bash internally fork+execs another binary"
+            // from "bash takes real wallclock time" from "two sequential
+            // writes with anything between them". Together with the existing
+            // echo_two_lines (no separator) and echo_after_sleep (fork+exec
+            // sleep with non-zero duration), they isolate the trigger.
+            Scenario {
+                // Pure bash builtins, no fork. If FAIL: bug is in any
+                // sequence of two writes with anything between them, even
+                // a no-op. If PASS: bash builtins are fine; trigger needs
+                // a fork.
+                id: "echo_builtin_true",
+                command: "echo PRE; true; echo POST",
+                expected: &["PRE", "POST"],
+                fixtures: &[],
+            },
+            Scenario {
+                // fork+exec /bin/true (no sleep). If FAIL: bug is in
+                // fork+exec of a child between two writes, not in the
+                // sleep itself. If PASS: bug needs real wallclock time
+                // or specific sleep behavior.
+                id: "echo_fork_true",
+                command: "echo PRE; /bin/true; echo POST",
+                expected: &["PRE", "POST"],
+                fixtures: &[],
+            },
+            Scenario {
+                // fork+exec /bin/sleep with 0 duration. Isolates "is it
+                // /bin/sleep specifically?" If FAIL: bug needs sleep.
+                // If PASS but echo_fork_true PASSES: bug is the wallclock
+                // delay in sleep with non-zero arg.
+                id: "echo_sleep_zero",
+                command: "echo PRE; /bin/sleep 0; echo POST",
+                expected: &["PRE", "POST"],
+                fixtures: &[],
             },
         ]
     }

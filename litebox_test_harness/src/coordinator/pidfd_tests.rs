@@ -123,6 +123,29 @@ const PIDFI_CLOEXEC: HandlerToken<PidfiInheritArgs, PidfiCloexecOut> =
     HandlerToken::new("pidfd_inherit.cloexec");
 const PIDFI_DUP: HandlerToken<PidfiInheritArgs, PidfiInheritOut> =
     HandlerToken::new("pidfd_inherit.dup_then_exec");
+const POLL_READY_AFTER_EXIT: HandlerToken<PollReadyArgs, PollReadyOut> =
+    HandlerToken::new("pidfd.poll_ready_after_exit");
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PollReadyArgs {
+    /// How many fork-exit-poll iterations to run.
+    iterations: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PollReadyOut {
+    iterations_run: u32,
+    /// Number of iterations where poll(pidfd, POLLIN, 0) NEVER returned
+    /// ready within `MAX_SPIN_POLLS` even though `waitpid(WNOHANG)`
+    /// confirmed the child had been reaped. Each such iteration is a
+    /// cache-staleness observation: the broker definitively knows the
+    /// target exited (waitpid wouldn't have succeeded otherwise), but
+    /// the shim's local readiness query disagrees.
+    stale_observations: u32,
+    /// Worst-case spin count observed across all iterations. Useful for
+    /// diagnosing how wide the cache-lag window is when the bug fires.
+    max_spin_polls: u32,
+}
 
 // ─── Handlers ───────────────────────────────────────────────────────
 
@@ -451,6 +474,112 @@ async fn handle_pidfi_dup(
     })
 }
 
+/// Pidfd cache-staleness regression probe — parallel to the Phase H
+/// PTY bug fix (commit `bdd1d234`). For each of `args.iterations`:
+///
+/// 1. Fork a child that immediately `_exit(0)`s.
+/// 2. Open a pidfd on the child.
+/// 3. Tight loop: alternate `poll(pidfd, POLLIN, 0)` with
+///    `waitpid(child, WNOHANG)`. Stop as soon as either poll reports
+///    ready or waitpid reaps the child.
+/// 4. If waitpid reaped the child (broker-truth proof: the child's exit
+///    has fully propagated to the parent-side wait machinery) but the
+///    poll that ran just before NEVER observed ready, count one
+///    `stale_observations` — the shim's local pidfd readiness query
+///    lagged the broker.
+///
+/// On a correct broker-as-source-of-truth implementation this counter
+/// stays 0: `poll(pidfd, POLLIN, 0)` synchronously asks the broker, so
+/// any time the broker would say "exited" the local poll also reports
+/// ready. The probe is deliberately tight-loop / no-sleep so the
+/// dispatcher-vs-main-thread race window is wide if a cache exists.
+async fn handle_poll_ready_after_exit(
+    args: PollReadyArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PollReadyOut, HandlerError> {
+    const MAX_SPIN_POLLS: u32 = 100_000;
+    let mut stale_observations: u32 = 0;
+    let mut max_spin_polls: u32 = 0;
+    for _ in 0..args.iterations {
+        // SAFETY: fork() — child does only async-signal-safe _exit(0);
+        // parent continues Rust execution.
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            return Err(HandlerError(format!(
+                "fork: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if child == 0 {
+            // SAFETY: terminate child immediately.
+            unsafe { libc::_exit(0) };
+        }
+        let pidfd = match Pidfd::open(child as u32) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = reap_child(child);
+                return Err(HandlerError(format!("pidfd_open({child}): {e}")));
+            }
+        };
+        let mut spin: u32 = 0;
+        let mut ever_ready = false;
+        let mut reaped = false;
+        while spin < MAX_SPIN_POLLS {
+            spin += 1;
+            // SAFETY: pidfd is owned; pollfd points to one valid entry.
+            let mut pfd = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, 0) };
+            if pfd.revents & libc::POLLIN != 0 {
+                ever_ready = true;
+                break;
+            }
+            // Broker-truth oracle: if waitpid reaps the child the
+            // broker has fully processed the exit (the runner's reap
+            // path drives waitpid through MarkProcessExited).
+            let mut status: libc::c_int = 0;
+            // SAFETY: child is a valid pid; status is one i32.
+            let waited = unsafe {
+                libc::waitpid(child, std::ptr::from_mut(&mut status), libc::WNOHANG)
+            };
+            if waited == child {
+                reaped = true;
+                // One last poll — observers fire immediately when the
+                // broker side updates, but the dispatcher may need this
+                // last instant if it was scheduled out.
+                let mut last = libc::pollfd {
+                    fd: pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: as above.
+                unsafe { libc::poll(std::ptr::from_mut(&mut last), 1, 0) };
+                if last.revents & libc::POLLIN != 0 {
+                    ever_ready = true;
+                }
+                break;
+            }
+        }
+        if spin > max_spin_polls {
+            max_spin_polls = spin;
+        }
+        if reaped && !ever_ready {
+            stale_observations += 1;
+        }
+        if !reaped {
+            let _ = reap_child(child);
+        }
+    }
+    Ok(PollReadyOut {
+        iterations_run: args.iterations,
+        stale_observations,
+        max_spin_polls,
+    })
+}
+
 // ─── Registration ──────────────────────────────────────────────────
 
 pub(crate) fn register_pidfd_tests(reg: &mut Registry<'_>) {
@@ -460,6 +589,7 @@ pub(crate) fn register_pidfd_tests(reg: &mut Registry<'_>) {
     register_handler!(PIDFI_BASIC, handle_pidfi_basic);
     register_handler!(PIDFI_CLOEXEC, handle_pidfi_cloexec);
     register_handler!(PIDFI_DUP, handle_pidfi_dup);
+    register_handler!(POLL_READY_AFTER_EXIT, handle_poll_ready_after_exit);
     // pidfd-test argv subcommand: the PIDF.* tests invoke
     // `<target_bt> pidfd-test self-test|poll-inherited …` directly via
     // tokio::process::Command (not through a handler) to exercise the
@@ -492,6 +622,48 @@ pub(crate) fn register_pidfd_tests(reg: &mut Registry<'_>) {
                             format!(
                                 "pidfd fd={} did not fire for child {}",
                                 out.pidfd_raw, out.child_pid
+                            ),
+                        ),
+                        Err(e) => TestOutcome::new("Dpg1", false, format!("handler error: {e}")),
+                    }
+                })
+            })
+        });
+
+    // PIDF.poll_ready_after_exit — pidfd cache-staleness regression
+    // probe. Phase H proved that broker-held readiness reads must NOT
+    // go through a shim-side mirror (commit bdd1d234). This test runs
+    // the parallel invariant on the pidfd path: after a child has
+    // definitely exited (waitpid reaped it), `poll(pidfd, POLLIN, 0)`
+    // must report ready. Tight-loop probe with 32 iterations to widen
+    // the dispatcher race window.
+    reg.test("vscode", "pidfd", "PIDF.poll_ready_after_exit")
+        .timeout(30)
+        .build(|cx| {
+            let agent = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let args = PollReadyArgs { iterations: 32 };
+                    match run
+                        .send_named_typed(&agent, &POLL_READY_AFTER_EXIT, args)
+                        .await
+                    {
+                        Ok(out) if out.stale_observations == 0 => TestOutcome::new(
+                            "Dpg1",
+                            true,
+                            format!(
+                                "no stale observations across {} iterations (worst spin={})",
+                                out.iterations_run, out.max_spin_polls
+                            ),
+                        ),
+                        Ok(out) => TestOutcome::new(
+                            "Dpg1",
+                            false,
+                            format!(
+                                "{} stale observations across {} iterations (worst spin={}): \
+                                 broker reported child reaped but poll(pidfd, POLLIN, 0) never \
+                                 saw ready — shim-side cache leads broker by a dispatcher gap",
+                                out.stale_observations, out.iterations_run, out.max_spin_polls
                             ),
                         ),
                         Err(e) => TestOutcome::new("Dpg1", false, format!("handler error: {e}")),

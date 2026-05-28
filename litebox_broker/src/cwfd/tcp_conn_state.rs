@@ -237,6 +237,10 @@ impl StateObject for TcpConnState {
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         self.subject.remove(subscription_id)
     }
+
+    fn current_events(&self) -> u32 {
+        notification_events(TcpConnState::current_events(self))
+    }
 }
 
 fn notification_events(events: u32) -> u32 {

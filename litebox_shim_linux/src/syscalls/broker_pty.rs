@@ -208,12 +208,10 @@ impl BrokerPtyFd<Platform> {
                         let n = bytes.len().min(buf.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
                         if n == 0 {
-                            self.common.set_readable(false);
                         }
                         Ok(n)
                     }
                     Err(BrokerOpError::WouldBlock) => {
-                        self.common.set_readable(false);
                         Err(litebox::event::polling::TryOpError::TryAgain)
                     }
                     Err(e) => Err(litebox::event::polling::TryOpError::Other(

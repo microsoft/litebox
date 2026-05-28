@@ -68,6 +68,7 @@ use litebox_common_linux::cwfd::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::cwfd::notification_ring::NotificationSender;
 
 use crate::cwfd::eventfd_state::EventfdState;
+use crate::cwfd::inotify_state::InotifyState;
 use crate::cwfd::pidfd_state::PidfdState;
 use crate::cwfd::pipe_state::{PipeReadEnd, PipeWriteEnd};
 use crate::cwfd::process_state::ProcessState;
@@ -142,6 +143,15 @@ pub trait StateObject: Any + Send + Sync + core::fmt::Debug {
     /// Kind-agnostic unsubscribe. Removes the subscription previously
     /// installed via [`Self::subscribe`].
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError>;
+
+    /// Returns the broker's authoritative current view of which
+    /// `NOTIFY_EVENT_*` bits are set for this state object.
+    /// Used by [`Opcode::QueryEvents`][crate::cwfd::fd_token_protocol::Opcode::QueryEvents]
+    /// so worker-side `poll`/`select`/`epoll_wait` paths can fetch
+    /// readiness synchronously rather than relying on a stale
+    /// subscription-mirror cache — the broker is the single source of
+    /// truth for broker-held resources.
+    fn current_events(&self) -> u32;
 }
 
 /// Closed set of broker-hosted state object variants.
@@ -153,6 +163,7 @@ pub enum StateKind {
     SocketPairEnd,
     TcpConn,
     Signalfd,
+    Inotify,
     Pty,
     Pidfd,
     Process,
@@ -167,6 +178,7 @@ pub enum StateObjectEnum {
     SocketPairEnd(Arc<SocketPairEnd>),
     TcpConn(Arc<TcpConnState>),
     Signalfd(Arc<SignalfdState>),
+    Inotify(Arc<InotifyState>),
     Pty(Arc<PtyState>),
     Pidfd(Arc<PidfdState>),
     Process(Arc<ProcessState>),
@@ -181,6 +193,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(_) => StateKind::SocketPairEnd,
             StateObjectEnum::TcpConn(_) => StateKind::TcpConn,
             StateObjectEnum::Signalfd(_) => StateKind::Signalfd,
+            StateObjectEnum::Inotify(_) => StateKind::Inotify,
             StateObjectEnum::Pty(_) => StateKind::Pty,
             StateObjectEnum::Pidfd(_) => StateKind::Pidfd,
             StateObjectEnum::Process(_) => StateKind::Process,
@@ -195,6 +208,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.subsystem_tag(),
             StateObjectEnum::TcpConn(state) => state.subsystem_tag(),
             StateObjectEnum::Signalfd(state) => state.subsystem_tag(),
+            StateObjectEnum::Inotify(state) => state.subsystem_tag(),
             StateObjectEnum::Pty(state) => state.subsystem_tag(),
             StateObjectEnum::Pidfd(state) => state.subsystem_tag(),
             StateObjectEnum::Process(state) => state.subsystem_tag(),
@@ -226,6 +240,9 @@ impl StateObjectEnum {
             StateObjectEnum::Signalfd(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
+            StateObjectEnum::Inotify(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
             StateObjectEnum::Pty(state) => state.subscribe(subscription_id, events_mask, sender),
             StateObjectEnum::Pidfd(state) => state.subscribe(subscription_id, events_mask, sender),
             StateObjectEnum::Process(state) => {
@@ -242,9 +259,25 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::TcpConn(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Signalfd(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::Inotify(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Pty(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Pidfd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Process(state) => state.unsubscribe(subscription_id),
+        }
+    }
+
+    pub fn current_events(&self) -> u32 {
+        match self {
+            StateObjectEnum::Eventfd(state) => state.current_events(),
+            StateObjectEnum::PipeReadEnd(state) => state.current_events(),
+            StateObjectEnum::PipeWriteEnd(state) => state.current_events(),
+            StateObjectEnum::SocketPairEnd(state) => state.current_events(),
+            StateObjectEnum::TcpConn(state) => state.current_events(),
+            StateObjectEnum::Signalfd(state) => state.current_events(),
+            StateObjectEnum::Inotify(state) => state.current_events(),
+            StateObjectEnum::Pty(state) => state.current_events(),
+            StateObjectEnum::Pidfd(state) => state.current_events(),
+            StateObjectEnum::Process(state) => state.current_events(),
         }
     }
 }
@@ -269,6 +302,10 @@ impl StateObject for StateObjectEnum {
 
     fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
         StateObjectEnum::unsubscribe(self, subscription_id)
+    }
+
+    fn current_events(&self) -> u32 {
+        StateObjectEnum::current_events(self)
     }
 }
 
@@ -305,6 +342,12 @@ impl From<Arc<TcpConnState>> for StateObjectEnum {
 impl From<Arc<SignalfdState>> for StateObjectEnum {
     fn from(state: Arc<SignalfdState>) -> Self {
         StateObjectEnum::Signalfd(state)
+    }
+}
+
+impl From<Arc<InotifyState>> for StateObjectEnum {
+    fn from(state: Arc<InotifyState>) -> Self {
+        StateObjectEnum::Inotify(state)
     }
 }
 

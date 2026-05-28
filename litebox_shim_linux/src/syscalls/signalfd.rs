@@ -93,7 +93,6 @@ impl SignalfdFile {
         let payload = signalfd_siginfo_payload(siginfo, sender_pid);
         match self.provider.push_siginfo(self.common.handle(), &payload) {
             Ok(()) => {
-                self.common.set_readable(true);
                 self.pollee.notify_observers(Events::IN);
                 Ok(())
             }
@@ -107,11 +106,9 @@ impl SignalfdFile {
     pub(crate) fn read_siginfo(&self) -> Result<Option<Vec<u8>>, Errno> {
         match self.provider.read_siginfo(self.common.handle()) {
             Ok(Some(payload)) => {
-                self.common.set_readable(false);
                 Ok(Some(payload))
             }
             Ok(None) => {
-                self.common.set_readable(false);
                 Ok(None)
             }
             Err(BrokerOpError::WouldBlock) => Ok(None),
