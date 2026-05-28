@@ -2011,7 +2011,8 @@ mod tests {
     ) -> HandlerResult {
         let bytes = request.encode().unwrap();
         let frame = decode(&bytes).unwrap();
-        handle_request(registry, conn, &frame, Vec::new())
+        let inotify_dispatcher = Arc::new(InotifyDispatcher::new());
+        handle_request(registry, &inotify_dispatcher, conn, &frame, Vec::new())
     }
 
     #[test]

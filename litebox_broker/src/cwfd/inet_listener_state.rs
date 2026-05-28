@@ -322,3 +322,106 @@ pub fn encode_sockaddr(addr: SocketAddr) -> Result<[u8; SOCKADDR_WIRE_LEN], Inet
     }
     Ok(raw)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cwfd::state_registry::{BrokerStateRegistry, StateHandle, StateObjectEnum};
+    use crate::cwfd::tcp_conn_state::TcpConnState;
+    use litebox_common_linux::cwfd::fd_transfer_frame::SubsystemTag;
+    use std::time::{Duration, Instant};
+
+    fn bind_loopback(state: &InetListenerState) -> SocketAddr {
+        let requested = encode_sockaddr(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(127, 0, 0, 1),
+            0,
+        )))
+        .unwrap();
+        let actual = state.bind(&requested).unwrap();
+        decode_sockaddr(&actual).unwrap()
+    }
+
+    fn accept_wait(state: &InetListenerState) -> (TcpStream, SocketAddr) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match state.accept() {
+                Ok(conn) => return conn,
+                Err(InetListenerError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("accept failed: {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn inet_listener_accept_would_block_without_pending_connections() {
+        let state = InetListenerState::new(AddressFamily::V4);
+        bind_loopback(&state);
+        state.listen(5).unwrap();
+        assert!(matches!(state.accept(), Err(InetListenerError::WouldBlock)));
+        assert_eq!(state.current_events() & NOTIFY_EVENT_IN, 0);
+    }
+
+    #[test]
+    fn inet_listener_accept_registers_tcp_conn_state() {
+        let registry = BrokerStateRegistry::new();
+        let state = InetListenerState::new(AddressFamily::V4);
+        let listener_handle = registry.register(Arc::clone(&state));
+        let addr = bind_loopback(&state);
+        state.listen(5).unwrap();
+
+        let client = TcpStream::connect(addr).unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let (stream, peer) = accept_wait(&state);
+        assert_eq!(peer, client_addr);
+
+        let conn_handle = registry.register(TcpConnState::new(stream));
+        let resolved = registry
+            .resolve(
+                StateHandle::from_id(conn_handle.id()),
+                SubsystemTag::TcpSocket,
+            )
+            .unwrap();
+        assert!(matches!(resolved.as_ref(), StateObjectEnum::TcpConn(_)));
+        assert!(
+            registry
+                .resolve(
+                    StateHandle::from_id(listener_handle.id()),
+                    SubsystemTag::InetListener
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn inet_listener_multiple_connects_drain_fifo() {
+        let state = InetListenerState::new(AddressFamily::V4);
+        let addr = bind_loopback(&state);
+        state.listen(5).unwrap();
+
+        let clients: Vec<_> = (0..3).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        let expected: Vec<_> = clients.iter().map(|s| s.local_addr().unwrap()).collect();
+        let actual: Vec<_> = (0..3).map(|_| accept_wait(&state).1).collect();
+        assert_eq!(actual, expected);
+        assert!(matches!(state.accept(), Err(InetListenerError::WouldBlock)));
+    }
+
+    #[test]
+    fn inet_listener_drop_stops_accept_thread() {
+        let state = InetListenerState::new(AddressFamily::V4);
+        bind_loopback(&state);
+        state.listen(5).unwrap();
+        assert!(
+            state
+                .accept_thread
+                .lock()
+                .expect("accept_thread poisoned")
+                .as_ref()
+                .is_some_and(|h| !h.is_finished())
+        );
+        let weak = Arc::downgrade(&state);
+        drop(state);
+        assert!(weak.upgrade().is_none());
+    }
+}
