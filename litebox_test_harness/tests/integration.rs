@@ -412,12 +412,31 @@ fn emit_timing_drain(test: &str, pass: &str, t_drain_ms: u128) {
 
 /// Cached test (id, timeout_secs) tuples from `collect_all_tests`
 /// (direct library call, no subprocess).
-static TEST_METADATA: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
+static TEST_METADATA: std::sync::OnceLock<Vec<TestMeta>> = std::sync::OnceLock::new();
 
-fn get_test_metadata() -> &'static Vec<(String, u64)> {
+/// (test_id, suite, group, timeout_secs) per registered trial.
+/// Authoritative for suite/group — the outer harness uses these
+/// instead of the inner coordinator's JSON line so we always have
+/// the right metadata even when a test times out before printing.
+struct TestMeta {
+    id: String,
+    suite: &'static str,
+    group: &'static str,
+    timeout_secs: u64,
+}
+
+fn get_test_metadata() -> &'static Vec<TestMeta> {
     TEST_METADATA.get_or_init(|| {
         let tests = litebox_test_harness::coordinator::collect_all_tests();
-        let meta: Vec<(String, u64)> = tests.into_iter().map(|t| (t.id, t.timeout_secs)).collect();
+        let meta: Vec<TestMeta> = tests
+            .into_iter()
+            .map(|t| TestMeta {
+                id: t.id,
+                suite: t.suite,
+                group: t.group,
+                timeout_secs: t.timeout_secs,
+            })
+            .collect();
         eprintln!(
             "[integration] {} test IDs from collect_all_tests",
             meta.len()
@@ -427,10 +446,7 @@ fn get_test_metadata() -> &'static Vec<(String, u64)> {
 }
 
 fn get_test_ids() -> Vec<String> {
-    get_test_metadata()
-        .iter()
-        .map(|(id, _)| id.clone())
-        .collect()
+    get_test_metadata().iter().map(|m| m.id.clone()).collect()
 }
 
 /// Lookup the harness-declared per-test timeout (the `.timeout(N)` value
@@ -439,9 +455,20 @@ fn get_test_ids() -> Vec<String> {
 fn test_timeout_secs(test_id: &str) -> u64 {
     get_test_metadata()
         .iter()
-        .find(|(id, _)| id == test_id)
-        .map(|(_, t)| *t)
+        .find(|m| m.id == test_id)
+        .map(|m| m.timeout_secs)
         .unwrap_or(60)
+}
+
+/// Look up (suite, group) from the canonical in-process registry.
+/// Used by the producer so dashboard rows always carry the right
+/// labels regardless of whether the in-container coordinator
+/// managed to emit its JSON line.
+fn test_suite_group(test_id: &str) -> Option<(&'static str, &'static str)> {
+    get_test_metadata()
+        .iter()
+        .find(|m| m.id == test_id)
+        .map(|m| (m.suite, m.group))
 }
 
 /// Whether to keep docker containers after exit (for debugging).
@@ -950,28 +977,20 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
 
     let sub_phases = SubPhaseMs::compute(&markers);
 
-    // Suite / group come from the in-container harness record() JSON
-    // (we extended its emitter to include them). Owned strings so the
-    // outer process can pass them to the dashboard writer without
-    // borrowing from `found`.
-    let suite_owned: Option<String> = found
-        .as_ref()
-        .and_then(|v| v.get("suite"))
-        .and_then(|s| s.as_str())
-        .map(str::to_string);
-    let group_owned: Option<String> = found
-        .as_ref()
-        .and_then(|v| v.get("group"))
-        .and_then(|s| s.as_str())
-        .map(str::to_string);
+    // Suite/group come from the canonical in-process registry, not
+    // from the in-container JSON line — so even if the container is
+    // reaped before printing (timeout, etc), the dashboard rows are
+    // always labeled correctly.
+    let (suite_static, group_static) = test_suite_group(test_id)
+        .map_or((None, None), |(s, g)| (Some(s), Some(g)));
 
     // Emit the main timing line synchronously (drain may get cut off
     // if cargo-test exits early).
     emit_timing_main(
         test_id,
         pass_static,
-        suite_owned.as_deref(),
-        group_owned.as_deref(),
+        suite_static,
+        group_static,
         t_acquire_ms,
         t_docker_start_ms,
         t_docker_spawn_ms,

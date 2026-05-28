@@ -113,8 +113,8 @@ pub(crate) fn ok_spawned_response(resp: &Response) -> bool {
 
 /// A registered test: metadata + deferred execution closure.
 pub struct Test {
-    pub(crate) suite: &'static str,
-    pub(crate) group: &'static str,
+    pub suite: &'static str,
+    pub group: &'static str,
     pub id: String,
     pub timeout_secs: u64,
     /// Agents this test will contact, expressed as an explicit set
