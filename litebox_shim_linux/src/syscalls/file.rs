@@ -3334,9 +3334,17 @@ impl<FS: ShimFS> Task<FS> {
             drop(entry);
             return Ok(());
         }
-        // All the above cases should cover all the known subsystems, and we've already
-        // early-handled the "raw FD not found" case.
-        unreachable!()
+        // The early "raw FD not found" check rejected unknown fds, so by
+        // construction the fd IS in `raw_descriptor_store`. If no
+        // subsystem arm above consumed it, a new `BrokerXXXSubsystem` was
+        // added without a corresponding `fd_consume_raw_integer` arm
+        // here. Returning EBADF would silently leak the descriptor table
+        // entry and lie about the failure mode; panic loudly so the
+        // missing arm is obvious in the stack trace.
+        unreachable!(
+            "sys_close fell through all subsystem arms for raw_fd {raw_fd}: \
+             a new BrokerXXXSubsystem needs a fd_consume_raw_integer arm in this chain"
+        )
     }
 
     /// Handle syscall `close`
