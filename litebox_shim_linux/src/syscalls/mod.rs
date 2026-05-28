@@ -4,6 +4,7 @@
 //! Syscalls Handlers
 
 pub(crate) mod broker_backed;
+pub(crate) mod broker_inet_listener;
 pub(crate) mod broker_pipe;
 pub(crate) mod broker_pty;
 pub(crate) mod broker_socketpair;
@@ -17,6 +18,7 @@ pub(crate) mod inotify;
 /// calls this at bootstrap if a broker fd-token control socket is
 /// available; the shim consults the registered provider from
 /// `sys_eventfd2`.
+pub use broker_inet_listener::{broker_inet_listener_provider, set_broker_inet_listener_provider};
 pub use broker_pipe::{broker_pipe_provider, set_broker_pipe_provider};
 pub use broker_pty::{broker_pty_provider, set_broker_pty_provider};
 pub use broker_socketpair::{
@@ -55,6 +57,16 @@ pub(crate) mod unix;
 pub(crate) mod signal;
 #[cfg(test)]
 pub(crate) mod tests;
+
+static BROKER_INET_DELAY_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_broker_inet_delay_ns(ns: u64) {
+    BROKER_INET_DELAY_NS.store(ns, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn broker_inet_delay_ns() -> u64 {
+    BROKER_INET_DELAY_NS.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 macro_rules! common_functions_for_file_status {
     () => {

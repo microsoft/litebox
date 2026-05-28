@@ -307,6 +307,8 @@ pub enum BrokerHandleKind {
     UnixSocket = 6,
     /// Broker-hosted connected TCP socket.
     TcpConn = 7,
+    /// Broker-hosted TCP listener.
+    InetListener = 8,
 }
 
 impl BrokerHandleKind {
@@ -326,6 +328,7 @@ impl BrokerHandleKind {
             5 => Self::Pipe,
             6 => Self::UnixSocket,
             7 => Self::TcpConn,
+            8 => Self::InetListener,
             _ => return None,
         })
     }
@@ -394,6 +397,8 @@ pub enum FdClass {
     AnonSpecialFd,
     /// inotify instance.
     Inotify,
+    /// Broker-hosted TCP listener.
+    InetListener,
     /// Unrecognized / other.
     Other,
 }
@@ -1125,6 +1130,7 @@ impl FdClass {
             Self::AnonSpecialFd => 9,
             Self::Inotify => 10,
             Self::Other => 11,
+            Self::InetListener => 13,
         }
     }
 
@@ -1143,6 +1149,7 @@ impl FdClass {
             9 => Ok(Self::AnonSpecialFd),
             10 => Ok(Self::Inotify),
             11 => Ok(Self::Other),
+            13 => Ok(Self::InetListener),
             _ => Err(SnapshotDeserializeError::InvalidEnum("FdClass", v)),
         }
     }
@@ -2197,6 +2204,7 @@ mod tests {
                 BrokerHandleKind::Pipe,
                 BrokerHandleKind::UnixSocket,
                 BrokerHandleKind::TcpConn,
+                BrokerHandleKind::InetListener,
             ];
             for k in &kinds {
                 match k {
@@ -2206,7 +2214,8 @@ mod tests {
                     | BrokerHandleKind::Pty
                     | BrokerHandleKind::Pipe
                     | BrokerHandleKind::UnixSocket
-                    | BrokerHandleKind::TcpConn => {}
+                    | BrokerHandleKind::TcpConn
+                    | BrokerHandleKind::InetListener => {}
                 }
             }
             kinds
@@ -2287,8 +2296,8 @@ mod tests {
                 }
             }
         }
-        // 7 kinds × 3 dir options × 3 endpoint options × 8 ids = 504 cases.
-        assert_eq!(total_cases, 504, "expected to cover 504 combinations");
+        // 8 kinds × 3 dir options × 3 endpoint options × 8 ids = 576 cases.
+        assert_eq!(total_cases, 576, "expected to cover 576 combinations");
     }
 
     #[test]
@@ -2300,6 +2309,7 @@ mod tests {
             BrokerHandleKind::Pty,
             BrokerHandleKind::UnixSocket,
             BrokerHandleKind::TcpConn,
+            BrokerHandleKind::InetListener,
         ] {
             let meta = FdMetadataSnapshot {
                 broker_handle: Some(BrokerHandleSnapshot {

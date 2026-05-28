@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
+pub mod broker_inet_listener_provider;
 pub mod broker_inotify_provider;
 pub mod broker_pgrp_signal_provider;
 pub mod broker_pidfd_provider;
@@ -315,6 +316,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         "pipe" => BrokerHandleKind::Pipe,
         "unix_socket" => BrokerHandleKind::UnixSocket,
         "tcp_conn" => BrokerHandleKind::TcpConn,
+        "inet_listener" => BrokerHandleKind::InetListener,
         other => anyhow::bail!("broker-fd-bridge: bad kind {other:?}"),
     };
     let handle_id: u64 = parts[2]
@@ -358,7 +360,8 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Eventfd, Some(extra))
         | (BrokerHandleKind::Pidfd, Some(extra))
         | (BrokerHandleKind::Signalfd, Some(extra))
-        | (BrokerHandleKind::TcpConn, Some(extra)) => {
+        | (BrokerHandleKind::TcpConn, Some(extra))
+        | (BrokerHandleKind::InetListener, Some(extra)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
                 parts[1]
@@ -367,7 +370,8 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Eventfd, None)
         | (BrokerHandleKind::Pidfd, None)
         | (BrokerHandleKind::Signalfd, None)
-        | (BrokerHandleKind::TcpConn, None) => (None, None, None),
+        | (BrokerHandleKind::TcpConn, None)
+        | (BrokerHandleKind::InetListener, None) => (None, None, None),
     };
     let pty_id = if kind == BrokerHandleKind::Pty {
         match parts.get(4) {
@@ -768,6 +772,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(true);
         litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
+    }
+
+    if let Ok(s) = std::env::var("LITEBOX_BROKER_INET_DELAY_NS")
+        && let Ok(ns) = s.parse::<u64>()
+    {
+        litebox_shim_linux::syscalls::set_broker_inet_delay_ns(ns);
     }
 
     // Stage 3a: broker-backed TCP accept is opt-in while the matrix is
@@ -3469,6 +3479,35 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_inotify_provider(inotify_provider)
         .map_err(|_| anyhow!("inotify provider already set"))?;
+
+    if broker_inet_listener_enabled() {
+        if let Err(e) = setup_broker_inet_listener_provider(&client, &dispatcher) {
+            tracing::warn!(error = %e, "broker_inet_listener provider setup failed");
+        }
+    }
+
+    fn broker_inet_listener_enabled() -> bool {
+        std::env::var("LITEBOX_BROKER_INET_LISTENER")
+            .ok()
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    }
+
+    fn setup_broker_inet_listener_provider(
+        client: &Arc<litebox_common_linux::fd_token_client::FdTokenClient>,
+        dispatcher: &Arc<litebox_common_linux::broker_eventfd::NotificationDispatcher>,
+    ) -> anyhow::Result<()> {
+        let provider: Arc<
+            dyn litebox_common_linux::broker_inet_listener_provider::BrokerInetListenerProvider,
+        > = Arc::new(
+            crate::broker_inet_listener_provider::RunnerBrokerInetListenerProvider::new(
+                Arc::clone(client),
+                Arc::clone(dispatcher),
+            ),
+        );
+        litebox_shim_linux::syscalls::set_broker_inet_listener_provider(provider)
+            .map_err(|_| anyhow!("inet listener provider already set"))
+    }
 
     // Install the guest-pid provider against the same fd-token client.
     // The shim's `do_fork` consults it; if missing, do_fork falls back

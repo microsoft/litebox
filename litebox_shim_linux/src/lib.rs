@@ -691,6 +691,58 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 );
                 Ok(())
             }
+            BrokerHandleKind::InetListener => {
+                let provider =
+                    syscalls::broker_inet_listener::broker_inet_listener_provider().ok_or(())?;
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(handle_id);
+                let listener =
+                    syscalls::broker_inet_listener::BrokerInetListenerFd::<Platform>::new(
+                        provider,
+                        handle_id,
+                        0,
+                        litebox::fs::OFlags::empty(),
+                    );
+                let typed: litebox::fd::TypedFd<
+                    syscalls::broker_inet_listener::BrokerInetListenerSubsystem,
+                > = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(listener);
+                let mut rds = files.raw_descriptor_store.write();
+                if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+                    drop(rds);
+                    let _ = files.fs.close(&old_fs);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_host) = rds
+                    .fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
+                {
+                    drop(rds);
+                    if let Some(entry) = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_host)
+                    {
+                        let host_fd = entry.take_fd();
+                        if host_fd >= 0 {
+                            self.task.global.platform.close_host_fd(host_fd);
+                        }
+                    }
+                    rds = files.raw_descriptor_store.write();
+                }
+                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+                debug_assert!(
+                    ok,
+                    "install_broker_bridge_fd(inet_listener): slot {guest_fd} still occupied"
+                );
+                Ok(())
+            }
             // C.5l guardrail: Signalfd / Pty are accepted by the
             // emit-side fork-snapshot code, but the install side
             // here has no implementation. Returning `Err(())` was
@@ -1919,6 +1971,55 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }
         }
 
+        // Restore broker-backed inet listener fds by re-attaching to the broker handle.
+        {
+            use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::InetListener {
+                    continue;
+                }
+                let Some(broker_handle) = entry.metadata.broker_handle else {
+                    continue;
+                };
+                if broker_handle.kind != BrokerHandleKind::InetListener {
+                    continue;
+                }
+                let Some(provider) =
+                    syscalls::broker_inet_listener::broker_inet_listener_provider()
+                else {
+                    continue;
+                };
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(broker_handle.handle_id);
+                let listener =
+                    syscalls::broker_inet_listener::BrokerInetListenerFd::<Platform>::new(
+                        provider,
+                        broker_handle.handle_id,
+                        0,
+                        litebox::fs::OFlags::from_bits_retain(entry.status_flags),
+                    );
+                let typed = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(
+                    listener,
+                );
+                let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
+                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                debug_assert!(
+                    success,
+                    "broker inet listener fd slot {} occupied during restore",
+                    entry.fd
+                );
+            }
+        }
+
         // Phase 2.F.3: Recreate EventFd entries that carry a broker_handle
         // reference. Re-attach to the same broker handle via the local
         // provider's `dup_handle` semantics — the parent already dup'd
@@ -1970,6 +2071,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         // exist yet — handled near the FdClass::Pipe block).
                         BrokerHandleKind::UnixSocket => None,
                         BrokerHandleKind::TcpConn => None,
+                        BrokerHandleKind::InetListener => None,
                         // `Signalfd` is restored by its dedicated FdClass branch below.
                         BrokerHandleKind::Signalfd => todo!(
                             "fork-snapshot restore for BrokerHandleKind::Signalfd \
@@ -2817,6 +2919,10 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             drop(rds);
             return Ok(f(RawFdRef::Inotify(&fd)));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(f(RawFdRef::BrokerInetListener(&fd)));
+        }
         Err(Errno::EBADF)
     }
 }
@@ -2841,6 +2947,9 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     BrokerPty(&'a Arc<TypedFd<syscalls::broker_pty::BrokerPtySubsystem>>),
     Signalfd(&'a Arc<TypedFd<syscalls::signalfd::SignalfdSubsystem>>),
     Inotify(&'a Arc<TypedFd<syscalls::inotify::InotifySubsystem>>),
+    BrokerInetListener(
+        &'a Arc<TypedFd<syscalls::broker_inet_listener::BrokerInetListenerSubsystem>>,
+    ),
 }
 
 /// Planned worker-exec fd-bridge decision for a `RawFdRef`.
@@ -2935,6 +3044,9 @@ impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
                 todo!("encode SignalfdBridgeState from broker-backed signalfd")
             }
             RawFdRef::Inotify(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::BrokerInetListener(_fd) => {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
             }
         }
@@ -3187,6 +3299,9 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerPty(_fd) => alloc::format!("raw={raw_fd} broker_pty"),
                 crate::RawFdRef::Signalfd(_fd) => alloc::format!("raw={raw_fd} signalfd"),
                 crate::RawFdRef::Inotify(_fd) => alloc::format!("raw={raw_fd} inotify"),
+                crate::RawFdRef::BrokerInetListener(_fd) => {
+                    alloc::format!("raw={raw_fd} broker-inet-listener")
+                }
             })
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))
     }

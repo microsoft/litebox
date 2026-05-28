@@ -70,6 +70,8 @@
 //! is 24 bytes (Subscribe), so this is comfortably generous; the
 //! cap exists primarily to bound memory on a malformed peer.
 
+#[cfg(debug_assertions)]
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Wire-format magic ("LBFD" — LiteBox FD).
@@ -108,6 +110,7 @@ pub const BODY_MAX: u32 = 65536;
 /// | `0x60`–`0x6F`    | Pty state (Phase E)         |
 /// | `0x70`–`0x78`    | Process state (Phase G)     |
 /// | `0x79`–`0x7C`    | TCP conn state (BrokerTcpConn) |
+/// | `0x48`–`0x4C`    | Inet listener state (Phase A) |
 ///
 /// Within a kind's range, follow the eventfd template:
 /// `0xN0` = create, `0xN1` = read-like primary op, `0xN2` = write-like
@@ -132,6 +135,11 @@ pub enum Opcode {
     InotifyRmWatch = 0x45,
     InotifyRead = 0x46,
     InotifyQueryEvents = 0x47,
+    InetListenerCreate = 0x48,
+    InetListenerBind = 0x49,
+    InetListenerListen = 0x4A,
+    InetListenerAccept = 0x4B,
+    InetListenerQueryEvents = 0x4C,
     CreatePipe = 0x50,
     ReadPipe = 0x51,
     WritePipe = 0x52,
@@ -187,6 +195,8 @@ pub enum Opcode {
     WriteTcpConn = 0x7A,
     ShutdownTcpConn = 0x7B,
     PollTcpConnEvents = 0x7C,
+    #[cfg(debug_assertions)]
+    DebugQueryStateObject = 0x7D,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -204,6 +214,11 @@ pub enum Opcode {
     InotifyRmWatchResponse = 0xC5,
     InotifyReadResponse = 0xC6,
     InotifyQueryEventsResponse = 0xC7,
+    InetListenerCreateResponse = 0xC8,
+    InetListenerBindResponse = 0xC9,
+    InetListenerListenResponse = 0xCA,
+    InetListenerAcceptResponse = 0xCB,
+    InetListenerQueryEventsResponse = 0xCC,
     CreatePipeResponse = 0xD0,
     ReadPipeResponse = 0xD1,
     WritePipeResponse = 0xD2,
@@ -237,6 +252,8 @@ pub enum Opcode {
     WriteTcpConnResponse = 0xFA,
     ShutdownTcpConnResponse = 0xFB,
     PollTcpConnEventsResponse = 0xFC,
+    #[cfg(debug_assertions)]
+    DebugQueryStateObjectResponse = 0xFD,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -269,6 +286,10 @@ pub mod opcode_ranges {
     /// 0x72 MarkProcessExited.
     pub const PROCESS_BASE: u8 = 0x70;
     pub const PROCESS_RESPONSE_BASE: u8 = 0xF0;
+
+    /// Inet listener state: create / bind / listen / accept / query-events.
+    pub const INET_LISTENER_BASE: u8 = 0x48;
+    pub const INET_LISTENER_RESPONSE_BASE: u8 = 0xC8;
 
     /// Connected TCP state: read / write / shutdown / poll-events.
     pub const TCP_CONN_BASE: u8 = 0x79;
@@ -349,6 +370,11 @@ impl Opcode {
             Opcode::InotifyRmWatch => Some(Opcode::InotifyRmWatchResponse),
             Opcode::InotifyRead => Some(Opcode::InotifyReadResponse),
             Opcode::InotifyQueryEvents => Some(Opcode::InotifyQueryEventsResponse),
+            Opcode::InetListenerCreate => Some(Opcode::InetListenerCreateResponse),
+            Opcode::InetListenerBind => Some(Opcode::InetListenerBindResponse),
+            Opcode::InetListenerListen => Some(Opcode::InetListenerListenResponse),
+            Opcode::InetListenerAccept => Some(Opcode::InetListenerAcceptResponse),
+            Opcode::InetListenerQueryEvents => Some(Opcode::InetListenerQueryEventsResponse),
             Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
             Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
             Opcode::WritePipe => Some(Opcode::WritePipeResponse),
@@ -380,12 +406,18 @@ impl Opcode {
             Opcode::WriteTcpConn => Some(Opcode::WriteTcpConnResponse),
             Opcode::ShutdownTcpConn => Some(Opcode::ShutdownTcpConnResponse),
             Opcode::PollTcpConnEvents => Some(Opcode::PollTcpConnEventsResponse),
+            #[cfg(debug_assertions)]
+            Opcode::DebugQueryStateObject => Some(Opcode::DebugQueryStateObjectResponse),
             _ => None,
         }
     }
 
     /// True if this opcode is a request.
     pub fn is_request(self) -> bool {
+        #[cfg(debug_assertions)]
+        if matches!(self, Opcode::DebugQueryStateObject) {
+            return true;
+        }
         matches!(
             self,
             Opcode::Register
@@ -404,6 +436,11 @@ impl Opcode {
                 | Opcode::InotifyRmWatch
                 | Opcode::InotifyRead
                 | Opcode::InotifyQueryEvents
+                | Opcode::InetListenerCreate
+                | Opcode::InetListenerBind
+                | Opcode::InetListenerListen
+                | Opcode::InetListenerAccept
+                | Opcode::InetListenerQueryEvents
                 | Opcode::CreatePipe
                 | Opcode::ReadPipe
                 | Opcode::WritePipe
@@ -476,6 +513,11 @@ impl TryFrom<u8> for Opcode {
             0x45 => Ok(Opcode::InotifyRmWatch),
             0x46 => Ok(Opcode::InotifyRead),
             0x47 => Ok(Opcode::InotifyQueryEvents),
+            0x48 => Ok(Opcode::InetListenerCreate),
+            0x49 => Ok(Opcode::InetListenerBind),
+            0x4A => Ok(Opcode::InetListenerListen),
+            0x4B => Ok(Opcode::InetListenerAccept),
+            0x4C => Ok(Opcode::InetListenerQueryEvents),
             0x50 => Ok(Opcode::CreatePipe),
             0x51 => Ok(Opcode::ReadPipe),
             0x52 => Ok(Opcode::WritePipe),
@@ -507,6 +549,8 @@ impl TryFrom<u8> for Opcode {
             0x7A => Ok(Opcode::WriteTcpConn),
             0x7B => Ok(Opcode::ShutdownTcpConn),
             0x7C => Ok(Opcode::PollTcpConnEvents),
+            #[cfg(debug_assertions)]
+            0x7D => Ok(Opcode::DebugQueryStateObject),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -523,6 +567,11 @@ impl TryFrom<u8> for Opcode {
             0xC5 => Ok(Opcode::InotifyRmWatchResponse),
             0xC6 => Ok(Opcode::InotifyReadResponse),
             0xC7 => Ok(Opcode::InotifyQueryEventsResponse),
+            0xC8 => Ok(Opcode::InetListenerCreateResponse),
+            0xC9 => Ok(Opcode::InetListenerBindResponse),
+            0xCA => Ok(Opcode::InetListenerListenResponse),
+            0xCB => Ok(Opcode::InetListenerAcceptResponse),
+            0xCC => Ok(Opcode::InetListenerQueryEventsResponse),
             0xD0 => Ok(Opcode::CreatePipeResponse),
             0xD1 => Ok(Opcode::ReadPipeResponse),
             0xD2 => Ok(Opcode::WritePipeResponse),
@@ -554,6 +603,8 @@ impl TryFrom<u8> for Opcode {
             0xFA => Ok(Opcode::WriteTcpConnResponse),
             0xFB => Ok(Opcode::ShutdownTcpConnResponse),
             0xFC => Ok(Opcode::PollTcpConnEventsResponse),
+            #[cfg(debug_assertions)]
+            0xFD => Ok(Opcode::DebugQueryStateObjectResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -1900,6 +1951,218 @@ pub fn parse_inotify_read_response_body(body: &[u8]) -> Result<Vec<u8>, Protocol
     Ok(body[8..].to_vec())
 }
 
+/// Body for [`Opcode::InetListenerCreate`]: family (u8: 0=v4, 1=v6) + reserved (7 bytes).
+pub fn build_inet_listener_create_request(family: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.push(family);
+    body.extend_from_slice(&[0u8; 7]);
+    OwnedFrame {
+        opcode: Opcode::InetListenerCreate,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_listener_create_body(body: &[u8]) -> Result<u8, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetListenerCreate,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[1..8].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok(body[0])
+}
+
+pub fn build_inet_listener_create_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetListenerCreateResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_listener_create_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetListenerCreateResponse)
+}
+
+/// Body for [`Opcode::InetListenerBind`]: handle id + 28-byte sockaddr_storage.
+pub fn build_inet_listener_bind_request(handle_id: u64, sockaddr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(36);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    let mut addr = [0u8; 28];
+    let n = core::cmp::min(sockaddr.len(), addr.len());
+    addr[..n].copy_from_slice(&sockaddr[..n]);
+    body.extend_from_slice(&addr);
+    OwnedFrame {
+        opcode: Opcode::InetListenerBind,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_listener_bind_body(body: &[u8]) -> Result<(u64, [u8; 28]), ProtocolError> {
+    if body.len() != 36 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetListenerBind,
+            got: body.len(),
+            want: 36,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(&body[8..36]);
+    Ok((handle, sockaddr))
+}
+
+pub fn build_inet_listener_bind_response_ok(actual_sockaddr: &[u8; 28]) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetListenerBindResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: actual_sockaddr.to_vec(),
+    }
+}
+
+pub fn parse_inet_listener_bind_response_ok(body: &[u8]) -> Result<[u8; 28], ProtocolError> {
+    if body.len() != 28 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetListenerBindResponse,
+            got: body.len(),
+            want: 28,
+        });
+    }
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(body);
+    Ok(sockaddr)
+}
+
+/// Body for [`Opcode::InetListenerListen`]: handle id + backlog (u32) + reserved (u32).
+pub fn build_inet_listener_listen_request(handle_id: u64, backlog: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&backlog.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InetListenerListen,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_listener_listen_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetListenerListen,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
+}
+
+pub fn build_inet_listener_listen_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetListenerListenResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::InetListenerAccept`]: handle id.
+pub fn build_inet_listener_accept_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetListenerAccept,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_listener_accept_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetListenerAccept)
+}
+
+pub fn build_inet_listener_accept_response_ok(
+    conn_handle_id: u64,
+    peer_sockaddr: &[u8; 28],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(36);
+    body.extend_from_slice(&conn_handle_id.to_le_bytes());
+    body.extend_from_slice(peer_sockaddr);
+    OwnedFrame {
+        opcode: Opcode::InetListenerAcceptResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_listener_accept_response_ok(
+    body: &[u8],
+) -> Result<(u64, [u8; 28]), ProtocolError> {
+    if body.len() != 36 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetListenerAcceptResponse,
+            got: body.len(),
+            want: 36,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut peer = [0u8; 28];
+    peer.copy_from_slice(&body[8..36]);
+    Ok((handle, peer))
+}
+
+/// Body for [`Opcode::InetListenerQueryEvents`]: handle id.
+pub fn build_inet_listener_query_events_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetListenerQueryEvents,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_listener_query_events_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetListenerQueryEvents)
+}
+
+pub fn build_inet_listener_query_events_response_ok(events: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetListenerQueryEventsResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: events.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_listener_query_events_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetListenerQueryEventsResponse,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
+}
+
 /// Body for [`Opcode::CreatePipe`]: (capacity: u64, atomic_write_size: u64).
 pub fn build_create_pipe_request(capacity: u64, atomic_write_size: u64) -> OwnedFrame {
     let mut body = Vec::with_capacity(16);
@@ -2891,6 +3154,84 @@ pub fn parse_query_events_response_ok(body: &[u8]) -> Result<u32, ProtocolError>
         });
     }
     Ok(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugStateObjectInfo {
+    pub kind_tag: u8,
+    pub refcount: u32,
+    pub debug_info: String,
+}
+
+#[cfg(debug_assertions)]
+pub fn build_debug_query_state_object_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::DebugQueryStateObject,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+#[cfg(debug_assertions)]
+pub fn parse_debug_query_state_object_request(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::DebugQueryStateObject)
+}
+
+#[cfg(debug_assertions)]
+pub fn build_debug_query_state_object_response_ok(
+    kind_tag: u8,
+    refcount: u32,
+    debug_info: &str,
+) -> OwnedFrame {
+    let info = debug_info.as_bytes();
+    let len = info.len().min(u16::MAX as usize);
+    let mut body = Vec::with_capacity(7 + len);
+    body.push(kind_tag);
+    body.extend_from_slice(&refcount.to_le_bytes());
+    body.extend_from_slice(&(len as u16).to_le_bytes());
+    body.extend_from_slice(&info[..len]);
+    OwnedFrame {
+        opcode: Opcode::DebugQueryStateObjectResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+#[cfg(debug_assertions)]
+pub fn parse_debug_query_state_object_response_body(
+    body: &[u8],
+) -> Result<DebugStateObjectInfo, ProtocolError> {
+    if body.len() < 7 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::DebugQueryStateObjectResponse,
+            got: body.len(),
+            want: 7,
+        });
+    }
+    let kind_tag = body[0];
+    let refcount = u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
+    let len = u16::from_le_bytes([body[5], body[6]]) as usize;
+    if body.len() != 7 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::DebugQueryStateObjectResponse,
+            got: body.len(),
+            want: 7 + len,
+        });
+    }
+    let debug_info =
+        String::from_utf8(body[7..].to_vec()).map_err(|_| ProtocolError::WrongBodyLen {
+            opcode: Opcode::DebugQueryStateObjectResponse,
+            got: body.len(),
+            want: 7 + len,
+        })?;
+    Ok(DebugStateObjectInfo {
+        kind_tag,
+        refcount,
+        debug_info,
+    })
 }
 
 /// Constructs an error response. The caller supplies the response

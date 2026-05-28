@@ -21,7 +21,7 @@ use crate::state_service::{
 use litebox_common_linux::fd_token_protocol::{
     BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, StatusCode, build_error_response,
     decode, parse_create_pidfd_response_ok, parse_create_pty_response_ok, parse_handle_body,
-    parse_open_pty_slave_response_ok,
+    parse_inet_listener_accept_response_ok, parse_open_pty_slave_response_ok,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use std::collections::HashMap;
@@ -473,7 +473,8 @@ fn update_tracker_from_response(
         Opcode::CreateEventfd
         | Opcode::CreatePidfd
         | Opcode::CreateSignalfd
-        | Opcode::InotifyInit1 => {
+        | Opcode::InotifyInit1
+        | Opcode::InetListenerCreate => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
                 tracker.record_state(caller_scope, id);
             }
@@ -505,6 +506,11 @@ fn update_tracker_from_response(
         Opcode::OpenPtySlave => {
             if let Ok((slave, _pty_id)) = parse_open_pty_slave_response_ok(&response.body) {
                 tracker.record_state(caller_scope, slave);
+            }
+        }
+        Opcode::InetListenerAccept => {
+            if let Ok((conn, _peer)) = parse_inet_listener_accept_response_ok(&response.body) {
+                tracker.record_state(caller_scope, conn);
             }
         }
         // Process-registry creator.
@@ -1251,6 +1257,11 @@ fn handle_control_connection_inner(
                     | Opcode::InotifyRmWatch
                     | Opcode::InotifyRead
                     | Opcode::InotifyQueryEvents
+                    | Opcode::InetListenerCreate
+                    | Opcode::InetListenerBind
+                    | Opcode::InetListenerListen
+                    | Opcode::InetListenerAccept
+                    | Opcode::InetListenerQueryEvents
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe
@@ -1569,11 +1580,13 @@ mod tests {
         let fd_registry = Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = Arc::new(BrokerStateRegistry::new());
         let process_registry = Arc::new(BrokerStateRegistry::new());
+        let inotify_dispatcher = Arc::new(InotifyDispatcher::new());
         let _ = spawn_control_listener(
             &path,
             Arc::clone(&fd_registry),
             Arc::clone(&state_registry),
             Arc::clone(&process_registry),
+            inotify_dispatcher,
         )
         .expect("spawn");
         for _ in 0..100 {

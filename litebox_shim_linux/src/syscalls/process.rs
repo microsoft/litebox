@@ -4444,7 +4444,8 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::BrokerTcpConn(_)
                         | crate::RawFdRef::BrokerPty(_)
                         | crate::RawFdRef::Signalfd(_)
-                        | crate::RawFdRef::Inotify(_) => {}
+                        | crate::RawFdRef::Inotify(_)
+                        | crate::RawFdRef::BrokerInetListener(_) => {}
                         crate::RawFdRef::Pipes(typed) => {
                             let direction = match self.global.pipes.half_pipe_type(typed) {
                                 Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
@@ -6725,6 +6726,9 @@ impl<FS: ShimFS> Task<FS> {
                         crate::RawFdRef::Inotify(fd) => {
                             (FdClass::Inotify, Some(fd.object_id()), None, None)
                         }
+                        crate::RawFdRef::BrokerInetListener(fd) => {
+                            (FdClass::InetListener, Some(fd.object_id()), None, None)
+                        }
                     }
                 })
                 .unwrap_or((FdClass::Other, None, None, None));
@@ -6768,7 +6772,7 @@ impl<FS: ShimFS> Task<FS> {
                 // Phase B-Step12: local eventfds get a fresh counter (matches
                 // Linux fork semantics); broker-backed reattaches the same
                 // broker handle.
-                FdClass::EventFd | FdClass::Signalfd => {}
+                FdClass::EventFd | FdClass::Signalfd | FdClass::InetListener => {}
                 // Rejected (fd class not yet migratable across worker hosts).
                 // Each variant called out explicitly so adding a new
                 // FdClass forces the developer to decide accept vs reject.
@@ -6820,6 +6824,20 @@ impl<FS: ShimFS> Task<FS> {
                 } else {
                     0
                 }
+            } else if class == FdClass::InetListener {
+                rds.fd_from_raw_integer::<super::broker_inet_listener::BrokerInetListenerSubsystem>(
+                    raw_fd,
+                )
+                .ok()
+                .and_then(|typed| {
+                    dt.with_entry(
+                        &typed,
+                        |fd: &super::broker_inet_listener::BrokerInetListenerFd<
+                            crate::Platform,
+                        >| { fd.get_status().bits() },
+                    )
+                })
+                .unwrap_or(0)
             } else {
                 0
             };
@@ -6873,6 +6891,11 @@ impl<FS: ShimFS> Task<FS> {
                                 }
                                 BrokerHandleKind::TcpConn => {
                                     super::broker_tcp_conn::broker_tcp_conn_provider()
+                                        .as_ref()
+                                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                                }
+                                BrokerHandleKind::InetListener => {
+                                    super::broker_inet_listener::broker_inet_listener_provider()
                                         .as_ref()
                                         .map(|p| alloc::sync::Arc::clone(p) as _)
                                 }
@@ -7047,6 +7070,42 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                         None => None,
+                    }
+                } else {
+                    None
+                }
+            } else if class == FdClass::InetListener {
+                if let Ok(typed) = rds.fd_from_raw_integer::<
+                    super::broker_inet_listener::BrokerInetListenerSubsystem,
+                >(raw_fd)
+                {
+                    let listener_provider = super::broker_inet_listener::broker_inet_listener_provider();
+                    let entry_result = dt.with_entry(
+                        &typed,
+                        |listener: &super::broker_inet_listener::BrokerInetListenerFd<crate::Platform>| {
+                            listener.handle()
+                        },
+                    );
+                    match (entry_result, listener_provider) {
+                        (Some(handle_id), Some(releaser)) => match releaser.dup_handle(handle_id) {
+                            Ok(()) => {
+                                broker_transit.push(ForkSnapshotBrokerTransit {
+                                    releaser: releaser as _,
+                                    handle_id,
+                                    kind: BrokerHandleKind::InetListener,
+                                });
+                                Some(BrokerHandleSnapshot {
+                                    kind: BrokerHandleKind::InetListener,
+                                    handle_id,
+                                    pipe_direction: None,
+                                    socketpair_endpoint: None,
+                                    pty_role: None,
+                                    pty_id: None,
+                                })
+                            }
+                            Err(_) => None,
+                        },
+                        _ => None,
                     }
                 } else {
                     None
@@ -9084,6 +9143,7 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Pipe => "pipe",
                         BrokerHandleKind::UnixSocket => "unix_socket",
                         BrokerHandleKind::TcpConn => "tcp_conn",
+                        BrokerHandleKind::InetListener => "inet_listener",
                     };
                     let releaser: Option<
                         alloc::sync::Arc<
@@ -9110,6 +9170,11 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         BrokerHandleKind::TcpConn => {
                             super::broker_tcp_conn::broker_tcp_conn_provider()
+                                .as_ref()
+                                .map(|p| alloc::sync::Arc::clone(p) as _)
+                        }
+                        BrokerHandleKind::InetListener => {
+                            super::broker_inet_listener::broker_inet_listener_provider()
                                 .as_ref()
                                 .map(|p| alloc::sync::Arc::clone(p) as _)
                         }
@@ -9363,6 +9428,51 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     }
                     broker_eventfd_specs.push(alloc::format!("{raw_fd}:tcp_conn:{handle_id}"));
+                    broker_tcp_conn_transit_release.push((releaser, handle_id));
+                }
+            }
+
+            let broker_inet_listener_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<
+                    litebox::fd::TypedFd<super::broker_inet_listener::BrokerInetListenerSubsystem>,
+                >,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) = rds.fd_from_raw_integer::<
+                        super::broker_inet_listener::BrokerInetListenerSubsystem,
+                    >(raw_fd)
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in broker_inet_listener_fds {
+                let listener_provider =
+                    super::broker_inet_listener::broker_inet_listener_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let handle_id = dt_local.with_entry(
+                    &typed,
+                    |listener: &super::broker_inet_listener::BrokerInetListenerFd<
+                        crate::Platform,
+                    >| { listener.handle() },
+                );
+                drop(dt_local);
+                if let (Some(provider), Some(handle_id)) = (listener_provider, handle_id) {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
+                    broker_eventfd_specs.push(alloc::format!("{raw_fd}:inet_listener:{handle_id}"));
                     broker_tcp_conn_transit_release.push((releaser, handle_id));
                 }
             }
@@ -10657,6 +10767,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 crate::RawFdRef::BrokerPty(_broker_pty) => false,
                 crate::RawFdRef::Signalfd(_signalfd) => false,
                 crate::RawFdRef::Inotify(_inotify) => false,
+                crate::RawFdRef::BrokerInetListener(_listener) => false,
             })
         .unwrap_or_else(|_| {
             log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
@@ -10836,6 +10947,7 @@ fn worker_exec_input_binding<FS: ShimFS>(
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::Signalfd(_broker_pipe) => WorkerExecInputBinding::Close,
             crate::RawFdRef::Inotify(_inotify) => WorkerExecInputBinding::Close,
+            crate::RawFdRef::BrokerInetListener(_listener) => WorkerExecInputBinding::Close,
         })
         .unwrap_or(WorkerExecInputBinding::Close)
 }
@@ -10990,6 +11102,7 @@ fn worker_exec_output_binding<FS: ShimFS>(
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::Signalfd(_broker_pipe) => WorkerExecOutputBinding::Close,
             crate::RawFdRef::Inotify(_inotify) => WorkerExecOutputBinding::Close,
+            crate::RawFdRef::BrokerInetListener(_listener) => WorkerExecOutputBinding::Close,
         })
         .unwrap_or(WorkerExecOutputBinding::Close)
 }
