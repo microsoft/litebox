@@ -276,7 +276,7 @@ impl Task {
                 0,
             )
             .map_err(|_| TeeResult::OutOfMemory)?;
-        let guard = MmapGuard::new(self, addr, total_size);
+        let guard = MmapGuard::new(self, addr, mmap_size);
 
         let padded_start = addr
             .as_usize()
