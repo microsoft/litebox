@@ -1614,6 +1614,28 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     _ => unimplemented!(),
                 };
+                if !crate::WORKER_LOCAL_INET {
+                    if matches!(protocol, litebox::net::Protocol::Tcp) {
+                        unreachable!(
+                            "worker-local Network::socket called for AF_INET TCP — broker-held InetListener/TcpConn is the only valid path under linux_userland default-on"
+                        );
+                    }
+                    if matches!(protocol, litebox::net::Protocol::Udp) {
+                        unreachable!(
+                            "worker-local Network::socket called for AF_INET UDP — broker-held InetDgram is the only valid path under linux_userland default-on"
+                        );
+                    }
+                    if matches!(protocol, litebox::net::Protocol::Icmp) {
+                        unreachable!(
+                            "worker-local Network::socket called for AF_INET raw ICMP — broker-held InetRaw is the only valid path under linux_userland default-on"
+                        );
+                    }
+                    if matches!(protocol, litebox::net::Protocol::Raw { .. }) {
+                        unreachable!(
+                            "worker-local Network::socket called for AF_INET raw — broker-held InetRaw is the only valid path under linux_userland default-on"
+                        );
+                    }
+                }
                 let socket = self.global.net.lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
                 #[cfg(feature = "trace_syscalls")]
