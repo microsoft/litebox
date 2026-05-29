@@ -26,7 +26,7 @@ impl<T: ClientControlChannel> BrokerClient<T> {
     pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<WaitOutcome, T::Error> {
         self.ensure_negotiated()?;
         match self.request(event_request(EventRequest::Wait { handle }))? {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait { outcome })) => {
+            BrokerResponse::Core(CoreResponse::Event(EventResponse::Waited { outcome })) => {
                 Ok(outcome)
             }
             response => Err(ClientError::UnexpectedResponse(response)),

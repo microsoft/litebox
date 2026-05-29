@@ -231,8 +231,12 @@ jobs:
           #   since it is a purely-userland implementation.
           #
           # - `litebox_broker_unix_socket` is allowed to have `std` access,
-          #   since it is the concrete Unix-domain-socket transport and hosted
-          #   broker executable for the userland split-broker proof of concept.
+          #   since it is the concrete Unix-domain-socket channel for the
+          #   userland split-broker proof of concept.
+          #
+          # - `litebox_broker_userland` is allowed to have `std` access,
+          #   since it is the hosted broker executable for the userland
+          #   split-broker proof of concept.
           #
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
@@ -290,6 +294,7 @@ jobs:
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_unix_socket/Cargo.toml' \
+            -not -path './litebox_broker_userland/Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \

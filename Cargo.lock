@@ -1511,11 +1511,19 @@ name = "litebox_broker_unix_socket"
 version = "0.1.0"
 dependencies = [
  "litebox_broker_channel",
+ "litebox_broker_protocol",
+ "litebox_broker_wire",
+]
+
+[[package]]
+name = "litebox_broker_userland"
+version = "0.1.0"
+dependencies = [
  "litebox_broker_client",
  "litebox_broker_core",
  "litebox_broker_protocol",
  "litebox_broker_server",
- "litebox_broker_wire",
+ "litebox_broker_unix_socket",
 ]
 
 [[package]]

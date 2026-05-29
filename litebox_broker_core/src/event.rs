@@ -3,7 +3,7 @@
 
 use crate::object::{ObjectId, ObjectKind};
 use crate::{
-    BrokerConnection, BrokerCore, BrokerError, ObjectHandle, ObjectRights, ObjectType,
+    BrokerAssociation, BrokerCore, BrokerError, ObjectHandle, ObjectRights, ObjectType,
     PolicyEngine, Result,
 };
 
@@ -35,8 +35,7 @@ pub enum WaitOutcome {
 
 impl<P: PolicyEngine> BrokerCore<P> {
     /// Creates a broker-owned event object.
-    pub fn create_event(&mut self, connection: &BrokerConnection) -> Result<ObjectHandle> {
-        let association = connection.association();
+    pub fn create_event(&mut self, association: &BrokerAssociation) -> Result<ObjectHandle> {
         self.authorize_create_object(association, ObjectType::Event)?;
 
         self.insert_object_with_reference(
@@ -50,16 +49,15 @@ impl<P: PolicyEngine> BrokerCore<P> {
     /// Checks whether an event wait would complete now.
     ///
     /// Blocking is intentionally outside BrokerCore for the first proof of
-    /// concept. Userland or kernel deployments can block on transport-specific
+    /// concept. Userland or kernel deployments can block on deployment-specific
     /// wait primitives after BrokerCore authorizes and reports readiness state.
     pub fn wait_event(
         &mut self,
-        connection: &BrokerConnection,
+        association: &BrokerAssociation,
         handle: ObjectHandle,
     ) -> Result<WaitOutcome> {
-        let association = connection.association();
         let object_id =
-            self.authorize_object_use(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
+            self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
         let state = self.event_state(object_id)?;
         Ok(if state.ready {
             WaitOutcome::Ready(state)
@@ -71,12 +69,11 @@ impl<P: PolicyEngine> BrokerCore<P> {
     /// Signals a broker-owned event object.
     pub fn signal_event(
         &mut self,
-        connection: &BrokerConnection,
+        association: &BrokerAssociation,
         handle: ObjectHandle,
     ) -> Result<ReadinessState> {
-        let association = connection.association();
         let object_id =
-            self.authorize_object_use(association, handle, ObjectType::Event, ObjectRights::WRITE)?;
+            self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WRITE)?;
         match &mut self.object_mut(object_id)?.kind {
             ObjectKind::Event(event) => event.signal(),
         }
@@ -125,12 +122,12 @@ mod tests {
     #[test]
     fn wait_rejects_reference_without_wait_right() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
-        let connection = core
-            .create_connection(CallerCredential::Unauthenticated)
+        let association = core
+            .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = core
             .insert_object_with_reference(
-                connection.association(),
+                &association,
                 ObjectKind::Event(EventObject::new()),
                 ObjectType::Event,
                 ObjectRights::WRITE,
@@ -138,7 +135,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            core.wait_event(&connection, handle),
+            core.wait_event(&association, handle),
             Err(BrokerError::InvalidRights)
         );
     }
@@ -146,15 +143,15 @@ mod tests {
     #[test]
     fn wait_rejects_stale_reference_generation() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
-        let connection = core
-            .create_connection(CallerCredential::Unauthenticated)
+        let association = core
+            .create_association(CallerCredential::Unauthenticated)
             .unwrap();
-        let mut handle = core.create_event(&connection).unwrap();
+        let mut handle = core.create_event(&association).unwrap();
         handle.reference_generation =
             ObjectReferenceGeneration::new(handle.reference_generation.get() + 1);
 
         assert_eq!(
-            core.wait_event(&connection, handle),
+            core.wait_event(&association, handle),
             Err(BrokerError::StaleHandle)
         );
     }
@@ -163,10 +160,10 @@ mod tests {
     fn wait_hides_handle_owned_by_another_association() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
         let owner = core
-            .create_connection(CallerCredential::Unauthenticated)
+            .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         let other = core
-            .create_connection(CallerCredential::Unauthenticated)
+            .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = core.create_event(&owner).unwrap();
 

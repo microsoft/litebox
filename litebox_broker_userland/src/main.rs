@@ -23,7 +23,7 @@ fn main() -> io::Result<()> {
 
 fn broker_error(error: BrokerServeError<io::Error>) -> io::Error {
     match error {
-        BrokerServeError::ConnectionSetup => io::Error::other("broker connection setup failed"),
+        BrokerServeError::AssociationSetup => io::Error::other("broker association setup failed"),
         BrokerServeError::Channel(error) => error,
         error => io::Error::other(error.to_string()),
     }

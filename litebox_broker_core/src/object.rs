@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 
 use crate::event::EventObject;
-use crate::identity::Association;
+use crate::identity::{AssociationIdentity, BrokerAssociation};
 use crate::{
     BrokerCore, BrokerError, ObjectRights, ObjectType, PolicyEngine, PolicyOperation, Result,
     allocate_id,
@@ -85,7 +85,7 @@ const FIRST_REFERENCE_GENERATION: ObjectReferenceGeneration = ObjectReferenceGen
 pub(crate) struct ObjectReference {
     pub(crate) object_id: ObjectId,
     pub(crate) reference_generation: ObjectReferenceGeneration,
-    pub(crate) owner: Association,
+    pub(crate) owner: AssociationIdentity,
     pub(crate) object_type: ObjectType,
     pub(crate) rights: ObjectRights,
 }
@@ -117,7 +117,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
     /// slot so stale handles cannot validate against a recycled reference.
     pub(crate) fn insert_object_with_reference(
         &mut self,
-        association: Association,
+        association: &BrokerAssociation,
         kind: ObjectKind,
         object_type: ObjectType,
         rights: ObjectRights,
@@ -132,7 +132,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
             ObjectReference {
                 object_id,
                 reference_generation,
-                owner: association,
+                owner: association.identity(),
                 object_type,
                 rights,
             },
@@ -143,7 +143,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
 
     pub(crate) fn authorize_create_object(
         &mut self,
-        association: Association,
+        association: &BrokerAssociation,
         object_type: ObjectType,
     ) -> Result<()> {
         self.policy.authorize(PolicyOperation::create_object(
@@ -152,9 +152,9 @@ impl<P: PolicyEngine> BrokerCore<P> {
         ))
     }
 
-    pub(crate) fn authorize_object_use(
+    pub(crate) fn authorize_use_object(
         &mut self,
-        association: Association,
+        association: &BrokerAssociation,
         handle: ObjectHandle,
         object_type: ObjectType,
         rights: ObjectRights,
@@ -182,7 +182,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
 
     fn validate_handle(
         &self,
-        association: Association,
+        association: &BrokerAssociation,
         handle: ObjectHandle,
         expected_type: ObjectType,
         required_rights: ObjectRights,
@@ -191,7 +191,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
             .references
             .get(&handle.reference_id)
             .ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != association {
+        if reference.owner != association.identity() {
             return Err(BrokerError::UnknownObject);
         }
         if reference.reference_generation != handle.reference_generation {
@@ -225,12 +225,14 @@ impl<P: PolicyEngine> BrokerCore<P> {
 }
 
 impl<P> BrokerCore<P> {
-    pub(crate) fn close_association(&mut self, association: Association) {
+    /// Closes a broker association and releases references owned by it.
+    pub fn close_association(&mut self, association: BrokerAssociation) {
+        let identity = association.identity();
         let reference_ids = self
             .references
             .iter()
             .filter_map(|(reference_id, reference)| {
-                (reference.owner == association).then_some(*reference_id)
+                (reference.owner == identity).then_some(*reference_id)
             })
             .collect::<Vec<_>>();
 
@@ -259,7 +261,7 @@ impl<P> BrokerCore<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BrokerError, CallerCredential, DefaultDenyPolicy};
+    use crate::{BrokerError, CallerCredential, DefaultDenyPolicy, EventOnlyPolicy};
 
     #[test]
     fn object_and_reference_allocators_issue_max_id_then_exhaust() {
@@ -272,7 +274,7 @@ mod tests {
 
         let handle = core
             .insert_object_with_reference(
-                association,
+                &association,
                 ObjectKind::Event(EventObject::new()),
                 ObjectType::Event,
                 ObjectRights::WAIT,
@@ -284,12 +286,29 @@ mod tests {
         assert_eq!(core.next_reference_id, 0);
         assert_eq!(
             core.insert_object_with_reference(
-                association,
+                &association,
                 ObjectKind::Event(EventObject::new()),
                 ObjectType::Event,
                 ObjectRights::WAIT,
             ),
             Err(BrokerError::ResourceExhausted)
         );
+    }
+
+    #[test]
+    fn close_association_releases_owned_references_and_orphaned_objects() {
+        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let association = core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        let _handle = core.create_event(&association).unwrap();
+        assert_eq!(core.references.len(), 1);
+        assert_eq!(core.objects.len(), 1);
+
+        core.close_association(association);
+
+        assert!(core.references.is_empty());
+        assert!(core.objects.is_empty());
     }
 }

@@ -19,7 +19,7 @@ pub struct ObjectRights(u32);
 impl ObjectRights {
     /// Right to wait for readiness.
     pub const WAIT: Self = Self(1 << 0);
-    /// Right to write payload data or signal an object.
+    /// Right to mutate object state, such as signaling an event.
     pub const WRITE: Self = Self(1 << 1);
 
     /// Returns true when all `required` rights are present.

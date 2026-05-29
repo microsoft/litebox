@@ -5,8 +5,7 @@
 //!
 //! This crate defines delivery contracts for broker authority messages. The
 //! current surface is intentionally limited to the paired control channel:
-//! one [`BrokerRequest`](litebox_broker_protocol::BrokerRequest) produces one
-//! [`BrokerResponse`](litebox_broker_protocol::BrokerResponse). Concrete IPC
+//! one [`BrokerRequest`] produces one [`BrokerResponse`]. Concrete IPC
 //! implementations own framing, buffering, authentication, and the mechanism;
 //! non-blocking IPCs can provide a blocking adapter at this boundary.
 //!

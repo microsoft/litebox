@@ -33,7 +33,7 @@ pub enum ClientError<E> {
         /// Protocol version advertised by the broker.
         broker_protocol_version: ProtocolVersion,
     },
-    /// BrokerCore rejected the request.
+    /// The broker rejected the request.
     Broker(ErrorCode),
     /// The broker returned a response type that does not match the request.
     UnexpectedResponse(BrokerResponse),

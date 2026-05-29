@@ -11,7 +11,9 @@ pub enum PolicyOperation {
     Object {
         /// Broker-entry-authenticated credential for the caller.
         caller_credential: CallerCredential,
+        /// Object type targeted by the operation.
         object_type: ObjectType,
+        /// Operation requested for the object type.
         operation: ObjectOperation,
     },
 }

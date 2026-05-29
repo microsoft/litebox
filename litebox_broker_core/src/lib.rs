@@ -14,7 +14,6 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-mod connection;
 mod error;
 mod event;
 mod identity;
@@ -24,10 +23,9 @@ mod types;
 
 use alloc::collections::BTreeMap;
 
-pub use connection::BrokerConnection;
 pub use error::BrokerError;
 pub use event::{ReadinessState, WaitOutcome};
-pub use identity::CallerCredential;
+pub use identity::{BrokerAssociation, CallerCredential};
 use object::{ObjectEntry, ObjectId, ObjectReference};
 pub use object::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
 pub use policy::{

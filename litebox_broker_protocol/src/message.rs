@@ -29,7 +29,7 @@ pub enum WaitOutcome {
     WouldBlock(ReadinessState),
 }
 
-/// Broker request transported over the control channel.
+/// Broker request sent over the control channel.
 ///
 /// The outer broker request is intentionally small. Object-family and
 /// domain-specific operations are grouped below it so new object families do not
@@ -72,7 +72,7 @@ pub enum EventRequest {
     },
 }
 
-/// Broker response transported over the control channel.
+/// Broker response sent over the control channel.
 ///
 /// Common connection/protocol outcomes stay at this layer. Domain payloads are
 /// grouped under [`CoreResponse`] so future object families can evolve without
@@ -120,6 +120,6 @@ pub enum EventResponse {
     Created { handle: ObjectHandle },
     /// Operation returned readiness state.
     Signaled { readiness: ReadinessState },
-    /// Operation returned wait state.
-    Wait { outcome: WaitOutcome },
+    /// Wait operation returned wait state.
+    Waited { outcome: WaitOutcome },
 }

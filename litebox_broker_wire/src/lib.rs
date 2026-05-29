@@ -31,7 +31,7 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
 const CORE_RESPONSE_TAG_EVENT: u8 = 0;
 const EVENT_RESPONSE_TAG_CREATED: u8 = 0;
 const EVENT_RESPONSE_TAG_SIGNALED: u8 = 1;
-const EVENT_RESPONSE_TAG_WAIT: u8 = 2;
+const EVENT_RESPONSE_TAG_WAITED: u8 = 2;
 
 const WAIT_OUTCOME_TAG_READY: u8 = 1;
 const WAIT_OUTCOME_TAG_WOULD_BLOCK: u8 = 2;
@@ -229,8 +229,8 @@ fn encode_event_response(encoder: &mut Encoder, response: EventResponse) -> Resu
             encoder.readiness(readiness);
             Ok(())
         }
-        EventResponse::Wait { outcome } => {
-            encoder.u8(EVENT_RESPONSE_TAG_WAIT);
+        EventResponse::Waited { outcome } => {
+            encoder.u8(EVENT_RESPONSE_TAG_WAITED);
             encode_wait_outcome(encoder, outcome)
         }
         _ => Err(WireError::EncodeUnknownResponseTag),
@@ -298,7 +298,7 @@ fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<Option<EventRespon
         EVENT_RESPONSE_TAG_SIGNALED => EventResponse::Signaled {
             readiness: decoder.readiness()?,
         },
-        EVENT_RESPONSE_TAG_WAIT => EventResponse::Wait {
+        EVENT_RESPONSE_TAG_WAITED => EventResponse::Waited {
             outcome: decode_wait_outcome(decoder)?,
         },
         _ => return Ok(None),
@@ -458,10 +458,10 @@ mod tests {
             event_response(EventResponse::Signaled {
                 readiness: ReadinessState::new(false, 7),
             }),
-            event_response(EventResponse::Wait {
+            event_response(EventResponse::Waited {
                 outcome: WaitOutcome::Ready(ReadinessState::new(true, 8)),
             }),
-            event_response(EventResponse::Wait {
+            event_response(EventResponse::Waited {
                 outcome: WaitOutcome::WouldBlock(ReadinessState::new(false, 9)),
             }),
             BrokerResponse::Error(ErrorCode::PolicyDenied),

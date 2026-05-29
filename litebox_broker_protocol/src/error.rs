@@ -30,10 +30,19 @@ pub enum ErrorCode {
     /// Broker-side resource exhaustion.
     ResourceExhausted,
     /// Error code emitted by a newer broker and not understood by this client.
+    ///
+    /// This variant is reserved for raw codes not assigned by this protocol
+    /// version.
     Unknown(u16),
 }
 
 impl ErrorCode {
+    /// Raw error values are part of the broker wire ABI; do not renumber
+    /// assigned values.
+    ///
+    /// Values `0` and `1` remain unassigned so null/default-looking values never
+    /// represent concrete broker errors.
+    ///
     /// Converts a raw protocol error code to an error category.
     pub const fn from_raw(raw: u16) -> Self {
         match raw {
