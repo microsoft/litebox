@@ -7,8 +7,11 @@
 #![no_std]
 
 use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
+use alloc::vec::Vec;
 use core::{
     arch::asm,
+    mem::ManuallyDrop,
+    ops::Range,
     sync::atomic::{AtomicU32, AtomicU64},
 };
 use hashbrown::HashMap;
@@ -49,6 +52,104 @@ pub mod mshv;
 pub mod syscall_entry;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
+static PHYS_RANGE_LOCK: spin::Mutex<PhysRangeLockInner> =
+    spin::Mutex::new(PhysRangeLockInner::new());
+
+struct PhysRangeLockInner {
+    entries: Vec<Range<usize>>,
+}
+
+/// Mapping info returned by [`LinuxKernel`]'s [`VmapManager::vmap`].
+///
+/// Carries the virtual base/size of the mapping together with an RAII ownership guard for the
+/// physical ranges it covers. Dropping it (or passing it to `vunmap`) releases the ownership lock,
+/// which is what lets the safe physical pointer APIs copy from the mapping without `unsafe`.
+pub struct LvbsPhysPageMapInfo {
+    base: *mut u8,
+    size: usize,
+    _ownership_guard: LvbsPhysRangeOwnershipGuard,
+}
+
+struct LvbsPhysRangeOwnershipGuard {
+    ranges: Vec<Range<usize>>,
+}
+
+impl LvbsPhysPageMapInfo {
+    fn new(base: *mut u8, size: usize, ownership_guard: LvbsPhysRangeOwnershipGuard) -> Self {
+        Self {
+            base,
+            size,
+            _ownership_guard: ownership_guard,
+        }
+    }
+}
+
+impl PhysPageMapInfo for LvbsPhysPageMapInfo {
+    fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl PhysRangeLockInner {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+/// Acquire exclusive ownership of the ALIGN-sized physical range covering each entry in
+/// `pages`.
+///
+/// Precondition: `pages` must not contain duplicate addresses. Intra-call overlap is not
+/// validated here. If two entries collide, both copies are pushed into the global lock list
+/// and the drop path only removes one of them, permanently leaking the duplicate entry. All
+/// current callers (`LinuxKernel::vmap`) pre-validate uniqueness — either by construction
+/// (contiguous pages cannot repeat) or by an explicit `HashSet` check on non-contiguous
+/// input — so this invariant is upheld today. Any new caller must do the same.
+fn acquire_phys_range_ownership<const ALIGN: usize>(
+    pages: &PhysPageAddrArray<ALIGN>,
+) -> Result<LvbsPhysRangeOwnershipGuard, PhysPointerError> {
+    let mut ranges = Vec::with_capacity(pages.len());
+    for page in pages {
+        let start = page.as_usize();
+        let end = start.checked_add(ALIGN).ok_or(PhysPointerError::Overflow)?;
+        ranges.push(start..end);
+    }
+
+    let mut inner = PHYS_RANGE_LOCK.lock();
+    for entry in &inner.entries {
+        for range in &ranges {
+            if ranges_overlap(entry, range) {
+                return Err(PhysPointerError::PhysicalAddressRangeLocked(range.start));
+            }
+        }
+    }
+
+    inner.entries.extend(ranges.iter().cloned());
+    drop(inner);
+
+    Ok(LvbsPhysRangeOwnershipGuard { ranges })
+}
+
+impl Drop for LvbsPhysRangeOwnershipGuard {
+    fn drop(&mut self) {
+        let mut inner = PHYS_RANGE_LOCK.lock();
+        for range in &self.ranges {
+            if let Some(index) = inner.entries.iter().position(|entry| entry == range) {
+                inner.entries.swap_remove(index);
+            }
+        }
+    }
+}
 
 /// Special page table ID for the base (kernel-only) page table.
 /// No real physical frame has address 0, so this is a safe sentinel.
@@ -636,11 +737,12 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// Allocator does not allocate memory frames for VTL0 pages, so frame deallocation is not needed.
     ///
-    /// Note: VTL0 physical memory is external memory not owned by LiteBox (similar to MMIO).
-    /// LiteBox accesses it by creating a temporary non-shared mapping, copying data to/from a
-    /// LiteBox-owned buffer, and unmapping immediately. No Rust references are created to the
-    /// mapped VTL0 memory; all accesses use raw pointer operations (read_volatile /
-    /// copy_nonoverlapping) to avoid violating Rust's aliasing model.
+    /// Note: VTL0 physical memory is external memory not owned by LiteBox, similar to DMA/shared
+    /// physical memory. Safe physical pointer APIs access it by creating a temporary mapping,
+    /// acquiring the cooperating LiteBox physical range ownership lock, copying data to/from a
+    /// LiteBox-owned buffer with fallible raw-pointer copies, and unmapping immediately. They do not
+    /// create Rust references to the mapped VTL0 memory. Direct `vmap()` remains unsafe because it
+    /// exposes raw mapped memory to the caller.
     fn unmap_vtl0_pages(
         &self,
         page_addr: *const u8,
@@ -1138,11 +1240,13 @@ fn is_contiguous<const ALIGN: usize>(addrs: &[PhysPageAddr<ALIGN>]) -> bool {
 }
 
 impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel<Host> {
+    type MapInfo = LvbsPhysPageMapInfo;
+
     unsafe fn vmap(
         &self,
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
-    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
+    ) -> Result<Self::MapInfo, PhysPointerError> {
         if pages.is_empty() {
             return Err(PhysPointerError::InvalidPhysicalAddress(0));
         }
@@ -1150,6 +1254,23 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
         if ALIGN != PAGE_SIZE {
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
+
+        // Reject duplicate page addresses for non-contiguous input. Contiguous input cannot
+        // repeat by construction. This upholds `acquire_phys_range_ownership`'s no-duplicate
+        // precondition so its drop path can correctly release every acquired range.
+        if !is_contiguous(pages) {
+            let mut seen = hashbrown::HashSet::with_capacity(pages.len());
+            for page in pages {
+                if !seen.insert(page.as_usize()) {
+                    return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
+                }
+            }
+        }
+
+        // Acquire exclusive ownership of the physical ranges before installing the mapping.
+        // The returned guard is carried by `LvbsPhysPageMapInfo` and released on drop/`vunmap`,
+        // which is what makes the copy-based physical pointer reads/writes safe.
+        let ownership_guard = acquire_phys_range_ownership(pages)?;
 
         // VTL0 memory must never be executable from VTL1 (DEP).
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
@@ -1179,10 +1300,11 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                 .current_page_table()
                 .map_phys_frame_range_direct(frame_range, flags, None)
             {
-                Ok(page_addr) => Ok(PhysPageMapInfo {
-                    base: page_addr,
-                    size: pages.len() * ALIGN,
-                }),
+                Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(
+                    page_addr,
+                    pages.len() * ALIGN,
+                    ownership_guard,
+                )),
                 Err(MapToError::PageAlreadyMapped(_)) => {
                     Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
                 }
@@ -1194,16 +1316,6 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                 ),
             }
         } else {
-            // Reject duplicate page addresses
-            {
-                let mut seen = hashbrown::HashSet::with_capacity(pages.len());
-                for page in pages {
-                    if !seen.insert(page.as_usize()) {
-                        return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
-                    }
-                }
-            }
-
             let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
                 .iter()
                 .map(|p| PhysFrame::containing_address(x86_64::PhysAddr::new(p.as_usize() as u64)))
@@ -1228,10 +1340,11 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
                 .current_page_table()
                 .map_non_contiguous_phys_frames(&frames, base_va, flags)
             {
-                Ok(page_addr) => Ok(PhysPageMapInfo {
-                    base: page_addr,
-                    size: pages.len() * ALIGN,
-                }),
+                Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(
+                    page_addr,
+                    pages.len() * ALIGN,
+                    ownership_guard,
+                )),
                 Err(e) => {
                     let _ = vmap_allocator().unregister_allocation(base_va);
                     match e {
@@ -1250,25 +1363,46 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
         }
     }
 
-    unsafe fn vunmap(&self, vmap_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
+    unsafe fn vunmap(
+        &self,
+        vmap_info: Self::MapInfo,
+    ) -> Result<(), (PhysPointerError, Self::MapInfo)> {
         if ALIGN != PAGE_SIZE {
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
-        let base_va = x86_64::VirtAddr::new(vmap_info.base as u64);
+        // Hold the map info in `ManuallyDrop` so its physical range ownership guard is only
+        // released once unmapping actually succeeds; on failure we hand it back to the caller.
+        let vmap_info = ManuallyDrop::new(vmap_info);
+        let base = vmap_info.base();
+        let size = vmap_info.size();
+        let base_va = x86_64::VirtAddr::new(base as u64);
 
         // Unmap the page table entries first. Only release the VA range back
         // to the allocator when unmapping succeeds; if it fails, stale PTE
         // entries remain and recycling the VA would cause collisions.
-        self.unmap_vtl0_pages(vmap_info.base, vmap_info.size)
-            .map_err(|_| PhysPointerError::Unmapped(vmap_info.base as usize))?;
-
-        if crate::mm::vmap::is_vmap_address(base_va) {
-            crate::mm::vmap::vmap_allocator()
-                .unregister_allocation(base_va)
-                .ok_or(PhysPointerError::Unmapped(vmap_info.base as usize))?;
+        if self.unmap_vtl0_pages(base, size).is_err() {
+            return Err((
+                PhysPointerError::Unmapped(base as usize),
+                ManuallyDrop::into_inner(vmap_info),
+            ));
         }
 
+        // PTEs are already cleared at this point, so the mapping is functionally gone
+        // and a retry would only re-fail against empty page-table entries. If the VA
+        // allocator's bookkeeping is inconsistent, surface it via `debug_assert!` and
+        // drop `vmap_info` to release the physical range ownership guard. The VA region
+        // is leaked but cannot be safely recycled.
+        let unregister_ok = !crate::mm::vmap::is_vmap_address(base_va)
+            || crate::mm::vmap::vmap_allocator()
+                .unregister_allocation(base_va)
+                .is_some();
+        debug_assert!(
+            unregister_ok,
+            "vmap allocator unregister failed at {base_va:?}",
+        );
+
+        ManuallyDrop::into_inner(vmap_info);
         Ok(())
     }
 

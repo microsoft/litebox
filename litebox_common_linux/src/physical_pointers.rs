@@ -3,67 +3,41 @@
 
 //! Physical Pointer Abstraction with On-demand Mapping
 //!
-//! This module adds supports for accessing physical addresses (e.g., VTL0 or
-//! normal-world physical memory) from LiteBox with on-demand mapping.
-//! In the context of LVBS and OP-TEE, accessing physical memory is necessary
-//! because VTL0 and VTL1 as well as normal world and secure world do not share
-//! the same virtual address space, but they still have to share data through memory.
-//! VTL1 and secure world receive physical addresses from VTL0 and normal world,
-//! respectively, and they need to read from or write to those addresses.
+//! This module adds supports for accessing physical addresses (e.g., VTL0
+//! or normal-world physical memory) from LiteBox with on-demand mapping.
+//! In the context of LVBS and OP-TEE, accessing physical memory is
+//! necessary because VTL0 and VTL1 as well as normal world and secure
+//! world exchange data using physical addresses.
 //!
-//! To simplify all these, we could persistently map the entire VTL0/normal-world
-//! physical memory into VTL1/secure-world address space at once and just access them
-//! through corresponding virtual addresses. However, this module does not take these
-//! approaches due to scalability (e.g., how to deal with a system with terabytes of
-//! physical memory?) and security concerns (e.g., data corruption or information
-//! leakage due to concurrent or persistent access).
+//! The safe read/write APIs in this module follow the same safety model as
+//! safe wrappers around DMA buffers or shared physical memory. The
+//! physical memory is external to Rust's ordinary ownership model and may
+//! be changed by hardware or another privilege level. These APIs remain
+//! safe because they do not create Rust references into that external
+//! memory; they only perform bounded copies between a temporary mapping
+//! and memory owned by LiteBox. Cooperating LiteBox mappings are
+//! serialized by the platform's physical range ownership policy so safe
+//! callers cannot create conflicting mappings through this abstraction.
 //!
-//! Instead, the approach this module takes is to map the required physical memory
-//! region on-demand when accessing them while using a LiteBox-owned buffer to copy
-//! data to/from those regions. This way, this module can ensure that data must be
-//! copied into LiteBox-owned memory before being used while avoiding any unknown
-//! side effects due to persistent memory mapping.
-//!
-//! Considerations:
-//!
-//! Ideally, this module should be able to validate whether a given physical address
-//! is okay to access or even exists in the first place. For example, accessing
-//! LiteBox's own memory with this physical pointer abstraction must be prohibited to
-//! prevent the Boomerang attack and any other undefined memory access. Also, some
-//! device memory is mapped to certain physical address ranges and LiteBox should not
-//! touch them without in-depth knowledge. However, this is a bit tricky because, in
-//! many cases, LiteBox does not directly interact with the underlying hardware or
-//! BIOS/UEFI such that it does not have complete knowledge of the physical memory
-//! layout. In the case of LVBS, LiteBox obtains the physical memory information
-//! from VTL0 including the total physical memory size and the memory range assigned
-//! to VTL1/LiteBox. Thus, this module can at least confirm a given physical address
-//! does not belong to VTL1's physical memory.
-//!
-//! This module should allow byte-level access while transparently handling page
-//! mapping and data access across page boundaries. This could become complicated
-//! when we consider multiple page sizes (e.g., 4 KiB, 2 MiB, 1 GiB). Also,
-//! unaligned access is a matter to be considered.
-//!
-//! In addition, often times, this physical pointer abstraction is involved with
-//! a list of physical addresses (i.e., scatter-gather list). For example, in
-//! the worse case, a two-byte value can span across two non-contiguous physical
-//! pages (the last byte of the first page and the first byte of the second page).
-//! Thus, to enhance the performance, we may need to consider mapping multiple pages
-//! at once, copy data from/to them, and unmap them later.
-//!
-//! When this module needs to access data across physical page boundaries, it assumes
-//! that those physical pages are virtually contiguous in VTL0 or normal-world address
-//! space. Otherwise, this module could end up with accessing misordered data. This is
-//! best-effort assumption and ensuring this is the caller's responsibility (e.g., even
-//! if this module always requires a list of physical addresses, the caller might
-//! provide a wrong list by mistake or intentionally).
+//! The safe APIs should validate whether a given physical address is okay
+//! to access. For example, accessing LiteBox's own memory through this
+//! physical pointer abstraction is prohibited to avoid confused-deputy
+//! attacks and to ensure Rust memory safety. In the case of LVBS, LiteBox
+//! obtains the physical memory information from VTL0 like the total
+//! physical memory range assigned to VTL1/LiteBox. Thus, this module can
+//! confirm a given physical address does not belong to VTL1's physical
+//! memory.
 
 use crate::vmap::{
     GlobalVmapManager, PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
     VmapManager,
 };
 use core::marker::PhantomData;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
+
+/// The concrete [`PhysPageMapInfo`] produced by the `VmapManager` behind a [`GlobalVmapManager`].
+type MapInfoOf<V, const ALIGN: usize> =
+    <<V as GlobalVmapManager<ALIGN>>::Manager as VmapManager<ALIGN>>::MapInfo;
 
 /// Allocate a zeroed `Box<T>` on the heap.
 ///
@@ -98,6 +72,14 @@ fn align_up(len: usize, align: usize) -> usize {
 }
 
 /// Represent a physical pointer to an object with on-demand mapping.
+///
+/// Safe methods on this type copy to or from a temporary mapping. They never expose
+/// references or slices into the mapped physical memory.
+///
+/// Read methods require `T: FromBytes` because external memory may contain any bit pattern.
+/// Write methods require `T: IntoBytes` because values are written by copying their byte
+/// representation.
+///
 /// - `pages`: An array of page-aligned physical addresses. We expect physical addresses in this array are
 ///   virtually contiguous.
 /// - `offset`: The offset within `pages[0]` where the object starts. It should be smaller than `ALIGN`.
@@ -105,13 +87,12 @@ fn align_up(len: usize, align: usize) -> usize {
 /// - `map_info`: The mapping information of the currently mapped physical pages, if any.
 /// - `T`: The type of the object being pointed to. `pages` with respect to `offset` should cover enough
 ///   memory for an object of type `T`.
-#[derive(Clone)]
 #[repr(C)]
 pub struct PhysMutPtr<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
     pages: alloc::boxed::Box<[PhysPageAddr<ALIGN>]>,
     offset: usize,
     count: usize,
-    map_info: Option<PhysPageMapInfo<ALIGN>>,
+    map_info: Option<MapInfoOf<V, ALIGN>>,
     _type: PhantomData<T>,
     _vmap: PhantomData<V>,
 }
@@ -200,16 +181,8 @@ where
 
     /// Read the value at the given offset from the physical pointer.
     ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
-    /// `FromBytes` is required to ensure T is valid for any bit pattern from untrusted physical memory.
-    pub unsafe fn read_at_offset(
-        &mut self,
-        count: usize,
-    ) -> Result<alloc::boxed::Box<T>, PhysPointerError>
+    /// Returns an owned copy of the value read from physical memory.
+    pub fn read_at_offset(&mut self, count: usize) -> Result<alloc::boxed::Box<T>, PhysPointerError>
     where
         T: FromBytes,
     {
@@ -239,13 +212,8 @@ where
 
     /// Read a slice of values at the given offset from the physical pointer.
     ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
-    /// `FromBytes` is required to ensure T is valid for any bit pattern from untrusted physical memory.
-    pub unsafe fn read_slice_at_offset(
+    /// Copies values from physical memory into the caller-provided slice.
+    pub fn read_slice_at_offset(
         &mut self,
         count: usize,
         values: &mut [T],
@@ -283,17 +251,10 @@ where
     }
 
     /// Write the value at the given offset to the physical pointer.
-    ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, data it writes might be overwritten.
-    pub unsafe fn write_at_offset(
-        &mut self,
-        count: usize,
-        value: T,
-    ) -> Result<(), PhysPointerError> {
+    pub fn write_at_offset(&mut self, count: usize, value: T) -> Result<(), PhysPointerError>
+    where
+        T: IntoBytes,
+    {
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
@@ -318,17 +279,14 @@ where
     }
 
     /// Write a slice of values at the given offset to the physical pointer.
-    ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, data it writes might be overwritten.
-    pub unsafe fn write_slice_at_offset(
+    pub fn write_slice_at_offset(
         &mut self,
         count: usize,
         values: &[T],
-    ) -> Result<(), PhysPointerError> {
+    ) -> Result<(), PhysPointerError>
+    where
+        T: IntoBytes,
+    {
         if values.is_empty() {
             return Ok(());
         }
@@ -397,7 +355,7 @@ where
             .map_info
             .as_ref()
             .ok_or(PhysPointerError::NoMappingInfo)?;
-        let ptr = map_info.base.wrapping_add(skip % ALIGN).cast::<T>();
+        let ptr = map_info.base().wrapping_add(skip % ALIGN).cast::<T>();
         let _ = map_info;
         Ok(MappedGuard {
             owner: self,
@@ -446,8 +404,11 @@ where
     /// requests for the same physical pages.
     unsafe fn unmap(&mut self) -> Result<(), PhysPointerError> {
         if let Some(map_info) = self.map_info.take() {
-            unsafe {
-                V::manager().vunmap(map_info)?;
+            // On failure, `vunmap` hands `map_info` back so the physical range ownership it
+            // carries is not lost; restore it so a later drop/retry can release it.
+            if let Err((err, map_info)) = unsafe { V::manager().vunmap(map_info) } {
+                self.map_info = Some(map_info);
+                return Err(err);
             }
             Ok(())
         } else {
@@ -472,8 +433,9 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop
     for MappedGuard<'_, T, ALIGN, V>
 {
     fn drop(&mut self) {
-        // SAFETY: The platform is expected to handle unmapping safely, including
-        // the case where pages were never mapped (returns Unmapped error, ignored).
+        // SAFETY: The platform is expected to handle unmapping safely. Drop cannot
+        // report errors, so a failed unmap leaves map_info restored in the owner and
+        // is only reported by debug assertion.
         let result = unsafe { self.owner.unmap() };
         debug_assert!(
             result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
@@ -484,8 +446,9 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop
 
 impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop for PhysMutPtr<T, ALIGN, V> {
     fn drop(&mut self) {
-        // SAFETY: The platform is expected to handle unmapping safely, including
-        // the case where pages were never mapped (returns Unmapped error, ignored).
+        // SAFETY: The platform is expected to handle unmapping safely. Drop cannot
+        // report errors, so a failed unmap leaves map_info restored for the remainder
+        // of this destructor and is only reported by debug assertion.
         let result = unsafe { self.unmap() };
         debug_assert!(
             result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
@@ -506,8 +469,7 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
 }
 
 /// Represent a physical pointer to a read-only object. This wraps around [`PhysMutPtr`] and
-/// exposes only read access.
-#[derive(Clone)]
+/// exposes only copy-out access.
 #[repr(C)]
 pub struct PhysConstPtr<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
     inner: PhysMutPtr<T, ALIGN, V>,
@@ -554,29 +516,18 @@ where
 
     /// Read the value at the given offset from the physical pointer.
     ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
-    pub unsafe fn read_at_offset(
-        &mut self,
-        count: usize,
-    ) -> Result<alloc::boxed::Box<T>, PhysPointerError>
+    /// Returns an owned copy of the value read from physical memory.
+    pub fn read_at_offset(&mut self, count: usize) -> Result<alloc::boxed::Box<T>, PhysPointerError>
     where
         T: FromBytes,
     {
-        unsafe { self.inner.read_at_offset(count) }
+        self.inner.read_at_offset(count)
     }
 
     /// Read a slice of values at the given offset from the physical pointer.
     ///
-    /// # Safety
-    ///
-    /// The caller should be aware that the given physical address might be concurrently written by
-    /// other entities (e.g., the normal world kernel) if there is no extra security mechanism
-    /// in place (e.g., by the hypervisor or hardware). That is, it might read corrupt data.
-    pub unsafe fn read_slice_at_offset(
+    /// Copies values from physical memory into the caller-provided slice.
+    pub fn read_slice_at_offset(
         &mut self,
         count: usize,
         values: &mut [T],
@@ -584,7 +535,7 @@ where
     where
         T: FromBytes,
     {
-        unsafe { self.inner.read_slice_at_offset(count, values) }
+        self.inner.read_slice_at_offset(count, values)
     }
 }
 

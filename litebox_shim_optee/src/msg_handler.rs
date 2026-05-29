@@ -184,7 +184,8 @@ pub fn read_optee_msg_args_from_phys(
     let mut blob_ptr =
         NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(phys_addr, copy_size)
             .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
-    unsafe { blob_ptr.read_slice_at_offset(0, &mut blob) }
+    blob_ptr
+        .read_slice_at_offset(0, &mut blob)
         .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
 
     parse_optee_msg_args(&blob, has_rpc_arg)
@@ -695,10 +696,8 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
         let mut ptr = NormalWorldConstPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
-        // SAFETY: bounds validated above; copy lands in a buffer owned by LiteBox to avoid TOCTOU issues.
-        unsafe {
-            ptr.read_slice_at_offset(offset, buffer)?;
-        }
+        // Copy lands in a buffer owned by LiteBox to avoid TOCTOU issues.
+        ptr.read_slice_at_offset(offset, buffer)?;
         Ok(())
     }
 
@@ -710,10 +709,8 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
         let mut ptr = NormalWorldMutPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
-        // SAFETY: bounds validated above; data comes from a buffer owned by LiteBox.
-        unsafe {
-            ptr.write_slice_at_offset(0, buffer)?;
-        }
+        // Data comes from a buffer owned by LiteBox.
+        ptr.write_slice_at_offset(0, buffer)?;
         Ok(())
     }
 }
@@ -792,8 +789,9 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
             visited_pages_data.insert(cur_addr);
             let mut cur_ptr = NormalWorldConstPtr::<ShmRefPagesData, ALIGN>::with_usize(cur_addr)
                 .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
-            let pages_data =
-                unsafe { cur_ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+            let pages_data = cur_ptr
+                .read_at_offset(0)
+                .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
             let pages_len_before = pages.len();
             for page in &pages_data.pages_list {
                 if *page == 0 || pages.len() == num_pages {

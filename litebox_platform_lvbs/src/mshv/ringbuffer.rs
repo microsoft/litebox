@@ -92,7 +92,7 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
     let Ok(mut ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::new(&span, in_page_offset) else {
         return write_offset;
     };
-    if unsafe { ptr.write_slice_at_offset(0, buf) }.is_ok() {
+    if ptr.write_slice_at_offset(0, buf).is_ok() {
         (start + buf.len()) % size
     } else {
         write_offset
@@ -109,7 +109,7 @@ fn write_fast(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
 fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> usize {
     let write_slice = |pa: PhysAddr, slice: &[u8]| -> bool {
         Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(pa.as_u64().trunc(), slice.len())
-            .and_then(|mut ptr| unsafe { ptr.write_slice_at_offset(0, slice) })
+            .and_then(|mut ptr| ptr.write_slice_at_offset(0, slice))
             .is_ok()
     };
 
