@@ -901,228 +901,126 @@ fn sanitize_id(id: &str) -> String {
         .collect()
 }
 
-fn test_container_suffix(test_id: &str) -> &'static str {
-    if test_id.starts_with("IOR.") {
-        "-ior"
-    } else if test_id.starts_with("RAND.") {
-        "-rand"
-    } else if test_id.starts_with("CL3.vfork.") {
-        "-cl3v"
-    } else if test_id.starts_with("INO.") {
-        "-ino"
-    } else if test_id.starts_with("SCM.") {
-        "-scm"
-    } else {
-        ""
+/// Build the inner docker-run args (everything after `docker run`
+/// `[--rm]`) for a standard coordinator-suite trial. Mirrors what
+/// the now-deleted `build_docker_cmd` constructed, but as data
+/// (Vec<String>) so `framework::run_trial` can own the actual
+/// docker invocation.
+fn build_standard_docker_args(pass: &str, test_id: &str, bins: &BinaryPaths) -> Vec<String> {
+    let mut v: Vec<String> = Vec::with_capacity(40);
+    // Skip the first two args of `docker_run_base_args` (`run` +
+    // possibly `--rm`) — framework owns those. Everything after
+    // that is uniform across families and we want to preserve it.
+    let mut base = docker_run_base_args().into_iter();
+    let _ = base.next(); // "run"
+    if !keep_containers() {
+        let _ = base.next(); // "--rm"
     }
+    v.extend(base);
+    if test_id.starts_with("IOR.") {
+        // Docker's default seccomp profile blocks io_uring_setup
+        // with EPERM, hiding the WSL2/native kernel baseline this
+        // family is meant to test.
+        v.push("--security-opt".into());
+        v.push("seccomp=unconfined".into());
+    }
+    let mounts = [
+        (&bins.pie_glibc, "/opt/litebox"),
+        (&bins.nonpie_glibc, "/opt/nonpie"),
+        (&bins.static_pie_glibc, "/opt/static-pie-glibc"),
+        (&bins.static_pie_musl, "/opt/static-pie-musl"),
+        (&bins.non_pie_static_musl, "/opt/non-pie-static-musl"),
+    ];
+    for (src, dst) in mounts {
+        v.push("-v".into());
+        v.push(format!("{}:{dst}:ro", src.display()));
+    }
+    v.push("-v".into());
+    v.push(format!("{}:/litebox-test-logs", log_dir().display()));
+    v.push("-e".into());
+    v.push(format!(
+        "LITEBOX_TIMING_PATH=/litebox-test-logs/{}",
+        timing_log_path_for(pass, test_id)
+            .file_name()
+            .expect("timing_log_path_for has file name")
+            .to_string_lossy(),
+    ));
+    v.push("-v".into());
+    v.push(format!(
+        "{}:/litebox-broker-elf-cache",
+        broker_elf_cache_dir().display()
+    ));
+    v.push("-e".into());
+    v.push("LITEBOX_BROKER_ELF_CACHE_DIR=/litebox-broker-elf-cache".into());
+    if pass == "native" {
+        v.push("-e".into());
+        v.push("LITEBOX_TIMING_CONTAINER_PID1=1".into());
+    }
+    v
 }
 
-/// Build the docker command for a single-test run. We pass `--name`
-/// so the container is identifiable in `docker ps` and so
-/// `LITEBOX_KEEP_CONTAINER` users can find it after the test
-/// finishes; the orchestrator never force-kills it externally.
-fn build_docker_cmd(
-    pass: &str,
-    test_id: &str,
-    container_name: &str,
-    bins: &BinaryPaths,
-) -> Command {
+/// Build the full `ContainerSpec` for a standard coordinator-suite
+/// trial. Native pass: bare `litebox_test_harness spawn-tree`. Litebox
+/// pass: wrap with `timeout --signal=KILL N litebox_tool_executor … --
+/// litebox_test_harness spawn-tree`. The inner `timeout` is embedded
+/// in `spec.command` rather than using `spec.timeout_secs` because
+/// only the litebox path needs it (and only around the inner
+/// tool_executor command).
+fn build_standard_spec(pass: &str, test_id: &str) -> framework::ContainerSpec {
+    let (_, bins) = setup();
+    let docker_args = build_standard_docker_args(pass, test_id, &bins);
     let filter = format!("--filter={test_id}");
-    let mut cmd = Command::new("docker");
-    // Set PR_SET_PDEATHSIG=SIGTERM on the docker-run child so it
-    // self-terminates if this harness dies abruptly (e.g. cargo
-    // SIGKILL'd by dashboard timeout escalation, before the harness's
-    // own signal handler ran). With `--rm` set on the run, the
-    // ensuing exit cleans up the container.
-    //
-    // SAFETY: `pre_exec` runs after `fork(2)` and before `execve(2)`
-    // in a single-threaded post-fork context where the only safe
-    // operations are async-signal-safe ones. `prctl(2)` is
-    // async-signal-safe (see signal-safety(7)). The flag is process-
-    // private and has no global side effects beyond this child.
-    use std::os::unix::process::CommandExt;
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
-            Ok(())
-        });
-    }
-    cmd.args(docker_run_base_args())
-        .arg("--name")
-        .arg(container_name);
-    if test_id.starts_with("IOR.") {
-        // Docker's default seccomp profile blocks io_uring_setup with EPERM,
-        // hiding the WSL2/native kernel baseline this family is meant to test.
-        cmd.args(["--security-opt", "seccomp=unconfined"]);
-    }
-    // Each binary-type leg is mounted at `/opt/<label>/` so the
-    // corresponding `find_*_binary()` helpers in lib.rs find them.
-    cmd.arg("-v")
-        .arg(format!("{}:/opt/litebox:ro", bins.pie_glibc.display()))
-        .arg("-v")
-        .arg(format!("{}:/opt/nonpie:ro", bins.nonpie_glibc.display()))
-        .arg("-v")
-        .arg(format!(
-            "{}:/opt/static-pie-glibc:ro",
-            bins.static_pie_glibc.display()
-        ))
-        .arg("-v")
-        .arg(format!(
-            "{}:/opt/static-pie-musl:ro",
-            bins.static_pie_musl.display()
-        ))
-        .arg("-v")
-        .arg(format!(
-            "{}:/opt/non-pie-static-musl:ro",
-            bins.non_pie_static_musl.display()
-        ));
-    // For litebox pass, no additional mounts are needed for the
-    // harness binaries — pre-rewriting is amortised in the broker's
-    // persistent ELF cache (LITEBOX_BROKER_ELF_CACHE_DIR) which
-    // setup() pre-populates from rewrites of all 5 variants. The
-    // broker hits the disk cache on first 9P read and never invokes
-    // the rewriter at runtime. Native pass gets the original
-    // (unmodified) binaries via the directory bind mounts above.
-    cmd.arg("-v")
-        // Bind-mount the host test-logs/ directory into the container so
-        // all in-container processes (tool_executor, broker, runner, the
-        // in-guest harness) can append timing markers via
-        // `litebox_timing::emit` to a per-trial file. WSL2 + Docker
-        // returns EACCES on a single-file bind-mount even when the
-        // container runs as root, so we bind-mount the directory and
-        // each component opens the per-trial file name.
-        .arg(format!("{}:/litebox-test-logs", log_dir().display()))
-        .args([
-            "-e",
-            &format!(
-                "LITEBOX_TIMING_PATH=/litebox-test-logs/{}",
-                timing_log_path_for(pass, test_id)
-                    .file_name()
-                    .expect("timing_log_path_for has file name")
-                    .to_string_lossy(),
-            ),
-        ])
-        // Bind-mount a persistent host directory for the broker's
-        // pre-warmed ELF cache. Without this, each test pays
-        // ~400ms in pre_warm_elf_cache for libc/ld-linux/libstdc++/etc.
-        // because the broker is per-container and its in-memory
-        // cache is cold on every spawn.
-        .arg("-v")
-        .arg(format!(
-            "{}:/litebox-broker-elf-cache",
-            broker_elf_cache_dir().display()
-        ))
-        .args([
-            "-e",
-            "LITEBOX_BROKER_ELF_CACHE_DIR=/litebox-broker-elf-cache",
-        ]);
-    if pass == "native" {
-        cmd.args(["-e", "LITEBOX_TIMING_CONTAINER_PID1=1"]);
-    }
-    cmd.arg("litebox-test");
-    match pass {
-        "native" => {
-            cmd.arg("/opt/litebox/litebox_test_harness")
-                .arg("spawn-tree")
-                .arg(&filter);
-        }
+    let command: Vec<String> = match pass {
+        "native" => vec![
+            "/opt/litebox/litebox_test_harness".into(),
+            "spawn-tree".into(),
+            filter,
+        ],
         "litebox" => {
-            // Outer timeout = per-test harness budget + 15 s grace
-            // for teardown_tree (5 s cap) and container shutdown.
-            // Replaces the previous blanket 120 s, which made
-            // failing fast-tests cost 120 s each.
             let outer = test_timeout_secs(test_id).saturating_add(15);
-            let outer_str = outer.to_string();
-            cmd.args(["timeout", "--signal=KILL"])
-                .arg(&outer_str)
-                .args([
-                    "/opt/litebox/litebox_tool_executor",
-                    "--rootfs",
-                    "/",
-                    "--record-baseline",
-                    "--",
-                    "/opt/litebox/litebox_test_harness",
-                    "spawn-tree",
-                ])
-                .arg(&filter);
+            vec![
+                "timeout".into(),
+                "--signal=KILL".into(),
+                outer.to_string(),
+                "/opt/litebox/litebox_tool_executor".into(),
+                "--rootfs".into(),
+                "/".into(),
+                "--record-baseline".into(),
+                "--".into(),
+                "/opt/litebox/litebox_test_harness".into(),
+                "spawn-tree".into(),
+                filter,
+            ]
         }
         _ => panic!("unknown pass: {pass}"),
+    };
+    framework::ContainerSpec {
+        image: "litebox-test".to_string(),
+        docker_args,
+        command,
+        detached: false,
+        timeout_secs: None,
     }
-    cmd
 }
 
-/// Per-trial log directory. Each Trial writes its docker stdout +
-/// stderr here so failure investigation is trivial. libtest-mimic
-/// captures test-function stdout (where the harness emits its JSON
-/// result detail), so without these files the only thing visible in
-/// `cargo test` output for a failed trial is the bare "FAILED" line.
-fn log_dir() -> &'static PathBuf {
-    static LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    LOG_DIR.get_or_init(|| {
-        let dir = target_dir().join("test-logs");
-        let _ = std::fs::create_dir_all(&dir);
-        dir
-    })
-}
-
-/// Path to a per-Trial log file. `kind` is "stdout" or "stderr".
-/// Overwritten on every run; we don't accumulate across runs.
-fn log_path_for(pass: &str, test_id: &str, kind: &str) -> PathBuf {
-    log_dir().join(format!("{pass}-{}.{kind}.log", sanitize_id(test_id)))
-}
-
-/// Run one test and return its JSON result. Holds an `active_jobs`
-/// Run one test and return its JSON result. Holds an `active_jobs`
-/// permit for the duration of the result-bearing phase, then hands
-/// the still-running child off to a background drain thread that
-/// holds a `drain_backlog` permit until the container exits.
-///
-/// Per-Trial logs (`target/test-logs/<pass>-<id>.{stdout,stderr}.log`)
-/// are written via the OS:
-///   * stderr — `Stdio::from(File::create(...))` so the docker
-///     daemon writes straight to disk; no in-process forwarding.
-///   * stdout — we still parse line by line for the JSON result,
-///     but each line is written to the stdout log file as it
-///     arrives.
-///
-/// Both files are populated synchronously while we still hold the
-/// `active_jobs` permit, so they're durable even if cargo-test exits
-/// the moment we return — no need for a drain-side join hook.
-fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> {
+/// Drive closure body for a standard coordinator-suite trial.
+/// Owns: stderr-thread for timing-marker scraping, stdout-line
+/// parse for the JSON verdict, file-based timing marker
+/// computation, runtime-rewrite invariant check. Returns a
+/// `DriveResult` for `framework::run_trial` to record + spawn_drain
+/// the still-running child.
+fn parse_standard_verdict(
+    pass: &str,
+    test_id: &str,
+    child: &mut std::process::Child,
+) -> framework::DriveResult {
     use std::io::Write as _;
-    let t_start = Instant::now();
-    let permit = active_jobs().acquire();
-    let t_acquired = Instant::now();
-    let t_acquire_ms = t_acquired.duration_since(t_start).as_millis();
-    let (_, bins) = setup();
-    let container_name = format!(
-        "litebox-{}-{}{}-{}-{}",
-        pass,
-        sanitize_id(test_id),
-        test_container_suffix(test_id),
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    );
-
+    let t_spawn = Instant::now();
+    let docker_run_invoke_ns = monotonic_nanos();
     let stdout_log = log_path_for(pass, test_id, "stdout");
     let stderr_log = log_path_for(pass, test_id, "stderr");
     let timing_log = timing_log_path_for(pass, test_id);
     ensure_timing_log_file(&timing_log);
-
-    let mut cmd = build_docker_cmd(pass, test_id, &container_name, &bins);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let label = format!("{pass}[{test_id}]");
-    let t_spawn = Instant::now();
-    let docker_run_invoke_ns = monotonic_nanos();
-    let mut child = cmd
-        .spawn()
-        .unwrap_or_else(|e| panic!("docker spawn failed for {label}: {e}"));
-
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
     let timing_markers = Arc::new(Mutex::new(TimingMarkers::default()));
@@ -1141,10 +1039,6 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
             let _ = writeln!(stderr_log_file, "{line}");
         }
     });
-
-    // Read stdout line by line; tee each line to the stdout log
-    // file, and record the first JSON line whose "test" field
-    // matches our test_id.
     let mut stdout_log_file = std::fs::File::create(&stdout_log)
         .unwrap_or_else(|e| panic!("create {}: {e}", stdout_log.display()));
     let mut found: Option<serde_json::Value> = None;
@@ -1160,34 +1054,12 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
             && v.get("test").and_then(|t| t.as_str()) == Some(test_id)
         {
             found = Some(v);
-            // Don't break — keep tee'ing later lines into
-            // the log so post-result harness output (e.g.
-            // teardown_tree messages) is captured for
-            // forensics. The drain thread takes over when
-            // we return and finishes draining the rest.
             break;
         }
     }
     let t_json = Instant::now();
     let t_json_ns = monotonic_nanos();
-
     let t_first_byte = t_first_byte.unwrap_or(t_json);
-    // Markers come from two sources:
-    //   * The bind-mounted timing-log file: tool_executor + broker +
-    //     runner + in-guest harness append `name=ns\n` via
-    //     `litebox_timing::emit`. All on host CLOCK_MONOTONIC EXCEPT
-    //     the in-guest harness in litebox pass, whose clock is
-    //     virtualized.
-    //   * The stderr `[TIMING] harness_first_output_ns=` proxy line
-    //     from the harness — used as a host-side arrival_ns boundary
-    //     for `harness_first_output_ns` in litebox pass (where the
-    //     guest's CLOCK_MONOTONIC value is not comparable to the
-    //     host-side markers).
-    // We pre-populate from the file first (all init markers are
-    // flushed by the time the JSON result line arrives on stdout),
-    // then merge the stderr snapshot — `record_timing_marker` is
-    // first-wins so the stderr arrival_ns proxy overrides the
-    // file's virtual-clock value when both are present.
     let mut markers = TimingMarkers::default();
     let mut runtime_rewrites: Vec<String> = Vec::new();
     {
@@ -1224,14 +1096,6 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         .harness_first_output_ns
         .and_then(|ns| ns_delta_ms(ns, t_json_ns))
         .unwrap_or_else(|| t_json.duration_since(t_first_byte).as_millis());
-    // Runtime-rewrite assertion: every binary the test loaded should
-    // have been pre-populated in the broker ELF cache (harness
-    // variants from setup(), shared libraries from
-    // pre_warm_elf_cache). A non-empty list means some binary was
-    // rewritten in-band, which costs ~hundreds of ms per file —
-    // worth surfacing as a perf bug to investigate, not silently
-    // tolerating. Override with `LITEBOX_ALLOW_RUNTIME_REWRITES=1`
-    // for one-off debugging.
     let allow_runtime_rewrites = std::env::var_os("LITEBOX_ALLOW_RUNTIME_REWRITES").is_some();
     if pass == "litebox" && !runtime_rewrites.is_empty() && !allow_runtime_rewrites {
         let mut unique: Vec<String> = runtime_rewrites.clone();
@@ -1250,7 +1114,6 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
             "detail": detail,
         }));
     }
-
     let verdict: &'static str = match &found {
         Some(v) => match v.get("result").and_then(|r| r.as_str()) {
             Some("pass") => "pass",
@@ -1259,63 +1122,55 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         },
         None => "no_result",
     };
-    let pass_static: &'static str = match pass {
-        "native" => "native",
-        "litebox" => "litebox",
-        _ => "unknown",
-    };
-    let jobs = current_jobs_cap();
-
     let sub_phases = SubPhaseMs::compute(&markers);
-
-    // Suite/group come from the canonical in-process registry, not
-    // from the in-container JSON line — so even if the container is
-    // reaped before printing (timeout, etc), the dashboard rows are
-    // always labeled correctly.
-    let (suite_static, group_static) = test_suite_group(test_id).expect(
-        "test_id missing from registry — emit_timing_main only \
-                 reachable from run_pass_group, which iterates get_test_ids",
-    );
-
-    // Emit the main timing line synchronously (drain may get cut off
-    // if cargo-test exits early).
-    emit_timing_main(
-        test_id,
-        pass_static,
-        suite_static,
-        group_static,
-        t_acquire_ms,
+    let detail = match (verdict, &found) {
+        ("pass", _) => None,
+        ("FAIL", Some(v)) => Some(format!(
+            "{pass}::{test_id}: {} (logs: {} {})",
+            v.get("detail").and_then(|d| d.as_str()).unwrap_or(""),
+            stdout_log.display(),
+            stderr_log.display(),
+        )),
+        ("no_result", _) => Some(format!(
+            "{pass}[{test_id}]: no JSON result for {test_id} on stdout (full log: {})",
+            stdout_log.display(),
+        )),
+        _ => Some(format!(
+            "{pass}::{test_id}: unexpected verdict {verdict} (logs: {} {})",
+            stdout_log.display(),
+            stderr_log.display(),
+        )),
+    };
+    framework::DriveResult {
+        verdict,
+        detail,
         t_docker_start_ms,
+        t_useful_ms,
+        sub_phases,
         t_docker_spawn_ms,
         t_litebox_init_ms,
         t_harness_load_ms,
-        &sub_phases,
-        t_useful_ms,
-        verdict,
-        jobs,
-    );
+    }
+}
 
-    // Hand off the still-running child to a drain worker. It just
-    // waits for clean exit so we bound zombies / per-host docker
-    // population. Logs are already on disk (stderr via Stdio::from,
-    // stdout via the tee above). The drain thread emits its own
-    // t_drain_ms line when wait() returns.
-    spawn_drain(
-        child,
-        container_name.clone(),
-        test_id.to_string(),
-        pass_static,
-        t_json,
-    );
-    drop(permit);
-
-    found.ok_or_else(|| {
-        format!(
-            "{label}: no JSON result for {test_id} on stdout (full log: {})",
-            stdout_log.display(),
-        )
-        .into()
+/// Per-trial log directory. Each Trial writes its docker stdout +
+/// stderr here so failure investigation is trivial. libtest-mimic
+/// captures test-function stdout (where the harness emits its JSON
+/// result detail), so without these files the only thing visible in
+/// `cargo test` output for a failed trial is the bare "FAILED" line.
+fn log_dir() -> &'static PathBuf {
+    static LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    LOG_DIR.get_or_init(|| {
+        let dir = target_dir().join("test-logs");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
     })
+}
+
+/// Path to a per-Trial log file. `kind` is "stdout" or "stderr".
+/// Overwritten on every run; we don't accumulate across runs.
+fn log_path_for(pass: &str, test_id: &str, kind: &str) -> PathBuf {
+    log_dir().join(format!("{pass}-{}.{kind}.log", sanitize_id(test_id)))
 }
 
 /// Wall-clock cap on the post-result drain phase. The drain thread
@@ -1677,23 +1532,27 @@ fn is_fill_arg(a: &str) -> bool {
 
 // ── Per-Trial runner ─────────────────────────────────────────────────
 
-/// Run one Trial: spawn its own `docker run` with `--filter=<test_id>`,
-/// read the JSON result, return pass/fail.
-fn run_pass_group(pass: &str, test_id: &str) -> Result<(), Failed> {
-    let result = run_one_test(pass, test_id)?;
-    let outcome = result["result"].as_str().unwrap_or("?");
-    if outcome == "FAIL" {
-        let detail = result["detail"].as_str().unwrap_or("");
-        let stdout_log = log_path_for(pass, test_id, "stdout");
-        let stderr_log = log_path_for(pass, test_id, "stderr");
-        return Err(format!(
-            "{pass}::{test_id}: {detail} (logs: {} {})",
-            stdout_log.display(),
-            stderr_log.display(),
-        )
-        .into());
-    }
-    Ok(())
+/// Run one Trial: build a `ContainerSpec` + drive closure + call
+/// `framework::run_trial`. The framework owns the entire trial
+/// lifecycle (gate, name, PDEATHSIG, registry, spawn-drain handoff,
+/// recording). The drive closure does the standard-family work:
+/// parse the in-container JSON verdict from stdout + scrape timing
+/// markers from stderr. See `parse_standard_verdict` and
+/// `tests/common/framework.rs`.
+fn run_pass_group(pass: &'static str, test_id: &str) -> Result<(), Failed> {
+    let (suite, group) = test_suite_group(test_id).expect(
+        "test_id missing from registry — run_pass_group only \
+         reachable from Trials generated over get_test_ids()",
+    );
+    let test_id_owned = test_id.to_string();
+    let spec = build_standard_spec(pass, test_id);
+    framework::run_trial(pass, test_id, suite, group, spec, move |container| {
+        let child = container
+            .child
+            .as_mut()
+            .expect("foreground spec → child is Some");
+        parse_standard_verdict(pass, &test_id_owned, child)
+    })
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
