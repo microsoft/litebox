@@ -1,0 +1,11 @@
+[package]
+name = "litebox_broker_wire"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+
+[lints]
+workspace = true

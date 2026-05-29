@@ -124,6 +124,36 @@ PolicyEngine should not own all broker state. It consumes facts from BrokerCore 
 
 Trusted backend for privileged operations: address-space control, host I/O, filesystem/device/network access, randomness/secrets, timers, scheduling hooks, host-side execution of PolicyEngine-authorized operations, and platform-specific primitives.
 
+## Crate layout and naming
+
+The broker split should use crate names that make the authority boundary visible. The first proof of concept should start with standalone crates rather than moving the existing `litebox` crate wholesale into the broker.
+
+| Crate | Initial role |
+|---|---|
+| `litebox_broker_protocol` | Shared `no_std` protocol crate for wire-visible types only: protocol version type, opaque event object/reference handles, minimal event request/response messages, readiness/wait outcomes, and ABI-neutral errors for the first event-object path. Richer envelopes, feature negotiation, and wire-visible frame structures are added when later milestones need them. |
+| `litebox_broker_core` | Transport-independent authority logic: peer-credential-to-association seam, broker-owned session/process associations, object/reference registry, object type and rights authority, generations, policy hooks, wait/readiness state, connection cleanup, and the first broker-owned event object. |
+| `litebox_broker_transport` | Neutral `no_std` transport-trait crate for blocking directional request/response transport contracts shared by clients and broker entry loops, including explicit clean-close receive semantics and the transport-produced peer credential type. Concrete IPC implementations live outside this crate; non-blocking transports can provide blocking adapters at this boundary. |
+| `litebox_broker_wire` | Reusable `no_std + alloc` byte codec for broker request/response message bodies. Byte-stream transports reuse it rather than duplicating protocol encoding. |
+| `litebox_broker_unix_socket` | Concrete `std` Unix-domain-socket transport crate implementing the neutral client/server transport traits for hosted userland testing, plus the hosted Unix-socket broker executable used by the POC. |
+| `litebox_broker_server` | Transport-neutral `no_std` broker server library: free receive/send loop over a caller-owned `BrokerCore` and generic server transport. The server obtains the peer credential through `ServerTransport`, so deployment entry points do not construct credentials out-of-band, and successful termination reports whether the peer closed or BrokerCore closed with a typed reason. |
+| `litebox_broker_client` | `no_std` transport-neutral user-side adapter linked into UserLiteBox/shims/runners: negotiate broker protocol, track client negotiation state, sequence request/response pairs, map broker errors, and expose typed broker calls. |
+| `litebox_user` | Untrusted UserLiteBox facade: guest fd table view, syscall/resource routing, local-private mechanics, broker-backed object wrappers, and compatibility-profile glue. |
+
+`litebox_broker_client` should stay narrow. It is not the syscall classifier and does not implement non-delegable syscall handling. Shim dispatch and `litebox_user` decide whether an operation is local-private, broker-delegated, or host-arbitrated; the client only carries broker-delegated operations over the selected transport.
+
+Transport must remain replaceable. `litebox_broker_protocol` and `litebox_broker_core` must not depend on Unix-domain sockets, shared-memory rings, or any specific IPC implementation. Shared request/response transport traits live in `litebox_broker_transport`; concrete IPC implementations, such as `litebox_broker_unix_socket` or a later shared-memory ring crate, live outside the broker deployment crate without changing broker object semantics.
+
+Forward-compatible protocol probing is explicit: unknown request tags decoded from the wire stay in transport-level receive wrappers rather than entering the known protocol enums, so the generic server loop can return `UnsupportedOperation` without closing the connection. Structurally malformed frames remain transport/wire errors.
+
+Kernel/trusted deployments will likely link the host-support and broker-authority pieces into one binary or image, but the code should still preserve their logical split:
+
+| Future crate/layer | Role |
+|---|---|
+| `litebox_broker_host` | BrokerHost abstractions for user-mode execution support, trap/upcall/transport delivery, process/thread setup, and the UserLiteBox host ABI. |
+| `litebox_broker_kernel` | Kernel/trusted-domain deployment wiring for `litebox_broker_core`, BrokerServices, PolicyEngine, BrokerPlatform, and BrokerHost. |
+
+These names do not require separate runtime processes. In a kernel-broker deployment, BrokerHost, BrokerCore, BrokerServices, PolicyEngine, and BrokerPlatform can be compiled into one trusted binary. The code boundary still matters: BrokerHost carries or classifies traffic, while BrokerCore decodes, validates, dispatches, and authorizes broker requests.
+
 ## Three interfaces
 
 There are three logical interfaces. In a broker-kernel deployment, the UserLiteBox/host interface and the broker authority interface may use the same trap instruction or kernel entry path, but they must remain separate contracts with separate authority rules. When they share a path, BrokerHost should only classify and deliver traffic; BrokerRequest decoding, validation, dispatch, and authorization remain broker-authority responsibilities.
@@ -190,7 +220,7 @@ Each sandboxed process has exactly one authenticated broker association. That as
 
 The broker creates or authorizes all channels and binds them to the host-authenticated peer identity of the guest process. UserLiteBox does not prove identity by filling in request fields.
 
-The protocol exposes broker-owned objects through opaque, typed object identifiers. Shims may map those identifiers to guest-visible integers, but the broker remains authoritative for object type, lifetime, generation, rights, and policy. Object rights are broker-internal; UserLiteBox cannot amplify authority by editing request fields.
+The protocol exposes broker-owned objects through opaque object identifiers plus closeable broker reference identifiers and generations. Shims may map those handles to guest-visible integers, but the broker remains authoritative for object type, object lifetime, reference lifetime, generations, rights, and policy. Object types and rights are broker-internal for authorization; UserLiteBox cannot amplify authority by editing request fields.
 
 The protocol never passes host file descriptors, handles, sockets, directory handles, or other host-native resources to untrusted code in the baseline design. UserLiteBox receives only broker object identifiers, response data, event data, and broker-created channel endpoints whose authority is already bound by the broker.
 
@@ -315,8 +345,8 @@ Startup should fail closed:
 
 1. The runner selects a deployment profile, such as `optee-on-lvbs` or `optee-on-userland`.
 2. The runner selects a UserLiteBox profile that matches the deployment's host ABI.
-3. The user side establishes an authenticated broker transport. In userland, this can use OS IPC peer credentials; in broker-kernel deployments, this comes from the trusted entry path.
-4. The broker binds the caller identity used in `BrokerRequest` to the authenticated peer. User mode does not choose its own authority identity.
+3. The user side establishes an authenticated broker transport. In userland, this can use OS IPC peer credentials; in broker-kernel deployments, this comes from the trusted entry path. The first POC's Unix-socket transport returns an explicit unauthenticated placeholder credential through the same `ServerTransport` API that later authenticated transports will implement.
+4. The broker binds the caller identity used for dispatch to the authenticated peer credential. User mode does not choose its own authority identity.
 5. The user side sends required BrokerCore, BrokerService, PolicyEngine policy profile, broker capability, UserLiteBox, BrokerHost, channel/ring, and host-syscall-profile versions.
 6. The broker replies with supported services and capabilities.
 7. The user side starts only if the required versions and features match.
@@ -396,7 +426,7 @@ The current `litebox` crate should not be split by whole module. Most modules mi
 | Current area | Keep in UserLiteBox | Move to BrokerCore / broker side |
 |---|---|---|
 | `LiteBox` object | user-mode facade, std-backed helpers, broker connection/session object | broker session/workload identity |
-| `fd::Descriptors` | guest fd number table/cache, typed wrappers, syscall ergonomics | authoritative object IDs, generations, rights, dup/pass/close/refcounts |
+| `fd::Descriptors` | guest fd number table/cache, typed wrappers, syscall ergonomics | authoritative object IDs, reference IDs, generations, rights, dup/pass/close/refcounts |
 | `fd::RawDescriptorStorage` | raw-int fd conversion for shim ABI | validation that a handle is live and authorized |
 | fd metadata | local ABI metadata and cached hints | shared open-description metadata and metadata inherited/duplicated/passed across processes |
 | `path.rs` | string/CStr conversion, cheap normalization helpers | authoritative path lookup, namespace traversal, permission checks |
@@ -413,7 +443,7 @@ The current `litebox` crate should not be split by whole module. Most modules mi
 
 Concrete examples:
 
-- `fd::Descriptors` currently stores in-process descriptor entries with `Arc<RwLock<DescriptorEntry>>`. UserLiteBox can keep the ergonomic raw-fd and typed-fd presentation, but BrokerCore should own the live object, rights, generation, refcount, passing, duplication, close, and revoke semantics.
+- `fd::Descriptors` currently stores in-process descriptor entries with `Arc<RwLock<DescriptorEntry>>`. UserLiteBox can keep the ergonomic raw-fd and typed-fd presentation, but BrokerCore should own the live object, closeable reference, rights, generations, refcount, passing, duplication, close, and revoke semantics.
 - `fs::in_mem`, `fs::layered`, and `fs::nine_p` currently store namespace-like state in-process. In a multiprocess design, namespace state and open file descriptions must be broker-side. UserLiteBox should only marshal paths/buffers and use broker-owned data channels or rings for payloads.
 - `net::Network` currently owns smoltcp socket state, local port allocation, close queues, and platform packet I/O. If the broker enforces network/firewall policy, socket and port authority must be broker-side. UserLiteBox should keep the socket facade and use broker-owned rings for data movement.
 - `mm::PageManager` currently owns VMA state and calls platform page-management operations. UserLiteBox can keep loader-side helpers and cached VMA views, but authoritative mapping permissions, shared mappings, and page-fault decisions belong broker-side.
@@ -594,7 +624,7 @@ LiteBox's proposed design combines ideas from several systems rather than copyin
 | **Arrakis / Exokernel** | OS as control plane, application gets direct data path after safe allocation | broker can be the control plane while UserLiteBox uses broker-owned rings/data channels for safe data paths |
 | **LITESHIELD** | userspace microkernel services, shared-memory IPC, delegable vs non-delegable syscall handling | borrow syscall classification and arbitration; keep LiteBox's explicit broker objects and PolicyEngine |
 | **SKernel** | split guest kernel into resource kernel and data kernel; trusted I/O data plane for performance | consider future trusted broker data-plane services, not untrusted UserLiteBox authority expansion |
-| **seL4 / capability microkernels** | explicit unforgeable capabilities define authority | BrokerCore handles should carry object identity, rights, and generation checks |
+| **seL4 / capability microkernels** | explicit unforgeable capabilities define authority | BrokerCore handles should carry object identity and generation checks while BrokerCore stores authoritative rights |
 | **Qubes OS** | compartmentalized workloads use service VMs for devices/network | isolate rich authority into broker services and policy, especially device/network access |
 | **Nabla / Kata / unikernels** | reduce host syscall surface or use VM-backed isolation | narrow the authority interface; choose stronger isolation per deployment when needed |
 
@@ -740,20 +770,42 @@ The OP-TEE/LVBS sections above are worked examples, not an exhaustive crate-by-c
 
 The first milestone should not attempt full multi-process support for every shim. Start with the smallest authority substrate:
 
-1. Define the component split: `Shim`, `UserLiteBox`, optional shim-specific user clients, `BrokerCore`, optional `BrokerServices`, `PolicyEngine`, `BrokerPlatform`, and, in broker-kernel deployments, `BrokerHost`.
-2. Define the BrokerClient adapter, shared broker envelope, handle format, memory-grant format, service IDs, protocol versions, transport authentication, policy profile/version format, control/event/data channel schema, shared-memory ring layout, UserLiteBox/BrokerHost ABI versions, and deployment profile format.
-3. Decide the Rust runtime strategy: `std` for UserLiteBox and userland broker; `no_std + alloc + traits` for kernel broker first; custom kernel `std` target only if later justified.
-4. Define host syscall profiles for bootstrap, fast local mode, and strict mode.
-5. Define broker-owned identity for workloads, processes, sessions, and threads.
-6. Define broker-owned capability/resource IDs with generation checks.
-7. Make UserLiteBox handle tables broker-backed views.
-8. Add startup negotiation between runner and broker, including required BrokerCore, BrokerService, PolicyEngine, broker capability, channel/ring, host syscall profile, UserLiteBox, and BrokerHost features.
-9. Add a minimal PolicyEngine that can authorize/deny one simple broker-owned shared resource, such as an event object or pipe-like queue.
-10. Add a broker wait/wakeup channel.
-11. Prototype a broker-owned pipe or queue with shared-ring data path.
-12. Prototype a broker-owned file object with mediated control/data-channel I/O, not host-handle delegation.
-13. Prototype broker-owned network resources with PolicyEngine firewall policy and BrokerPlatform backend execution.
-14. Add a small OP-TEE BrokerService only for authority that cannot be represented by generic BrokerCore primitives.
-15. Expand to shared memory, lifecycle transitions, IPC, filesystem policy, network policy, and shim-specific resource models.
+The first proof of concept should use:
+
+```text
+litebox_broker_protocol
+litebox_broker_core
+litebox_broker_transport
+litebox_broker_wire
+litebox_broker_unix_socket
+litebox_broker_server
+litebox_broker_client
+separate userland broker process
+Unix-domain-socket transport implementing neutral transport traits
+control channel only
+minimal PolicyEngine
+broker-owned event object
+```
+
+Early end-to-end shim tests should use a hybrid migration profile: only the migrated object family routes through the broker, while unrelated operations continue through the existing local compatibility path. UserLiteBox handle entries can therefore contain either local compatibility objects or broker object/reference IDs with generations and cached rights. This is explicitly a migration profile, not the final security posture for arbitrary workloads.
+
+Then proceed incrementally:
+
+1. Define the component split: `Shim`, `litebox_user`/UserLiteBox, optional shim-specific user clients, `BrokerCore`, optional `BrokerServices`, `PolicyEngine`, `BrokerPlatform`, and, in broker-kernel deployments, `BrokerHost`.
+2. Create `litebox_broker_protocol` with only the shared protocol version type, opaque event object/reference handle format, minimal event request/response messages, readiness/wait outcomes, and ABI-neutral errors needed for the first event-object path.
+3. Create `litebox_broker_core` with broker-owned process/session association IDs, authority-only object type and rights metadata, an explicit transport-provided peer-credential connection seam that is stored on the association and visible to policy operations, event object/reference IDs with generation checks, a minimal object/reference registry, connection cleanup, and policy hooks.
+4. Create `litebox_broker_transport` with neutral client/server request-response traits, `litebox_broker_wire` with reusable message-body encoding, `litebox_broker_unix_socket` with the concrete Unix-domain-socket implementation plus hosted executable, and `litebox_broker_server` with a thin receive/send loop over BrokerCore connection dispatch.
+5. Add startup negotiation between runner/client and broker, including required BrokerCore, BrokerService, PolicyEngine, broker capability, channel/ring, host syscall profile, UserLiteBox, and BrokerHost features.
+6. Add a broker-owned event object with the smallest end-to-end surface first: create, wait, and signal. Add duplicate, close, explicit readiness queries, stale-handle tests, and process-disconnect cleanup after the initial broker path is proven.
+7. Use `litebox_broker_client` for typed end-to-end broker tests, keeping the client independent of Unix sockets so future transports can implement the same neutral transport traits.
+8. Introduce `litebox_user` as the untrusted UserLiteBox facade for syscall/resource routing, local-private operations, broker-backed object wrappers, and compatibility-profile glue.
+9. Define host syscall profiles for bootstrap, fast local mode, and strict mode.
+10. Make UserLiteBox handle tables broker-backed views for migrated object families.
+11. Add a broker wait/wakeup channel.
+12. Prototype a broker-owned pipe or queue with shared-ring data path.
+13. Prototype a broker-owned file object with mediated control/data-channel I/O, not host-handle delegation.
+14. Prototype broker-owned network resources with PolicyEngine firewall policy and BrokerPlatform backend execution.
+15. Add a small OP-TEE BrokerService only for authority that cannot be represented by generic BrokerCore primitives.
+16. Expand to shared memory, lifecycle transitions, IPC, filesystem policy, network policy, and shim-specific resource models.
 
 That gives a controlled path from current single-process/single-session assumptions toward true shared-state support without rewriting every shim and platform at once.

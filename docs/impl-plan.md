@@ -54,17 +54,15 @@ Create a shared crate for broker protocol types.
 
 Initial contents:
 
-- protocol version;
-- session/process/workload IDs;
-- broker object IDs with type tags and generations;
-- request/response envelopes;
+- protocol version type;
+- broker event object/reference IDs with generations;
+- minimal event request/response messages;
+- readiness and wait outcome payloads;
 - ABI-neutral error categories;
-- control/event/data channel frame headers;
-- policy profile IDs;
-- host syscall profile IDs;
-- feature negotiation structures.
 
-Prefer `no_std + alloc` for shared types so they can be reused by userland and kernel-broker deployments.
+Richer request/response envelopes, control/event/data channel frame headers, policy profile IDs, host syscall profile IDs, and feature negotiation structures are added when later milestones need them.
+
+Prefer `no_std` for shared types, adding `alloc` only in crates that need owned buffers, so they can be reused by userland and kernel-broker deployments.
 
 Exit criteria:
 
@@ -79,17 +77,27 @@ Implement a userland broker process first.
 Initial scope:
 
 - one broker process per sandbox session;
-- one authenticated process association;
+- at least one authenticated process association within the broker session;
 - control channel only;
-- exact protocol version negotiation;
+- major-version/minor-compatible protocol negotiation;
+- neutral blocking `no_std` request/response transport traits with transport-specific error types and explicit clean-close receive semantics;
+- transport-produced peer credentials returned through the server transport trait and passed into BrokerCore associations;
+- reusable `no_std + alloc` request/response wire codec for byte-stream transports;
+- Unix-domain-socket framing as the first concrete userland transport crate;
+- a Unix-socket executable crate that wires the generic transport-neutral server to the concrete Unix transport;
+- BrokerCore-owned connection negotiation, request dispatch, peer-credential association seam, and connection cleanup;
 - default-deny PolicyEngine;
 - fail-closed channel/session behavior.
 
 Exit criteria:
 
 - UserLiteBox can connect and negotiate.
-- Broker binds caller identity to the authenticated transport.
+- Broker binds caller identity to the authenticated transport. The first hosted executable passes the explicit unauthenticated placeholder through the same server API that later deployment-specific authentication will use.
+- Userland transport code only receives/sends decoded frames and supplies peer credentials; BrokerCore owns broker request dispatch and typed dispatch outcomes, and the generic server reports successful termination as peer-close or broker-close with a reason.
+- Client code does not need to depend on the userland broker server crate to use the first Unix socket transport.
+- The generic broker server library does not depend on concrete Unix socket transport code and remains `no_std`.
 - Malformed or unauthorized requests fail closed or return policy-denied according to explicit policy.
+- Unsupported future protocol operations return `UnsupportedOperation` without closing the connection so clients can probe optional features explicitly.
 
 ## Phase 3: UserLiteBox facade
 
@@ -106,7 +114,7 @@ Exit criteria:
 
 - Current tests can still use the local profile.
 - A broker-backed profile can issue a simple broker request.
-- UserLiteBox handle entries can store broker object ID + generation + cached rights.
+- UserLiteBox handle entries can store opaque broker object/reference IDs + generations plus local cached rights hints.
 
 ## Phase 4: First broker-owned object
 
@@ -115,8 +123,7 @@ Start with a small event or pipe-like object, not filesystem or networking.
 Broker owns:
 
 - object ID and generation;
-- endpoint/reference lifetime;
-- close semantics;
+- initial reference ID, generation, and rights;
 - readiness state;
 - wait/wakeup state.
 
@@ -129,9 +136,8 @@ UserLiteBox owns:
 
 Exit criteria:
 
-- Create, duplicate, close, wait, and readiness work through BrokerCore.
-- Stale handles and wrong-generation handles are rejected.
-- Process disconnect cleans up broker-owned references.
+- Create, wait, and signal work through BrokerCore and the separate broker process.
+- Duplicate, close, explicit readiness queries, stale-handle tests, and process-disconnect cleanup are added after the first end-to-end path is proven.
 
 ## Phase 5: Broker-backed fd semantics
 
@@ -354,10 +360,11 @@ The smallest useful milestone is:
 ```text
 single process
 userland broker
+typed broker client
 control channel only
-default-deny PolicyEngine
-broker-owned event/pipe object
-UserLiteBox fd table maps guest fd -> broker object id
+minimal PolicyEngine
+broker-owned event object
+UserLiteBox fd table maps guest fd -> broker object/reference id
 ```
 
 This proves the trust boundary before taking on filesystem, networking, mapping, or multiprocess complexity.
