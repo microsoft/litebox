@@ -143,6 +143,16 @@ mod dashboard_store;
 #[path = "common/lease.rs"]
 mod lease;
 
+// ── Per-trial container lifecycle framework ──────────────────────────
+// Single entry point `framework::run_trial(...)` that every test
+// family uses. Owns the dispatch-gate acquire, canonical container
+// name allocation, PR_SET_PDEATHSIG, cleanup-registry registration,
+// spawn_drain / explicit teardown, and emit_timing_main recording.
+// See `tests/common/framework.rs` for the surface + rationale.
+#[allow(dead_code)]
+#[path = "common/framework.rs"]
+mod framework;
+
 fn emit_timing_main(
     test: &str,
     pass: &str,
@@ -748,24 +758,43 @@ mod cleanup {
     use std::process::{Command, Stdio};
     use std::sync::{Mutex, OnceLock};
 
-    static CHILDREN: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+    /// Per-registered container: the host docker-run PID (used for
+    /// graceful SIGTERM during foreground drain) and a hint about
+    /// whether the docker-run host process is still expected to be
+    /// alive. Detached containers (`docker run -d`) record the
+    /// short-lived docker-run PID which exits as soon as the
+    /// container starts; the `pid_alive` field is set false for
+    /// those so reap_all skips the SIGTERM step.
+    pub(crate) struct ChildEntry {
+        pub pid: u32,
+        pub pid_alive: bool,
+    }
 
-    fn registry() -> &'static Mutex<HashMap<u32, String>> {
+    /// Keyed by **container name** so detached and foreground
+    /// containers coexist cleanly (PID alone is ambiguous: a
+    /// detached docker-run PID exits and may be reused).
+    static CHILDREN: OnceLock<Mutex<HashMap<String, ChildEntry>>> = OnceLock::new();
+
+    fn registry() -> &'static Mutex<HashMap<String, ChildEntry>> {
         CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Register a live `docker run` child + the container name it was
-    /// launched with. Called immediately after `Command::spawn()`.
-    pub(crate) fn register_docker_child(pid: u32, container_name: &str) {
+    /// Register a live container. `pid` is the docker-run host
+    /// process's PID; `pid_alive=true` means it's still running and
+    /// reap_all should SIGTERM it (foreground), `false` means the
+    /// docker-run process already exited (detached) so reap_all
+    /// should only do `docker rm -f`.
+    pub(crate) fn register_docker_child(pid: u32, container_name: &str, pid_alive: bool) {
         if let Ok(mut g) = registry().lock() {
-            g.insert(pid, container_name.to_string());
+            g.insert(container_name.to_string(), ChildEntry { pid, pid_alive });
         }
     }
 
-    /// Deregister a `docker run` child after `wait()` returns.
-    pub(crate) fn deregister_docker_child(pid: u32) {
+    /// Deregister a container after it's been cleaned up (graceful
+    /// drain, explicit teardown, or signal-handler reap).
+    pub(crate) fn deregister_docker_child(container_name: &str) {
         if let Ok(mut g) = registry().lock() {
-            g.remove(&pid);
+            g.remove(container_name);
         }
     }
 
@@ -783,20 +812,25 @@ mod cleanup {
         }
     }
 
-    /// Snapshot the registry and run `docker rm -f` + SIGTERM on each
-    /// entry in parallel-bounded fashion. Best-effort: any individual
-    /// failure is logged and skipped. Returns when all entries have
-    /// been processed (or 30 s elapsed, whichever first).
+    /// Snapshot the registry and run `docker rm -f` + (for
+    /// foreground entries) SIGTERM on each entry in parallel-bounded
+    /// fashion. Best-effort: any individual failure is logged and
+    /// skipped. Returns when all entries have been processed (or
+    /// 30 s elapsed, whichever first).
     pub(crate) fn reap_all() {
-        let snapshot: Vec<(u32, String)> = registry()
+        let snapshot: Vec<(String, u32, bool)> = registry()
             .lock()
-            .map(|g| g.iter().map(|(k, v)| (*k, v.clone())).collect())
+            .map(|g| {
+                g.iter()
+                    .map(|(name, e)| (name.clone(), e.pid, e.pid_alive))
+                    .collect()
+            })
             .unwrap_or_default();
         if snapshot.is_empty() {
             return;
         }
         eprintln!(
-            "[cleanup] reaping {} in-flight docker run children",
+            "[cleanup] reaping {} in-flight docker containers",
             snapshot.len()
         );
         // Bound parallelism to 8: each `docker rm -f` is a daemon RPC
@@ -804,8 +838,9 @@ mod cleanup {
         let chunk = 8usize;
         for batch in snapshot.chunks(chunk) {
             let mut threads = Vec::with_capacity(batch.len());
-            for (pid, name) in batch {
+            for (name, pid, pid_alive) in batch {
                 let pid = *pid;
+                let pid_alive = *pid_alive;
                 let name = name.clone();
                 threads.push(std::thread::spawn(move || {
                     // 5 s timeout on the docker call via timeout(1).
@@ -814,11 +849,15 @@ mod cleanup {
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
-                    // SAFETY: pid came from std::process::Child::id()
-                    // of a child we own; SIGTERM is the documented
-                    // signal for orderly shutdown.
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
+                    if pid_alive {
+                        // SAFETY: pid came from std::process::Child::id()
+                        // of a child we own; SIGTERM is the documented
+                        // signal for orderly shutdown. For detached
+                        // entries (pid_alive=false) the PID was already
+                        // reaped and could be reused — skip the kill.
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGTERM);
+                        }
                     }
                 }));
             }
@@ -1332,7 +1371,7 @@ fn spawn_drain(
         let cname = container_name;
         // Register so the top-level SIGTERM handler can reap us if the
         // harness is asked to shut down before this drain completes.
-        cleanup::register_docker_child(pid as u32, &cname);
+        cleanup::register_docker_child(pid as u32, &cname, /* pid_alive */ true);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let cname_for_watchdog = cname.clone();
         let watchdog = std::thread::spawn(move || {
@@ -1358,7 +1397,7 @@ fn spawn_drain(
         let _ = child.wait();
         let _ = tx.send(());
         let _ = watchdog.join();
-        cleanup::deregister_docker_child(pid as u32);
+        cleanup::deregister_docker_child(&cname);
         let t_drain_ms = t_drain_start.elapsed().as_millis();
         emit_timing_drain(&test_id, pass, t_drain_ms);
     });
