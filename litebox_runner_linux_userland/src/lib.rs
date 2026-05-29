@@ -780,15 +780,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_broker_inet_delay_ns(ns);
     }
 
-    // Stage 3a: broker-backed TCP accept is opt-in while the matrix is
-    // validated. The broker process reads the same environment variable.
-    {
-        let enabled = std::env::var("LITEBOX_BROKER_TCP_CONN")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        litebox_shim_linux::syscalls::set_broker_tcp_conn_accept_enabled(enabled);
-    }
+    // Stage 3a/Phase B: broker-backed TCP accept promotion remains opt-in.
+    // Phase B's outbound-TCP gate also enables the accept-promoted path.
+    litebox_shim_linux::syscalls::set_broker_tcp_conn_accept_enabled(
+        broker_tcp_conn_accept_or_outbound_enabled(),
+    );
 
     // Phase B-Step8c: if --fd-token-broker is supplied, connect to
     // the broker's fd-token control socket and register a
@@ -3380,6 +3376,21 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
 /// `RunnerBrokerEventfdProvider` as the shim's global provider.
 ///
 /// Called from `run()` when `--fd-token-broker <path>` is supplied.
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn broker_inet_tcp_enabled() -> bool {
+    env_flag_enabled("LITEBOX_BROKER_INET_TCP")
+}
+
+fn broker_tcp_conn_accept_or_outbound_enabled() -> bool {
+    env_flag_enabled("LITEBOX_BROKER_TCP_CONN") || broker_inet_tcp_enabled()
+}
+
 fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     use litebox_common_linux::broker_eventfd::NotificationDispatcher;
     use litebox_common_linux::fd_token_client::FdTokenClient;
@@ -3433,14 +3444,16 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     litebox_shim_linux::syscalls::set_broker_socketpair_provider(socketpair_provider)
         .map_err(|_| anyhow!("socketpair provider already set"))?;
 
-    let tcp_conn_provider = Arc::new(
-        crate::broker_tcp_conn_provider::RunnerBrokerTcpConnProvider::new(
-            Arc::clone(&client),
-            Arc::clone(&dispatcher),
-        ),
-    );
-    litebox_shim_linux::syscalls::set_broker_tcp_conn_provider(tcp_conn_provider)
-        .map_err(|_| anyhow!("tcp conn provider already set"))?;
+    if broker_tcp_conn_accept_or_outbound_enabled() {
+        let tcp_conn_provider = Arc::new(
+            crate::broker_tcp_conn_provider::RunnerBrokerTcpConnProvider::new(
+                Arc::clone(&client),
+                Arc::clone(&dispatcher),
+            ),
+        );
+        litebox_shim_linux::syscalls::set_broker_tcp_conn_provider(tcp_conn_provider)
+            .map_err(|_| anyhow!("tcp conn provider already set"))?;
+    }
 
     let pgrp_signal_provider = Arc::new(
         crate::broker_pgrp_signal_provider::RunnerBrokerPgrpSignalProvider::new(
@@ -3487,10 +3500,7 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     }
 
     fn broker_inet_listener_enabled() -> bool {
-        std::env::var("LITEBOX_BROKER_INET_LISTENER")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
+        env_flag_enabled("LITEBOX_BROKER_INET_LISTENER")
     }
 
     fn setup_broker_inet_listener_provider(
