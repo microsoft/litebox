@@ -3,7 +3,7 @@
 
 //! Broker-backed TCP connection file descriptors.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use litebox::{
@@ -165,6 +165,29 @@ impl BrokerTcpConnFd<Platform> {
         self.provider
             .getpeername(self.handle())
             .map_err(broker_err_to_errno)
+    }
+
+    pub(crate) fn setsockopt(&self, level: u32, optname: u32, optval: &[u8]) -> Result<(), Errno> {
+        self.provider
+            .setsockopt(self.handle(), level, optname, optval)
+            .map_err(|err| match err {
+                BrokerOpError::InvalidValue => Errno::EOPNOTSUPP,
+                other => broker_err_to_errno(other),
+            })
+    }
+
+    pub(crate) fn getsockopt(
+        &self,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, Errno> {
+        self.provider
+            .getsockopt(self.handle(), level, optname, optlen)
+            .map_err(|err| match err {
+                BrokerOpError::InvalidValue => Errno::EOPNOTSUPP,
+                other => broker_err_to_errno(other),
+            })
     }
 
     pub(crate) fn try_read_now(&self, buf: &mut [u8]) -> Result<usize, Errno> {

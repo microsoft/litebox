@@ -55,6 +55,8 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
     Signalfd(Arc<TypedFd<super::signalfd::SignalfdSubsystem>>),
     Inotify(Arc<TypedFd<super::inotify::InotifySubsystem>>),
     BrokerInetListener(Arc<TypedFd<super::broker_inet_listener::BrokerInetListenerSubsystem>>),
+    BrokerInetDgram(Arc<TypedFd<super::broker_inet_dgram::BrokerInetDgramSubsystem>>),
+    BrokerInetRaw(Arc<TypedFd<super::broker_inet_raw::BrokerInetRawSubsystem>>),
     Epoll(EntryHandle<Platform, super::epoll::EpollSubsystem<FS>>),
     File(Arc<crate::FileFd<FS>>),
     Socket(Arc<super::net::SocketFd>),
@@ -102,6 +104,12 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             crate::RawFdRef::BrokerInetListener(fd) => {
                 Ok(EpollDescriptor::BrokerInetListener(Arc::clone(fd)))
             }
+            crate::RawFdRef::BrokerInetDgram(fd) => {
+                Ok(EpollDescriptor::BrokerInetDgram(Arc::clone(fd)))
+            }
+            crate::RawFdRef::BrokerInetRaw(fd) => {
+                Ok(EpollDescriptor::BrokerInetRaw(Arc::clone(fd)))
+            }
         })?
     }
 }
@@ -111,6 +119,8 @@ enum DescriptorRef<FS: ShimFS> {
     Signalfd(Weak<TypedFd<super::signalfd::SignalfdSubsystem>>),
     Inotify(Weak<TypedFd<super::inotify::InotifySubsystem>>),
     BrokerInetListener(Weak<TypedFd<super::broker_inet_listener::BrokerInetListenerSubsystem>>),
+    BrokerInetDgram(Weak<TypedFd<super::broker_inet_dgram::BrokerInetDgramSubsystem>>),
+    BrokerInetRaw(Weak<TypedFd<super::broker_inet_raw::BrokerInetRawSubsystem>>),
     Epoll(WeakEntryHandle<Platform, super::epoll::EpollSubsystem<FS>>),
     File(Weak<crate::FileFd<FS>>),
     Socket(Weak<super::net::SocketFd>),
@@ -132,6 +142,8 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             EpollDescriptor::BrokerInetListener(file) => {
                 Self::BrokerInetListener(Arc::downgrade(file))
             }
+            EpollDescriptor::BrokerInetDgram(file) => Self::BrokerInetDgram(Arc::downgrade(file)),
+            EpollDescriptor::BrokerInetRaw(file) => Self::BrokerInetRaw(Arc::downgrade(file)),
             EpollDescriptor::Epoll(file) => Self::Epoll(file.downgrade()),
             EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
@@ -153,6 +165,10 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerInetListener(listener) => {
                 listener.upgrade().map(EpollDescriptor::BrokerInetListener)
             }
+            DescriptorRef::BrokerInetDgram(dgram) => {
+                dgram.upgrade().map(EpollDescriptor::BrokerInetDgram)
+            }
+            DescriptorRef::BrokerInetRaw(raw) => raw.upgrade().map(EpollDescriptor::BrokerInetRaw),
             DescriptorRef::Epoll(epoll) => epoll.upgrade().map(EpollDescriptor::Epoll),
             DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
@@ -174,6 +190,8 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::Signalfd(_) => "Signalfd",
             DescriptorRef::Inotify(_) => "Inotify",
             DescriptorRef::BrokerInetListener(_) => "BrokerInetListener",
+            DescriptorRef::BrokerInetDgram(_) => "BrokerInetDgram",
+            DescriptorRef::BrokerInetRaw(_) => "BrokerInetRaw",
             DescriptorRef::Epoll(_) => "Epoll",
             DescriptorRef::File(_) => "File",
             DescriptorRef::Socket(_) => "Socket",
@@ -191,10 +209,12 @@ impl<FS: ShimFS> DescriptorRef<FS> {
         match self {
             DescriptorRef::Socket(socket) => socket.upgrade().is_some(),
             DescriptorRef::BrokerTcpConn(tcp_conn) => tcp_conn.upgrade().is_some(),
+            DescriptorRef::BrokerInetDgram(dgram) => dgram.upgrade().is_some(),
             DescriptorRef::Eventfd(_)
             | DescriptorRef::Signalfd(_)
             | DescriptorRef::Inotify(_)
             | DescriptorRef::BrokerInetListener(_)
+            | DescriptorRef::BrokerInetRaw(_)
             | DescriptorRef::Epoll(_)
             | DescriptorRef::File(_)
             | DescriptorRef::Pipe(_)
@@ -237,6 +257,14 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 Some(handle.with_entry(|entry| poll(entry)))
             }
             EpollDescriptor::BrokerInetListener(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
+            EpollDescriptor::BrokerInetDgram(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
+            EpollDescriptor::BrokerInetRaw(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
@@ -302,6 +330,8 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             EpollDescriptor::Signalfd(_) => false,
             EpollDescriptor::Inotify(_) => false,
             EpollDescriptor::BrokerInetListener(_) => false,
+            EpollDescriptor::BrokerInetDgram(_) => false,
+            EpollDescriptor::BrokerInetRaw(_) => false,
             EpollDescriptor::Eventfd(fd) => global
                 .litebox
                 .descriptor_table()
@@ -839,6 +869,8 @@ impl<FS: ShimFS> EpollFile<FS> {
                 EpollDescriptor::Signalfd(_) => "Signalfd",
                 EpollDescriptor::Inotify(_) => "Inotify",
                 EpollDescriptor::BrokerInetListener(_) => "BrokerInetListener",
+                EpollDescriptor::BrokerInetDgram(_) => "BrokerInetDgram",
+                EpollDescriptor::BrokerInetRaw(_) => "BrokerInetRaw",
                 EpollDescriptor::Epoll(_) => "Epoll",
                 EpollDescriptor::File(_) => "File",
                 EpollDescriptor::Socket(_) => "Socket",
@@ -933,6 +965,8 @@ impl EpollEntryKey {
             EpollDescriptor::Signalfd(file) => file.object_id(),
             EpollDescriptor::Inotify(file) => file.object_id(),
             EpollDescriptor::BrokerInetListener(file) => file.object_id(),
+            EpollDescriptor::BrokerInetDgram(file) => file.object_id(),
+            EpollDescriptor::BrokerInetRaw(file) => file.object_id(),
             EpollDescriptor::Epoll(file) => file.object_id(),
             EpollDescriptor::File(file) => file.object_id(),
             EpollDescriptor::Socket(socket_fd) => socket_fd.object_id(),

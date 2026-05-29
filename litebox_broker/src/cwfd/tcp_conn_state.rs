@@ -18,7 +18,7 @@ use litebox_common_linux::notification_frame::{
 };
 use litebox_common_linux::notification_ring::NotificationSender;
 
-use crate::cwfd::inet_listener_state::{AddressFamily, encode_sockaddr, family_from_u8};
+use crate::cwfd::inet_listener_state::{encode_sockaddr, family_from_u8, AddressFamily};
 use crate::state_registry::StateObject;
 use crate::subscription_list::{SubscribeError, SubscriptionList, UnsubscribeError};
 
@@ -49,12 +49,16 @@ pub struct TcpConnState {
 enum TcpConnInner {
     /// Created by InetTcpConnCreate; not yet connected.
     /// `getsockname` returns 0.0.0.0:0; `getpeername` returns ENOTCONN.
-    Unconnected { family: u8 },
+    Unconnected {
+        family: u8,
+        pending_sockopts: Vec<StoredSockOpt>,
+    },
     /// Mid-connect. The background thread runs connect_timeout off-thread;
     /// completion is reaped by a subsequent start_connect call.
     Connecting {
         family: u8,
         target: SocketAddr,
+        pending_sockopts: Vec<StoredSockOpt>,
         thread: JoinHandle<std::io::Result<TcpStream>>,
     },
     /// Normal connected state.
@@ -69,6 +73,13 @@ struct TcpConnConnected {
     peer_addr: Option<SocketAddr>,
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
+}
+
+#[derive(Clone, Debug)]
+struct StoredSockOpt {
+    level: libc::c_int,
+    optname: libc::c_int,
+    value: Vec<u8>,
 }
 
 impl TcpConnState {
@@ -86,7 +97,10 @@ impl TcpConnState {
 
     pub fn new_unconnected(family: u8) -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(TcpConnInner::Unconnected { family }),
+            inner: Mutex::new(TcpConnInner::Unconnected {
+                family,
+                pending_sockopts: Vec::new(),
+            }),
             subject: SubscriptionList::new(),
         })
     }
@@ -116,9 +130,13 @@ impl TcpConnState {
 
         let mut inner = self.inner.lock().expect("TcpConnState inner poisoned");
         match &*inner {
-            TcpConnInner::Unconnected { family } => {
+            TcpConnInner::Unconnected {
+                family,
+                pending_sockopts,
+            } => {
                 validate_target_family(*family, target)?;
                 let family = *family;
+                let pending_sockopts = pending_sockopts.clone();
                 let weak = Arc::downgrade(self);
                 let thread = std::thread::Builder::new()
                     .name("litebox-tcp-conn-connect".into())
@@ -137,6 +155,7 @@ impl TcpConnState {
                 *inner = TcpConnInner::Connecting {
                     family,
                     target,
+                    pending_sockopts,
                     thread,
                 };
                 Err(TcpConnError::WouldBlock)
@@ -148,7 +167,7 @@ impl TcpConnState {
 
     pub fn getsockname(&self) -> Result<[u8; SOCKADDR_WIRE_LEN], TcpConnError> {
         match &*self.inner.lock().expect("TcpConnState inner poisoned") {
-            TcpConnInner::Unconnected { family } | TcpConnInner::Connecting { family, .. } => {
+            TcpConnInner::Unconnected { family, .. } | TcpConnInner::Connecting { family, .. } => {
                 encode_unspecified_sockaddr(*family)
             }
             TcpConnInner::Connected(connected) => encode_sockaddr(
@@ -300,6 +319,67 @@ impl TcpConnState {
         Ok(())
     }
 
+    pub fn setsockopt(&self, level: u32, optname: u32, optval: &[u8]) -> Result<(), TcpConnError> {
+        let level = level
+            .try_into()
+            .map_err(|_| TcpConnError::Errno(libc::EINVAL))?;
+        let optname = optname
+            .try_into()
+            .map_err(|_| TcpConnError::Errno(libc::EINVAL))?;
+        ensure_supported_sockopt(level, optname, false)?;
+        let mut inner = self.inner.lock().expect("TcpConnState inner poisoned");
+        match &mut *inner {
+            TcpConnInner::Unconnected {
+                pending_sockopts, ..
+            } => {
+                upsert_pending_sockopt(pending_sockopts, level, optname, optval);
+                Ok(())
+            }
+            TcpConnInner::Connecting { .. } => Err(TcpConnError::WouldBlock),
+            TcpConnInner::Connected(connected) => {
+                let stream = connected
+                    .stream
+                    .lock()
+                    .expect("TcpConnState stream poisoned");
+                apply_setsockopt(stream.as_raw_fd(), level, optname, optval)
+            }
+        }
+    }
+
+    pub fn getsockopt(
+        &self,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, TcpConnError> {
+        let level = level
+            .try_into()
+            .map_err(|_| TcpConnError::Errno(libc::EINVAL))?;
+        let optname = optname
+            .try_into()
+            .map_err(|_| TcpConnError::Errno(libc::EINVAL))?;
+        ensure_supported_sockopt(level, optname, true)?;
+        let inner = self.inner.lock().expect("TcpConnState inner poisoned");
+        match &*inner {
+            TcpConnInner::Unconnected {
+                pending_sockopts, ..
+            } => pending_sockopts
+                .iter()
+                .rev()
+                .find(|opt| opt.level == level && opt.optname == optname)
+                .map(|opt| opt.value.clone())
+                .ok_or(TcpConnError::Errno(libc::ENOTCONN)),
+            TcpConnInner::Connecting { .. } => Err(TcpConnError::WouldBlock),
+            TcpConnInner::Connected(connected) => {
+                let stream = connected
+                    .stream
+                    .lock()
+                    .expect("TcpConnState stream poisoned");
+                read_getsockopt(stream.as_raw_fd(), level, optname, optlen)
+            }
+        }
+    }
+
     pub fn current_events(&self) -> u32 {
         let inner = self.inner.lock().expect("TcpConnState inner poisoned");
         match &*inner {
@@ -337,15 +417,25 @@ impl TcpConnState {
                 | TcpConnInner::Connecting { .. }
                 | TcpConnInner::Connected(_) => return None,
             }
-            let previous = std::mem::replace(&mut *inner, TcpConnInner::Unconnected { family: 0 });
+            let previous = std::mem::replace(
+                &mut *inner,
+                TcpConnInner::Unconnected {
+                    family: 0,
+                    pending_sockopts: Vec::new(),
+                },
+            );
             match previous {
                 TcpConnInner::Connecting {
                     family,
                     target,
+                    pending_sockopts,
                     thread,
                 } => {
-                    *inner = TcpConnInner::Unconnected { family };
-                    (family, target, thread)
+                    *inner = TcpConnInner::Unconnected {
+                        family,
+                        pending_sockopts: pending_sockopts.clone(),
+                    };
+                    (family, target, pending_sockopts, thread)
                 }
                 TcpConnInner::Unconnected { .. } | TcpConnInner::Connected(_) => {
                     unreachable!("non-connecting TcpConnInner after Connecting match")
@@ -353,9 +443,22 @@ impl TcpConnState {
             }
         };
 
-        let (family, _target, thread) = pending;
+        let (family, _target, pending_sockopts, thread) = pending;
         match thread.join() {
             Ok(Ok(stream)) => {
+                for opt in &pending_sockopts {
+                    if let Err(err) =
+                        apply_setsockopt(stream.as_raw_fd(), opt.level, opt.optname, &opt.value)
+                    {
+                        *self.inner.lock().expect("TcpConnState inner poisoned") =
+                            TcpConnInner::Unconnected {
+                                family,
+                                pending_sockopts,
+                            };
+                        self.subject.notify(NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR);
+                        return Some(Err(err));
+                    }
+                }
                 let (connected, poll_stream) = TcpConnConnected::new(stream);
                 *self.inner.lock().expect("TcpConnState inner poisoned") =
                     TcpConnInner::Connected(connected);
@@ -367,13 +470,19 @@ impl TcpConnState {
             }
             Ok(Err(err)) => {
                 *self.inner.lock().expect("TcpConnState inner poisoned") =
-                    TcpConnInner::Unconnected { family };
+                    TcpConnInner::Unconnected {
+                        family,
+                        pending_sockopts,
+                    };
                 self.subject.notify(NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR);
                 Some(Err(io_error_to_tcp_error(err)))
             }
             Err(_) => {
                 *self.inner.lock().expect("TcpConnState inner poisoned") =
-                    TcpConnInner::Unconnected { family };
+                    TcpConnInner::Unconnected {
+                        family,
+                        pending_sockopts,
+                    };
                 self.subject.notify(NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR);
                 Some(Err(TcpConnError::Io))
             }
@@ -436,6 +545,94 @@ impl Drop for TcpConnState {
         self.subject
             .notify(NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR);
     }
+}
+
+fn ensure_supported_sockopt(
+    level: libc::c_int,
+    optname: libc::c_int,
+    is_get: bool,
+) -> Result<(), TcpConnError> {
+    match (level, optname, is_get) {
+        (libc::SOL_SOCKET, libc::SO_REUSEADDR, _)
+        | (libc::SOL_SOCKET, libc::SO_REUSEPORT, _)
+        | (libc::SOL_SOCKET, libc::SO_KEEPALIVE, _)
+        | (libc::SOL_SOCKET, libc::SO_SNDBUF, _)
+        | (libc::SOL_SOCKET, libc::SO_RCVBUF, _)
+        | (libc::SOL_SOCKET, libc::SO_LINGER, _)
+        | (libc::SOL_SOCKET, libc::SO_ERROR, true)
+        | (libc::IPPROTO_TCP, libc::TCP_NODELAY, _)
+        | (libc::IPPROTO_IP, libc::IP_TTL, _) => Ok(()),
+        (libc::SOL_SOCKET, libc::SO_ERROR, false) => Err(TcpConnError::Errno(libc::ENOPROTOOPT)),
+        _ => Err(TcpConnError::Errno(libc::EOPNOTSUPP)),
+    }
+}
+
+fn upsert_pending_sockopt(
+    pending: &mut Vec<StoredSockOpt>,
+    level: libc::c_int,
+    optname: libc::c_int,
+    optval: &[u8],
+) {
+    if let Some(existing) = pending
+        .iter_mut()
+        .find(|opt| opt.level == level && opt.optname == optname)
+    {
+        existing.value.clear();
+        existing.value.extend_from_slice(optval);
+    } else {
+        pending.push(StoredSockOpt {
+            level,
+            optname,
+            value: optval.to_vec(),
+        });
+    }
+}
+
+fn apply_setsockopt(
+    fd: libc::c_int,
+    level: libc::c_int,
+    optname: libc::c_int,
+    optval: &[u8],
+) -> Result<(), TcpConnError> {
+    // SAFETY: `fd` is a live socket fd and `optval` is a valid readable buffer.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            optval.as_ptr().cast(),
+            optval
+                .len()
+                .try_into()
+                .map_err(|_| TcpConnError::Errno(libc::EINVAL))?,
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(last_errno()) }
+}
+
+fn read_getsockopt(
+    fd: libc::c_int,
+    level: libc::c_int,
+    optname: libc::c_int,
+    optlen: u32,
+) -> Result<Vec<u8>, TcpConnError> {
+    let mut buf = vec![0u8; optlen as usize];
+    let mut len: libc::socklen_t = optlen;
+    // SAFETY: `fd` is a live socket fd; `buf` and `len` point to writable storage.
+    let rc = unsafe { libc::getsockopt(fd, level, optname, buf.as_mut_ptr().cast(), &raw mut len) };
+    if rc == 0 {
+        buf.truncate(len as usize);
+        Ok(buf)
+    } else {
+        Err(last_errno())
+    }
+}
+
+fn last_errno() -> TcpConnError {
+    let errno = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO);
+    TcpConnError::Errno(errno)
 }
 
 impl StateObject for TcpConnState {
@@ -547,7 +744,7 @@ mod tests {
         }
     }
 
-    fn read_wait(state: &TcpConnState, max_len: usize) -> Vec<u8> {
+    fn read_wait(state: &Arc<TcpConnState>, max_len: usize) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match state.read(max_len) {

@@ -207,8 +207,7 @@ impl BrokerPtyFd<Platform> {
                     Ok(bytes) => {
                         let n = bytes.len().min(buf.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
-                        if n == 0 {
-                        }
+                        if n == 0 {}
                         Ok(n)
                     }
                     Err(BrokerOpError::WouldBlock) => {
@@ -264,6 +263,9 @@ impl BrokerPtyFd<Platform> {
             BrokerOpError::InvalidValue => Errno::EINVAL,
             BrokerOpError::UnknownHandle => Errno::ENOTTY,
             BrokerOpError::WouldBlock => Errno::EAGAIN,
+            BrokerOpError::PermissionDenied | BrokerOpError::ProtocolNotSupported => {
+                broker_err_to_errno(err)
+            }
             BrokerOpError::Io => broker_err_to_errno(err),
         }
     }

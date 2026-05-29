@@ -691,6 +691,35 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 );
                 Ok(())
             }
+            BrokerHandleKind::InetDgram => {
+                let provider =
+                    syscalls::broker_inet_dgram::broker_inet_dgram_provider().ok_or(())?;
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(handle_id);
+                let dgram = syscalls::broker_inet_dgram::BrokerInetDgramFd::<Platform>::new(
+                    provider,
+                    handle_id,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<
+                    syscalls::broker_inet_dgram::BrokerInetDgramSubsystem,
+                > = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(dgram);
+                let mut rds = files.raw_descriptor_store.write();
+                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+                debug_assert!(
+                    ok,
+                    "install_broker_bridge_fd(inet_dgram): slot {guest_fd} still occupied"
+                );
+                Ok(())
+            }
             BrokerHandleKind::InetListener => {
                 let provider =
                     syscalls::broker_inet_listener::broker_inet_listener_provider().ok_or(())?;
@@ -2072,6 +2101,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         BrokerHandleKind::UnixSocket => None,
                         BrokerHandleKind::TcpConn => None,
                         BrokerHandleKind::InetListener => None,
+                        BrokerHandleKind::InetDgram => None,
                         // `Signalfd` is restored by its dedicated FdClass branch below.
                         BrokerHandleKind::Signalfd => todo!(
                             "fork-snapshot restore for BrokerHandleKind::Signalfd \
@@ -2923,6 +2953,14 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             drop(rds);
             return Ok(f(RawFdRef::BrokerInetListener(&fd)));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(f(RawFdRef::BrokerInetDgram(&fd)));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(f(RawFdRef::BrokerInetRaw(&fd)));
+        }
         Err(Errno::EBADF)
     }
 }
@@ -2950,6 +2988,8 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     BrokerInetListener(
         &'a Arc<TypedFd<syscalls::broker_inet_listener::BrokerInetListenerSubsystem>>,
     ),
+    BrokerInetDgram(&'a Arc<TypedFd<syscalls::broker_inet_dgram::BrokerInetDgramSubsystem>>),
+    BrokerInetRaw(&'a Arc<TypedFd<syscalls::broker_inet_raw::BrokerInetRawSubsystem>>),
 }
 
 /// Planned worker-exec fd-bridge decision for a `RawFdRef`.
@@ -3047,6 +3087,12 @@ impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
             }
             RawFdRef::BrokerInetListener(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::BrokerInetDgram(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::BrokerInetRaw(_fd) => {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
             }
         }
@@ -3301,6 +3347,12 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Inotify(_fd) => alloc::format!("raw={raw_fd} inotify"),
                 crate::RawFdRef::BrokerInetListener(_fd) => {
                     alloc::format!("raw={raw_fd} broker-inet-listener")
+                }
+                crate::RawFdRef::BrokerInetDgram(_fd) => {
+                    alloc::format!("raw={raw_fd} broker-inet-dgram")
+                }
+                crate::RawFdRef::BrokerInetRaw(_fd) => {
+                    alloc::format!("raw={raw_fd} broker-inet-raw")
                 }
             })
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))

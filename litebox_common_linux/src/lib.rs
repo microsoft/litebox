@@ -30,10 +30,11 @@ pub mod vmap;
 // `litebox_common_linux::broker_eventfd_provider::*` etc. import
 // paths working.
 pub use cwfd::{
-    broker_eventfd_provider, broker_inet_listener_provider, broker_inotify_provider,
-    broker_pgrp_signal_provider, broker_pidfd_provider, broker_pipe_provider, broker_pty_provider,
-    broker_signalfd_provider, broker_socketpair_provider, broker_tcp_conn_provider,
-    fd_token_protocol, fd_transfer_frame, guest_pid_provider, notification_frame,
+    broker_eventfd_provider, broker_inet_listener_provider, broker_inet_raw_provider,
+    broker_inotify_provider, broker_pgrp_signal_provider, broker_pidfd_provider,
+    broker_pipe_provider, broker_pty_provider, broker_signalfd_provider,
+    broker_socketpair_provider, broker_tcp_conn_provider, fd_token_protocol, fd_transfer_frame,
+    guest_pid_provider, notification_frame,
 };
 
 #[cfg(feature = "std")]
@@ -886,7 +887,7 @@ pub struct Linger {
 /// IP Protocols
 #[repr(u8)]
 #[non_exhaustive]
-#[derive(IntEnum, Debug)]
+#[derive(IntEnum, Debug, Clone, Copy)]
 pub enum IPProtocol {
     Default = 0,
     ICMP = 1,

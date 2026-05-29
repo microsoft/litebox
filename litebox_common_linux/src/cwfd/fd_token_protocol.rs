@@ -112,6 +112,7 @@ pub const BODY_MAX: u32 = 65536;
 /// | `0x79`–`0x7C`    | TCP conn data ops (BrokerTcpConn) |
 /// | `0x48`–`0x4C`    | Inet listener state (Phase A) |
 /// | `0x34`–`0x38`    | Inet TCP conn lifecycle/name ops |
+/// | `0x3C`–`0x3F`    | Inet raw socket state (Phase D) |
 ///
 /// Within a kind's range, follow the eventfd template:
 /// `0xN0` = create, `0xN1` = read-like primary op, `0xN2` = write-like
@@ -148,6 +149,10 @@ pub enum Opcode {
     ReadSocketPair = 0x31,
     WriteSocketPair = 0x32,
     ShutdownSocketPairWrite = 0x33,
+    InetRawCreate = 0x3C,
+    InetRawSendTo = 0x3D,
+    InetRawRecvFrom = 0x3E,
+    InetRawQueryEvents = 0x3F,
     InetTcpConnCreate = 0x34,
     InetTcpConnConnect = 0x35,
     InetTcpConnQueryEvents = 0x36,
@@ -170,6 +175,17 @@ pub enum Opcode {
     QueryEvents = 0x16,
     CreatePidfd = 0x20,
     PidfdExited = 0x21,
+    InetDgramCreate = 0x22,
+    InetDgramBind = 0x23,
+    InetDgramConnect = 0x24,
+    InetDgramSendTo = 0x25,
+    InetDgramRecvFrom = 0x26,
+    InetDgramShutdown = 0x27,
+    InetDgramGetSockName = 0x28,
+    InetDgramGetPeerName = 0x29,
+    InetDgramSetSockOpt = 0x2A,
+    InetDgramGetSockOpt = 0x2B,
+    InetDgramQueryEvents = 0x2C,
     /// Broker-hosted process registration. Allocates a globally-
     /// unique guest pid in the broker's `process_registry`. The
     /// response carries the new pid as a `StateHandle` id (low 32
@@ -201,6 +217,8 @@ pub enum Opcode {
     WriteTcpConn = 0x7A,
     ShutdownTcpConn = 0x7B,
     PollTcpConnEvents = 0x7C,
+    InetTcpConnSetSockOpt = 0x7E,
+    InetTcpConnGetSockOpt = 0x7F,
     #[cfg(debug_assertions)]
     DebugQueryStateObject = 0x7D,
 
@@ -232,6 +250,10 @@ pub enum Opcode {
     ReadSocketPairResponse = 0xB1,
     WriteSocketPairResponse = 0xB2,
     ShutdownSocketPairWriteResponse = 0xB3,
+    InetRawCreateResponse = 0xBC,
+    InetRawSendToResponse = 0xBD,
+    InetRawRecvFromResponse = 0xBE,
+    InetRawQueryEventsResponse = 0xBF,
     InetTcpConnCreateResponse = 0xB4,
     InetTcpConnConnectResponse = 0xB5,
     InetTcpConnQueryEventsResponse = 0xB6,
@@ -249,6 +271,17 @@ pub enum Opcode {
     QueryEventsResponse = 0x96,
     CreatePidfdResponse = 0xA0,
     PidfdExitedResponse = 0xA1,
+    InetDgramCreateResponse = 0xA2,
+    InetDgramBindResponse = 0xA3,
+    InetDgramConnectResponse = 0xA4,
+    InetDgramSendToResponse = 0xA5,
+    InetDgramRecvFromResponse = 0xA6,
+    InetDgramShutdownResponse = 0xA7,
+    InetDgramGetSockNameResponse = 0xA8,
+    InetDgramGetPeerNameResponse = 0xA9,
+    InetDgramSetSockOptResponse = 0xAA,
+    InetDgramGetSockOptResponse = 0xAB,
+    InetDgramQueryEventsResponse = 0xAC,
     RegisterProcessResponse = 0xF0,
     SubscribeProcessExitResponse = 0xF1,
     MarkProcessExitedResponse = 0xF2,
@@ -263,6 +296,8 @@ pub enum Opcode {
     WriteTcpConnResponse = 0xFA,
     ShutdownTcpConnResponse = 0xFB,
     PollTcpConnEventsResponse = 0xFC,
+    InetTcpConnSetSockOptResponse = 0xFE,
+    InetTcpConnGetSockOptResponse = 0xFF,
     #[cfg(debug_assertions)]
     DebugQueryStateObjectResponse = 0xFD,
 }
@@ -276,6 +311,10 @@ pub mod opcode_ranges {
     /// Pidfd state (P2.B): create / exit-query / subscribe.
     pub const PIDFD_BASE: u8 = 0x20;
     pub const PIDFD_RESPONSE_BASE: u8 = 0xA0;
+
+    /// Inet UDP datagram state: create / bind / connect / datagram I/O / socket options.
+    pub const INET_DGRAM_BASE: u8 = 0x22;
+    pub const INET_DGRAM_RESPONSE_BASE: u8 = 0xA2;
 
     /// Socket-pair state (P2.A), with 0x34-0x38 used by Inet TCP lifecycle/name ops.
     pub const UNIX_SOCKET_BASE: u8 = 0x30;
@@ -309,6 +348,10 @@ pub mod opcode_ranges {
     /// Inet TCP lifecycle/name ops: create / connect / query-events / getsockname / getpeername.
     pub const INET_TCP_CONN_BASE: u8 = 0x34;
     pub const INET_TCP_CONN_RESPONSE_BASE: u8 = 0xB4;
+
+    /// Inet raw socket state: create / sendto / recvfrom / query-events.
+    pub const INET_RAW_BASE: u8 = 0x3C;
+    pub const INET_RAW_RESPONSE_BASE: u8 = 0xBC;
 }
 
 /// Endpoint side for a broker-hosted PTY handle.
@@ -397,6 +440,10 @@ impl Opcode {
             Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
             Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
             Opcode::ShutdownSocketPairWrite => Some(Opcode::ShutdownSocketPairWriteResponse),
+            Opcode::InetRawCreate => Some(Opcode::InetRawCreateResponse),
+            Opcode::InetRawSendTo => Some(Opcode::InetRawSendToResponse),
+            Opcode::InetRawRecvFrom => Some(Opcode::InetRawRecvFromResponse),
+            Opcode::InetRawQueryEvents => Some(Opcode::InetRawQueryEventsResponse),
             Opcode::InetTcpConnCreate => Some(Opcode::InetTcpConnCreateResponse),
             Opcode::InetTcpConnConnect => Some(Opcode::InetTcpConnConnectResponse),
             Opcode::InetTcpConnQueryEvents => Some(Opcode::InetTcpConnQueryEventsResponse),
@@ -413,6 +460,17 @@ impl Opcode {
             Opcode::QueryEvents => Some(Opcode::QueryEventsResponse),
             Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
             Opcode::PidfdExited => Some(Opcode::PidfdExitedResponse),
+            Opcode::InetDgramCreate => Some(Opcode::InetDgramCreateResponse),
+            Opcode::InetDgramBind => Some(Opcode::InetDgramBindResponse),
+            Opcode::InetDgramConnect => Some(Opcode::InetDgramConnectResponse),
+            Opcode::InetDgramSendTo => Some(Opcode::InetDgramSendToResponse),
+            Opcode::InetDgramRecvFrom => Some(Opcode::InetDgramRecvFromResponse),
+            Opcode::InetDgramShutdown => Some(Opcode::InetDgramShutdownResponse),
+            Opcode::InetDgramGetSockName => Some(Opcode::InetDgramGetSockNameResponse),
+            Opcode::InetDgramGetPeerName => Some(Opcode::InetDgramGetPeerNameResponse),
+            Opcode::InetDgramSetSockOpt => Some(Opcode::InetDgramSetSockOptResponse),
+            Opcode::InetDgramGetSockOpt => Some(Opcode::InetDgramGetSockOptResponse),
+            Opcode::InetDgramQueryEvents => Some(Opcode::InetDgramQueryEventsResponse),
             Opcode::RegisterProcess => Some(Opcode::RegisterProcessResponse),
             Opcode::SubscribeProcessExit => Some(Opcode::SubscribeProcessExitResponse),
             Opcode::MarkProcessExited => Some(Opcode::MarkProcessExitedResponse),
@@ -426,6 +484,8 @@ impl Opcode {
             Opcode::WriteTcpConn => Some(Opcode::WriteTcpConnResponse),
             Opcode::ShutdownTcpConn => Some(Opcode::ShutdownTcpConnResponse),
             Opcode::PollTcpConnEvents => Some(Opcode::PollTcpConnEventsResponse),
+            Opcode::InetTcpConnSetSockOpt => Some(Opcode::InetTcpConnSetSockOptResponse),
+            Opcode::InetTcpConnGetSockOpt => Some(Opcode::InetTcpConnGetSockOptResponse),
             #[cfg(debug_assertions)]
             Opcode::DebugQueryStateObject => Some(Opcode::DebugQueryStateObjectResponse),
             _ => None,
@@ -468,6 +528,10 @@ impl Opcode {
                 | Opcode::ReadSocketPair
                 | Opcode::WriteSocketPair
                 | Opcode::ShutdownSocketPairWrite
+                | Opcode::InetRawCreate
+                | Opcode::InetRawSendTo
+                | Opcode::InetRawRecvFrom
+                | Opcode::InetRawQueryEvents
                 | Opcode::InetTcpConnCreate
                 | Opcode::InetTcpConnConnect
                 | Opcode::InetTcpConnQueryEvents
@@ -484,6 +548,17 @@ impl Opcode {
                 | Opcode::QueryEvents
                 | Opcode::CreatePidfd
                 | Opcode::PidfdExited
+                | Opcode::InetDgramCreate
+                | Opcode::InetDgramBind
+                | Opcode::InetDgramConnect
+                | Opcode::InetDgramSendTo
+                | Opcode::InetDgramRecvFrom
+                | Opcode::InetDgramShutdown
+                | Opcode::InetDgramGetSockName
+                | Opcode::InetDgramGetPeerName
+                | Opcode::InetDgramSetSockOpt
+                | Opcode::InetDgramGetSockOpt
+                | Opcode::InetDgramQueryEvents
                 | Opcode::RegisterProcess
                 | Opcode::SubscribeProcessExit
                 | Opcode::MarkProcessExited
@@ -497,6 +572,8 @@ impl Opcode {
                 | Opcode::WriteTcpConn
                 | Opcode::ShutdownTcpConn
                 | Opcode::PollTcpConnEvents
+                | Opcode::InetTcpConnSetSockOpt
+                | Opcode::InetTcpConnGetSockOpt
         )
     }
 
@@ -550,6 +627,10 @@ impl TryFrom<u8> for Opcode {
             0x31 => Ok(Opcode::ReadSocketPair),
             0x32 => Ok(Opcode::WriteSocketPair),
             0x33 => Ok(Opcode::ShutdownSocketPairWrite),
+            0x3C => Ok(Opcode::InetRawCreate),
+            0x3D => Ok(Opcode::InetRawSendTo),
+            0x3E => Ok(Opcode::InetRawRecvFrom),
+            0x3F => Ok(Opcode::InetRawQueryEvents),
             0x34 => Ok(Opcode::InetTcpConnCreate),
             0x35 => Ok(Opcode::InetTcpConnConnect),
             0x36 => Ok(Opcode::InetTcpConnQueryEvents),
@@ -566,6 +647,17 @@ impl TryFrom<u8> for Opcode {
             0x16 => Ok(Opcode::QueryEvents),
             0x20 => Ok(Opcode::CreatePidfd),
             0x21 => Ok(Opcode::PidfdExited),
+            0x22 => Ok(Opcode::InetDgramCreate),
+            0x23 => Ok(Opcode::InetDgramBind),
+            0x24 => Ok(Opcode::InetDgramConnect),
+            0x25 => Ok(Opcode::InetDgramSendTo),
+            0x26 => Ok(Opcode::InetDgramRecvFrom),
+            0x27 => Ok(Opcode::InetDgramShutdown),
+            0x28 => Ok(Opcode::InetDgramGetSockName),
+            0x29 => Ok(Opcode::InetDgramGetPeerName),
+            0x2A => Ok(Opcode::InetDgramSetSockOpt),
+            0x2B => Ok(Opcode::InetDgramGetSockOpt),
+            0x2C => Ok(Opcode::InetDgramQueryEvents),
             0x70 => Ok(Opcode::RegisterProcess),
             0x71 => Ok(Opcode::SubscribeProcessExit),
             0x72 => Ok(Opcode::MarkProcessExited),
@@ -579,6 +671,8 @@ impl TryFrom<u8> for Opcode {
             0x7A => Ok(Opcode::WriteTcpConn),
             0x7B => Ok(Opcode::ShutdownTcpConn),
             0x7C => Ok(Opcode::PollTcpConnEvents),
+            0x7E => Ok(Opcode::InetTcpConnSetSockOpt),
+            0x7F => Ok(Opcode::InetTcpConnGetSockOpt),
             #[cfg(debug_assertions)]
             0x7D => Ok(Opcode::DebugQueryStateObject),
             0x81 => Ok(Opcode::RegisterResponse),
@@ -609,6 +703,10 @@ impl TryFrom<u8> for Opcode {
             0xB1 => Ok(Opcode::ReadSocketPairResponse),
             0xB2 => Ok(Opcode::WriteSocketPairResponse),
             0xB3 => Ok(Opcode::ShutdownSocketPairWriteResponse),
+            0xBC => Ok(Opcode::InetRawCreateResponse),
+            0xBD => Ok(Opcode::InetRawSendToResponse),
+            0xBE => Ok(Opcode::InetRawRecvFromResponse),
+            0xBF => Ok(Opcode::InetRawQueryEventsResponse),
             0xB4 => Ok(Opcode::InetTcpConnCreateResponse),
             0xB5 => Ok(Opcode::InetTcpConnConnectResponse),
             0xB6 => Ok(Opcode::InetTcpConnQueryEventsResponse),
@@ -625,6 +723,17 @@ impl TryFrom<u8> for Opcode {
             0x96 => Ok(Opcode::QueryEventsResponse),
             0xA0 => Ok(Opcode::CreatePidfdResponse),
             0xA1 => Ok(Opcode::PidfdExitedResponse),
+            0xA2 => Ok(Opcode::InetDgramCreateResponse),
+            0xA3 => Ok(Opcode::InetDgramBindResponse),
+            0xA4 => Ok(Opcode::InetDgramConnectResponse),
+            0xA5 => Ok(Opcode::InetDgramSendToResponse),
+            0xA6 => Ok(Opcode::InetDgramRecvFromResponse),
+            0xA7 => Ok(Opcode::InetDgramShutdownResponse),
+            0xA8 => Ok(Opcode::InetDgramGetSockNameResponse),
+            0xA9 => Ok(Opcode::InetDgramGetPeerNameResponse),
+            0xAA => Ok(Opcode::InetDgramSetSockOptResponse),
+            0xAB => Ok(Opcode::InetDgramGetSockOptResponse),
+            0xAC => Ok(Opcode::InetDgramQueryEventsResponse),
             0xF0 => Ok(Opcode::RegisterProcessResponse),
             0xF1 => Ok(Opcode::SubscribeProcessExitResponse),
             0xF2 => Ok(Opcode::MarkProcessExitedResponse),
@@ -638,6 +747,8 @@ impl TryFrom<u8> for Opcode {
             0xFA => Ok(Opcode::WriteTcpConnResponse),
             0xFB => Ok(Opcode::ShutdownTcpConnResponse),
             0xFC => Ok(Opcode::PollTcpConnEventsResponse),
+            0xFE => Ok(Opcode::InetTcpConnSetSockOptResponse),
+            0xFF => Ok(Opcode::InetTcpConnGetSockOptResponse),
             #[cfg(debug_assertions)]
             0xFD => Ok(Opcode::DebugQueryStateObjectResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
@@ -669,6 +780,10 @@ pub enum StatusCode {
     /// The worker hasn't yet registered a notification ring; the
     /// requested op requires one (e.g. SubscribeEventfd).
     NoNotificationRing = 0x09,
+    /// Operation is blocked by broker policy or host permissions.
+    PermissionDenied = 0x0A,
+    /// Requested protocol is not supported by this broker subsystem.
+    ProtocolNotSupported = 0x0B,
 
     /// Generic protocol violation.
     Protocol = 0x10,
@@ -691,6 +806,8 @@ impl TryFrom<u8> for StatusCode {
             0x07 => Ok(StatusCode::UnknownSubscription),
             0x08 => Ok(StatusCode::SubsystemMismatch),
             0x09 => Ok(StatusCode::NoNotificationRing),
+            0x0A => Ok(StatusCode::PermissionDenied),
+            0x0B => Ok(StatusCode::ProtocolNotSupported),
             0x10 => Ok(StatusCode::Protocol),
             0x11 => Ok(StatusCode::Internal),
             other => Err(ProtocolError::UnknownStatus { status: other }),
@@ -2576,6 +2693,219 @@ pub fn build_shutdown_socketpair_write_response_ok() -> OwnedFrame {
 }
 
 // =====================================================================
+// BrokerInetRaw wire format.
+// =====================================================================
+
+/// Body for [`Opcode::InetRawCreate`]: family (u8: 0=v4, 1=v6), protocol (u8), reserved (6 bytes).
+pub fn build_inet_raw_create_request(family: u8, protocol: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.push(family);
+    body.push(protocol);
+    body.extend_from_slice(&[0u8; 6]);
+    OwnedFrame {
+        opcode: Opcode::InetRawCreate,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_raw_create_body(body: &[u8]) -> Result<(u8, u8), ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawCreate,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[2..8].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((body[0], body[1]))
+}
+
+pub fn build_inet_raw_create_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetRawCreateResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_raw_create_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetRawCreateResponse)
+}
+
+/// Body for [`Opcode::InetRawSendTo`]: handle id + 28-byte sockaddr + payload length/reserved + payload.
+pub fn build_inet_raw_sendto_request(handle_id: u64, sockaddr: &[u8], bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(44 + bytes.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    let mut addr = [0u8; 28];
+    let n = core::cmp::min(sockaddr.len(), addr.len());
+    addr[..n].copy_from_slice(&sockaddr[..n]);
+    body.extend_from_slice(&addr);
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::InetRawSendTo,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_raw_sendto_body(body: &[u8]) -> Result<(u64, [u8; 28], Vec<u8>), ProtocolError> {
+    if body.len() < 44 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawSendTo,
+            got: body.len(),
+            want: 44,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(&body[8..36]);
+    let len = u32::from_le_bytes(body[36..40].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[40..44].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 44 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawSendTo,
+            got: body.len(),
+            want: 44 + len,
+        });
+    }
+    Ok((handle, sockaddr, body[44..].to_vec()))
+}
+
+pub fn build_inet_raw_sendto_response_ok(written: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetRawSendToResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: written.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_raw_sendto_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawSendToResponse,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
+}
+
+/// Body for [`Opcode::InetRawRecvFrom`]: handle id + max_len.
+pub fn build_inet_raw_recvfrom_request(handle_id: u64, max_len: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InetRawRecvFrom,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_raw_recvfrom_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawRecvFrom,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+    ))
+}
+
+pub fn build_inet_raw_recvfrom_response_ok(sockaddr: &[u8; 28], bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(36 + bytes.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(sockaddr);
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::InetRawRecvFromResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_raw_recvfrom_response_ok(
+    body: &[u8],
+) -> Result<([u8; 28], Vec<u8>), ProtocolError> {
+    if body.len() < 36 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawRecvFromResponse,
+            got: body.len(),
+            want: 36,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 36 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawRecvFromResponse,
+            got: body.len(),
+            want: 36 + len,
+        });
+    }
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(&body[8..36]);
+    Ok((sockaddr, body[36..].to_vec()))
+}
+
+pub fn build_inet_raw_query_events_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetRawQueryEvents,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_raw_query_events_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetRawQueryEvents)
+}
+
+pub fn build_inet_raw_query_events_response_ok(events: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetRawQueryEventsResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: events.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_raw_query_events_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawQueryEventsResponse,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
+}
+
+// =====================================================================
 // BrokerTcpConn wire format.
 // =====================================================================
 
@@ -2768,6 +3098,144 @@ fn parse_inet_tcp_sockaddr_response(
     Ok(sockaddr)
 }
 
+pub fn build_inet_tcp_conn_setsockopt_request(
+    handle_id: u64,
+    level: u32,
+    optname: u32,
+    optval: &[u8],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24 + optval.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&level.to_le_bytes());
+    body.extend_from_slice(&optname.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(optval.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(optval);
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnSetSockOpt,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_tcp_conn_setsockopt_body(
+    body: &[u8],
+) -> Result<(u64, u32, u32, Vec<u8>), ProtocolError> {
+    if body.len() < 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnSetSockOpt,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let level = u32::from_le_bytes(body[8..12].try_into().unwrap());
+    let optname = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    let len = u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[20..24].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 24 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnSetSockOpt,
+            got: body.len(),
+            want: 24 + len,
+        });
+    }
+    Ok((handle, level, optname, body[24..].to_vec()))
+}
+
+pub fn build_inet_tcp_conn_setsockopt_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnSetSockOptResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_inet_tcp_conn_getsockopt_request(
+    handle_id: u64,
+    level: u32,
+    optname: u32,
+    optlen: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&level.to_le_bytes());
+    body.extend_from_slice(&optname.to_le_bytes());
+    body.extend_from_slice(&optlen.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnGetSockOpt,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_tcp_conn_getsockopt_body(
+    body: &[u8],
+) -> Result<(u64, u32, u32, u32), ProtocolError> {
+    if body.len() != 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnGetSockOpt,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    let reserved = u32::from_le_bytes(body[20..24].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+        u32::from_le_bytes(body[12..16].try_into().unwrap()),
+        u32::from_le_bytes(body[16..20].try_into().unwrap()),
+    ))
+}
+
+pub fn build_inet_tcp_conn_getsockopt_response_ok(bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + bytes.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnGetSockOptResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_tcp_conn_getsockopt_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnGetSockOptResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnGetSockOptResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
+}
+
 pub fn build_read_tcp_conn_request(handle_id: u64, max_len: u64) -> OwnedFrame {
     let mut body = Vec::with_capacity(16);
     body.extend_from_slice(&handle_id.to_le_bytes());
@@ -2953,6 +3421,546 @@ pub fn parse_poll_tcp_conn_events_response_ok(body: &[u8]) -> Result<u32, Protoc
     if body.len() != 8 {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::PollTcpConnEventsResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
+}
+
+// =====================================================================
+// BrokerInetDgram wire format.
+// =====================================================================
+
+/// [`InetDgramRecvFromResponse`] flag: original datagram was larger than the returned payload.
+pub const INET_DGRAM_RECV_FLAG_TRUNC: u32 = 0x1;
+
+pub fn build_inet_dgram_create_request(family: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.push(family);
+    body.extend_from_slice(&[0u8; 7]);
+    OwnedFrame {
+        opcode: Opcode::InetDgramCreate,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_dgram_create_body(body: &[u8]) -> Result<u8, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramCreate,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[1..8].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok(body[0])
+}
+
+pub fn build_inet_dgram_create_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramCreateResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_dgram_create_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetDgramCreateResponse)
+}
+
+fn build_inet_dgram_handle_sockaddr_request(
+    opcode: Opcode,
+    handle_id: u64,
+    sockaddr: &[u8],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(36);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    let mut addr = [0u8; 28];
+    let n = core::cmp::min(sockaddr.len(), addr.len());
+    addr[..n].copy_from_slice(&sockaddr[..n]);
+    body.extend_from_slice(&addr);
+    OwnedFrame {
+        opcode,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+fn parse_inet_dgram_handle_sockaddr_body(
+    body: &[u8],
+    opcode: Opcode,
+) -> Result<(u64, [u8; 28]), ProtocolError> {
+    if body.len() != 36 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            got: body.len(),
+            want: 36,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(&body[8..36]);
+    Ok((handle, sockaddr))
+}
+
+pub fn build_inet_dgram_bind_request(handle_id: u64, sockaddr: &[u8]) -> OwnedFrame {
+    build_inet_dgram_handle_sockaddr_request(Opcode::InetDgramBind, handle_id, sockaddr)
+}
+
+pub fn parse_inet_dgram_bind_body(body: &[u8]) -> Result<(u64, [u8; 28]), ProtocolError> {
+    parse_inet_dgram_handle_sockaddr_body(body, Opcode::InetDgramBind)
+}
+
+pub fn build_inet_dgram_bind_response_ok(sockaddr: &[u8; 28]) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramBindResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: sockaddr.to_vec(),
+    }
+}
+
+pub fn parse_inet_dgram_bind_response_ok(body: &[u8]) -> Result<[u8; 28], ProtocolError> {
+    parse_inet_dgram_sockaddr_response(body, Opcode::InetDgramBindResponse)
+}
+
+pub fn build_inet_dgram_connect_request(handle_id: u64, sockaddr: &[u8]) -> OwnedFrame {
+    build_inet_dgram_handle_sockaddr_request(Opcode::InetDgramConnect, handle_id, sockaddr)
+}
+
+pub fn parse_inet_dgram_connect_body(body: &[u8]) -> Result<(u64, [u8; 28]), ProtocolError> {
+    parse_inet_dgram_handle_sockaddr_body(body, Opcode::InetDgramConnect)
+}
+
+pub fn build_inet_dgram_connect_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramConnectResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_inet_dgram_sendto_request(
+    handle_id: u64,
+    sockaddr: &[u8],
+    payload: &[u8],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(44 + payload.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    let mut addr = [0u8; 28];
+    let n = core::cmp::min(sockaddr.len(), addr.len());
+    addr[..n].copy_from_slice(&sockaddr[..n]);
+    body.extend_from_slice(&addr);
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(payload);
+    OwnedFrame {
+        opcode: Opcode::InetDgramSendTo,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_dgram_sendto_body(
+    body: &[u8],
+) -> Result<(u64, [u8; 28], Vec<u8>), ProtocolError> {
+    if body.len() < 44 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramSendTo,
+            got: body.len(),
+            want: 44,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(&body[8..36]);
+    let len = u32::from_le_bytes(body[36..40].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[40..44].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 44 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramSendTo,
+            got: body.len(),
+            want: 44 + len,
+        });
+    }
+    Ok((handle, sockaddr, body[44..].to_vec()))
+}
+
+pub fn build_inet_dgram_sendto_response_ok(written: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramSendToResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: written.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_dgram_sendto_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetDgramSendToResponse)
+}
+
+pub fn build_inet_dgram_recvfrom_request(handle_id: u64, max_len: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InetDgramRecvFrom,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_dgram_recvfrom_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramRecvFrom,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
+}
+
+pub fn build_inet_dgram_recvfrom_response_ok(
+    peer_sockaddr: &[u8; 28],
+    payload: &[u8],
+    flags: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(36 + payload.len());
+    body.extend_from_slice(peer_sockaddr);
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    body.extend_from_slice(&flags.to_le_bytes());
+    body.extend_from_slice(payload);
+    OwnedFrame {
+        opcode: Opcode::InetDgramRecvFromResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_dgram_recvfrom_response_ok(
+    body: &[u8],
+) -> Result<([u8; 28], Vec<u8>, u32), ProtocolError> {
+    if body.len() < 36 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramRecvFromResponse,
+            got: body.len(),
+            want: 36,
+        });
+    }
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(&body[0..28]);
+    let len = u32::from_le_bytes(body[28..32].try_into().unwrap()) as usize;
+    let flags = u32::from_le_bytes(body[32..36].try_into().unwrap());
+    if body.len() != 36 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramRecvFromResponse,
+            got: body.len(),
+            want: 36 + len,
+        });
+    }
+    Ok((sockaddr, body[36..].to_vec(), flags))
+}
+
+pub fn build_inet_dgram_shutdown_request(handle_id: u64, how: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.push(how);
+    body.extend_from_slice(&[0u8; 7]);
+    OwnedFrame {
+        opcode: Opcode::InetDgramShutdown,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_dgram_shutdown_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramShutdown,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    if body[9..16].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((u64::from_le_bytes(body[0..8].try_into().unwrap()), body[8]))
+}
+
+pub fn build_inet_dgram_shutdown_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramShutdownResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_inet_dgram_getsockname_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramGetSockName,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_dgram_getsockname_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetDgramGetSockName)
+}
+
+pub fn build_inet_dgram_getsockname_response_ok(sockaddr: &[u8; 28]) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramGetSockNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: sockaddr.to_vec(),
+    }
+}
+
+pub fn parse_inet_dgram_getsockname_response_ok(body: &[u8]) -> Result<[u8; 28], ProtocolError> {
+    parse_inet_dgram_sockaddr_response(body, Opcode::InetDgramGetSockNameResponse)
+}
+
+pub fn build_inet_dgram_getpeername_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramGetPeerName,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_dgram_getpeername_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetDgramGetPeerName)
+}
+
+pub fn build_inet_dgram_getpeername_response_ok(sockaddr: &[u8; 28]) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramGetPeerNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: sockaddr.to_vec(),
+    }
+}
+
+pub fn parse_inet_dgram_getpeername_response_ok(body: &[u8]) -> Result<[u8; 28], ProtocolError> {
+    parse_inet_dgram_sockaddr_response(body, Opcode::InetDgramGetPeerNameResponse)
+}
+
+fn parse_inet_dgram_sockaddr_response(
+    body: &[u8],
+    opcode: Opcode,
+) -> Result<[u8; 28], ProtocolError> {
+    if body.len() != 28 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            got: body.len(),
+            want: 28,
+        });
+    }
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(body);
+    Ok(sockaddr)
+}
+
+pub fn build_inet_dgram_setsockopt_request(
+    handle_id: u64,
+    level: i32,
+    name: i32,
+    value: &[u8],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24 + value.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&level.to_le_bytes());
+    body.extend_from_slice(&name.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(value);
+    OwnedFrame {
+        opcode: Opcode::InetDgramSetSockOpt,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_dgram_setsockopt_body(
+    body: &[u8],
+) -> Result<(u64, i32, i32, Vec<u8>), ProtocolError> {
+    if body.len() < 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramSetSockOpt,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let level = i32::from_le_bytes(body[8..12].try_into().unwrap());
+    let name = i32::from_le_bytes(body[12..16].try_into().unwrap());
+    let len = u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[20..24].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 24 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramSetSockOpt,
+            got: body.len(),
+            want: 24 + len,
+        });
+    }
+    Ok((handle, level, name, body[24..].to_vec()))
+}
+
+pub fn build_inet_dgram_setsockopt_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramSetSockOptResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_inet_dgram_getsockopt_request(
+    handle_id: u64,
+    level: i32,
+    name: i32,
+    max_len: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&level.to_le_bytes());
+    body.extend_from_slice(&name.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InetDgramGetSockOpt,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_dgram_getsockopt_body(
+    body: &[u8],
+) -> Result<(u64, i32, i32, u32), ProtocolError> {
+    if body.len() != 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramGetSockOpt,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    let reserved = u32::from_le_bytes(body[20..24].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        i32::from_le_bytes(body[8..12].try_into().unwrap()),
+        i32::from_le_bytes(body[12..16].try_into().unwrap()),
+        u32::from_le_bytes(body[16..20].try_into().unwrap()),
+    ))
+}
+
+pub fn build_inet_dgram_getsockopt_response_ok(value: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + value.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(value);
+    OwnedFrame {
+        opcode: Opcode::InetDgramGetSockOptResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_dgram_getsockopt_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramGetSockOptResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramGetSockOptResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
+}
+
+pub fn build_inet_dgram_query_events_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetDgramQueryEvents,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_dgram_query_events_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetDgramQueryEvents)
+}
+
+pub fn build_inet_dgram_query_events_response_ok(events: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&events.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InetDgramQueryEventsResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_dgram_query_events_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetDgramQueryEventsResponse,
             got: body.len(),
             want: 8,
         });

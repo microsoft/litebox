@@ -32,9 +32,12 @@ use crate::fd_token_protocol::{
     build_deliver_signal_inbox_request, build_inet_listener_accept_request,
     build_inet_listener_bind_request, build_inet_listener_create_request,
     build_inet_listener_listen_request, build_inet_listener_query_events_request,
+    build_inet_raw_create_request, build_inet_raw_query_events_request,
+    build_inet_raw_recvfrom_request, build_inet_raw_sendto_request,
     build_inet_tcp_conn_connect_request, build_inet_tcp_conn_create_request,
     build_inet_tcp_conn_getpeername_request, build_inet_tcp_conn_getsockname_request,
-    build_inet_tcp_conn_query_events_request, build_inotify_add_watch_request,
+    build_inet_tcp_conn_getsockopt_request, build_inet_tcp_conn_query_events_request,
+    build_inet_tcp_conn_setsockopt_request, build_inotify_add_watch_request,
     build_inotify_init1_request, build_inotify_read_request, build_inotify_rm_watch_request,
     build_mark_process_exited_request, build_materialize_request, build_open_pty_slave_request,
     build_pidfd_exited_request, build_poll_tcp_conn_events_request, build_pty_ioctl_request,
@@ -52,16 +55,19 @@ use crate::fd_token_protocol::{
     parse_create_socketpair_response_body, parse_handle_body,
     parse_inet_listener_accept_response_ok, parse_inet_listener_bind_response_ok,
     parse_inet_listener_create_response_ok, parse_inet_listener_query_events_response_ok,
+    parse_inet_raw_create_response_ok, parse_inet_raw_query_events_response_ok,
+    parse_inet_raw_recvfrom_response_ok, parse_inet_raw_sendto_response_ok,
     parse_inet_tcp_conn_create_response_ok, parse_inet_tcp_conn_getpeername_response_ok,
-    parse_inet_tcp_conn_getsockname_response_ok, parse_inet_tcp_conn_query_events_response_ok,
-    parse_inotify_add_watch_response_ok, parse_inotify_read_response_body,
-    parse_open_pty_slave_response_ok, parse_pidfd_exited_response_ok,
-    parse_poll_tcp_conn_events_response_ok, parse_pty_ioctl_response_body,
-    parse_pty_read_response_body, parse_pty_write_response_ok, parse_read_pipe_response_body,
-    parse_read_siginfo_response_body, parse_read_socketpair_response_body,
-    parse_read_tcp_conn_response_body, parse_set_sid_response_ok,
-    parse_subscribe_process_exit_response_ok, parse_write_pipe_response_ok,
-    parse_write_socketpair_response_ok, parse_write_tcp_conn_response_ok,
+    parse_inet_tcp_conn_getsockname_response_ok, parse_inet_tcp_conn_getsockopt_response_ok,
+    parse_inet_tcp_conn_query_events_response_ok, parse_inotify_add_watch_response_ok,
+    parse_inotify_read_response_body, parse_open_pty_slave_response_ok,
+    parse_pidfd_exited_response_ok, parse_poll_tcp_conn_events_response_ok,
+    parse_pty_ioctl_response_body, parse_pty_read_response_body, parse_pty_write_response_ok,
+    parse_read_pipe_response_body, parse_read_siginfo_response_body,
+    parse_read_socketpair_response_body, parse_read_tcp_conn_response_body,
+    parse_set_sid_response_ok, parse_subscribe_process_exit_response_ok,
+    parse_write_pipe_response_ok, parse_write_socketpair_response_ok,
+    parse_write_tcp_conn_response_ok,
 };
 use std::format;
 use std::io;
@@ -107,6 +113,12 @@ pub enum ClientError {
 
     #[error("worker has not registered a notification ring yet")]
     NoNotificationRing,
+
+    #[error("operation denied by broker policy or host permissions")]
+    PermissionDenied,
+
+    #[error("protocol not supported by broker subsystem")]
+    ProtocolNotSupported,
 
     #[error("broker internal error for opcode {opcode:?}")]
     BrokerInternal { opcode: Opcode },
@@ -1306,6 +1318,119 @@ impl FdTokenClient {
         }
     }
 
+    pub fn inet_raw_create(&self, family: u8, protocol: u8) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_raw_create_request(family, protocol),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetRawCreateResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_inet_raw_create_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: family as u64,
+            }),
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    pub fn inet_raw_sendto(
+        &self,
+        handle_id: u64,
+        sockaddr: &[u8],
+        bytes: &[u8],
+    ) -> Result<usize, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_raw_sendto_request(handle_id, sockaddr, bytes),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetRawSendToResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_inet_raw_sendto_response_ok(resp.body)
+                .map(|n| n as usize)
+                .map_err(ClientError::Protocol),
+            StatusCode::WouldBlock => Err(ClientError::WouldBlock),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: bytes.len() as u64,
+            }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_raw_recvfrom(
+        &self,
+        handle_id: u64,
+        max_len: u64,
+    ) -> Result<([u8; 28], Vec<u8>), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_raw_recvfrom_request(handle_id, max_len),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetRawRecvFromResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_inet_raw_recvfrom_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
+            StatusCode::WouldBlock => Err(ClientError::WouldBlock),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: max_len }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_raw_query_events(&self, handle_id: u64) -> Result<u32, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_raw_query_events_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetRawQueryEventsResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_inet_raw_query_events_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
     pub fn tcp_conn_create(&self, family: u8) -> Result<u64, ClientError> {
         let stream = self.lock();
         send_frame(&stream, &build_inet_tcp_conn_create_request(family), None)?;
@@ -1430,6 +1555,70 @@ impl FdTokenClient {
         }
     }
 
+    pub fn tcp_conn_setsockopt(
+        &self,
+        handle_id: u64,
+        level: u32,
+        optname: u32,
+        optval: &[u8],
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_tcp_conn_setsockopt_request(handle_id, level, optname, optval),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetTcpConnSetSockOptResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: optname as u64,
+            }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn tcp_conn_getsockopt(
+        &self,
+        handle_id: u64,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_tcp_conn_getsockopt_request(handle_id, level, optname, optlen),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetTcpConnGetSockOptResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_inet_tcp_conn_getsockopt_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: optname as u64,
+            }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
     pub fn read_tcp_conn(&self, handle_id: u64, max_len: u64) -> Result<Vec<u8>, ClientError> {
         let stream = self.lock();
         send_frame(
@@ -1527,6 +1716,302 @@ impl FdTokenClient {
             StatusCode::Ok => {
                 parse_poll_tcp_conn_events_response_ok(resp.body).map_err(ClientError::Protocol)
             }
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_dgram_create(&self, family: u8) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_create_request(family),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramCreateResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                proto::parse_inet_dgram_create_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: family as u64,
+            }),
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    pub fn inet_dgram_bind(
+        &self,
+        handle_id: u64,
+        sockaddr: &[u8],
+    ) -> Result<[u8; 28], ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_bind_request(handle_id, sockaddr),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramBindResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                proto::parse_inet_dgram_bind_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: sockaddr.len() as u64,
+            }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_dgram_connect(&self, handle_id: u64, sockaddr: &[u8]) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_connect_request(handle_id, sockaddr),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramConnectResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: sockaddr.len() as u64,
+            }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_dgram_sendto(
+        &self,
+        handle_id: u64,
+        sockaddr: &[u8],
+        payload: &[u8],
+    ) -> Result<usize, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_sendto_request(handle_id, sockaddr, payload),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramSendToResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => proto::parse_inet_dgram_sendto_response_ok(resp.body)
+                .map(|n| n as usize)
+                .map_err(ClientError::Protocol),
+            StatusCode::WouldBlock => Err(ClientError::WouldBlock),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: payload.len() as u64,
+            }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_dgram_recvfrom(
+        &self,
+        handle_id: u64,
+        max_len: u32,
+    ) -> Result<([u8; 28], Vec<u8>, u32), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_recvfrom_request(handle_id, max_len),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramRecvFromResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => proto::parse_inet_dgram_recvfrom_response_ok(resp.body)
+                .map_err(ClientError::Protocol),
+            StatusCode::WouldBlock => Err(ClientError::WouldBlock),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_dgram_shutdown(&self, handle_id: u64, how: u8) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_shutdown_request(handle_id, how),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramShutdownResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: how as u64 }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_dgram_getsockname(&self, handle_id: u64) -> Result<[u8; 28], ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_getsockname_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramGetSockNameResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => proto::parse_inet_dgram_getsockname_response_ok(resp.body)
+                .map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_dgram_getpeername(&self, handle_id: u64) -> Result<[u8; 28], ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_getpeername_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramGetPeerNameResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => proto::parse_inet_dgram_getpeername_response_ok(resp.body)
+                .map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_dgram_setsockopt(
+        &self,
+        handle_id: u64,
+        level: i32,
+        name: i32,
+        value: &[u8],
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_setsockopt_request(handle_id, level, name, value),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramSetSockOptResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: name as u64 }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_dgram_getsockopt(
+        &self,
+        handle_id: u64,
+        level: i32,
+        name: i32,
+        max_len: u32,
+    ) -> Result<Vec<u8>, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_getsockopt_request(handle_id, level, name, max_len),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramGetSockOptResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => proto::parse_inet_dgram_getsockopt_response_ok(resp.body)
+                .map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: name as u64 }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_dgram_query_events(&self, handle_id: u64) -> Result<u32, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &proto::build_inet_dgram_query_events_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetDgramQueryEventsResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => proto::parse_inet_dgram_query_events_response_ok(resp.body)
+                .map_err(ClientError::Protocol),
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }
@@ -1663,6 +2148,8 @@ fn map_status_no_handle(opcode: Opcode, status: StatusCode) -> ClientError {
     match status {
         StatusCode::Protocol => ClientError::BrokerRejectedProtocol,
         StatusCode::Internal => ClientError::BrokerInternal { opcode },
+        StatusCode::PermissionDenied => ClientError::PermissionDenied,
+        StatusCode::ProtocolNotSupported => ClientError::ProtocolNotSupported,
         s => ClientError::OtherStatus { opcode, status: s },
     }
 }
@@ -1671,6 +2158,8 @@ fn map_status_with_handle(opcode: Opcode, status: StatusCode, _handle: u64) -> C
     match status {
         StatusCode::Protocol => ClientError::BrokerRejectedProtocol,
         StatusCode::Internal => ClientError::BrokerInternal { opcode },
+        StatusCode::PermissionDenied => ClientError::PermissionDenied,
+        StatusCode::ProtocolNotSupported => ClientError::ProtocolNotSupported,
         StatusCode::SubsystemMismatch => ClientError::SubsystemMismatch,
         s => ClientError::OtherStatus { opcode, status: s },
     }

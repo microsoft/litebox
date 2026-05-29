@@ -1,28 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Runner-side implementation of [`BrokerTcpConnProvider`].
+//! Runner-side implementation of [`BrokerInetRawProvider`].
 
 use litebox_common_linux::broker_eventfd::{NotificationCallback, NotificationDispatcher};
-use litebox_common_linux::broker_tcp_conn_provider::{
-    BrokerEventCallback, BrokerOpError, BrokerTcpConnProvider,
+use litebox_common_linux::broker_inet_raw_provider::{
+    BrokerEventCallback, BrokerInetRawProvider, BrokerOpError,
 };
 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
 use litebox_common_linux::fd_token_client::{ClientError, FdTokenClient};
 use std::sync::Arc;
 
-pub struct RunnerBrokerTcpConnProvider {
+pub struct RunnerBrokerInetRawProvider {
     client: Arc<FdTokenClient>,
     dispatcher: Arc<NotificationDispatcher>,
 }
 
-impl RunnerBrokerTcpConnProvider {
+impl RunnerBrokerInetRawProvider {
     pub fn new(client: Arc<FdTokenClient>, dispatcher: Arc<NotificationDispatcher>) -> Self {
         Self { client, dispatcher }
     }
 }
 
-impl BrokerSubscribable for RunnerBrokerTcpConnProvider {
+impl BrokerSubscribable for RunnerBrokerInetRawProvider {
     fn subscribe(
         &self,
         handle: u64,
@@ -44,13 +44,13 @@ impl BrokerSubscribable for RunnerBrokerTcpConnProvider {
     fn unsubscribe(&self, handle: u64, subscription_id: u64) {
         self.dispatcher.unregister_callback(subscription_id);
         if let Err(e) = self.client.unsubscribe(handle, subscription_id) {
-            tracing::warn!(handle, subscription_id, error = %e, "tcp conn unsubscribe failed");
+            tracing::warn!(handle, subscription_id, error = %e, "inet raw unsubscribe failed");
         }
     }
 
     fn release(&self, handle: u64) {
         if let Err(e) = self.client.release(handle) {
-            tracing::warn!(handle, error = %e, "tcp conn release failed; broker handle may leak");
+            tracing::warn!(handle, error = %e, "inet raw release failed; broker handle may leak");
         }
     }
 
@@ -62,81 +62,33 @@ impl BrokerSubscribable for RunnerBrokerTcpConnProvider {
 
     fn query_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
         self.client
-            .query_events(handle)
+            .inet_raw_query_events(handle)
             .map_err(client_err_to_broker_err)
     }
 }
 
-impl BrokerTcpConnProvider for RunnerBrokerTcpConnProvider {
-    fn create(&self, family: u8) -> Result<u64, BrokerOpError> {
+impl BrokerInetRawProvider for RunnerBrokerInetRawProvider {
+    fn create(&self, family: u8, protocol: u8) -> Result<u64, BrokerOpError> {
         self.client
-            .tcp_conn_create(family)
+            .inet_raw_create(family, protocol)
             .map_err(client_err_to_broker_err)
     }
 
-    fn connect(&self, handle: u64, sockaddr: &[u8], timeout_ms: u32) -> Result<(), BrokerOpError> {
+    fn send_to(&self, handle: u64, sockaddr: &[u8], bytes: &[u8]) -> Result<usize, BrokerOpError> {
         self.client
-            .tcp_conn_connect(handle, sockaddr, timeout_ms)
+            .inet_raw_sendto(handle, sockaddr, bytes)
             .map_err(client_err_to_broker_err)
     }
 
-    fn getsockname(&self, handle: u64) -> Result<[u8; 28], BrokerOpError> {
+    fn recv_from(&self, handle: u64, max_len: u64) -> Result<([u8; 28], Vec<u8>), BrokerOpError> {
         self.client
-            .tcp_conn_getsockname(handle)
+            .inet_raw_recvfrom(handle, max_len)
             .map_err(client_err_to_broker_err)
     }
 
-    fn getpeername(&self, handle: u64) -> Result<[u8; 28], BrokerOpError> {
+    fn poll_raw_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
         self.client
-            .tcp_conn_getpeername(handle)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn read_tcp_conn(&self, handle: u64, max_len: u64) -> Result<Vec<u8>, BrokerOpError> {
-        self.client
-            .read_tcp_conn(handle, max_len)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn write_tcp_conn(&self, handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError> {
-        self.client
-            .write_tcp_conn(handle, bytes)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn shutdown_tcp_conn(&self, handle: u64, read: bool, write: bool) -> Result<(), BrokerOpError> {
-        self.client
-            .shutdown_tcp_conn(handle, read, write)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn setsockopt(
-        &self,
-        handle: u64,
-        level: u32,
-        optname: u32,
-        optval: &[u8],
-    ) -> Result<(), BrokerOpError> {
-        self.client
-            .tcp_conn_setsockopt(handle, level, optname, optval)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn getsockopt(
-        &self,
-        handle: u64,
-        level: u32,
-        optname: u32,
-        optlen: u32,
-    ) -> Result<Vec<u8>, BrokerOpError> {
-        self.client
-            .tcp_conn_getsockopt(handle, level, optname, optlen)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn poll_tcp_conn_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
-        self.client
-            .poll_tcp_conn_events(handle)
+            .inet_raw_query_events(handle)
             .map_err(client_err_to_broker_err)
     }
 }
@@ -156,6 +108,8 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
         ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
         ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
+        ClientError::PermissionDenied => BrokerOpError::PermissionDenied,
+        ClientError::ProtocolNotSupported => BrokerOpError::ProtocolNotSupported,
         ClientError::Protocol(_) => BrokerOpError::InvalidValue,
         ClientError::Io(_)
         | ClientError::UnexpectedOpcode { .. }
@@ -164,8 +118,6 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
         | ClientError::UnknownSubscription(_)
         | ClientError::SubsystemMismatch
         | ClientError::NoNotificationRing
-        | ClientError::PermissionDenied
-        | ClientError::ProtocolNotSupported
         | ClientError::BrokerInternal { .. }
         | ClientError::OtherStatus { .. }
         | ClientError::UnexpectedFdAttachment { .. }

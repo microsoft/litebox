@@ -44,6 +44,11 @@ pub enum BrokerOpError {
     InvalidValue,
     /// The handle id was unknown to the broker. Maps to `Errno::EBADF`.
     UnknownHandle,
+    /// Operation is blocked by broker policy or host permissions. Maps to
+    /// `Errno::EPERM`.
+    PermissionDenied,
+    /// Requested protocol is not supported. Maps to `Errno::EPROTONOSUPPORT`.
+    ProtocolNotSupported,
     /// Generic communications or broker-side failure. Maps to
     /// `Errno::EIO`.
     Io,

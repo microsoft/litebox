@@ -35,6 +35,24 @@ pub trait BrokerTcpConnProvider: BrokerSubscribable {
     /// Applies `shutdown(2)` to the broker-held stream.
     fn shutdown_tcp_conn(&self, handle: u64, read: bool, write: bool) -> Result<(), BrokerOpError>;
 
+    /// Passes a supported socket option through to the broker-held host socket.
+    fn setsockopt(
+        &self,
+        handle: u64,
+        level: u32,
+        optname: u32,
+        optval: &[u8],
+    ) -> Result<(), BrokerOpError>;
+
+    /// Reads a supported socket option from the broker-held host socket.
+    fn getsockopt(
+        &self,
+        handle: u64,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<alloc::vec::Vec<u8>, BrokerOpError>;
+
     /// Returns current poll/epoll-style readiness bits, including `RDHUP` when available.
     fn poll_tcp_conn_events(&self, handle: u64) -> Result<u32, BrokerOpError>;
 }

@@ -1,28 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Runner-side implementation of [`BrokerTcpConnProvider`].
+//! Runner-side implementation of [`BrokerInetDgramProvider`].
 
 use litebox_common_linux::broker_eventfd::{NotificationCallback, NotificationDispatcher};
-use litebox_common_linux::broker_tcp_conn_provider::{
-    BrokerEventCallback, BrokerOpError, BrokerTcpConnProvider,
+use litebox_common_linux::cwfd::{
+    broker_inet_dgram_provider::{BrokerEventCallback, BrokerInetDgramProvider, BrokerOpError},
+    broker_subscribable::BrokerSubscribable,
 };
-use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
 use litebox_common_linux::fd_token_client::{ClientError, FdTokenClient};
 use std::sync::Arc;
 
-pub struct RunnerBrokerTcpConnProvider {
+pub struct RunnerBrokerInetDgramProvider {
     client: Arc<FdTokenClient>,
     dispatcher: Arc<NotificationDispatcher>,
 }
 
-impl RunnerBrokerTcpConnProvider {
+impl RunnerBrokerInetDgramProvider {
     pub fn new(client: Arc<FdTokenClient>, dispatcher: Arc<NotificationDispatcher>) -> Self {
         Self { client, dispatcher }
     }
 }
 
-impl BrokerSubscribable for RunnerBrokerTcpConnProvider {
+impl BrokerSubscribable for RunnerBrokerInetDgramProvider {
     fn subscribe(
         &self,
         handle: u64,
@@ -44,13 +44,13 @@ impl BrokerSubscribable for RunnerBrokerTcpConnProvider {
     fn unsubscribe(&self, handle: u64, subscription_id: u64) {
         self.dispatcher.unregister_callback(subscription_id);
         if let Err(e) = self.client.unsubscribe(handle, subscription_id) {
-            tracing::warn!(handle, subscription_id, error = %e, "tcp conn unsubscribe failed");
+            tracing::warn!(handle, subscription_id, error = %e, "inet dgram unsubscribe failed");
         }
     }
 
     fn release(&self, handle: u64) {
         if let Err(e) = self.client.release(handle) {
-            tracing::warn!(handle, error = %e, "tcp conn release failed; broker handle may leak");
+            tracing::warn!(handle, error = %e, "inet dgram release failed; broker handle may leak");
         }
     }
 
@@ -67,76 +67,86 @@ impl BrokerSubscribable for RunnerBrokerTcpConnProvider {
     }
 }
 
-impl BrokerTcpConnProvider for RunnerBrokerTcpConnProvider {
+impl BrokerInetDgramProvider for RunnerBrokerInetDgramProvider {
     fn create(&self, family: u8) -> Result<u64, BrokerOpError> {
         self.client
-            .tcp_conn_create(family)
+            .inet_dgram_create(family)
             .map_err(client_err_to_broker_err)
     }
 
-    fn connect(&self, handle: u64, sockaddr: &[u8], timeout_ms: u32) -> Result<(), BrokerOpError> {
+    fn bind(&self, handle: u64, sockaddr: &[u8]) -> Result<[u8; 28], BrokerOpError> {
         self.client
-            .tcp_conn_connect(handle, sockaddr, timeout_ms)
+            .inet_dgram_bind(handle, sockaddr)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn connect(&self, handle: u64, sockaddr: &[u8]) -> Result<(), BrokerOpError> {
+        self.client
+            .inet_dgram_connect(handle, sockaddr)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn sendto(&self, handle: u64, sockaddr: &[u8], payload: &[u8]) -> Result<usize, BrokerOpError> {
+        self.client
+            .inet_dgram_sendto(handle, sockaddr, payload)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn recvfrom(
+        &self,
+        handle: u64,
+        max_len: u32,
+    ) -> Result<([u8; 28], Vec<u8>, u32), BrokerOpError> {
+        self.client
+            .inet_dgram_recvfrom(handle, max_len)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn shutdown(&self, handle: u64, how: u8) -> Result<(), BrokerOpError> {
+        self.client
+            .inet_dgram_shutdown(handle, how)
             .map_err(client_err_to_broker_err)
     }
 
     fn getsockname(&self, handle: u64) -> Result<[u8; 28], BrokerOpError> {
         self.client
-            .tcp_conn_getsockname(handle)
+            .inet_dgram_getsockname(handle)
             .map_err(client_err_to_broker_err)
     }
 
     fn getpeername(&self, handle: u64) -> Result<[u8; 28], BrokerOpError> {
         self.client
-            .tcp_conn_getpeername(handle)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn read_tcp_conn(&self, handle: u64, max_len: u64) -> Result<Vec<u8>, BrokerOpError> {
-        self.client
-            .read_tcp_conn(handle, max_len)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn write_tcp_conn(&self, handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError> {
-        self.client
-            .write_tcp_conn(handle, bytes)
-            .map_err(client_err_to_broker_err)
-    }
-
-    fn shutdown_tcp_conn(&self, handle: u64, read: bool, write: bool) -> Result<(), BrokerOpError> {
-        self.client
-            .shutdown_tcp_conn(handle, read, write)
+            .inet_dgram_getpeername(handle)
             .map_err(client_err_to_broker_err)
     }
 
     fn setsockopt(
         &self,
         handle: u64,
-        level: u32,
-        optname: u32,
-        optval: &[u8],
+        level: i32,
+        name: i32,
+        value: &[u8],
     ) -> Result<(), BrokerOpError> {
         self.client
-            .tcp_conn_setsockopt(handle, level, optname, optval)
+            .inet_dgram_setsockopt(handle, level, name, value)
             .map_err(client_err_to_broker_err)
     }
 
     fn getsockopt(
         &self,
         handle: u64,
-        level: u32,
-        optname: u32,
-        optlen: u32,
+        level: i32,
+        name: i32,
+        max_len: u32,
     ) -> Result<Vec<u8>, BrokerOpError> {
         self.client
-            .tcp_conn_getsockopt(handle, level, optname, optlen)
+            .inet_dgram_getsockopt(handle, level, name, max_len)
             .map_err(client_err_to_broker_err)
     }
 
-    fn poll_tcp_conn_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
+    fn query_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
         self.client
-            .poll_tcp_conn_events(handle)
+            .inet_dgram_query_events(handle)
             .map_err(client_err_to_broker_err)
     }
 }
@@ -157,6 +167,7 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
         ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
         ClientError::Protocol(_) => BrokerOpError::InvalidValue,
+        ClientError::PermissionDenied | ClientError::ProtocolNotSupported => BrokerOpError::Io,
         ClientError::Io(_)
         | ClientError::UnexpectedOpcode { .. }
         | ClientError::BrokerRejectedProtocol
@@ -164,8 +175,6 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
         | ClientError::UnknownSubscription(_)
         | ClientError::SubsystemMismatch
         | ClientError::NoNotificationRing
-        | ClientError::PermissionDenied
-        | ClientError::ProtocolNotSupported
         | ClientError::BrokerInternal { .. }
         | ClientError::OtherStatus { .. }
         | ClientError::UnexpectedFdAttachment { .. }
