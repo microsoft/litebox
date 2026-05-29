@@ -3405,7 +3405,7 @@ mod copilot {
 mod dropbear_bash {
     use super::{Failed, Trial, copilot};
     use litebox_test_harness::os::pty::Pty;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     struct Scenario {
         id: &'static str,
@@ -3502,62 +3502,140 @@ mod dropbear_bash {
     }
 
     fn run_scenario(pass: &str, scenario_id: &str) -> Result<(), Failed> {
-        let scn = scenarios()
-            .iter()
-            .find(|s| s.id == scenario_id)
-            .expect("scenario lookup");
+        // Shared infrastructure: acquire the cross-trial dispatch gate
+        // (so dropbear counts against the same per-host concurrent
+        // budget as standard tests) and time each phase the same way
+        // `run_one_test` does, so the dashboard records:
+        //   t_acquire_ms  — wait for a dispatch slot
+        //   t_docker_start_ms — container spawn + ssh ready
+        //   t_useful_ms — actual bash driving + assertion
+        //
+        // At end we call the shared `emit_timing_main` (single source
+        // of truth for `dashboard_store::record_result`), so dropbear
+        // trials flow through the same dashboard pipeline as everything
+        // else. The container image and the dispatch protocol (SSH/PTY
+        // vs JSON-stdout) remain dropbear-specific — that's the
+        // intentional difference; recording/coordination is shared.
+        let t_start = Instant::now();
+        let _permit = super::active_jobs().acquire();
+        let t_acquired = Instant::now();
+        let t_acquire_ms = t_acquired.duration_since(t_start).as_millis();
+        let pass_static: &'static str = match pass {
+            "native" => "native",
+            "litebox" => "litebox",
+            _ => "unknown",
+        };
+        let test_id = format!("dropbear_bash.{scenario_id}");
 
-        let fixture_dir = super::fixture_dir(pass, "dropbear_bash", scenario_id);
-        let _ = std::fs::remove_dir_all(&fixture_dir);
-        std::fs::create_dir_all(&fixture_dir)
-            .map_err(|e| format!("create fixture dir {}: {e}", fixture_dir.display()))?;
-        for (rel, content) in scn.fixtures {
-            let path = fixture_dir.join(rel);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
-            }
-            std::fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
-        }
+        // Inner closure returns (t_docker_start_ms, t_useful_ms) on
+        // success or the same plus an error message on failure. We
+        // then record + map to Result<(), Failed> uniformly below.
+        let outcome: Result<(u128, u128), (u128, u128, String)> =
+            (|| -> Result<(u128, u128), (u128, u128, String)> {
+                let scn = scenarios()
+                    .iter()
+                    .find(|s| s.id == scenario_id)
+                    .expect("scenario lookup");
+                let fixture_dir = super::fixture_dir(pass, "dropbear_bash", scenario_id);
+                let _ = std::fs::remove_dir_all(&fixture_dir);
+                std::fs::create_dir_all(&fixture_dir).map_err(|e| {
+                    (
+                        0,
+                        0,
+                        format!("create fixture dir {}: {e}", fixture_dir.display()),
+                    )
+                })?;
+                for (rel, content) in scn.fixtures {
+                    let path = fixture_dir.join(rel);
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| (0, 0, format!("mkdir: {e}")))?;
+                    }
+                    std::fs::write(&path, content)
+                        .map_err(|e| (0, 0, format!("write {}: {e}", path.display())))?;
+                }
+                if pass == "litebox" {
+                    let _ = super::setup();
+                }
+                super::ensure_copilot_image(&super::workspace_root());
 
-        if pass == "litebox" {
-            let _ = super::setup();
-        }
-        super::ensure_copilot_image(&super::workspace_root());
-        let container = copilot::ContainerHandle::spawn(
-            pass,
-            scenario_id,
+                let t_dispatch = Instant::now();
+                let container = copilot::ContainerHandle::spawn(
+                    pass,
+                    scenario_id,
+                    "dropbear_bash",
+                    &fixture_dir,
+                    false,
+                )
+                .map_err(|e| (0, 0, format!("{e}")))?;
+                let port = container.ssh_port;
+                copilot::wait_for_sshd(port, Duration::from_secs(30))
+                    .map_err(|e| (t_dispatch.elapsed().as_millis(), 0, format!("{e}")))?;
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let response = drive_bash(port, scn.command)
+                    .map_err(|e| (t_docker_start_ms, t_useful_start.elapsed().as_millis(), e))?;
+                let stripped = copilot::strip_ansi(&response);
+                persist_transcript(pass, scenario_id, &response, &stripped);
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+
+                let missing: Vec<&str> = scn
+                    .expected
+                    .iter()
+                    .copied()
+                    .filter(|expected| !stripped.contains(expected))
+                    .collect();
+                if !missing.is_empty() {
+                    let preview: String = stripped.chars().take(800).collect();
+                    return Err((
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        format!(
+                            "{pass}::dropbear_bash.{scenario_id} missing expected output {:?}.\n\
+                             transcript: {}\n\
+                             first 800 chars of ANSI-stripped response:\n{preview}",
+                            missing,
+                            super::log_dir()
+                                .join(format!("dropbear_bash-{pass}-{scenario_id}.stripped.log"))
+                                .display(),
+                        ),
+                    ));
+                }
+                Ok((t_docker_start_ms, t_useful_ms))
+            })();
+
+        let (verdict, t_docker_start_ms, t_useful_ms, result): (
+            &'static str,
+            u128,
+            u128,
+            Result<(), Failed>,
+        ) = match outcome {
+            Ok((d, u)) => ("pass", d, u, Ok(())),
+            Err((d, u, msg)) => ("FAIL", d, u, Err(msg.into())),
+        };
+
+        // Single source of truth for recording — same path the
+        // standard `run_one_test` uses. Optional timings (litebox
+        // init, harness sub-phases, etc.) are None because dropbear
+        // doesn't have those concepts (different driving protocol).
+        super::emit_timing_main(
+            &test_id,
+            pass_static,
             "dropbear_bash",
-            &fixture_dir,
-            false,
-        )?;
-        let port = container.ssh_port;
-        copilot::wait_for_sshd(port, Duration::from_secs(30))?;
+            "phase_h",
+            t_acquire_ms,
+            t_docker_start_ms,
+            None,
+            None,
+            None,
+            &super::SubPhaseMs::default(),
+            t_useful_ms,
+            verdict,
+            super::current_jobs_cap(),
+        );
 
-        let response = drive_bash(port, scn.command)?;
-        let stripped = copilot::strip_ansi(&response);
-        persist_transcript(pass, scenario_id, &response, &stripped);
-
-        let missing: Vec<&str> = scn
-            .expected
-            .iter()
-            .copied()
-            .filter(|expected| !stripped.contains(expected))
-            .collect();
-        if !missing.is_empty() {
-            let preview: String = stripped.chars().take(800).collect();
-            return Err(format!(
-                "{pass}::dropbear_bash.{scenario_id} missing expected output {:?}.\n\
-                 transcript: {}\n\
-                 first 800 chars of ANSI-stripped response:\n{preview}",
-                missing,
-                super::log_dir()
-                    .join(format!("dropbear_bash-{pass}-{scenario_id}.stripped.log"))
-                    .display(),
-            )
-            .into());
-        }
-
-        Ok(())
+        result
     }
 
     fn drive_bash(port: u16, command: &str) -> Result<String, String> {
