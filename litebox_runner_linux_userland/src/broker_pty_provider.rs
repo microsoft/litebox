@@ -137,6 +137,8 @@ fn client_err_to_broker_err(err: ClientError) -> BrokerOpError {
         | ClientError::UnknownSubscription(_)
         | ClientError::SubsystemMismatch
         | ClientError::NoNotificationRing
+        | ClientError::PermissionDenied
+        | ClientError::ProtocolNotSupported
         | ClientError::BrokerInternal { .. }
         | ClientError::OtherStatus { .. }
         | ClientError::UnexpectedFdAttachment { .. }

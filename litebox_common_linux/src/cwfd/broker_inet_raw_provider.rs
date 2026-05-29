@@ -17,7 +17,11 @@ pub trait BrokerInetRawProvider: BrokerSubscribable {
     fn send_to(&self, handle: u64, sockaddr: &[u8], bytes: &[u8]) -> Result<usize, BrokerOpError>;
 
     /// Receives one raw packet, returning `(peer_sockaddr, bytes)`.
-    fn recv_from(&self, handle: u64, max_len: u64) -> Result<([u8; 28], alloc::vec::Vec<u8>), BrokerOpError>;
+    fn recv_from(
+        &self,
+        handle: u64,
+        max_len: u64,
+    ) -> Result<([u8; 28], alloc::vec::Vec<u8>), BrokerOpError>;
 
     /// Returns current poll/epoll-style readiness bits.
     fn poll_raw_events(&self, handle: u64) -> Result<u32, BrokerOpError>;

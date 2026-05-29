@@ -484,6 +484,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                     Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
                     Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
                     Err(BrokerOpError::InvalidValue) => Err(TryOpError::Other(Errno::EINVAL)),
+                    Err(BrokerOpError::PermissionDenied) => Err(TryOpError::Other(Errno::EPERM)),
+                    Err(BrokerOpError::ProtocolNotSupported) => {
+                        Err(TryOpError::Other(Errno::EPROTONOSUPPORT))
+                    }
                     Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
                 }
             }
@@ -597,6 +601,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                     Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
                     Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
                     Err(BrokerOpError::InvalidValue) => Err(TryOpError::Other(Errno::EINVAL)),
+                    Err(BrokerOpError::PermissionDenied) => Err(TryOpError::Other(Errno::EPERM)),
+                    Err(BrokerOpError::ProtocolNotSupported) => {
+                        Err(TryOpError::Other(Errno::EPROTONOSUPPORT))
+                    }
                     Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
                 }
             }

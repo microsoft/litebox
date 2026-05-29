@@ -1318,7 +1318,11 @@ impl FdTokenClient {
 
     pub fn inet_raw_create(&self, family: u8, protocol: u8) -> Result<u64, ClientError> {
         let stream = self.lock();
-        send_frame(&stream, &build_inet_raw_create_request(family, protocol), None)?;
+        send_frame(
+            &stream,
+            &build_inet_raw_create_request(family, protocol),
+            None,
+        )?;
         let (resp_bytes, attached) = recv_frame(&stream)?;
         let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
         check_opcode(&resp, Opcode::InetRawCreateResponse)?;
@@ -1364,7 +1368,9 @@ impl FdTokenClient {
                 .map_err(ClientError::Protocol),
             StatusCode::WouldBlock => Err(ClientError::WouldBlock),
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
-            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: bytes.len() as u64 }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: bytes.len() as u64,
+            }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }
     }
@@ -1389,8 +1395,9 @@ impl FdTokenClient {
             });
         }
         match resp.status {
-            StatusCode::Ok => parse_inet_raw_recvfrom_response_ok(resp.body)
-                .map_err(ClientError::Protocol),
+            StatusCode::Ok => {
+                parse_inet_raw_recvfrom_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
             StatusCode::WouldBlock => Err(ClientError::WouldBlock),
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: max_len }),
@@ -1414,8 +1421,9 @@ impl FdTokenClient {
             });
         }
         match resp.status {
-            StatusCode::Ok => parse_inet_raw_query_events_response_ok(resp.body)
-                .map_err(ClientError::Protocol),
+            StatusCode::Ok => {
+                parse_inet_raw_query_events_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }

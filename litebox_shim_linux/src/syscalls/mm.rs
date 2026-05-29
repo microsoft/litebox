@@ -251,7 +251,8 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::Signalfd(_)
             | crate::RawFdRef::Inotify(_)
-            | crate::RawFdRef::BrokerInetListener(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            | crate::RawFdRef::BrokerInetListener(_)
+            | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
         })?
     }
 
@@ -278,7 +279,8 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerPty(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::Signalfd(_)
                 | crate::RawFdRef::Inotify(_)
-                | crate::RawFdRef::BrokerInetListener(_) => None, // non-FS descriptor has no filesystem path,
+                | crate::RawFdRef::BrokerInetListener(_)
+                | crate::RawFdRef::BrokerInetRaw(_) => None, // non-FS descriptor has no filesystem path,
             })
             .ok()
             .flatten()
@@ -941,7 +943,8 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerPty(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::Signalfd(_)
                 | crate::RawFdRef::Inotify(_)
-                | crate::RawFdRef::BrokerInetListener(_) => None, // CoW fast path only supports FS static backing,
+                | crate::RawFdRef::BrokerInetListener(_)
+                | crate::RawFdRef::BrokerInetRaw(_) => None, // CoW fast path only supports FS static backing,
             })
             .ok()??;
 
