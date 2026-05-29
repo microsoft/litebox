@@ -18,7 +18,7 @@ use litebox_common_linux::notification_frame::{
 };
 use litebox_common_linux::notification_ring::NotificationSender;
 
-use crate::cwfd::inet_listener_state::{encode_sockaddr, family_from_u8, AddressFamily};
+use crate::cwfd::inet_listener_state::{AddressFamily, encode_sockaddr, family_from_u8};
 use crate::state_registry::StateObject;
 use crate::subscription_list::{SubscribeError, SubscriptionList, UnsubscribeError};
 
@@ -331,11 +331,13 @@ impl TcpConnState {
         match &mut *inner {
             TcpConnInner::Unconnected {
                 pending_sockopts, ..
+            }
+            | TcpConnInner::Connecting {
+                pending_sockopts, ..
             } => {
                 upsert_pending_sockopt(pending_sockopts, level, optname, optval);
                 Ok(())
             }
-            TcpConnInner::Connecting { .. } => Err(TcpConnError::WouldBlock),
             TcpConnInner::Connected(connected) => {
                 let stream = connected
                     .stream
@@ -559,6 +561,8 @@ fn ensure_supported_sockopt(
         | (libc::SOL_SOCKET, libc::SO_SNDBUF, _)
         | (libc::SOL_SOCKET, libc::SO_RCVBUF, _)
         | (libc::SOL_SOCKET, libc::SO_LINGER, _)
+        | (libc::SOL_SOCKET, libc::SO_RCVTIMEO, _)
+        | (libc::SOL_SOCKET, libc::SO_SNDTIMEO, _)
         | (libc::SOL_SOCKET, libc::SO_ERROR, true)
         | (libc::IPPROTO_TCP, libc::TCP_NODELAY, _)
         | (libc::IPPROTO_IP, libc::IP_TTL, _) => Ok(()),
