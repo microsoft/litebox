@@ -500,12 +500,14 @@ impl TcpConnState {
                     };
                     let events = poll_stream_events(&stream);
                     let notify = notification_events(events);
-                    if notify != 0 && notify != last {
+                    // Data/HUP/error readiness is level-triggered; repeat it so a read
+                    // that drained data between poll samples cannot mask the next arrival.
+                    let level_triggered =
+                        notify & (NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR) != 0;
+                    if notify != 0 && (notify != last || level_triggered) {
                         state.subject.notify(notify);
-                        last = notify;
-                    } else if notify == 0 {
-                        last = 0;
                     }
+                    last = notify;
                     drop(state);
                     std::thread::sleep(Duration::from_millis(10));
                 }
