@@ -383,6 +383,20 @@ pub fn handle_set_pgid(
     }
 }
 
+fn resolve_or_register_process(
+    process_registry: &BrokerStateRegistry,
+    pid: u32,
+) -> Result<(), StateRegistryError> {
+    let handle = StateHandle::from_id(u64::from(pid));
+    match process_registry.resolve(handle, SubsystemTag::Process) {
+        Ok(_) => Ok(()),
+        Err(StateRegistryError::UnknownHandle(_)) => process_registry
+            .register_with_id(u64::from(pid), ProcessState::arc())
+            .map(|_| ()),
+        Err(err) => Err(err),
+    }
+}
+
 pub fn handle_set_sid(
     process_registry: &BrokerStateRegistry,
     inbox: &PgrpSignalInbox,
@@ -397,11 +411,8 @@ pub fn handle_set_sid(
         Ok(v) => v,
         Err(_) => return protocol_err(Opcode::SetSidResponse),
     };
-    match process_registry.resolve(
-        StateHandle::from_id(u64::from(caller_pid)),
-        SubsystemTag::Process,
-    ) {
-        Ok(_) => {}
+    match resolve_or_register_process(process_registry, caller_pid) {
+        Ok(()) => {}
         Err(StateRegistryError::UnknownHandle(_)) => {
             return status_err(Opcode::SetSidResponse, StatusCode::UnknownHandle);
         }
