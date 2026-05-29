@@ -2024,6 +2024,7 @@ fn handle_inet_listener_bind(
             if registry
                 .register_broker_held_inet_listener(
                     actual_addr.port(),
+                    state.family(),
                     StateHandle::from_id(handle_id),
                 )
                 .is_err()

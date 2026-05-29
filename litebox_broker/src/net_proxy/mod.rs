@@ -1199,9 +1199,9 @@ fn run_inner(
                     // IP — check if a worker registered a listen on this port
                     // via port_router (cross-worker loopback).
                     let routed_to_worker = port_router.has_route(dst_port);
-                    let broker_held_listener = state_registry
-                        .as_deref()
-                        .and_then(|registry| registry.resolve_broker_held_inet_listener(dst_port));
+                    let broker_held_listener = state_registry.as_deref().and_then(|registry| {
+                        registry.resolve_broker_held_inet_listener_for_inbound(dst_port)
+                    });
 
                     if routed_to_worker {
                         // Cross-worker loopback: create a TCP pair.
@@ -1763,7 +1763,7 @@ fn run_inner(
                         );
 
                         if let Some(listener) = state_registry.as_deref().and_then(|registry| {
-                            registry.resolve_broker_held_inet_listener(fwd.guest_port)
+                            registry.resolve_broker_held_inet_listener_for_inbound(fwd.guest_port)
                         }) {
                             match listener.accept_inbound(stream, peer) {
                                 Ok(()) => continue,
