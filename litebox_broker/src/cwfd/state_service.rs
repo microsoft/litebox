@@ -2011,10 +2011,34 @@ fn handle_inet_listener_bind(
         Err(r) => return r,
     };
     match state.bind(&sockaddr) {
-        Ok(actual) => HandlerResult {
-            frame: build_inet_listener_bind_response_ok(&actual),
-            out_fd: None,
-        },
+        Ok(actual) => {
+            let actual_addr = match decode_sockaddr(&actual) {
+                Ok(addr) => addr,
+                Err(InetListenerError::InvalidSockaddr) | Err(InetListenerError::InvalidFamily) => {
+                    return status_err(Opcode::InetListenerBindResponse, StatusCode::Internal);
+                }
+                Err(InetListenerError::AlreadyBound)
+                | Err(InetListenerError::NotBound)
+                | Err(InetListenerError::AlreadyListening)
+                | Err(InetListenerError::WouldBlock)
+                | Err(InetListenerError::Io(_)) => {
+                    return status_err(Opcode::InetListenerBindResponse, StatusCode::Internal);
+                }
+            };
+            if registry
+                .register_broker_held_inet_listener(
+                    actual_addr.port(),
+                    StateHandle::from_id(handle_id),
+                )
+                .is_err()
+            {
+                return status_err(Opcode::InetListenerBindResponse, StatusCode::Internal);
+            }
+            HandlerResult {
+                frame: build_inet_listener_bind_response_ok(&actual),
+                out_fd: None,
+            }
+        }
         Err(
             InetListenerError::InvalidFamily
             | InetListenerError::InvalidSockaddr

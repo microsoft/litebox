@@ -71,7 +71,7 @@ use litebox_common_linux::cwfd::notification_ring::NotificationSender;
 
 use crate::cwfd::eventfd_state::EventfdState;
 use crate::cwfd::inet_dgram_state::InetDgramState;
-use crate::cwfd::inet_listener_state::InetListenerState;
+use crate::cwfd::inet_listener_state::{AddressFamily, InetListenerState};
 use crate::cwfd::inet_raw_state::InetRawState;
 use crate::cwfd::inotify_state::InotifyState;
 use crate::cwfd::pidfd_state::PidfdState;
@@ -485,6 +485,7 @@ struct Entry {
 struct State {
     next_id: u64,
     table: HashMap<u64, Entry>,
+    broker_held_inet_listeners: HashMap<u16, u64>,
 }
 
 /// Snapshot of one live registry entry, for diagnostic dumps and
@@ -520,6 +521,7 @@ impl BrokerStateRegistry {
             state: Mutex::new(State {
                 next_id: 1,
                 table: HashMap::new(),
+                broker_held_inet_listeners: HashMap::new(),
             }),
         }
     }
@@ -610,6 +612,89 @@ impl BrokerStateRegistry {
         Ok(Self::insert_locked(&mut s, id, state))
     }
 
+    pub fn register_broker_held_inet_listener(
+        &self,
+        port: u16,
+        handle: StateHandle,
+    ) -> Result<(), StateRegistryError> {
+        let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        let entry = s
+            .table
+            .get(&handle.0)
+            .ok_or(StateRegistryError::UnknownHandle(handle))?;
+        let new_family = match entry.state.as_ref() {
+            StateObjectEnum::InetListener(listener) => listener.family(),
+            StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeReadEnd(_)
+            | StateObjectEnum::PipeWriteEnd(_)
+            | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::TcpConn(_)
+            | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
+            | StateObjectEnum::Pty(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::Process(_) => {
+                return Err(StateRegistryError::TagMismatch {
+                    handle,
+                    expected: SubsystemTag::InetListener,
+                    actual: entry.state.subsystem_tag(),
+                });
+            }
+        };
+        if let Some(existing) = s.broker_held_inet_listeners.get(&port).copied() {
+            let existing_family =
+                s.table
+                    .get(&existing)
+                    .and_then(|entry| match entry.state.as_ref() {
+                        StateObjectEnum::InetListener(listener) => Some(listener.family()),
+                        StateObjectEnum::Eventfd(_)
+                        | StateObjectEnum::PipeReadEnd(_)
+                        | StateObjectEnum::PipeWriteEnd(_)
+                        | StateObjectEnum::SocketPairEnd(_)
+                        | StateObjectEnum::TcpConn(_)
+                        | StateObjectEnum::InetDgram(_)
+                        | StateObjectEnum::InetRaw(_)
+                        | StateObjectEnum::Signalfd(_)
+                        | StateObjectEnum::Inotify(_)
+                        | StateObjectEnum::Pty(_)
+                        | StateObjectEnum::Pidfd(_)
+                        | StateObjectEnum::Process(_) => None,
+                    });
+            if existing_family == Some(AddressFamily::V4) && new_family == AddressFamily::V6 {
+                return Ok(());
+            }
+        }
+        s.broker_held_inet_listeners.insert(port, handle.0);
+        Ok(())
+    }
+
+    pub fn resolve_broker_held_inet_listener(&self, port: u16) -> Option<Arc<InetListenerState>> {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        let handle = *s.broker_held_inet_listeners.get(&port)?;
+        let entry = s.table.get(&handle)?;
+        match entry.state.as_ref() {
+            StateObjectEnum::InetListener(listener) => Some(Arc::clone(listener)),
+            StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeReadEnd(_)
+            | StateObjectEnum::PipeWriteEnd(_)
+            | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::TcpConn(_)
+            | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
+            | StateObjectEnum::Pty(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::Process(_) => {
+                panic!(
+                    "broker-held inet listener route for port {port} points at non-listener handle {handle}"
+                );
+            }
+        }
+    }
+
     fn insert_locked(s: &mut State, id: u64, state: Arc<StateObjectEnum>) -> StateHandle {
         let tag = state.subsystem_tag();
         s.table.insert(id, Entry { state, refcount: 1 });
@@ -690,6 +775,8 @@ impl BrokerStateRegistry {
         let tag = entry.state.subsystem_tag();
         if new_rc == 0 {
             s.table.remove(&handle.0);
+            s.broker_held_inet_listeners
+                .retain(|_, registered| *registered != handle.0);
         }
         drop(s);
         // PE.10 diag: log every release with the new rc. Opt-in via

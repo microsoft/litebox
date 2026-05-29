@@ -1192,6 +1192,9 @@ fn run_inner(
                     // IP — check if a worker registered a listen on this port
                     // via port_router (cross-worker loopback).
                     let routed_to_worker = port_router.has_route(dst_port);
+                    let broker_held_listener = state_registry
+                        .as_deref()
+                        .and_then(|registry| registry.resolve_broker_held_inet_listener(dst_port));
 
                     if routed_to_worker {
                         // Cross-worker loopback: create a TCP pair.
@@ -1232,6 +1235,44 @@ fn run_inner(
                             }
                             Err(e) => {
                                 warn!("failed to create TCP pair for cross-worker loopback: {e}");
+                                suppress_from_smoltcp = true;
+                            }
+                        }
+                    } else if let Some(listener) = broker_held_listener {
+                        match create_tcp_pair() {
+                            Ok((local_end, remote_end)) => {
+                                let peer = SocketAddr::V4(SocketAddrV4::new(
+                                    Ipv4Addr::from(src_ip),
+                                    src_port,
+                                ));
+                                match listener.accept_inbound(remote_end, peer) {
+                                    Ok(()) => {
+                                        local_end.set_nonblocking(true).ok();
+                                        ready_host_streams
+                                            .insert(flow_key, (local_end, Instant::now()));
+                                        ensure_listen_socket(
+                                            &mut sockets,
+                                            &mut listen_sockets,
+                                            &mut accepting_sockets,
+                                            dest_ipv4,
+                                            dst_port,
+                                        );
+                                        debug!(
+                                            "broker-held listener: SYN {src_ip:?}:{src_port} → {dest_ipv4}:{dst_port}, TCP pair created"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "broker-held listener rejected inbound stream for port {dst_port}: {e}"
+                                        );
+                                        suppress_from_smoltcp = true;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "failed to create TCP pair for broker-held listener on port {dst_port}: {e}"
+                                );
                                 suppress_from_smoltcp = true;
                             }
                         }
@@ -1713,6 +1754,21 @@ fn run_inner(
                             "inbound TCP: accepted from {peer} → {}:{}",
                             fwd.guest_ip, fwd.guest_port
                         );
+
+                        if let Some(listener) = state_registry.as_deref().and_then(|registry| {
+                            registry.resolve_broker_held_inet_listener(fwd.guest_port)
+                        }) {
+                            match listener.accept_inbound(stream, peer) {
+                                Ok(()) => continue,
+                                Err(e) => {
+                                    warn!(
+                                        "broker-held listener rejected host-inbound stream for port {}: {e}",
+                                        fwd.guest_port
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
 
                         // Check if a worker has registered for this port.
                         // If so, route the stream to the worker's proxy.
