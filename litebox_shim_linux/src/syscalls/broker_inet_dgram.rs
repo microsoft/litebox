@@ -18,8 +18,8 @@ use litebox::{
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{
-    broker_inet_dgram_provider::{BrokerInetDgramProvider, BrokerOpError},
     cwfd::{
+        broker_inet_dgram_provider::{BrokerInetDgramProvider, BrokerOpError},
         broker_subscribable::BrokerSubscribable,
         notification_frame::{
             NOTIFY_EVENT_ERR, NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
@@ -244,7 +244,7 @@ impl BrokerInetDgramFd<Platform> {
 
 impl IOPollable for BrokerInetDgramFd<Platform> {
     fn check_io_events(&self) -> Events {
-        match self.provider.query_events(self.handle()) {
+        match BrokerInetDgramProvider::query_events(&*self.provider, self.handle()) {
             Ok(events) => Events::from_bits_truncate(events),
             Err(_) => self.common.check_io_events(),
         }

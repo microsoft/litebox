@@ -4,10 +4,10 @@
 //! Runner-side implementation of [`BrokerInetDgramProvider`].
 
 use litebox_common_linux::broker_eventfd::{NotificationCallback, NotificationDispatcher};
-use litebox_common_linux::broker_inet_dgram_provider::{
-    BrokerEventCallback, BrokerInetDgramProvider, BrokerOpError,
+use litebox_common_linux::cwfd::{
+    broker_inet_dgram_provider::{BrokerEventCallback, BrokerInetDgramProvider, BrokerOpError},
+    broker_subscribable::BrokerSubscribable,
 };
-use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
 use litebox_common_linux::fd_token_client::{ClientError, FdTokenClient};
 use std::sync::Arc;
 

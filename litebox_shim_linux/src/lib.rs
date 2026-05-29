@@ -691,6 +691,35 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 );
                 Ok(())
             }
+            BrokerHandleKind::InetDgram => {
+                let provider =
+                    syscalls::broker_inet_dgram::broker_inet_dgram_provider().ok_or(())?;
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(handle_id);
+                let dgram = syscalls::broker_inet_dgram::BrokerInetDgramFd::<Platform>::new(
+                    provider,
+                    handle_id,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<
+                    syscalls::broker_inet_dgram::BrokerInetDgramSubsystem,
+                > = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(dgram);
+                let mut rds = files.raw_descriptor_store.write();
+                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+                debug_assert!(
+                    ok,
+                    "install_broker_bridge_fd(inet_dgram): slot {guest_fd} still occupied"
+                );
+                Ok(())
+            }
             BrokerHandleKind::InetListener => {
                 let provider =
                     syscalls::broker_inet_listener::broker_inet_listener_provider().ok_or(())?;
@@ -2072,6 +2101,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         BrokerHandleKind::UnixSocket => None,
                         BrokerHandleKind::TcpConn => None,
                         BrokerHandleKind::InetListener => None,
+                        BrokerHandleKind::InetDgram => None,
                         // `Signalfd` is restored by its dedicated FdClass branch below.
                         BrokerHandleKind::Signalfd => todo!(
                             "fork-snapshot restore for BrokerHandleKind::Signalfd \
