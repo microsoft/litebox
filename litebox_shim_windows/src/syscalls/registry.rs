@@ -418,7 +418,7 @@ impl<FS: ShimFS> Task<FS> {
                 let information = KeyValueBasicInformation {
                     title_index: 0,
                     value_type: value.value_type.into(),
-                    name_length: name.len().truncate(),
+                    name_length: name.len().trunc(),
                     name: [0u8; 0],
                 };
                 write_query_result_length(result_length, length, required_length)?;
@@ -442,9 +442,9 @@ impl<FS: ShimFS> Task<FS> {
                 let information = KeyValueFullInformation {
                     title_index: 0,
                     value_type: value.value_type.into(),
-                    data_offset: data_offset.truncate(),
-                    data_length: value.data.len().truncate(),
-                    name_length: name.len().truncate(),
+                    data_offset: data_offset.trunc(),
+                    data_length: value.data.len().trunc(),
+                    name_length: name.len().trunc(),
                     name: [0u8; 0],
                 };
 
@@ -465,7 +465,7 @@ impl<FS: ShimFS> Task<FS> {
                 let information = KeyValuePartialInformation {
                     title_index: 0,
                     value_type: value.value_type.into(),
-                    data_length: value.data.len().truncate(),
+                    data_length: value.data.len().trunc(),
                     data: [0u8; 0],
                 };
 
@@ -498,7 +498,7 @@ fn write_query_result_length(
     required_length: usize,
 ) -> Result<(), NtStatus> {
     result_length
-        .write_at_offset(0, required_length.truncate())
+        .write_at_offset(0, required_length.trunc())
         .ok_or(NtStatus::ACCESS_VIOLATION)?;
     if (buffer_length as usize) < required_length {
         return Err(NtStatus::BUFFER_OVERFLOW);
