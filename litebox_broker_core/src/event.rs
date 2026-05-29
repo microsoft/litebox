@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::object::ObjectKind;
+use crate::object::{ObjectId, ObjectKind};
 use crate::{
     BrokerConnection, BrokerCore, BrokerError, ObjectHandle, ObjectRights, ObjectType,
     PolicyEngine, Result,
@@ -58,8 +58,9 @@ impl<P: PolicyEngine> BrokerCore<P> {
         handle: ObjectHandle,
     ) -> Result<WaitOutcome> {
         let association = connection.association();
-        self.authorize_object_use(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
-        let state = self.event_state(handle)?;
+        let object_id =
+            self.authorize_object_use(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
+        let state = self.event_state(object_id)?;
         Ok(if state.ready {
             WaitOutcome::Ready(state)
         } else {
@@ -74,14 +75,15 @@ impl<P: PolicyEngine> BrokerCore<P> {
         handle: ObjectHandle,
     ) -> Result<ReadinessState> {
         let association = connection.association();
-        self.authorize_object_use(association, handle, ObjectType::Event, ObjectRights::WRITE)?;
-        match &mut self.object_mut(handle.object_id)?.kind {
+        let object_id =
+            self.authorize_object_use(association, handle, ObjectType::Event, ObjectRights::WRITE)?;
+        match &mut self.object_mut(object_id)?.kind {
             ObjectKind::Event(event) => event.signal(),
         }
     }
 
-    fn event_state(&self, handle: ObjectHandle) -> Result<ReadinessState> {
-        match &self.object(handle.object_id)?.kind {
+    fn event_state(&self, object_id: ObjectId) -> Result<ReadinessState> {
+        match &self.object(object_id)?.kind {
             ObjectKind::Event(event) => Ok(event.readiness_state()),
         }
     }
@@ -118,7 +120,7 @@ impl EventObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BrokerCore, CallerCredential, EventOnlyPolicy, ObjectGeneration};
+    use crate::{BrokerCore, CallerCredential, EventOnlyPolicy, ObjectReferenceGeneration};
 
     #[test]
     fn wait_rejects_reference_without_wait_right() {
@@ -142,13 +144,14 @@ mod tests {
     }
 
     #[test]
-    fn wait_rejects_stale_object_generation() {
+    fn wait_rejects_stale_reference_generation() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
         let connection = core
             .create_connection(CallerCredential::Unauthenticated)
             .unwrap();
         let mut handle = core.create_event(&connection).unwrap();
-        handle.object_generation = ObjectGeneration::new(handle.object_generation.get() + 1);
+        handle.reference_generation =
+            ObjectReferenceGeneration::new(handle.reference_generation.get() + 1);
 
         assert_eq!(
             core.wait_event(&connection, handle),

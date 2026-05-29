@@ -15,9 +15,7 @@ mod object;
 
 pub use error::ErrorCode;
 pub use message::{BrokerRequest, BrokerResponse, ReadinessState, WaitOutcome};
-pub use object::{
-    ObjectGeneration, ObjectHandle, ObjectId, ObjectReferenceGeneration, ObjectReferenceId,
-};
+pub use object::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
 
 /// Major/minor broker protocol version.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

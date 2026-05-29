@@ -4,15 +4,13 @@
 use core::fmt;
 
 use litebox_broker_core::{
-    BrokerConnection, BrokerCore, BrokerError, CallerCredential,
-    ObjectGeneration as CoreObjectGeneration, ObjectHandle as CoreObjectHandle,
-    ObjectId as CoreObjectId, ObjectReferenceGeneration as CoreObjectReferenceGeneration,
+    BrokerConnection, BrokerCore, BrokerError, CallerCredential, ObjectHandle as CoreObjectHandle,
+    ObjectReferenceGeneration as CoreObjectReferenceGeneration,
     ObjectReferenceId as CoreObjectReferenceId, PolicyEngine, ReadinessState as CoreReadinessState,
     WaitOutcome as CoreWaitOutcome,
 };
 use litebox_broker_protocol::{
-    BrokerRequest, BrokerResponse, ErrorCode, ObjectGeneration as ProtocolObjectGeneration,
-    ObjectHandle as ProtocolObjectHandle, ObjectId as ProtocolObjectId,
+    BrokerRequest, BrokerResponse, ErrorCode, ObjectHandle as ProtocolObjectHandle,
     ObjectReferenceGeneration as ProtocolObjectReferenceGeneration,
     ObjectReferenceId as ProtocolObjectReferenceId, ProtocolVersion,
     ReadinessState as ProtocolReadinessState, WaitOutcome as ProtocolWaitOutcome,
@@ -208,8 +206,6 @@ fn protocol_error(error: BrokerError) -> ErrorCode {
 
 fn core_handle(handle: ProtocolObjectHandle) -> CoreObjectHandle {
     CoreObjectHandle::new(
-        CoreObjectId::new(handle.object_id.get()),
-        CoreObjectGeneration::new(handle.object_generation.get()),
         CoreObjectReferenceId::new(handle.reference_id.get()),
         CoreObjectReferenceGeneration::new(handle.reference_generation.get()),
     )
@@ -217,8 +213,6 @@ fn core_handle(handle: ProtocolObjectHandle) -> CoreObjectHandle {
 
 fn protocol_handle(handle: CoreObjectHandle) -> ProtocolObjectHandle {
     ProtocolObjectHandle::new(
-        ProtocolObjectId::new(handle.object_id.get()),
-        ProtocolObjectGeneration::new(handle.object_generation.get()),
         ProtocolObjectReferenceId::new(handle.reference_id.get()),
         ProtocolObjectReferenceGeneration::new(handle.reference_generation.get()),
     )
@@ -593,8 +587,6 @@ mod tests {
     #[test]
     fn protocol_adapters_preserve_handle_fields() {
         let protocol = ProtocolObjectHandle::new(
-            ProtocolObjectId::new(10),
-            ProtocolObjectGeneration::new(11),
             ProtocolObjectReferenceId::new(12),
             ProtocolObjectReferenceGeneration::new(13),
         );

@@ -11,8 +11,8 @@ use core::fmt;
 
 use alloc::vec::Vec;
 use litebox_broker_protocol::{
-    BrokerRequest, BrokerResponse, ErrorCode, ObjectGeneration, ObjectHandle, ObjectId,
-    ObjectReferenceGeneration, ObjectReferenceId, ProtocolVersion, ReadinessState, WaitOutcome,
+    BrokerRequest, BrokerResponse, ErrorCode, ObjectHandle, ObjectReferenceGeneration,
+    ObjectReferenceId, ProtocolVersion, ReadinessState, WaitOutcome,
 };
 use litebox_broker_transport::{ReceivedRequest, ReceivedResponse};
 
@@ -235,8 +235,6 @@ impl Encoder {
     }
 
     fn handle(&mut self, handle: ObjectHandle) {
-        self.u64(handle.object_id.get());
-        self.u64(handle.object_generation.get());
         self.u64(handle.reference_id.get());
         self.u64(handle.reference_generation.get());
     }
@@ -291,17 +289,10 @@ impl<'a> Decoder<'a> {
     }
 
     fn handle(&mut self) -> Result<ObjectHandle, WireError> {
-        let object_id = ObjectId::new(self.u64()?);
-        let object_generation = ObjectGeneration::new(self.u64()?);
         let reference_id = ObjectReferenceId::new(self.u64()?);
         let reference_generation = ObjectReferenceGeneration::new(self.u64()?);
 
-        Ok(ObjectHandle::new(
-            object_id,
-            object_generation,
-            reference_id,
-            reference_generation,
-        ))
+        Ok(ObjectHandle::new(reference_id, reference_generation))
     }
 
     fn readiness(&mut self) -> Result<ReadinessState, WireError> {
@@ -428,8 +419,6 @@ mod tests {
 
     const fn sample_handle() -> ObjectHandle {
         ObjectHandle::new(
-            ObjectId::new(11),
-            ObjectGeneration::new(12),
             ObjectReferenceId::new(13),
             ObjectReferenceGeneration::new(14),
         )

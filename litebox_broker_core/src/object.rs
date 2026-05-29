@@ -31,14 +31,16 @@ macro_rules! id_type {
     };
 }
 
-id_type! {
-    /// Broker-owned object identifier.
-    ObjectId
-}
+/// Broker-owned object identifier.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ObjectId(u64);
 
-id_type! {
-    /// Generation attached to a broker object.
-    ObjectGeneration
+impl ObjectId {
+    /// Creates an object identifier from its raw value.
+    const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 id_type! {
@@ -51,16 +53,13 @@ id_type! {
     ObjectReferenceGeneration
 }
 
-/// Broker-owned object handle returned by BrokerCore.
+/// Broker-owned reference handle returned by BrokerCore.
 ///
 /// UserLiteBox may cache this value, but the broker remains authoritative for
-/// object lifetime, reference lifetime, type, rights, and generation.
+/// object identity, object lifetime, reference lifetime, type, rights, and
+/// reference generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ObjectHandle {
-    /// Opaque broker object identifier.
-    pub object_id: ObjectId,
-    /// Object generation used to reject stale handles after object-slot reuse.
-    pub object_generation: ObjectGeneration,
     /// Opaque broker reference identifier owned by one authenticated process association.
     pub reference_id: ObjectReferenceId,
     /// Reference generation used to reject stale handles after reference-slot reuse.
@@ -70,32 +69,21 @@ pub struct ObjectHandle {
 impl ObjectHandle {
     /// Creates an object handle.
     pub const fn new(
-        object_id: ObjectId,
-        object_generation: ObjectGeneration,
         reference_id: ObjectReferenceId,
         reference_generation: ObjectReferenceGeneration,
     ) -> Self {
         Self {
-            object_id,
-            object_generation,
             reference_id,
             reference_generation,
         }
     }
 }
 
-const FIRST_OBJECT_GENERATION: ObjectGeneration = ObjectGeneration::new(1);
 const FIRST_REFERENCE_GENERATION: ObjectReferenceGeneration = ObjectReferenceGeneration::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ObjectReference {
     pub(crate) object_id: ObjectId,
-    /// Mirrors the referenced object's generation when this reference is minted.
-    ///
-    /// The duplicate lets stale-reference validation reject mismatched handles
-    /// before trusting any object-table lookup; object validation below still
-    /// checks the authoritative entry generation.
-    pub(crate) object_generation: ObjectGeneration,
     pub(crate) reference_generation: ObjectReferenceGeneration,
     pub(crate) owner: Association,
     pub(crate) object_type: ObjectType,
@@ -104,7 +92,6 @@ pub(crate) struct ObjectReference {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ObjectEntry {
-    pub(crate) generation: ObjectGeneration,
     pub(crate) kind: ObjectKind,
 }
 
@@ -124,10 +111,10 @@ impl ObjectKind {
 impl<P: PolicyEngine> BrokerCore<P> {
     /// Inserts a broker object and mints its first owned reference.
     ///
-    /// The current POC never reuses object or reference slots, so both
-    /// generations start at the authority-owned first generation. Any future
-    /// slot-reuse path must bump the corresponding generation before reissuing
-    /// a slot so stale handles cannot validate against a recycled entry.
+    /// The current POC never reuses reference slots, so the reference
+    /// generation starts at the authority-owned first generation. Any future
+    /// reference-slot reuse path must bump the generation before reissuing a
+    /// slot so stale handles cannot validate against a recycled reference.
     pub(crate) fn insert_object_with_reference(
         &mut self,
         association: Association,
@@ -137,22 +124,13 @@ impl<P: PolicyEngine> BrokerCore<P> {
     ) -> Result<ObjectHandle> {
         let object_id = self.allocate_object_id()?;
         let reference_id = self.allocate_reference_id()?;
-        let object_generation = FIRST_OBJECT_GENERATION;
         let reference_generation = FIRST_REFERENCE_GENERATION;
-        debug_assert_eq!(reference_generation, FIRST_REFERENCE_GENERATION);
 
-        self.objects.insert(
-            object_id,
-            ObjectEntry {
-                generation: object_generation,
-                kind,
-            },
-        );
+        self.objects.insert(object_id, ObjectEntry { kind });
         self.references.insert(
             reference_id,
             ObjectReference {
                 object_id,
-                object_generation,
                 reference_generation,
                 owner: association,
                 object_type,
@@ -160,12 +138,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
             },
         );
 
-        Ok(ObjectHandle::new(
-            object_id,
-            object_generation,
-            reference_id,
-            reference_generation,
-        ))
+        Ok(ObjectHandle::new(reference_id, reference_generation))
     }
 
     pub(crate) fn authorize_create_object(
@@ -185,13 +158,14 @@ impl<P: PolicyEngine> BrokerCore<P> {
         handle: ObjectHandle,
         object_type: ObjectType,
         rights: ObjectRights,
-    ) -> Result<()> {
-        self.validate_handle(association, handle, object_type, rights)?;
+    ) -> Result<ObjectId> {
+        let object_id = self.validate_handle(association, handle, object_type, rights)?;
         self.policy.authorize(PolicyOperation::use_object(
             association.caller_credential(),
             object_type,
             rights,
-        ))
+        ))?;
+        Ok(object_id)
     }
 
     pub(crate) fn object(&self, object_id: ObjectId) -> Result<&ObjectEntry> {
@@ -212,19 +186,15 @@ impl<P: PolicyEngine> BrokerCore<P> {
         handle: ObjectHandle,
         expected_type: ObjectType,
         required_rights: ObjectRights,
-    ) -> Result<()> {
+    ) -> Result<ObjectId> {
         let reference = self
             .references
             .get(&handle.reference_id)
             .ok_or(BrokerError::UnknownObject)?;
-        debug_assert_eq!(reference.reference_generation, FIRST_REFERENCE_GENERATION);
         if reference.owner != association {
             return Err(BrokerError::UnknownObject);
         }
-        if reference.reference_generation != handle.reference_generation
-            || reference.object_generation != handle.object_generation
-            || reference.object_id != handle.object_id
-        {
+        if reference.reference_generation != handle.reference_generation {
             return Err(BrokerError::StaleHandle);
         }
         if reference.object_type != expected_type {
@@ -238,15 +208,11 @@ impl<P: PolicyEngine> BrokerCore<P> {
             .objects
             .get(&reference.object_id)
             .ok_or(BrokerError::UnknownObject)?;
-        debug_assert_eq!(reference.object_generation, object.generation);
-        if object.generation != handle.object_generation {
-            return Err(BrokerError::StaleHandle);
-        }
         if object.kind.object_type() != expected_type {
             return Err(BrokerError::WrongObjectType);
         }
 
-        Ok(())
+        Ok(reference.object_id)
     }
 
     fn allocate_object_id(&mut self) -> Result<ObjectId> {
@@ -313,7 +279,6 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(handle.object_id, ObjectId::new(u64::MAX));
         assert_eq!(handle.reference_id, ObjectReferenceId::new(u64::MAX));
         assert_eq!(core.next_object_id, 0);
         assert_eq!(core.next_reference_id, 0);
@@ -325,32 +290,6 @@ mod tests {
                 ObjectRights::WAIT,
             ),
             Err(BrokerError::ResourceExhausted)
-        );
-    }
-
-    #[test]
-    fn validate_handle_rejects_reference_object_generation_mismatch() {
-        let mut core = BrokerCore::new(DefaultDenyPolicy);
-        let association = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        let handle = core
-            .insert_object_with_reference(
-                association,
-                ObjectKind::Event(EventObject::new()),
-                ObjectType::Event,
-                ObjectRights::WAIT,
-            )
-            .unwrap();
-
-        core.references
-            .get_mut(&handle.reference_id)
-            .unwrap()
-            .object_generation = ObjectGeneration::new(handle.object_generation.get() + 1);
-
-        assert_eq!(
-            core.validate_handle(association, handle, ObjectType::Event, ObjectRights::WAIT),
-            Err(BrokerError::StaleHandle)
         );
     }
 
@@ -369,8 +308,6 @@ mod tests {
             )
             .unwrap();
         let stale_handle = ObjectHandle::new(
-            handle.object_id,
-            handle.object_generation,
             handle.reference_id,
             ObjectReferenceGeneration::new(handle.reference_generation.get() + 1),
         );

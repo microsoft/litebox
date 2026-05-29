@@ -4,7 +4,7 @@
 //! Protocol- and transport-independent broker authority core.
 //!
 //! `litebox_broker_core` owns broker-side object identity, reference lifetime,
-//! rights checks, generation checks, and policy calls. It deliberately has no
+//! rights checks, reference generation checks, and policy calls. It deliberately has no
 //! dependency on protocol request/response types, Unix sockets, shared-memory
 //! rings, or any other transport.
 
@@ -28,10 +28,8 @@ pub use connection::BrokerConnection;
 pub use error::BrokerError;
 pub use event::{ReadinessState, WaitOutcome};
 pub use identity::CallerCredential;
-use object::{ObjectEntry, ObjectReference};
-pub use object::{
-    ObjectGeneration, ObjectHandle, ObjectId, ObjectReferenceGeneration, ObjectReferenceId,
-};
+use object::{ObjectEntry, ObjectId, ObjectReference};
+pub use object::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
 pub use policy::{
     DefaultDenyPolicy, EventOnlyPolicy, ObjectOperation, PolicyEngine, PolicyOperation,
 };

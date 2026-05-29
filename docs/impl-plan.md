@@ -56,7 +56,7 @@ Create a shared crate for broker protocol types.
 Initial contents:
 
 - protocol version type;
-- broker event object/reference IDs with generations;
+- broker event reference handles with reference generations;
 - minimal event request/response messages;
 - readiness and wait outcome payloads;
 - ABI-neutral error categories;
@@ -118,7 +118,7 @@ Exit criteria:
 
 - Current tests can still use the local profile.
 - A broker-backed profile can issue a simple broker request.
-- UserLiteBox handle entries can store opaque broker object/reference IDs + generations plus local cached rights hints.
+- UserLiteBox handle entries can store opaque broker reference handles plus local cached rights hints.
 
 ## Phase 4: First broker-owned object
 
@@ -126,8 +126,8 @@ Start with a small event or pipe-like object, not filesystem or networking.
 
 Broker owns:
 
-- object ID and generation;
-- initial reference ID, generation, and rights;
+- broker-internal object ID and lifetime;
+- initial reference ID, reference generation, and rights;
 - readiness state;
 - wait/wakeup state.
 
@@ -151,7 +151,7 @@ BrokerCore owns:
 
 - object refs;
 - rights;
-- generations;
+- reference generations;
 - refcounts;
 - dup/pass/close;
 - inherited object tables;
@@ -368,7 +368,7 @@ typed broker client
 control channel only
 minimal PolicyEngine
 broker-owned event object
-UserLiteBox fd table maps guest fd -> broker object/reference id
+UserLiteBox fd table maps guest fd -> broker reference handle
 ```
 
 This proves the trust boundary before taking on filesystem, networking, mapping, or multiprocess complexity.
@@ -380,8 +380,8 @@ Add conformance tests at each layer:
 - protocol parsing rejects malformed frames;
 - policy default-denies unknown operations;
 - caller identity is transport-bound;
-- stale object IDs fail;
-- wrong generation fails;
+- stale reference IDs fail;
+- wrong reference generation fails;
 - process disconnect cleans up refs;
 - UserLiteBox local handle edits cannot create authority;
 - shared-memory cursor/frame corruption fails closed;
