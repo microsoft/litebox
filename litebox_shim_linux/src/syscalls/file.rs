@@ -391,9 +391,7 @@ impl<FS: ShimFS> Task<FS> {
                 |fd| {
                     espipe_for_non_seekable_offset(offset)?;
                     self.global
-                        .pipes
-                        .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
-                        .map_err(Errno::from)
+                        .read_linux_pipe(&self.wait_cx(), fd, &mut buf.borrow_mut())
                 },
                 |fd| {
                     let handle = self
@@ -464,10 +462,7 @@ impl<FS: ShimFS> Task<FS> {
                 },
                 |fd| {
                     espipe_for_non_seekable_offset(offset)?;
-                    self.global
-                        .pipes
-                        .write(&self.wait_cx(), fd, buf)
-                        .map_err(Errno::from)
+                    self.global.write_linux_pipe(&self.wait_cx(), fd, buf)
                 },
                 |fd| {
                     let handle = self
@@ -675,7 +670,7 @@ impl<FS: ShimFS> Task<FS> {
                 files.fs.close(&fd).map_err(Errno::from)
             }
             ConsumedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
-            ConsumedFd::Pipes(fd) => self.global.pipes.close(&fd).map_err(Errno::from),
+            ConsumedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),
             ConsumedFd::Eventfd(fd) => {
                 let entry = {
                     let mut dt = self.global.litebox.descriptor_table_mut();
@@ -966,14 +961,10 @@ where
             },
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
             |fd| {
-                let half_pipe_type = task.global.pipes.half_pipe_type(fd)?;
-                let read_write_mode = match half_pipe_type {
-                    litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
-                    litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
-                };
-                let pipe_mode =
-                    read_write_mode.bits() | litebox_common_linux::InodeType::NamedPipe as u32;
-                Ok(T::from(synthetic(pipe_mode, 4096)))
+                Ok(T::from(synthetic(
+                    task.global.linux_pipe_mode_bits(fd)?,
+                    4096,
+                )))
             },
             |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
             |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
@@ -1207,7 +1198,7 @@ impl<FS: ShimFS> Task<FS> {
                         desc,
                         |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
                         |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
-                        |fd| getfl_from_metadata!(fd, crate::PipeStatusFlags),
+                        |fd| self.global.linux_pipe_status_flags(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
@@ -1281,22 +1272,8 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     },
                     |fd| {
-                        // Update the actual pipe non-blocking behavior
                         self.global
-                            .pipes
-                            .update_flags(
-                                fd,
-                                litebox::pipes::Flags::NON_BLOCKING,
-                                flags.intersects(OFlags::NONBLOCK),
-                            )
-                            .map_err(Errno::from)?;
-                        // Record all status flags in metadata for F_GETFL
-                        setfl_in_metadata!(
-                            fd,
-                            crate::PipeStatusFlags,
-                            unreachable!("all pipes have PipeStatusFlags when created"),
-                            |_| {}
-                        )
+                            .set_linux_pipe_status_flags(fd, flags, setfl_mask)
                     },
                     |fd| {
                         toggle_flags!(fd);
@@ -1436,70 +1413,24 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
-
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
-        let (pipe_flags, cloexec) = {
-            use litebox::pipes::Flags;
-            let mut f = Flags::empty();
-            if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement())
-            {
-                return Err(Errno::EINVAL);
-            }
-            f.set(Flags::NON_BLOCKING, flags.contains(OFlags::NONBLOCK));
-            if flags.contains(OFlags::DIRECT) {
-                todo!("O_DIRECT not supported");
-            }
-            (f, flags.contains(OFlags::CLOEXEC))
-        };
-
-        let (writer, reader) = self.global.pipes.create_pipe(
-            DEFAULT_PIPE_BUF_SIZE,
-            pipe_flags,
-            // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
-            core::num::NonZero::new(4096),
-        );
-
-        {
-            let initial_status = OFlags::from(pipe_flags);
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let old = dt.set_entry_metadata(
-                &writer,
-                crate::PipeStatusFlags(initial_status | OFlags::WRONLY),
-            );
-            assert!(old.is_none());
-            let old = dt.set_entry_metadata(
-                &reader,
-                crate::PipeStatusFlags(initial_status | OFlags::RDONLY),
-            );
-            assert!(old.is_none());
-        }
-
-        if cloexec {
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let None = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC) else {
-                unreachable!()
-            };
-            let None = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC) else {
-                unreachable!()
-            };
-        }
+        let pipe = self.global.create_linux_pipe(flags)?;
 
         let files = self.files.borrow();
-        let wr_raw_fd = files.insert_raw_fd(writer).map_err(|writer| {
-            self.global.pipes.close(&writer).unwrap();
+        let wr_raw_fd = files.insert_raw_fd(pipe.writer).map_err(|writer| {
+            self.global.close_linux_pipe(&writer).unwrap();
             Errno::EMFILE
         })?;
-        let rd_raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
+        let rd_raw_fd = files.insert_raw_fd(pipe.reader).map_err(|reader| {
             let writer = files
                 .raw_descriptor_store
                 .write()
                 .fd_consume_raw_integer(wr_raw_fd)
                 .unwrap();
-            self.global.pipes.close(&writer).unwrap();
-            self.global.pipes.close(&reader).unwrap();
+            self.global.close_linux_pipe(&writer).unwrap();
+            self.global.close_linux_pipe(&reader).unwrap();
             Errno::EMFILE
         })?;
         Ok((rd_raw_fd.try_into().unwrap(), wr_raw_fd.try_into().unwrap()))
