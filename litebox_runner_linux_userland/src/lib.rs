@@ -3391,12 +3391,27 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Like `env_flag_enabled` but defaults to `true` when the env var is
+/// unset. Returns `false` only when the var is explicitly set to a
+/// recognised off-value (`"0"`, `"false"`, `"no"`). Use for opt-out
+/// flags where the broker-held codepath is the new default.
+fn env_flag_enabled_default_on(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true)
+}
+
 fn broker_inet_tcp_enabled() -> bool {
-    env_flag_enabled("LITEBOX_BROKER_INET_TCP")
+    // Phase F.1: broker-held outbound TCP is the linux_userland default.
+    // Set LITEBOX_BROKER_INET_TCP=0 to opt back to worker-local smoltcp.
+    env_flag_enabled_default_on("LITEBOX_BROKER_INET_TCP")
 }
 
 fn broker_inet_udp_enabled() -> bool {
-    env_flag_enabled("LITEBOX_BROKER_INET_UDP")
+    // Phase F.1: broker-held UDP is the linux_userland default.
+    // Set LITEBOX_BROKER_INET_UDP=0 to opt back to worker-local smoltcp.
+    env_flag_enabled_default_on("LITEBOX_BROKER_INET_UDP")
 }
 
 fn broker_tcp_conn_accept_or_outbound_enabled() -> bool {
@@ -3530,10 +3545,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     }
 
     fn broker_inet_listener_enabled() -> bool {
-        env_flag_enabled("LITEBOX_BROKER_INET_LISTENER")
+        // Phase F.1: broker-held TCP listeners are the linux_userland default.
+        // Set LITEBOX_BROKER_INET_LISTENER=0 to opt back to worker-local smoltcp.
+        env_flag_enabled_default_on("LITEBOX_BROKER_INET_LISTENER")
     }
 
     fn broker_inet_raw_enabled() -> bool {
+        // Default OFF: raw sockets usually require CAP_NET_RAW which most
+        // sandbox environments don't grant. Opt-in only when the host
+        // explicitly enables it via LITEBOX_BROKER_INET_RAW=1.
         env_flag_enabled("LITEBOX_BROKER_INET_RAW")
     }
 

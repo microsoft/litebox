@@ -1285,6 +1285,8 @@ fn handle_control_connection_inner(
                     | Opcode::InetDgramSetSockOpt
                     | Opcode::InetDgramGetSockOpt
                     | Opcode::InetDgramQueryEvents
+                    | Opcode::InetTcpConnSetSockOpt
+                    | Opcode::InetTcpConnGetSockOpt
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe

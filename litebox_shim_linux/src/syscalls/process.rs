@@ -4446,7 +4446,7 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::Signalfd(_)
                         | crate::RawFdRef::Inotify(_)
                         | crate::RawFdRef::BrokerInetListener(_)
-                        | crate::RawFdRef::BrokerInetDgram(_) => {}
+                        | crate::RawFdRef::BrokerInetDgram(_)
                         | crate::RawFdRef::BrokerInetRaw(_) => {}
                         crate::RawFdRef::Pipes(typed) => {
                             let direction = match self.global.pipes.half_pipe_type(typed) {
