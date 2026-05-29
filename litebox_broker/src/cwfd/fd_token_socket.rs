@@ -1265,6 +1265,7 @@ fn handle_control_connection_inner(
                     | Opcode::InetListenerListen
                     | Opcode::InetListenerAccept
                     | Opcode::InetListenerQueryEvents
+                    | Opcode::InetListenerSetSockOpt
                     | Opcode::InetRawCreate
                     | Opcode::InetRawSendTo
                     | Opcode::InetRawRecvFrom
