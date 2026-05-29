@@ -99,21 +99,21 @@ impl SignalfdFile {
             Err(BrokerOpError::UnknownHandle) => Err(Errno::EBADF),
             Err(BrokerOpError::InvalidValue) => Err(Errno::EINVAL),
             Err(BrokerOpError::WouldBlock) => Err(Errno::EAGAIN),
+            Err(BrokerOpError::PermissionDenied) => Err(Errno::EPERM),
+            Err(BrokerOpError::ProtocolNotSupported) => Err(Errno::EPROTONOSUPPORT),
             Err(BrokerOpError::Io) => Err(Errno::EIO),
         }
     }
 
     pub(crate) fn read_siginfo(&self) -> Result<Option<Vec<u8>>, Errno> {
         match self.provider.read_siginfo(self.common.handle()) {
-            Ok(Some(payload)) => {
-                Ok(Some(payload))
-            }
-            Ok(None) => {
-                Ok(None)
-            }
+            Ok(Some(payload)) => Ok(Some(payload)),
+            Ok(None) => Ok(None),
             Err(BrokerOpError::WouldBlock) => Ok(None),
             Err(BrokerOpError::UnknownHandle) => Err(Errno::EBADF),
             Err(BrokerOpError::InvalidValue) => Err(Errno::EINVAL),
+            Err(BrokerOpError::PermissionDenied) => Err(Errno::EPERM),
+            Err(BrokerOpError::ProtocolNotSupported) => Err(Errno::EPROTONOSUPPORT),
             Err(BrokerOpError::Io) => Err(Errno::EIO),
         }
     }

@@ -20,12 +20,19 @@ const CONNECT_BASIC: HandlerToken<(), BLOut> = HandlerToken::new("broker_listene
 const UDP_RECVFROM_REMOTE_ADDR: HandlerToken<(), BLOut> =
     HandlerToken::new("broker_listener.udp_recvfrom_remote_addr");
 const UDP_TRUNCATION: HandlerToken<(), BLOut> = HandlerToken::new("broker_listener.udp_truncation");
+const RAW_ICMP_ECHO: HandlerToken<(), RawOut> = HandlerToken::new("broker_listener.raw_icmp_echo");
 
 #[derive(Serialize, Deserialize, Debug)]
 struct BLOut {
     bound_port: u16,
     peer_port: u16,
     bytes: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum RawOut {
+    PermissionDenied,
+    EchoSucceeded,
 }
 
 struct Fd(i32);
@@ -281,6 +288,116 @@ async fn handle_listen_basic(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<BLO
         peer_port: sockaddr_to_v4(peer).port(),
         bytes: "accepted".into(),
     })
+}
+
+fn icmp_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+    }
+    if let Some(&byte) = chunks.remainder().first() {
+        sum = sum.wrapping_add(u16::from_be_bytes([byte, 0]) as u32);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+async fn handle_raw_icmp_echo(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<RawOut, HandlerError> {
+    // SAFETY: socket has no pointer arguments.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP) };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EPERM) {
+            return Ok(RawOut::PermissionDenied);
+        }
+        return Err(HandlerError(format!("socket failed: {err}")));
+    }
+    let raw = Fd(fd);
+
+    // SAFETY: fcntl does not dereference pointers for F_GETFL/F_SETFL.
+    let flags = unsafe { libc::fcntl(raw.0, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(raw.0, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
+        return Err(HandlerError(format!(
+            "fcntl nonblock: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let ident = (std::process::id() as u16).to_be_bytes();
+    let seq = 1u16.to_be_bytes();
+    let mut packet = Vec::from([8u8, 0, 0, 0, ident[0], ident[1], seq[0], seq[1]]);
+    packet.extend_from_slice(b"litebox-raw-icmp");
+    let checksum = icmp_checksum(&packet).to_be_bytes();
+    packet[2] = checksum[0];
+    packet[3] = checksum[1];
+
+    let dst = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: `dst` points to a valid sockaddr_in and `packet` is a valid buffer.
+    let sent = unsafe {
+        libc::sendto(
+            raw.0,
+            packet.as_ptr().cast(),
+            packet.len(),
+            0,
+            (&dst as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if sent != packet.len() as isize {
+        return Err(HandlerError(format!(
+            "sendto sent={sent}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut buf = [0u8; 512];
+    loop {
+        // SAFETY: `raw` is valid and `buf` is writable for its full length.
+        let n = unsafe { libc::recv(raw.0, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n > 0 {
+            let n = n as usize;
+            if n >= 28 {
+                let ihl = usize::from(buf[0] & 0x0f) * 4;
+                if ihl >= 20 && n >= ihl + 8 {
+                    let icmp = &buf[ihl..n];
+                    if icmp[0] == 0
+                        && icmp[1] == 0
+                        && icmp[4] == ident[0]
+                        && icmp[5] == ident[1]
+                        && icmp[6] == seq[0]
+                        && icmp[7] == seq[1]
+                    {
+                        return Ok(RawOut::EchoSucceeded);
+                    }
+                }
+            }
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EAGAIN)
+                && err.raw_os_error() != Some(libc::EWOULDBLOCK)
+            {
+                return Err(HandlerError(format!("recv: {err}")));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(HandlerError("timed out waiting for ICMP echo reply".into()));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 async fn handle_connect_basic(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<BLOut, HandlerError> {
@@ -610,6 +727,7 @@ pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
     register_handler!(CONNECT_BASIC, handle_connect_basic);
     register_handler!(UDP_RECVFROM_REMOTE_ADDR, handle_udp_recvfrom_remote_addr);
     register_handler!(UDP_TRUNCATION, handle_udp_truncation);
+    register_handler!(RAW_ICMP_ECHO, handle_raw_icmp_echo);
     reg.single_agent_handler_test(
         "broker_listener",
         "listen_basic",
@@ -660,6 +778,22 @@ pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
                 "bound={} peer={} bytes={}",
                 out.bound_port, out.peer_port, out.bytes
             ))
+        },
+    );
+    reg.single_agent_handler_test(
+        "broker_listener",
+        "raw_icmp_echo",
+        "BL.raw_icmp_echo.pie-glibc.dpg1",
+        AgentName::Dpg1,
+        &RAW_ICMP_ECHO,
+        |out| {
+            // Raw sockets require CAP_NET_RAW; EPERM is the expected PASS outcome
+            // in many Docker/Linux environments, while privileged environments can
+            // exercise the actual loopback echo path.
+            match out {
+                RawOut::PermissionDenied => Ok("raw_icmp=PermissionDenied".to_string()),
+                RawOut::EchoSucceeded => Ok("raw_icmp=EchoSucceeded".to_string()),
+            }
         },
     );
 }

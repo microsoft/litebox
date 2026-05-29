@@ -4447,6 +4447,7 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::Inotify(_)
                         | crate::RawFdRef::BrokerInetListener(_)
                         | crate::RawFdRef::BrokerInetDgram(_) => {}
+                        | crate::RawFdRef::BrokerInetRaw(_) => {}
                         crate::RawFdRef::Pipes(typed) => {
                             let direction = match self.global.pipes.half_pipe_type(typed) {
                                 Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
@@ -6732,6 +6733,9 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         crate::RawFdRef::BrokerInetListener(fd) => {
                             (FdClass::InetListener, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerInetRaw(fd) => {
+                            (FdClass::Other, Some(fd.object_id()), None, None)
                         }
                     }
                 })
@@ -10784,6 +10788,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 crate::RawFdRef::Inotify(_inotify) => false,
                 crate::RawFdRef::BrokerInetListener(_listener) => false,
                 crate::RawFdRef::BrokerInetDgram(_dgram) => false,
+                crate::RawFdRef::BrokerInetRaw(_raw) => false,
             })
         .unwrap_or_else(|_| {
             log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
@@ -10965,6 +10970,7 @@ fn worker_exec_input_binding<FS: ShimFS>(
             crate::RawFdRef::Inotify(_inotify) => WorkerExecInputBinding::Close,
             crate::RawFdRef::BrokerInetListener(_listener) => WorkerExecInputBinding::Close,
             crate::RawFdRef::BrokerInetDgram(_dgram) => WorkerExecInputBinding::Close,
+            crate::RawFdRef::BrokerInetRaw(_raw) => WorkerExecInputBinding::Close,
         })
         .unwrap_or(WorkerExecInputBinding::Close)
 }
@@ -11121,6 +11127,7 @@ fn worker_exec_output_binding<FS: ShimFS>(
             crate::RawFdRef::Inotify(_inotify) => WorkerExecOutputBinding::Close,
             crate::RawFdRef::BrokerInetListener(_listener) => WorkerExecOutputBinding::Close,
             crate::RawFdRef::BrokerInetDgram(_dgram) => WorkerExecOutputBinding::Close,
+            crate::RawFdRef::BrokerInetRaw(_raw) => WorkerExecOutputBinding::Close,
         })
         .unwrap_or(WorkerExecOutputBinding::Close)
 }

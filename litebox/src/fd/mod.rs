@@ -67,6 +67,8 @@ pub enum SubsystemKind {
     BrokerInetListener,
     /// Broker UDP datagram descriptors.
     BrokerInetDgram,
+    /// Broker raw IPv4 socket descriptors.
+    BrokerInetRaw,
     /// Broker TCP connection descriptors.
     BrokerTcpConn,
 }

@@ -14,6 +14,7 @@ extern crate alloc;
 pub mod broker_eventfd_provider;
 pub mod broker_inet_dgram_provider;
 pub mod broker_inet_listener_provider;
+pub mod broker_inet_raw_provider;
 pub mod broker_inotify_provider;
 pub mod broker_pgrp_signal_provider;
 pub mod broker_pidfd_provider;
@@ -3522,9 +3523,18 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
             tracing::warn!(error = %e, "broker_inet_listener provider setup failed");
         }
     }
+    if broker_inet_raw_enabled() {
+        if let Err(e) = setup_broker_inet_raw_provider(&client, &dispatcher) {
+            tracing::warn!(error = %e, "broker_inet_raw provider setup failed");
+        }
+    }
 
     fn broker_inet_listener_enabled() -> bool {
         env_flag_enabled("LITEBOX_BROKER_INET_LISTENER")
+    }
+
+    fn broker_inet_raw_enabled() -> bool {
+        env_flag_enabled("LITEBOX_BROKER_INET_RAW")
     }
 
     fn setup_broker_inet_listener_provider(
@@ -3541,6 +3551,22 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
         );
         litebox_shim_linux::syscalls::set_broker_inet_listener_provider(provider)
             .map_err(|_| anyhow!("inet listener provider already set"))
+    }
+
+    fn setup_broker_inet_raw_provider(
+        client: &Arc<litebox_common_linux::fd_token_client::FdTokenClient>,
+        dispatcher: &Arc<litebox_common_linux::broker_eventfd::NotificationDispatcher>,
+    ) -> anyhow::Result<()> {
+        let provider: Arc<
+            dyn litebox_common_linux::broker_inet_raw_provider::BrokerInetRawProvider,
+        > = Arc::new(
+            crate::broker_inet_raw_provider::RunnerBrokerInetRawProvider::new(
+                Arc::clone(client),
+                Arc::clone(dispatcher),
+            ),
+        );
+        litebox_shim_linux::syscalls::set_broker_inet_raw_provider(provider)
+            .map_err(|_| anyhow!("inet raw provider already set"))
     }
 
     // Install the guest-pid provider against the same fd-token client.

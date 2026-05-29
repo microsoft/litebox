@@ -23,6 +23,7 @@ use crate::cwfd::inet_dgram_state::{InetDgramError, InetDgramState};
 use crate::cwfd::inet_listener_state::{
     InetListenerError, InetListenerState, decode_sockaddr, encode_sockaddr, family_from_u8,
 };
+use crate::cwfd::inet_raw_state::{InetRawError, InetRawState};
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
 use crate::eventfd_state::{EventfdError, EventfdState};
 use crate::inotify_dispatcher::InotifyDispatcher;
@@ -49,27 +50,30 @@ use litebox_common_linux::fd_token_protocol::{
     build_deliver_signal_inbox_response_ok, build_error_response,
     build_inet_listener_accept_response_ok, build_inet_listener_bind_response_ok,
     build_inet_listener_create_response_ok, build_inet_listener_listen_response_ok,
-    build_inet_listener_query_events_response_ok, build_inotify_add_watch_response_ok,
-    build_inotify_init1_response_ok, build_inotify_read_response_ok,
-    build_inotify_rm_watch_response_ok, build_mark_process_exited_response_ok,
-    build_open_pty_slave_response_ok, build_pidfd_exited_response_ok,
-    build_poll_tcp_conn_events_response_ok, build_pty_ioctl_response_ok,
-    build_pty_read_response_ok, build_pty_write_response_ok, build_push_siginfo_response_ok,
-    build_read_eventfd_response_ok, build_read_pipe_response_ok, build_read_siginfo_response_ok,
-    build_read_socketpair_response_ok, build_read_tcp_conn_response_ok,
-    build_register_notification_ring_response_ok, build_register_process_response_ok,
-    build_release_response_ok, build_set_pgid_response_ok, build_set_sid_response_ok,
-    build_shutdown_socketpair_write_response_ok, build_shutdown_tcp_conn_response_ok,
-    build_subscribe_eventfd_response_ok, build_subscribe_process_exit_response_ok,
-    build_subscribe_pty_response_ok, build_subscribe_signal_inbox_response_ok,
-    build_unsubscribe_response_ok, build_unsubscribe_signal_inbox_response_ok,
-    build_write_eventfd_response_ok, build_write_pipe_response_ok,
-    build_write_socketpair_response_ok, build_write_tcp_conn_response_ok,
-    parse_create_eventfd_body, parse_create_pidfd_body, parse_create_pipe_body,
-    parse_create_signalfd_body, parse_create_socketpair_body, parse_deliver_signal_inbox_body,
-    parse_handle_body, parse_inet_listener_accept_body, parse_inet_listener_bind_body,
-    parse_inet_listener_create_body, parse_inet_listener_listen_body,
-    parse_inet_listener_query_events_body, parse_inotify_add_watch_body, parse_inotify_init1_body,
+    build_inet_listener_query_events_response_ok, build_inet_raw_query_events_response_ok,
+    build_inet_raw_recvfrom_response_ok, build_inet_raw_sendto_response_ok,
+    build_inotify_add_watch_response_ok, build_inotify_init1_response_ok,
+    build_inotify_read_response_ok, build_inotify_rm_watch_response_ok,
+    build_mark_process_exited_response_ok, build_open_pty_slave_response_ok,
+    build_pidfd_exited_response_ok, build_poll_tcp_conn_events_response_ok,
+    build_pty_ioctl_response_ok, build_pty_read_response_ok, build_pty_write_response_ok,
+    build_push_siginfo_response_ok, build_read_eventfd_response_ok, build_read_pipe_response_ok,
+    build_read_siginfo_response_ok, build_read_socketpair_response_ok,
+    build_read_tcp_conn_response_ok, build_register_notification_ring_response_ok,
+    build_register_process_response_ok, build_release_response_ok, build_set_pgid_response_ok,
+    build_set_sid_response_ok, build_shutdown_socketpair_write_response_ok,
+    build_shutdown_tcp_conn_response_ok, build_subscribe_eventfd_response_ok,
+    build_subscribe_process_exit_response_ok, build_subscribe_pty_response_ok,
+    build_subscribe_signal_inbox_response_ok, build_unsubscribe_response_ok,
+    build_unsubscribe_signal_inbox_response_ok, build_write_eventfd_response_ok,
+    build_write_pipe_response_ok, build_write_socketpair_response_ok,
+    build_write_tcp_conn_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
+    parse_create_pipe_body, parse_create_signalfd_body, parse_create_socketpair_body,
+    parse_deliver_signal_inbox_body, parse_handle_body, parse_inet_listener_accept_body,
+    parse_inet_listener_bind_body, parse_inet_listener_create_body,
+    parse_inet_listener_listen_body, parse_inet_listener_query_events_body,
+    parse_inet_raw_create_body, parse_inet_raw_query_events_body, parse_inet_raw_recvfrom_body,
+    parse_inet_raw_sendto_body, parse_inotify_add_watch_body, parse_inotify_init1_body,
     parse_inotify_read_body, parse_inotify_rm_watch_body, parse_mark_process_exited_body,
     parse_open_pty_slave_body, parse_pidfd_exited_request, parse_poll_tcp_conn_events_body,
     parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body,
@@ -214,6 +218,10 @@ pub fn handle_request(
         Opcode::InetListenerQueryEvents => {
             handle_inet_listener_query_events(registry, request, in_fds)
         }
+        Opcode::InetRawCreate => handle_inet_raw_create(registry, request, in_fds),
+        Opcode::InetRawSendTo => handle_inet_raw_sendto(registry, request, in_fds),
+        Opcode::InetRawRecvFrom => handle_inet_raw_recvfrom(registry, request, in_fds),
+        Opcode::InetRawQueryEvents => handle_inet_raw_query_events(registry, request, in_fds),
         Opcode::InetTcpConnCreate => handle_inet_tcp_conn_create(
             registry,
             request,
@@ -819,6 +827,7 @@ fn resolve_pipe_read(
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
@@ -844,6 +853,7 @@ fn resolve_pipe_write(
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
@@ -962,6 +972,7 @@ fn resolve_socketpair_end(
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
@@ -1245,6 +1256,7 @@ fn resolve_tcp_conn(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
@@ -1966,6 +1978,141 @@ fn handle_inet_listener_query_events(
     }
 }
 
+fn handle_inet_raw_create(
+    _registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetRawCreateResponse);
+    }
+    let (family, protocol) = match parse_inet_raw_create_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InetRawCreateResponse),
+    };
+    if family_from_u8(family).is_err() {
+        return status_err(Opcode::InetRawCreateResponse, StatusCode::InvalidValue);
+    }
+    if i32::from(protocol) != libc::IPPROTO_ICMP {
+        return status_err(
+            Opcode::InetRawCreateResponse,
+            StatusCode::ProtocolNotSupported,
+        );
+    }
+    status_err(Opcode::InetRawCreateResponse, StatusCode::PermissionDenied)
+}
+
+fn resolve_inet_raw(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+    response: Opcode,
+) -> Result<Arc<InetRawState>, HandlerResult> {
+    let state = match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::InetRaw) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return Err(status_err(response, StatusCode::UnknownHandle));
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            return Err(status_err(response, StatusCode::SubsystemMismatch));
+        }
+        Err(_) => return Err(status_err(response, StatusCode::Internal)),
+    };
+    let StateObjectEnum::InetRaw(raw) = state.as_ref() else {
+        return Err(status_err(response, StatusCode::SubsystemMismatch));
+    };
+    Ok(Arc::clone(raw))
+}
+
+fn handle_inet_raw_sendto(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetRawSendToResponse);
+    }
+    let (handle_id, sockaddr, bytes) = match parse_inet_raw_sendto_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InetRawSendToResponse),
+    };
+    let state = match resolve_inet_raw(registry, handle_id, Opcode::InetRawSendToResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.send_to(&sockaddr, &bytes) {
+        Ok(written) => HandlerResult {
+            #[allow(clippy::cast_possible_truncation)]
+            frame: build_inet_raw_sendto_response_ok(written as u32),
+            out_fd: None,
+        },
+        Err(InetRawError::WouldBlock) => {
+            status_err(Opcode::InetRawSendToResponse, StatusCode::WouldBlock)
+        }
+        Err(InetRawError::InvalidValue) => {
+            status_err(Opcode::InetRawSendToResponse, StatusCode::InvalidValue)
+        }
+        Err(InetRawError::PermissionDenied) => {
+            status_err(Opcode::InetRawSendToResponse, StatusCode::PermissionDenied)
+        }
+    }
+}
+
+fn handle_inet_raw_recvfrom(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetRawRecvFromResponse);
+    }
+    let (handle_id, max_len) = match parse_inet_raw_recvfrom_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InetRawRecvFromResponse),
+    };
+    let state = match resolve_inet_raw(registry, handle_id, Opcode::InetRawRecvFromResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.recv_from(max_len) {
+        Ok((sockaddr, bytes)) => HandlerResult {
+            frame: build_inet_raw_recvfrom_response_ok(&sockaddr, &bytes),
+            out_fd: None,
+        },
+        Err(InetRawError::WouldBlock) => {
+            status_err(Opcode::InetRawRecvFromResponse, StatusCode::WouldBlock)
+        }
+        Err(InetRawError::InvalidValue) => {
+            status_err(Opcode::InetRawRecvFromResponse, StatusCode::InvalidValue)
+        }
+        Err(InetRawError::PermissionDenied) => status_err(
+            Opcode::InetRawRecvFromResponse,
+            StatusCode::PermissionDenied,
+        ),
+    }
+}
+
+fn handle_inet_raw_query_events(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetRawQueryEventsResponse);
+    }
+    let handle_id = match parse_inet_raw_query_events_body(request.body) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::InetRawQueryEventsResponse),
+    };
+    let state = match resolve_inet_raw(registry, handle_id, Opcode::InetRawQueryEventsResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    HandlerResult {
+        frame: build_inet_raw_query_events_response_ok(state.current_events()),
+        out_fd: None,
+    }
+}
+
 fn handle_inotify_init1(
     registry: &BrokerStateRegistry,
     dispatcher: &Arc<InotifyDispatcher>,
@@ -2154,6 +2301,7 @@ fn resolve_pty(
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pidfd(_)

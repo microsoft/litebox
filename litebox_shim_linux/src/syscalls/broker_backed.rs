@@ -250,6 +250,8 @@ pub(crate) fn broker_err_to_errno(err: BrokerOpError) -> Errno {
         BrokerOpError::WouldBlock => Errno::EAGAIN,
         BrokerOpError::InvalidValue => Errno::EINVAL,
         BrokerOpError::UnknownHandle => Errno::EBADF,
+        BrokerOpError::PermissionDenied => Errno::EPERM,
+        BrokerOpError::ProtocolNotSupported => Errno::EPROTONOSUPPORT,
         BrokerOpError::Io => Errno::EIO,
     }
 }

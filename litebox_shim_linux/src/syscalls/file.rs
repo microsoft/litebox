@@ -100,6 +100,9 @@ impl<FS: ShimFS> Task<FS> {
             litebox::fd::SubsystemKind::BrokerInetDgram => (
                 TypeId::of::<super::broker_inet_dgram::BrokerInetDgramFd<Platform>>(),
                 core::any::type_name::<super::broker_inet_dgram::BrokerInetDgramFd<Platform>>(),
+            litebox::fd::SubsystemKind::BrokerInetRaw => (
+                TypeId::of::<super::broker_inet_raw::BrokerInetRawFd<Platform>>(),
+                core::any::type_name::<super::broker_inet_raw::BrokerInetRawFd<Platform>>(),
             ),
             litebox::fd::SubsystemKind::BrokerTcpConn => (
                 TypeId::of::<super::broker_tcp_conn::BrokerTcpConnFd<Platform>>(),
@@ -876,6 +879,7 @@ impl<FS: ShimFS> Task<FS> {
                 | crate::RawFdRef::Inotify(_)
                 | crate::RawFdRef::BrokerInetListener(_)
                 | crate::RawFdRef::BrokerInetDgram(_) => None, // non-PTY descriptor has no PTY rdev,
+                | crate::RawFdRef::BrokerInetRaw(_) => None, // non-PTY descriptor has no PTY rdev,
             })
             .ok()
             .flatten()
@@ -1553,6 +1557,7 @@ impl<FS: ShimFS> Task<FS> {
                     | crate::RawFdRef::Inotify(_)
                     | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                 })?;
                 let file = file?;
                 {
@@ -1644,6 +1649,7 @@ impl<FS: ShimFS> Task<FS> {
                 | crate::RawFdRef::Inotify(_)
                 | crate::RawFdRef::BrokerInetListener(_)
                 | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
             })
             .flatten()
     }
@@ -1735,6 +1741,7 @@ impl<FS: ShimFS> Task<FS> {
                     | crate::RawFdRef::Inotify(_)
                     | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                 })?
             }
         }
@@ -1810,6 +1817,7 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::Inotify(_)
                         | crate::RawFdRef::BrokerInetListener(_)
                         | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                        | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                     })?
                 }
             }
@@ -2177,6 +2185,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 crate::RawFdRef::Inotify(_fd) => Err(Errno::EINVAL),
                 crate::RawFdRef::BrokerInetListener(_fd) => Err(Errno::EINVAL),
+                crate::RawFdRef::BrokerInetRaw(_fd) => Err(Errno::EINVAL),
             })
             .flatten()
     }
@@ -2366,6 +2375,7 @@ impl<FS: ShimFS> Task<FS> {
                 | crate::RawFdRef::Inotify(_)
                 | crate::RawFdRef::BrokerInetListener(_)
                 | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
             })
             .flatten();
         if let Err(Errno::EPIPE) = res {
@@ -2745,6 +2755,7 @@ impl<FS: ShimFS> Task<FS> {
                 | crate::RawFdRef::Inotify(_)
                 | crate::RawFdRef::BrokerInetListener(_)
                 | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
+                | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ESPIPE), // real Linux: ESPIPE for non-seekable fd
             })
             .flatten()
     }
@@ -2945,6 +2956,7 @@ impl<FS: ShimFS> Task<FS> {
                     | crate::RawFdRef::Inotify(_)
                     | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                 })?
             }
         }
@@ -2972,6 +2984,7 @@ impl<FS: ShimFS> Task<FS> {
             | crate::RawFdRef::Inotify(_)
             | crate::RawFdRef::BrokerInetListener(_)
             | crate::RawFdRef::BrokerInetDgram(_) => (),
+            | crate::RawFdRef::BrokerInetRaw(_) => (),
         })?;
         Ok(())
     }
@@ -3055,6 +3068,7 @@ impl<FS: ShimFS> Task<FS> {
             | crate::RawFdRef::Inotify(_)
             | crate::RawFdRef::BrokerInetListener(_)
             | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
         })?
     }
 
@@ -3249,6 +3263,7 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) =
             rds.fd_consume_raw_integer::<super::broker_inet_dgram::BrokerInetDgramSubsystem>(raw_fd)
+            rds.fd_consume_raw_integer::<super::broker_inet_raw::BrokerInetRawSubsystem>(raw_fd)
         {
             drop(rds);
             let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
@@ -3507,6 +3522,7 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
             }
             crate::RawFdRef::BrokerInetDgram(fd) => {
+            crate::RawFdRef::BrokerInetRaw(fd) => {
                 let _old = self
                     .global
                     .litebox
@@ -3800,6 +3816,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 crate::RawFdRef::Inotify(_fd) => Err(Errno::EINVAL),
                 crate::RawFdRef::BrokerInetListener(_fd) => Err(Errno::EINVAL),
+                crate::RawFdRef::BrokerInetRaw(_fd) => Err(Errno::EINVAL),
             })
             .flatten()
     }
@@ -3901,6 +3918,7 @@ fn fcntl_status_flags<FS: ShimFS>(
             crate::RawFdRef::Inotify(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::BrokerInetListener(fd) => getfl_from_handle!(fd),
             crate::RawFdRef::BrokerInetDgram(fd) => getfl_from_handle!(fd),
+            crate::RawFdRef::BrokerInetRaw(fd) => getfl_from_handle!(fd),
         })
         .flatten()
         .map(|flags| flags & OFlags::STATUS_FLAGS_MASK)
@@ -4199,6 +4217,7 @@ impl<FS: ShimFS> Task<FS> {
                 | crate::RawFdRef::Inotify(_)
                 | crate::RawFdRef::BrokerInetListener(_)
                 | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
+                | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::EINVAL), // real Linux: EINVAL for this unsupported fd/syscall combination
             })
             .flatten();
         if let Err(Errno::EPIPE) = res {
@@ -4279,6 +4298,7 @@ impl<FS: ShimFS> Task<FS> {
                     | crate::RawFdRef::Inotify(_)
                     | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => Ok(()),
+                    | crate::RawFdRef::BrokerInetRaw(_) => Ok(()),
                 })?;
             }
             FsPath::FdRelative { fd, path } => {
@@ -4306,6 +4326,7 @@ impl<FS: ShimFS> Task<FS> {
                     | crate::RawFdRef::Inotify(_)
                     | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                 })?;
             }
         };
@@ -4570,6 +4591,7 @@ impl<FS: ShimFS> Task<FS> {
                     | crate::RawFdRef::Inotify(_)
                     | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => (),
+                    | crate::RawFdRef::BrokerInetRaw(_) => (),
                 })?;
                 Err(Errno::ENOENT)
             }
@@ -4606,6 +4628,7 @@ impl<FS: ShimFS> Task<FS> {
                     | crate::RawFdRef::Inotify(_)
                     | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                 })?
             }
         }?;
@@ -4962,6 +4985,7 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                 })
             }
             crate::RawFdRef::BrokerInetDgram(fd) => {
+            crate::RawFdRef::BrokerInetRaw(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 let read_write_mode = Mode::RUSR | Mode::WUSR;
                 Ok(FileStat {
@@ -5038,6 +5062,7 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
             | crate::RawFdRef::Inotify(_)
             | crate::RawFdRef::BrokerInetListener(_)
             | crate::RawFdRef::BrokerInetDgram(_) => false, // host-PTY stat override only applies to FS aliases,
+            | crate::RawFdRef::BrokerInetRaw(_) => false, // host-PTY stat override only applies to FS aliases,
         })?;
         if should_override {
             fstat.st_dev = info.dev.truncate();
@@ -5110,6 +5135,7 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
         crate::RawFdRef::Inotify(fd) => get_flags(global, fd),
         crate::RawFdRef::BrokerInetListener(fd) => get_flags(global, fd),
         crate::RawFdRef::BrokerInetDgram(fd) => get_flags(global, fd),
+        crate::RawFdRef::BrokerInetRaw(fd) => get_flags(global, fd),
     })
 }
 
@@ -5146,6 +5172,7 @@ fn set_file_descriptor_flags<FS: ShimFS>(
         crate::RawFdRef::Inotify(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::BrokerInetListener(fd) => set_flags(global, fd, flags),
         crate::RawFdRef::BrokerInetDgram(fd) => set_flags(global, fd, flags),
+        crate::RawFdRef::BrokerInetRaw(fd) => set_flags(global, fd, flags),
     })?;
     Ok(())
 }
@@ -5407,6 +5434,7 @@ impl<FS: ShimFS> Task<FS> {
                     | crate::RawFdRef::Inotify(_)
                     | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+                    | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
                 })??
             }
         };
@@ -5852,6 +5880,7 @@ impl<FS: ShimFS> Task<FS> {
                         })
                     }
                     crate::RawFdRef::BrokerInetDgram(fd) => {
+                    crate::RawFdRef::BrokerInetRaw(fd) => {
                         let handle = self
                             .global
                             .litebox
@@ -5987,6 +6016,7 @@ impl<FS: ShimFS> Task<FS> {
             | crate::RawFdRef::Inotify(_)
             | crate::RawFdRef::BrokerInetListener(_)
             | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
         })??;
 
         let mut new_cwd = dir_path;
@@ -7051,6 +7081,7 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => {
+                | crate::RawFdRef::BrokerInetRaw(_) => {
                             Err(Errno::ENOTTY)
                         },
                     })
@@ -7274,6 +7305,7 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(())
                         }
                         crate::RawFdRef::BrokerInetDgram(fd) => {
+                        crate::RawFdRef::BrokerInetRaw(fd) => {
                             let handle = self
                                 .global
                                 .litebox
@@ -7405,6 +7437,7 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 }
                 crate::RawFdRef::BrokerInetDgram(fd) => {
+                crate::RawFdRef::BrokerInetRaw(fd) => {
                     let _old = self
                         .global
                         .litebox
@@ -7527,6 +7560,7 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 }
                 crate::RawFdRef::BrokerInetDgram(fd) => {
+                crate::RawFdRef::BrokerInetRaw(fd) => {
                     let _old = self
                         .global
                         .litebox
@@ -7565,6 +7599,7 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => {
+                | crate::RawFdRef::BrokerInetRaw(_) => {
                         Err(Errno::ENOTTY)
                     },
                 })??;
@@ -7670,6 +7705,7 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) | crate::RawFdRef::BrokerInetListener(_)
                     | crate::RawFdRef::BrokerInetDgram(_) => {
+                | crate::RawFdRef::BrokerInetRaw(_) => {
                         Err(Errno::ENOTTY)
                     },
                 })?
@@ -8461,6 +8497,7 @@ impl<FS: ShimFS> Task<FS> {
                 min_fd,
             ),
             crate::RawFdRef::BrokerInetDgram(fd) => dup(
+            crate::RawFdRef::BrokerInetRaw(fd) => dup(
                 &self.global,
                 &files,
                 fd,
@@ -8644,6 +8681,7 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(())
                         }
                         crate::RawFdRef::BrokerInetDgram(fd) => {
+                        crate::RawFdRef::BrokerInetRaw(fd) => {
                             self.global
                                 .litebox
                                 .descriptor_table_mut()
@@ -8790,6 +8828,7 @@ impl<FS: ShimFS> Task<FS> {
             | crate::RawFdRef::Inotify(_)
             | crate::RawFdRef::BrokerInetListener(_)
             | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
+            | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENOTDIR), // real Linux: ENOTDIR for non-directory fd
         })?
     }
 }

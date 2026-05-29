@@ -198,6 +198,15 @@ fn assert_no_unhandled_socket_subsystem<FS: ShimFS>(
              the caller must dispatch broker-backed inet listener fds BEFORE calling with_socket"
         );
     }
+    if rds
+        .fd_from_raw_integer::<crate::syscalls::broker_inet_raw::BrokerInetRawSubsystem>(raw_fd)
+        .is_ok()
+    {
+        panic!(
+            "with_socket: fd={raw_fd} is a BrokerInetRawSubsystem entry — \
+             the caller must dispatch broker-backed inet raw fds BEFORE calling with_socket"
+        );
+    }
     // No socket-like subsystem matched → genuine ENOTSOCK.
 }
 
@@ -1549,7 +1558,45 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         litebox::net::Protocol::Udp
                     }
-                    SockType::Raw => todo!(),
+                    SockType::Raw => {
+                        if !matches!(protocol, IPProtocol::ICMP) {
+                            return Err(Errno::EPROTONOSUPPORT);
+                        }
+                        if let Some(provider) =
+                            crate::syscalls::broker_inet_raw::broker_inet_raw_provider()
+                        {
+                            let mut status = OFlags::empty();
+                            status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                            let handle = provider
+                                .create(0, protocol as u8)
+                                .map_err(super::broker_backed::broker_err_to_errno)?;
+                            let raw =
+                                crate::syscalls::broker_inet_raw::BrokerInetRawFd::<Platform>::new(
+                                    provider,
+                                    handle,
+                                    0,
+                                    protocol as u8,
+                                    status,
+                                );
+                            let mut dt = self.global.litebox.descriptor_table_mut();
+                            let typed = dt
+                                .insert::<crate::syscalls::broker_inet_raw::BrokerInetRawSubsystem>(
+                                    raw,
+                                );
+                            if flags.contains(SockFlags::CLOEXEC) {
+                                let old =
+                                    dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                                assert!(old.is_none());
+                            }
+                            drop(dt);
+                            let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                                Errno::EMFILE
+                            })?;
+                            return Ok(u32::try_from(raw_fd).unwrap());
+                        }
+                        return Err(Errno::EPROTONOSUPPORT);
+                    }
                     _ => unimplemented!(),
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
@@ -2709,6 +2756,7 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 handle.with_entry(|entry| entry.shutdown(how))
             }
+            crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::EINVAL),
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::ENOTSOCK),
         })?
@@ -3111,8 +3159,8 @@ impl<FS: ShimFS> Task<FS> {
                             );
                             Ok(true)
                         }
-                        crate::RawFdRef::BrokerPty(_) => {
-                            // Broker ptys are not broker-token-transferable over SCM yet.
+                        crate::RawFdRef::BrokerPty(_) | crate::RawFdRef::BrokerInetRaw(_) => {
+                            // Broker ptys/raw sockets are not broker-token-transferable over SCM yet.
                             Ok(false)
                         }
                         crate::RawFdRef::BrokerInetListener(typed) => {
@@ -3885,7 +3933,8 @@ impl<FS: ShimFS> Task<FS> {
                     | SubsystemTag::Timerfd
                     | SubsystemTag::Inotify
                     | SubsystemTag::Pipe
-                    | SubsystemTag::Pty => {
+                    | SubsystemTag::Pty
+                    | SubsystemTag::InetRaw => {
                         // Reserved for P2.A/B/C and later phases.
                         // Until those subphases land, the receive
                         // path drops the fd cleanly rather than
