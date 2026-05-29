@@ -219,7 +219,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
             .ok_or(BrokerError::UnknownObject)?;
         debug_assert_eq!(reference.reference_generation, FIRST_REFERENCE_GENERATION);
         if reference.owner != association {
-            return Err(BrokerError::InvalidRights);
+            return Err(BrokerError::UnknownObject);
         }
         if reference.reference_generation != handle.reference_generation
             || reference.object_generation != handle.object_generation

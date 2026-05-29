@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_rejects_handle_owned_by_another_association() {
+    fn wait_hides_handle_owned_by_another_association() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
         let owner = core
             .create_connection(CallerCredential::Unauthenticated)
@@ -168,7 +168,7 @@ mod tests {
 
         assert_eq!(
             core.wait_event(&other, handle),
-            Err(BrokerError::InvalidRights)
+            Err(BrokerError::UnknownObject)
         );
     }
 }

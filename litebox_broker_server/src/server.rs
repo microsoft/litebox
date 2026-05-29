@@ -558,7 +558,7 @@ mod tests {
         );
         assert_eq!(
             dispatch.response,
-            BrokerResponse::Error(ErrorCode::InvalidRights)
+            BrokerResponse::Error(ErrorCode::UnknownObject)
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
     }
