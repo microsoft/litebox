@@ -1185,7 +1185,7 @@ where
         }
         let end = offset + iov.iov_len;
         let mut byte_offset: isize = 0;
-        for byte in data[offset..end].iter_mut() {
+        for byte in &mut data[offset..end] {
             *byte = iov
                 .iov_base
                 .read_at_offset(byte_offset)
