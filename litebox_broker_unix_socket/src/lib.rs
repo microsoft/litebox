@@ -1,31 +1,32 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Unix-domain-socket broker transport for hosted userland deployments.
+//! Unix-domain-socket broker channel for hosted userland deployments.
 //!
 //! This crate deliberately uses `std` because Unix-domain sockets and `std::io`
 //! framing are hosted userland concerns. Portable broker interfaces live in the
-//! no_std protocol, wire, transport, client, core, and server crates.
+//! no_std protocol, wire, channel, client, core, and server crates.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
-use litebox_broker_transport::{
-    ClientTransport, PeerCredential, ReceivedRequest, ReceivedResponse, ServerTransport,
+use litebox_broker_channel::{
+    ClientControlChannel, PeerCredential, ReceivedBrokerRequest, ReceivedBrokerResponse,
+    ServerControlChannel,
 };
+use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
 use litebox_broker_wire::{decode_request, decode_response, encode_request, encode_response};
 
 const MAX_FRAME_LEN: usize = 64 * 1024;
 
-/// Client-side Unix-domain-socket transport for the hosted userland POC.
-pub struct UnixStreamClientTransport {
+/// Client-side Unix-domain-socket control channel for the hosted userland POC.
+pub struct UnixStreamClientControlChannel {
     stream: UnixStream,
 }
 
-impl UnixStreamClientTransport {
-    /// Creates a client transport from an already-connected Unix stream.
+impl UnixStreamClientControlChannel {
+    /// Creates a client control channel from an already-connected Unix stream.
     pub const fn from_connected(stream: UnixStream) -> Self {
         Self { stream }
     }
@@ -36,19 +37,19 @@ impl UnixStreamClientTransport {
     }
 }
 
-/// Server-side Unix-domain-socket transport for the hosted userland POC.
-pub struct UnixStreamServerTransport {
+/// Server-side Unix-domain-socket control channel for the hosted userland POC.
+pub struct UnixStreamServerControlChannel {
     stream: UnixStream,
 }
 
-impl UnixStreamServerTransport {
-    /// Creates a server transport from an accepted Unix stream.
+impl UnixStreamServerControlChannel {
+    /// Creates a server control channel from an accepted Unix stream.
     pub const fn from_accepted(stream: UnixStream) -> Self {
         Self { stream }
     }
 }
 
-impl ClientTransport for UnixStreamClientTransport {
+impl ClientControlChannel for UnixStreamClientControlChannel {
     type Error = io::Error;
 
     fn send_request(&mut self, request: &BrokerRequest) -> io::Result<()> {
@@ -58,7 +59,7 @@ impl ClientTransport for UnixStreamClientTransport {
         )
     }
 
-    fn recv_response(&mut self) -> io::Result<Option<ReceivedResponse>> {
+    fn recv_response(&mut self) -> io::Result<Option<ReceivedBrokerResponse>> {
         let Some(frame) = read_frame(&mut self.stream)? else {
             return Ok(None);
         };
@@ -66,14 +67,14 @@ impl ClientTransport for UnixStreamClientTransport {
     }
 }
 
-impl ServerTransport for UnixStreamServerTransport {
+impl ServerControlChannel for UnixStreamServerControlChannel {
     type Error = io::Error;
 
     fn peer_credential(&self) -> io::Result<PeerCredential> {
         Ok(PeerCredential::Unauthenticated)
     }
 
-    fn recv_request(&mut self) -> io::Result<Option<ReceivedRequest>> {
+    fn recv_request(&mut self) -> io::Result<Option<ReceivedBrokerRequest>> {
         let Some(frame) = read_frame(&mut self.stream)? else {
             return Ok(None);
         };

@@ -1,12 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Protocol- and transport-independent broker authority core.
+//! Protocol- and channel-independent broker authority core.
 //!
 //! `litebox_broker_core` owns broker-side object identity, reference lifetime,
 //! rights checks, reference generation checks, and policy calls. It deliberately has no
 //! dependency on protocol request/response types, Unix sockets, shared-memory
-//! rings, or any other transport.
+//! rings, kernel traps, or any other channel implementation.
 
 #![no_std]
 
@@ -38,7 +38,7 @@ pub use types::{ObjectRights, ObjectType};
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
 
-/// Transport-independent broker authority state.
+/// Channel-independent broker authority state.
 pub struct BrokerCore<P> {
     policy: P,
     next_process_id: u64,

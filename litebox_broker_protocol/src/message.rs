@@ -30,6 +30,10 @@ pub enum WaitOutcome {
 }
 
 /// Broker request transported over the control channel.
+///
+/// The outer broker request is intentionally small. Object-family and
+/// domain-specific operations are grouped below it so new object families do not
+/// accumulate as unrelated top-level broker variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BrokerRequest {
@@ -38,21 +42,41 @@ pub enum BrokerRequest {
         /// Required protocol version.
         protocol_version: ProtocolVersion,
     },
+    /// BrokerCore authority request.
+    Core(CoreRequest),
+}
+
+/// Request adapted by the broker server into a BrokerCore domain call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CoreRequest {
+    /// Event object request family.
+    Event(EventRequest),
+}
+
+/// Broker-owned event object request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EventRequest {
     /// Create a broker-owned event object.
-    CreateEvent,
+    Create,
     /// Check whether an event wait would complete now.
-    WaitEvent {
+    Wait {
         /// Event handle.
         handle: ObjectHandle,
     },
     /// Signal an event.
-    SignalEvent {
+    Signal {
         /// Event handle.
         handle: ObjectHandle,
     },
 }
 
 /// Broker response transported over the control channel.
+///
+/// Common connection/protocol outcomes stay at this layer. Domain payloads are
+/// grouped under [`CoreResponse`] so future object families can evolve without
+/// turning the broker envelope into a flat operation/result list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BrokerResponse {
@@ -74,12 +98,28 @@ pub enum BrokerResponse {
         /// Broker protocol version supported by this endpoint.
         broker_protocol_version: ProtocolVersion,
     },
-    /// Operation returned a broker object handle.
-    Handle(ObjectHandle),
-    /// Operation returned readiness state.
-    Readiness(ReadinessState),
-    /// Operation returned wait state.
-    Wait(WaitOutcome),
+    /// BrokerCore authority response.
+    Core(CoreResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
+}
+
+/// Response returned by a BrokerCore domain request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CoreResponse {
+    /// Event object response family.
+    Event(EventResponse),
+}
+
+/// Broker-owned event object response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EventResponse {
+    /// Operation returned a broker object handle.
+    Created { handle: ObjectHandle },
+    /// Operation returned readiness state.
+    Signaled { readiness: ReadinessState },
+    /// Operation returned wait state.
+    Wait { outcome: WaitOutcome },
 }

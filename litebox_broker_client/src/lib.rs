@@ -3,9 +3,9 @@
 
 //! Typed client adapter for broker requests.
 //!
-//! The client owns request/response sequencing but does not own a transport.
-//! Userland, kernel, or ring-buffer deployments can provide transports by
-//! implementing [`litebox_broker_transport::ClientTransport`].
+//! The client owns request/response sequencing but does not own a channel.
+//! Userland, kernel, or ring-buffer deployments can provide channels by
+//! implementing [`litebox_broker_channel::ClientControlChannel`].
 
 #![no_std]
 
@@ -16,8 +16,8 @@ mod error;
 mod event;
 mod negotiate;
 
+use litebox_broker_channel::{ClientControlChannel, ReceivedBrokerResponse};
 use litebox_broker_protocol::{BrokerRequest, BrokerResponse, ProtocolVersion};
-use litebox_broker_transport::{ClientTransport, ReceivedResponse};
 
 pub use error::{ClientError, Result};
 
@@ -26,7 +26,7 @@ pub const CLIENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);
 
 /// Typed client for broker operations.
 pub struct BrokerClient<T> {
-    transport: T,
+    channel: T,
     state: ConnectionState,
 }
 
@@ -39,16 +39,16 @@ enum ConnectionState {
 }
 
 impl<T> BrokerClient<T> {
-    /// Creates a broker client over an already-connected transport.
-    pub const fn new(transport: T) -> Self {
+    /// Creates a broker client over an already-connected control channel.
+    pub const fn new(channel: T) -> Self {
         Self {
-            transport,
+            channel,
             state: ConnectionState::AwaitingNegotiation,
         }
     }
 }
 
-impl<T: ClientTransport> BrokerClient<T> {
+impl<T: ClientControlChannel> BrokerClient<T> {
     /// Returns the effective protocol version this connection negotiated.
     ///
     /// Feature gating must use this effective version because the broker may
@@ -72,19 +72,19 @@ impl<T: ClientTransport> BrokerClient<T> {
     }
 
     pub(crate) fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
-        self.transport
+        self.channel
             .send_request(&request)
-            .map_err(ClientError::Transport)?;
+            .map_err(ClientError::Channel)?;
         match self
-            .transport
+            .channel
             .recv_response()
-            .map_err(ClientError::Transport)?
-            .ok_or(ClientError::TransportClosed)?
+            .map_err(ClientError::Channel)?
+            .ok_or(ClientError::ChannelClosed)?
         {
-            ReceivedResponse::Response(BrokerResponse::Error(error)) => {
+            ReceivedBrokerResponse::Response(BrokerResponse::Error(error)) => {
                 Err(ClientError::Broker(error))
             }
-            ReceivedResponse::Response(response) => Ok(response),
+            ReceivedBrokerResponse::Response(response) => Ok(response),
             _ => Err(ClientError::UnknownResponse),
         }
     }
@@ -98,14 +98,15 @@ mod tests {
 
     #[test]
     fn event_operations_require_negotiation_without_sending() {
-        let transport = FakeTransport::new(Some(BrokerResponse::Error(ErrorCode::ProtocolState)));
-        let mut client = BrokerClient::new(transport);
+        let channel =
+            FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::ProtocolState)));
+        let mut client = BrokerClient::new(channel);
 
         assert!(matches!(
             client.create_event(),
             Err(ClientError::NotNegotiated)
         ));
-        assert_eq!(client.transport.sent_request, None);
+        assert_eq!(client.channel.sent_request, None);
     }
 
     #[test]
@@ -114,14 +115,14 @@ mod tests {
             CLIENT_PROTOCOL_VERSION.major,
             CLIENT_PROTOCOL_VERSION.minor - 1,
         );
-        let transport = FakeTransport::new(Some(BrokerResponse::Negotiated {
+        let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
             broker_protocol_version: CLIENT_PROTOCOL_VERSION,
         }));
-        let mut client = BrokerClient::new(transport);
+        let mut client = BrokerClient::new(channel);
 
         assert_eq!(client.negotiate_version(requested).unwrap(), requested);
         assert_eq!(
-            client.transport.sent_request,
+            client.channel.sent_request,
             Some(BrokerRequest::Negotiate {
                 protocol_version: requested
             })
@@ -132,10 +133,10 @@ mod tests {
     #[test]
     fn negotiate_version_rejects_incompatible_broker_response() {
         let requested = ProtocolVersion::new(1, 1);
-        let transport = FakeTransport::new(Some(BrokerResponse::Negotiated {
+        let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
             broker_protocol_version: ProtocolVersion::new(1, 0),
         }));
-        let mut client = BrokerClient::new(transport);
+        let mut client = BrokerClient::new(channel);
 
         assert!(matches!(
             client.negotiate_version(requested),
@@ -155,10 +156,10 @@ mod tests {
             CLIENT_PROTOCOL_VERSION.minor + 1,
         );
         let fallback = CLIENT_PROTOCOL_VERSION;
-        let transport = FakeTransport::new(Some(BrokerResponse::VersionMismatch {
+        let channel = FakeControlChannel::new(Some(BrokerResponse::VersionMismatch {
             broker_protocol_version: fallback,
         }));
-        let mut client = BrokerClient::new(transport);
+        let mut client = BrokerClient::new(channel);
 
         assert!(matches!(
             client.negotiate_version(too_new),
@@ -169,7 +170,7 @@ mod tests {
         ));
         assert_eq!(client.negotiated_protocol_version(), None);
 
-        client.transport.response = Some(BrokerResponse::Negotiated {
+        client.channel.response = Some(BrokerResponse::Negotiated {
             broker_protocol_version: fallback,
         });
 
@@ -177,12 +178,12 @@ mod tests {
         assert_eq!(client.negotiated_protocol_version(), Some(fallback));
     }
 
-    struct FakeTransport {
+    struct FakeControlChannel {
         sent_request: Option<BrokerRequest>,
         response: Option<BrokerResponse>,
     }
 
-    impl FakeTransport {
+    impl FakeControlChannel {
         const fn new(response: Option<BrokerResponse>) -> Self {
             Self {
                 sent_request: None,
@@ -191,7 +192,7 @@ mod tests {
         }
     }
 
-    impl ClientTransport for FakeTransport {
+    impl ClientControlChannel for FakeControlChannel {
         type Error = Infallible;
 
         fn send_request(
@@ -202,8 +203,10 @@ mod tests {
             Ok(())
         }
 
-        fn recv_response(&mut self) -> core::result::Result<Option<ReceivedResponse>, Self::Error> {
-            Ok(self.response.take().map(ReceivedResponse::Response))
+        fn recv_response(
+            &mut self,
+        ) -> core::result::Result<Option<ReceivedBrokerResponse>, Self::Error> {
+            Ok(self.response.take().map(ReceivedBrokerResponse::Response))
         }
     }
 }

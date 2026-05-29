@@ -3,7 +3,7 @@
 
 //! Shared broker protocol types.
 //!
-//! This crate is intentionally transport-neutral. It describes broker-visible
+//! This crate is intentionally channel-neutral. It describes broker-visible
 //! opaque handles, errors, and versions, but does not know whether the bytes
 //! move over Unix sockets, shared rings, kernel traps, or another IPC mechanism.
 
@@ -14,7 +14,10 @@ mod message;
 mod object;
 
 pub use error::ErrorCode;
-pub use message::{BrokerRequest, BrokerResponse, ReadinessState, WaitOutcome};
+pub use message::{
+    BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, EventRequest, EventResponse,
+    ReadinessState, WaitOutcome,
+};
 pub use object::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
 
 /// Major/minor broker protocol version.

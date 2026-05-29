@@ -9,14 +9,14 @@ use litebox_broker_protocol::{BrokerResponse, ErrorCode, ProtocolVersion};
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ClientError<E> {
-    /// The transport failed.
-    Transport(E),
+    /// The control channel failed.
+    Channel(E),
     /// An operation requiring an active broker session was called before negotiation.
     NotNegotiated,
     /// Negotiation was requested after the client was already active.
     AlreadyNegotiated,
-    /// The broker closed the transport before returning a response.
-    TransportClosed,
+    /// The broker closed the channel before returning a response.
+    ChannelClosed,
     /// The broker returned a response this client does not understand.
     UnknownResponse,
     /// The broker accepted negotiation with a version that cannot serve the request.
@@ -42,10 +42,10 @@ pub enum ClientError<E> {
 impl<E: fmt::Display> fmt::Display for ClientError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Transport(error) => write!(f, "broker transport failed: {error}"),
+            Self::Channel(error) => write!(f, "broker channel failed: {error}"),
             Self::NotNegotiated => write!(f, "broker client has not negotiated protocol version"),
             Self::AlreadyNegotiated => f.write_str("broker client already negotiated"),
-            Self::TransportClosed => write!(f, "broker closed the transport"),
+            Self::ChannelClosed => write!(f, "broker closed the channel"),
             Self::UnknownResponse => f.write_str("unknown broker response"),
             Self::IncompatibleNegotiation {
                 requested,
@@ -75,11 +75,11 @@ where
 {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Transport(error) => Some(error),
+            Self::Channel(error) => Some(error),
             Self::Broker(error) => Some(error),
             Self::NotNegotiated
             | Self::AlreadyNegotiated
-            | Self::TransportClosed
+            | Self::ChannelClosed
             | Self::UnknownResponse
             | Self::IncompatibleNegotiation { .. }
             | Self::UnsupportedVersion { .. }

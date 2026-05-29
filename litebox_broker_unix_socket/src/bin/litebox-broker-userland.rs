@@ -8,15 +8,15 @@ use std::path::PathBuf;
 
 use litebox_broker_core::{BrokerCore, EventOnlyPolicy};
 use litebox_broker_server::{BrokerServeError, serve_connection};
-use litebox_broker_unix_socket::UnixStreamServerTransport;
+use litebox_broker_unix_socket::UnixStreamServerControlChannel;
 
 fn main() -> io::Result<()> {
     let args = Args::parse(env::args().skip(1))?;
     let listener = UnixListener::bind(&args.socket_path)?;
     let (stream, _) = listener.accept()?;
-    let mut transport = UnixStreamServerTransport::from_accepted(stream);
+    let mut channel = UnixStreamServerControlChannel::from_accepted(stream);
     let mut broker = BrokerCore::new(EventOnlyPolicy);
-    serve_connection(&mut broker, &mut transport)
+    serve_connection(&mut broker, &mut channel)
         .map(|_| ())
         .map_err(broker_error)
 }
@@ -24,7 +24,7 @@ fn main() -> io::Result<()> {
 fn broker_error(error: BrokerServeError<io::Error>) -> io::Error {
     match error {
         BrokerServeError::ConnectionSetup => io::Error::other("broker connection setup failed"),
-        BrokerServeError::Transport(error) => error,
+        BrokerServeError::Channel(error) => error,
         error => io::Error::other(error.to_string()),
     }
 }

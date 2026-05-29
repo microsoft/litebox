@@ -3,6 +3,7 @@
 
 use core::fmt;
 
+use litebox_broker_channel::{PeerCredential, ReceivedBrokerRequest, ServerControlChannel};
 use litebox_broker_core::{
     BrokerConnection, BrokerCore, BrokerError, CallerCredential, ObjectHandle as CoreObjectHandle,
     ObjectReferenceGeneration as CoreObjectReferenceGeneration,
@@ -10,61 +11,58 @@ use litebox_broker_core::{
     WaitOutcome as CoreWaitOutcome,
 };
 use litebox_broker_protocol::{
-    BrokerRequest, BrokerResponse, ErrorCode, ObjectHandle as ProtocolObjectHandle,
+    BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, ErrorCode, EventRequest,
+    EventResponse, ObjectHandle as ProtocolObjectHandle,
     ObjectReferenceGeneration as ProtocolObjectReferenceGeneration,
     ObjectReferenceId as ProtocolObjectReferenceId, ProtocolVersion,
     ReadinessState as ProtocolReadinessState, WaitOutcome as ProtocolWaitOutcome,
 };
-use litebox_broker_transport::{PeerCredential, ReceivedRequest, ServerTransport};
 
 /// Protocol version this broker server implementation supports.
 pub const SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);
 
-/// Serves one broker connection over the provided connected transport.
+/// Serves one broker connection over the provided connected control channel.
 pub fn serve_connection<P, T>(
     core: &mut BrokerCore<P>,
-    transport: &mut T,
+    channel: &mut T,
 ) -> Result<ConnectionTermination, BrokerServeError<T::Error>>
 where
     P: PolicyEngine,
-    T: ServerTransport,
+    T: ServerControlChannel,
 {
-    let peer_credential = transport
+    let peer_credential = channel
         .peer_credential()
-        .map_err(BrokerServeError::Transport)?;
+        .map_err(BrokerServeError::Channel)?;
     let caller_credential = caller_credential_from_peer(peer_credential)
         .map_err(|()| BrokerServeError::ConnectionSetup)?;
     let connection = core
         .create_connection(caller_credential)
         .map_err(|_error| BrokerServeError::ConnectionSetup)?;
 
-    let result = serve_request_loop(core, transport, &connection);
+    let result = serve_request_loop(core, channel, &connection);
     core.close_connection(connection);
     result
 }
 
 fn serve_request_loop<P, T>(
     core: &mut BrokerCore<P>,
-    transport: &mut T,
+    channel: &mut T,
     connection: &BrokerConnection,
 ) -> Result<ConnectionTermination, BrokerServeError<T::Error>>
 where
     P: PolicyEngine,
-    T: ServerTransport,
+    T: ServerControlChannel,
 {
     let mut state = ConnectionState::AwaitingNegotiation;
     loop {
-        let Some(received) = transport
-            .recv_request()
-            .map_err(BrokerServeError::Transport)?
-        else {
+        let Some(received) = channel.recv_request().map_err(BrokerServeError::Channel)? else {
             break;
         };
 
         let dispatch = handle_received_request(core, connection, &mut state, received);
-        transport
+        channel
             .send_response(&dispatch.response)
-            .map_err(BrokerServeError::Transport)?;
+            .map_err(BrokerServeError::Channel)?;
         if let DispatchOutcome::Close(reason) = dispatch.outcome {
             return Ok(ConnectionTermination::BrokerClosed(reason));
         }
@@ -85,10 +83,10 @@ fn handle_received_request<P: PolicyEngine>(
     core: &mut BrokerCore<P>,
     connection: &BrokerConnection,
     state: &mut ConnectionState,
-    received: ReceivedRequest,
+    received: ReceivedBrokerRequest,
 ) -> BrokerDispatch {
     match received {
-        ReceivedRequest::Request(request) => handle_request(core, connection, state, request),
+        ReceivedBrokerRequest::Request(request) => handle_request(core, connection, state, request),
         _ => handle_unknown_request(*state),
     }
 }
@@ -126,20 +124,36 @@ fn handle_active_request<P: PolicyEngine>(
             BrokerResponse::Error(ErrorCode::ProtocolState),
             CloseReason::ProtocolViolation,
         ),
-        BrokerRequest::CreateEvent => BrokerDispatch::continue_after(handle_core_result(
-            core.create_event(connection),
-            |handle| BrokerResponse::Handle(protocol_handle(handle)),
-        )),
-        BrokerRequest::WaitEvent { handle } => BrokerDispatch::continue_after(handle_wait_result(
-            core.wait_event(connection, core_handle(handle)),
-        )),
-        BrokerRequest::SignalEvent { handle } => {
-            BrokerDispatch::continue_after(handle_core_result(
-                core.signal_event(connection, core_handle(handle)),
-                |readiness| BrokerResponse::Readiness(protocol_readiness_state(readiness)),
-            ))
+        BrokerRequest::Core(CoreRequest::Event(request)) => {
+            BrokerDispatch::continue_after(handle_event_request(core, connection, request))
         }
         _ => BrokerDispatch::continue_after(BrokerResponse::Error(ErrorCode::UnsupportedOperation)),
+    }
+}
+
+fn handle_event_request<P: PolicyEngine>(
+    core: &mut BrokerCore<P>,
+    connection: &BrokerConnection,
+    request: EventRequest,
+) -> BrokerResponse {
+    match request {
+        EventRequest::Create => handle_core_result(core.create_event(connection), |handle| {
+            event_response(EventResponse::Created {
+                handle: protocol_handle(handle),
+            })
+        }),
+        EventRequest::Wait { handle } => {
+            handle_wait_result(core.wait_event(connection, core_handle(handle)))
+        }
+        EventRequest::Signal { handle } => handle_core_result(
+            core.signal_event(connection, core_handle(handle)),
+            |readiness| {
+                event_response(EventResponse::Signaled {
+                    readiness: protocol_readiness_state(readiness),
+                })
+            },
+        ),
+        _ => BrokerResponse::Error(ErrorCode::UnsupportedOperation),
     }
 }
 
@@ -185,11 +199,15 @@ fn handle_core_result<T>(
 fn handle_wait_result(result: litebox_broker_core::Result<CoreWaitOutcome>) -> BrokerResponse {
     match result {
         Ok(outcome) => match protocol_wait_outcome(outcome) {
-            Some(outcome) => BrokerResponse::Wait(outcome),
+            Some(outcome) => event_response(EventResponse::Wait { outcome }),
             None => BrokerResponse::Error(ErrorCode::Internal),
         },
         Err(error) => BrokerResponse::Error(protocol_error(error)),
     }
+}
+
+const fn event_response(response: EventResponse) -> BrokerResponse {
+    BrokerResponse::Core(CoreResponse::Event(response))
 }
 
 fn protocol_error(error: BrokerError) -> ErrorCode {
@@ -274,8 +292,6 @@ impl BrokerDispatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CloseReason {
-    /// The peer requested an unsupported protocol version.
-    UnsupportedVersion,
     /// The peer violated the request sequencing state machine.
     ProtocolViolation,
 }
@@ -283,7 +299,6 @@ pub enum CloseReason {
 impl fmt::Display for CloseReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedVersion => f.write_str("unsupported protocol version"),
             Self::ProtocolViolation => f.write_str("protocol violation"),
         }
     }
@@ -293,7 +308,7 @@ impl fmt::Display for CloseReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionTermination {
-    /// The peer cleanly closed the transport.
+    /// The peer cleanly closed the channel.
     PeerClosed,
     /// The server sent a terminal protocol response and closed the connection.
     BrokerClosed(CloseReason),
@@ -305,15 +320,15 @@ pub enum ConnectionTermination {
 pub enum BrokerServeError<E> {
     /// The server could not allocate or map state for a new connection.
     ConnectionSetup,
-    /// The concrete transport failed.
-    Transport(E),
+    /// The concrete channel failed.
+    Channel(E),
 }
 
 impl<E: fmt::Display> fmt::Display for BrokerServeError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConnectionSetup => f.write_str("broker connection setup failed"),
-            Self::Transport(error) => write!(f, "broker transport failed: {error}"),
+            Self::Channel(error) => write!(f, "broker channel failed: {error}"),
         }
     }
 }
@@ -325,7 +340,7 @@ where
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::ConnectionSetup => None,
-            Self::Transport(error) => Some(error),
+            Self::Channel(error) => Some(error),
         }
     }
 }
@@ -343,7 +358,7 @@ mod tests {
             &mut core,
             &connection,
             &mut state,
-            BrokerRequest::CreateEvent,
+            event_request(EventRequest::Create),
         );
 
         assert_eq!(
@@ -467,8 +482,12 @@ mod tests {
         let (mut core, connection, mut state) = new_connection();
         negotiate(&mut core, &connection, &mut state);
 
-        let dispatch =
-            handle_received_request(&mut core, &connection, &mut state, ReceivedRequest::Unknown);
+        let dispatch = handle_received_request(
+            &mut core,
+            &connection,
+            &mut state,
+            ReceivedBrokerRequest::Unknown,
+        );
 
         assert_eq!(
             dispatch.response,
@@ -481,8 +500,12 @@ mod tests {
     fn dispatch_closes_unknown_requests_before_negotiation() {
         let (mut core, connection, mut state) = new_connection();
 
-        let dispatch =
-            handle_received_request(&mut core, &connection, &mut state, ReceivedRequest::Unknown);
+        let dispatch = handle_received_request(
+            &mut core,
+            &connection,
+            &mut state,
+            ReceivedBrokerRequest::Unknown,
+        );
 
         assert_eq!(
             dispatch.response,
@@ -524,10 +547,10 @@ mod tests {
             &mut core,
             &connection,
             &mut state,
-            BrokerRequest::CreateEvent,
+            event_request(EventRequest::Create),
         );
         let handle = match dispatch.response {
-            BrokerResponse::Handle(handle) => handle,
+            BrokerResponse::Core(CoreResponse::Event(EventResponse::Created { handle })) => handle,
             response => panic!("unexpected response: {response:?}"),
         };
 
@@ -535,13 +558,13 @@ mod tests {
             &mut core,
             &connection,
             &mut state,
-            BrokerRequest::WaitEvent { handle },
+            event_request(EventRequest::Wait { handle }),
         );
         assert_eq!(
             dispatch.response,
-            BrokerResponse::Wait(ProtocolWaitOutcome::WouldBlock(
-                ProtocolReadinessState::new(false, 0)
-            ))
+            event_response(EventResponse::Wait {
+                outcome: ProtocolWaitOutcome::WouldBlock(ProtocolReadinessState::new(false, 0))
+            })
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
     }
@@ -564,10 +587,10 @@ mod tests {
             &mut core,
             &owner,
             &mut owner_state,
-            BrokerRequest::CreateEvent,
+            event_request(EventRequest::Create),
         );
         let handle = match dispatch.response {
-            BrokerResponse::Handle(handle) => handle,
+            BrokerResponse::Core(CoreResponse::Event(EventResponse::Created { handle })) => handle,
             response => panic!("unexpected response: {response:?}"),
         };
 
@@ -575,7 +598,7 @@ mod tests {
             &mut core,
             &other,
             &mut other_state,
-            BrokerRequest::WaitEvent { handle },
+            event_request(EventRequest::Wait { handle }),
         );
         assert_eq!(
             dispatch.response,
@@ -643,5 +666,9 @@ mod tests {
                 negotiated_protocol_version: SUPPORTED_PROTOCOL_VERSION
             }
         );
+    }
+
+    const fn event_request(request: EventRequest) -> BrokerRequest {
+        BrokerRequest::Core(CoreRequest::Event(request))
     }
 }

@@ -3,11 +3,11 @@
 
 use litebox_broker_protocol::{BrokerRequest, BrokerResponse, ProtocolVersion};
 
-use litebox_broker_transport::ClientTransport;
+use litebox_broker_channel::ClientControlChannel;
 
 use crate::{BrokerClient, CLIENT_PROTOCOL_VERSION, ClientError, Result};
 
-impl<T: ClientTransport> BrokerClient<T> {
+impl<T: ClientControlChannel> BrokerClient<T> {
     /// Negotiates the default client protocol version.
     ///
     /// Returns the effective protocol version this connection will speak.

@@ -12,14 +12,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use litebox_broker_client::BrokerClient;
 use litebox_broker_protocol::{ReadinessState, WaitOutcome};
 use litebox_broker_server::SUPPORTED_PROTOCOL_VERSION;
-use litebox_broker_unix_socket::UnixStreamClientTransport;
+use litebox_broker_unix_socket::UnixStreamClientControlChannel;
 
 #[test]
 fn separate_process_broker_serves_event_object_requests() {
     let socket_path = unique_socket_path();
     let mut child = spawn_broker(&socket_path);
-    let transport = connect_with_retry(&socket_path).unwrap();
-    let mut client = BrokerClient::new(transport);
+    let channel = connect_with_retry(&socket_path).unwrap();
+    let mut client = BrokerClient::new(channel);
 
     assert_eq!(client.negotiate().unwrap(), SUPPORTED_PROTOCOL_VERSION);
 
@@ -52,11 +52,11 @@ fn spawn_broker(socket_path: &Path) -> Child {
         .unwrap()
 }
 
-fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamClientTransport> {
+fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamClientControlChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match UnixStreamClientTransport::connect(socket_path) {
-            Ok(transport) => return Ok(transport),
+        match UnixStreamClientControlChannel::connect(socket_path) {
+            Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() < deadline => {
                 if error.kind() != io::ErrorKind::NotFound
                     && error.kind() != io::ErrorKind::ConnectionRefused
