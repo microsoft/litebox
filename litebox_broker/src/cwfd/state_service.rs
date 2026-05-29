@@ -20,7 +20,7 @@
 //! `SubscribeEventfd` calls use that sender.
 
 use crate::cwfd::inet_listener_state::{
-    InetListenerError, InetListenerState, encode_sockaddr, family_from_u8,
+    InetListenerError, InetListenerState, decode_sockaddr, encode_sockaddr, family_from_u8,
 };
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
 use crate::eventfd_state::{EventfdError, EventfdState};
@@ -83,6 +83,7 @@ use litebox_common_linux::notification_ring::NotificationSender;
 use litebox_common_linux::shmem_ring::ShmemRingPair;
 use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubscriptionRegistry {
@@ -1017,6 +1018,184 @@ fn handle_shutdown_socketpair_write(
     }
 }
 
+#[allow(dead_code)]
+fn handle_inet_tcp_conn_create(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+    response_opcode: Opcode,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(response_opcode);
+    }
+    let family = match parse_inet_tcp_conn_create_body(request.body) {
+        Some(family) => family,
+        None => return protocol_err(response_opcode),
+    };
+    if family_from_u8(family).is_err() {
+        return status_err(response_opcode, StatusCode::InvalidValue);
+    }
+    let handle = registry.register(TcpConnState::new_unconnected(family));
+    HandlerResult {
+        frame: build_handle_response_ok(response_opcode, handle.id()),
+        out_fd: None,
+    }
+}
+
+#[allow(dead_code)]
+fn handle_inet_tcp_conn_connect(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+    response_opcode: Opcode,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(response_opcode);
+    }
+    let (handle_id, sockaddr, timeout_ms) = match parse_inet_tcp_conn_connect_body(request.body) {
+        Some(parts) => parts,
+        None => return protocol_err(response_opcode),
+    };
+    let target = match decode_sockaddr(&sockaddr) {
+        Ok(target) => target,
+        Err(_) => return status_err(response_opcode, StatusCode::InvalidValue),
+    };
+    let state = match resolve_tcp_conn(registry, handle_id) {
+        Ok(state) => state,
+        Err(status) => return status_err(response_opcode, status),
+    };
+    match state.start_connect(target, Duration::from_millis(u64::from(timeout_ms))) {
+        Ok(()) => HandlerResult {
+            frame: build_empty_response_ok(response_opcode),
+            out_fd: None,
+        },
+        Err(TcpConnError::WouldBlock) => status_err(response_opcode, StatusCode::WouldBlock),
+        Err(TcpConnError::PeerClosed | TcpConnError::Errno(_)) => {
+            status_err(response_opcode, StatusCode::InvalidValue)
+        }
+        Err(TcpConnError::Io) => status_err(response_opcode, StatusCode::Internal),
+    }
+}
+
+#[allow(dead_code)]
+fn handle_inet_tcp_conn_getsockname(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+    response_opcode: Opcode,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(response_opcode);
+    }
+    let handle_id = match parse_single_handle_body(request.body) {
+        Some(handle_id) => handle_id,
+        None => return protocol_err(response_opcode),
+    };
+    let state = match resolve_tcp_conn(registry, handle_id) {
+        Ok(state) => state,
+        Err(status) => return status_err(response_opcode, status),
+    };
+    match state.getsockname() {
+        Ok(sockaddr) => HandlerResult {
+            frame: build_sockaddr_response_ok(response_opcode, &sockaddr),
+            out_fd: None,
+        },
+        Err(TcpConnError::WouldBlock) => status_err(response_opcode, StatusCode::WouldBlock),
+        Err(TcpConnError::PeerClosed | TcpConnError::Errno(_)) => {
+            status_err(response_opcode, StatusCode::InvalidValue)
+        }
+        Err(TcpConnError::Io) => status_err(response_opcode, StatusCode::Internal),
+    }
+}
+
+#[allow(dead_code)]
+fn handle_inet_tcp_conn_getpeername(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+    response_opcode: Opcode,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(response_opcode);
+    }
+    let handle_id = match parse_single_handle_body(request.body) {
+        Some(handle_id) => handle_id,
+        None => return protocol_err(response_opcode),
+    };
+    let state = match resolve_tcp_conn(registry, handle_id) {
+        Ok(state) => state,
+        Err(status) => return status_err(response_opcode, status),
+    };
+    match state.getpeername() {
+        Ok(sockaddr) => HandlerResult {
+            frame: build_sockaddr_response_ok(response_opcode, &sockaddr),
+            out_fd: None,
+        },
+        Err(TcpConnError::WouldBlock) => status_err(response_opcode, StatusCode::WouldBlock),
+        Err(TcpConnError::PeerClosed | TcpConnError::Errno(_)) => {
+            status_err(response_opcode, StatusCode::InvalidValue)
+        }
+        Err(TcpConnError::Io) => status_err(response_opcode, StatusCode::Internal),
+    }
+}
+
+fn parse_inet_tcp_conn_create_body(body: &[u8]) -> Option<u8> {
+    if body.len() != 8 || body[1..8].iter().any(|&b| b != 0) {
+        return None;
+    }
+    Some(body[0])
+}
+
+fn parse_inet_tcp_conn_connect_body(body: &[u8]) -> Option<(u64, [u8; 28], u32)> {
+    if body.len() != 48 {
+        return None;
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().ok()?);
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(&body[8..36]);
+    let timeout_ms = u32::from_le_bytes(body[36..40].try_into().ok()?);
+    let reserved = u32::from_le_bytes(body[40..44].try_into().ok()?);
+    let reserved2 = u32::from_le_bytes(body[44..48].try_into().ok()?);
+    if reserved != 0 || reserved2 != 0 {
+        return None;
+    }
+    Some((handle, sockaddr, timeout_ms))
+}
+
+fn parse_single_handle_body(body: &[u8]) -> Option<u64> {
+    if body.len() != 8 {
+        return None;
+    }
+    Some(u64::from_le_bytes(body.try_into().ok()?))
+}
+
+fn build_handle_response_ok(opcode: Opcode, handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+fn build_empty_response_ok(opcode: Opcode) -> OwnedFrame {
+    OwnedFrame {
+        opcode,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+fn build_sockaddr_response_ok(opcode: Opcode, sockaddr: &[u8; 28]) -> OwnedFrame {
+    OwnedFrame {
+        opcode,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: sockaddr.to_vec(),
+    }
+}
+
 fn resolve_tcp_conn(
     registry: &BrokerStateRegistry,
     handle_id: u64,
@@ -1068,7 +1247,7 @@ fn handle_read_tcp_conn(
         Err(TcpConnError::WouldBlock) => {
             status_err(Opcode::ReadTcpConnResponse, StatusCode::WouldBlock)
         }
-        Err(TcpConnError::PeerClosed) => {
+        Err(TcpConnError::PeerClosed | TcpConnError::Errno(_)) => {
             status_err(Opcode::ReadTcpConnResponse, StatusCode::InvalidValue)
         }
         Err(TcpConnError::Io) => status_err(Opcode::ReadTcpConnResponse, StatusCode::Internal),
@@ -1099,7 +1278,7 @@ fn handle_write_tcp_conn(
         Err(TcpConnError::WouldBlock) => {
             status_err(Opcode::WriteTcpConnResponse, StatusCode::WouldBlock)
         }
-        Err(TcpConnError::PeerClosed) => {
+        Err(TcpConnError::PeerClosed | TcpConnError::Errno(_)) => {
             status_err(Opcode::WriteTcpConnResponse, StatusCode::InvalidValue)
         }
         Err(TcpConnError::Io) => status_err(Opcode::WriteTcpConnResponse, StatusCode::Internal),
