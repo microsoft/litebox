@@ -2956,6 +2956,9 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(f(RawFdRef::BrokerInetDgram(&fd)));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
             return Ok(f(RawFdRef::BrokerInetRaw(&fd)));
         }
         Err(Errno::EBADF)
@@ -3087,6 +3090,8 @@ impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
             }
             RawFdRef::BrokerInetDgram(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
             RawFdRef::BrokerInetRaw(_fd) => {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
             }
@@ -3345,6 +3350,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 crate::RawFdRef::BrokerInetDgram(_fd) => {
                     alloc::format!("raw={raw_fd} broker-inet-dgram")
+                }
                 crate::RawFdRef::BrokerInetRaw(_fd) => {
                     alloc::format!("raw={raw_fd} broker-inet-raw")
                 }

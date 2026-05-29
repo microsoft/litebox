@@ -138,7 +138,7 @@ pub enum SubsystemTag {
     InetListener,
     /// Broker-hosted UDP datagram socket. Wire value `12`. Phase C.
     InetDgram,
-    /// Broker-hosted raw IPv4 socket. Wire value `12`. Phase D.
+    /// Broker-hosted raw IPv4 socket. Wire value `13`. Phase D.
     InetRaw,
     /// Tag that this receiver doesn't recognise. Carries the raw u8
     /// value so the receiver can log diagnostics; callers should reject
@@ -163,7 +163,7 @@ impl SubsystemTag {
             SubsystemTag::Pty => 10,
             SubsystemTag::InetListener => 11,
             SubsystemTag::InetDgram => 12,
-            SubsystemTag::InetRaw => 12,
+            SubsystemTag::InetRaw => 13,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -185,7 +185,7 @@ impl SubsystemTag {
             10 => SubsystemTag::Pty,
             11 => SubsystemTag::InetListener,
             12 => SubsystemTag::InetDgram,
-            12 => SubsystemTag::InetRaw,
+            13 => SubsystemTag::InetRaw,
             other => SubsystemTag::Unknown(other),
         }
     }

@@ -100,6 +100,7 @@ impl<FS: ShimFS> Task<FS> {
             litebox::fd::SubsystemKind::BrokerInetDgram => (
                 TypeId::of::<super::broker_inet_dgram::BrokerInetDgramFd<Platform>>(),
                 core::any::type_name::<super::broker_inet_dgram::BrokerInetDgramFd<Platform>>(),
+            ),
             litebox::fd::SubsystemKind::BrokerInetRaw => (
                 TypeId::of::<super::broker_inet_raw::BrokerInetRawFd<Platform>>(),
                 core::any::type_name::<super::broker_inet_raw::BrokerInetRawFd<Platform>>(),
@@ -3263,6 +3264,13 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) =
             rds.fd_consume_raw_integer::<super::broker_inet_dgram::BrokerInetDgramSubsystem>(raw_fd)
+        {
+            drop(rds);
+            let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
+            drop(entry);
+            return Ok(());
+        }
+        if let Ok(fd) =
             rds.fd_consume_raw_integer::<super::broker_inet_raw::BrokerInetRawSubsystem>(raw_fd)
         {
             drop(rds);
@@ -3522,6 +3530,12 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
             }
             crate::RawFdRef::BrokerInetDgram(fd) => {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            }
             crate::RawFdRef::BrokerInetRaw(fd) => {
                 let _old = self
                     .global
@@ -4985,6 +4999,24 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                 })
             }
             crate::RawFdRef::BrokerInetDgram(fd) => {
+                let ino = get_or_assign_anon_ino(task, fd);
+                let read_write_mode = Mode::RUSR | Mode::WUSR;
+                Ok(FileStat {
+                    st_dev: ANON_INODE_DEV.truncate(),
+                    st_ino: ino.truncate(),
+                    st_nlink: 1,
+                    st_mode: (read_write_mode.bits()
+                        | litebox_common_linux::InodeType::Socket as u32)
+                        .truncate(),
+                    st_uid: uid,
+                    st_gid: gid,
+                    st_rdev: 0,
+                    st_size: 0,
+                    st_blksize: 4096,
+                    st_blocks: 0,
+                    ..Default::default()
+                })
+            }
             crate::RawFdRef::BrokerInetRaw(fd) => {
                 let ino = get_or_assign_anon_ino(task, fd);
                 let read_write_mode = Mode::RUSR | Mode::WUSR;
@@ -5880,6 +5912,21 @@ impl<FS: ShimFS> Task<FS> {
                         })
                     }
                     crate::RawFdRef::BrokerInetDgram(fd) => {
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle.with_entry(|file| {
+                            let diff = (file.get_status() & setfl_mask) ^ flags;
+                            if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                                log_unsupported!("unsupported flags");
+                            }
+                            file.set_status(flags);
+                            Ok(())
+                        })
+                    }
                     crate::RawFdRef::BrokerInetRaw(fd) => {
                         let handle = self
                             .global
@@ -7080,7 +7127,7 @@ impl<FS: ShimFS> Task<FS> {
                             todo!("FIONREAD on broker PTY: real Linux returns queued terminal input byte count")
                         }
                         crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) | crate::RawFdRef::BrokerInetListener(_)
-                    | crate::RawFdRef::BrokerInetDgram(_) => {
+                    | crate::RawFdRef::BrokerInetDgram(_)
                 | crate::RawFdRef::BrokerInetRaw(_) => {
                             Err(Errno::ENOTTY)
                         },
@@ -7305,6 +7352,19 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(())
                         }
                         crate::RawFdRef::BrokerInetDgram(fd) => {
+                            let handle = self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .entry_handle(fd)
+                                .ok_or(Errno::EBADF)?;
+                            handle.with_entry(|file| {
+                                let mut flags = file.get_status();
+                                flags.set(OFlags::NONBLOCK, val != 0);
+                                file.set_status(flags);
+                            });
+                            Ok(())
+                        }
                         crate::RawFdRef::BrokerInetRaw(fd) => {
                             let handle = self
                                 .global
@@ -7437,6 +7497,13 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 }
                 crate::RawFdRef::BrokerInetDgram(fd) => {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+                    Ok(0)
+                }
                 crate::RawFdRef::BrokerInetRaw(fd) => {
                     let _old = self
                         .global
@@ -7560,6 +7627,13 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(0)
                 }
                 crate::RawFdRef::BrokerInetDgram(fd) => {
+                    let _old = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                    Ok(0)
+                }
                 crate::RawFdRef::BrokerInetRaw(fd) => {
                     let _old = self
                         .global
@@ -7598,7 +7672,7 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     }
                     crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) | crate::RawFdRef::BrokerInetListener(_)
-                    | crate::RawFdRef::BrokerInetDgram(_) => {
+                    | crate::RawFdRef::BrokerInetDgram(_)
                 | crate::RawFdRef::BrokerInetRaw(_) => {
                         Err(Errno::ENOTTY)
                     },
@@ -7704,7 +7778,7 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     }
                     crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) | crate::RawFdRef::BrokerInetListener(_)
-                    | crate::RawFdRef::BrokerInetDgram(_) => {
+                    | crate::RawFdRef::BrokerInetDgram(_)
                 | crate::RawFdRef::BrokerInetRaw(_) => {
                         Err(Errno::ENOTTY)
                     },
@@ -8497,6 +8571,15 @@ impl<FS: ShimFS> Task<FS> {
                 min_fd,
             ),
             crate::RawFdRef::BrokerInetDgram(fd) => dup(
+                &self.global,
+                &files,
+                fd,
+                self.pid,
+                file,
+                close_on_exec,
+                target,
+                min_fd,
+            ),
             crate::RawFdRef::BrokerInetRaw(fd) => dup(
                 &self.global,
                 &files,
@@ -8681,6 +8764,12 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(())
                         }
                         crate::RawFdRef::BrokerInetDgram(fd) => {
+                            self.global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_fd_metadata(fd, FileDescriptorFlags::empty());
+                            Ok(())
+                        }
                         crate::RawFdRef::BrokerInetRaw(fd) => {
                             self.global
                                 .litebox

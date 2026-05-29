@@ -106,6 +106,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             }
             crate::RawFdRef::BrokerInetDgram(fd) => {
                 Ok(EpollDescriptor::BrokerInetDgram(Arc::clone(fd)))
+            }
             crate::RawFdRef::BrokerInetRaw(fd) => {
                 Ok(EpollDescriptor::BrokerInetRaw(Arc::clone(fd)))
             }
@@ -260,6 +261,9 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 Some(handle.with_entry(|entry| poll(entry)))
             }
             EpollDescriptor::BrokerInetDgram(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
             EpollDescriptor::BrokerInetRaw(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
