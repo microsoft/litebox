@@ -6,7 +6,7 @@
 use core::{
     ffi::CStr,
     mem::offset_of,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
 
 use alloc::sync::Arc;
@@ -254,6 +254,7 @@ impl Default for SocketAddress {
 fn socket_option_raw(optname: SocketOptionName) -> (u32, u32) {
     match optname {
         SocketOptionName::IP(ip) => (0, ip as u32),
+        SocketOptionName::IPv6(ipv6) => (41, ipv6 as u32),
         SocketOptionName::Socket(socket) => (1, socket as u32),
         SocketOptionName::TCP(tcp) => (IPProtocol::TCP as u32, tcp as u32),
     }
@@ -551,6 +552,10 @@ impl<FS: ShimFS> GlobalState<FS> {
                     return Err(Errno::ENOPROTOOPT);
                 }
             },
+            SocketOptionName::IPv6(litebox_common_linux::Ipv6Option::V6ONLY) => {
+                let _val: u32 = super::read_from_user(optval, optlen)?;
+                return Ok(());
+            }
             SocketOptionName::TCP(to) => match to {
                 TcpOption::CONGESTION => {
                     const TCP_CONGESTION_NAME_MAX: usize = 16;
@@ -754,6 +759,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 }
                 SocketOption::PEERCRED => return Err(Errno::ENOPROTOOPT),
             },
+            SocketOptionName::IPv6(litebox_common_linux::Ipv6Option::V6ONLY) => 0,
             SocketOptionName::TCP(tcpopt) => {
                 match tcpopt {
                     TcpOption::CONGESTION => {
@@ -1295,6 +1301,7 @@ fn parse_type_and_flags(type_and_flags: u32) -> Result<(SockType, SockFlags), Er
 fn socket_option_name_to_raw(optname: SocketOptionName) -> (i32, i32) {
     match optname {
         SocketOptionName::IP(name) => (0, name as i32),
+        SocketOptionName::IPv6(name) => (41, name as i32),
         SocketOptionName::Socket(name) => (1, name as i32),
         SocketOptionName::TCP(name) => (IPProtocol::TCP as i32, name as i32),
     }
@@ -1683,6 +1690,69 @@ impl<FS: ShimFS> Task<FS> {
                         if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
                             return Err(Errno::EINVAL);
                         }
+                        if crate::syscalls::broker_tcp_conn::broker_inet_tcp_conn_provider_outbound_enabled()
+                            && crate::syscalls::broker_inet_listener::broker_inet_listener_provider()
+                                .is_none()
+                            && let Some(provider) =
+                                crate::syscalls::broker_tcp_conn::broker_tcp_conn_provider()
+                        {
+                            let mut status = OFlags::empty();
+                            status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                            let handle = provider
+                                .create(1)
+                                .map_err(super::broker_backed::broker_err_to_errno)?;
+                            let conn = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<
+                                Platform,
+                            >::new(provider, handle, status);
+                            let mut dt = self.global.litebox.descriptor_table_mut();
+                            let typed = dt
+                                .insert::<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                                    conn,
+                                );
+                            if flags.contains(SockFlags::CLOEXEC) {
+                                let old =
+                                    dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                                assert!(old.is_none());
+                            }
+                            drop(dt);
+                            let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                                Errno::EMFILE
+                            })?;
+                            self.inet6_fds
+                                .borrow_mut()
+                                .insert(u32::try_from(raw_fd).unwrap());
+                            return Ok(u32::try_from(raw_fd).unwrap());
+                        }
+                        if let Some(provider) =
+                            crate::syscalls::broker_inet_listener::broker_inet_listener_provider()
+                        {
+                            let mut status = OFlags::empty();
+                            status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                            let handle = provider
+                                .create(1)
+                                .map_err(super::broker_backed::broker_err_to_errno)?;
+                            let listener =
+                                crate::syscalls::broker_inet_listener::BrokerInetListenerFd::<
+                                    Platform,
+                                >::new(provider, handle, 1, status);
+                            let mut dt = self.global.litebox.descriptor_table_mut();
+                            let typed = dt.insert::<crate::syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(listener);
+                            if flags.contains(SockFlags::CLOEXEC) {
+                                let old =
+                                    dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                                assert!(old.is_none());
+                            }
+                            drop(dt);
+                            let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                                Errno::EMFILE
+                            })?;
+                            self.inet6_fds
+                                .borrow_mut()
+                                .insert(u32::try_from(raw_fd).unwrap());
+                            return Ok(u32::try_from(raw_fd).unwrap());
+                        }
                         litebox::net::Protocol::Tcp
                     }
                     SockType::Datagram => {
@@ -1696,7 +1766,7 @@ impl<FS: ShimFS> Task<FS> {
                             let mut status = OFlags::empty();
                             status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
                             let handle = provider
-                                .create(0)
+                                .create(1)
                                 .map_err(super::broker_backed::broker_err_to_errno)?;
                             let dgram = crate::syscalls::broker_inet_dgram::BrokerInetDgramFd::<
                                 Platform,
@@ -1967,36 +2037,20 @@ pub(crate) fn read_sockaddr_from_user(
             Ok(SocketAddress::default())
         }
         AddressFamily::INET6 => {
-            // Map IPv6 addresses to IPv4 for the internal smoltcp stack.
-            // sockaddr_in6: family(2) + port(2) + flowinfo(4) + addr(16) + scope(4) = 28
             if addrlen < 28 {
                 return Err(Errno::EINVAL);
             }
             let raw = sockaddr.to_owned_slice(28).ok_or(Errno::EFAULT)?;
             let port = u16::from_be_bytes([raw[2], raw[3]]);
-            let addr_bytes = &raw[8..24]; // 16-byte IPv6 address
-
-            // Map ::1 → 127.0.0.1, :: → 0.0.0.0, ::ffff:a.b.c.d → a.b.c.d
-            let ipv4 = if addr_bytes == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] {
-                // ::1 (IPv6 loopback) → 127.0.0.1
-                Ipv4Addr::LOCALHOST
-            } else if addr_bytes == [0u8; 16] {
-                // :: (unspecified) → 0.0.0.0
-                Ipv4Addr::UNSPECIFIED
-            } else if addr_bytes[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] {
-                // ::ffff:a.b.c.d (IPv4-mapped IPv6) → a.b.c.d
-                Ipv4Addr::new(
-                    addr_bytes[12],
-                    addr_bytes[13],
-                    addr_bytes[14],
-                    addr_bytes[15],
-                )
-            } else {
-                // Other IPv6 addresses: not supported
-                return Err(Errno::EAFNOSUPPORT);
-            };
-            Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::new(
-                ipv4, port,
+            let flowinfo = u32::from_ne_bytes(raw[4..8].try_into().unwrap());
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(&raw[8..24]);
+            let scope_id = u32::from_ne_bytes(raw[24..28].try_into().unwrap());
+            Ok(SocketAddress::Inet(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(addr),
+                port,
+                flowinfo,
+                scope_id,
             ))))
         }
         _ => todo!("unsupported family {family:?}"),
@@ -2012,21 +2066,44 @@ fn socket_address_to_inet_listener_wire(sockaddr: SocketAddress) -> Result<[u8; 
             raw[4..8].copy_from_slice(&v4.ip().octets());
             Ok(raw)
         }
-        SocketAddress::Inet(SocketAddr::V6(_)) => Err(Errno::EAFNOSUPPORT),
+        SocketAddress::Inet(SocketAddr::V6(v6)) => {
+            let mut raw = [0u8; 28];
+            raw[0..2].copy_from_slice(&(AddressFamily::INET6 as u16).to_ne_bytes());
+            raw[2..4].copy_from_slice(&v6.port().to_be_bytes());
+            raw[4..8].copy_from_slice(&v6.flowinfo().to_ne_bytes());
+            raw[8..24].copy_from_slice(&v6.ip().octets());
+            raw[24..28].copy_from_slice(&v6.scope_id().to_ne_bytes());
+            Ok(raw)
+        }
         SocketAddress::Unix(_) => Err(Errno::EAFNOSUPPORT),
     }
 }
 
 fn inet_listener_wire_to_socket_address(raw: [u8; 28]) -> Result<SocketAddress, Errno> {
     let family = u16::from_ne_bytes([raw[0], raw[1]]) as u32;
-    if family != AddressFamily::INET as u32 {
-        return Err(Errno::EAFNOSUPPORT);
+    match family {
+        family if family == AddressFamily::INET as u32 => {
+            let port = u16::from_be_bytes([raw[2], raw[3]]);
+            let ip = Ipv4Addr::new(raw[4], raw[5], raw[6], raw[7]);
+            Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::new(
+                ip, port,
+            ))))
+        }
+        family if family == AddressFamily::INET6 as u32 => {
+            let port = u16::from_be_bytes([raw[2], raw[3]]);
+            let flowinfo = u32::from_ne_bytes(raw[4..8].try_into().unwrap());
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(&raw[8..24]);
+            let scope_id = u32::from_ne_bytes(raw[24..28].try_into().unwrap());
+            Ok(SocketAddress::Inet(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(addr),
+                port,
+                flowinfo,
+                scope_id,
+            ))))
+        }
+        _ => Err(Errno::EAFNOSUPPORT),
     }
-    let port = u16::from_be_bytes([raw[2], raw[3]]);
-    let ip = Ipv4Addr::new(raw[4], raw[5], raw[6], raw[7]);
-    Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::new(
-        ip, port,
-    ))))
 }
 
 pub(crate) fn write_sockaddr_to_user(
@@ -2092,8 +2169,17 @@ pub(crate) fn write_sockaddr_to_user(
                 }
             }
         }
-        SocketAddress::Inet(SocketAddr::V6(_)) => {
-            return Err(Errno::EAFNOSUPPORT);
+        SocketAddress::Inet(SocketAddr::V6(v6_addr)) => {
+            let mut sa6 = [0u8; 28];
+            sa6[0..2].copy_from_slice(&(AddressFamily::INET6 as u16).to_ne_bytes());
+            sa6[2..4].copy_from_slice(&v6_addr.port().to_be_bytes());
+            sa6[4..8].copy_from_slice(&v6_addr.flowinfo().to_ne_bytes());
+            sa6[8..24].copy_from_slice(&v6_addr.ip().octets());
+            sa6[24..28].copy_from_slice(&v6_addr.scope_id().to_ne_bytes());
+            let copy_len = (addrlen_val as usize).min(28);
+            addr.write_slice_at_offset(0, &sa6[..copy_len])
+                .ok_or(Errno::EFAULT)?;
+            28
         }
     }
     .truncate();
@@ -2378,9 +2464,10 @@ impl<FS: ShimFS> Task<FS> {
                     .with_metadata(typed, |flags: &FileDescriptorFlags| *flags)
                     .unwrap_or_else(|_| FileDescriptorFlags::empty());
                 let listener_handle = self.broker_inet_listener_handle(typed)?;
-                let status = listener_handle.with_entry(|entry| entry.get_status());
+                let (status, family) =
+                    listener_handle.with_entry(|entry| (entry.get_status(), entry.family()));
                 let tcp_handle = tcp_provider
-                    .create(0)
+                    .create(family)
                     .map_err(super::broker_backed::broker_err_to_errno)?;
                 let tcp_fd = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
                     tcp_provider,
@@ -2507,55 +2594,61 @@ impl<FS: ShimFS> Task<FS> {
                 .bind();
             return Ok(());
         }
-        if let Some(result) =
-            self.try_with_broker_tcp_conn(sockfd, |typed| {
-                let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
-                let listener_provider =
-                    crate::syscalls::broker_inet_listener::broker_inet_listener_provider()
-                        .ok_or(Errno::EINVAL)?;
-                let raw_fd = usize::try_from(sockfd).map_err(|_| Errno::EBADF)?;
-                let tcp_handle = self.broker_tcp_conn_handle(typed)?;
-                let status = tcp_handle.with_entry(|entry| entry.get_status());
-                let fd_flags = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .with_metadata(typed, |flags: &FileDescriptorFlags| *flags)
-                    .unwrap_or_else(|_| FileDescriptorFlags::empty());
-                let listener_handle = listener_provider
-                    .create(0)
-                    .map_err(super::broker_backed::broker_err_to_errno)?;
-                let listener = crate::syscalls::broker_inet_listener::BrokerInetListenerFd::<
-                    Platform,
-                >::new(listener_provider, listener_handle, 0, status);
-                listener.bind(&raw)?;
-                let typed_listener = {
-                    let mut dt = self.global.litebox.descriptor_table_mut();
-                    let typed_listener = dt
+        if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
+            let listener_provider =
+                crate::syscalls::broker_inet_listener::broker_inet_listener_provider()
+                    .ok_or(Errno::EINVAL)?;
+            let raw_fd = usize::try_from(sockfd).map_err(|_| Errno::EBADF)?;
+            let tcp_handle = self.broker_tcp_conn_handle(typed)?;
+            let status = tcp_handle.with_entry(|entry| entry.get_status());
+            let fd_flags = self
+                .global
+                .litebox
+                .descriptor_table()
+                .with_metadata(typed, |flags: &FileDescriptorFlags| *flags)
+                .unwrap_or_else(|_| FileDescriptorFlags::empty());
+            let listener_family = match sockaddr {
+                SocketAddress::Inet(SocketAddr::V4(_)) => 0,
+                SocketAddress::Inet(SocketAddr::V6(_)) => 1,
+                SocketAddress::Unix(_) => return Err(Errno::EAFNOSUPPORT),
+            };
+            let listener_handle = listener_provider
+                .create(listener_family)
+                .map_err(super::broker_backed::broker_err_to_errno)?;
+            let listener =
+                crate::syscalls::broker_inet_listener::BrokerInetListenerFd::<Platform>::new(
+                    listener_provider,
+                    listener_handle,
+                    listener_family,
+                    status,
+                );
+            listener.bind(&raw)?;
+            let typed_listener = {
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                let typed_listener = dt
                     .insert::<crate::syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(
                         listener,
                     );
-                    if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
-                        let old =
-                            dt.set_fd_metadata(&typed_listener, FileDescriptorFlags::FD_CLOEXEC);
-                        assert!(old.is_none());
-                    }
-                    typed_listener
-                };
-                {
-                    let files = self.files.borrow();
-                    let mut rds = files.raw_descriptor_store.write();
-                    let _old_fd = rds
-                        .fd_consume_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(
-                            raw_fd,
-                        )
-                        .map_err(|_| Errno::EBADF)?;
-                    assert!(rds.fd_into_specific_raw_integer(typed_listener, raw_fd));
+                if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
+                    let old = dt.set_fd_metadata(&typed_listener, FileDescriptorFlags::FD_CLOEXEC);
+                    assert!(old.is_none());
                 }
-                let _ = self.global.litebox.descriptor_table_mut().remove(typed);
-                Ok(())
-            })
-        {
+                typed_listener
+            };
+            {
+                let files = self.files.borrow();
+                let mut rds = files.raw_descriptor_store.write();
+                let _old_fd = rds
+                    .fd_consume_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                        raw_fd,
+                    )
+                    .map_err(|_| Errno::EBADF)?;
+                assert!(rds.fd_into_specific_raw_integer(typed_listener, raw_fd));
+            }
+            let _ = self.global.litebox.descriptor_table_mut().remove(typed);
+            Ok(())
+        }) {
             return result;
         }
         if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
@@ -4161,17 +4254,15 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
-            // IPv6-specific socket options (level 41 = IPPROTO_IPV6) are silently
-            // ignored since we map AF_INET6 to AF_INET internally.
             if level == 41 {
-                return Errno::ENOPROTOOPT; // sentinel — caught below
+                return Errno::ENOPROTOOPT;
             }
             log_unsupported!("setsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
         });
         match optname {
             Ok(name) => self.do_setsockopt(sockfd, name, optval, optlen),
-            Err(Errno::ENOPROTOOPT) => Ok(()), // IPv6 options silently ignored
+            Err(Errno::ENOPROTOOPT) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -4226,9 +4317,19 @@ impl<FS: ShimFS> Task<FS> {
         }) {
             return result;
         }
-        if let Some(result) =
-            self.try_with_broker_inet_listener(sockfd, |_typed| broker_sockopt(optname))
-        {
+        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
+            if matches!(
+                optname,
+                SocketOptionName::IPv6(litebox_common_linux::Ipv6Option::V6ONLY)
+            ) {
+                let _val: u32 = super::read_from_user(optval, optlen)?;
+                return Ok(());
+            }
+            let value = optval.to_owned_slice(optlen).ok_or(Errno::EFAULT)?;
+            let (level, raw_optname) = socket_option_raw(optname);
+            let handle = self.broker_inet_listener_handle(typed)?;
+            handle.with_entry(|entry| entry.setsockopt(level, raw_optname, &value))
+        }) {
             return result;
         }
         self.files.borrow().with_socket(

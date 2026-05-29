@@ -2441,7 +2441,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 // the precedent in net.rs for TCP/UDP sockets.
                 SocketOption::RCVBUF | SocketOption::SNDBUF => Ok(()),
             },
-            SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
+            SocketOptionName::IPv6(_) | SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }
     }
     pub(super) fn getsockopt(
@@ -2512,7 +2512,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                     return super::write_to_user(ucred, optval, len);
                 }
             },
-            SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
+            SocketOptionName::IPv6(_) | SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         };
         super::write_to_user(val, optval, len)
     }
