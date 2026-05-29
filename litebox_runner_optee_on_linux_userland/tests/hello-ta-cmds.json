@@ -1,6 +1,9 @@
 [
   {
-    "func_id": "open_session"
+    "func_id": "open_session",
+    "client_identity": {
+      "login": "user"
+    }
   },
   {
     "func_id": "invoke_command",

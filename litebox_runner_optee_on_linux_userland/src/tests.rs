@@ -7,7 +7,9 @@
 
 use litebox::platform::RawConstPointer;
 use litebox::utils::TruncateExt;
-use litebox_common_optee::{TeeParamType, UteeEntryFunc, UteeParamOwned, UteeParams};
+use litebox_common_optee::{
+    TeeIdentity, TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
+};
 use litebox_shim_optee::session::SessionManager;
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
@@ -51,12 +53,22 @@ pub fn run_ta_with_test_commands(
             let ta_head = litebox_common_optee::parse_ta_head(ta_bin)
                 .expect("Failed to parse TA header from ta_bin");
             let session_token = session_manager.try_acquire_open_session_token().unwrap();
+            // Emulate the client identity a real REE client would present. The
+            // secure world normally derives this from the OpenSession meta
+            // params; here the test file states it, defaulting to a `user` login.
+            let client_identity = cmd.client_identity.as_ref().map_or(
+                TeeIdentity {
+                    login: TeeLogin::User,
+                    uuid: TeeUuid::NIL,
+                },
+                ClientIdentityJson::to_tee_identity,
+            );
             let loaded = shim
                 .load_ldelf(
                     ldelf_bin,
                     ta_head.uuid,
                     Some(ta_bin),
-                    None,
+                    Some(client_identity),
                     session_token.session_id().unwrap(),
                 )
                 .map_err(|_| {
@@ -175,6 +187,80 @@ pub struct TaCommandBase64 {
     cmd_id: u32,
     #[serde(default)]
     args: Vec<TaCommandParamsBase64>,
+    /// Client identity presented for an `OpenSession`, mirroring the
+    /// `TEE_Identity` a real REE client would supply (the secure world derives
+    /// this from the message meta params; this userland harness has no such
+    /// client, so the test states it here). Ignored for other commands. When
+    /// absent it defaults to a `user` login with the nil UUID, which is what a
+    /// typical REE user client presents.
+    #[serde(default)]
+    client_identity: Option<ClientIdentityJson>,
+}
+
+/// Client identity for an `OpenSession`, parsed from the test JSON.
+#[derive(Debug, Deserialize)]
+struct ClientIdentityJson {
+    #[serde(default)]
+    login: ClientLoginJson,
+    /// RFC 4122 UUID string (hyphens optional). Defaults to the nil UUID.
+    #[serde(default)]
+    uuid: Option<String>,
+}
+
+/// JSON mirror of [`TeeLogin`], so test files can name logins (e.g. `"user"`)
+/// instead of raw `TEE_LOGIN_*` constants.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ClientLoginJson {
+    Public,
+    #[default]
+    User,
+    Group,
+    Application,
+    ApplicationUser,
+    ApplicationGroup,
+    ReeKernel,
+    TrustedApp,
+}
+
+impl From<ClientLoginJson> for TeeLogin {
+    fn from(login: ClientLoginJson) -> Self {
+        match login {
+            ClientLoginJson::Public => TeeLogin::Public,
+            ClientLoginJson::User => TeeLogin::User,
+            ClientLoginJson::Group => TeeLogin::Group,
+            ClientLoginJson::Application => TeeLogin::Application,
+            ClientLoginJson::ApplicationUser => TeeLogin::ApplicationUser,
+            ClientLoginJson::ApplicationGroup => TeeLogin::ApplicationGroup,
+            ClientLoginJson::ReeKernel => TeeLogin::ReeKernel,
+            ClientLoginJson::TrustedApp => TeeLogin::TrustedApp,
+        }
+    }
+}
+
+impl ClientIdentityJson {
+    fn to_tee_identity(&self) -> TeeIdentity {
+        let uuid = self
+            .uuid
+            .as_deref()
+            .map_or(TeeUuid::NIL, parse_uuid_or_panic);
+        TeeIdentity {
+            login: self.login.into(),
+            uuid,
+        }
+    }
+}
+
+/// Parse an RFC 4122 UUID string (hyphens optional) into a [`TeeUuid`].
+fn parse_uuid_or_panic(s: &str) -> TeeUuid {
+    let hex: String = s.chars().filter(|&c| c != '-').collect();
+    assert_eq!(hex.len(), 32, "client uuid must be 32 hex digits: {s:?}");
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .unwrap_or_else(|_| panic!("invalid hex in client uuid: {s:?}"));
+    }
+    TeeUuid::from_bytes(bytes)
 }
 
 #[derive(Debug, Deserialize)]
