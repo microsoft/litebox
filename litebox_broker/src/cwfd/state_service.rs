@@ -212,6 +212,31 @@ pub fn handle_request(
         Opcode::InetListenerQueryEvents => {
             handle_inet_listener_query_events(registry, request, in_fds)
         }
+        Opcode::InetTcpConnCreate => handle_inet_tcp_conn_create(
+            registry,
+            request,
+            in_fds,
+            Opcode::InetTcpConnCreateResponse,
+        ),
+        Opcode::InetTcpConnConnect => handle_inet_tcp_conn_connect(
+            registry,
+            request,
+            in_fds,
+            Opcode::InetTcpConnConnectResponse,
+        ),
+        Opcode::InetTcpConnQueryEvents => handle_query_events(registry, request, in_fds),
+        Opcode::InetTcpConnGetSockName => handle_inet_tcp_conn_getsockname(
+            registry,
+            request,
+            in_fds,
+            Opcode::InetTcpConnGetSockNameResponse,
+        ),
+        Opcode::InetTcpConnGetPeerName => handle_inet_tcp_conn_getpeername(
+            registry,
+            request,
+            in_fds,
+            Opcode::InetTcpConnGetPeerNameResponse,
+        ),
         Opcode::CreatePipe => handle_create_pipe(registry, request, in_fds),
         Opcode::ReadPipe => handle_read_pipe(registry, request, in_fds),
         Opcode::WritePipe => handle_write_pipe(registry, request, in_fds),
@@ -1147,18 +1172,13 @@ fn parse_inet_tcp_conn_create_body(body: &[u8]) -> Option<u8> {
 }
 
 fn parse_inet_tcp_conn_connect_body(body: &[u8]) -> Option<(u64, [u8; 28], u32)> {
-    if body.len() != 48 {
+    if body.len() != 40 {
         return None;
     }
     let handle = u64::from_le_bytes(body[0..8].try_into().ok()?);
     let mut sockaddr = [0u8; 28];
     sockaddr.copy_from_slice(&body[8..36]);
     let timeout_ms = u32::from_le_bytes(body[36..40].try_into().ok()?);
-    let reserved = u32::from_le_bytes(body[40..44].try_into().ok()?);
-    let reserved2 = u32::from_le_bytes(body[44..48].try_into().ok()?);
-    if reserved != 0 || reserved2 != 0 {
-        return None;
-    }
     Some((handle, sockaddr, timeout_ms))
 }
 

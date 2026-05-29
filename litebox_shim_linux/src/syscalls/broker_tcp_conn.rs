@@ -125,6 +125,48 @@ where
 }
 
 impl BrokerTcpConnFd<Platform> {
+    pub(crate) fn connect(
+        &self,
+        _cx: &WaitContext<'_, Platform>,
+        sockaddr: &[u8],
+    ) -> Result<(), Errno> {
+        const CONNECT_TIMEOUT_MS: u32 = 30_000;
+        self.common.ensure_subscribed(&self.pollee);
+        let nonblock = self.get_status().contains(OFlags::NONBLOCK);
+        if nonblock {
+            return match self
+                .provider
+                .connect(self.handle(), sockaddr, CONNECT_TIMEOUT_MS)
+            {
+                Ok(()) => Ok(()),
+                Err(BrokerOpError::WouldBlock) => Err(Errno::EINPROGRESS),
+                Err(e) => Err(broker_err_to_errno(e)),
+            };
+        }
+        loop {
+            match self
+                .provider
+                .connect(self.handle(), sockaddr, CONNECT_TIMEOUT_MS)
+            {
+                Ok(()) => return Ok(()),
+                Err(BrokerOpError::WouldBlock) => core::hint::spin_loop(),
+                Err(e) => return Err(broker_err_to_errno(e)),
+            }
+        }
+    }
+
+    pub(crate) fn getsockname(&self) -> Result<[u8; 28], Errno> {
+        self.provider
+            .getsockname(self.handle())
+            .map_err(broker_err_to_errno)
+    }
+
+    pub(crate) fn getpeername(&self) -> Result<[u8; 28], Errno> {
+        self.provider
+            .getpeername(self.handle())
+            .map_err(broker_err_to_errno)
+    }
+
     pub(crate) fn read(
         &self,
         cx: &WaitContext<'_, Platform>,

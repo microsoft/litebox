@@ -174,13 +174,20 @@ impl TcpConnState {
         }
     }
 
-    pub fn read(&self, max_len: usize) -> Result<Vec<u8>, TcpConnError> {
+    pub fn read(self: &Arc<Self>, max_len: usize) -> Result<Vec<u8>, TcpConnError> {
         if max_len == 0 {
             return Ok(Vec::new());
         }
+        if let Some(result) = self.finish_completed_connect() {
+            result?;
+        }
         let mut guard = self.inner.lock().expect("TcpConnState inner poisoned");
         let TcpConnInner::Connected(connected) = &mut *guard else {
-            return Err(TcpConnError::Errno(libc::ENOTCONN));
+            return match &*guard {
+                TcpConnInner::Connecting { .. } => Err(TcpConnError::WouldBlock),
+                TcpConnInner::Unconnected { .. } => Err(TcpConnError::Errno(libc::ENOTCONN)),
+                TcpConnInner::Connected(_) => unreachable!("matched Connected in else branch"),
+            };
         };
         if connected.read_shutdown.load(Ordering::Acquire) {
             return Ok(Vec::new());
@@ -218,13 +225,20 @@ impl TcpConnState {
         }
     }
 
-    pub fn write(&self, bytes: &[u8]) -> Result<usize, TcpConnError> {
+    pub fn write(self: &Arc<Self>, bytes: &[u8]) -> Result<usize, TcpConnError> {
         if bytes.is_empty() {
             return Ok(0);
         }
+        if let Some(result) = self.finish_completed_connect() {
+            result?;
+        }
         let mut guard = self.inner.lock().expect("TcpConnState inner poisoned");
         let TcpConnInner::Connected(connected) = &mut *guard else {
-            return Err(TcpConnError::Errno(libc::ENOTCONN));
+            return match &*guard {
+                TcpConnInner::Connecting { .. } => Err(TcpConnError::WouldBlock),
+                TcpConnInner::Unconnected { .. } => Err(TcpConnError::Errno(libc::ENOTCONN)),
+                TcpConnInner::Connected(_) => unreachable!("matched Connected in else branch"),
+            };
         };
         if connected.write_shutdown.load(Ordering::Acquire) {
             return Err(TcpConnError::PeerClosed);
