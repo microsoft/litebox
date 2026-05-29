@@ -14,7 +14,12 @@ use crate::{DefaultFS, GlobalState, Process, Task, WindowsHandleStore, WindowsPa
 pub(crate) fn init_platform() {
     static PLATFORM_INIT: std::sync::Once = std::sync::Once::new();
     PLATFORM_INIT.call_once(|| {
+        #[cfg(target_os = "linux")]
+        let platform = crate::Platform::new(None);
+
+        #[cfg(not(target_os = "linux"))]
         let platform = crate::Platform::new();
+
         litebox_platform_multiplex::set_platform(platform);
     });
 }
