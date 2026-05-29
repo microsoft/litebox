@@ -17,6 +17,9 @@ use super::registry::Registry;
 
 const LISTEN_BASIC: HandlerToken<(), BLOut> = HandlerToken::new("broker_listener.listen_basic");
 const CONNECT_BASIC: HandlerToken<(), BLOut> = HandlerToken::new("broker_listener.connect_basic");
+const UDP_RECVFROM_REMOTE_ADDR: HandlerToken<(), BLOut> =
+    HandlerToken::new("broker_listener.udp_recvfrom_remote_addr");
+const UDP_TRUNCATION: HandlerToken<(), BLOut> = HandlerToken::new("broker_listener.udp_truncation");
 
 #[derive(Serialize, Deserialize, Debug)]
 struct BLOut {
@@ -63,6 +66,57 @@ fn sockaddr_to_v4(addr: libc::sockaddr_in) -> SocketAddrV4 {
         Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes()),
         u16::from_be(addr.sin_port),
     )
+}
+
+fn sockaddr_from_v4(addr: SocketAddrV4) -> libc::sockaddr_in {
+    libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: addr.port().to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(addr.ip().octets()),
+        },
+        sin_zero: [0; 8],
+    }
+}
+
+fn getsockname_v4(fd: i32, what: &str) -> Result<SocketAddrV4, HandlerError> {
+    // SAFETY: zeroed sockaddr_in is immediately filled by getsockname.
+    let mut actual: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut actual_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: `actual` and `actual_len` are valid output pointers.
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            (&mut actual as *mut libc::sockaddr_in).cast::<libc::sockaddr>(),
+            &mut actual_len,
+        )
+    };
+    if rc != 0 {
+        return Err(HandlerError(format!(
+            "{what}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(sockaddr_to_v4(actual))
+}
+
+fn bind_loopback_any(fd: i32) -> Result<SocketAddrV4, HandlerError> {
+    let bind_addr = sockaddr_loopback_any();
+    // SAFETY: `bind_addr` points to a valid sockaddr_in.
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            (&bind_addr as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(HandlerError(format!(
+            "bind: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    getsockname_v4(fd, "getsockname")
 }
 
 async fn handle_listen_basic(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<BLOut, HandlerError> {
@@ -385,15 +439,209 @@ async fn handle_connect_basic(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<BL
     })
 }
 
+async fn handle_udp_recvfrom_remote_addr(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<BLOut, HandlerError> {
+    // SAFETY: socket has no pointer arguments.
+    let recv = Fd::new(
+        unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) },
+        "recv socket(AF_INET, SOCK_DGRAM)",
+    )?;
+    let bound = bind_loopback_any(recv.0)?;
+
+    let sender = thread::spawn(move || -> Result<SocketAddrV4, String> {
+        // SAFETY: socket has no pointer arguments.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(format!("send socket: {}", std::io::Error::last_os_error()));
+        }
+        let _fd = Fd(fd);
+        let dst = sockaddr_from_v4(bound);
+        // SAFETY: `dst` and payload pointers are valid for the provided lengths.
+        let n = unsafe {
+            libc::sendto(
+                fd,
+                b"hi".as_ptr().cast(),
+                2,
+                0,
+                (&dst as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if n != 2 {
+            return Err(format!("sendto n={n}: {}", std::io::Error::last_os_error()));
+        }
+        getsockname_v4(fd, "sender getsockname").map_err(|e| e.0)
+    });
+
+    let mut buf = [0u8; 8];
+    // SAFETY: zeroed sockaddr_in is immediately filled by recvfrom.
+    let mut peer: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut peer_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: `recv`, `buf`, `peer`, and `peer_len` are valid.
+    let n = unsafe {
+        libc::recvfrom(
+            recv.0,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+            (&mut peer as *mut libc::sockaddr_in).cast::<libc::sockaddr>(),
+            &mut peer_len,
+        )
+    };
+    if n != 2 {
+        return Err(HandlerError(format!(
+            "recvfrom n={n}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if &buf[..2] != b"hi" {
+        return Err(HandlerError(format!("recvfrom bytes: {:?}", &buf[..2])));
+    }
+    let sender_addr = sender
+        .join()
+        .map_err(|_| HandlerError("sender panicked".into()))?
+        .map_err(HandlerError)?;
+    let peer_addr = sockaddr_to_v4(peer);
+    if peer_addr.port() != sender_addr.port() {
+        return Err(HandlerError(format!(
+            "peer port {} != sender port {}",
+            peer_addr.port(),
+            sender_addr.port()
+        )));
+    }
+
+    Ok(BLOut {
+        bound_port: bound.port(),
+        peer_port: peer_addr.port(),
+        bytes: String::from_utf8_lossy(&buf[..2]).into_owned(),
+    })
+}
+
+async fn handle_udp_truncation(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<BLOut, HandlerError> {
+    // SAFETY: socket has no pointer arguments.
+    let recv = Fd::new(
+        unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) },
+        "recv socket(AF_INET, SOCK_DGRAM)",
+    )?;
+    let bound = bind_loopback_any(recv.0)?;
+
+    let sender = thread::spawn(move || -> Result<SocketAddrV4, String> {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(format!("send socket: {}", std::io::Error::last_os_error()));
+        }
+        let _fd = Fd(fd);
+        let payload = vec![b'x'; 4096];
+        let dst = sockaddr_from_v4(bound);
+        // SAFETY: `dst` and payload pointers are valid for the provided lengths.
+        let n = unsafe {
+            libc::sendto(
+                fd,
+                payload.as_ptr().cast(),
+                payload.len(),
+                0,
+                (&dst as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if n != payload.len() as isize {
+            return Err(format!("sendto n={n}: {}", std::io::Error::last_os_error()));
+        }
+        getsockname_v4(fd, "sender getsockname").map_err(|e| e.0)
+    });
+
+    let mut buf = [0u8; 100];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: zeroed structures are filled by recvmsg.
+    let mut peer: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = (&mut peer as *mut libc::sockaddr_in).cast();
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    // SAFETY: `msg` points to valid name and iov storage.
+    let n = unsafe { libc::recvmsg(recv.0, &mut msg, 0) };
+    if n != 100 {
+        return Err(HandlerError(format!(
+            "recvmsg n={n}: {} flags={:#x}",
+            std::io::Error::last_os_error(),
+            msg.msg_flags
+        )));
+    }
+    if msg.msg_flags & libc::MSG_TRUNC == 0 {
+        return Err(HandlerError(format!(
+            "recvmsg missing MSG_TRUNC: flags={:#x}",
+            msg.msg_flags
+        )));
+    }
+    if buf.iter().any(|&b| b != b'x') {
+        return Err(HandlerError("truncated payload bytes not preserved".into()));
+    }
+    let sender_addr = sender
+        .join()
+        .map_err(|_| HandlerError("sender panicked".into()))?
+        .map_err(HandlerError)?;
+    let peer_addr = sockaddr_to_v4(peer);
+    if peer_addr.port() != sender_addr.port() {
+        return Err(HandlerError(format!(
+            "peer port {} != sender port {}",
+            peer_addr.port(),
+            sender_addr.port()
+        )));
+    }
+
+    Ok(BLOut {
+        bound_port: bound.port(),
+        peer_port: peer_addr.port(),
+        bytes: format!("{} bytes trunc", n),
+    })
+}
+
 pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
     register_handler!(LISTEN_BASIC, handle_listen_basic);
     register_handler!(CONNECT_BASIC, handle_connect_basic);
+    register_handler!(UDP_RECVFROM_REMOTE_ADDR, handle_udp_recvfrom_remote_addr);
+    register_handler!(UDP_TRUNCATION, handle_udp_truncation);
     reg.single_agent_handler_test(
         "broker_listener",
         "listen_basic",
         "BL.listen_basic.pie-glibc.dpg1",
         AgentName::Dpg1,
         &LISTEN_BASIC,
+        |out| {
+            Ok(format!(
+                "bound={} peer={} bytes={}",
+                out.bound_port, out.peer_port, out.bytes
+            ))
+        },
+    );
+    reg.single_agent_handler_test(
+        "broker_listener",
+        "udp_recvfrom_remote_addr",
+        "BL.udp_recvfrom_remote_addr.pie-glibc.dpg1",
+        AgentName::Dpg1,
+        &UDP_RECVFROM_REMOTE_ADDR,
+        |out| {
+            Ok(format!(
+                "bound={} peer={} bytes={}",
+                out.bound_port, out.peer_port, out.bytes
+            ))
+        },
+    );
+    reg.single_agent_handler_test(
+        "invariants",
+        "udp_truncation",
+        "INV.udp_truncation.pie-glibc.dpg1",
+        AgentName::Dpg1,
+        &UDP_TRUNCATION,
         |out| {
             Ok(format!(
                 "bound={} peer={} bytes={}",

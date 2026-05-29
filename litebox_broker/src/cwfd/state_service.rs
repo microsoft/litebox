@@ -19,6 +19,7 @@
 //! its ring once via `RegisterNotificationRing`; subsequent
 //! `SubscribeEventfd` calls use that sender.
 
+use crate::cwfd::inet_dgram_state::{InetDgramError, InetDgramState};
 use crate::cwfd::inet_listener_state::{
     InetListenerError, InetListenerState, decode_sockaddr, encode_sockaddr, family_from_u8,
 };
@@ -39,6 +40,7 @@ use crate::state_registry::{
 };
 use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use crate::tcp_conn_state::{TcpConnError, TcpConnState};
+use litebox_common_linux::fd_token_protocol as proto;
 use litebox_common_linux::fd_token_protocol::PtyEndpoint;
 use litebox_common_linux::fd_token_protocol::{
     Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
@@ -237,6 +239,17 @@ pub fn handle_request(
             in_fds,
             Opcode::InetTcpConnGetPeerNameResponse,
         ),
+        Opcode::InetDgramCreate => handle_inet_dgram_create(registry, request, in_fds),
+        Opcode::InetDgramBind => handle_inet_dgram_bind(registry, request, in_fds),
+        Opcode::InetDgramConnect => handle_inet_dgram_connect(registry, request, in_fds),
+        Opcode::InetDgramSendTo => handle_inet_dgram_sendto(registry, request, in_fds),
+        Opcode::InetDgramRecvFrom => handle_inet_dgram_recvfrom(registry, request, in_fds),
+        Opcode::InetDgramShutdown => handle_inet_dgram_shutdown(registry, request, in_fds),
+        Opcode::InetDgramGetSockName => handle_inet_dgram_getsockname(registry, request, in_fds),
+        Opcode::InetDgramGetPeerName => handle_inet_dgram_getpeername(registry, request, in_fds),
+        Opcode::InetDgramSetSockOpt => handle_inet_dgram_setsockopt(registry, request, in_fds),
+        Opcode::InetDgramGetSockOpt => handle_inet_dgram_getsockopt(registry, request, in_fds),
+        Opcode::InetDgramQueryEvents => handle_inet_dgram_query_events(registry, request, in_fds),
         Opcode::CreatePipe => handle_create_pipe(registry, request, in_fds),
         Opcode::ReadPipe => handle_read_pipe(registry, request, in_fds),
         Opcode::WritePipe => handle_write_pipe(registry, request, in_fds),
@@ -805,6 +818,7 @@ fn resolve_pipe_read(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
+            | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
@@ -829,6 +843,7 @@ fn resolve_pipe_write(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
+            | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
@@ -946,6 +961,7 @@ fn resolve_socketpair_end(
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::InetListener(_)
+            | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
@@ -1228,6 +1244,7 @@ fn resolve_tcp_conn(
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::InetListener(_)
+            | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
@@ -1448,6 +1465,325 @@ fn handle_push_siginfo(
     HandlerResult {
         frame: build_push_siginfo_response_ok(),
         out_fd: None,
+    }
+}
+
+fn handle_inet_dgram_create(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramCreateResponse);
+    }
+    let family = match proto::parse_inet_dgram_create_body(request.body)
+        .ok()
+        .and_then(|raw| family_from_u8(raw).ok())
+    {
+        Some(family) => family,
+        None => return status_err(Opcode::InetDgramCreateResponse, StatusCode::InvalidValue),
+    };
+    let handle = registry.register(InetDgramState::new(family));
+    HandlerResult {
+        frame: proto::build_inet_dgram_create_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn resolve_inet_dgram(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+    response: Opcode,
+) -> Result<Arc<InetDgramState>, HandlerResult> {
+    let state = match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::InetDgram) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return Err(status_err(response, StatusCode::UnknownHandle));
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            return Err(status_err(response, StatusCode::SubsystemMismatch));
+        }
+        Err(_) => return Err(status_err(response, StatusCode::Internal)),
+    };
+    match state.as_ref() {
+        StateObjectEnum::InetDgram(dgram) => Ok(Arc::clone(dgram)),
+        StateObjectEnum::Eventfd(_)
+        | StateObjectEnum::PipeReadEnd(_)
+        | StateObjectEnum::PipeWriteEnd(_)
+        | StateObjectEnum::SocketPairEnd(_)
+        | StateObjectEnum::TcpConn(_)
+        | StateObjectEnum::InetListener(_)
+        | StateObjectEnum::Signalfd(_)
+        | StateObjectEnum::Inotify(_)
+        | StateObjectEnum::Pty(_)
+        | StateObjectEnum::Pidfd(_)
+        | StateObjectEnum::Process(_) => {
+            unreachable!("registry returned wrong state variant for InetDgram tag")
+        }
+    }
+}
+
+fn handle_inet_dgram_bind(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramBindResponse);
+    }
+    let (handle_id, sockaddr) = match proto::parse_inet_dgram_bind_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InetDgramBindResponse),
+    };
+    let state = match resolve_inet_dgram(registry, handle_id, Opcode::InetDgramBindResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.bind(&sockaddr) {
+        Ok(actual) => HandlerResult {
+            frame: proto::build_inet_dgram_bind_response_ok(&actual),
+            out_fd: None,
+        },
+        Err(err) => dgram_error_response(Opcode::InetDgramBindResponse, err),
+    }
+}
+
+fn handle_inet_dgram_connect(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramConnectResponse);
+    }
+    let (handle_id, sockaddr) = match proto::parse_inet_dgram_connect_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InetDgramConnectResponse),
+    };
+    let state = match resolve_inet_dgram(registry, handle_id, Opcode::InetDgramConnectResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.connect(&sockaddr) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_inet_dgram_connect_response_ok(),
+            out_fd: None,
+        },
+        Err(err) => dgram_error_response(Opcode::InetDgramConnectResponse, err),
+    }
+}
+
+fn handle_inet_dgram_sendto(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramSendToResponse);
+    }
+    let (handle_id, sockaddr, payload) = match proto::parse_inet_dgram_sendto_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InetDgramSendToResponse),
+    };
+    let state = match resolve_inet_dgram(registry, handle_id, Opcode::InetDgramSendToResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.sendto(&sockaddr, &payload) {
+        Ok(written) => HandlerResult {
+            frame: proto::build_inet_dgram_sendto_response_ok(written as u64),
+            out_fd: None,
+        },
+        Err(err) => dgram_error_response(Opcode::InetDgramSendToResponse, err),
+    }
+}
+
+fn handle_inet_dgram_recvfrom(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramRecvFromResponse);
+    }
+    let (handle_id, max_len) = match proto::parse_inet_dgram_recvfrom_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InetDgramRecvFromResponse),
+    };
+    let state = match resolve_inet_dgram(registry, handle_id, Opcode::InetDgramRecvFromResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.recvfrom(max_len as usize) {
+        Ok((peer, payload, flags)) => HandlerResult {
+            frame: proto::build_inet_dgram_recvfrom_response_ok(&peer, &payload, flags),
+            out_fd: None,
+        },
+        Err(err) => dgram_error_response(Opcode::InetDgramRecvFromResponse, err),
+    }
+}
+
+fn handle_inet_dgram_shutdown(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramShutdownResponse);
+    }
+    let (handle_id, how) = match proto::parse_inet_dgram_shutdown_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InetDgramShutdownResponse),
+    };
+    let state = match resolve_inet_dgram(registry, handle_id, Opcode::InetDgramShutdownResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.shutdown(how) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_inet_dgram_shutdown_response_ok(),
+            out_fd: None,
+        },
+        Err(err) => dgram_error_response(Opcode::InetDgramShutdownResponse, err),
+    }
+}
+
+fn handle_inet_dgram_getsockname(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramGetSockNameResponse);
+    }
+    let handle_id = match proto::parse_inet_dgram_getsockname_body(request.body) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::InetDgramGetSockNameResponse),
+    };
+    let state = match resolve_inet_dgram(registry, handle_id, Opcode::InetDgramGetSockNameResponse)
+    {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.getsockname() {
+        Ok(sockaddr) => HandlerResult {
+            frame: proto::build_inet_dgram_getsockname_response_ok(&sockaddr),
+            out_fd: None,
+        },
+        Err(err) => dgram_error_response(Opcode::InetDgramGetSockNameResponse, err),
+    }
+}
+
+fn handle_inet_dgram_getpeername(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramGetPeerNameResponse);
+    }
+    let handle_id = match proto::parse_inet_dgram_getpeername_body(request.body) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::InetDgramGetPeerNameResponse),
+    };
+    let state = match resolve_inet_dgram(registry, handle_id, Opcode::InetDgramGetPeerNameResponse)
+    {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.getpeername() {
+        Ok(sockaddr) => HandlerResult {
+            frame: proto::build_inet_dgram_getpeername_response_ok(&sockaddr),
+            out_fd: None,
+        },
+        Err(err) => dgram_error_response(Opcode::InetDgramGetPeerNameResponse, err),
+    }
+}
+
+fn handle_inet_dgram_setsockopt(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramSetSockOptResponse);
+    }
+    let (handle_id, level, name, value) =
+        match proto::parse_inet_dgram_setsockopt_body(request.body) {
+            Ok(v) => v,
+            Err(_) => return protocol_err(Opcode::InetDgramSetSockOptResponse),
+        };
+    let state = match resolve_inet_dgram(registry, handle_id, Opcode::InetDgramSetSockOptResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.setsockopt(level, name, &value) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_inet_dgram_setsockopt_response_ok(),
+            out_fd: None,
+        },
+        Err(err) => dgram_error_response(Opcode::InetDgramSetSockOptResponse, err),
+    }
+}
+
+fn handle_inet_dgram_getsockopt(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramGetSockOptResponse);
+    }
+    let (handle_id, level, name, max_len) =
+        match proto::parse_inet_dgram_getsockopt_body(request.body) {
+            Ok(v) => v,
+            Err(_) => return protocol_err(Opcode::InetDgramGetSockOptResponse),
+        };
+    let state = match resolve_inet_dgram(registry, handle_id, Opcode::InetDgramGetSockOptResponse) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match state.getsockopt(level, name, max_len) {
+        Ok(value) => HandlerResult {
+            frame: proto::build_inet_dgram_getsockopt_response_ok(&value),
+            out_fd: None,
+        },
+        Err(err) => dgram_error_response(Opcode::InetDgramGetSockOptResponse, err),
+    }
+}
+
+fn handle_inet_dgram_query_events(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetDgramQueryEventsResponse);
+    }
+    let handle_id = match proto::parse_inet_dgram_query_events_body(request.body) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::InetDgramQueryEventsResponse),
+    };
+    let state = match resolve_inet_dgram(registry, handle_id, Opcode::InetDgramQueryEventsResponse)
+    {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    HandlerResult {
+        frame: proto::build_inet_dgram_query_events_response_ok(state.current_events()),
+        out_fd: None,
+    }
+}
+
+fn dgram_error_response(opcode: Opcode, err: InetDgramError) -> HandlerResult {
+    match err {
+        InetDgramError::WouldBlock => status_err(opcode, StatusCode::WouldBlock),
+        InetDgramError::InvalidSockaddr
+        | InetDgramError::AlreadyBound
+        | InetDgramError::NotBound
+        | InetDgramError::NotConnected
+        | InetDgramError::Errno(_) => status_err(opcode, StatusCode::InvalidValue),
+        InetDgramError::Io(_) => status_err(opcode, StatusCode::Internal),
     }
 }
 
@@ -1817,6 +2153,7 @@ fn resolve_pty(
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
+            | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pidfd(_)

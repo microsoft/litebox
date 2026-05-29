@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
+pub mod broker_inet_dgram_provider;
 pub mod broker_inet_listener_provider;
 pub mod broker_inotify_provider;
 pub mod broker_pgrp_signal_provider;
@@ -317,6 +318,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         "unix_socket" => BrokerHandleKind::UnixSocket,
         "tcp_conn" => BrokerHandleKind::TcpConn,
         "inet_listener" => BrokerHandleKind::InetListener,
+        "inet_dgram" => BrokerHandleKind::InetDgram,
         other => anyhow::bail!("broker-fd-bridge: bad kind {other:?}"),
     };
     let handle_id: u64 = parts[2]
@@ -361,7 +363,8 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         | (BrokerHandleKind::Pidfd, Some(extra))
         | (BrokerHandleKind::Signalfd, Some(extra))
         | (BrokerHandleKind::TcpConn, Some(extra))
-        | (BrokerHandleKind::InetListener, Some(extra)) => {
+        | (BrokerHandleKind::InetListener, Some(extra))
+        | (BrokerHandleKind::InetDgram, Some(extra)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
                 parts[1]
@@ -371,7 +374,8 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         | (BrokerHandleKind::Pidfd, None)
         | (BrokerHandleKind::Signalfd, None)
         | (BrokerHandleKind::TcpConn, None)
-        | (BrokerHandleKind::InetListener, None) => (None, None, None),
+        | (BrokerHandleKind::InetListener, None)
+        | (BrokerHandleKind::InetDgram, None) => (None, None, None),
     };
     let pty_id = if kind == BrokerHandleKind::Pty {
         match parts.get(4) {
@@ -3390,6 +3394,10 @@ fn broker_inet_tcp_enabled() -> bool {
     env_flag_enabled("LITEBOX_BROKER_INET_TCP")
 }
 
+fn broker_inet_udp_enabled() -> bool {
+    env_flag_enabled("LITEBOX_BROKER_INET_UDP")
+}
+
 fn broker_tcp_conn_accept_or_outbound_enabled() -> bool {
     env_flag_enabled("LITEBOX_BROKER_TCP_CONN") || broker_inet_tcp_enabled()
 }
@@ -3446,6 +3454,19 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_socketpair_provider(socketpair_provider)
         .map_err(|_| anyhow!("socketpair provider already set"))?;
+
+    litebox_shim_linux::syscalls::set_broker_inet_dgram_enabled(broker_inet_udp_enabled());
+
+    if broker_inet_udp_enabled() {
+        let inet_dgram_provider = Arc::new(
+            crate::broker_inet_dgram_provider::RunnerBrokerInetDgramProvider::new(
+                Arc::clone(&client),
+                Arc::clone(&dispatcher),
+            ),
+        );
+        litebox_shim_linux::syscalls::set_broker_inet_dgram_provider(inet_dgram_provider)
+            .map_err(|_| anyhow!("inet dgram provider already set"))?;
+    }
 
     if broker_tcp_conn_accept_or_outbound_enabled() {
         let tcp_conn_provider = Arc::new(

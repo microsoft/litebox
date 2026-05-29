@@ -309,6 +309,8 @@ pub enum BrokerHandleKind {
     TcpConn = 7,
     /// Broker-hosted TCP listener.
     InetListener = 8,
+    /// Broker-hosted UDP datagram socket.
+    InetDgram = 9,
 }
 
 impl BrokerHandleKind {
@@ -329,6 +331,7 @@ impl BrokerHandleKind {
             6 => Self::UnixSocket,
             7 => Self::TcpConn,
             8 => Self::InetListener,
+            9 => Self::InetDgram,
             _ => return None,
         })
     }
