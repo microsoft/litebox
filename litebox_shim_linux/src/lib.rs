@@ -37,6 +37,46 @@ use litebox::{
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
 
+/// Whether this shim build includes the worker-local smoltcp network stack.
+pub const WORKER_LOCAL_INET: bool = cfg!(feature = "worker_local_inet");
+
+struct LocalNetwork {
+    #[cfg(feature = "worker_local_inet")]
+    inner: litebox::sync::Mutex<Platform, Network<Platform>>,
+}
+
+impl LocalNetwork {
+    fn new(litebox: &LiteBox<Platform>) -> Self {
+        #[cfg(feature = "worker_local_inet")]
+        {
+            let mut net = Network::new(litebox);
+            net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+            Self {
+                inner: litebox::sync::Mutex::new(net),
+            }
+        }
+        #[cfg(not(feature = "worker_local_inet"))]
+        {
+            let _ = litebox;
+            Self {}
+        }
+    }
+
+    fn lock(&self) -> litebox::sync::MutexGuard<'_, Platform, Network<Platform>> {
+        #[cfg(feature = "worker_local_inet")]
+        {
+            self.inner.lock()
+        }
+        #[cfg(not(feature = "worker_local_inet"))]
+        {
+            let _ = self;
+            unreachable!(
+                "worker-local Network<Platform> accessed under linux_userland broker-held inet default-on"
+            )
+        }
+    }
+}
+
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 // DEVNOTE: this is before the `mod` declarations so that it can be used within them.
 macro_rules! log_unsupported {
@@ -1060,8 +1100,7 @@ impl LinuxShimBuilder {
         use litebox::platform::AddressSpaceProvider;
         use litebox::platform::RawMutex as _;
 
-        let mut net = Network::new(&self.litebox);
-        net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        let net = LocalNetwork::new(&self.litebox);
 
         // Allocate the init process's address space (slot 0 on userland).
         let init_as_id = self
@@ -1103,7 +1142,7 @@ impl LinuxShimBuilder {
             platform: self.platform,
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
-            net: litebox::sync::Mutex::new(net),
+            net,
             boot_time: self.platform.now(),
             load_filter: self.load_filter,
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
@@ -4897,8 +4936,8 @@ struct GlobalState<FS: ShimFS> {
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
     pipes: Pipes<Platform>,
-    /// The network subsystem.
-    net: litebox::sync::Mutex<Platform, Network<Platform>>,
+    /// The optional worker-local network subsystem.
+    net: LocalNetwork,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
     /// Optional load filter function to modify environment variables during program loading.
