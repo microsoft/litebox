@@ -96,20 +96,22 @@ image stage in the Dockerfile + a new module that builds its
 `ContainerSpec` + writes a drive closure + calls
 `framework::run_trial` — no new cleanup or throttling code.
 
-Current callers:
+Current callers — **all three test families** in the harness now
+go through `framework::run_trial`. No bespoke container lifecycle
+code remains:
 
+- `run_pass_group` (standard coordinator tests) — image
+  `litebox-test`, foreground, drive closure parses JSON line on
+  stdout and scrapes timing markers from stderr.
 - `dropbear_bash::run_scenario` — image `litebox-agent-cli`,
   detached, drive closure SSHes to the published port and checks
   bash output. Host-side SSH driving preserved so the test
   exercises the same docker-bridge → litebox-inbound-TCP path a
   real user hits.
-- `copilot_cli` matrix (Phase I) — still uses the older
-  `ContainerHandle` flow; same migration applies but hasn't
-  landed yet.
-- `run_one_test` (standard coordinator tests) — still inlined;
-  not migrated to `framework::run_trial` because the existing
-  flow already participates in cleanup correctly (no bug to
-  fix). Cosmetic unification deferred to a future commit.
+- `copilot_cli::run_scenario` — image `litebox-agent-cli`,
+  detached, drive closure runs the Copilot CLI through SSH (pminus
+  or tui mode) and checks the response canary. `CopilotPermit`
+  (Copilot-API rate-limiter) sits above `framework::run_trial`.
 
 ### Sqlite schema (minimal — facts + one config table)
 
