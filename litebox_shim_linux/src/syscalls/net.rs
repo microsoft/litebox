@@ -61,6 +61,16 @@ macro_rules! convert_flags {
     };
 }
 
+macro_rules! worker_local_network_unreachable {
+    ($path:literal) => {
+        unreachable!(concat!(
+            "worker-local Network::",
+            $path,
+            " called — broker-held inet is the only valid path under linux_userland default-on"
+        ))
+    };
+}
+
 pub(crate) type SocketFd = litebox::net::SocketFd<Platform>;
 type BrokerSocketPairTypedFd =
     litebox::fd::TypedFd<crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem>;
@@ -318,6 +328,9 @@ impl<FS: ShimFS> GlobalState<FS> {
         sock_type: SockType,
         flags: SockFlags,
     ) -> Arc<NetworkProxy<litebox_platform_multiplex::Platform>> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("set_socket_proxy during socket initialization");
+        }
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
@@ -449,6 +462,9 @@ impl<FS: ShimFS> GlobalState<FS> {
         optval: ConstPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("setsockopt");
+        }
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
             // Collect any TCP option that needs to be applied via Network after
             // releasing the descriptor table write lock, to avoid a deadlock:
@@ -705,6 +721,9 @@ impl<FS: ShimFS> GlobalState<FS> {
         optval: MutPtr<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("getsockopt");
+        }
         match self.getsockopt_common(optname, optval, len, |sopt| {
             // reason: unsupported variants intentionally share this fallback path.
             #[allow(clippy::wildcard_enum_match_arm)]
@@ -840,6 +859,9 @@ impl<FS: ShimFS> GlobalState<FS> {
         fd: &SocketFd,
         peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, TryOpError<Errno>> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("accept");
+        }
         // Drive smoltcp explicitly — platform_interaction is Manual, so
         // automated_platform_interaction inside accept() is a no-op.
         // Without this, the network thread's poll results aren't visible
@@ -878,6 +900,9 @@ impl<FS: ShimFS> GlobalState<FS> {
     }
 
     fn bind(&self, fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("bind");
+        }
         let reuse_port = self.with_socket_options(fd, |options| options.reuse_port);
         self.net
             .lock()
@@ -892,6 +917,9 @@ impl<FS: ShimFS> GlobalState<FS> {
         raw_fd: u32,
         files: &core::cell::RefCell<alloc::sync::Arc<crate::syscalls::file::FilesState<FS>>>,
     ) -> Result<SocketFd, Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("accept by raw fd");
+        }
         files.borrow().with_socket(
             self,
             raw_fd,
@@ -912,6 +940,9 @@ impl<FS: ShimFS> GlobalState<FS> {
         fd: &SocketFd,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("connect");
+        }
         if sockaddr.port() == 0 {
             return Err(Errno::ECONNREFUSED);
         }
@@ -981,6 +1012,9 @@ impl<FS: ShimFS> GlobalState<FS> {
     }
 
     fn listen(&self, fd: &SocketFd, backlog: u16) -> Result<(), Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("listen");
+        }
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
@@ -991,6 +1025,9 @@ impl<FS: ShimFS> GlobalState<FS> {
     }
 
     fn shutdown(&self, fd: &SocketFd, read: bool, write: bool) -> Result<(), Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("shutdown");
+        }
         let result = self
             .net
             .lock()
@@ -1018,6 +1055,9 @@ impl<FS: ShimFS> GlobalState<FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("sendto");
+        }
         let proxy = self.get_proxy(fd)?;
 
         // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
@@ -1103,6 +1143,9 @@ impl<FS: ShimFS> GlobalState<FS> {
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("receive");
+        }
         let timeout = self.with_socket_options(fd, |opt| opt.recv_timeout);
         let is_nonblock = self.get_status(fd).contains(OFlags::NONBLOCK)
             || flags.contains(ReceiveFlags::DONTWAIT);
@@ -1232,6 +1275,9 @@ impl<FS: ShimFS> GlobalState<FS> {
         cx: &WaitContext<'_, Platform>,
         fd: Arc<SocketFd>,
     ) -> Result<(), Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("close");
+        }
         let linger_timeout = self.with_socket_options(&fd, |opt| opt.linger_timeout);
         let behavior = match linger_timeout {
             Some(timeout) if timeout.is_zero() => CloseBehavior::Immediate,
@@ -2287,6 +2333,9 @@ impl<FS: ShimFS> Task<FS> {
         flags: SockFlags,
         files: &crate::syscalls::file::FilesState<FS>,
     ) -> Result<Option<usize>, Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("accepted local TCP broker conversion");
+        }
         if !crate::syscalls::broker_tcp_conn::broker_tcp_conn_accept_enabled() {
             return Ok(None);
         }
@@ -2724,6 +2773,9 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn tcp_listen_worker_exec_bridge_spec(&self, raw_fd: usize) -> Option<String> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("worker-exec listen bridge spec");
+        }
         let fd = {
             let files = self.files.borrow();
             files
@@ -2756,6 +2808,9 @@ impl<FS: ShimFS> Task<FS> {
         port: u16,
         reuse_port: bool,
     ) -> Result<(), Errno> {
+        if !crate::WORKER_LOCAL_INET {
+            worker_local_network_unreachable!("install worker-exec listen bridge fd");
+        }
         let created_fd = self.do_socket(
             AddressFamily::INET,
             SockType::Stream,
@@ -4560,13 +4615,8 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |fd| {
-                self.global
-                    .net
-                    .lock()
-                    .get_local_addr(fd)
-                    .map(SocketAddress::Inet)
-                    .map_err(Errno::from)
+            |_fd| {
+                worker_local_network_unreachable!("get_local_addr via getsockname");
             },
             |file| Ok(SocketAddress::Unix(file.get_local_addr())),
         )
@@ -4615,13 +4665,8 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |fd| {
-                self.global
-                    .net
-                    .lock()
-                    .get_remote_addr(fd)
-                    .map(SocketAddress::Inet)
-                    .map_err(Errno::from)
+            |_fd| {
+                worker_local_network_unreachable!("get_remote_addr via getpeername");
             },
             |file| {
                 file.get_peer_addr()
