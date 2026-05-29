@@ -23,7 +23,7 @@ use crate::subscription_list::{SubscribeError, SubscriptionList, UnsubscribeErro
 const ACCEPT_QUEUE_CAP: usize = 128;
 const SOCKADDR_WIRE_LEN: usize = 28;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AddressFamily {
     V4,
     V6,

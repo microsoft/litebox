@@ -485,7 +485,7 @@ struct Entry {
 struct State {
     next_id: u64,
     table: HashMap<u64, Entry>,
-    broker_held_inet_listeners: HashMap<u16, u64>,
+    broker_held_inet_listeners: HashMap<(u16, AddressFamily), u64>,
     /// Ports already owned by the broker's `net_proxy` inbound forwarders.
     /// Worker-side `bind(port)` requests for these ports use a virtual bind
     /// (no host `bind()` call) because the broker already owns the host
@@ -636,6 +636,7 @@ impl BrokerStateRegistry {
     pub fn register_broker_held_inet_listener(
         &self,
         port: u16,
+        family: AddressFamily,
         handle: StateHandle,
     ) -> Result<(), StateRegistryError> {
         let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
@@ -643,8 +644,10 @@ impl BrokerStateRegistry {
             .table
             .get(&handle.0)
             .ok_or(StateRegistryError::UnknownHandle(handle))?;
-        let new_family = match entry.state.as_ref() {
-            StateObjectEnum::InetListener(listener) => listener.family(),
+        match entry.state.as_ref() {
+            StateObjectEnum::InetListener(listener) => {
+                debug_assert_eq!(listener.family(), family);
+            }
             StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
@@ -663,40 +666,49 @@ impl BrokerStateRegistry {
                     actual: entry.state.subsystem_tag(),
                 });
             }
-        };
-        if let Some(existing) = s.broker_held_inet_listeners.get(&port).copied() {
-            let existing_family =
-                s.table
-                    .get(&existing)
-                    .and_then(|entry| match entry.state.as_ref() {
-                        StateObjectEnum::InetListener(listener) => Some(listener.family()),
-                        StateObjectEnum::Eventfd(_)
-                        | StateObjectEnum::PipeReadEnd(_)
-                        | StateObjectEnum::PipeWriteEnd(_)
-                        | StateObjectEnum::SocketPairEnd(_)
-                        | StateObjectEnum::TcpConn(_)
-                        | StateObjectEnum::InetDgram(_)
-                        | StateObjectEnum::InetRaw(_)
-                        | StateObjectEnum::Signalfd(_)
-                        | StateObjectEnum::Inotify(_)
-                        | StateObjectEnum::Pty(_)
-                        | StateObjectEnum::Pidfd(_)
-                        | StateObjectEnum::Process(_) => None,
-                    });
-            if existing_family == Some(AddressFamily::V4) && new_family == AddressFamily::V6 {
-                return Ok(());
-            }
         }
-        s.broker_held_inet_listeners.insert(port, handle.0);
+        s.broker_held_inet_listeners
+            .insert((port, family), handle.0);
         Ok(())
     }
 
-    pub fn resolve_broker_held_inet_listener(&self, port: u16) -> Option<Arc<InetListenerState>> {
+    pub fn resolve_broker_held_inet_listener(
+        &self,
+        port: u16,
+        family: AddressFamily,
+    ) -> Option<Arc<InetListenerState>> {
         let s = self.state.lock().expect("BrokerStateRegistry poisoned");
-        let handle = *s.broker_held_inet_listeners.get(&port)?;
+        let handle = *s.broker_held_inet_listeners.get(&(port, family))?;
         let entry = s.table.get(&handle)?;
+        Some(Self::inet_listener_from_entry_or_panic(
+            entry, handle, port, family,
+        ))
+    }
+
+    pub fn resolve_broker_held_inet_listener_for_inbound(
+        &self,
+        port: u16,
+    ) -> Option<Arc<InetListenerState>> {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        for family in [AddressFamily::V6, AddressFamily::V4] {
+            if let Some(handle) = s.broker_held_inet_listeners.get(&(port, family)).copied() {
+                let entry = s.table.get(&handle)?;
+                return Some(Self::inet_listener_from_entry_or_panic(
+                    entry, handle, port, family,
+                ));
+            }
+        }
+        None
+    }
+
+    fn inet_listener_from_entry_or_panic(
+        entry: &Entry,
+        handle: u64,
+        port: u16,
+        family: AddressFamily,
+    ) -> Arc<InetListenerState> {
         match entry.state.as_ref() {
-            StateObjectEnum::InetListener(listener) => Some(Arc::clone(listener)),
+            StateObjectEnum::InetListener(listener) => Arc::clone(listener),
             StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
@@ -710,7 +722,7 @@ impl BrokerStateRegistry {
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::Process(_) => {
                 panic!(
-                    "broker-held inet listener route for port {port} points at non-listener handle {handle}"
+                    "broker-held inet listener route for port {port} family {family:?} points at non-listener handle {handle}"
                 );
             }
         }
@@ -1025,6 +1037,47 @@ mod tests {
 
         reg.release(h_ev).unwrap();
         reg.release(h_proc).unwrap();
+    }
+
+    #[test]
+    fn inet_listener_registry_v4_and_v6_coexist_on_same_port() {
+        let reg = BrokerStateRegistry::new();
+        let v4 = InetListenerState::new(AddressFamily::V4);
+        let v6 = InetListenerState::new(AddressFamily::V6);
+        let h4 = reg.register(Arc::clone(&v4));
+        let h6 = reg.register(Arc::clone(&v6));
+
+        reg.register_broker_held_inet_listener(22, AddressFamily::V4, h4)
+            .unwrap();
+        reg.register_broker_held_inet_listener(22, AddressFamily::V6, h6)
+            .unwrap();
+
+        let inbound = reg
+            .resolve_broker_held_inet_listener_for_inbound(22)
+            .unwrap();
+        assert!(Arc::ptr_eq(&inbound, &v6));
+
+        let v4_specific = reg
+            .resolve_broker_held_inet_listener(22, AddressFamily::V4)
+            .unwrap();
+        assert!(Arc::ptr_eq(&v4_specific, &v4));
+
+        let v6_specific = reg
+            .resolve_broker_held_inet_listener(22, AddressFamily::V6)
+            .unwrap();
+        assert!(Arc::ptr_eq(&v6_specific, &v6));
+
+        reg.release(h4).unwrap();
+        let inbound = reg
+            .resolve_broker_held_inet_listener_for_inbound(22)
+            .unwrap();
+        assert!(Arc::ptr_eq(&inbound, &v6));
+
+        reg.release(h6).unwrap();
+        assert!(
+            reg.resolve_broker_held_inet_listener_for_inbound(22)
+                .is_none()
+        );
     }
 
     #[test]
