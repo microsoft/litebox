@@ -1184,13 +1184,11 @@ where
             continue;
         }
         let end = offset + iov.iov_len;
-        let mut byte_offset: isize = 0;
-        for byte in &mut data[offset..end] {
+        for (byte_offset, byte) in (0_isize..).zip(data[offset..end].iter_mut()) {
             *byte = iov
                 .iov_base
                 .read_at_offset(byte_offset)
                 .ok_or(Errno::EFAULT)?;
-            byte_offset += 1;
         }
         offset = end;
     }
