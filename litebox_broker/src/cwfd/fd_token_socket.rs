@@ -12,7 +12,8 @@ use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_req
 use crate::fd_tokens::BrokerFdTokenRegistry;
 use crate::inotify_dispatcher::InotifyDispatcher;
 use crate::pgrp_signal_inbox::PgrpSignalInbox;
-use crate::state_registry::{BrokerStateRegistry, StateHandle};
+use crate::process_state::ProcessState;
+use crate::state_registry::{BrokerStateRegistry, StateHandle, StateRegistryError};
 use crate::state_service::{
     ConnState, SubscriptionRegistry, handle_deliver_signal_inbox, handle_pty_ioctl,
     handle_pty_write, handle_request as state_handle_request, handle_set_pgid, handle_set_sid,
@@ -450,6 +451,50 @@ fn peer_cred_fields(peer_cred: Option<PeerCred>) -> String {
             cred.pid, cred.uid, cred.gid
         ),
         None => "peer_pid=? peer_uid=? peer_gid=?".to_string(),
+    }
+}
+
+fn ensure_process_registered_for_caller(
+    process_registry: &BrokerStateRegistry,
+    tracker: &mut ConnRefTracker,
+    caller_scope: CallerScope,
+) {
+    let CallerScope::Owned(pid) = caller_scope else {
+        return;
+    };
+    let id = u64::from(pid.get());
+    if tracker.owns_process(caller_scope, id) {
+        return;
+    }
+
+    let handle = StateHandle::from_id(id);
+    match process_registry.resolve(handle, SubsystemTag::Process) {
+        Ok(_) => match process_registry.dup(handle) {
+            Ok(_) => tracker.record_process(caller_scope, id),
+            Err(err) => {
+                warn!(pid = pid.get(), error = ?err, "fd-token control: failed to dup caller process handle")
+            }
+        },
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            match process_registry.register_with_id(id, ProcessState::arc()) {
+                Ok(registered) => {
+                    debug_assert_eq!(registered.id(), id);
+                    tracker.record_process(caller_scope, id);
+                }
+                Err(err) => {
+                    warn!(pid = pid.get(), error = ?err, "fd-token control: failed to auto-register caller process handle")
+                }
+            }
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            warn!(
+                pid = pid.get(),
+                "fd-token control: caller pid handle is not a Process"
+            );
+        }
+        Err(err) => {
+            warn!(pid = pid.get(), error = ?err, "fd-token control: failed to resolve caller process handle")
+        }
     }
 }
 
@@ -943,6 +988,15 @@ fn handle_control_connection_inner(
                 let request_body = frame.body.to_vec();
                 let caller_pid = frame.caller_pid;
                 let caller_scope = tracker.note_caller_scope(CallerScope::from_wire(caller_pid));
+                if matches!(
+                    request_opcode,
+                    Opcode::SetSid
+                        | Opcode::SetPgid
+                        | Opcode::SubscribeProcessExit
+                        | Opcode::MarkProcessExited
+                ) {
+                    ensure_process_registered_for_caller(process_registry, tracker, caller_scope);
+                }
                 // PE.12 diag: log every frame received, gated on
                 // LITEBOX_PE10_DIAG. Tracker state pid_count helps
                 // identify which conn (by tracker fingerprint) the

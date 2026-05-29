@@ -55,6 +55,7 @@ mod net;
 mod netlink;
 mod pipe_lifecycle;
 mod proc;
+mod process;
 mod readiness;
 mod term;
 mod unix_socket;
@@ -66,6 +67,8 @@ pub(crate) fn dispatch_fast_leaf(args: &[String]) -> Option<i32> {
         _ => None,
     }
 }
+
+pub(crate) use process::register_process_tests;
 
 #[derive(Serialize, Deserialize)]
 struct ExecScriptArgs {

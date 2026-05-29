@@ -690,7 +690,7 @@ impl BrokerStateRegistry {
         port: u16,
     ) -> Option<Arc<InetListenerState>> {
         let s = self.state.lock().expect("BrokerStateRegistry poisoned");
-        for family in [AddressFamily::V6, AddressFamily::V4] {
+        for family in [AddressFamily::V4, AddressFamily::V6] {
             if let Some(handle) = s.broker_held_inet_listeners.get(&(port, family)).copied() {
                 let entry = s.table.get(&handle)?;
                 return Some(Self::inet_listener_from_entry_or_panic(
@@ -1055,7 +1055,7 @@ mod tests {
         let inbound = reg
             .resolve_broker_held_inet_listener_for_inbound(22)
             .unwrap();
-        assert!(Arc::ptr_eq(&inbound, &v6));
+        assert!(Arc::ptr_eq(&inbound, &v4));
 
         let v4_specific = reg
             .resolve_broker_held_inet_listener(22, AddressFamily::V4)
