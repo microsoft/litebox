@@ -244,9 +244,11 @@ impl OpteeShim {
                 thread: ThreadState::new(),
                 session_id,
                 ta_app_id: ta_uuid,
+                // Fall back to the anonymous public identity when no client is
+                // supplied (matches OP-TEE OS / the Linux driver).
                 client_identity: client.unwrap_or(TeeIdentity {
-                    login: TeeLogin::User,
-                    uuid: TeeUuid::default(),
+                    login: TeeLogin::Public,
+                    uuid: TeeUuid::NIL,
                 }),
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
@@ -1475,8 +1477,8 @@ mod test_utils {
                 session_id: SessionIdPool::allocate().unwrap(),
                 ta_app_id: TeeUuid::default(),
                 client_identity: TeeIdentity {
-                    login: TeeLogin::User,
-                    uuid: TeeUuid::default(),
+                    login: TeeLogin::Public,
+                    uuid: TeeUuid::NIL,
                 },
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
