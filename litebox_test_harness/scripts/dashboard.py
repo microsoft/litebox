@@ -393,6 +393,17 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
         " ORDER BY run_id DESC LIMIT 1"
     ).fetchone()
     universe_n = (universe[0] if universe else 0) or 0
+    # Per-pass universe: distinct test_ids ever observed per pass.
+    # See _render_result_groups for rationale (universe_size from runs
+    # is the grand total across passes — using it as per-pass total
+    # makes coverage look ~50% even at full per-pass coverage).
+    per_pass_universe: dict[str, int] = {
+        r["pass"]: r["n"]
+        for r in conn.execute(
+            'SELECT pass, COUNT(DISTINCT test_id) AS n '
+            'FROM run_results GROUP BY pass'
+        )
+    }
 
     lines = ["## Tracked refs\n",
              "| Ref | Worktree | Pass | HEAD | Coverage trend "
@@ -416,8 +427,9 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
             covered, n_pass, n_fail = _coverage_pass_fail(
                 conn, head_sha, pass_name
             )
+            total = per_pass_universe.get(pass_name) or (universe_n // 2 if universe_n else 0)
             cells.extend([
-                str(universe_n) if universe_n else "?",
+                str(total) if total else "?",
                 str(covered),
                 str(n_pass),
                 str(n_fail),
@@ -578,6 +590,20 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     ).fetchone()
     universe_n = (universe[0] if universe else 0) or 0
 
+    # Per-pass universe: count of distinct test_ids ever observed
+    # per pass. The harness's `universe_size` is the grand total
+    # across both passes (native + litebox + host::fwd) and using it
+    # as the "native total" / "litebox total" column makes coverage
+    # look like ~50% even at full per-pass coverage. Per-pass totals
+    # are stable observables: distinct test_ids per pass.
+    per_pass_universe: dict[str, int] = {
+        r["pass"]: r["n"]
+        for r in conn.execute(
+            'SELECT pass, COUNT(DISTINCT test_id) AS n '
+            'FROM run_results GROUP BY pass'
+        )
+    }
+
     now = now_ms()
     lines = ["## Result groups (per commit × dirty-state)\n",
              "| Tracked ref | Sha | Dirty | Worktree(s) "
@@ -602,8 +628,11 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
         cells: list[str] = []
         for pass_name in ("native", "litebox"):
             cov, n_pass, n_fail = _counts_from_verdicts(g["verdicts"], pass_name)
+            # Per-pass universe; fall back to halved grand total if
+            # the table is empty (very fresh DB).
+            total = per_pass_universe.get(pass_name) or (universe_n // 2 if universe_n else 0)
             cells.extend([
-                str(universe_n) if universe_n else "?",
+                str(total) if total else "?",
                 str(cov),
                 str(n_pass),
                 str(n_fail),
