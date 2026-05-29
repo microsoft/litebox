@@ -1,0 +1,425 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Broker-hosted UDP datagram socket state.
+
+use core::any::Any;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc as channel};
+use std::thread;
+use std::time::Duration;
+
+use litebox_common_linux::fd_token_protocol::INET_DGRAM_RECV_FLAG_TRUNC;
+use litebox_common_linux::fd_transfer_frame::SubsystemTag;
+use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
+use litebox_common_linux::notification_ring::NotificationSender;
+
+use crate::cwfd::inet_listener_state::{AddressFamily, decode_sockaddr, encode_sockaddr};
+use crate::state_registry::StateObject;
+use crate::subscription_list::{SubscribeError, SubscriptionList, UnsubscribeError};
+
+const RECV_QUEUE_CAP: usize = 128;
+const SOCKADDR_WIRE_LEN: usize = 28;
+const UDP_RECV_BUF_LEN: usize = 65_536;
+
+#[derive(Debug, thiserror::Error)]
+pub enum InetDgramError {
+    #[error("invalid inet datagram sockaddr")]
+    InvalidSockaddr,
+    #[error("inet datagram socket is already bound")]
+    AlreadyBound,
+    #[error("inet datagram socket is not bound")]
+    NotBound,
+    #[error("inet datagram socket is not connected")]
+    NotConnected,
+    #[error("inet datagram operation would block")]
+    WouldBlock,
+    #[error("inet datagram OS error {0}")]
+    Errno(i32),
+    #[error("inet datagram I/O error")]
+    Io(#[from] std::io::Error),
+}
+
+/// Broker-owned host UDP socket plus readiness subscribers.
+#[derive(Debug)]
+pub struct InetDgramState {
+    family: AddressFamily,
+    socket: Mutex<Option<UdpSocket>>,
+    connected_peer: Mutex<Option<SocketAddr>>,
+    subject: SubscriptionList,
+    recv_chan: Mutex<Option<channel::Receiver<(Vec<u8>, SocketAddr)>>>,
+    recv_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    queued_recvs: AtomicUsize,
+    stop_recv: Arc<AtomicBool>,
+}
+
+impl InetDgramState {
+    pub fn new(family: AddressFamily) -> Arc<Self> {
+        Arc::new(Self {
+            family,
+            socket: Mutex::new(None),
+            connected_peer: Mutex::new(None),
+            subject: SubscriptionList::new(),
+            recv_chan: Mutex::new(None),
+            recv_thread: Mutex::new(None),
+            queued_recvs: AtomicUsize::new(0),
+            stop_recv: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub fn family(&self) -> AddressFamily {
+        self.family
+    }
+
+    pub fn bind(
+        self: &Arc<Self>,
+        sockaddr: &[u8; SOCKADDR_WIRE_LEN],
+    ) -> Result<[u8; SOCKADDR_WIRE_LEN], InetDgramError> {
+        let addr = self.decode_family_sockaddr(sockaddr)?;
+        let socket = UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        let actual = socket.local_addr()?;
+        self.install_socket(socket)?;
+        encode_sockaddr(actual).map_err(|_| InetDgramError::InvalidSockaddr)
+    }
+
+    pub fn connect(
+        self: &Arc<Self>,
+        sockaddr: &[u8; SOCKADDR_WIRE_LEN],
+    ) -> Result<(), InetDgramError> {
+        let peer = self.decode_family_sockaddr(sockaddr)?;
+        self.ensure_socket()?;
+        let socket = self.clone_socket()?;
+        socket.connect(peer)?;
+        *self
+            .connected_peer
+            .lock()
+            .expect("InetDgramState connected_peer poisoned") = Some(peer);
+        Ok(())
+    }
+
+    pub fn sendto(
+        self: &Arc<Self>,
+        sockaddr: &[u8; SOCKADDR_WIRE_LEN],
+        payload: &[u8],
+    ) -> Result<usize, InetDgramError> {
+        self.ensure_socket()?;
+        let socket = self.clone_socket()?;
+        let result = if sockaddr.iter().all(|&b| b == 0) {
+            if self
+                .connected_peer
+                .lock()
+                .expect("InetDgramState connected_peer poisoned")
+                .is_none()
+            {
+                return Err(InetDgramError::NotConnected);
+            }
+            socket.send(payload)
+        } else {
+            let peer = self.decode_family_sockaddr(sockaddr)?;
+            socket.send_to(payload, peer)
+        };
+        match result {
+            Ok(n) => Ok(n),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(InetDgramError::WouldBlock)
+            }
+            Err(err) => Err(io_error_to_dgram_error(err)),
+        }
+    }
+
+    pub fn recvfrom(
+        &self,
+        max_len: usize,
+    ) -> Result<([u8; SOCKADDR_WIRE_LEN], Vec<u8>, u32), InetDgramError> {
+        let guard = self
+            .recv_chan
+            .lock()
+            .expect("InetDgramState recv_chan poisoned");
+        let rx = guard.as_ref().ok_or(InetDgramError::NotBound)?;
+        match rx.try_recv() {
+            Ok((mut payload, peer)) => {
+                self.queued_recvs.fetch_sub(1, Ordering::AcqRel);
+                let mut flags = 0;
+                if payload.len() > max_len {
+                    payload.truncate(max_len);
+                    flags |= INET_DGRAM_RECV_FLAG_TRUNC;
+                }
+                let peer = encode_sockaddr(peer).map_err(|_| InetDgramError::InvalidSockaddr)?;
+                Ok((peer, payload, flags))
+            }
+            Err(channel::TryRecvError::Empty) => Err(InetDgramError::WouldBlock),
+            Err(channel::TryRecvError::Disconnected) => Err(InetDgramError::Io(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "recv thread exited"),
+            )),
+        }
+    }
+
+    pub fn shutdown(&self, how: u8) -> Result<(), InetDgramError> {
+        let socket = self.clone_socket()?;
+        let how = match how {
+            0 => libc::SHUT_RD,
+            1 => libc::SHUT_WR,
+            2 => libc::SHUT_RDWR,
+            _ => return Err(InetDgramError::Errno(libc::EINVAL)),
+        };
+        // SAFETY: `socket.as_raw_fd()` is a valid live UDP socket fd for the duration of the call;
+        // `how` is one of the libc SHUT_* constants validated above.
+        let rc = unsafe { libc::shutdown(socket.as_raw_fd(), how) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(last_errno_error())
+        }
+    }
+
+    pub fn getsockname(&self) -> Result<[u8; SOCKADDR_WIRE_LEN], InetDgramError> {
+        let socket = self.clone_socket()?;
+        encode_sockaddr(socket.local_addr()?).map_err(|_| InetDgramError::InvalidSockaddr)
+    }
+
+    pub fn getpeername(&self) -> Result<[u8; SOCKADDR_WIRE_LEN], InetDgramError> {
+        let peer = self
+            .connected_peer
+            .lock()
+            .expect("InetDgramState connected_peer poisoned")
+            .ok_or(InetDgramError::NotConnected)?;
+        encode_sockaddr(peer).map_err(|_| InetDgramError::InvalidSockaddr)
+    }
+
+    pub fn setsockopt(&self, level: i32, name: i32, value: &[u8]) -> Result<(), InetDgramError> {
+        let socket = self.clone_socket()?;
+        let optlen: libc::socklen_t = value
+            .len()
+            .try_into()
+            .map_err(|_| InetDgramError::Errno(libc::EINVAL))?;
+        // SAFETY: `socket.as_raw_fd()` is live, and `value.as_ptr()` is valid for `optlen` bytes.
+        // The kernel copies the option value during this call and does not retain the pointer.
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                level,
+                name,
+                value.as_ptr().cast::<libc::c_void>(),
+                optlen,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(last_errno_error())
+        }
+    }
+
+    pub fn getsockopt(
+        &self,
+        level: i32,
+        name: i32,
+        max_len: u32,
+    ) -> Result<Vec<u8>, InetDgramError> {
+        let socket = self.clone_socket()?;
+        let mut value = vec![0u8; max_len as usize];
+        let mut optlen: libc::socklen_t = max_len;
+        // SAFETY: `socket.as_raw_fd()` is live, `value` has capacity for `optlen` bytes, and
+        // `&mut optlen` is a valid out-parameter for the kernel to report bytes written.
+        let rc = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                level,
+                name,
+                value.as_mut_ptr().cast::<libc::c_void>(),
+                &mut optlen,
+            )
+        };
+        if rc == 0 {
+            let len: usize = optlen
+                .try_into()
+                .map_err(|_| InetDgramError::Errno(libc::EINVAL))?;
+            value.truncate(len);
+            Ok(value)
+        } else {
+            Err(last_errno_error())
+        }
+    }
+
+    pub fn current_events(&self) -> u32 {
+        let mut events = NOTIFY_EVENT_OUT;
+        if self.queued_recvs.load(Ordering::Acquire) != 0 {
+            events |= NOTIFY_EVENT_IN;
+        }
+        events
+    }
+
+    fn decode_family_sockaddr(
+        &self,
+        sockaddr: &[u8; SOCKADDR_WIRE_LEN],
+    ) -> Result<SocketAddr, InetDgramError> {
+        let addr = decode_sockaddr(sockaddr).map_err(|_| InetDgramError::InvalidSockaddr)?;
+        match (self.family, addr) {
+            (AddressFamily::V4, SocketAddr::V4(_)) | (AddressFamily::V6, SocketAddr::V6(_)) => {
+                Ok(addr)
+            }
+            (AddressFamily::V4, SocketAddr::V6(_)) | (AddressFamily::V6, SocketAddr::V4(_)) => {
+                Err(InetDgramError::Errno(libc::EAFNOSUPPORT))
+            }
+        }
+    }
+
+    fn ensure_socket(self: &Arc<Self>) -> Result<(), InetDgramError> {
+        if self
+            .socket
+            .lock()
+            .expect("InetDgramState socket poisoned")
+            .is_some()
+        {
+            return Ok(());
+        }
+        let bind_addr = match self.family {
+            AddressFamily::V4 => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            AddressFamily::V6 => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+        };
+        let socket = UdpSocket::bind(bind_addr)?;
+        socket.set_nonblocking(true)?;
+        self.install_socket(socket)
+    }
+
+    fn install_socket(self: &Arc<Self>, socket: UdpSocket) -> Result<(), InetDgramError> {
+        let reader = socket.try_clone()?;
+        {
+            let mut slot = self.socket.lock().expect("InetDgramState socket poisoned");
+            if slot.is_some() {
+                return Err(InetDgramError::AlreadyBound);
+            }
+            *slot = Some(socket);
+        }
+        let (tx, rx) = channel::sync_channel(RECV_QUEUE_CAP);
+        *self
+            .recv_chan
+            .lock()
+            .expect("InetDgramState recv_chan poisoned") = Some(rx);
+        let weak = Arc::downgrade(self);
+        let stop = Arc::clone(&self.stop_recv);
+        let handle = thread::Builder::new()
+            .name("litebox-inet-dgram-recv".into())
+            .spawn(move || recv_loop(reader, tx, weak, stop))?;
+        *self
+            .recv_thread
+            .lock()
+            .expect("InetDgramState recv_thread poisoned") = Some(handle);
+        Ok(())
+    }
+
+    fn clone_socket(&self) -> Result<UdpSocket, InetDgramError> {
+        self.socket
+            .lock()
+            .expect("InetDgramState socket poisoned")
+            .as_ref()
+            .ok_or(InetDgramError::NotBound)?
+            .try_clone()
+            .map_err(InetDgramError::Io)
+    }
+}
+
+impl Drop for InetDgramState {
+    fn drop(&mut self) {
+        self.stop_recv.store(true, Ordering::Release);
+        let _ = self.socket.lock().map(|mut s| s.take());
+        let _ = self.recv_chan.lock().map(|mut rx| rx.take());
+        if let Ok(mut thread) = self.recv_thread.lock() {
+            if let Some(handle) = thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl StateObject for InetDgramState {
+    fn subsystem_tag(&self) -> SubsystemTag {
+        SubsystemTag::InetDgram
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn subscribe(
+        &self,
+        subscription_id: u64,
+        events_mask: u32,
+        sender: Arc<Mutex<NotificationSender>>,
+    ) -> Result<(), SubscribeError> {
+        let now = self.current_events();
+        self.subject.add(subscription_id, events_mask, sender)?;
+        if now & events_mask != 0 {
+            self.subject.notify(now);
+        }
+        Ok(())
+    }
+
+    fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
+        self.subject.remove(subscription_id)
+    }
+
+    fn current_events(&self) -> u32 {
+        InetDgramState::current_events(self)
+    }
+}
+
+fn recv_loop(
+    socket: UdpSocket,
+    tx: channel::SyncSender<(Vec<u8>, SocketAddr)>,
+    state: std::sync::Weak<InetDgramState>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut buf = vec![0u8; UDP_RECV_BUF_LEN];
+    while !stop.load(Ordering::Acquire) {
+        match socket.recv_from(&mut buf) {
+            Ok((n, peer)) => {
+                let payload = buf[..n].to_vec();
+                let mut pending = Some((payload, peer));
+                while let Some(item) = pending.take() {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match tx.try_send(item) {
+                        Ok(()) => {
+                            if let Some(state) = state.upgrade() {
+                                state.queued_recvs.fetch_add(1, Ordering::AcqRel);
+                                state.subject.notify(NOTIFY_EVENT_IN);
+                            } else {
+                                return;
+                            }
+                        }
+                        Err(channel::TrySendError::Full(item)) => {
+                            pending = Some(item);
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(channel::TrySendError::Disconnected(_)) => return,
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+fn last_errno_error() -> InetDgramError {
+    InetDgramError::Errno(
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO),
+    )
+}
+
+fn io_error_to_dgram_error(err: std::io::Error) -> InetDgramError {
+    match err.raw_os_error() {
+        Some(errno) => InetDgramError::Errno(errno),
+        None => InetDgramError::Io(err),
+    }
+}
