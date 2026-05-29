@@ -799,6 +799,21 @@ fn ssh_mode(
     let guest_ip = "10.0.0.2";
     let ssh_port = cli.ssh_port;
 
+    // Host-inbound SSH still depends on the smoltcp port-forward path. Broker-held
+    // inet listeners bind the same container port as the forwarding listener but
+    // are not yet reachable through the broker's inbound gateway.
+    for var in [
+        "LITEBOX_BROKER_INET_LISTENER",
+        "LITEBOX_BROKER_INET_TCP",
+        "LITEBOX_BROKER_INET_UDP",
+    ] {
+        // SAFETY: ssh_mode runs before spawning the broker/runner children and
+        // this process has not started any threads that concurrently access the environment.
+        unsafe {
+            std::env::set_var(var, "0");
+        }
+    }
+
     // SSH port forwarding: host:ssh_port → guest:22
     let forward_ports = vec![(ssh_port, guest_ip.to_string(), 22u16)];
 
