@@ -7,7 +7,7 @@ use core::any::Any;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc as channel};
+use std::sync::{mpsc as channel, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
 use litebox_common_linux::notification_ring::NotificationSender;
 
-use crate::cwfd::inet_listener_state::{AddressFamily, decode_sockaddr, encode_sockaddr};
+use crate::cwfd::inet_listener_state::{decode_sockaddr, encode_sockaddr, AddressFamily};
 use crate::state_registry::StateObject;
 use crate::subscription_list::{SubscribeError, SubscriptionList, UnsubscribeError};
 
@@ -421,5 +421,107 @@ fn io_error_to_dgram_error(err: std::io::Error) -> InetDgramError {
     match err.raw_os_error() {
         Some(errno) => InetDgramError::Errno(errno),
         None => InetDgramError::Io(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    use litebox_common_linux::fd_token_protocol::INET_DGRAM_RECV_FLAG_TRUNC;
+
+    fn loopback_zero() -> [u8; SOCKADDR_WIRE_LEN] {
+        encode_sockaddr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap()
+    }
+
+    fn bound_state() -> (Arc<InetDgramState>, SocketAddr) {
+        let state = InetDgramState::new(AddressFamily::V4);
+        state.bind(&loopback_zero()).unwrap();
+        let local = decode_sockaddr(&state.getsockname().unwrap()).unwrap();
+        (state, local)
+    }
+
+    fn recv_until(
+        state: &InetDgramState,
+        max_len: usize,
+    ) -> Result<([u8; SOCKADDR_WIRE_LEN], Vec<u8>, u32), InetDgramError> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match state.recvfrom(max_len) {
+                Err(InetDgramError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    #[test]
+    fn inet_dgram_create_bind_recvfrom_wouldblock() {
+        let (state, _) = bound_state();
+
+        match state.recvfrom(64) {
+            Err(InetDgramError::WouldBlock) => {}
+            other => panic!("expected WouldBlock, got {other:?}"),
+        }
+        assert_eq!(state.current_events(), NOTIFY_EVENT_OUT);
+    }
+
+    #[test]
+    fn inet_dgram_bind_receives_datagram_from_loopback_peer() {
+        let (state, local) = bound_state();
+        let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender.send_to(b"hello", local).unwrap();
+
+        let (peer_raw, payload, flags) = recv_until(&state, 64).unwrap();
+        let peer = decode_sockaddr(&peer_raw).unwrap();
+        assert_eq!(payload, b"hello");
+        assert_eq!(flags, 0);
+        assert_eq!(peer, sender.local_addr().unwrap());
+    }
+
+    #[test]
+    fn inet_dgram_connected_sendto_zero_sockaddr_uses_peer() {
+        let (state, _) = bound_state();
+        let peer = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let peer_raw = encode_sockaddr(peer.local_addr().unwrap()).unwrap();
+
+        state.connect(&peer_raw).unwrap();
+        let zero_sockaddr = [0u8; SOCKADDR_WIRE_LEN];
+        assert_eq!(state.sendto(&zero_sockaddr, b"connected").unwrap(), 9);
+
+        let mut buf = [0u8; 32];
+        let (n, from) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"connected");
+        assert_eq!(
+            from,
+            decode_sockaddr(&state.getsockname().unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn inet_dgram_recvfrom_truncates_large_datagram() {
+        let (state, local) = bound_state();
+        let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender.send_to(b"abcdef", local).unwrap();
+
+        let (_peer, payload, flags) = recv_until(&state, 3).unwrap();
+        assert_eq!(payload, b"abc");
+        assert_eq!(
+            flags & INET_DGRAM_RECV_FLAG_TRUNC,
+            INET_DGRAM_RECV_FLAG_TRUNC
+        );
+    }
+
+    #[test]
+    fn inet_dgram_drop_joins_recv_thread() {
+        let started = Instant::now();
+        {
+            let (state, _) = bound_state();
+            assert!(state.recv_thread.lock().unwrap().is_some());
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

@@ -18,7 +18,7 @@ use litebox_common_linux::notification_frame::{
 };
 use litebox_common_linux::notification_ring::NotificationSender;
 
-use crate::cwfd::inet_listener_state::{AddressFamily, encode_sockaddr, family_from_u8};
+use crate::cwfd::inet_listener_state::{encode_sockaddr, family_from_u8, AddressFamily};
 use crate::state_registry::StateObject;
 use crate::subscription_list::{SubscribeError, SubscriptionList, UnsubscribeError};
 
@@ -547,7 +547,7 @@ mod tests {
         }
     }
 
-    fn read_wait(state: &TcpConnState, max_len: usize) -> Vec<u8> {
+    fn read_wait(state: &Arc<TcpConnState>, max_len: usize) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match state.read(max_len) {
