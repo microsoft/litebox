@@ -718,8 +718,8 @@ impl<FS: ShimFS> Task<FS> {
             .flatten()
     }
 
-    fn do_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
-        let mode = Mode::from_bits_retain(mode) & !self.get_umask();
+    fn do_mkdir(&self, pathname: impl path::Arg, mode: Mode) -> Result<(), Errno> {
+        let mode = mode & !self.get_umask();
         self.files
             .borrow()
             .fs
@@ -735,7 +735,7 @@ impl<FS: ShimFS> Task<FS> {
         mode: u32,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        self.do_mkdir(pathname, mode)
+        self.do_mkdir(pathname, Mode::from_bits_retain(mode))
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
