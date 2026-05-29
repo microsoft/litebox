@@ -504,6 +504,121 @@ fn io_error_to_tcp_error(err: std::io::Error) -> TcpConnError {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cwfd::inet_listener_state::decode_sockaddr;
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    fn wait_for_connect(
+        state: &Arc<TcpConnState>,
+        target: SocketAddr,
+        timeout: Duration,
+    ) -> Result<(), TcpConnError> {
+        assert!(matches!(
+            state.start_connect(target, timeout),
+            Err(TcpConnError::WouldBlock)
+        ));
+        let deadline = Instant::now() + timeout + Duration::from_secs(2);
+        loop {
+            if state.current_events() & NOTIFY_EVENT_OUT != 0 {
+                return state.start_connect(target, timeout);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "connect did not complete before deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn read_wait(state: &TcpConnState, max_len: usize) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match state.read(max_len) {
+                Ok(bytes) => return bytes,
+                Err(TcpConnError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("tcp_conn read failed: {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_conn_new_unconnected_getpeername_returns_enotconn() {
+        let state = TcpConnState::new_unconnected(0);
+        assert_eq!(
+            state.getpeername(),
+            Err(TcpConnError::Errno(libc::ENOTCONN))
+        );
+        let local = decode_sockaddr(&state.getsockname().unwrap()).unwrap();
+        assert_eq!(
+            local,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        );
+    }
+
+    #[test]
+    fn tcp_conn_start_connect_to_host_listener_completes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+        let state = TcpConnState::new_unconnected(0);
+
+        wait_for_connect(&state, target, Duration::from_secs(2)).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let peer = decode_sockaddr(&state.getpeername().unwrap()).unwrap();
+        assert_eq!(peer, target);
+        assert_eq!(state.peer_addr(), Some(target));
+        drop(server);
+    }
+
+    #[test]
+    fn tcp_conn_start_connect_to_unbound_port_returns_econnrefused() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+        drop(listener);
+        let state = TcpConnState::new_unconnected(0);
+
+        assert_eq!(
+            wait_for_connect(&state, target, Duration::from_secs(2)),
+            Err(TcpConnError::Errno(libc::ECONNREFUSED))
+        );
+    }
+
+    #[test]
+    fn tcp_conn_start_connect_timeout_returns_etimedout() {
+        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 1));
+        let state = TcpConnState::new_unconnected(0);
+
+        assert_eq!(
+            wait_for_connect(&state, target, Duration::from_millis(100)),
+            Err(TcpConnError::Errno(libc::ETIMEDOUT))
+        );
+    }
+
+    #[test]
+    fn tcp_conn_connected_state_read_write_shutdown_still_work() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(target).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let state = TcpConnState::new(server);
+
+        client.write_all(b"ping").unwrap();
+        assert_eq!(read_wait(&state, 4), b"ping");
+
+        assert_eq!(state.write(b"pong").unwrap(), 4);
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
+
+        state.shutdown(false, true).unwrap();
+        assert_eq!(state.write(b"again"), Err(TcpConnError::PeerClosed));
+    }
+}
+
 fn poll_stream_events(stream: &TcpStream) -> u32 {
     let mut pfd = libc::pollfd {
         fd: stream.as_raw_fd(),
