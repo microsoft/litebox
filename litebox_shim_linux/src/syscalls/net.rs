@@ -1716,6 +1716,9 @@ impl<FS: ShimFS> Task<FS> {
                                 let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
                                 Errno::EMFILE
                             })?;
+                            self.inet6_fds
+                                .borrow_mut()
+                                .insert(u32::try_from(raw_fd).unwrap());
                             return Ok(u32::try_from(raw_fd).unwrap());
                         }
                         litebox::net::Protocol::Udp

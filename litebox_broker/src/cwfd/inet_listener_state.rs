@@ -53,7 +53,8 @@ pub struct InetListenerState {
     listener: Mutex<Option<TcpListener>>,
     bound_addr: Mutex<Option<SocketAddr>>,
     subject: SubscriptionList,
-    accept_chan: Mutex<Option<channel::Receiver<(TcpStream, SocketAddr)>>>,
+    accept_tx: Mutex<Option<channel::SyncSender<(TcpStream, SocketAddr)>>>,
+    accept_rx: Mutex<Option<channel::Receiver<(TcpStream, SocketAddr)>>>,
     accept_thread: Mutex<Option<thread::JoinHandle<()>>>,
     queued_accepts: AtomicUsize,
     accept_error: AtomicBool,
@@ -67,7 +68,8 @@ impl InetListenerState {
             listener: Mutex::new(None),
             bound_addr: Mutex::new(None),
             subject: SubscriptionList::new(),
-            accept_chan: Mutex::new(None),
+            accept_tx: Mutex::new(None),
+            accept_rx: Mutex::new(None),
             accept_thread: Mutex::new(None),
             queued_accepts: AtomicUsize::new(0),
             accept_error: AtomicBool::new(false),
@@ -115,9 +117,9 @@ impl InetListenerState {
 
     pub fn listen(self: &Arc<Self>, _backlog: u32) -> Result<(), InetListenerError> {
         if self
-            .accept_chan
+            .accept_rx
             .lock()
-            .expect("InetListenerState accept_chan poisoned")
+            .expect("InetListenerState accept_rx poisoned")
             .is_some()
         {
             return Err(InetListenerError::AlreadyListening);
@@ -132,9 +134,13 @@ impl InetListenerState {
         listener.set_nonblocking(true)?;
         let (tx, rx) = channel::sync_channel(ACCEPT_QUEUE_CAP);
         *self
-            .accept_chan
+            .accept_tx
             .lock()
-            .expect("InetListenerState accept_chan poisoned") = Some(rx);
+            .expect("InetListenerState accept_tx poisoned") = Some(tx.clone());
+        *self
+            .accept_rx
+            .lock()
+            .expect("InetListenerState accept_rx poisoned") = Some(rx);
         let weak = Arc::downgrade(self);
         let stop = Arc::clone(&self.stop_accept);
         let handle = thread::Builder::new()
@@ -149,9 +155,9 @@ impl InetListenerState {
 
     pub fn accept(&self) -> Result<(TcpStream, SocketAddr), InetListenerError> {
         let guard = self
-            .accept_chan
+            .accept_rx
             .lock()
-            .expect("InetListenerState accept_chan poisoned");
+            .expect("InetListenerState accept_rx poisoned");
         let rx = guard.as_ref().ok_or(InetListenerError::NotBound)?;
         match rx.try_recv() {
             Ok(conn) => {
@@ -161,6 +167,32 @@ impl InetListenerState {
             Err(channel::TryRecvError::Empty) => Err(InetListenerError::WouldBlock),
             Err(channel::TryRecvError::Disconnected) => Err(InetListenerError::Io(
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "accept thread exited"),
+            )),
+        }
+    }
+
+    pub fn accept_inbound(
+        &self,
+        stream: TcpStream,
+        peer: SocketAddr,
+    ) -> Result<(), InetListenerError> {
+        stream.set_nonblocking(true)?;
+        let tx = self
+            .accept_tx
+            .lock()
+            .expect("InetListenerState accept_tx poisoned")
+            .as_ref()
+            .cloned()
+            .ok_or(InetListenerError::NotBound)?;
+        match tx.try_send((stream, peer)) {
+            Ok(()) => {
+                self.queued_accepts.fetch_add(1, Ordering::AcqRel);
+                self.subject.notify(NOTIFY_EVENT_IN);
+                Ok(())
+            }
+            Err(channel::TrySendError::Full(_)) => Err(InetListenerError::WouldBlock),
+            Err(channel::TrySendError::Disconnected(_)) => Err(InetListenerError::Io(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "accept queue closed"),
             )),
         }
     }
@@ -181,7 +213,8 @@ impl Drop for InetListenerState {
     fn drop(&mut self) {
         self.stop_accept.store(true, Ordering::Release);
         let _ = self.listener.lock().map(|mut l| l.take());
-        let _ = self.accept_chan.lock().map(|mut rx| rx.take());
+        let _ = self.accept_tx.lock().map(|mut tx| tx.take());
+        let _ = self.accept_rx.lock().map(|mut rx| rx.take());
         if let Ok(mut thread) = self.accept_thread.lock() {
             if let Some(handle) = thread.take() {
                 let _ = handle.join();
