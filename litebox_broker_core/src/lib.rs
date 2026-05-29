@@ -1,11 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Transport-independent broker authority core.
+//! Protocol- and transport-independent broker authority core.
 //!
 //! `litebox_broker_core` owns broker-side object identity, reference lifetime,
 //! rights checks, generation checks, and policy calls. It deliberately has no
-//! dependency on Unix sockets, shared-memory rings, or any other transport.
+//! dependency on protocol request/response types, Unix sockets, shared-memory
+//! rings, or any other transport.
 
 #![no_std]
 
@@ -14,6 +15,7 @@ extern crate alloc;
 extern crate std;
 
 mod connection;
+mod error;
 mod event;
 mod identity;
 mod object;
@@ -22,19 +24,21 @@ mod types;
 
 use alloc::collections::BTreeMap;
 
-pub use connection::{BrokerConnection, BrokerDispatch, CloseReason, DispatchOutcome};
-use litebox_broker_protocol::{ErrorCode, ObjectId, ObjectReferenceId, ProtocolVersion};
+pub use connection::BrokerConnection;
+pub use error::BrokerError;
+pub use event::{ReadinessState, WaitOutcome};
+pub use identity::CallerCredential;
 use object::{ObjectEntry, ObjectReference};
+pub use object::{
+    ObjectGeneration, ObjectHandle, ObjectId, ObjectReferenceGeneration, ObjectReferenceId,
+};
 pub use policy::{
     DefaultDenyPolicy, EventOnlyPolicy, ObjectOperation, PolicyEngine, PolicyOperation,
 };
 pub use types::{ObjectRights, ObjectType};
 
 /// BrokerCore result type.
-pub type Result<T> = core::result::Result<T, ErrorCode>;
-
-/// Protocol version this broker core implementation supports.
-pub const SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);
+pub type Result<T> = core::result::Result<T, BrokerError>;
 
 /// Transport-independent broker authority state.
 pub struct BrokerCore<P> {
@@ -64,7 +68,7 @@ const EXHAUSTED_ID: u64 = 0;
 
 fn allocate_id(next_id: &mut u64) -> Result<u64> {
     if *next_id == EXHAUSTED_ID {
-        return Err(ErrorCode::ResourceExhausted);
+        return Err(BrokerError::ResourceExhausted);
     }
 
     let id = *next_id;

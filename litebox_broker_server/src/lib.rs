@@ -11,4 +11,7 @@
 
 mod server;
 
-pub use server::{BrokerServeError, ConnectionTermination, serve_connection};
+pub use server::{
+    BrokerServeError, CloseReason, ConnectionTermination, SUPPORTED_PROTOCOL_VERSION,
+    serve_connection,
+};

@@ -11,7 +11,7 @@ User mode:
   Shim + UserLiteBox + optional shim-specific user clients
 
 Authority domain:
-  BrokerCore + optional BrokerServices + PolicyEngine + BrokerPlatform
+  broker entry/server + BrokerCore + optional BrokerServices + PolicyEngine + BrokerPlatform
 
 Kernel-broker deployments:
   BrokerHost supports user-mode UserLiteBox execution and broker transport
@@ -24,6 +24,7 @@ The baseline is the stricter durable-unicorn model: no host fd/HANDLE delegation
 - Build vertical slices, not a big-bang refactor.
 - Keep UserLiteBox untrusted and broker authority explicit.
 - Keep BrokerCore shim-neutral.
+- Keep BrokerCore protocol-neutral and transport-neutral. BrokerCore exposes in-domain authority methods and domain types; broker entry/server code adapts protocol requests and transport credentials before calling it.
 - Put domain-specific authority in BrokerServices.
 - Put final allow/deny/audit decisions in PolicyEngine.
 - Keep BrokerPlatform as authorized backend execution, not a policy owner.
@@ -81,11 +82,12 @@ Initial scope:
 - control channel only;
 - major-version/minor-compatible protocol negotiation;
 - neutral blocking `no_std` request/response transport traits with transport-specific error types and explicit clean-close receive semantics;
-- transport-produced peer credentials returned through the server transport trait and passed into BrokerCore associations;
+- transport-produced peer credentials returned through the server transport trait and mapped by the broker server into BrokerCore caller credentials;
 - reusable `no_std + alloc` request/response wire codec for byte-stream transports;
 - Unix-domain-socket framing as the first concrete userland transport crate;
-- a Unix-socket executable crate that wires the generic transport-neutral server to the concrete Unix transport;
-- BrokerCore-owned connection negotiation, request dispatch, peer-credential association seam, and connection cleanup;
+- a Unix-socket executable that wires the generic transport-neutral server to the concrete Unix transport;
+- server-owned protocol negotiation, request sequencing, unknown-tag handling, protocol/core type adaptation, and connection-close reasons;
+- BrokerCore-owned caller associations, object/reference authority, policy hooks, event behavior, and connection cleanup;
 - default-deny PolicyEngine;
 - fail-closed channel/session behavior.
 
@@ -93,7 +95,8 @@ Exit criteria:
 
 - UserLiteBox can connect and negotiate.
 - Broker binds caller identity to the authenticated transport. The first hosted executable passes the explicit unauthenticated placeholder through the same server API that later deployment-specific authentication will use.
-- Userland transport code only receives/sends decoded frames and supplies peer credentials; BrokerCore owns broker request dispatch and typed dispatch outcomes, and the generic server reports successful termination as peer-close or broker-close with a reason.
+- Userland transport code only receives/sends decoded frames and supplies peer credentials; the generic server owns broker protocol dispatch and reports successful termination as peer-close or broker-close with a reason.
+- BrokerCore has no dependency on `litebox_broker_protocol`, `litebox_broker_transport`, wire codecs, or concrete IPC crates.
 - Client code does not need to depend on the userland broker server crate to use the first Unix socket transport.
 - The generic broker server library does not depend on concrete Unix socket transport code and remains `no_std`.
 - Malformed or unauthorized requests fail closed or return policy-denied according to explicit policy.
@@ -329,7 +332,7 @@ Split trusted deployment code into:
 Exit criteria:
 
 - BrokerHost does not decode or authorize BrokerRequest.
-- BrokerCore protocol and object semantics are reused.
+- Broker server/entry protocol semantics and BrokerCore object semantics are reused through the same protocol-to-core adapter boundary.
 - Kernel-broker deployment passes the same broker-object conformance tests as userland broker.
 
 ## Phase 13: OP-TEE BrokerService

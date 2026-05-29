@@ -1,9 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{ObjectRights, ObjectType};
-use litebox_broker_protocol::ErrorCode;
-use litebox_broker_transport::PeerCredential;
+use crate::{BrokerError, CallerCredential, ObjectRights, ObjectType};
 
 /// Broker operation submitted to the policy engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,8 +9,8 @@ use litebox_broker_transport::PeerCredential;
 pub enum PolicyOperation {
     /// Perform an operation on a broker-owned object type.
     Object {
-        /// Transport-authenticated peer credential for the caller.
-        peer_credential: PeerCredential,
+        /// Broker-entry-authenticated credential for the caller.
+        caller_credential: CallerCredential,
         object_type: ObjectType,
         operation: ObjectOperation,
     },
@@ -30,9 +28,12 @@ pub enum ObjectOperation {
 
 impl PolicyOperation {
     /// Creates a policy operation for creating a broker-owned object type.
-    pub const fn create_object(peer_credential: PeerCredential, object_type: ObjectType) -> Self {
+    pub const fn create_object(
+        caller_credential: CallerCredential,
+        object_type: ObjectType,
+    ) -> Self {
         Self::Object {
-            peer_credential,
+            caller_credential,
             object_type,
             operation: ObjectOperation::Create,
         }
@@ -40,12 +41,12 @@ impl PolicyOperation {
 
     /// Creates a policy operation for using a broker-owned object with rights.
     pub const fn use_object(
-        peer_credential: PeerCredential,
+        caller_credential: CallerCredential,
         object_type: ObjectType,
         rights: ObjectRights,
     ) -> Self {
         Self::Object {
-            peer_credential,
+            caller_credential,
             object_type,
             operation: ObjectOperation::Use { rights },
         }
@@ -55,7 +56,7 @@ impl PolicyOperation {
 /// Broker policy decision interface.
 pub trait PolicyEngine {
     /// Authorizes or denies a broker operation.
-    fn authorize(&mut self, operation: PolicyOperation) -> Result<(), ErrorCode>;
+    fn authorize(&mut self, operation: PolicyOperation) -> Result<(), BrokerError>;
 }
 
 /// Policy engine that denies every operation.
@@ -63,8 +64,8 @@ pub trait PolicyEngine {
 pub struct DefaultDenyPolicy;
 
 impl PolicyEngine for DefaultDenyPolicy {
-    fn authorize(&mut self, _operation: PolicyOperation) -> Result<(), ErrorCode> {
-        Err(ErrorCode::PolicyDenied)
+    fn authorize(&mut self, _operation: PolicyOperation) -> Result<(), BrokerError> {
+        Err(BrokerError::PolicyDenied)
     }
 }
 
@@ -78,22 +79,22 @@ impl PolicyEngine for DefaultDenyPolicy {
 pub struct EventOnlyPolicy;
 
 impl PolicyEngine for EventOnlyPolicy {
-    fn authorize(&mut self, operation: PolicyOperation) -> Result<(), ErrorCode> {
+    fn authorize(&mut self, operation: PolicyOperation) -> Result<(), BrokerError> {
         match operation {
             PolicyOperation::Object {
-                peer_credential: PeerCredential::Unauthenticated,
+                caller_credential: CallerCredential::Unauthenticated,
                 object_type: ObjectType::Event,
                 operation: ObjectOperation::Create,
             } => Ok(()),
             PolicyOperation::Object {
-                peer_credential: PeerCredential::Unauthenticated,
+                caller_credential: CallerCredential::Unauthenticated,
                 object_type: ObjectType::Event,
                 operation: ObjectOperation::Use { rights },
             } if rights == ObjectRights::WAIT || rights == ObjectRights::WRITE => Ok(()),
             PolicyOperation::Object {
                 object_type: ObjectType::Event,
                 ..
-            } => Err(ErrorCode::PolicyDenied),
+            } => Err(BrokerError::PolicyDenied),
         }
     }
 }
@@ -101,7 +102,6 @@ impl PolicyEngine for EventOnlyPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_transport::PeerCredential;
 
     #[test]
     fn event_only_policy_allows_only_current_event_surface() {
@@ -109,14 +109,14 @@ mod tests {
 
         assert_eq!(
             policy.authorize(PolicyOperation::create_object(
-                PeerCredential::Unauthenticated,
+                CallerCredential::Unauthenticated,
                 ObjectType::Event
             )),
             Ok(())
         );
         assert_eq!(
             policy.authorize(PolicyOperation::use_object(
-                PeerCredential::Unauthenticated,
+                CallerCredential::Unauthenticated,
                 ObjectType::Event,
                 ObjectRights::WAIT
             )),
@@ -124,7 +124,7 @@ mod tests {
         );
         assert_eq!(
             policy.authorize(PolicyOperation::use_object(
-                PeerCredential::Unauthenticated,
+                CallerCredential::Unauthenticated,
                 ObjectType::Event,
                 ObjectRights::WRITE
             )),
@@ -132,11 +132,11 @@ mod tests {
         );
         assert_eq!(
             policy.authorize(PolicyOperation::use_object(
-                PeerCredential::Unauthenticated,
+                CallerCredential::Unauthenticated,
                 ObjectType::Event,
                 ObjectRights::WAIT | ObjectRights::WRITE
             )),
-            Err(ErrorCode::PolicyDenied)
+            Err(BrokerError::PolicyDenied)
         );
     }
 }

@@ -1,14 +1,41 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::identity::Association;
 use crate::object::ObjectKind;
-use crate::{BrokerCore, ObjectRights, ObjectType, PolicyEngine, Result};
-use litebox_broker_protocol::{ErrorCode, ObjectHandle, ReadinessState, WaitOutcome};
+use crate::{
+    BrokerConnection, BrokerCore, BrokerError, ObjectHandle, ObjectRights, ObjectType,
+    PolicyEngine, Result,
+};
+
+/// Event readiness snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadinessState {
+    /// Whether the event is currently ready.
+    pub ready: bool,
+    /// Monotonic generation incremented on readiness changes.
+    pub generation: u64,
+}
+
+impl ReadinessState {
+    /// Creates a readiness snapshot.
+    pub const fn new(ready: bool, generation: u64) -> Self {
+        Self { ready, generation }
+    }
+}
+
+/// Result of checking an event wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// The event was ready and a nonblocking wait would complete.
+    Ready(ReadinessState),
+    /// The event was not ready and a blocking wait would sleep.
+    WouldBlock(ReadinessState),
+}
 
 impl<P: PolicyEngine> BrokerCore<P> {
     /// Creates a broker-owned event object.
-    pub(crate) fn create_event(&mut self, association: Association) -> Result<ObjectHandle> {
+    pub fn create_event(&mut self, connection: &BrokerConnection) -> Result<ObjectHandle> {
+        let association = connection.association();
         self.authorize_create_object(association, ObjectType::Event)?;
 
         self.insert_object_with_reference(
@@ -24,11 +51,12 @@ impl<P: PolicyEngine> BrokerCore<P> {
     /// Blocking is intentionally outside BrokerCore for the first proof of
     /// concept. Userland or kernel deployments can block on transport-specific
     /// wait primitives after BrokerCore authorizes and reports readiness state.
-    pub(crate) fn wait_event(
+    pub fn wait_event(
         &mut self,
-        association: Association,
+        connection: &BrokerConnection,
         handle: ObjectHandle,
     ) -> Result<WaitOutcome> {
+        let association = connection.association();
         self.authorize_object_use(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
         let state = self.event_state(handle)?;
         Ok(if state.ready {
@@ -39,11 +67,12 @@ impl<P: PolicyEngine> BrokerCore<P> {
     }
 
     /// Signals a broker-owned event object.
-    pub(crate) fn signal_event(
+    pub fn signal_event(
         &mut self,
-        association: Association,
+        connection: &BrokerConnection,
         handle: ObjectHandle,
     ) -> Result<ReadinessState> {
+        let association = connection.association();
         self.authorize_object_use(association, handle, ObjectType::Event, ObjectRights::WRITE)?;
         match &mut self.object_mut(handle.object_id)?.kind {
             ObjectKind::Event(event) => event.signal(),
@@ -80,7 +109,7 @@ impl EventObject {
         self.readiness_generation = self
             .readiness_generation
             .checked_add(1)
-            .ok_or(ErrorCode::ResourceExhausted)?;
+            .ok_or(BrokerError::ResourceExhausted)?;
         Ok(self.readiness_state())
     }
 }
@@ -88,19 +117,17 @@ impl EventObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BrokerCore, EventOnlyPolicy};
-    use litebox_broker_protocol::ObjectGeneration;
-    use litebox_broker_transport::PeerCredential;
+    use crate::{BrokerCore, CallerCredential, EventOnlyPolicy, ObjectGeneration};
 
     #[test]
     fn wait_rejects_reference_without_wait_right() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
-        let association = core
-            .create_association(PeerCredential::Unauthenticated)
+        let connection = core
+            .create_connection(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = core
             .insert_object_with_reference(
-                association,
+                connection.association(),
                 ObjectKind::Event(EventObject::new()),
                 ObjectType::Event,
                 ObjectRights::WRITE,
@@ -108,23 +135,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            core.wait_event(association, handle),
-            Err(ErrorCode::InvalidRights)
+            core.wait_event(&connection, handle),
+            Err(BrokerError::InvalidRights)
         );
     }
 
     #[test]
     fn wait_rejects_stale_object_generation() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
-        let association = core
-            .create_association(PeerCredential::Unauthenticated)
+        let connection = core
+            .create_connection(CallerCredential::Unauthenticated)
             .unwrap();
-        let mut handle = core.create_event(association).unwrap();
+        let mut handle = core.create_event(&connection).unwrap();
         handle.object_generation = ObjectGeneration::new(handle.object_generation.get() + 1);
 
         assert_eq!(
-            core.wait_event(association, handle),
-            Err(ErrorCode::StaleHandle)
+            core.wait_event(&connection, handle),
+            Err(BrokerError::StaleHandle)
         );
     }
 
@@ -132,16 +159,16 @@ mod tests {
     fn wait_rejects_handle_owned_by_another_association() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
         let owner = core
-            .create_association(PeerCredential::Unauthenticated)
+            .create_connection(CallerCredential::Unauthenticated)
             .unwrap();
         let other = core
-            .create_association(PeerCredential::Unauthenticated)
+            .create_connection(CallerCredential::Unauthenticated)
             .unwrap();
-        let handle = core.create_event(owner).unwrap();
+        let handle = core.create_event(&owner).unwrap();
 
         assert_eq!(
-            core.wait_event(other, handle),
-            Err(ErrorCode::InvalidRights)
+            core.wait_event(&other, handle),
+            Err(BrokerError::InvalidRights)
         );
     }
 }

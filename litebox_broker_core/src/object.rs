@@ -6,12 +6,83 @@ use alloc::vec::Vec;
 use crate::event::EventObject;
 use crate::identity::Association;
 use crate::{
-    BrokerCore, ObjectRights, ObjectType, PolicyEngine, PolicyOperation, Result, allocate_id,
+    BrokerCore, BrokerError, ObjectRights, ObjectType, PolicyEngine, PolicyOperation, Result,
+    allocate_id,
 };
-use litebox_broker_protocol::{
-    ErrorCode, ObjectGeneration, ObjectHandle, ObjectId, ObjectReferenceGeneration,
-    ObjectReferenceId,
-};
+
+macro_rules! id_type {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[repr(transparent)]
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(u64);
+
+        impl $name {
+            /// Creates an identifier from its raw value.
+            pub const fn new(raw: u64) -> Self {
+                Self(raw)
+            }
+
+            /// Returns the raw identifier value.
+            pub const fn get(self) -> u64 {
+                self.0
+            }
+        }
+    };
+}
+
+id_type! {
+    /// Broker-owned object identifier.
+    ObjectId
+}
+
+id_type! {
+    /// Generation attached to a broker object.
+    ObjectGeneration
+}
+
+id_type! {
+    /// Broker-owned object reference identifier.
+    ObjectReferenceId
+}
+
+id_type! {
+    /// Generation attached to a broker object reference.
+    ObjectReferenceGeneration
+}
+
+/// Broker-owned object handle returned by BrokerCore.
+///
+/// UserLiteBox may cache this value, but the broker remains authoritative for
+/// object lifetime, reference lifetime, type, rights, and generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ObjectHandle {
+    /// Opaque broker object identifier.
+    pub object_id: ObjectId,
+    /// Object generation used to reject stale handles after object-slot reuse.
+    pub object_generation: ObjectGeneration,
+    /// Opaque broker reference identifier owned by one authenticated process association.
+    pub reference_id: ObjectReferenceId,
+    /// Reference generation used to reject stale handles after reference-slot reuse.
+    pub reference_generation: ObjectReferenceGeneration,
+}
+
+impl ObjectHandle {
+    /// Creates an object handle.
+    pub const fn new(
+        object_id: ObjectId,
+        object_generation: ObjectGeneration,
+        reference_id: ObjectReferenceId,
+        reference_generation: ObjectReferenceGeneration,
+    ) -> Self {
+        Self {
+            object_id,
+            object_generation,
+            reference_id,
+            reference_generation,
+        }
+    }
+}
 
 const FIRST_OBJECT_GENERATION: ObjectGeneration = ObjectGeneration::new(1);
 const FIRST_REFERENCE_GENERATION: ObjectReferenceGeneration = ObjectReferenceGeneration::new(1);
@@ -103,7 +174,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
         object_type: ObjectType,
     ) -> Result<()> {
         self.policy.authorize(PolicyOperation::create_object(
-            association.peer_credential(),
+            association.caller_credential(),
             object_type,
         ))
     }
@@ -117,20 +188,22 @@ impl<P: PolicyEngine> BrokerCore<P> {
     ) -> Result<()> {
         self.validate_handle(association, handle, object_type, rights)?;
         self.policy.authorize(PolicyOperation::use_object(
-            association.peer_credential(),
+            association.caller_credential(),
             object_type,
             rights,
         ))
     }
 
     pub(crate) fn object(&self, object_id: ObjectId) -> Result<&ObjectEntry> {
-        self.objects.get(&object_id).ok_or(ErrorCode::UnknownObject)
+        self.objects
+            .get(&object_id)
+            .ok_or(BrokerError::UnknownObject)
     }
 
     pub(crate) fn object_mut(&mut self, object_id: ObjectId) -> Result<&mut ObjectEntry> {
         self.objects
             .get_mut(&object_id)
-            .ok_or(ErrorCode::UnknownObject)
+            .ok_or(BrokerError::UnknownObject)
     }
 
     fn validate_handle(
@@ -143,34 +216,34 @@ impl<P: PolicyEngine> BrokerCore<P> {
         let reference = self
             .references
             .get(&handle.reference_id)
-            .ok_or(ErrorCode::UnknownObject)?;
+            .ok_or(BrokerError::UnknownObject)?;
         debug_assert_eq!(reference.reference_generation, FIRST_REFERENCE_GENERATION);
         if reference.owner != association {
-            return Err(ErrorCode::InvalidRights);
+            return Err(BrokerError::InvalidRights);
         }
         if reference.reference_generation != handle.reference_generation
             || reference.object_generation != handle.object_generation
             || reference.object_id != handle.object_id
         {
-            return Err(ErrorCode::StaleHandle);
+            return Err(BrokerError::StaleHandle);
         }
         if reference.object_type != expected_type {
-            return Err(ErrorCode::WrongObjectType);
+            return Err(BrokerError::WrongObjectType);
         }
         if !reference.rights.contains(required_rights) {
-            return Err(ErrorCode::InvalidRights);
+            return Err(BrokerError::InvalidRights);
         }
 
         let object = self
             .objects
             .get(&reference.object_id)
-            .ok_or(ErrorCode::UnknownObject)?;
+            .ok_or(BrokerError::UnknownObject)?;
         debug_assert_eq!(reference.object_generation, object.generation);
         if object.generation != handle.object_generation {
-            return Err(ErrorCode::StaleHandle);
+            return Err(BrokerError::StaleHandle);
         }
         if object.kind.object_type() != expected_type {
-            return Err(ErrorCode::WrongObjectType);
+            return Err(BrokerError::WrongObjectType);
         }
 
         Ok(())
@@ -220,14 +293,13 @@ impl<P> BrokerCore<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DefaultDenyPolicy;
-    use litebox_broker_transport::PeerCredential;
+    use crate::{BrokerError, CallerCredential, DefaultDenyPolicy};
 
     #[test]
     fn object_and_reference_allocators_issue_max_id_then_exhaust() {
         let mut core = BrokerCore::new(DefaultDenyPolicy);
         let association = core
-            .create_association(PeerCredential::Unauthenticated)
+            .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         core.next_object_id = u64::MAX;
         core.next_reference_id = u64::MAX;
@@ -252,7 +324,7 @@ mod tests {
                 ObjectType::Event,
                 ObjectRights::WAIT,
             ),
-            Err(ErrorCode::ResourceExhausted)
+            Err(BrokerError::ResourceExhausted)
         );
     }
 
@@ -260,7 +332,7 @@ mod tests {
     fn validate_handle_rejects_reference_object_generation_mismatch() {
         let mut core = BrokerCore::new(DefaultDenyPolicy);
         let association = core
-            .create_association(PeerCredential::Unauthenticated)
+            .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = core
             .insert_object_with_reference(
@@ -278,7 +350,7 @@ mod tests {
 
         assert_eq!(
             core.validate_handle(association, handle, ObjectType::Event, ObjectRights::WAIT),
-            Err(ErrorCode::StaleHandle)
+            Err(BrokerError::StaleHandle)
         );
     }
 
@@ -286,7 +358,7 @@ mod tests {
     fn validate_handle_rejects_stale_reference_generation() {
         let mut core = BrokerCore::new(DefaultDenyPolicy);
         let association = core
-            .create_association(PeerCredential::Unauthenticated)
+            .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = core
             .insert_object_with_reference(
@@ -310,7 +382,7 @@ mod tests {
                 ObjectType::Event,
                 ObjectRights::WAIT
             ),
-            Err(ErrorCode::StaleHandle)
+            Err(BrokerError::StaleHandle)
         );
     }
 }

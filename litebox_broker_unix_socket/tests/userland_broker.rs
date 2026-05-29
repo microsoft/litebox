@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use litebox_broker_client::BrokerClient;
-use litebox_broker_core::SUPPORTED_PROTOCOL_VERSION;
 use litebox_broker_protocol::{ReadinessState, WaitOutcome};
+use litebox_broker_server::SUPPORTED_PROTOCOL_VERSION;
 use litebox_broker_unix_socket::UnixStreamClientTransport;
 
 #[test]

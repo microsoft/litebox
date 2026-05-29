@@ -14,8 +14,8 @@ use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
 /// Peer identity information supplied by the transport or host layer.
 ///
 /// The first userland proof of concept does not authenticate Unix-socket peers,
-/// but BrokerCore still accepts an explicit credential value so authenticated
-/// transports can plumb identity through the same connection-creation seam.
+/// but transports still return an explicit credential value so the server layer
+/// can map authenticated peer identity into BrokerCore caller identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum PeerCredential {
