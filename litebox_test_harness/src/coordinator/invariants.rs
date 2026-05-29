@@ -17,6 +17,8 @@ const BROKER_HANDLE_REFCOUNT: HandlerToken<(), InvariantOut> =
     HandlerToken::new("invariants.broker_handle_refcount");
 const GETIFADDRS_SANDBOX_VIEW: HandlerToken<(), GetifaddrsSandboxView> =
     HandlerToken::new("invariants.getifaddrs_sandbox_view");
+const SETSOCKOPT_PASSTHROUGH: HandlerToken<SetSockOptProbe, InvariantOut> =
+    HandlerToken::new("invariants.setsockopt_passthrough");
 
 const LITEBOX_IOCTL_KIND_TYPEID_INVARIANT: libc::c_ulong = 0x4c42_4901;
 
@@ -36,6 +38,11 @@ struct GetifaddrsEntry {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct GetifaddrsSandboxView {
     entries: Vec<GetifaddrsEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SetSockOptProbe {
+    option: String,
 }
 
 struct Fd(i32);
@@ -205,6 +212,90 @@ fn check_getifaddrs_sandbox_view(view: &GetifaddrsSandboxView) -> Result<String,
     }
 }
 
+async fn handle_setsockopt_passthrough(
+    args: SetSockOptProbe,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<InvariantOut, HandlerError> {
+    // SAFETY: socket has no pointer arguments.
+    let client = Fd::new(
+        unsafe {
+            libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            )
+        },
+        "client socket",
+    )?;
+    let mut got: libc::c_int = 0;
+    let mut got_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+
+    let (level, optname, value, check): (
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        fn(i32, i32) -> bool,
+    ) = match args.option.as_str() {
+        "TCP_NODELAY" => (libc::IPPROTO_TCP, libc::TCP_NODELAY, 1, |_got, _want| true),
+        "SO_REUSEADDR" => (libc::SOL_SOCKET, libc::SO_REUSEADDR, 1, |_got, _want| true),
+        "SO_SNDBUF" => (libc::SOL_SOCKET, libc::SO_SNDBUF, 4096, |got, want| {
+            got >= want
+        }),
+        other => {
+            return Ok(InvariantOut {
+                ok: false,
+                detail: format!("unknown sockopt probe {other}"),
+            });
+        }
+    };
+
+    // SAFETY: `client` is a live socket fd and `value` points to a valid int.
+    let set_rc = unsafe {
+        libc::setsockopt(
+            client.0,
+            level,
+            optname,
+            (&raw const value).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if set_rc != 0 {
+        return Ok(InvariantOut {
+            ok: false,
+            detail: format!(
+                "setsockopt({}) failed: {}",
+                args.option,
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    // SAFETY: `got` and `got_len` point to writable storage for getsockopt.
+    let get_rc = unsafe {
+        libc::getsockopt(
+            client.0,
+            level,
+            optname,
+            (&raw mut got).cast(),
+            &raw mut got_len,
+        )
+    };
+    if get_rc != 0 {
+        return Ok(InvariantOut {
+            ok: false,
+            detail: format!(
+                "getsockopt({}) failed: {}",
+                args.option,
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    let ok = got_len as usize == std::mem::size_of::<libc::c_int>() && check(got, value);
+    Ok(InvariantOut {
+        ok,
+        detail: format!("{} set={} got={} len={}", args.option, value, got, got_len),
+    })
+}
+
 async fn handle_broker_handle_refcount(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
@@ -322,6 +413,7 @@ pub(crate) fn register_invariant_tests(reg: &mut Registry<'_>) {
     register_handler!(KIND_TYPEID_MATCH, handle_kind_typeid_match);
     register_handler!(BROKER_HANDLE_REFCOUNT, handle_broker_handle_refcount);
     register_handler!(GETIFADDRS_SANDBOX_VIEW, handle_getifaddrs_sandbox_view);
+    register_handler!(SETSOCKOPT_PASSTHROUGH, handle_setsockopt_passthrough);
     for &bt in BinaryType::ALL {
         let id = format!("INV.getifaddrs_sandbox_view.{}.dpg1", bt.label());
         reg.test("invariants", "getifaddrs_sandbox_view", id)
@@ -352,6 +444,32 @@ pub(crate) fn register_invariant_tests(reg: &mut Registry<'_>) {
                                 Ok(detail) => super::TestOutcome::new("dpg1", true, detail),
                                 Err(detail) => super::TestOutcome::new("dpg1", false, detail),
                             },
+                            Err(err) => super::TestOutcome::new("dpg1", false, err),
+                        }
+                    })
+                })
+            });
+    }
+    for option in ["TCP_NODELAY", "SO_REUSEADDR", "SO_SNDBUF"] {
+        let id = format!("INV.setsockopt_passthrough.{option}.pie-glibc.dpg1");
+        let option = option.to_string();
+        reg.test("invariants", "setsockopt_passthrough", id)
+            .timeout(60)
+            .build(move |cx| {
+                let dpg1 = cx.require(AgentName::Dpg1);
+                let option = option.clone();
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let result = run
+                            .send_named_typed(
+                                &dpg1,
+                                &SETSOCKOPT_PASSTHROUGH,
+                                SetSockOptProbe { option },
+                            )
+                            .await;
+                        match result {
+                            Ok(out) if out.ok => super::TestOutcome::new("dpg1", true, out.detail),
+                            Ok(out) => super::TestOutcome::new("dpg1", false, out.detail),
                             Err(err) => super::TestOutcome::new("dpg1", false, err),
                         }
                     })

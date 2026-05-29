@@ -47,7 +47,8 @@ use litebox_common_linux::fd_token_protocol::{
     build_deliver_signal_inbox_response_ok, build_error_response,
     build_inet_listener_accept_response_ok, build_inet_listener_bind_response_ok,
     build_inet_listener_create_response_ok, build_inet_listener_listen_response_ok,
-    build_inet_listener_query_events_response_ok, build_inotify_add_watch_response_ok,
+    build_inet_listener_query_events_response_ok, build_inet_tcp_conn_getsockopt_response_ok,
+    build_inet_tcp_conn_setsockopt_response_ok, build_inotify_add_watch_response_ok,
     build_inotify_init1_response_ok, build_inotify_read_response_ok,
     build_inotify_rm_watch_response_ok, build_mark_process_exited_response_ok,
     build_open_pty_slave_response_ok, build_pidfd_exited_response_ok,
@@ -67,7 +68,8 @@ use litebox_common_linux::fd_token_protocol::{
     parse_create_signalfd_body, parse_create_socketpair_body, parse_deliver_signal_inbox_body,
     parse_handle_body, parse_inet_listener_accept_body, parse_inet_listener_bind_body,
     parse_inet_listener_create_body, parse_inet_listener_listen_body,
-    parse_inet_listener_query_events_body, parse_inotify_add_watch_body, parse_inotify_init1_body,
+    parse_inet_listener_query_events_body, parse_inet_tcp_conn_getsockopt_body,
+    parse_inet_tcp_conn_setsockopt_body, parse_inotify_add_watch_body, parse_inotify_init1_body,
     parse_inotify_read_body, parse_inotify_rm_watch_body, parse_mark_process_exited_body,
     parse_open_pty_slave_body, parse_pidfd_exited_request, parse_poll_tcp_conn_events_body,
     parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body,
@@ -250,6 +252,8 @@ pub fn handle_request(
         Opcode::WriteTcpConn => handle_write_tcp_conn(registry, request, in_fds),
         Opcode::ShutdownTcpConn => handle_shutdown_tcp_conn(registry, request, in_fds),
         Opcode::PollTcpConnEvents => handle_poll_tcp_conn_events(registry, request, in_fds),
+        Opcode::InetTcpConnSetSockOpt => handle_inet_tcp_conn_setsockopt(registry, request, in_fds),
+        Opcode::InetTcpConnGetSockOpt => handle_inet_tcp_conn_getsockopt(registry, request, in_fds),
         Opcode::ReadSiginfo => handle_read_siginfo(registry, request, in_fds),
         Opcode::PushSiginfo => handle_push_siginfo(registry, request, in_fds),
         Opcode::CreatePty => handle_create_pty(registry, request, in_fds),
@@ -1349,6 +1353,86 @@ fn handle_poll_tcp_conn_events(
     HandlerResult {
         frame: build_poll_tcp_conn_events_response_ok(state.current_events()),
         out_fd: None,
+    }
+}
+
+fn handle_inet_tcp_conn_setsockopt(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetTcpConnSetSockOptResponse);
+    }
+    let (handle_id, level, optname, optval) =
+        match parse_inet_tcp_conn_setsockopt_body(request.body) {
+            Ok(parts) => parts,
+            Err(_) => return protocol_err(Opcode::InetTcpConnSetSockOptResponse),
+        };
+    let state = match resolve_tcp_conn(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::InetTcpConnSetSockOptResponse, status),
+    };
+    match state.setsockopt(level, optname, &optval) {
+        Ok(()) => HandlerResult {
+            frame: build_inet_tcp_conn_setsockopt_response_ok(),
+            out_fd: None,
+        },
+        Err(TcpConnError::Errno(errno)) if errno == libc::EOPNOTSUPP => status_err(
+            Opcode::InetTcpConnSetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::Errno(_)) => status_err(
+            Opcode::InetTcpConnSetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::WouldBlock | TcpConnError::PeerClosed) => status_err(
+            Opcode::InetTcpConnSetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::Io) => {
+            status_err(Opcode::InetTcpConnSetSockOptResponse, StatusCode::Internal)
+        }
+    }
+}
+
+fn handle_inet_tcp_conn_getsockopt(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetTcpConnGetSockOptResponse);
+    }
+    let (handle_id, level, optname, optlen) =
+        match parse_inet_tcp_conn_getsockopt_body(request.body) {
+            Ok(parts) => parts,
+            Err(_) => return protocol_err(Opcode::InetTcpConnGetSockOptResponse),
+        };
+    let state = match resolve_tcp_conn(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::InetTcpConnGetSockOptResponse, status),
+    };
+    match state.getsockopt(level, optname, optlen) {
+        Ok(bytes) => HandlerResult {
+            frame: build_inet_tcp_conn_getsockopt_response_ok(&bytes),
+            out_fd: None,
+        },
+        Err(TcpConnError::Errno(errno)) if errno == libc::EOPNOTSUPP => status_err(
+            Opcode::InetTcpConnGetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::Errno(_)) => status_err(
+            Opcode::InetTcpConnGetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::WouldBlock | TcpConnError::PeerClosed) => status_err(
+            Opcode::InetTcpConnGetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::Io) => {
+            status_err(Opcode::InetTcpConnGetSockOptResponse, StatusCode::Internal)
+        }
     }
 }
 

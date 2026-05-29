@@ -236,6 +236,14 @@ impl Default for SocketAddress {
     }
 }
 
+fn socket_option_raw(optname: SocketOptionName) -> (u32, u32) {
+    match optname {
+        SocketOptionName::IP(ip) => (0, ip as u32),
+        SocketOptionName::Socket(socket) => (1, socket as u32),
+        SocketOptionName::TCP(tcp) => (IPProtocol::TCP as u32, tcp as u32),
+    }
+}
+
 impl SocketAddress {
     pub(crate) fn inet(self) -> Option<SocketAddr> {
         // reason: unsupported variants intentionally share this fallback path.
@@ -3931,7 +3939,8 @@ impl<FS: ShimFS> Task<FS> {
             ) => self
                 .global
                 .setsockopt_common(optname, optval, optlen, |_sopt, _value| Ok(())),
-            SocketOptionName::TCP(TcpOption::NODELAY | TcpOption::CORK) => {
+            SocketOptionName::Socket(SocketOption::RCVBUF | SocketOption::SNDBUF)
+            | SocketOptionName::TCP(TcpOption::NODELAY | TcpOption::CORK) => {
                 let _val: u32 = super::read_from_user(optval, optlen)?;
                 Ok(())
             }
@@ -3940,9 +3949,12 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| broker_sockopt(optname)) {
             return result;
         }
-        if let Some(result) =
-            self.try_with_broker_tcp_conn(sockfd, |_typed| broker_sockopt(optname))
-        {
+        if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            let (level, raw_optname) = socket_option_raw(optname);
+            let value = optval.to_owned_slice(optlen).ok_or(Errno::EFAULT)?;
+            let handle = self.broker_tcp_conn_handle(typed)?;
+            handle.with_entry(|entry| entry.setsockopt(level, raw_optname, &value))
+        }) {
             return result;
         }
         if let Some(result) =
@@ -4046,9 +4058,16 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(result) = self.try_with_broker_sp(sockfd, |_typed| broker_getsockopt(optname)) {
             return result;
         }
-        if let Some(result) =
-            self.try_with_broker_tcp_conn(sockfd, |_typed| broker_getsockopt(optname))
-        {
+        if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            let (level, raw_optname) = socket_option_raw(optname);
+            let handle = self.broker_tcp_conn_handle(typed)?;
+            let value = handle.with_entry(|entry| entry.getsockopt(level, raw_optname, len))?;
+            let write_len = value.len().min(len as usize);
+            optval
+                .write_slice_at_offset(0, &value[..write_len])
+                .ok_or(Errno::EFAULT)?;
+            Ok(write_len)
+        }) {
             return result;
         }
         if let Some(result) =

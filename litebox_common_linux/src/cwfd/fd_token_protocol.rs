@@ -201,6 +201,8 @@ pub enum Opcode {
     WriteTcpConn = 0x7A,
     ShutdownTcpConn = 0x7B,
     PollTcpConnEvents = 0x7C,
+    InetTcpConnSetSockOpt = 0x7E,
+    InetTcpConnGetSockOpt = 0x7F,
     #[cfg(debug_assertions)]
     DebugQueryStateObject = 0x7D,
 
@@ -263,6 +265,8 @@ pub enum Opcode {
     WriteTcpConnResponse = 0xFA,
     ShutdownTcpConnResponse = 0xFB,
     PollTcpConnEventsResponse = 0xFC,
+    InetTcpConnSetSockOptResponse = 0xFE,
+    InetTcpConnGetSockOptResponse = 0xFF,
     #[cfg(debug_assertions)]
     DebugQueryStateObjectResponse = 0xFD,
 }
@@ -426,6 +430,8 @@ impl Opcode {
             Opcode::WriteTcpConn => Some(Opcode::WriteTcpConnResponse),
             Opcode::ShutdownTcpConn => Some(Opcode::ShutdownTcpConnResponse),
             Opcode::PollTcpConnEvents => Some(Opcode::PollTcpConnEventsResponse),
+            Opcode::InetTcpConnSetSockOpt => Some(Opcode::InetTcpConnSetSockOptResponse),
+            Opcode::InetTcpConnGetSockOpt => Some(Opcode::InetTcpConnGetSockOptResponse),
             #[cfg(debug_assertions)]
             Opcode::DebugQueryStateObject => Some(Opcode::DebugQueryStateObjectResponse),
             _ => None,
@@ -497,6 +503,8 @@ impl Opcode {
                 | Opcode::WriteTcpConn
                 | Opcode::ShutdownTcpConn
                 | Opcode::PollTcpConnEvents
+                | Opcode::InetTcpConnSetSockOpt
+                | Opcode::InetTcpConnGetSockOpt
         )
     }
 
@@ -579,6 +587,8 @@ impl TryFrom<u8> for Opcode {
             0x7A => Ok(Opcode::WriteTcpConn),
             0x7B => Ok(Opcode::ShutdownTcpConn),
             0x7C => Ok(Opcode::PollTcpConnEvents),
+            0x7E => Ok(Opcode::InetTcpConnSetSockOpt),
+            0x7F => Ok(Opcode::InetTcpConnGetSockOpt),
             #[cfg(debug_assertions)]
             0x7D => Ok(Opcode::DebugQueryStateObject),
             0x81 => Ok(Opcode::RegisterResponse),
@@ -638,6 +648,8 @@ impl TryFrom<u8> for Opcode {
             0xFA => Ok(Opcode::WriteTcpConnResponse),
             0xFB => Ok(Opcode::ShutdownTcpConnResponse),
             0xFC => Ok(Opcode::PollTcpConnEventsResponse),
+            0xFE => Ok(Opcode::InetTcpConnSetSockOptResponse),
+            0xFF => Ok(Opcode::InetTcpConnGetSockOptResponse),
             #[cfg(debug_assertions)]
             0xFD => Ok(Opcode::DebugQueryStateObjectResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
@@ -2766,6 +2778,144 @@ fn parse_inet_tcp_sockaddr_response(
     let mut sockaddr = [0u8; 28];
     sockaddr.copy_from_slice(body);
     Ok(sockaddr)
+}
+
+pub fn build_inet_tcp_conn_setsockopt_request(
+    handle_id: u64,
+    level: u32,
+    optname: u32,
+    optval: &[u8],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24 + optval.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&level.to_le_bytes());
+    body.extend_from_slice(&optname.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(optval.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(optval);
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnSetSockOpt,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_tcp_conn_setsockopt_body(
+    body: &[u8],
+) -> Result<(u64, u32, u32, Vec<u8>), ProtocolError> {
+    if body.len() < 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnSetSockOpt,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let level = u32::from_le_bytes(body[8..12].try_into().unwrap());
+    let optname = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    let len = u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[20..24].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 24 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnSetSockOpt,
+            got: body.len(),
+            want: 24 + len,
+        });
+    }
+    Ok((handle, level, optname, body[24..].to_vec()))
+}
+
+pub fn build_inet_tcp_conn_setsockopt_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnSetSockOptResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_inet_tcp_conn_getsockopt_request(
+    handle_id: u64,
+    level: u32,
+    optname: u32,
+    optlen: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&level.to_le_bytes());
+    body.extend_from_slice(&optname.to_le_bytes());
+    body.extend_from_slice(&optlen.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnGetSockOpt,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_tcp_conn_getsockopt_body(
+    body: &[u8],
+) -> Result<(u64, u32, u32, u32), ProtocolError> {
+    if body.len() != 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnGetSockOpt,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    let reserved = u32::from_le_bytes(body[20..24].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+        u32::from_le_bytes(body[12..16].try_into().unwrap()),
+        u32::from_le_bytes(body[16..20].try_into().unwrap()),
+    ))
+}
+
+pub fn build_inet_tcp_conn_getsockopt_response_ok(bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + bytes.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnGetSockOptResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_tcp_conn_getsockopt_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnGetSockOptResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnGetSockOptResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
 }
 
 pub fn build_read_tcp_conn_request(handle_id: u64, max_len: u64) -> OwnedFrame {
