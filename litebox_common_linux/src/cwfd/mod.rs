@@ -20,6 +20,7 @@
 
 pub mod broker_eventfd_provider;
 pub mod broker_inet_listener_provider;
+pub mod broker_inet_raw_provider;
 pub mod broker_inotify_provider;
 pub mod broker_pgrp_signal_provider;
 pub mod broker_pidfd_provider;

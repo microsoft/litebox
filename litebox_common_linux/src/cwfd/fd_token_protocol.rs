@@ -112,6 +112,7 @@ pub const BODY_MAX: u32 = 65536;
 /// | `0x79`–`0x7C`    | TCP conn data ops (BrokerTcpConn) |
 /// | `0x48`–`0x4C`    | Inet listener state (Phase A) |
 /// | `0x34`–`0x38`    | Inet TCP conn lifecycle/name ops |
+/// | `0x3C`–`0x3F`    | Inet raw socket state (Phase D) |
 ///
 /// Within a kind's range, follow the eventfd template:
 /// `0xN0` = create, `0xN1` = read-like primary op, `0xN2` = write-like
@@ -148,6 +149,10 @@ pub enum Opcode {
     ReadSocketPair = 0x31,
     WriteSocketPair = 0x32,
     ShutdownSocketPairWrite = 0x33,
+    InetRawCreate = 0x3C,
+    InetRawSendTo = 0x3D,
+    InetRawRecvFrom = 0x3E,
+    InetRawQueryEvents = 0x3F,
     InetTcpConnCreate = 0x34,
     InetTcpConnConnect = 0x35,
     InetTcpConnQueryEvents = 0x36,
@@ -232,6 +237,10 @@ pub enum Opcode {
     ReadSocketPairResponse = 0xB1,
     WriteSocketPairResponse = 0xB2,
     ShutdownSocketPairWriteResponse = 0xB3,
+    InetRawCreateResponse = 0xBC,
+    InetRawSendToResponse = 0xBD,
+    InetRawRecvFromResponse = 0xBE,
+    InetRawQueryEventsResponse = 0xBF,
     InetTcpConnCreateResponse = 0xB4,
     InetTcpConnConnectResponse = 0xB5,
     InetTcpConnQueryEventsResponse = 0xB6,
@@ -309,6 +318,10 @@ pub mod opcode_ranges {
     /// Inet TCP lifecycle/name ops: create / connect / query-events / getsockname / getpeername.
     pub const INET_TCP_CONN_BASE: u8 = 0x34;
     pub const INET_TCP_CONN_RESPONSE_BASE: u8 = 0xB4;
+
+    /// Inet raw socket state: create / sendto / recvfrom / query-events.
+    pub const INET_RAW_BASE: u8 = 0x3C;
+    pub const INET_RAW_RESPONSE_BASE: u8 = 0xBC;
 }
 
 /// Endpoint side for a broker-hosted PTY handle.
@@ -397,6 +410,10 @@ impl Opcode {
             Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
             Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
             Opcode::ShutdownSocketPairWrite => Some(Opcode::ShutdownSocketPairWriteResponse),
+            Opcode::InetRawCreate => Some(Opcode::InetRawCreateResponse),
+            Opcode::InetRawSendTo => Some(Opcode::InetRawSendToResponse),
+            Opcode::InetRawRecvFrom => Some(Opcode::InetRawRecvFromResponse),
+            Opcode::InetRawQueryEvents => Some(Opcode::InetRawQueryEventsResponse),
             Opcode::InetTcpConnCreate => Some(Opcode::InetTcpConnCreateResponse),
             Opcode::InetTcpConnConnect => Some(Opcode::InetTcpConnConnectResponse),
             Opcode::InetTcpConnQueryEvents => Some(Opcode::InetTcpConnQueryEventsResponse),
@@ -468,6 +485,10 @@ impl Opcode {
                 | Opcode::ReadSocketPair
                 | Opcode::WriteSocketPair
                 | Opcode::ShutdownSocketPairWrite
+                | Opcode::InetRawCreate
+                | Opcode::InetRawSendTo
+                | Opcode::InetRawRecvFrom
+                | Opcode::InetRawQueryEvents
                 | Opcode::InetTcpConnCreate
                 | Opcode::InetTcpConnConnect
                 | Opcode::InetTcpConnQueryEvents
@@ -550,6 +571,10 @@ impl TryFrom<u8> for Opcode {
             0x31 => Ok(Opcode::ReadSocketPair),
             0x32 => Ok(Opcode::WriteSocketPair),
             0x33 => Ok(Opcode::ShutdownSocketPairWrite),
+            0x3C => Ok(Opcode::InetRawCreate),
+            0x3D => Ok(Opcode::InetRawSendTo),
+            0x3E => Ok(Opcode::InetRawRecvFrom),
+            0x3F => Ok(Opcode::InetRawQueryEvents),
             0x34 => Ok(Opcode::InetTcpConnCreate),
             0x35 => Ok(Opcode::InetTcpConnConnect),
             0x36 => Ok(Opcode::InetTcpConnQueryEvents),
@@ -609,6 +634,10 @@ impl TryFrom<u8> for Opcode {
             0xB1 => Ok(Opcode::ReadSocketPairResponse),
             0xB2 => Ok(Opcode::WriteSocketPairResponse),
             0xB3 => Ok(Opcode::ShutdownSocketPairWriteResponse),
+            0xBC => Ok(Opcode::InetRawCreateResponse),
+            0xBD => Ok(Opcode::InetRawSendToResponse),
+            0xBE => Ok(Opcode::InetRawRecvFromResponse),
+            0xBF => Ok(Opcode::InetRawQueryEventsResponse),
             0xB4 => Ok(Opcode::InetTcpConnCreateResponse),
             0xB5 => Ok(Opcode::InetTcpConnConnectResponse),
             0xB6 => Ok(Opcode::InetTcpConnQueryEventsResponse),
@@ -669,6 +698,10 @@ pub enum StatusCode {
     /// The worker hasn't yet registered a notification ring; the
     /// requested op requires one (e.g. SubscribeEventfd).
     NoNotificationRing = 0x09,
+    /// Operation is blocked by broker policy or host permissions.
+    PermissionDenied = 0x0A,
+    /// Requested protocol is not supported by this broker subsystem.
+    ProtocolNotSupported = 0x0B,
 
     /// Generic protocol violation.
     Protocol = 0x10,
@@ -691,6 +724,8 @@ impl TryFrom<u8> for StatusCode {
             0x07 => Ok(StatusCode::UnknownSubscription),
             0x08 => Ok(StatusCode::SubsystemMismatch),
             0x09 => Ok(StatusCode::NoNotificationRing),
+            0x0A => Ok(StatusCode::PermissionDenied),
+            0x0B => Ok(StatusCode::ProtocolNotSupported),
             0x10 => Ok(StatusCode::Protocol),
             0x11 => Ok(StatusCode::Internal),
             other => Err(ProtocolError::UnknownStatus { status: other }),
@@ -2573,6 +2608,219 @@ pub fn build_shutdown_socketpair_write_response_ok() -> OwnedFrame {
         caller_pid: 0,
         body: Vec::new(),
     }
+}
+
+// =====================================================================
+// BrokerInetRaw wire format.
+// =====================================================================
+
+/// Body for [`Opcode::InetRawCreate`]: family (u8: 0=v4, 1=v6), protocol (u8), reserved (6 bytes).
+pub fn build_inet_raw_create_request(family: u8, protocol: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.push(family);
+    body.push(protocol);
+    body.extend_from_slice(&[0u8; 6]);
+    OwnedFrame {
+        opcode: Opcode::InetRawCreate,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_raw_create_body(body: &[u8]) -> Result<(u8, u8), ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawCreate,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[2..8].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((body[0], body[1]))
+}
+
+pub fn build_inet_raw_create_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetRawCreateResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_raw_create_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetRawCreateResponse)
+}
+
+/// Body for [`Opcode::InetRawSendTo`]: handle id + 28-byte sockaddr + payload length/reserved + payload.
+pub fn build_inet_raw_sendto_request(handle_id: u64, sockaddr: &[u8], bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(44 + bytes.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    let mut addr = [0u8; 28];
+    let n = core::cmp::min(sockaddr.len(), addr.len());
+    addr[..n].copy_from_slice(&sockaddr[..n]);
+    body.extend_from_slice(&addr);
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::InetRawSendTo,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_raw_sendto_body(body: &[u8]) -> Result<(u64, [u8; 28], Vec<u8>), ProtocolError> {
+    if body.len() < 44 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawSendTo,
+            got: body.len(),
+            want: 44,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(&body[8..36]);
+    let len = u32::from_le_bytes(body[36..40].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[40..44].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 44 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawSendTo,
+            got: body.len(),
+            want: 44 + len,
+        });
+    }
+    Ok((handle, sockaddr, body[44..].to_vec()))
+}
+
+pub fn build_inet_raw_sendto_response_ok(written: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetRawSendToResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: written.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_raw_sendto_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawSendToResponse,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
+}
+
+/// Body for [`Opcode::InetRawRecvFrom`]: handle id + max_len.
+pub fn build_inet_raw_recvfrom_request(handle_id: u64, max_len: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InetRawRecvFrom,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_raw_recvfrom_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawRecvFrom,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+    ))
+}
+
+pub fn build_inet_raw_recvfrom_response_ok(sockaddr: &[u8; 28], bytes: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(36 + bytes.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(sockaddr);
+    body.extend_from_slice(bytes);
+    OwnedFrame {
+        opcode: Opcode::InetRawRecvFromResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_raw_recvfrom_response_ok(
+    body: &[u8],
+) -> Result<([u8; 28], Vec<u8>), ProtocolError> {
+    if body.len() < 36 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawRecvFromResponse,
+            got: body.len(),
+            want: 36,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 36 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawRecvFromResponse,
+            got: body.len(),
+            want: 36 + len,
+        });
+    }
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(&body[8..36]);
+    Ok((sockaddr, body[36..].to_vec()))
+}
+
+pub fn build_inet_raw_query_events_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetRawQueryEvents,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_raw_query_events_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetRawQueryEvents)
+}
+
+pub fn build_inet_raw_query_events_response_ok(events: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetRawQueryEventsResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: events.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_raw_query_events_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetRawQueryEventsResponse,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
 }
 
 // =====================================================================

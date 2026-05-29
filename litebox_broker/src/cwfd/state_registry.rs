@@ -71,6 +71,7 @@ use litebox_common_linux::cwfd::notification_ring::NotificationSender;
 
 use crate::cwfd::eventfd_state::EventfdState;
 use crate::cwfd::inet_listener_state::InetListenerState;
+use crate::cwfd::inet_raw_state::InetRawState;
 use crate::cwfd::inotify_state::InotifyState;
 use crate::cwfd::pidfd_state::PidfdState;
 use crate::cwfd::pipe_state::{PipeReadEnd, PipeWriteEnd};
@@ -171,6 +172,7 @@ pub enum StateKind {
     SocketPairEnd,
     TcpConn,
     InetListener,
+    InetRaw,
     Signalfd,
     Inotify,
     Pty,
@@ -187,6 +189,7 @@ pub enum StateObjectEnum {
     SocketPairEnd(Arc<SocketPairEnd>),
     TcpConn(Arc<TcpConnState>),
     InetListener(Arc<InetListenerState>),
+    InetRaw(Arc<InetRawState>),
     Signalfd(Arc<SignalfdState>),
     Inotify(Arc<InotifyState>),
     Pty(Arc<PtyState>),
@@ -203,6 +206,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(_) => StateKind::SocketPairEnd,
             StateObjectEnum::TcpConn(_) => StateKind::TcpConn,
             StateObjectEnum::InetListener(_) => StateKind::InetListener,
+            StateObjectEnum::InetRaw(_) => StateKind::InetRaw,
             StateObjectEnum::Signalfd(_) => StateKind::Signalfd,
             StateObjectEnum::Inotify(_) => StateKind::Inotify,
             StateObjectEnum::Pty(_) => StateKind::Pty,
@@ -219,6 +223,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.subsystem_tag(),
             StateObjectEnum::TcpConn(state) => state.subsystem_tag(),
             StateObjectEnum::InetListener(state) => state.subsystem_tag(),
+            StateObjectEnum::InetRaw(state) => state.subsystem_tag(),
             StateObjectEnum::Signalfd(state) => state.subsystem_tag(),
             StateObjectEnum::Inotify(state) => state.subsystem_tag(),
             StateObjectEnum::Pty(state) => state.subsystem_tag(),
@@ -252,6 +257,9 @@ impl StateObjectEnum {
             StateObjectEnum::InetListener(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
+            StateObjectEnum::InetRaw(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
             StateObjectEnum::Signalfd(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
@@ -274,6 +282,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::TcpConn(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::InetListener(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::InetRaw(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Signalfd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Inotify(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Pty(state) => state.unsubscribe(subscription_id),
@@ -290,6 +299,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.current_events(),
             StateObjectEnum::TcpConn(state) => state.current_events(),
             StateObjectEnum::InetListener(state) => state.current_events(),
+            StateObjectEnum::InetRaw(state) => state.current_events(),
             StateObjectEnum::Signalfd(state) => state.current_events(),
             StateObjectEnum::Inotify(state) => state.current_events(),
             StateObjectEnum::Pty(state) => state.current_events(),
@@ -307,6 +317,7 @@ impl StateObjectEnum {
             StateObjectEnum::SocketPairEnd(state) => state.debug_repr(),
             StateObjectEnum::TcpConn(state) => state.debug_repr(),
             StateObjectEnum::InetListener(state) => state.debug_repr(),
+            StateObjectEnum::InetRaw(state) => state.debug_repr(),
             StateObjectEnum::Signalfd(state) => state.debug_repr(),
             StateObjectEnum::Inotify(state) => state.debug_repr(),
             StateObjectEnum::Pty(state) => state.debug_repr(),
@@ -381,6 +392,12 @@ impl From<Arc<TcpConnState>> for StateObjectEnum {
 impl From<Arc<InetListenerState>> for StateObjectEnum {
     fn from(state: Arc<InetListenerState>) -> Self {
         StateObjectEnum::InetListener(state)
+    }
+}
+
+impl From<Arc<InetRawState>> for StateObjectEnum {
+    fn from(state: Arc<InetRawState>) -> Self {
+        StateObjectEnum::InetRaw(state)
     }
 }
 
