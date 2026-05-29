@@ -1068,7 +1068,7 @@ fn handle_read_tcp_conn(
         Err(TcpConnError::WouldBlock) => {
             status_err(Opcode::ReadTcpConnResponse, StatusCode::WouldBlock)
         }
-        Err(TcpConnError::PeerClosed) => {
+        Err(TcpConnError::PeerClosed | TcpConnError::Errno(_)) => {
             status_err(Opcode::ReadTcpConnResponse, StatusCode::InvalidValue)
         }
         Err(TcpConnError::Io) => status_err(Opcode::ReadTcpConnResponse, StatusCode::Internal),
@@ -1099,7 +1099,7 @@ fn handle_write_tcp_conn(
         Err(TcpConnError::WouldBlock) => {
             status_err(Opcode::WriteTcpConnResponse, StatusCode::WouldBlock)
         }
-        Err(TcpConnError::PeerClosed) => {
+        Err(TcpConnError::PeerClosed | TcpConnError::Errno(_)) => {
             status_err(Opcode::WriteTcpConnResponse, StatusCode::InvalidValue)
         }
         Err(TcpConnError::Io) => status_err(Opcode::WriteTcpConnResponse, StatusCode::Internal),
