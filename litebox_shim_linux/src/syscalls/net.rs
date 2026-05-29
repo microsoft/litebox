@@ -758,6 +758,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
+        let is_empty_stream = buf.is_empty() && matches!(proxy.as_ref(), NetworkProxy::Stream(_));
 
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -768,8 +769,10 @@ impl<FS: ShimFS> GlobalState<FS> {
                     Ok(())
                 },
                 || match proxy.try_write(buf, new_flags, sockaddr) {
+                    Ok(0) if buf.is_empty() => Ok(0),
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
+                    Err(litebox::net::errors::SendError::BufferFull) if is_empty_stream => Ok(0),
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
@@ -1162,6 +1165,38 @@ pub(crate) fn write_sockaddr_to_user(
     addrlen.write_at_offset(0, len).ok_or(Errno::EFAULT)
 }
 
+fn copy_iovs_to_vec<P>(
+    iovs: &[litebox_common_linux::IoVec<P>],
+) -> Result<alloc::vec::Vec<u8>, Errno>
+where
+    P: litebox::platform::RawMutPointer<u8>,
+{
+    let total_len = iovs.iter().try_fold(0usize, |total_len, iov| {
+        total_len.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
+    })?;
+    let mut data = alloc::vec::Vec::new();
+    data.try_reserve_exact(total_len)
+        .map_err(|_| Errno::ENOMEM)?;
+    data.resize(total_len, 0);
+    let mut offset = 0;
+    for iov in iovs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let end = offset + iov.iov_len;
+        let mut byte_offset: isize = 0;
+        for byte in data[offset..end].iter_mut() {
+            *byte = iov
+                .iov_base
+                .read_at_offset(byte_offset)
+                .ok_or(Errno::EFAULT)?;
+            byte_offset += 1;
+        }
+        offset = end;
+    }
+    Ok(data)
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `accept`
     pub(crate) fn sys_accept(
@@ -1400,16 +1435,18 @@ impl<FS: ShimFS> Task<FS> {
             log_unsupported!("ancillary data is not supported");
             return Err(Errno::EINVAL);
         }
-        if msg.msg_iovlen == 0 {
-            return Err(Errno::EINVAL);
-        }
         if msg.msg_iovlen > UIO_MAXIOV {
             return Err(Errno::EMSGSIZE);
         }
-        let iovs = msg
-            .msg_iov
-            .to_owned_slice(msg.msg_iovlen)
-            .ok_or(Errno::EFAULT)?;
+        let iovs = if msg.msg_iovlen == 0 {
+            None
+        } else {
+            Some(
+                msg.msg_iov
+                    .to_owned_slice(msg.msg_iovlen)
+                    .ok_or(Errno::EFAULT)?,
+            )
+        };
         let res = self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -1418,23 +1455,17 @@ impl<FS: ShimFS> Task<FS> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                super::file::write_to_iovec(
-                    iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
-                    |buf| {
-                        self.global
-                            .sendto(&self.wait_cx(), fd, buf, flags, sock_addr)
-                    },
-                )
+                let data = copy_iovs_to_vec(iovs.as_deref().unwrap_or_default())?;
+                self.global
+                    .sendto(&self.wait_cx(), fd, &data, flags, sock_addr)
             },
             |file| {
                 let unix_addr = sock_addr
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                super::file::write_to_iovec(
-                    iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
-                    |buf| file.sendto(self, buf, flags, unix_addr.clone()),
-                )
+                let data = copy_iovs_to_vec(iovs.as_deref().unwrap_or_default())?;
+                file.sendto(self, &data, flags, unix_addr)
             },
         );
         if let Err(Errno::EPIPE) = res
@@ -1489,7 +1520,7 @@ impl<FS: ShimFS> Task<FS> {
             };
             let msg_len_ptr =
                 MutPtr::<u32>::from_usize(msgvec.as_usize() + i * stride + msg_len_off);
-            if msg_len_ptr.write_at_offset(0, n.truncate()).is_none() {
+            if msg_len_ptr.write_at_offset(0, n.trunc()).is_none() {
                 return bail(Errno::EFAULT);
             }
             sent += 1;
