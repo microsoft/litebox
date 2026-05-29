@@ -97,6 +97,10 @@ impl<FS: ShimFS> Task<FS> {
                 core::any::type_name::<super::broker_inet_listener::BrokerInetListenerFd<Platform>>(
                 ),
             ),
+            litebox::fd::SubsystemKind::BrokerInetDgram => (
+                TypeId::of::<super::broker_inet_dgram::BrokerInetDgramFd<Platform>>(),
+                core::any::type_name::<super::broker_inet_dgram::BrokerInetDgramFd<Platform>>(),
+            ),
             litebox::fd::SubsystemKind::BrokerTcpConn => (
                 TypeId::of::<super::broker_tcp_conn::BrokerTcpConnFd<Platform>>(),
                 core::any::type_name::<super::broker_tcp_conn::BrokerTcpConnFd<Platform>>(),
@@ -3208,7 +3212,19 @@ impl<FS: ShimFS> Task<FS> {
             drop(entry);
             return Ok(());
         }
-        if let Ok(fd) = rds.fd_consume_raw_integer::<super::broker_inet_listener::BrokerInetListenerSubsystem>(raw_fd) {
+        if let Ok(fd) = rds
+            .fd_consume_raw_integer::<super::broker_inet_listener::BrokerInetListenerSubsystem>(
+                raw_fd,
+            )
+        {
+            drop(rds);
+            let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
+            drop(entry);
+            return Ok(());
+        }
+        if let Ok(fd) =
+            rds.fd_consume_raw_integer::<super::broker_inet_dgram::BrokerInetDgramSubsystem>(raw_fd)
+        {
             drop(rds);
             let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
             drop(entry);

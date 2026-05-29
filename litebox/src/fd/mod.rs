@@ -65,6 +65,8 @@ pub enum SubsystemKind {
     Inotify,
     /// Broker TCP listener descriptors.
     BrokerInetListener,
+    /// Broker UDP datagram descriptors.
+    BrokerInetDgram,
     /// Broker TCP connection descriptors.
     BrokerTcpConn,
 }
