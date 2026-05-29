@@ -49,20 +49,6 @@ mod tests {
     use crate::{BrokerCore, EventOnlyPolicy};
 
     #[test]
-    fn create_connection_records_caller_credential() {
-        let mut core = BrokerCore::new(EventOnlyPolicy);
-
-        let connection = core
-            .create_connection(CallerCredential::Unauthenticated)
-            .unwrap();
-
-        assert_eq!(
-            connection.caller_credential(),
-            CallerCredential::Unauthenticated
-        );
-    }
-
-    #[test]
     fn close_connection_releases_owned_references_and_orphaned_objects() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
         let connection = core

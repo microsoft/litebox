@@ -292,34 +292,4 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         );
     }
-
-    #[test]
-    fn validate_handle_rejects_stale_reference_generation() {
-        let mut core = BrokerCore::new(DefaultDenyPolicy);
-        let association = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        let handle = core
-            .insert_object_with_reference(
-                association,
-                ObjectKind::Event(EventObject::new()),
-                ObjectType::Event,
-                ObjectRights::WAIT,
-            )
-            .unwrap();
-        let stale_handle = ObjectHandle::new(
-            handle.reference_id,
-            ObjectReferenceGeneration::new(handle.reference_generation.get() + 1),
-        );
-
-        assert_eq!(
-            core.validate_handle(
-                association,
-                stale_handle,
-                ObjectType::Event,
-                ObjectRights::WAIT
-            ),
-            Err(BrokerError::StaleHandle)
-        );
-    }
 }

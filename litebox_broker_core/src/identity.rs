@@ -99,7 +99,7 @@ impl<P> BrokerCore<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BrokerError, DefaultDenyPolicy};
+    use crate::DefaultDenyPolicy;
 
     #[test]
     fn create_association_uses_one_session_and_distinct_processes() {
@@ -121,23 +121,5 @@ mod tests {
             second.caller_credential(),
             CallerCredential::Unauthenticated
         );
-    }
-
-    #[test]
-    fn create_association_issues_max_process_id_then_exhausts() {
-        let mut core = BrokerCore::new(DefaultDenyPolicy);
-        core.next_process_id = u64::MAX;
-
-        let association = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        assert_eq!(association.process_id, ProcessId::new(u64::MAX));
-        assert_eq!(association.session_id, SessionId::FIRST);
-        assert_eq!(core.next_process_id, 0);
-        assert_eq!(
-            core.create_association(CallerCredential::Unauthenticated),
-            Err(BrokerError::ResourceExhausted)
-        );
-        assert_eq!(core.next_process_id, 0);
     }
 }

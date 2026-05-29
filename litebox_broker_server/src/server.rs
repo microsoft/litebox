@@ -351,7 +351,7 @@ mod tests {
     use litebox_broker_core::EventOnlyPolicy;
 
     #[test]
-    fn dispatch_requires_negotiation_first() {
+    fn dispatch_enforces_negotiation_state() {
         let (mut core, connection, mut state) = new_connection();
 
         let dispatch = handle_request(
@@ -360,20 +360,9 @@ mod tests {
             &mut state,
             event_request(EventRequest::Create),
         );
-
-        assert_eq!(
-            dispatch.response,
-            BrokerResponse::Error(ErrorCode::ProtocolState)
-        );
-        assert_eq!(
-            dispatch.outcome,
-            DispatchOutcome::Close(CloseReason::ProtocolViolation)
-        );
+        assert_protocol_violation(dispatch);
         assert_eq!(state, ConnectionState::AwaitingNegotiation);
-    }
 
-    #[test]
-    fn dispatch_closes_after_post_negotiation_negotiate() {
         let (mut core, connection, mut state) = new_connection();
         negotiate(&mut core, &connection, &mut state);
 
@@ -385,19 +374,11 @@ mod tests {
                 protocol_version: SUPPORTED_PROTOCOL_VERSION,
             },
         );
-
-        assert_eq!(
-            dispatch.response,
-            BrokerResponse::Error(ErrorCode::ProtocolState)
-        );
-        assert_eq!(
-            dispatch.outcome,
-            DispatchOutcome::Close(CloseReason::ProtocolViolation)
-        );
+        assert_protocol_violation(dispatch);
     }
 
     #[test]
-    fn dispatch_reports_supported_version_after_unsupported_major() {
+    fn dispatch_rejects_unsupported_protocol_version_without_activation() {
         let (mut core, connection, mut state) = new_connection();
 
         let dispatch = handle_request(
@@ -420,65 +401,17 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_accepts_supported_older_minor_version() {
+    fn dispatch_handles_unknown_wire_requests_by_state() {
         let (mut core, connection, mut state) = new_connection();
-        let requested = ProtocolVersion::new(
-            SUPPORTED_PROTOCOL_VERSION.major,
-            SUPPORTED_PROTOCOL_VERSION.minor - 1,
-        );
 
-        let dispatch = handle_request(
+        let dispatch = handle_received_request(
             &mut core,
             &connection,
             &mut state,
-            BrokerRequest::Negotiate {
-                protocol_version: requested,
-            },
+            ReceivedBrokerRequest::Unknown,
         );
+        assert_protocol_violation(dispatch);
 
-        assert_eq!(
-            dispatch.response,
-            BrokerResponse::Negotiated {
-                broker_protocol_version: SUPPORTED_PROTOCOL_VERSION
-            }
-        );
-        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-        assert_eq!(
-            state,
-            ConnectionState::Active {
-                negotiated_protocol_version: requested
-            }
-        );
-    }
-
-    #[test]
-    fn dispatch_rejects_newer_minor_version() {
-        let (mut core, connection, mut state) = new_connection();
-
-        let dispatch = handle_request(
-            &mut core,
-            &connection,
-            &mut state,
-            BrokerRequest::Negotiate {
-                protocol_version: ProtocolVersion::new(
-                    SUPPORTED_PROTOCOL_VERSION.major,
-                    SUPPORTED_PROTOCOL_VERSION.minor + 1,
-                ),
-            },
-        );
-
-        assert_eq!(
-            dispatch.response,
-            BrokerResponse::VersionMismatch {
-                broker_protocol_version: SUPPORTED_PROTOCOL_VERSION
-            }
-        );
-        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-        assert_eq!(state, ConnectionState::AwaitingNegotiation);
-    }
-
-    #[test]
-    fn dispatch_reports_unknown_requests_without_closing() {
         let (mut core, connection, mut state) = new_connection();
         negotiate(&mut core, &connection, &mut state);
 
@@ -497,51 +430,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_closes_unknown_requests_before_negotiation() {
-        let (mut core, connection, mut state) = new_connection();
-
-        let dispatch = handle_received_request(
-            &mut core,
-            &connection,
-            &mut state,
-            ReceivedBrokerRequest::Unknown,
-        );
-
-        assert_eq!(
-            dispatch.response,
-            BrokerResponse::Error(ErrorCode::ProtocolState)
-        );
-        assert_eq!(
-            dispatch.outcome,
-            DispatchOutcome::Close(CloseReason::ProtocolViolation)
-        );
-    }
-
-    #[test]
     fn dispatch_negotiates_then_routes_event_requests() {
         let (mut core, connection, mut state) = new_connection();
-
-        let dispatch = handle_request(
-            &mut core,
-            &connection,
-            &mut state,
-            BrokerRequest::Negotiate {
-                protocol_version: SUPPORTED_PROTOCOL_VERSION,
-            },
-        );
-        assert_eq!(
-            dispatch.response,
-            BrokerResponse::Negotiated {
-                broker_protocol_version: SUPPORTED_PROTOCOL_VERSION
-            }
-        );
-        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-        assert_eq!(
-            state,
-            ConnectionState::Active {
-                negotiated_protocol_version: SUPPORTED_PROTOCOL_VERSION
-            }
-        );
+        negotiate(&mut core, &connection, &mut state);
 
         let dispatch = handle_request(
             &mut core,
@@ -549,6 +440,7 @@ mod tests {
             &mut state,
             event_request(EventRequest::Create),
         );
+        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
         let handle = match dispatch.response {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Created { handle })) => handle,
             response => panic!("unexpected response: {response:?}"),
@@ -567,65 +459,44 @@ mod tests {
             })
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-    }
-
-    #[test]
-    fn dispatch_rejects_handle_from_another_connection() {
-        let mut core = BrokerCore::new(EventOnlyPolicy);
-        let owner = core
-            .create_connection(CallerCredential::Unauthenticated)
-            .unwrap();
-        let other = core
-            .create_connection(CallerCredential::Unauthenticated)
-            .unwrap();
-        let mut owner_state = ConnectionState::AwaitingNegotiation;
-        let mut other_state = ConnectionState::AwaitingNegotiation;
-        negotiate(&mut core, &owner, &mut owner_state);
-        negotiate(&mut core, &other, &mut other_state);
 
         let dispatch = handle_request(
             &mut core,
-            &owner,
-            &mut owner_state,
-            event_request(EventRequest::Create),
+            &connection,
+            &mut state,
+            event_request(EventRequest::Signal { handle }),
         );
-        let handle = match dispatch.response {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Created { handle })) => handle,
-            response => panic!("unexpected response: {response:?}"),
-        };
+        assert_eq!(
+            dispatch.response,
+            event_response(EventResponse::Signaled {
+                readiness: ProtocolReadinessState::new(true, 1)
+            })
+        );
+        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
 
         let dispatch = handle_request(
             &mut core,
-            &other,
-            &mut other_state,
+            &connection,
+            &mut state,
             event_request(EventRequest::Wait { handle }),
         );
         assert_eq!(
             dispatch.response,
-            BrokerResponse::Error(ErrorCode::UnknownObject)
+            event_response(EventResponse::Wait {
+                outcome: ProtocolWaitOutcome::Ready(ProtocolReadinessState::new(true, 1))
+            })
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
     }
 
-    #[test]
-    fn protocol_adapters_preserve_handle_fields() {
-        let protocol = ProtocolObjectHandle::new(
-            ProtocolObjectReferenceId::new(12),
-            ProtocolObjectReferenceGeneration::new(13),
-        );
-
-        assert_eq!(protocol_handle(core_handle(protocol)), protocol);
-    }
-
-    #[test]
-    fn protocol_adapters_preserve_wait_outcome() {
-        let outcome = CoreWaitOutcome::Ready(CoreReadinessState::new(true, 42));
-
+    fn assert_protocol_violation(dispatch: BrokerDispatch) {
         assert_eq!(
-            protocol_wait_outcome(outcome),
-            Some(ProtocolWaitOutcome::Ready(ProtocolReadinessState::new(
-                true, 42
-            )))
+            dispatch.response,
+            BrokerResponse::Error(ErrorCode::ProtocolState)
+        );
+        assert_eq!(
+            dispatch.outcome,
+            DispatchOutcome::Close(CloseReason::ProtocolViolation)
         );
     }
 

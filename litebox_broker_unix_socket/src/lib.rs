@@ -159,43 +159,38 @@ mod tests {
     }
 
     #[test]
-    fn truncated_length_prefix_is_invalid() {
+    fn malformed_frames_are_invalid() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer.write_all(&[1, 0]).unwrap();
         drop(writer);
+        assert_eq!(
+            read_frame(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
 
-        let error = read_frame(&mut reader).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn zero_frame_length_is_invalid() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer.write_all(&0u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            read_frame(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
 
-        let error = read_frame(&mut reader).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn oversize_frame_length_is_invalid() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer
             .write_all(&u32::try_from(MAX_FRAME_LEN + 1).unwrap().to_le_bytes())
             .unwrap();
+        assert_eq!(
+            read_frame(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
 
-        let error = read_frame(&mut reader).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn truncated_frame_body_is_invalid() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer.write_all(&4u32.to_le_bytes()).unwrap();
         writer.write_all(&[1, 2]).unwrap();
         drop(writer);
-
-        let error = read_frame(&mut reader).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_frame(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }
