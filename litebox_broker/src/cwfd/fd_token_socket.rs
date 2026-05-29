@@ -474,7 +474,8 @@ fn update_tracker_from_response(
         | Opcode::CreatePidfd
         | Opcode::CreateSignalfd
         | Opcode::InotifyInit1
-        | Opcode::InetListenerCreate => {
+        | Opcode::InetListenerCreate
+        | Opcode::InetTcpConnCreate => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
                 tracker.record_state(caller_scope, id);
             }
@@ -1262,6 +1263,11 @@ fn handle_control_connection_inner(
                     | Opcode::InetListenerListen
                     | Opcode::InetListenerAccept
                     | Opcode::InetListenerQueryEvents
+                    | Opcode::InetTcpConnCreate
+                    | Opcode::InetTcpConnConnect
+                    | Opcode::InetTcpConnQueryEvents
+                    | Opcode::InetTcpConnGetSockName
+                    | Opcode::InetTcpConnGetPeerName
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe
