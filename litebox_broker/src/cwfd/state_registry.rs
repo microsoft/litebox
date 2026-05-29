@@ -263,6 +263,8 @@ impl StateObjectEnum {
                 state.subscribe(subscription_id, events_mask, sender)
             }
             StateObjectEnum::InetDgram(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
             StateObjectEnum::InetRaw(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
@@ -407,6 +409,9 @@ impl From<Arc<InetListenerState>> for StateObjectEnum {
 impl From<Arc<InetDgramState>> for StateObjectEnum {
     fn from(state: Arc<InetDgramState>) -> Self {
         StateObjectEnum::InetDgram(state)
+    }
+}
+
 impl From<Arc<InetRawState>> for StateObjectEnum {
     fn from(state: Arc<InetRawState>) -> Self {
         StateObjectEnum::InetRaw(state)

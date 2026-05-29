@@ -110,6 +110,30 @@ impl BrokerTcpConnProvider for RunnerBrokerTcpConnProvider {
             .map_err(client_err_to_broker_err)
     }
 
+    fn setsockopt(
+        &self,
+        handle: u64,
+        level: u32,
+        optname: u32,
+        optval: &[u8],
+    ) -> Result<(), BrokerOpError> {
+        self.client
+            .tcp_conn_setsockopt(handle, level, optname, optval)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn getsockopt(
+        &self,
+        handle: u64,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, BrokerOpError> {
+        self.client
+            .tcp_conn_getsockopt(handle, level, optname, optlen)
+            .map_err(client_err_to_broker_err)
+    }
+
     fn poll_tcp_conn_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
         self.client
             .poll_tcp_conn_events(handle)

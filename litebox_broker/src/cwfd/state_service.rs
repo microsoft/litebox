@@ -43,47 +43,113 @@ use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use crate::tcp_conn_state::{TcpConnError, TcpConnState};
 use litebox_common_linux::fd_token_protocol as proto;
 use litebox_common_linux::fd_token_protocol::PtyEndpoint;
+
 use litebox_common_linux::fd_token_protocol::{
-    Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
-    build_create_pidfd_response_ok, build_create_pipe_response_ok, build_create_pty_response_ok,
-    build_create_signalfd_response_ok, build_create_socketpair_response_ok,
-    build_deliver_signal_inbox_response_ok, build_error_response,
-    build_inet_listener_accept_response_ok, build_inet_listener_bind_response_ok,
-    build_inet_listener_create_response_ok, build_inet_listener_listen_response_ok,
-    build_inet_listener_query_events_response_ok, build_inet_raw_query_events_response_ok,
-    build_inet_raw_recvfrom_response_ok, build_inet_raw_sendto_response_ok,
-    build_inotify_add_watch_response_ok, build_inotify_init1_response_ok,
-    build_inotify_read_response_ok, build_inotify_rm_watch_response_ok,
-    build_mark_process_exited_response_ok, build_open_pty_slave_response_ok,
-    build_pidfd_exited_response_ok, build_poll_tcp_conn_events_response_ok,
-    build_pty_ioctl_response_ok, build_pty_read_response_ok, build_pty_write_response_ok,
-    build_push_siginfo_response_ok, build_read_eventfd_response_ok, build_read_pipe_response_ok,
-    build_read_siginfo_response_ok, build_read_socketpair_response_ok,
-    build_read_tcp_conn_response_ok, build_register_notification_ring_response_ok,
-    build_register_process_response_ok, build_release_response_ok, build_set_pgid_response_ok,
-    build_set_sid_response_ok, build_shutdown_socketpair_write_response_ok,
-    build_shutdown_tcp_conn_response_ok, build_subscribe_eventfd_response_ok,
-    build_subscribe_process_exit_response_ok, build_subscribe_pty_response_ok,
-    build_subscribe_signal_inbox_response_ok, build_unsubscribe_response_ok,
-    build_unsubscribe_signal_inbox_response_ok, build_write_eventfd_response_ok,
-    build_write_pipe_response_ok, build_write_socketpair_response_ok,
-    build_write_tcp_conn_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
-    parse_create_pipe_body, parse_create_signalfd_body, parse_create_socketpair_body,
-    parse_deliver_signal_inbox_body, parse_handle_body, parse_inet_listener_accept_body,
-    parse_inet_listener_bind_body, parse_inet_listener_create_body,
-    parse_inet_listener_listen_body, parse_inet_listener_query_events_body,
-    parse_inet_raw_create_body, parse_inet_raw_query_events_body, parse_inet_raw_recvfrom_body,
-    parse_inet_raw_sendto_body, parse_inotify_add_watch_body, parse_inotify_init1_body,
-    parse_inotify_read_body, parse_inotify_rm_watch_body, parse_mark_process_exited_body,
-    parse_open_pty_slave_body, parse_pidfd_exited_request, parse_poll_tcp_conn_events_body,
-    parse_pty_ioctl_body, parse_pty_read_body, parse_pty_write_body, parse_push_siginfo_body,
-    parse_read_pipe_body, parse_read_socketpair_body, parse_read_tcp_conn_body,
-    parse_set_pgid_body, parse_set_sid_body, parse_shutdown_socketpair_write_body,
-    parse_shutdown_tcp_conn_body, parse_subscribe_eventfd_body, parse_subscribe_process_exit_body,
-    parse_subscribe_pty_body, parse_subscribe_signal_inbox_body, parse_unsubscribe_body,
-    parse_unsubscribe_signal_inbox_body, parse_write_eventfd_body, parse_write_pipe_body,
-    parse_write_socketpair_body, parse_write_tcp_conn_body,
+    Frame,
+    Opcode,
+    OwnedFrame,
+    StatusCode,
+    build_create_eventfd_response_ok,
+    build_create_pidfd_response_ok,
+    build_create_pipe_response_ok,
+    build_create_pty_response_ok,
+    build_create_signalfd_response_ok,
+    build_create_socketpair_response_ok,
+    build_deliver_signal_inbox_response_ok,
+    build_error_response,
+    build_inet_listener_accept_response_ok,
+    build_inet_listener_bind_response_ok,
+    build_inet_listener_create_response_ok,
+    build_inet_listener_listen_response_ok,
+    build_inet_listener_query_events_response_ok,
+    build_inet_raw_query_events_response_ok,
+    build_inet_raw_recvfrom_response_ok,
+    build_inet_raw_sendto_response_ok,
+    build_inet_tcp_conn_getsockopt_response_ok,
+    build_inet_tcp_conn_setsockopt_response_ok,
+    build_inotify_add_watch_response_ok,
+    build_inotify_init1_response_ok,
+    build_inotify_read_response_ok,
+    build_inotify_rm_watch_response_ok,
+    build_mark_process_exited_response_ok,
+    build_open_pty_slave_response_ok,
+    build_pidfd_exited_response_ok,
+    build_poll_tcp_conn_events_response_ok,
+    build_pty_ioctl_response_ok,
+    build_pty_read_response_ok,
+    build_pty_write_response_ok,
+    build_push_siginfo_response_ok,
+    build_read_eventfd_response_ok,
+    build_read_pipe_response_ok,
+    build_read_siginfo_response_ok,
+    build_read_socketpair_response_ok,
+    build_read_tcp_conn_response_ok,
+    build_register_notification_ring_response_ok,
+    build_register_process_response_ok,
+    build_release_response_ok,
+    build_set_pgid_response_ok,
+    build_set_sid_response_ok,
+    build_shutdown_socketpair_write_response_ok,
+    build_shutdown_tcp_conn_response_ok,
+    build_subscribe_eventfd_response_ok,
+    build_subscribe_process_exit_response_ok,
+    build_subscribe_pty_response_ok,
+    build_subscribe_signal_inbox_response_ok,
+    build_unsubscribe_response_ok,
+    build_unsubscribe_signal_inbox_response_ok,
+    build_write_eventfd_response_ok,
+    build_write_pipe_response_ok,
+    build_write_socketpair_response_ok,
+    build_write_tcp_conn_response_ok,
+    parse_create_eventfd_body,
+    parse_create_pidfd_body,
+    parse_create_pipe_body,
+    parse_create_signalfd_body,
+    parse_create_socketpair_body,
+    parse_deliver_signal_inbox_body,
+    parse_handle_body,
+    parse_inet_listener_accept_body,
+    parse_inet_listener_bind_body,
+    parse_inet_listener_create_body,
+    parse_inet_listener_listen_body,
+    parse_inet_listener_query_events_body,
+    parse_inet_raw_create_body,
+    parse_inet_raw_query_events_body,
+    parse_inet_raw_recvfrom_body,
+    parse_inet_raw_sendto_body,
+    parse_inet_tcp_conn_getsockopt_body,
+    parse_inet_tcp_conn_setsockopt_body,
+    parse_inotify_add_watch_body,
+    parse_inotify_init1_body,
+    parse_inotify_read_body,
+    parse_inotify_rm_watch_body,
+    parse_mark_process_exited_body,
+    parse_open_pty_slave_body,
+    parse_pidfd_exited_request,
+    parse_poll_tcp_conn_events_body,
+    parse_pty_ioctl_body,
+    parse_pty_read_body,
+    parse_pty_write_body,
+    parse_push_siginfo_body,
+    parse_read_pipe_body,
+    parse_read_socketpair_body,
+    parse_read_tcp_conn_body,
+    parse_set_pgid_body,
+    parse_set_sid_body,
+    parse_shutdown_socketpair_write_body,
+    parse_shutdown_tcp_conn_body,
+    parse_subscribe_eventfd_body,
+    parse_subscribe_process_exit_body,
+    parse_subscribe_pty_body,
+    parse_subscribe_signal_inbox_body,
+    parse_unsubscribe_body,
+    parse_unsubscribe_signal_inbox_body,
+    parse_write_eventfd_body,
+    parse_write_pipe_body,
+    parse_write_socketpair_body,
+    parse_write_tcp_conn_body,
 };
+
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
 use litebox_common_linux::shmem_ring::ShmemRingPair;
@@ -271,6 +337,8 @@ pub fn handle_request(
         Opcode::WriteTcpConn => handle_write_tcp_conn(registry, request, in_fds),
         Opcode::ShutdownTcpConn => handle_shutdown_tcp_conn(registry, request, in_fds),
         Opcode::PollTcpConnEvents => handle_poll_tcp_conn_events(registry, request, in_fds),
+        Opcode::InetTcpConnSetSockOpt => handle_inet_tcp_conn_setsockopt(registry, request, in_fds),
+        Opcode::InetTcpConnGetSockOpt => handle_inet_tcp_conn_getsockopt(registry, request, in_fds),
         Opcode::ReadSiginfo => handle_read_siginfo(registry, request, in_fds),
         Opcode::PushSiginfo => handle_push_siginfo(registry, request, in_fds),
         Opcode::CreatePty => handle_create_pty(registry, request, in_fds),
@@ -1381,6 +1449,86 @@ fn handle_poll_tcp_conn_events(
     }
 }
 
+fn handle_inet_tcp_conn_setsockopt(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetTcpConnSetSockOptResponse);
+    }
+    let (handle_id, level, optname, optval) =
+        match parse_inet_tcp_conn_setsockopt_body(request.body) {
+            Ok(parts) => parts,
+            Err(_) => return protocol_err(Opcode::InetTcpConnSetSockOptResponse),
+        };
+    let state = match resolve_tcp_conn(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::InetTcpConnSetSockOptResponse, status),
+    };
+    match state.setsockopt(level, optname, &optval) {
+        Ok(()) => HandlerResult {
+            frame: build_inet_tcp_conn_setsockopt_response_ok(),
+            out_fd: None,
+        },
+        Err(TcpConnError::Errno(errno)) if errno == libc::EOPNOTSUPP => status_err(
+            Opcode::InetTcpConnSetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::Errno(_)) => status_err(
+            Opcode::InetTcpConnSetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::WouldBlock | TcpConnError::PeerClosed) => status_err(
+            Opcode::InetTcpConnSetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::Io) => {
+            status_err(Opcode::InetTcpConnSetSockOptResponse, StatusCode::Internal)
+        }
+    }
+}
+
+fn handle_inet_tcp_conn_getsockopt(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetTcpConnGetSockOptResponse);
+    }
+    let (handle_id, level, optname, optlen) =
+        match parse_inet_tcp_conn_getsockopt_body(request.body) {
+            Ok(parts) => parts,
+            Err(_) => return protocol_err(Opcode::InetTcpConnGetSockOptResponse),
+        };
+    let state = match resolve_tcp_conn(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::InetTcpConnGetSockOptResponse, status),
+    };
+    match state.getsockopt(level, optname, optlen) {
+        Ok(bytes) => HandlerResult {
+            frame: build_inet_tcp_conn_getsockopt_response_ok(&bytes),
+            out_fd: None,
+        },
+        Err(TcpConnError::Errno(errno)) if errno == libc::EOPNOTSUPP => status_err(
+            Opcode::InetTcpConnGetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::Errno(_)) => status_err(
+            Opcode::InetTcpConnGetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::WouldBlock | TcpConnError::PeerClosed) => status_err(
+            Opcode::InetTcpConnGetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(TcpConnError::Io) => {
+            status_err(Opcode::InetTcpConnGetSockOptResponse, StatusCode::Internal)
+        }
+    }
+}
+
 fn handle_create_signalfd(
     registry: &BrokerStateRegistry,
     request: &Frame<'_>,
@@ -1525,6 +1673,7 @@ fn resolve_inet_dgram(
         | StateObjectEnum::SocketPairEnd(_)
         | StateObjectEnum::TcpConn(_)
         | StateObjectEnum::InetListener(_)
+        | StateObjectEnum::InetRaw(_)
         | StateObjectEnum::Signalfd(_)
         | StateObjectEnum::Inotify(_)
         | StateObjectEnum::Pty(_)

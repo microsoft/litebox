@@ -476,9 +476,8 @@ fn update_tracker_from_response(
         | Opcode::InotifyInit1
         | Opcode::InetListenerCreate
         | Opcode::InetTcpConnCreate
-        | Opcode::InetDgramCreate => {
-        | Opcode::InetRawCreate
-        | Opcode::InetTcpConnCreate => {
+        | Opcode::InetDgramCreate
+        | Opcode::InetRawCreate => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
                 tracker.record_state(caller_scope, id);
             }
