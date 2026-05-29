@@ -1696,12 +1696,20 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     // Fork-restore replays a snapshot whose process identity may differ from
     // the runner's default worker task params. Seed the local registry with the
-    // restored pid so any subsequent fork can register children with this
-    // process as their parent.
+    // restored pid AND the inherited pgid/sid so any subsequent guest setsid()
+    // can become its own session leader (would otherwise EPERM).
     {
         let pid = u32::try_from(snapshot.identity.pid)
             .expect("fork-restore snapshot pid must be non-negative");
-        shim_builder.init_with_pid(litebox::process::ProcessId(pid));
+        let pgid = u32::try_from(snapshot.identity.pgid)
+            .expect("fork-restore snapshot pgid must be non-negative");
+        let sid = u32::try_from(snapshot.identity.sid)
+            .expect("fork-restore snapshot sid must be non-negative");
+        shim_builder.init_for_fork_restore(
+            litebox::process::ProcessId(pid),
+            litebox::process::ProcessGroupId(pgid),
+            litebox::process::SessionId(sid),
+        );
     }
     let litebox = shim_builder.litebox();
 

@@ -1015,6 +1015,24 @@ impl LinuxShimBuilder {
             .expect("init process creation must succeed");
     }
 
+    /// Like [`init_with_pid`] but for fork-restored child workers that
+    /// inherit pgid/sid from their parent's snapshot. Without this, the
+    /// child registry entry would default to pgid=sid=pid, making any
+    /// subsequent guest `setsid()` fail with EPERM ("already group
+    /// leader"). This is required for any guest fork-then-setsid pattern,
+    /// notably dropbear SSH session children.
+    pub fn init_for_fork_restore(
+        &self,
+        pid: litebox::process::ProcessId,
+        pgid: litebox::process::ProcessGroupId,
+        sid: litebox::process::SessionId,
+    ) {
+        self.litebox
+            .process_registry()
+            .create_process_with_id_and_pgrp(pid, None, Some((pgid, sid)), 0)
+            .expect("fork-restored process creation must succeed");
+    }
+
     /// Returns the litebox object for the shim.
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.litebox
