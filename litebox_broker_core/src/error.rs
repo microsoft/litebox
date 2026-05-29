@@ -5,6 +5,7 @@ use core::fmt;
 
 /// Broker authority error category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum BrokerError {
     /// Policy denied the operation.
     PolicyDenied,

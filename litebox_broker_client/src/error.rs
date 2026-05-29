@@ -3,10 +3,11 @@
 
 use core::fmt;
 
-use litebox_broker_protocol::{BrokerResponse, ErrorCode};
+use litebox_broker_protocol::{BrokerResponse, ErrorCode, ProtocolVersion};
 
 /// Errors returned by the broker client adapter.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ClientError<E> {
     /// The transport failed.
     Transport(E),
@@ -16,8 +17,22 @@ pub enum ClientError<E> {
     AlreadyNegotiated,
     /// The broker closed the transport before returning a response.
     TransportClosed,
-    /// The broker returned a response tag this client does not understand.
-    UnknownResponse { tag: u8 },
+    /// The broker returned a response this client does not understand.
+    UnknownResponse,
+    /// The broker accepted negotiation with a version that cannot serve the request.
+    IncompatibleNegotiation {
+        /// Protocol version requested by this client.
+        requested: ProtocolVersion,
+        /// Protocol version advertised by the broker.
+        broker_protocol_version: ProtocolVersion,
+    },
+    /// The broker does not support the requested protocol version.
+    UnsupportedVersion {
+        /// Protocol version requested by this client.
+        requested: ProtocolVersion,
+        /// Protocol version advertised by the broker.
+        broker_protocol_version: ProtocolVersion,
+    },
     /// BrokerCore rejected the request.
     Broker(ErrorCode),
     /// The broker returned a response type that does not match the request.
@@ -31,7 +46,21 @@ impl<E: fmt::Display> fmt::Display for ClientError<E> {
             Self::NotNegotiated => write!(f, "broker client has not negotiated protocol version"),
             Self::AlreadyNegotiated => f.write_str("broker client already negotiated"),
             Self::TransportClosed => write!(f, "broker closed the transport"),
-            Self::UnknownResponse { tag } => write!(f, "unknown broker response tag {tag}"),
+            Self::UnknownResponse => f.write_str("unknown broker response"),
+            Self::IncompatibleNegotiation {
+                requested,
+                broker_protocol_version,
+            } => write!(
+                f,
+                "broker accepted incompatible protocol negotiation: requested {requested:?}, broker supports {broker_protocol_version:?}"
+            ),
+            Self::UnsupportedVersion {
+                requested,
+                broker_protocol_version,
+            } => write!(
+                f,
+                "broker does not support requested protocol version {requested:?}; broker supports {broker_protocol_version:?}"
+            ),
             Self::Broker(error) => write!(f, "broker rejected request: {error}"),
             Self::UnexpectedResponse(response) => {
                 write!(f, "broker returned unexpected response: {response:?}")
@@ -51,7 +80,9 @@ where
             Self::NotNegotiated
             | Self::AlreadyNegotiated
             | Self::TransportClosed
-            | Self::UnknownResponse { .. }
+            | Self::UnknownResponse
+            | Self::IncompatibleNegotiation { .. }
+            | Self::UnsupportedVersion { .. }
             | Self::UnexpectedResponse(_) => None,
         }
     }

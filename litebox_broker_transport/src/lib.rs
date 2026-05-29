@@ -30,11 +30,12 @@ pub enum PeerCredential {
 
 /// Request received from a transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReceivedRequest {
     /// A request understood by the current protocol crate.
     Request(BrokerRequest),
-    /// A request tag emitted by a newer peer and not understood by this process.
-    Unknown { tag: u8 },
+    /// A request emitted by a newer peer and not understood by this process.
+    Unknown,
 }
 
 impl From<BrokerRequest> for ReceivedRequest {
@@ -45,11 +46,12 @@ impl From<BrokerRequest> for ReceivedRequest {
 
 /// Response received from a transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReceivedResponse {
     /// A response understood by the current protocol crate.
     Response(BrokerResponse),
-    /// A response tag emitted by a newer broker and not understood by this process.
-    Unknown { tag: u8 },
+    /// A response emitted by a newer broker and not understood by this process.
+    Unknown,
 }
 
 impl From<BrokerResponse> for ReceivedResponse {

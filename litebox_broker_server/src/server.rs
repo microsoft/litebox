@@ -91,7 +91,7 @@ fn handle_received_request<P: PolicyEngine>(
 ) -> BrokerDispatch {
     match received {
         ReceivedRequest::Request(request) => handle_request(core, connection, state, request),
-        ReceivedRequest::Unknown { tag: _ } => handle_unknown_request(*state),
+        _ => handle_unknown_request(*state),
     }
 }
 
@@ -101,8 +101,8 @@ fn handle_request<P: PolicyEngine>(
     state: &mut ConnectionState,
     request: BrokerRequest,
 ) -> BrokerDispatch {
-    if *state == ConnectionState::AwaitingNegotiation {
-        return match request {
+    match *state {
+        ConnectionState::AwaitingNegotiation => match request {
             BrokerRequest::Negotiate { protocol_version } => {
                 handle_negotiation(state, protocol_version)
             }
@@ -110,9 +110,19 @@ fn handle_request<P: PolicyEngine>(
                 BrokerResponse::Error(ErrorCode::ProtocolState),
                 CloseReason::ProtocolViolation,
             ),
-        };
+        },
+        ConnectionState::Active {
+            negotiated_protocol_version,
+        } => handle_active_request(core, connection, negotiated_protocol_version, request),
     }
+}
 
+fn handle_active_request<P: PolicyEngine>(
+    core: &mut BrokerCore<P>,
+    connection: &BrokerConnection,
+    _negotiated_protocol_version: ProtocolVersion,
+    request: BrokerRequest,
+) -> BrokerDispatch {
     match request {
         BrokerRequest::Negotiate { .. } => BrokerDispatch::close_after(
             BrokerResponse::Error(ErrorCode::ProtocolState),
@@ -122,9 +132,8 @@ fn handle_request<P: PolicyEngine>(
             core.create_event(connection),
             |handle| BrokerResponse::Handle(protocol_handle(handle)),
         )),
-        BrokerRequest::WaitEvent { handle } => BrokerDispatch::continue_after(handle_core_result(
+        BrokerRequest::WaitEvent { handle } => BrokerDispatch::continue_after(handle_wait_result(
             core.wait_event(connection, core_handle(handle)),
-            |outcome| BrokerResponse::Wait(protocol_wait_outcome(outcome)),
         )),
         BrokerRequest::SignalEvent { handle } => {
             BrokerDispatch::continue_after(handle_core_result(
@@ -152,15 +161,16 @@ fn handle_negotiation(
     protocol_version: ProtocolVersion,
 ) -> BrokerDispatch {
     if protocol_version.is_supported_by(SUPPORTED_PROTOCOL_VERSION) {
-        *state = ConnectionState::Active;
+        *state = ConnectionState::Active {
+            negotiated_protocol_version: protocol_version,
+        };
         BrokerDispatch::continue_after(BrokerResponse::Negotiated {
             broker_protocol_version: SUPPORTED_PROTOCOL_VERSION,
         })
     } else {
-        BrokerDispatch::close_after(
-            BrokerResponse::Error(ErrorCode::UnsupportedVersion),
-            CloseReason::UnsupportedVersion,
-        )
+        BrokerDispatch::continue_after(BrokerResponse::VersionMismatch {
+            broker_protocol_version: SUPPORTED_PROTOCOL_VERSION,
+        })
     }
 }
 
@@ -174,6 +184,16 @@ fn handle_core_result<T>(
     }
 }
 
+fn handle_wait_result(result: litebox_broker_core::Result<CoreWaitOutcome>) -> BrokerResponse {
+    match result {
+        Ok(outcome) => match protocol_wait_outcome(outcome) {
+            Some(outcome) => BrokerResponse::Wait(outcome),
+            None => BrokerResponse::Error(ErrorCode::Internal),
+        },
+        Err(error) => BrokerResponse::Error(protocol_error(error)),
+    }
+}
+
 fn protocol_error(error: BrokerError) -> ErrorCode {
     match error {
         BrokerError::PolicyDenied => ErrorCode::PolicyDenied,
@@ -182,6 +202,7 @@ fn protocol_error(error: BrokerError) -> ErrorCode {
         BrokerError::WrongObjectType => ErrorCode::WrongObjectType,
         BrokerError::InvalidRights => ErrorCode::InvalidRights,
         BrokerError::ResourceExhausted => ErrorCode::ResourceExhausted,
+        _ => ErrorCode::Internal,
     }
 }
 
@@ -207,21 +228,24 @@ fn protocol_readiness_state(readiness: CoreReadinessState) -> ProtocolReadinessS
     ProtocolReadinessState::new(readiness.ready, readiness.generation)
 }
 
-fn protocol_wait_outcome(outcome: CoreWaitOutcome) -> ProtocolWaitOutcome {
+fn protocol_wait_outcome(outcome: CoreWaitOutcome) -> Option<ProtocolWaitOutcome> {
     match outcome {
-        CoreWaitOutcome::Ready(readiness) => {
-            ProtocolWaitOutcome::Ready(protocol_readiness_state(readiness))
-        }
-        CoreWaitOutcome::WouldBlock(readiness) => {
-            ProtocolWaitOutcome::WouldBlock(protocol_readiness_state(readiness))
-        }
+        CoreWaitOutcome::Ready(readiness) => Some(ProtocolWaitOutcome::Ready(
+            protocol_readiness_state(readiness),
+        )),
+        CoreWaitOutcome::WouldBlock(readiness) => Some(ProtocolWaitOutcome::WouldBlock(
+            protocol_readiness_state(readiness),
+        )),
+        _ => None,
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectionState {
     AwaitingNegotiation,
-    Active,
+    Active {
+        negotiated_protocol_version: ProtocolVersion,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,6 +278,7 @@ impl BrokerDispatch {
 
 /// Reason the broker server closed the connection after sending a response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CloseReason {
     /// The peer requested an unsupported protocol version.
     UnsupportedVersion,
@@ -272,6 +297,7 @@ impl fmt::Display for CloseReason {
 
 /// Terminal outcome for a successfully served broker connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionTermination {
     /// The peer cleanly closed the transport.
     PeerClosed,
@@ -281,6 +307,7 @@ pub enum ConnectionTermination {
 
 /// Errors returned by a broker receive/send loop.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BrokerServeError<E> {
     /// The server could not allocate or map state for a new connection.
     ConnectionSetup,
@@ -361,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_closes_after_unsupported_version() {
+    fn dispatch_reports_supported_version_after_unsupported_major() {
         let (mut core, connection, mut state) = new_connection();
 
         let dispatch = handle_request(
@@ -375,12 +402,11 @@ mod tests {
 
         assert_eq!(
             dispatch.response,
-            BrokerResponse::Error(ErrorCode::UnsupportedVersion)
+            BrokerResponse::VersionMismatch {
+                broker_protocol_version: SUPPORTED_PROTOCOL_VERSION
+            }
         );
-        assert_eq!(
-            dispatch.outcome,
-            DispatchOutcome::Close(CloseReason::UnsupportedVersion)
-        );
+        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
         assert_eq!(state, ConnectionState::AwaitingNegotiation);
     }
 
@@ -408,7 +434,12 @@ mod tests {
             }
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-        assert_eq!(state, ConnectionState::Active);
+        assert_eq!(
+            state,
+            ConnectionState::Active {
+                negotiated_protocol_version: requested
+            }
+        );
     }
 
     #[test]
@@ -429,12 +460,11 @@ mod tests {
 
         assert_eq!(
             dispatch.response,
-            BrokerResponse::Error(ErrorCode::UnsupportedVersion)
+            BrokerResponse::VersionMismatch {
+                broker_protocol_version: SUPPORTED_PROTOCOL_VERSION
+            }
         );
-        assert_eq!(
-            dispatch.outcome,
-            DispatchOutcome::Close(CloseReason::UnsupportedVersion)
-        );
+        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
         assert_eq!(state, ConnectionState::AwaitingNegotiation);
     }
 
@@ -443,12 +473,8 @@ mod tests {
         let (mut core, connection, mut state) = new_connection();
         negotiate(&mut core, &connection, &mut state);
 
-        let dispatch = handle_received_request(
-            &mut core,
-            &connection,
-            &mut state,
-            ReceivedRequest::Unknown { tag: 0xff },
-        );
+        let dispatch =
+            handle_received_request(&mut core, &connection, &mut state, ReceivedRequest::Unknown);
 
         assert_eq!(
             dispatch.response,
@@ -461,12 +487,8 @@ mod tests {
     fn dispatch_closes_unknown_requests_before_negotiation() {
         let (mut core, connection, mut state) = new_connection();
 
-        let dispatch = handle_received_request(
-            &mut core,
-            &connection,
-            &mut state,
-            ReceivedRequest::Unknown { tag: 0xff },
-        );
+        let dispatch =
+            handle_received_request(&mut core, &connection, &mut state, ReceivedRequest::Unknown);
 
         assert_eq!(
             dispatch.response,
@@ -497,7 +519,12 @@ mod tests {
             }
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-        assert_eq!(state, ConnectionState::Active);
+        assert_eq!(
+            state,
+            ConnectionState::Active {
+                negotiated_protocol_version: SUPPORTED_PROTOCOL_VERSION
+            }
+        );
 
         let dispatch = handle_request(
             &mut core,
@@ -581,7 +608,9 @@ mod tests {
 
         assert_eq!(
             protocol_wait_outcome(outcome),
-            ProtocolWaitOutcome::Ready(ProtocolReadinessState::new(true, 42))
+            Some(ProtocolWaitOutcome::Ready(ProtocolReadinessState::new(
+                true, 42
+            )))
         );
     }
 
@@ -616,6 +645,11 @@ mod tests {
                 broker_protocol_version: SUPPORTED_PROTOCOL_VERSION
             }
         );
-        assert_eq!(*state, ConnectionState::Active);
+        assert_eq!(
+            *state,
+            ConnectionState::Active {
+                negotiated_protocol_version: SUPPORTED_PROTOCOL_VERSION
+            }
+        );
     }
 }

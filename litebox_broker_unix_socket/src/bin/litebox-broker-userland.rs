@@ -25,6 +25,7 @@ fn broker_error(error: BrokerServeError<io::Error>) -> io::Error {
     match error {
         BrokerServeError::ConnectionSetup => io::Error::other("broker connection setup failed"),
         BrokerServeError::Transport(error) => error,
+        error => io::Error::other(error.to_string()),
     }
 }
 

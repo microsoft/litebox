@@ -100,7 +100,8 @@ Exit criteria:
 - Client code does not need to depend on the userland broker server crate to use the first Unix socket transport.
 - The generic broker server library does not depend on concrete Unix socket transport code and remains `no_std`.
 - Malformed or unauthorized requests fail closed or return policy-denied according to explicit policy.
-- Unsupported future protocol operations return `UnsupportedOperation` without closing the connection so clients can probe optional features explicitly.
+- Unsupported future protocol operations return `UnsupportedOperation` without closing the connection so clients can probe optional features explicitly; newer core error categories or wait outcomes that the server adapter cannot represent return `Internal`.
+- Version-mismatch negotiation responses advertise the broker-supported version and keep the connection in negotiation state so clients can downgrade without reconnecting or guessing.
 
 ## Phase 3: UserLiteBox facade
 

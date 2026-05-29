@@ -25,6 +25,7 @@ impl ReadinessState {
 
 /// Result of checking an event wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WaitOutcome {
     /// The event was ready and a nonblocking wait would complete.
     Ready(ReadinessState),

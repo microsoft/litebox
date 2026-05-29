@@ -26,12 +26,14 @@ const RESPONSE_TAG_HANDLE: u8 = 1;
 const RESPONSE_TAG_READINESS: u8 = 2;
 const RESPONSE_TAG_WAIT: u8 = 3;
 const RESPONSE_TAG_ERROR: u8 = 4;
+const RESPONSE_TAG_VERSION_MISMATCH: u8 = 5;
 
 const WAIT_OUTCOME_TAG_READY: u8 = 1;
 const WAIT_OUTCOME_TAG_WOULD_BLOCK: u8 = 2;
 
 /// Error produced while encoding or decoding a broker wire message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WireError {
     /// The encoder was asked to emit a request tag this codec does not own.
     EncodeUnknownRequestTag,
@@ -117,7 +119,7 @@ pub fn decode_request(frame: &[u8]) -> Result<ReceivedRequest, WireError> {
         REQUEST_TAG_SIGNAL_EVENT => BrokerRequest::SignalEvent {
             handle: decoder.handle()?,
         },
-        _ => return Ok(ReceivedRequest::Unknown { tag }),
+        _ => return Ok(ReceivedRequest::Unknown),
     };
     decoder.finish()?;
     Ok(ReceivedRequest::Request(request))
@@ -134,6 +136,13 @@ pub fn encode_response(response: BrokerResponse) -> Result<Vec<u8>, WireError> {
             broker_protocol_version,
         } => {
             encoder.u8(RESPONSE_TAG_NEGOTIATED);
+            encoder.u16(broker_protocol_version.major);
+            encoder.u16(broker_protocol_version.minor);
+        }
+        BrokerResponse::VersionMismatch {
+            broker_protocol_version,
+        } => {
+            encoder.u8(RESPONSE_TAG_VERSION_MISMATCH);
             encoder.u16(broker_protocol_version.major);
             encoder.u16(broker_protocol_version.minor);
         }
@@ -176,6 +185,9 @@ pub fn decode_response(frame: &[u8]) -> Result<ReceivedResponse, WireError> {
         RESPONSE_TAG_NEGOTIATED => BrokerResponse::Negotiated {
             broker_protocol_version: ProtocolVersion::new(decoder.u16()?, decoder.u16()?),
         },
+        RESPONSE_TAG_VERSION_MISMATCH => BrokerResponse::VersionMismatch {
+            broker_protocol_version: ProtocolVersion::new(decoder.u16()?, decoder.u16()?),
+        },
         RESPONSE_TAG_HANDLE => BrokerResponse::Handle(decoder.handle()?),
         RESPONSE_TAG_READINESS => BrokerResponse::Readiness(decoder.readiness()?),
         RESPONSE_TAG_WAIT => {
@@ -190,7 +202,7 @@ pub fn decode_response(frame: &[u8]) -> Result<ReceivedResponse, WireError> {
             let error = ErrorCode::from_raw(decoder.u16()?);
             BrokerResponse::Error(error)
         }
-        _ => return Ok(ReceivedResponse::Unknown { tag }),
+        _ => return Ok(ReceivedResponse::Unknown),
     };
     decoder.finish()?;
     Ok(ReceivedResponse::Response(response))
@@ -341,11 +353,15 @@ mod tests {
             BrokerResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion::new(1, 0),
             },
+            BrokerResponse::VersionMismatch {
+                broker_protocol_version: ProtocolVersion::new(1, 0),
+            },
             BrokerResponse::Handle(handle),
             BrokerResponse::Readiness(ReadinessState::new(false, 7)),
             BrokerResponse::Wait(WaitOutcome::Ready(ReadinessState::new(true, 8))),
             BrokerResponse::Wait(WaitOutcome::WouldBlock(ReadinessState::new(false, 9))),
             BrokerResponse::Error(ErrorCode::PolicyDenied),
+            BrokerResponse::Error(ErrorCode::Internal),
         ];
 
         for response in responses {
@@ -360,7 +376,7 @@ mod tests {
     fn decode_rejects_malformed_request_frames() {
         assert_eq!(
             decode_request(&[0xff, 1, 2, 3]),
-            Ok(ReceivedRequest::Unknown { tag: 0xff })
+            Ok(ReceivedRequest::Unknown)
         );
         assert_eq!(decode_request(&[0, 1]), Err(WireError::TruncatedFrame));
         let mut frame = encode_request(BrokerRequest::CreateEvent).unwrap();
@@ -372,7 +388,7 @@ mod tests {
     fn decode_rejects_malformed_response_frames() {
         assert_eq!(
             decode_response(&[0xff, 1, 2, 3]),
-            Ok(ReceivedResponse::Unknown { tag: 0xff })
+            Ok(ReceivedResponse::Unknown)
         );
         assert_eq!(
             decode_response(&[3, 0xff]),

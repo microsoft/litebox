@@ -15,6 +15,8 @@ pub enum ErrorCode {
     ProtocolState,
     /// The request is unsupported by this broker protocol implementation.
     UnsupportedOperation,
+    /// Broker hit an internal condition or an error category this protocol cannot represent.
+    Internal,
     /// Policy denied the operation.
     PolicyDenied,
     /// The referenced object does not exist.
@@ -39,6 +41,7 @@ impl ErrorCode {
             3 => Self::MalformedRequest,
             10 => Self::ProtocolState,
             11 => Self::UnsupportedOperation,
+            12 => Self::Internal,
             4 => Self::PolicyDenied,
             5 => Self::UnknownObject,
             6 => Self::StaleHandle,
@@ -56,6 +59,7 @@ impl ErrorCode {
             Self::MalformedRequest => 3,
             Self::ProtocolState => 10,
             Self::UnsupportedOperation => 11,
+            Self::Internal => 12,
             Self::PolicyDenied => 4,
             Self::UnknownObject => 5,
             Self::StaleHandle => 6,
@@ -74,6 +78,7 @@ impl fmt::Display for ErrorCode {
             Self::MalformedRequest => f.write_str("malformed broker request"),
             Self::ProtocolState => f.write_str("broker protocol state violation"),
             Self::UnsupportedOperation => f.write_str("unsupported broker operation"),
+            Self::Internal => f.write_str("internal broker error"),
             Self::PolicyDenied => f.write_str("broker policy denied the operation"),
             Self::UnknownObject => f.write_str("unknown broker object"),
             Self::StaleHandle => f.write_str("stale broker handle"),

@@ -33,7 +33,9 @@ pub struct BrokerClient<T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectionState {
     AwaitingNegotiation,
-    Active,
+    Active {
+        negotiated_protocol_version: ProtocolVersion,
+    },
 }
 
 impl<T> BrokerClient<T> {
@@ -47,10 +49,25 @@ impl<T> BrokerClient<T> {
 }
 
 impl<T: ClientTransport> BrokerClient<T> {
-    pub(crate) fn ensure_negotiated(&self) -> Result<(), T::Error> {
+    /// Returns the effective protocol version this connection negotiated.
+    ///
+    /// Feature gating must use this effective version because the broker may
+    /// support a newer minor version than this client requested.
+    pub fn negotiated_protocol_version(&self) -> Option<ProtocolVersion> {
+        match self.state {
+            ConnectionState::AwaitingNegotiation => None,
+            ConnectionState::Active {
+                negotiated_protocol_version,
+            } => Some(negotiated_protocol_version),
+        }
+    }
+
+    pub(crate) fn ensure_negotiated(&self) -> Result<ProtocolVersion, T::Error> {
         match self.state {
             ConnectionState::AwaitingNegotiation => Err(ClientError::NotNegotiated),
-            ConnectionState::Active => Ok(()),
+            ConnectionState::Active {
+                negotiated_protocol_version,
+            } => Ok(negotiated_protocol_version),
         }
     }
 
@@ -68,7 +85,7 @@ impl<T: ClientTransport> BrokerClient<T> {
                 Err(ClientError::Broker(error))
             }
             ReceivedResponse::Response(response) => Ok(response),
-            ReceivedResponse::Unknown { tag } => Err(ClientError::UnknownResponse { tag }),
+            _ => Err(ClientError::UnknownResponse),
         }
     }
 }
@@ -102,17 +119,62 @@ mod tests {
         }));
         let mut client = BrokerClient::new(transport);
 
-        assert_eq!(
-            client.negotiate_version(requested).unwrap(),
-            CLIENT_PROTOCOL_VERSION
-        );
+        assert_eq!(client.negotiate_version(requested).unwrap(), requested);
         assert_eq!(
             client.transport.sent_request,
             Some(BrokerRequest::Negotiate {
                 protocol_version: requested
             })
         );
-        assert_eq!(client.state, ConnectionState::Active);
+        assert_eq!(client.negotiated_protocol_version(), Some(requested));
+    }
+
+    #[test]
+    fn negotiate_version_rejects_incompatible_broker_response() {
+        let requested = ProtocolVersion::new(1, 1);
+        let transport = FakeTransport::new(Some(BrokerResponse::Negotiated {
+            broker_protocol_version: ProtocolVersion::new(1, 0),
+        }));
+        let mut client = BrokerClient::new(transport);
+
+        assert!(matches!(
+            client.negotiate_version(requested),
+            Err(ClientError::IncompatibleNegotiation {
+                requested: actual_requested,
+                broker_protocol_version
+            }) if actual_requested == requested
+                && broker_protocol_version == ProtocolVersion::new(1, 0)
+        ));
+        assert_eq!(client.negotiated_protocol_version(), None);
+    }
+
+    #[test]
+    fn negotiate_version_reports_supported_version_and_allows_retry() {
+        let too_new = ProtocolVersion::new(
+            CLIENT_PROTOCOL_VERSION.major,
+            CLIENT_PROTOCOL_VERSION.minor + 1,
+        );
+        let fallback = CLIENT_PROTOCOL_VERSION;
+        let transport = FakeTransport::new(Some(BrokerResponse::VersionMismatch {
+            broker_protocol_version: fallback,
+        }));
+        let mut client = BrokerClient::new(transport);
+
+        assert!(matches!(
+            client.negotiate_version(too_new),
+            Err(ClientError::UnsupportedVersion {
+                requested,
+                broker_protocol_version
+            }) if requested == too_new && broker_protocol_version == fallback
+        ));
+        assert_eq!(client.negotiated_protocol_version(), None);
+
+        client.transport.response = Some(BrokerResponse::Negotiated {
+            broker_protocol_version: fallback,
+        });
+
+        assert_eq!(client.negotiate_version(fallback).unwrap(), fallback);
+        assert_eq!(client.negotiated_protocol_version(), Some(fallback));
     }
 
     struct FakeTransport {

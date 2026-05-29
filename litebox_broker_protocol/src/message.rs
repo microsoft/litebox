@@ -65,6 +65,15 @@ pub enum BrokerResponse {
         /// [`ProtocolVersion::is_supported_by`](crate::ProtocolVersion::is_supported_by).
         broker_protocol_version: ProtocolVersion,
     },
+    /// Negotiation failed because the requested version is unsupported.
+    ///
+    /// The connection remains in negotiation state and the client may retry
+    /// with a compatible version using the broker-supported version advertised
+    /// here.
+    VersionMismatch {
+        /// Broker protocol version supported by this endpoint.
+        broker_protocol_version: ProtocolVersion,
+    },
     /// Operation returned a broker object handle.
     Handle(ObjectHandle),
     /// Operation returned readiness state.
