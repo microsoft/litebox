@@ -29,7 +29,8 @@ pub use identity::{BrokerAssociation, CallerCredential};
 use object::{ObjectEntry, ObjectId, ObjectReference};
 pub use object::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
 pub use policy::{
-    DefaultDenyPolicy, EventOnlyPolicy, ObjectOperation, PolicyEngine, PolicyOperation,
+    DefaultDenyPolicy, EventOnlyPolicy, ObjectOperation, PolicyDecision, PolicyEngine,
+    PolicyOperation,
 };
 pub use types::{ObjectRights, ObjectType};
 

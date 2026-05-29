@@ -17,14 +17,27 @@ pub enum ObjectType {
 pub struct ObjectRights(u32);
 
 impl ObjectRights {
+    /// Empty rights set.
+    pub const NONE: Self = Self(0);
     /// Right to wait for readiness.
     pub const WAIT: Self = Self(1 << 0);
     /// Right to mutate object state, such as signaling an event.
     pub const WRITE: Self = Self(1 << 1);
 
+    /// Returns true when no rights are present.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
     /// Returns true when all `required` rights are present.
     pub const fn contains(self, required: Self) -> bool {
         (self.0 & required.0) == required.0
+    }
+
+    /// Returns the union of two rights sets.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 }
 
@@ -32,6 +45,6 @@ impl BitOr for ObjectRights {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self::Output {
-        Self(self.0 | rhs.0)
+        self.union(rhs)
     }
 }

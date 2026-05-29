@@ -36,13 +36,13 @@ pub enum WaitOutcome {
 impl<P: PolicyEngine> BrokerCore<P> {
     /// Creates a broker-owned event object.
     pub fn create_event(&mut self, association: &BrokerAssociation) -> Result<ObjectHandle> {
-        self.authorize_create_object(association, ObjectType::Event)?;
+        let rights = self.authorize_create_object(association, ObjectType::Event)?;
 
         self.insert_object_with_reference(
             association,
             ObjectKind::Event(EventObject::new()),
             ObjectType::Event,
-            ObjectRights::WAIT | ObjectRights::WRITE,
+            rights,
         )
     }
 
@@ -117,7 +117,10 @@ impl EventObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BrokerCore, CallerCredential, EventOnlyPolicy, ObjectReferenceGeneration};
+    use crate::{
+        BrokerCore, CallerCredential, EventOnlyPolicy, ObjectOperation, ObjectReferenceGeneration,
+        PolicyDecision, PolicyEngine, PolicyOperation,
+    };
 
     #[test]
     fn wait_rejects_reference_without_wait_right() {
@@ -171,5 +174,45 @@ mod tests {
             core.wait_event(&other, handle),
             Err(BrokerError::UnknownObject)
         );
+    }
+
+    #[test]
+    fn create_event_uses_policy_granted_reference_rights() {
+        let mut core = BrokerCore::new(WaitOnlyCreatePolicy);
+        let association = core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        let handle = core.create_event(&association).unwrap();
+
+        assert!(matches!(
+            core.wait_event(&association, handle),
+            Ok(WaitOutcome::WouldBlock(_))
+        ));
+        assert_eq!(
+            core.signal_event(&association, handle),
+            Err(BrokerError::InvalidRights)
+        );
+    }
+
+    struct WaitOnlyCreatePolicy;
+
+    impl PolicyEngine for WaitOnlyCreatePolicy {
+        fn authorize(&mut self, operation: PolicyOperation) -> Result<PolicyDecision> {
+            match operation {
+                PolicyOperation::Object {
+                    object_type: ObjectType::Event,
+                    operation: ObjectOperation::Create,
+                    ..
+                } => Ok(PolicyDecision::GrantObjectReference {
+                    rights: ObjectRights::WAIT,
+                }),
+                PolicyOperation::Object {
+                    object_type: ObjectType::Event,
+                    operation: ObjectOperation::Use { .. },
+                    ..
+                } => Ok(PolicyDecision::Authorized),
+            }
+        }
     }
 }

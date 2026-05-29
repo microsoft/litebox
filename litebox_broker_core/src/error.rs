@@ -19,6 +19,8 @@ pub enum BrokerError {
     InvalidRights,
     /// Broker-side resource exhaustion.
     ResourceExhausted,
+    /// Policy returned a decision that does not match the authorized operation.
+    InvalidPolicyDecision,
 }
 
 impl fmt::Display for BrokerError {
@@ -30,6 +32,7 @@ impl fmt::Display for BrokerError {
             Self::WrongObjectType => f.write_str("wrong broker object type"),
             Self::InvalidRights => f.write_str("invalid broker rights"),
             Self::ResourceExhausted => f.write_str("broker resource exhausted"),
+            Self::InvalidPolicyDecision => f.write_str("invalid broker policy decision"),
         }
     }
 }

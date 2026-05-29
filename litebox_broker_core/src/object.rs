@@ -6,8 +6,8 @@ use alloc::vec::Vec;
 use crate::event::EventObject;
 use crate::identity::{AssociationIdentity, BrokerAssociation};
 use crate::{
-    BrokerCore, BrokerError, ObjectRights, ObjectType, PolicyEngine, PolicyOperation, Result,
-    allocate_id,
+    BrokerCore, BrokerError, ObjectRights, ObjectType, PolicyDecision, PolicyEngine,
+    PolicyOperation, Result, allocate_id,
 };
 
 macro_rules! id_type {
@@ -145,11 +145,14 @@ impl<P: PolicyEngine> BrokerCore<P> {
         &mut self,
         association: &BrokerAssociation,
         object_type: ObjectType,
-    ) -> Result<()> {
-        self.policy.authorize(PolicyOperation::create_object(
+    ) -> Result<ObjectRights> {
+        match self.policy.authorize(PolicyOperation::create_object(
             association.caller_credential(),
             object_type,
-        ))
+        ))? {
+            PolicyDecision::GrantObjectReference { rights } => Ok(rights),
+            _ => Err(BrokerError::InvalidPolicyDecision),
+        }
     }
 
     pub(crate) fn authorize_use_object(
@@ -160,12 +163,14 @@ impl<P: PolicyEngine> BrokerCore<P> {
         rights: ObjectRights,
     ) -> Result<ObjectId> {
         let object_id = self.validate_handle(association, handle, object_type, rights)?;
-        self.policy.authorize(PolicyOperation::use_object(
+        match self.policy.authorize(PolicyOperation::use_object(
             association.caller_credential(),
             object_type,
             rights,
-        ))?;
-        Ok(object_id)
+        ))? {
+            PolicyDecision::Authorized => Ok(object_id),
+            _ => Err(BrokerError::InvalidPolicyDecision),
+        }
     }
 
     pub(crate) fn object(&self, object_id: ObjectId) -> Result<&ObjectEntry> {
@@ -187,16 +192,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
         expected_type: ObjectType,
         required_rights: ObjectRights,
     ) -> Result<ObjectId> {
-        let reference = self
-            .references
-            .get(&handle.reference_id)
-            .ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != association.identity() {
-            return Err(BrokerError::UnknownObject);
-        }
-        if reference.reference_generation != handle.reference_generation {
-            return Err(BrokerError::StaleHandle);
-        }
+        let reference = self.reference_for_handle(association, handle)?;
         if reference.object_type != expected_type {
             return Err(BrokerError::WrongObjectType);
         }
@@ -225,6 +221,24 @@ impl<P: PolicyEngine> BrokerCore<P> {
 }
 
 impl<P> BrokerCore<P> {
+    /// Closes one object reference owned by an association.
+    ///
+    /// The underlying object is released when this was the last live reference.
+    pub fn close_object_reference(
+        &mut self,
+        association: &BrokerAssociation,
+        handle: ObjectHandle,
+    ) -> Result<()> {
+        let object_id = self.reference_for_handle(association, handle)?.object_id;
+        if !self.objects.contains_key(&object_id) {
+            return Err(BrokerError::UnknownObject);
+        }
+
+        self.references.remove(&handle.reference_id);
+        self.drop_object_if_unreferenced(object_id);
+        Ok(())
+    }
+
     /// Closes a broker association and releases references owned by it.
     pub fn close_association(&mut self, association: BrokerAssociation) {
         let identity = association.identity();
@@ -236,23 +250,42 @@ impl<P> BrokerCore<P> {
             })
             .collect::<Vec<_>>();
 
+        let mut object_ids = Vec::new();
         for reference_id in reference_ids {
-            self.references.remove(&reference_id);
+            if let Some(reference) = self.references.remove(&reference_id) {
+                object_ids.push(reference.object_id);
+            }
         }
 
-        let object_ids = self
-            .objects
-            .keys()
-            .copied()
-            .filter(|object_id| {
-                !self
-                    .references
-                    .values()
-                    .any(|reference| reference.object_id == *object_id)
-            })
-            .collect::<Vec<_>>();
-
         for object_id in object_ids {
+            self.drop_object_if_unreferenced(object_id);
+        }
+    }
+
+    fn reference_for_handle(
+        &self,
+        association: &BrokerAssociation,
+        handle: ObjectHandle,
+    ) -> Result<&ObjectReference> {
+        let reference = self
+            .references
+            .get(&handle.reference_id)
+            .ok_or(BrokerError::UnknownObject)?;
+        if reference.owner != association.identity() {
+            return Err(BrokerError::UnknownObject);
+        }
+        if reference.reference_generation != handle.reference_generation {
+            return Err(BrokerError::StaleHandle);
+        }
+        Ok(reference)
+    }
+
+    fn drop_object_if_unreferenced(&mut self, object_id: ObjectId) {
+        if !self
+            .references
+            .values()
+            .any(|reference| reference.object_id == object_id)
+        {
             self.objects.remove(&object_id);
         }
     }
@@ -310,5 +343,52 @@ mod tests {
 
         assert!(core.references.is_empty());
         assert!(core.objects.is_empty());
+    }
+
+    #[test]
+    fn close_object_reference_releases_reference_and_orphaned_object() {
+        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let association = core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = core.create_event(&association).unwrap();
+
+        assert_eq!(core.close_object_reference(&association, handle), Ok(()));
+        assert!(core.references.is_empty());
+        assert!(core.objects.is_empty());
+        assert_eq!(
+            core.close_object_reference(&association, handle),
+            Err(BrokerError::UnknownObject)
+        );
+    }
+
+    #[test]
+    fn close_object_reference_rejects_stale_and_foreign_handles() {
+        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let owner = core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+        let other = core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = core.create_event(&owner).unwrap();
+
+        assert_eq!(
+            core.close_object_reference(&other, handle),
+            Err(BrokerError::UnknownObject)
+        );
+
+        let stale = ObjectHandle::new(
+            handle.reference_id,
+            ObjectReferenceGeneration::new(handle.reference_generation.get() + 1),
+        );
+        assert_eq!(
+            core.close_object_reference(&owner, stale),
+            Err(BrokerError::StaleHandle)
+        );
+        assert!(matches!(
+            core.wait_event(&owner, handle),
+            Ok(crate::WaitOutcome::WouldBlock(_))
+        ));
     }
 }

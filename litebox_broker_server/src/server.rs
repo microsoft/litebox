@@ -491,6 +491,109 @@ mod tests {
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
     }
 
+    #[test]
+    fn serve_connection_negotiates_routes_event_and_returns_peer_closed() {
+        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let mut channel = FakeServerChannel::new(std::vec::Vec::from([
+            Ok(Some(ReceivedBrokerRequest::Request(
+                BrokerRequest::Negotiate {
+                    protocol_version: SUPPORTED_PROTOCOL_VERSION,
+                },
+            ))),
+            Ok(Some(ReceivedBrokerRequest::Request(event_request(
+                EventRequest::Create,
+            )))),
+            Ok(None),
+        ]));
+
+        assert_eq!(
+            serve_connection(&mut core, &mut channel).unwrap(),
+            ConnectionTermination::PeerClosed
+        );
+        assert_eq!(
+            channel.responses[0],
+            BrokerResponse::Negotiated {
+                broker_protocol_version: SUPPORTED_PROTOCOL_VERSION
+            }
+        );
+        let handle = match channel.responses[1] {
+            BrokerResponse::Core(CoreResponse::Event(EventResponse::Created { handle })) => handle,
+            response => panic!("unexpected response: {response:?}"),
+        };
+
+        let probe = core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_eq!(
+            core.close_object_reference(&probe, to_core_handle(handle)),
+            Err(BrokerError::UnknownObject)
+        );
+    }
+
+    #[test]
+    fn serve_connection_closes_after_protocol_violation() {
+        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let mut channel = FakeServerChannel::new(std::vec::Vec::from([
+            Ok(Some(ReceivedBrokerRequest::Request(event_request(
+                EventRequest::Create,
+            )))),
+            Ok(Some(ReceivedBrokerRequest::Request(
+                BrokerRequest::Negotiate {
+                    protocol_version: SUPPORTED_PROTOCOL_VERSION,
+                },
+            ))),
+        ]));
+
+        assert_eq!(
+            serve_connection(&mut core, &mut channel).unwrap(),
+            ConnectionTermination::BrokerClosed(CloseReason::ProtocolViolation)
+        );
+        assert_eq!(
+            channel.responses,
+            [BrokerResponse::Error(ErrorCode::ProtocolState)]
+        );
+        assert_eq!(channel.requests.len(), 1);
+    }
+
+    #[test]
+    fn serve_connection_returns_channel_error_after_cleanup_path() {
+        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let mut channel = FakeServerChannel::new(std::vec::Vec::from([
+            Ok(Some(ReceivedBrokerRequest::Request(
+                BrokerRequest::Negotiate {
+                    protocol_version: SUPPORTED_PROTOCOL_VERSION,
+                },
+            ))),
+            Ok(Some(ReceivedBrokerRequest::Request(event_request(
+                EventRequest::Create,
+            )))),
+            Err(FakeChannelError::Recv),
+        ]));
+
+        match serve_connection(&mut core, &mut channel) {
+            Err(BrokerServeError::Channel(FakeChannelError::Recv)) => {}
+            result => panic!("unexpected serve result: {result:?}"),
+        }
+        assert_eq!(channel.responses.len(), 2);
+    }
+
+    #[test]
+    fn serve_connection_returns_channel_error_when_response_send_fails() {
+        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let mut channel = FakeServerChannel::new(std::vec::Vec::from([Ok(Some(
+            ReceivedBrokerRequest::Request(BrokerRequest::Negotiate {
+                protocol_version: SUPPORTED_PROTOCOL_VERSION,
+            }),
+        ))]));
+        channel.send_error = Some(FakeChannelError::Send);
+
+        match serve_connection(&mut core, &mut channel) {
+            Err(BrokerServeError::Channel(FakeChannelError::Send)) => {}
+            result => panic!("unexpected serve result: {result:?}"),
+        }
+        assert!(channel.responses.is_empty());
+    }
+
     fn assert_protocol_violation(dispatch: BrokerDispatch) {
         assert_eq!(
             dispatch.response,
@@ -543,5 +646,72 @@ mod tests {
 
     const fn event_request(request: EventRequest) -> BrokerRequest {
         BrokerRequest::Core(CoreRequest::Event(request))
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FakeChannelError {
+        Recv,
+        Send,
+    }
+
+    impl fmt::Display for FakeChannelError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Recv => f.write_str("fake receive error"),
+                Self::Send => f.write_str("fake send error"),
+            }
+        }
+    }
+
+    impl core::error::Error for FakeChannelError {}
+
+    struct FakeServerChannel {
+        requests:
+            std::vec::Vec<core::result::Result<Option<ReceivedBrokerRequest>, FakeChannelError>>,
+        responses: std::vec::Vec<BrokerResponse>,
+        send_error: Option<FakeChannelError>,
+    }
+
+    impl FakeServerChannel {
+        fn new(
+            requests: std::vec::Vec<
+                core::result::Result<Option<ReceivedBrokerRequest>, FakeChannelError>,
+            >,
+        ) -> Self {
+            Self {
+                requests,
+                responses: std::vec::Vec::new(),
+                send_error: None,
+            }
+        }
+    }
+
+    impl ServerControlChannel for FakeServerChannel {
+        type Error = FakeChannelError;
+
+        fn peer_credential(&self) -> core::result::Result<PeerCredential, Self::Error> {
+            Ok(PeerCredential::Unauthenticated)
+        }
+
+        fn recv_request(
+            &mut self,
+        ) -> core::result::Result<Option<ReceivedBrokerRequest>, Self::Error> {
+            if self.requests.is_empty() {
+                Ok(None)
+            } else {
+                self.requests.remove(0)
+            }
+        }
+
+        fn send_response(
+            &mut self,
+            response: &BrokerResponse,
+        ) -> core::result::Result<(), Self::Error> {
+            if let Some(error) = self.send_error {
+                return Err(error);
+            }
+            self.responses.push(*response);
+            Ok(())
+        }
     }
 }

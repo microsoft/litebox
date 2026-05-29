@@ -64,10 +64,12 @@ impl AssociationIdentity {
 ///
 /// User mode does not choose this value. The broker entry layer authenticates
 /// the caller, then BrokerCore assigns this identity for all operations received
-/// on that association.
+/// on that association. The current architecture expects one BrokerCore per
+/// broker, so this token is scoped by broker-assigned session and process
+/// identity rather than by a separate core identifier.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BrokerAssociation {
-    /// Broker-assigned sandbox session identity.
+    /// Broker-assigned sandbox session and guest process identity.
     identity: AssociationIdentity,
     /// Broker-entry-authenticated caller credential for this association.
     caller_credential: CallerCredential,
