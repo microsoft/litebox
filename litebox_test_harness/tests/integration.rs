@@ -2729,12 +2729,6 @@ mod copilot {
             }
             std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
         }
-        // For `build`, the workspace itself needs to be visible inside
-        // the container. Symlinks won't work (target path doesn't
-        // exist inside container). Bind-mount the host workspace at
-        // /workspace/litebox-src via an extra `-v` flag in the
-        // container spawn. The flag is added at ContainerHandle::spawn
-        // time based on scenario_id.
         // Token env file inside the bind-mounted workspace. Mode 0600.
         // dropbear strips env vars from session children (only PATH /
         // HOME / SHELL / USER / LOGNAME / MAIL survive), so we can't
@@ -2743,186 +2737,203 @@ mod copilot {
         let token_env_path = fixture_dir.join(".copilot-env");
         super::write_token_env(&token_env_path, token())?;
 
-        // Spawn container.
-        let container =
-            ContainerHandle::spawn(pass, scenario_id, mode, &fixture_dir, scn.id == "build")?;
-        let port = container.ssh_port;
+        let pass_static: &'static str = match pass {
+            "native" => "native",
+            "litebox" => "litebox",
+            _ => "unknown",
+        };
+        let test_id = format!("copilot::{mode}.{scenario_id}");
+        let mount_workspace_src = scn.id == "build";
+        let spec = build_copilot_spec(pass, &fixture_dir, mount_workspace_src);
 
-        // Wait for sshd to listen.
-        wait_for_sshd(port, Duration::from_secs(30))?;
-
-        // Build the response by running the appropriate mode.
         let prompt_text = (scn.prompt)(&canary);
-        let response = match mode {
-            "pminus" => drive_pminus(port, &prompt_text, scn.timeout_secs)?,
-            "tui" => drive_tui(port, &prompt_text, scn.timeout_secs)?,
-            _ => return Err(format!("unknown mode {mode}").into()),
+        let check: fn(&str, &str) -> bool = scn.check;
+        let timeout_secs = scn.timeout_secs;
+        let canary_clone = canary.clone();
+        let pass_owned = pass.to_string();
+        let mode_owned = mode.to_string();
+        let scenario_id_owned = scenario_id.to_string();
+        let prompt_text_for_log = prompt_text.clone();
+        let canary_for_log = canary.clone();
+
+        let group_static: &'static str = match mode {
+            "pminus" => "pminus",
+            "tui" => "tui",
+            _ => "unknown",
         };
 
-        // Persist the raw + ANSI-stripped transcript for forensics.
-        // Path mirrors test-logs convention so debuggers know where
-        // to look.
-        let log_dir = super::log_dir();
-        let _ = std::fs::create_dir_all(&log_dir);
-        let safe = format!("copilot-{pass}-{mode}-{scenario_id}");
-        let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &response);
-        let _ = std::fs::write(
-            log_dir.join(format!("{safe}.stripped.log")),
-            strip_ansi(&response),
-        );
-        let _ = std::fs::write(
-            log_dir.join(format!("{safe}.prompt.txt")),
-            format!("canary={canary}\n\n--- prompt ---\n{prompt_text}\n"),
-        );
+        super::framework::run_trial(
+            pass_static,
+            &test_id,
+            "copilot_cli",
+            group_static,
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!(
+                            "container {} did not publish port 22",
+                            container.name
+                        )),
+                        t_docker_start_ms: 0,
+                        t_useful_ms: 0,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                };
+                if let Err(e) = wait_for_sshd(port, Duration::from_secs(30)) {
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!("wait_for_sshd port {port}: {e}")),
+                        t_docker_start_ms: t_dispatch.elapsed().as_millis(),
+                        t_useful_ms: 0,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
 
-        // Verdict.
-        let ok = (scn.check)(&canary, &response);
-        if !ok {
-            let preview: String = strip_ansi(&response).chars().take(800).collect();
-            return Err(format!(
-                "{pass}::copilot::{mode}.{scenario_id} \
-                 canary check failed.\n\
-                 canary={canary}\n\
-                 transcript: {}\n\
-                 first 800 chars of response (ANSI-stripped):\n{preview}",
-                log_dir.join(format!("{safe}.stripped.log")).display(),
-            )
-            .into());
+                let response = match mode_owned.as_str() {
+                    "pminus" => drive_pminus(port, &prompt_text, timeout_secs),
+                    "tui" => drive_tui(port, &prompt_text, timeout_secs),
+                    _ => Err(format!("unknown mode {mode_owned}")),
+                };
+                let response = match response {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return super::framework::DriveResult {
+                            verdict: "FAIL",
+                            detail: Some(format!("drive: {e}")),
+                            t_docker_start_ms,
+                            t_useful_ms: t_useful_start.elapsed().as_millis(),
+                            sub_phases: super::SubPhaseMs::default(),
+                            t_docker_spawn_ms: None,
+                            t_litebox_init_ms: None,
+                            t_harness_load_ms: None,
+                        };
+                    }
+                };
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("copilot-{pass_owned}-{mode_owned}-{scenario_id_owned}");
+                let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &response);
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.stripped.log")),
+                    strip_ansi(&response),
+                );
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.prompt.txt")),
+                    format!("canary={canary_for_log}\n\n--- prompt ---\n{prompt_text_for_log}\n"),
+                );
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+
+                let ok = check(&canary_clone, &response);
+                if !ok {
+                    let preview: String = strip_ansi(&response).chars().take(800).collect();
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!(
+                            "copilot::{mode_owned}.{scenario_id_owned} canary check failed.\n\
+                             canary={canary_clone}\n\
+                             transcript: {}\n\
+                             first 800 chars of response (ANSI-stripped):\n{preview}",
+                            log_dir.join(format!("{safe}.stripped.log")).display(),
+                        )),
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+                super::framework::DriveResult {
+                    verdict: "pass",
+                    detail: None,
+                    t_docker_start_ms,
+                    t_useful_ms,
+                    sub_phases: super::SubPhaseMs::default(),
+                    t_docker_spawn_ms: None,
+                    t_litebox_init_ms: None,
+                    t_harness_load_ms: None,
+                }
+            },
+        )
+    }
+
+    /// Build the `ContainerSpec` for a copilot_cli scenario. Mirrors
+    /// what `ContainerHandle::spawn` used to construct, but returns
+    /// data instead of spawning — `framework::run_trial` owns the
+    /// docker invocation + lifecycle.
+    fn build_copilot_spec(
+        pass: &str,
+        fixture_dir: &Path,
+        mount_workspace_src: bool,
+    ) -> super::framework::ContainerSpec {
+        let ws_root = super::workspace_root();
+        let bin_dir = super::debug_dir();
+        let mut docker_args: Vec<String> = vec![
+            "--cap-add".into(),
+            "SYS_PTRACE".into(),
+            "-p".into(),
+            "127.0.0.1:0:22".into(),
+            "-v".into(),
+            format!("{}:/opt/litebox:ro", bin_dir.display()),
+            "-v".into(),
+            format!("{}:/workspace", fixture_dir.display()),
+        ];
+        for var in [
+            "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+            "LITEBOX_BROKER_TCP_CONN",
+            "LITEBOX_PE10_DIAG",
+            "LITEBOX_PE5_DIAG",
+            "LITEBOX_CLEANUP_DELAY_MS",
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                docker_args.push("-e".into());
+                docker_args.push(format!("{var}={val}"));
+            }
         }
-        Ok(())
-    }
-
-    /// Owned container that destroys itself on Drop.
-    pub(super) struct ContainerHandle {
-        name: String,
-        pub(super) ssh_port: u16,
-    }
-
-    impl ContainerHandle {
-        pub(super) fn spawn(
-            pass: &str,
-            scenario_id: &str,
-            mode: &str,
-            fixture_dir: &Path,
-            mount_workspace_src: bool,
-        ) -> Result<Self, String> {
-            let ws_root = super::workspace_root();
-            let bin_dir = super::debug_dir();
-            let pid = std::process::id();
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let name = format!("litebox-copilot-{pass}-{mode}-{scenario_id}-{pid}-{nanos}");
-
-            // CMD per pass.
-            let mut cmd = Command::new("docker");
-            cmd.arg("run").arg("-d");
-            if !super::keep_containers() {
-                cmd.arg("--rm");
-            }
-            cmd.args(["--name", &name])
-                .args(["--cap-add", "SYS_PTRACE"])
-                .args(["-p", "127.0.0.1:0:22"])
-                .arg("-v")
-                .arg(format!("{}:/opt/litebox:ro", bin_dir.display()))
-                .arg("-v")
-                .arg(format!("{}:/workspace", fixture_dir.display()));
-            // Forward selected LITEBOX_* env vars into the container.
-            for var in [
-                "LITEBOX_EAGER_BROKER_SOCKETPAIR",
-                "LITEBOX_BROKER_TCP_CONN",
-                "LITEBOX_PE10_DIAG",
-                "LITEBOX_PE5_DIAG",
-                "LITEBOX_CLEANUP_DELAY_MS",
-                "RUST_LOG",
-                "RUST_BACKTRACE",
-            ] {
-                if let Ok(val) = std::env::var(var) {
-                    cmd.args(["-e", &format!("{var}={val}")]);
-                }
-            }
-            if mount_workspace_src {
-                cmd.arg("-v")
-                    .arg(format!("{}:/workspace/litebox-src:ro", ws_root.display()));
-            }
-            cmd.arg(super::copilot_image_name());
-            match pass {
-                "native" => {
-                    cmd.args(["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"]);
-                }
-                "litebox" => {
-                    // Use `--ssh` (no `--ssh-command`) so litebox sets
-                    // up the host:22 → sandbox:22 port forward AND lets
-                    // the ssh client choose the per-session remote
-                    // command. `--record-baseline` is the unconstrained
-                    // audit-only mode (no policy file) — this iteration
-                    // is about validating Copilot under litebox, not
-                    // policy enforcement.
-                    cmd.args([
-                        "/opt/litebox/litebox_tool_executor",
-                        "--rootfs",
-                        "/",
-                        "--record-baseline",
-                        "--ssh",
-                        "--ssh-port",
-                        "22",
-                    ]);
-                }
-                _ => return Err(format!("unknown pass {pass}")),
-            }
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-
-            let out = cmd.output().map_err(|e| format!("docker run spawn: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "docker run failed (exit {}): {}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr)
-                ));
-            }
-
-            // Find the host port mapped to container port 22.
-            let port_out = Command::new("docker")
-                .args(["port", &name, "22"])
-                .output()
-                .map_err(|e| format!("docker port: {e}"))?;
-            if !port_out.status.success() {
-                let _ = Command::new("docker").args(["rm", "-f", &name]).output();
-                return Err(format!(
-                    "docker port {name} 22 failed: {}",
-                    String::from_utf8_lossy(&port_out.stderr)
-                ));
-            }
-            let mapping = String::from_utf8_lossy(&port_out.stdout);
-            let port = mapping
-                .lines()
-                .find_map(|l| {
-                    l.rsplit(':')
-                        .next()
-                        .and_then(|p| p.trim().parse::<u16>().ok())
-                })
-                .ok_or_else(|| format!("could not parse host port from `{mapping}`"))?;
-
-            Ok(ContainerHandle {
-                name,
-                ssh_port: port,
-            })
+        if mount_workspace_src {
+            docker_args.push("-v".into());
+            docker_args.push(format!("{}:/workspace/litebox-src:ro", ws_root.display()));
         }
-    }
-
-    impl Drop for ContainerHandle {
-        fn drop(&mut self) {
-            if super::keep_containers() {
-                return;
-            }
-            let _ = Command::new("docker")
-                .args(["rm", "-f", &self.name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        let command: Vec<String> = match pass {
+            "native" => vec![
+                "/usr/sbin/dropbear".into(),
+                "-F".into(),
+                "-E".into(),
+                "-B".into(),
+                "-R".into(),
+                "-p".into(),
+                "22".into(),
+            ],
+            "litebox" => vec![
+                "/opt/litebox/litebox_tool_executor".into(),
+                "--rootfs".into(),
+                "/".into(),
+                "--record-baseline".into(),
+                "--ssh".into(),
+                "--ssh-port".into(),
+                "22".into(),
+            ],
+            _ => panic!("unknown pass {pass}"),
+        };
+        super::framework::ContainerSpec {
+            image: super::copilot_image_name().to_string(),
+            docker_args,
+            command,
+            detached: true,
+            timeout_secs: None,
         }
     }
 
