@@ -1385,6 +1385,35 @@ impl<FS: ShimFS> Task<FS> {
                         if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
                             return Err(Errno::EINVAL);
                         }
+                        if crate::syscalls::broker_tcp_conn::broker_inet_tcp_conn_provider_outbound_enabled()
+                            && let Some(provider) =
+                                crate::syscalls::broker_tcp_conn::broker_tcp_conn_provider()
+                        {
+                            let mut status = OFlags::empty();
+                            status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                            let handle = provider
+                                .create(0)
+                                .map_err(super::broker_backed::broker_err_to_errno)?;
+                            let conn = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<
+                                Platform,
+                            >::new(provider, handle, status);
+                            let mut dt = self.global.litebox.descriptor_table_mut();
+                            let typed = dt
+                                .insert::<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                                    conn,
+                                );
+                            if flags.contains(SockFlags::CLOEXEC) {
+                                let old =
+                                    dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                                assert!(old.is_none());
+                            }
+                            drop(dt);
+                            let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                                Errno::EMFILE
+                            })?;
+                            return Ok(u32::try_from(raw_fd).unwrap());
+                        }
                         if let Some(provider) =
                             crate::syscalls::broker_inet_listener::broker_inet_listener_provider()
                         {

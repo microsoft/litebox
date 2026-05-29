@@ -27,6 +27,7 @@ use super::fork_snapshot::BrokerHandleKind;
 static BROKER_TCP_CONN_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerTcpConnProvider>> =
     once_cell::race::OnceBox::new();
 static BROKER_TCP_CONN_ACCEPT_ENABLED: AtomicBool = AtomicBool::new(false);
+static BROKER_INET_TCP_CONN_OUTBOUND_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_broker_tcp_conn_accept_enabled(enabled: bool) {
     BROKER_TCP_CONN_ACCEPT_ENABLED.store(enabled, Ordering::Release);
@@ -34,6 +35,14 @@ pub fn set_broker_tcp_conn_accept_enabled(enabled: bool) {
 
 pub fn broker_tcp_conn_accept_enabled() -> bool {
     BROKER_TCP_CONN_ACCEPT_ENABLED.load(Ordering::Acquire)
+}
+
+pub fn set_broker_inet_tcp_conn_provider_outbound_enabled(enabled: bool) {
+    BROKER_INET_TCP_CONN_OUTBOUND_ENABLED.store(enabled, Ordering::Release);
+}
+
+pub fn broker_inet_tcp_conn_provider_outbound_enabled() -> bool {
+    BROKER_INET_TCP_CONN_OUTBOUND_ENABLED.load(Ordering::Acquire)
 }
 
 pub fn set_broker_tcp_conn_provider(
@@ -140,8 +149,7 @@ impl BrokerTcpConnFd<Platform> {
                     Ok(bytes) => {
                         let n = bytes.len().min(buf.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
-                        if n == 0 {
-                        }
+                        if n == 0 {}
                         Ok(n)
                     }
                     Err(BrokerOpError::WouldBlock) => {

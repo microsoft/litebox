@@ -785,6 +785,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_shim_linux::syscalls::set_broker_tcp_conn_accept_enabled(
         broker_tcp_conn_accept_or_outbound_enabled(),
     );
+    litebox_shim_linux::syscalls::set_broker_inet_tcp_conn_provider_outbound_enabled(
+        broker_inet_tcp_enabled(),
+    );
 
     // Phase B-Step8c: if --fd-token-broker is supplied, connect to
     // the broker's fd-token control socket and register a
