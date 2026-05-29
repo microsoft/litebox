@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
-use crate::register_handler;
+use crate::{BinaryType, register_handler};
 
 use super::agents::AgentName;
 use super::registry::Registry;
@@ -15,6 +15,8 @@ const KIND_TYPEID_MATCH: HandlerToken<(), InvariantOut> =
     HandlerToken::new("invariants.kind_typeid_match");
 const BROKER_HANDLE_REFCOUNT: HandlerToken<(), InvariantOut> =
     HandlerToken::new("invariants.broker_handle_refcount");
+const GETIFADDRS_SANDBOX_VIEW: HandlerToken<(), GetifaddrsSandboxView> =
+    HandlerToken::new("invariants.getifaddrs_sandbox_view");
 
 const LITEBOX_IOCTL_KIND_TYPEID_INVARIANT: libc::c_ulong = 0x4c42_4901;
 
@@ -22,6 +24,18 @@ const LITEBOX_IOCTL_KIND_TYPEID_INVARIANT: libc::c_ulong = 0x4c42_4901;
 struct InvariantOut {
     ok: bool,
     detail: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct GetifaddrsEntry {
+    name: String,
+    addr: [u8; 4],
+    prefix: u8,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct GetifaddrsSandboxView {
+    entries: Vec<GetifaddrsEntry>,
 }
 
 struct Fd(i32);
@@ -118,6 +132,77 @@ async fn handle_kind_typeid_match(
         ok: rc == 0 && detail.starts_with("ok:"),
         detail,
     })
+}
+
+async fn handle_getifaddrs_sandbox_view(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<GetifaddrsSandboxView, HandlerError> {
+    let mut ifaddr: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `ifaddr` points to writable storage for libc to fill.
+    if unsafe { libc::getifaddrs(&raw mut ifaddr) } != 0 {
+        return Err(HandlerError(format!(
+            "getifaddrs: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let mut entries = Vec::new();
+    let mut ptr = ifaddr;
+    while !ptr.is_null() {
+        // SAFETY: `ptr` walks the list returned by getifaddrs until NULL.
+        let item = unsafe { &*ptr };
+        if !item.ifa_addr.is_null() {
+            // SAFETY: `ifa_addr` is non-null and points to a sockaddr.
+            let family = unsafe { (*item.ifa_addr).sa_family as i32 };
+            if family == libc::AF_INET {
+                // SAFETY: AF_INET implies sockaddr_in layout.
+                let sockaddr = unsafe { &*(item.ifa_addr.cast::<libc::sockaddr_in>()) };
+                let netmask = if item.ifa_netmask.is_null() {
+                    0
+                } else {
+                    // SAFETY: AF_INET entries carry an AF_INET netmask when present.
+                    let mask = unsafe { &*(item.ifa_netmask.cast::<libc::sockaddr_in>()) };
+                    u32::from_be(mask.sin_addr.s_addr).count_ones() as u8
+                };
+                // SAFETY: `ifa_name` is a NUL-terminated C string owned by libc.
+                let name = unsafe { std::ffi::CStr::from_ptr(item.ifa_name) }
+                    .to_string_lossy()
+                    .into_owned();
+                entries.push(GetifaddrsEntry {
+                    name,
+                    addr: sockaddr.sin_addr.s_addr.to_ne_bytes(),
+                    prefix: netmask,
+                });
+            }
+        }
+        ptr = item.ifa_next;
+    }
+    // SAFETY: `ifaddr` is the exact list returned by getifaddrs.
+    unsafe { libc::freeifaddrs(ifaddr) };
+
+    entries.sort_by(|a, b| a.name.cmp(&b.name).then(a.addr.cmp(&b.addr)));
+    Ok(GetifaddrsSandboxView { entries })
+}
+
+fn check_getifaddrs_sandbox_view(view: &GetifaddrsSandboxView) -> Result<String, String> {
+    let want = [
+        GetifaddrsEntry {
+            name: "eth0".into(),
+            addr: [10, 0, 0, 2],
+            prefix: 24,
+        },
+        GetifaddrsEntry {
+            name: "lo".into(),
+            addr: [127, 0, 0, 1],
+            prefix: 8,
+        },
+    ];
+    if view.entries == want {
+        Ok(format!("sandbox getifaddrs view: {:?}", view.entries))
+    } else {
+        Err(format!("unexpected getifaddrs view: {:?}", view.entries))
+    }
 }
 
 async fn handle_broker_handle_refcount(
@@ -236,6 +321,43 @@ async fn handle_broker_handle_refcount(
 pub(crate) fn register_invariant_tests(reg: &mut Registry<'_>) {
     register_handler!(KIND_TYPEID_MATCH, handle_kind_typeid_match);
     register_handler!(BROKER_HANDLE_REFCOUNT, handle_broker_handle_refcount);
+    register_handler!(GETIFADDRS_SANDBOX_VIEW, handle_getifaddrs_sandbox_view);
+    for &bt in BinaryType::ALL {
+        let id = format!("INV.getifaddrs_sandbox_view.{}.dpg1", bt.label());
+        reg.test("invariants", "getifaddrs_sandbox_view", id)
+            .timeout(60)
+            .build(|cx| {
+                let dpg1 = cx.require(AgentName::Dpg1);
+                let dpg2 = cx.require(AgentName::Dpg2);
+                Box::new(|run| {
+                    Box::pin(async move {
+                        let equality = run
+                            .assert_eq_across_agents(
+                                &dpg1,
+                                &dpg2,
+                                "getifaddrs sandbox view",
+                                &GETIFADDRS_SANDBOX_VIEW,
+                                (),
+                                (),
+                            )
+                            .await;
+                        if let Err(err) = equality {
+                            return super::TestOutcome::new("dpg1", false, err);
+                        }
+                        let result = run
+                            .send_named_typed(&dpg1, &GETIFADDRS_SANDBOX_VIEW, ())
+                            .await;
+                        match result {
+                            Ok(view) => match check_getifaddrs_sandbox_view(&view) {
+                                Ok(detail) => super::TestOutcome::new("dpg1", true, detail),
+                                Err(detail) => super::TestOutcome::new("dpg1", false, detail),
+                            },
+                            Err(err) => super::TestOutcome::new("dpg1", false, err),
+                        }
+                    })
+                })
+            });
+    }
     reg.single_agent_handler_test(
         "invariants",
         "broker_inet",

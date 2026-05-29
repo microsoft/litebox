@@ -5,8 +5,8 @@
 //!
 //! glibc's `getifaddrs()` creates an AF_NETLINK socket, sends
 //! `RTM_GETLINK` and `RTM_GETADDR` dump requests, and parses the
-//! responses. This module implements just enough of the netlink
-//! protocol to respond with a loopback interface (127.0.0.1/8).
+//! responses. This module implements the deterministic sandbox network
+//! view exposed to guests: loopback plus the virtual eth0 interface.
 
 use alloc::vec::Vec;
 
@@ -230,7 +230,7 @@ impl NetlinkRouteSocket {
     }
 
     fn append_link_eth0(&mut self, seq: u32) {
-        // ARPHRD_ETHER = 1, Docker-style MAC
+        // ARPHRD_ETHER = 1; keep the existing Docker-style guest MAC convention.
         self.append_link_msg(
             seq,
             1,
