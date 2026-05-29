@@ -127,6 +127,17 @@ where
 }
 
 impl BrokerInetListenerFd<Platform> {
+    pub(crate) fn setsockopt(
+        &self,
+        level: u32,
+        optname: u32,
+        optval: &[u8],
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
+        self.provider
+            .setsockopt(self.handle(), level, optname, optval)
+            .map_err(broker_err_to_errno)
+    }
+
     pub(crate) fn bind(
         &self,
         sockaddr: &[u8],

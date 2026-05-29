@@ -29,6 +29,7 @@ pub fn run(sub: &str) -> i32 {
         "ipv6-getaddrinfo" => test_ipv6_getaddrinfo(),
         "ipv6-v6only" => test_ipv6_v6only(),
         "ipv4-listen" => test_ipv4_listen(),
+        "ipv6-dual-accept" => test_ipv6_dual_accept(),
         other => {
             eprintln!("unknown net test: {other}");
             1
@@ -218,6 +219,72 @@ fn test_ipv6_listen() -> i32 {
     0
 }
 
+fn test_ipv6_dual_accept() -> i32 {
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        println!("NET7_SOCKET_FAIL");
+        return 1;
+    }
+    let v6only: libc::c_int = 0;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            (&raw const v6only).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as u32,
+        )
+    };
+    if ret < 0 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        println!("NET7_V6ONLY_FAIL:errno={e}");
+        return 1;
+    }
+    let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    addr.sin6_family = libc::AF_INET6 as u16;
+    addr.sin6_port = 0;
+    addr.sin6_addr = libc::in6_addr { s6_addr: [0; 16] };
+    if unsafe {
+        libc::bind(
+            fd,
+            (&raw const addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in6>() as u32,
+        )
+    } < 0
+    {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        println!("NET7_BIND_FAIL:errno={e}");
+        return 1;
+    }
+    if unsafe { libc::listen(fd, 16) } < 0 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        println!("NET7_LISTEN_FAIL:errno={e}");
+        return 1;
+    }
+    let mut bound: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+    unsafe { libc::getsockname(fd, (&raw mut bound).cast::<libc::sockaddr>(), &raw mut len) };
+    let port = u16::from_be(bound.sin6_port);
+    let client = std::thread::spawn(move || std::net::TcpStream::connect(("127.0.0.1", port)));
+    let accepted = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if accepted < 0 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        println!("NET7_ACCEPT_FAIL:errno={e}");
+        return 1;
+    }
+    unsafe { libc::close(accepted) };
+    match client.join().unwrap() {
+        Ok(_) => {
+            println!("NET7_OK:port={port}");
+            0
+        }
+        Err(e) => {
+            println!("NET7_CONNECT_FAIL:{e}");
+            1
+        }
+    }
+}
+
 /// NET4: IPv4 listen+connect baseline (should already work).
 fn test_ipv4_listen() -> i32 {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
@@ -304,6 +371,7 @@ pub(super) fn register_net_ipv6(reg: &mut Registry<'_>) {
         ("NET4.ipv4_listen", "ipv4-listen"),
         ("NET5.ipv6_getaddrinfo", "ipv6-getaddrinfo"),
         ("NET6.ipv6_v6only", "ipv6-v6only"),
+        ("NET7.ipv6_dual_accept", "ipv6-dual-accept"),
     ];
     for &(name, sub) in cases {
         for &bt in crate::BinaryType::ALL {

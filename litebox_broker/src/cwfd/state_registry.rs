@@ -61,7 +61,7 @@
 //! synchronization — the registry is just a table.
 
 use core::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(debug_assertions)]
 use std::string::{String, ToString as _};
 use std::sync::{Arc, Mutex};
@@ -486,6 +486,11 @@ struct State {
     next_id: u64,
     table: HashMap<u64, Entry>,
     broker_held_inet_listeners: HashMap<u16, u64>,
+    /// Ports already owned by the broker's `net_proxy` inbound forwarders.
+    /// Worker-side `bind(port)` requests for these ports use a virtual bind
+    /// (no host `bind()` call) because the broker already owns the host
+    /// listener and will deliver accepted streams via `accept_inbound`.
+    inbound_forwarded_ports: HashSet<u16>,
 }
 
 /// Snapshot of one live registry entry, for diagnostic dumps and
@@ -522,8 +527,24 @@ impl BrokerStateRegistry {
                 next_id: 1,
                 table: HashMap::new(),
                 broker_held_inet_listeners: HashMap::new(),
+                inbound_forwarded_ports: HashSet::new(),
             }),
         }
+    }
+
+    /// Records the set of guest ports that the broker's `net_proxy`
+    /// already owns inbound host listeners for. Workers that
+    /// `bind(port)` for these ports get a "virtual bind" (no host
+    /// `bind()` call) because the broker already accepts on the host
+    /// port and delivers accepted streams via `accept_inbound`.
+    pub fn add_inbound_forwarded_port(&self, port: u16) {
+        let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        s.inbound_forwarded_ports.insert(port);
+    }
+
+    pub fn is_inbound_forwarded(&self, port: u16) -> bool {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        s.inbound_forwarded_ports.contains(&port)
     }
 
     /// Returns the number of currently-registered handles.

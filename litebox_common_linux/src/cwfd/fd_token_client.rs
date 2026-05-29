@@ -32,18 +32,18 @@ use crate::fd_token_protocol::{
     build_deliver_signal_inbox_request, build_inet_listener_accept_request,
     build_inet_listener_bind_request, build_inet_listener_create_request,
     build_inet_listener_listen_request, build_inet_listener_query_events_request,
-    build_inet_raw_create_request, build_inet_raw_query_events_request,
-    build_inet_raw_recvfrom_request, build_inet_raw_sendto_request,
-    build_inet_tcp_conn_connect_request, build_inet_tcp_conn_create_request,
-    build_inet_tcp_conn_getpeername_request, build_inet_tcp_conn_getsockname_request,
-    build_inet_tcp_conn_getsockopt_request, build_inet_tcp_conn_query_events_request,
-    build_inet_tcp_conn_setsockopt_request, build_inotify_add_watch_request,
-    build_inotify_init1_request, build_inotify_read_request, build_inotify_rm_watch_request,
-    build_mark_process_exited_request, build_materialize_request, build_open_pty_slave_request,
-    build_pidfd_exited_request, build_poll_tcp_conn_events_request, build_pty_ioctl_request,
-    build_pty_read_request, build_pty_write_request, build_push_siginfo_request,
-    build_read_eventfd_request, build_read_pipe_request, build_read_siginfo_request,
-    build_read_socketpair_request, build_read_tcp_conn_request,
+    build_inet_listener_setsockopt_request, build_inet_raw_create_request,
+    build_inet_raw_query_events_request, build_inet_raw_recvfrom_request,
+    build_inet_raw_sendto_request, build_inet_tcp_conn_connect_request,
+    build_inet_tcp_conn_create_request, build_inet_tcp_conn_getpeername_request,
+    build_inet_tcp_conn_getsockname_request, build_inet_tcp_conn_getsockopt_request,
+    build_inet_tcp_conn_query_events_request, build_inet_tcp_conn_setsockopt_request,
+    build_inotify_add_watch_request, build_inotify_init1_request, build_inotify_read_request,
+    build_inotify_rm_watch_request, build_mark_process_exited_request, build_materialize_request,
+    build_open_pty_slave_request, build_pidfd_exited_request, build_poll_tcp_conn_events_request,
+    build_pty_ioctl_request, build_pty_read_request, build_pty_write_request,
+    build_push_siginfo_request, build_read_eventfd_request, build_read_pipe_request,
+    build_read_siginfo_request, build_read_socketpair_request, build_read_tcp_conn_request,
     build_register_notification_ring_request, build_register_process_request,
     build_register_request, build_release_request, build_set_pgid_request, build_set_sid_request,
     build_shutdown_socketpair_write_request, build_shutdown_tcp_conn_request,
@@ -1039,6 +1039,37 @@ impl FdTokenClient {
                 value: family as u64,
             }),
             s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    pub fn inet_listener_setsockopt(
+        &self,
+        handle_id: u64,
+        level: u32,
+        optname: u32,
+        optval: &[u8],
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_listener_setsockopt_request(handle_id, level, optname, optval),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetListenerSetSockOptResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: optname as u64,
+            }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }
     }
 

@@ -110,7 +110,7 @@ pub const BODY_MAX: u32 = 65536;
 /// | `0x60`–`0x6F`    | Pty state (Phase E)         |
 /// | `0x70`–`0x78`    | Process state (Phase G)     |
 /// | `0x79`–`0x7C`    | TCP conn data ops (BrokerTcpConn) |
-/// | `0x48`–`0x4C`    | Inet listener state (Phase A) |
+/// | `0x48`–`0x4D`    | Inet listener state (Phase A/F.2) |
 /// | `0x34`–`0x38`    | Inet TCP conn lifecycle/name ops |
 /// | `0x3C`–`0x3F`    | Inet raw socket state (Phase D) |
 ///
@@ -142,6 +142,7 @@ pub enum Opcode {
     InetListenerListen = 0x4A,
     InetListenerAccept = 0x4B,
     InetListenerQueryEvents = 0x4C,
+    InetListenerSetSockOpt = 0x4D,
     CreatePipe = 0x50,
     ReadPipe = 0x51,
     WritePipe = 0x52,
@@ -243,6 +244,7 @@ pub enum Opcode {
     InetListenerListenResponse = 0xCA,
     InetListenerAcceptResponse = 0xCB,
     InetListenerQueryEventsResponse = 0xCC,
+    InetListenerSetSockOptResponse = 0xCD,
     CreatePipeResponse = 0xD0,
     ReadPipeResponse = 0xD1,
     WritePipeResponse = 0xD2,
@@ -433,6 +435,7 @@ impl Opcode {
             Opcode::InetListenerListen => Some(Opcode::InetListenerListenResponse),
             Opcode::InetListenerAccept => Some(Opcode::InetListenerAcceptResponse),
             Opcode::InetListenerQueryEvents => Some(Opcode::InetListenerQueryEventsResponse),
+            Opcode::InetListenerSetSockOpt => Some(Opcode::InetListenerSetSockOptResponse),
             Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
             Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
             Opcode::WritePipe => Some(Opcode::WritePipeResponse),
@@ -521,6 +524,7 @@ impl Opcode {
                 | Opcode::InetListenerListen
                 | Opcode::InetListenerAccept
                 | Opcode::InetListenerQueryEvents
+                | Opcode::InetListenerSetSockOpt
                 | Opcode::CreatePipe
                 | Opcode::ReadPipe
                 | Opcode::WritePipe
@@ -620,6 +624,7 @@ impl TryFrom<u8> for Opcode {
             0x4A => Ok(Opcode::InetListenerListen),
             0x4B => Ok(Opcode::InetListenerAccept),
             0x4C => Ok(Opcode::InetListenerQueryEvents),
+            0x4D => Ok(Opcode::InetListenerSetSockOpt),
             0x50 => Ok(Opcode::CreatePipe),
             0x51 => Ok(Opcode::ReadPipe),
             0x52 => Ok(Opcode::WritePipe),
@@ -696,6 +701,7 @@ impl TryFrom<u8> for Opcode {
             0xCA => Ok(Opcode::InetListenerListenResponse),
             0xCB => Ok(Opcode::InetListenerAcceptResponse),
             0xCC => Ok(Opcode::InetListenerQueryEventsResponse),
+            0xCD => Ok(Opcode::InetListenerSetSockOptResponse),
             0xD0 => Ok(Opcode::CreatePipeResponse),
             0xD1 => Ok(Opcode::ReadPipeResponse),
             0xD2 => Ok(Opcode::WritePipeResponse),
@@ -2281,6 +2287,44 @@ pub fn parse_inet_listener_accept_response_ok(
     Ok((handle, peer))
 }
 
+/// Body for [`Opcode::InetListenerSetSockOpt`]: handle, level, optname, optval.
+pub fn build_inet_listener_setsockopt_request(
+    handle_id: u64,
+    level: u32,
+    optname: u32,
+    optval: &[u8],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24 + optval.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&level.to_le_bytes());
+    body.extend_from_slice(&optname.to_le_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(optval.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(optval);
+    OwnedFrame {
+        opcode: Opcode::InetListenerSetSockOpt,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_listener_setsockopt_body(
+    body: &[u8],
+) -> Result<(u64, u32, u32, Vec<u8>), ProtocolError> {
+    parse_sockopt_set_body(body, Opcode::InetListenerSetSockOpt)
+}
+
+pub fn build_inet_listener_setsockopt_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetListenerSetSockOptResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
 /// Body for [`Opcode::InetListenerQueryEvents`]: handle id.
 pub fn build_inet_listener_query_events_request(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
@@ -3123,9 +3167,16 @@ pub fn build_inet_tcp_conn_setsockopt_request(
 pub fn parse_inet_tcp_conn_setsockopt_body(
     body: &[u8],
 ) -> Result<(u64, u32, u32, Vec<u8>), ProtocolError> {
+    parse_sockopt_set_body(body, Opcode::InetTcpConnSetSockOpt)
+}
+
+fn parse_sockopt_set_body(
+    body: &[u8],
+    opcode: Opcode,
+) -> Result<(u64, u32, u32, Vec<u8>), ProtocolError> {
     if body.len() < 24 {
         return Err(ProtocolError::WrongBodyLen {
-            opcode: Opcode::InetTcpConnSetSockOpt,
+            opcode,
             got: body.len(),
             want: 24,
         });
@@ -3140,7 +3191,7 @@ pub fn parse_inet_tcp_conn_setsockopt_body(
     }
     if body.len() != 24 + len {
         return Err(ProtocolError::WrongBodyLen {
-            opcode: Opcode::InetTcpConnSetSockOpt,
+            opcode,
             got: body.len(),
             want: 24 + len,
         });
