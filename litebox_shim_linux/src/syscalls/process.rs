@@ -2176,7 +2176,7 @@ impl<FS: ShimFS> Task<FS> {
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
                         ),
-                        inet6_fds: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
+                        inet6_fds: core::cell::RefCell::new(self.inet6_fds.borrow().clone()),
                     },
                 }),
             )
@@ -2960,7 +2960,7 @@ impl<FS: ShimFS> Task<FS> {
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
                         ),
-                        inet6_fds: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
+                        inet6_fds: core::cell::RefCell::new(self.inet6_fds.borrow().clone()),
                     },
                 }),
             )
@@ -8596,7 +8596,10 @@ impl<FS: ShimFS> Task<FS> {
         match super::guest_pid::try_broker_set_sid(self.process_id.0) {
             Ok(_) => {}
             Err(litebox_common_linux::guest_pid_provider::GuestPidProviderError::UnknownHandle) => {
-                return Err(Errno::ESRCH);
+                log_unsupported!(
+                    "broker SetSid missing pid {}; applying local setsid only",
+                    self.process_id.0
+                );
             }
             Err(litebox_common_linux::guest_pid_provider::GuestPidProviderError::NotPermitted) => {
                 return Err(Errno::EPERM);

@@ -3144,6 +3144,9 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
+        if let Ok(raw_fd_u32) = u32::try_from(raw_fd) {
+            self.inet6_fds.borrow_mut().remove(&raw_fd_u32);
+        }
         let files = self.files.borrow();
         if let Some(state) = files.remove_inotify_fd(raw_fd) {
             self.global
@@ -8606,6 +8609,11 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
         files.duplicate_inotify_fd(file, new_fd);
+        if let (Ok(source), Ok(duplicated)) = (u32::try_from(file), u32::try_from(new_fd))
+            && self.inet6_fds.borrow().contains(&source)
+        {
+            self.inet6_fds.borrow_mut().insert(duplicated);
+        }
         Ok(new_fd)
     }
 

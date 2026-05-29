@@ -5584,7 +5584,7 @@ mod test_utils {
                 local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
-                inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
+                inet6_fds: RefCell::new(self.inet6_fds.borrow().clone()),
             };
             Some(task)
         }
