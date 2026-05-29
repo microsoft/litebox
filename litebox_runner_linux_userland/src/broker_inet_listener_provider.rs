@@ -77,6 +77,18 @@ impl BrokerInetListenerProvider for RunnerBrokerInetListenerProvider {
             .map_err(client_err_to_broker_err)
     }
 
+    fn setsockopt(
+        &self,
+        handle: u64,
+        level: u32,
+        optname: u32,
+        optval: &[u8],
+    ) -> Result<(), BrokerOpError> {
+        self.client
+            .inet_listener_setsockopt(handle, level, optname, optval)
+            .map_err(client_err_to_broker_err)
+    }
+
     fn bind(&self, handle: u64, sockaddr: &[u8]) -> Result<[u8; 28], BrokerOpError> {
         self.client
             .inet_listener_bind(handle, sockaddr)

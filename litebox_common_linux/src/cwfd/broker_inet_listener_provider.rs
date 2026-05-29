@@ -13,6 +13,15 @@ pub trait BrokerInetListenerProvider: BrokerSubscribable {
     /// Creates a broker-hosted TCP listener placeholder for `family` (0=v4, 1=v6).
     fn create(&self, family: u8) -> Result<u64, BrokerOpError>;
 
+    /// Applies a socket option before bind/listen where the host requires it.
+    fn setsockopt(
+        &self,
+        handle: u64,
+        level: u32,
+        optname: u32,
+        optval: &[u8],
+    ) -> Result<(), BrokerOpError>;
+
     /// Binds a broker-hosted listener and returns the actual bound address.
     fn bind(&self, handle: u64, sockaddr: &[u8]) -> Result<[u8; 28], BrokerOpError>;
 
