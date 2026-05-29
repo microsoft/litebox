@@ -1,11 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+pub(crate) mod registry;
+
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+use crate::nt_types;
 
 const FIRST_STACK_ARGUMENT_OFFSET: usize = 0x28;
 const HANDLE_SHIFT: u32 = 2;
@@ -78,11 +82,21 @@ impl ProcessHandle {
     }
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
-    NtTerminateProcess {
-        process_handle: ProcessHandle,
-        exit_status: i32,
+    NtOpenKey {
+        key_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtQueryValueKey {
+        key_handle: Handle,
+        value_name: Platform::RawConstPointer<nt_types::UnicodeString>,
+        key_value_information_class: u32,
+        key_value_information: Platform::RawMutPointer<u8>,
+        length: u32,
+        result_length: Platform::RawMutPointer<u32>,
     },
     NtAllocateVirtualMemory {
         process_handle: ProcessHandle,
@@ -91,6 +105,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         region_size: Platform::RawMutPointer<usize>,
         allocation_type: u32,
         protect: u32,
+    },
+    NtTerminateProcess {
+        process_handle: ProcessHandle,
+        exit_status: i32,
     },
 }
 
@@ -115,9 +133,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         }
 
         match NtSysno::from_raw(pt_regs.orig_rax)? {
-            NtSysno::NtTerminateProcess => Some(sys_req!(NtTerminateProcess {
-                process_handle: { ProcessHandle::from_raw },
-                exit_status,
+            NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
+                key_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtQueryValueKey => Some(sys_req!(NtQueryValueKey {
+                key_handle:{Handle::from_raw},
+                value_name:*,
+                key_value_information_class,
+                key_value_information:*,
+                length,
+                result_length:*,
             })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },
@@ -126,6 +153,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 region_size:*,
                 allocation_type,
                 protect,
+            })),
+            NtSysno::NtTerminateProcess => Some(sys_req!(NtTerminateProcess {
+                process_handle: { ProcessHandle::from_raw },
+                exit_status,
             })),
             _ => None,
         }
