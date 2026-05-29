@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
+pub mod broker_inet_dgram_provider;
 pub mod broker_inet_listener_provider;
 pub mod broker_inotify_provider;
 pub mod broker_pgrp_signal_provider;
@@ -3390,6 +3391,10 @@ fn broker_inet_tcp_enabled() -> bool {
     env_flag_enabled("LITEBOX_BROKER_INET_TCP")
 }
 
+fn broker_inet_udp_enabled() -> bool {
+    env_flag_enabled("LITEBOX_BROKER_INET_UDP")
+}
+
 fn broker_tcp_conn_accept_or_outbound_enabled() -> bool {
     env_flag_enabled("LITEBOX_BROKER_TCP_CONN") || broker_inet_tcp_enabled()
 }
@@ -3446,6 +3451,17 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_socketpair_provider(socketpair_provider)
         .map_err(|_| anyhow!("socketpair provider already set"))?;
+
+    if broker_inet_udp_enabled() {
+        let inet_dgram_provider = Arc::new(
+            crate::broker_inet_dgram_provider::RunnerBrokerInetDgramProvider::new(
+                Arc::clone(&client),
+                Arc::clone(&dispatcher),
+            ),
+        );
+        litebox_shim_linux::syscalls::set_broker_inet_dgram_provider(inet_dgram_provider)
+            .map_err(|_| anyhow!("inet dgram provider already set"))?;
+    }
 
     if broker_tcp_conn_accept_or_outbound_enabled() {
         let tcp_conn_provider = Arc::new(
