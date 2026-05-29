@@ -855,10 +855,8 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
         let mut heki_patch = HekiPatch::new_zeroed();
         let heki_patch_bytes = heki_patch.as_mut_bytes();
         let pages = [
-            PhysPageAddr::<PAGE_SIZE>::new(
-                patch_pa_0.align_down(Size4KiB::SIZE).as_u64().trunc(),
-            )
-            .ok_or(VsmError::Vtl0CopyFailed)?,
+            PhysPageAddr::<PAGE_SIZE>::new(patch_pa_0.align_down(Size4KiB::SIZE).as_u64().trunc())
+                .ok_or(VsmError::Vtl0CopyFailed)?,
             PhysPageAddr::<PAGE_SIZE>::new(patch_pa_1.as_u64().trunc())
                 .ok_or(VsmError::Vtl0CopyFailed)?,
         ];
@@ -913,10 +911,7 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
     } else {
         let pages = [
             PhysPageAddr::<PAGE_SIZE>::new(
-                heki_patch_pa_0
-                    .align_down(Size4KiB::SIZE)
-                    .as_u64()
-                    .trunc(),
+                heki_patch_pa_0.align_down(Size4KiB::SIZE).as_u64().trunc(),
             )
             .ok_or(VsmError::Vtl0CopyFailed)?,
             PhysPageAddr::<PAGE_SIZE>::new(heki_patch_pa_1.as_u64().trunc())
@@ -965,11 +960,9 @@ fn mshv_vsm_set_platform_root_key(key_pa: u64) -> Result<i64, VsmError> {
     let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
 
     let mut keybuf = Zeroizing::new([0u8; PRK_LEN]);
-    let mut key_ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-        key_pa.as_u64().trunc(),
-        PRK_LEN,
-    )
-    .map_err(|_| VsmError::Vtl0CopyFailed)?;
+    let mut key_ptr =
+        Vtl0PhysConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(key_pa.as_u64().trunc(), PRK_LEN)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
     unsafe { key_ptr.read_slice_at_offset(0, &mut *keybuf) }
         .map_err(|_| VsmError::Vtl0CopyFailed)?;
     set_platform_root_key(&*keybuf);
