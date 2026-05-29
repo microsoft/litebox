@@ -8596,10 +8596,7 @@ impl<FS: ShimFS> Task<FS> {
         match super::guest_pid::try_broker_set_sid(self.process_id.0) {
             Ok(_) => {}
             Err(litebox_common_linux::guest_pid_provider::GuestPidProviderError::UnknownHandle) => {
-                log_unsupported!(
-                    "broker SetSid missing pid {}; applying local setsid only",
-                    self.process_id.0
-                );
+                return Err(Errno::ESRCH);
             }
             Err(litebox_common_linux::guest_pid_provider::GuestPidProviderError::NotPermitted) => {
                 return Err(Errno::EPERM);
