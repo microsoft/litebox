@@ -167,6 +167,34 @@ impl BrokerTcpConnFd<Platform> {
             .map_err(broker_err_to_errno)
     }
 
+    pub(crate) fn try_read_now(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        const READ_TCP_CONN_CHUNK: usize = 60 * 1024;
+        let capped_len = core::cmp::min(buf.len(), READ_TCP_CONN_CHUNK);
+        match self
+            .provider
+            .read_tcp_conn(self.handle(), capped_len as u64)
+        {
+            Ok(bytes) => {
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            Err(BrokerOpError::WouldBlock) => Err(Errno::EAGAIN),
+            Err(e) => Err(broker_err_to_errno(e)),
+        }
+    }
+
+    pub(crate) fn try_write_now(&self, buf: &[u8]) -> Result<usize, Errno> {
+        const WRITE_TCP_CONN_CHUNK: usize = 60 * 1024;
+        let chunk = &buf[..core::cmp::min(buf.len(), WRITE_TCP_CONN_CHUNK)];
+        match self.provider.write_tcp_conn(self.handle(), chunk) {
+            Ok(n) => Ok(n),
+            Err(BrokerOpError::WouldBlock) => Err(Errno::EAGAIN),
+            Err(BrokerOpError::InvalidValue) => Err(Errno::EPIPE),
+            Err(e) => Err(broker_err_to_errno(e)),
+        }
+    }
+
     pub(crate) fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -179,28 +207,12 @@ impl BrokerTcpConnFd<Platform> {
             return Ok(0);
         }
         self.common.ensure_subscribed(&self.pollee);
-        const READ_TCP_CONN_CHUNK: usize = 60 * 1024;
-        let capped_len = core::cmp::min(buf.len(), READ_TCP_CONN_CHUNK);
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
-            .wait(cx, nonblock, Events::IN, || {
-                match self
-                    .provider
-                    .read_tcp_conn(self.handle(), capped_len as u64)
-                {
-                    Ok(bytes) => {
-                        let n = bytes.len().min(buf.len());
-                        buf[..n].copy_from_slice(&bytes[..n]);
-                        if n == 0 {}
-                        Ok(n)
-                    }
-                    Err(BrokerOpError::WouldBlock) => {
-                        Err(litebox::event::polling::TryOpError::TryAgain)
-                    }
-                    Err(e) => Err(litebox::event::polling::TryOpError::Other(
-                        broker_err_to_errno(e),
-                    )),
-                }
+            .wait(cx, nonblock, Events::IN, || match self.try_read_now(buf) {
+                Ok(n) => Ok(n),
+                Err(Errno::EAGAIN) => Err(litebox::event::polling::TryOpError::TryAgain),
+                Err(e) => Err(litebox::event::polling::TryOpError::Other(e)),
             })
             .map_err(|e| match e {
                 litebox::event::polling::TryOpError::TryAgain => Errno::EAGAIN,
@@ -217,22 +229,13 @@ impl BrokerTcpConnFd<Platform> {
             return Err(Errno::EPIPE);
         }
         self.common.ensure_subscribed(&self.pollee);
-        const WRITE_TCP_CONN_CHUNK: usize = 60 * 1024;
-        let chunk = &buf[..core::cmp::min(buf.len(), WRITE_TCP_CONN_CHUNK)];
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::OUT, || {
-                match self.provider.write_tcp_conn(self.handle(), chunk) {
+                match self.try_write_now(buf) {
                     Ok(n) => Ok(n),
-                    Err(BrokerOpError::WouldBlock) => {
-                        Err(litebox::event::polling::TryOpError::TryAgain)
-                    }
-                    Err(BrokerOpError::InvalidValue) => {
-                        Err(litebox::event::polling::TryOpError::Other(Errno::EPIPE))
-                    }
-                    Err(e) => Err(litebox::event::polling::TryOpError::Other(
-                        broker_err_to_errno(e),
-                    )),
+                    Err(Errno::EAGAIN) => Err(litebox::event::polling::TryOpError::TryAgain),
+                    Err(e) => Err(litebox::event::polling::TryOpError::Other(e)),
                 }
             })
             .map_err(|e| match e {

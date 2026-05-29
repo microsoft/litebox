@@ -955,7 +955,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
-    fn send_listen_route_transfer(&self, port: u16) -> Result<(), Errno> {
+    pub(super) fn send_listen_route_transfer(&self, port: u16) -> Result<(), Errno> {
         self.platform
             .send_port_listen_transfer(port)
             .map_err(|_| Errno::EIO)
@@ -1174,6 +1174,18 @@ impl<FS: ShimFS> GlobalState<FS> {
         raw_fd: u32,
         files: &core::cell::RefCell<Arc<crate::syscalls::file::FilesState<FS>>>,
     ) -> Option<Arc<NetworkProxy<Platform>>> {
+        {
+            let files_ref = files.borrow();
+            let rds = files_ref.raw_descriptor_store.read();
+            if rds
+                .fd_from_raw_integer::<crate::syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(
+                    raw_fd as usize,
+                )
+                .is_ok()
+            {
+                return None;
+            }
+        }
         files
             .borrow()
             .with_socket(
@@ -2513,24 +2525,10 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Get the local port for an INET socket. Returns None if not bound.
     pub(super) fn do_getsockname_inet_port(&self, sockfd: u32) -> Option<u16> {
-        self.files
-            .borrow()
-            .with_socket(
-                &self.global,
-                sockfd,
-                |fd| {
-                    Ok(self
-                        .global
-                        .net
-                        .lock()
-                        .get_local_addr(fd)
-                        .ok()
-                        .map(|a| a.port()))
-                },
-                |_| Ok(None),
-            )
+        self.do_getsockname(sockfd)
             .ok()
-            .flatten()
+            .and_then(SocketAddress::inet)
+            .map(|addr| addr.port())
     }
 
     /// Handle syscall `shutdown`
@@ -2953,9 +2951,28 @@ impl<FS: ShimFS> Task<FS> {
                             // Broker socketpairs are not broker-token-transferable over SCM yet.
                             Ok(false)
                         }
-                        crate::RawFdRef::BrokerTcpConn(_) => {
-                            // Broker TCP connections are not broker-token-transferable over SCM yet.
-                            Ok(false)
+                        crate::RawFdRef::BrokerTcpConn(typed) => {
+                            let entry_handle = dt
+                                .entry_handle::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(typed)
+                                .ok_or(Errno::EBADF)?;
+                            let (handle_id, provider) = entry_handle.with_entry(|e| {
+                                (
+                                    e.handle(),
+                                    super::broker_tcp_conn::broker_tcp_conn_provider(),
+                                )
+                            });
+                            let Some(provider) = provider else {
+                                return Ok(false);
+                            };
+                            provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                            passed_tokens.push(
+                                litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::TcpSocket,
+                                    handle_id,
+                                )
+                                .map_err(|_| Errno::EINVAL)?,
+                            );
+                            Ok(true)
                         }
                         crate::RawFdRef::BrokerPty(_) => {
                             // Broker ptys are not broker-token-transferable over SCM yet.
@@ -3639,7 +3656,46 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                     }
-                    SubsystemTag::TcpSocket | SubsystemTag::Process | SubsystemTag::Unknown(_) => {
+                    SubsystemTag::TcpSocket => {
+                        let Some(provider) = super::broker_tcp_conn::broker_tcp_conn_provider()
+                        else {
+                            continue;
+                        };
+                        let handle_id = token.id();
+                        if provider.dup_handle(handle_id).is_err() {
+                            continue;
+                        }
+                        let status_flags = litebox::fs::OFlags::empty();
+                        let conn = super::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+                            provider,
+                            handle_id,
+                            status_flags,
+                        );
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed =
+                            dt.insert::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(conn);
+                        if cloexec {
+                            let _ = dt.set_fd_metadata(
+                                &typed,
+                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                            );
+                        }
+                        drop(dt);
+                        let files = self.files.borrow();
+                        match files.insert_raw_fd(typed) {
+                            Ok(raw_fd) => {
+                                installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                            }
+                            Err(typed) => {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .remove(&typed)
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    SubsystemTag::Process | SubsystemTag::Unknown(_) => {
                         // Unsupported token kind on this worker; drop.
                     }
                     SubsystemTag::Pidfd
