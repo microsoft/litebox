@@ -109,8 +109,9 @@ pub const BODY_MAX: u32 = 65536;
 /// | `0x50`–`0x5F`    | Pipe state (Phase C)        |
 /// | `0x60`–`0x6F`    | Pty state (Phase E)         |
 /// | `0x70`–`0x78`    | Process state (Phase G)     |
-/// | `0x79`–`0x7C`    | TCP conn state (BrokerTcpConn) |
+/// | `0x79`–`0x7C`    | TCP conn data ops (BrokerTcpConn) |
 /// | `0x48`–`0x4C`    | Inet listener state (Phase A) |
+/// | `0x34`–`0x38`    | Inet TCP conn lifecycle/name ops |
 ///
 /// Within a kind's range, follow the eventfd template:
 /// `0xN0` = create, `0xN1` = read-like primary op, `0xN2` = write-like
@@ -147,6 +148,11 @@ pub enum Opcode {
     ReadSocketPair = 0x31,
     WriteSocketPair = 0x32,
     ShutdownSocketPairWrite = 0x33,
+    InetTcpConnCreate = 0x34,
+    InetTcpConnConnect = 0x35,
+    InetTcpConnQueryEvents = 0x36,
+    InetTcpConnGetSockName = 0x37,
+    InetTcpConnGetPeerName = 0x38,
     CreatePty = 0x60,
     OpenPtySlave = 0x65,
     PtyRead = 0x61,
@@ -226,6 +232,11 @@ pub enum Opcode {
     ReadSocketPairResponse = 0xB1,
     WriteSocketPairResponse = 0xB2,
     ShutdownSocketPairWriteResponse = 0xB3,
+    InetTcpConnCreateResponse = 0xB4,
+    InetTcpConnConnectResponse = 0xB5,
+    InetTcpConnQueryEventsResponse = 0xB6,
+    InetTcpConnGetSockNameResponse = 0xB7,
+    InetTcpConnGetPeerNameResponse = 0xB8,
     CreatePtyResponse = 0xE0,
     OpenPtySlaveResponse = 0xE5,
     PtyReadResponse = 0xE1,
@@ -266,7 +277,7 @@ pub mod opcode_ranges {
     pub const PIDFD_BASE: u8 = 0x20;
     pub const PIDFD_RESPONSE_BASE: u8 = 0xA0;
 
-    /// UnixSocket state (P2.A): create / sendmsg / recvmsg / shutdown / subscribe.
+    /// Socket-pair state (P2.A), with 0x34-0x38 used by Inet TCP lifecycle/name ops.
     pub const UNIX_SOCKET_BASE: u8 = 0x30;
     pub const UNIX_SOCKET_RESPONSE_BASE: u8 = 0xB0;
 
@@ -291,9 +302,13 @@ pub mod opcode_ranges {
     pub const INET_LISTENER_BASE: u8 = 0x48;
     pub const INET_LISTENER_RESPONSE_BASE: u8 = 0xC8;
 
-    /// Connected TCP state: read / write / shutdown / poll-events.
+    /// Connected TCP data ops: read / write / shutdown / poll-events.
     pub const TCP_CONN_BASE: u8 = 0x79;
     pub const TCP_CONN_RESPONSE_BASE: u8 = 0xF9;
+
+    /// Inet TCP lifecycle/name ops: create / connect / query-events / getsockname / getpeername.
+    pub const INET_TCP_CONN_BASE: u8 = 0x34;
+    pub const INET_TCP_CONN_RESPONSE_BASE: u8 = 0xB4;
 }
 
 /// Endpoint side for a broker-hosted PTY handle.
@@ -382,6 +397,11 @@ impl Opcode {
             Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
             Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
             Opcode::ShutdownSocketPairWrite => Some(Opcode::ShutdownSocketPairWriteResponse),
+            Opcode::InetTcpConnCreate => Some(Opcode::InetTcpConnCreateResponse),
+            Opcode::InetTcpConnConnect => Some(Opcode::InetTcpConnConnectResponse),
+            Opcode::InetTcpConnQueryEvents => Some(Opcode::InetTcpConnQueryEventsResponse),
+            Opcode::InetTcpConnGetSockName => Some(Opcode::InetTcpConnGetSockNameResponse),
+            Opcode::InetTcpConnGetPeerName => Some(Opcode::InetTcpConnGetPeerNameResponse),
             Opcode::CreatePty => Some(Opcode::CreatePtyResponse),
             Opcode::OpenPtySlave => Some(Opcode::OpenPtySlaveResponse),
             Opcode::PtyRead => Some(Opcode::PtyReadResponse),
@@ -448,6 +468,11 @@ impl Opcode {
                 | Opcode::ReadSocketPair
                 | Opcode::WriteSocketPair
                 | Opcode::ShutdownSocketPairWrite
+                | Opcode::InetTcpConnCreate
+                | Opcode::InetTcpConnConnect
+                | Opcode::InetTcpConnQueryEvents
+                | Opcode::InetTcpConnGetSockName
+                | Opcode::InetTcpConnGetPeerName
                 | Opcode::CreatePty
                 | Opcode::OpenPtySlave
                 | Opcode::PtyRead
@@ -525,6 +550,11 @@ impl TryFrom<u8> for Opcode {
             0x31 => Ok(Opcode::ReadSocketPair),
             0x32 => Ok(Opcode::WriteSocketPair),
             0x33 => Ok(Opcode::ShutdownSocketPairWrite),
+            0x34 => Ok(Opcode::InetTcpConnCreate),
+            0x35 => Ok(Opcode::InetTcpConnConnect),
+            0x36 => Ok(Opcode::InetTcpConnQueryEvents),
+            0x37 => Ok(Opcode::InetTcpConnGetSockName),
+            0x38 => Ok(Opcode::InetTcpConnGetPeerName),
             0x60 => Ok(Opcode::CreatePty),
             0x65 => Ok(Opcode::OpenPtySlave),
             0x61 => Ok(Opcode::PtyRead),
@@ -579,6 +609,11 @@ impl TryFrom<u8> for Opcode {
             0xB1 => Ok(Opcode::ReadSocketPairResponse),
             0xB2 => Ok(Opcode::WriteSocketPairResponse),
             0xB3 => Ok(Opcode::ShutdownSocketPairWriteResponse),
+            0xB4 => Ok(Opcode::InetTcpConnCreateResponse),
+            0xB5 => Ok(Opcode::InetTcpConnConnectResponse),
+            0xB6 => Ok(Opcode::InetTcpConnQueryEventsResponse),
+            0xB7 => Ok(Opcode::InetTcpConnGetSockNameResponse),
+            0xB8 => Ok(Opcode::InetTcpConnGetPeerNameResponse),
             0xE0 => Ok(Opcode::CreatePtyResponse),
             0xE5 => Ok(Opcode::OpenPtySlaveResponse),
             0xE1 => Ok(Opcode::PtyReadResponse),
@@ -2543,6 +2578,195 @@ pub fn build_shutdown_socketpair_write_response_ok() -> OwnedFrame {
 // =====================================================================
 // BrokerTcpConn wire format.
 // =====================================================================
+
+/// Body for [`Opcode::InetTcpConnCreate`]: family (u8: 0=v4, 1=v6) + reserved (7 bytes).
+pub fn build_inet_tcp_conn_create_request(family: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.push(family);
+    body.extend_from_slice(&[0u8; 7]);
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnCreate,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_tcp_conn_create_body(body: &[u8]) -> Result<u8, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnCreate,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[1..8].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok(body[0])
+}
+
+pub fn build_inet_tcp_conn_create_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnCreateResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_tcp_conn_create_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetTcpConnCreateResponse)
+}
+
+/// Body for [`Opcode::InetTcpConnConnect`]: handle id + 28-byte sockaddr_storage + timeout_ms.
+pub fn build_inet_tcp_conn_connect_request(
+    handle_id: u64,
+    sockaddr: &[u8],
+    timeout_ms: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(40);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    let mut addr = [0u8; 28];
+    let n = core::cmp::min(sockaddr.len(), addr.len());
+    addr[..n].copy_from_slice(&sockaddr[..n]);
+    body.extend_from_slice(&addr);
+    body.extend_from_slice(&timeout_ms.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnConnect,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_tcp_conn_connect_body(
+    body: &[u8],
+) -> Result<(u64, [u8; 28], u32), ProtocolError> {
+    if body.len() != 40 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnConnect,
+            got: body.len(),
+            want: 40,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(&body[8..36]);
+    let timeout_ms = u32::from_le_bytes(body[36..40].try_into().unwrap());
+    Ok((handle, sockaddr, timeout_ms))
+}
+
+pub fn build_inet_tcp_conn_connect_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnConnectResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::InetTcpConnQueryEvents`]: handle id.
+pub fn build_inet_tcp_conn_query_events_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnQueryEvents,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_tcp_conn_query_events_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetTcpConnQueryEvents)
+}
+
+pub fn build_inet_tcp_conn_query_events_response_ok(events: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnQueryEventsResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: events.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_tcp_conn_query_events_response_ok(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetTcpConnQueryEventsResponse,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes(body[0..4].try_into().unwrap()))
+}
+
+pub fn build_inet_tcp_conn_getsockname_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnGetSockName,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_tcp_conn_getsockname_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetTcpConnGetSockName)
+}
+
+pub fn build_inet_tcp_conn_getsockname_response_ok(sockaddr: &[u8; 28]) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnGetSockNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: sockaddr.to_vec(),
+    }
+}
+
+pub fn parse_inet_tcp_conn_getsockname_response_ok(body: &[u8]) -> Result<[u8; 28], ProtocolError> {
+    parse_inet_tcp_sockaddr_response(body, Opcode::InetTcpConnGetSockNameResponse)
+}
+
+pub fn build_inet_tcp_conn_getpeername_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnGetPeerName,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_tcp_conn_getpeername_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetTcpConnGetPeerName)
+}
+
+pub fn build_inet_tcp_conn_getpeername_response_ok(sockaddr: &[u8; 28]) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetTcpConnGetPeerNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: sockaddr.to_vec(),
+    }
+}
+
+pub fn parse_inet_tcp_conn_getpeername_response_ok(body: &[u8]) -> Result<[u8; 28], ProtocolError> {
+    parse_inet_tcp_sockaddr_response(body, Opcode::InetTcpConnGetPeerNameResponse)
+}
+
+fn parse_inet_tcp_sockaddr_response(
+    body: &[u8],
+    opcode: Opcode,
+) -> Result<[u8; 28], ProtocolError> {
+    if body.len() != 28 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            got: body.len(),
+            want: 28,
+        });
+    }
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(body);
+    Ok(sockaddr)
+}
 
 pub fn build_read_tcp_conn_request(handle_id: u64, max_len: u64) -> OwnedFrame {
     let mut body = Vec::with_capacity(16);
