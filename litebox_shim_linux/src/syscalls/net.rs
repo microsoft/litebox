@@ -40,6 +40,10 @@ use crate::{
     syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr},
 };
 
+/// Linux's hard cap on the number of iovecs per `*msg`-style call, and on the
+/// number of entries per `*mmsg`-style call. See `UIO_MAXIOV` in `<uapi/linux/uio.h>`.
+const UIO_MAXIOV: usize = 1024;
+
 macro_rules! convert_flags {
     ($src:expr, $src_type:ty, $dst_type:ty, $($flag:ident),+ $(,)?) => {
         {
@@ -754,6 +758,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
+        let is_empty_stream = buf.is_empty() && matches!(proxy.as_ref(), NetworkProxy::Stream(_));
 
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -764,8 +769,10 @@ impl<FS: ShimFS> GlobalState<FS> {
                     Ok(())
                 },
                 || match proxy.try_write(buf, new_flags, sockaddr) {
+                    Ok(0) if buf.is_empty() => Ok(0),
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
+                    Err(litebox::net::errors::SendError::BufferFull) if is_empty_stream => Ok(0),
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
@@ -1158,6 +1165,36 @@ pub(crate) fn write_sockaddr_to_user(
     addrlen.write_at_offset(0, len).ok_or(Errno::EFAULT)
 }
 
+fn copy_iovs_to_vec<P>(
+    iovs: &[litebox_common_linux::IoVec<P>],
+) -> Result<alloc::vec::Vec<u8>, Errno>
+where
+    P: litebox::platform::RawMutPointer<u8>,
+{
+    let total_len = iovs.iter().try_fold(0usize, |total_len, iov| {
+        total_len.checked_add(iov.iov_len).ok_or(Errno::EINVAL)
+    })?;
+    let mut data = alloc::vec::Vec::new();
+    data.try_reserve_exact(total_len)
+        .map_err(|_| Errno::ENOMEM)?;
+    data.resize(total_len, 0);
+    let mut offset = 0;
+    for iov in iovs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let end = offset + iov.iov_len;
+        for (byte_offset, byte) in (0_isize..).zip(data[offset..end].iter_mut()) {
+            *byte = iov
+                .iov_base
+                .read_at_offset(byte_offset)
+                .ok_or(Errno::EFAULT)?;
+        }
+        offset = end;
+    }
+    Ok(data)
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `accept`
     pub(crate) fn sys_accept(
@@ -1396,13 +1433,18 @@ impl<FS: ShimFS> Task<FS> {
             log_unsupported!("ancillary data is not supported");
             return Err(Errno::EINVAL);
         }
-        if msg.msg_iovlen == 0 || msg.msg_iovlen > 1024 {
-            return Err(Errno::EINVAL);
+        if msg.msg_iovlen > UIO_MAXIOV {
+            return Err(Errno::EMSGSIZE);
         }
-        let iovs = msg
-            .msg_iov
-            .to_owned_slice(msg.msg_iovlen)
-            .ok_or(Errno::EFAULT)?;
+        let iovs = if msg.msg_iovlen == 0 {
+            None
+        } else {
+            Some(
+                msg.msg_iov
+                    .to_owned_slice(msg.msg_iovlen)
+                    .ok_or(Errno::EFAULT)?,
+            )
+        };
         let res = self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -1411,23 +1453,17 @@ impl<FS: ShimFS> Task<FS> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                super::file::write_to_iovec(
-                    iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
-                    |buf| {
-                        self.global
-                            .sendto(&self.wait_cx(), fd, buf, flags, sock_addr)
-                    },
-                )
+                let data = copy_iovs_to_vec(iovs.as_deref().unwrap_or_default())?;
+                self.global
+                    .sendto(&self.wait_cx(), fd, &data, flags, sock_addr)
             },
             |file| {
                 let unix_addr = sock_addr
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                super::file::write_to_iovec(
-                    iovs.iter().map(|iov| (iov.iov_base, iov.iov_len)),
-                    |buf| file.sendto(self, buf, flags, unix_addr.clone()),
-                )
+                let data = copy_iovs_to_vec(iovs.as_deref().unwrap_or_default())?;
+                file.sendto(self, &data, flags, unix_addr)
             },
         );
         if let Err(Errno::EPIPE) = res
@@ -1436,6 +1472,58 @@ impl<FS: ShimFS> Task<FS> {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
         res
+    }
+
+    /// Handle syscall `sendmmsg`
+    pub(crate) fn sys_sendmmsg(
+        &self,
+        fd: i32,
+        msgvec: MutPtr<litebox_common_linux::UserMmsgHdr<Platform>>,
+        vlen: u32,
+        flags: SendFlags,
+    ) -> Result<usize, Errno> {
+        let Ok(sockfd) = u32::try_from(fd) else {
+            return Err(Errno::EBADF);
+        };
+
+        let vlen = (vlen as usize).min(UIO_MAXIOV);
+
+        // Linux looks up the fd before touching vlen/msgvec, so a bogus fd
+        // takes priority over a bogus msgvec pointer or vlen == 0.
+        self.files.borrow().with_socket(
+            &self.global,
+            sockfd,
+            |_| Ok::<(), Errno>(()),
+            |_| Ok::<(), Errno>(()),
+        )?;
+
+        if vlen == 0 {
+            return Ok(0);
+        }
+
+        let stride = core::mem::size_of::<litebox_common_linux::UserMmsgHdr<Platform>>();
+        let msg_len_off =
+            core::mem::offset_of!(litebox_common_linux::UserMmsgHdr<Platform>, msg_len);
+
+        let mut sent: usize = 0;
+        for i in 0..vlen {
+            let bail = |e: Errno| if sent > 0 { Ok(sent) } else { Err(e) };
+            let Some(mmh) = msgvec.read_at_offset(isize::try_from(i).unwrap()) else {
+                return bail(Errno::EFAULT);
+            };
+            let inner = mmh.msg_hdr;
+            let n = match self.do_sendmsg(sockfd, &inner, flags) {
+                Ok(n) => n,
+                Err(e) => return bail(e),
+            };
+            let msg_len_ptr =
+                MutPtr::<u32>::from_usize(msgvec.as_usize() + i * stride + msg_len_off);
+            if msg_len_ptr.write_at_offset(0, n.trunc()).is_none() {
+                return bail(Errno::EFAULT);
+            }
+            sent += 1;
+        }
+        Ok(sent)
     }
 
     /// Handle syscall `recvfrom`
@@ -1565,8 +1653,8 @@ impl<FS: ShimFS> Task<FS> {
         if msg_controllen != 0 {
             log_unsupported!("ancillary data is not supported");
         }
-        if msg_iovlen > 1024 {
-            return Err(Errno::EINVAL);
+        if msg_iovlen > UIO_MAXIOV {
+            return Err(Errno::EMSGSIZE);
         }
 
         let iovs = msg_iov.to_owned_slice(msg_iovlen).ok_or(Errno::EFAULT)?;

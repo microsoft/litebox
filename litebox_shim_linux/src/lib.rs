@@ -688,6 +688,12 @@ impl<FS: ShimFS> Task<FS> {
                 addrlen,
             } => self.sys_sendto(sockfd, buf, len, flags, addr, addrlen),
             SyscallRequest::Sendmsg { sockfd, msg, flags } => self.sys_sendmsg(sockfd, msg, flags),
+            SyscallRequest::Sendmmsg {
+                sockfd,
+                msgvec,
+                vlen,
+                flags,
+            } => self.sys_sendmmsg(sockfd, msgvec, vlen, flags),
             SyscallRequest::Recvfrom {
                 sockfd,
                 buf,
