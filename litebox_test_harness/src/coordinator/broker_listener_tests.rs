@@ -313,7 +313,18 @@ async fn handle_raw_icmp_echo(
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP) };
     if fd < 0 {
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EPERM) {
+        // Documented "raw not available in this environment" outcomes:
+        //   - EPERM: broker holds the raw socket but the host kernel
+        //     denied it (lacks CAP_NET_RAW), or sandbox policy denies.
+        //     Returned when LITEBOX_BROKER_INET_RAW=1 + Docker without
+        //     --cap-add NET_RAW.
+        //   - EPROTONOSUPPORT: no raw provider is installed at all, so
+        //     the shim's worker-local stack reports "this protocol is
+        //     not supported here." Returned when LITEBOX_BROKER_INET_RAW
+        //     is unset / =0 (the F.1-flip default).
+        // Both are accurate kernel-shaped errnos; the probe accepts
+        // either as the same "raw is restricted/unavailable" outcome.
+        if matches!(err.raw_os_error(), Some(libc::EPERM) | Some(libc::EPROTONOSUPPORT)) {
             return Ok(RawOut::PermissionDenied);
         }
         return Err(HandlerError(format!("socket failed: {err}")));
