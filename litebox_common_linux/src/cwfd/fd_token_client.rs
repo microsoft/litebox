@@ -26,12 +26,15 @@
 // StatusCode pass-through arms deliberately preserve broker statuses; converting every RPC remains incremental.
 
 use crate::fd_token_protocol::{
-    self as proto, build_create_eventfd_request, build_create_pidfd_request,
-    build_create_pipe_request, build_create_pty_request, build_create_signalfd_request,
-    build_create_socketpair_request, build_deliver_signal_inbox_request,
-    build_inet_listener_accept_request, build_inet_listener_bind_request,
-    build_inet_listener_create_request, build_inet_listener_listen_request,
-    build_inet_listener_query_events_request, build_inotify_add_watch_request,
+    self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
+    build_create_eventfd_request, build_create_pidfd_request, build_create_pipe_request,
+    build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
+    build_deliver_signal_inbox_request, build_inet_listener_accept_request,
+    build_inet_listener_bind_request, build_inet_listener_create_request,
+    build_inet_listener_listen_request, build_inet_listener_query_events_request,
+    build_inet_tcp_conn_connect_request, build_inet_tcp_conn_create_request,
+    build_inet_tcp_conn_getpeername_request, build_inet_tcp_conn_getsockname_request,
+    build_inet_tcp_conn_query_events_request, build_inotify_add_watch_request,
     build_inotify_init1_request, build_inotify_read_request, build_inotify_rm_watch_request,
     build_mark_process_exited_request, build_materialize_request, build_open_pty_slave_request,
     build_pidfd_exited_request, build_poll_tcp_conn_events_request, build_pty_ioctl_request,
@@ -49,6 +52,8 @@ use crate::fd_token_protocol::{
     parse_create_socketpair_response_body, parse_handle_body,
     parse_inet_listener_accept_response_ok, parse_inet_listener_bind_response_ok,
     parse_inet_listener_create_response_ok, parse_inet_listener_query_events_response_ok,
+    parse_inet_tcp_conn_create_response_ok, parse_inet_tcp_conn_getpeername_response_ok,
+    parse_inet_tcp_conn_getsockname_response_ok, parse_inet_tcp_conn_query_events_response_ok,
     parse_inotify_add_watch_response_ok, parse_inotify_read_response_body,
     parse_open_pty_slave_response_ok, parse_pidfd_exited_response_ok,
     parse_poll_tcp_conn_events_response_ok, parse_pty_ioctl_response_body,
@@ -56,8 +61,7 @@ use crate::fd_token_protocol::{
     parse_read_siginfo_response_body, parse_read_socketpair_response_body,
     parse_read_tcp_conn_response_body, parse_set_sid_response_ok,
     parse_subscribe_process_exit_response_ok, parse_write_pipe_response_ok,
-    parse_write_socketpair_response_ok, parse_write_tcp_conn_response_ok, Frame, Opcode,
-    ProtocolError, PtyIoctlOp, StatusCode, BODY_MAX, CTRL_HEADER_LEN,
+    parse_write_socketpair_response_ok, parse_write_tcp_conn_response_ok,
 };
 use std::format;
 use std::io;
@@ -1298,6 +1302,130 @@ impl FdTokenClient {
         match resp.status {
             StatusCode::Ok => Ok(()),
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn tcp_conn_create(&self, family: u8) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_inet_tcp_conn_create_request(family), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetTcpConnCreateResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_inet_tcp_conn_create_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: family as u64,
+            }),
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    pub fn tcp_conn_connect(
+        &self,
+        handle_id: u64,
+        sockaddr: &[u8],
+        timeout_ms: u32,
+    ) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_tcp_conn_connect_request(handle_id, sockaddr, timeout_ms),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetTcpConnConnectResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::WouldBlock => Err(ClientError::WouldBlock),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: sockaddr.len() as u64,
+            }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn tcp_conn_query_events(&self, handle_id: u64) -> Result<u32, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_tcp_conn_query_events_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetTcpConnQueryEventsResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_inet_tcp_conn_query_events_response_ok(resp.body)
+                .map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn tcp_conn_getsockname(&self, handle_id: u64) -> Result<[u8; 28], ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_tcp_conn_getsockname_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetTcpConnGetSockNameResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_inet_tcp_conn_getsockname_response_ok(resp.body)
+                .map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn tcp_conn_getpeername(&self, handle_id: u64) -> Result<[u8; 28], ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_tcp_conn_getpeername_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetTcpConnGetPeerNameResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_inet_tcp_conn_getpeername_response_ok(resp.body)
+                .map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: handle_id }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }
     }

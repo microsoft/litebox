@@ -186,7 +186,11 @@ pub enum TransferListenRouteError {
 }
 
 fn broker_tcp_conn_accept_enabled() -> bool {
-    std::env::var("LITEBOX_BROKER_TCP_CONN")
+    env_flag_enabled("LITEBOX_BROKER_TCP_CONN") || env_flag_enabled("LITEBOX_BROKER_INET_TCP")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)

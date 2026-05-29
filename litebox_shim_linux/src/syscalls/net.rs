@@ -70,6 +70,8 @@ type BrokerSocketPairHandle = litebox::fd::EntryHandle<
 >;
 type BrokerTcpConnTypedFd =
     litebox::fd::TypedFd<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>;
+type BrokerTcpConnHandle =
+    litebox::fd::EntryHandle<Platform, crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>;
 type BrokerInetListenerTypedFd =
     litebox::fd::TypedFd<crate::syscalls::broker_inet_listener::BrokerInetListenerSubsystem>;
 type BrokerInetListenerHandle = litebox::fd::EntryHandle<
@@ -953,7 +955,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
-    fn send_listen_route_transfer(&self, port: u16) -> Result<(), Errno> {
+    pub(super) fn send_listen_route_transfer(&self, port: u16) -> Result<(), Errno> {
         self.platform
             .send_port_listen_transfer(port)
             .map_err(|_| Errno::EIO)
@@ -1172,6 +1174,18 @@ impl<FS: ShimFS> GlobalState<FS> {
         raw_fd: u32,
         files: &core::cell::RefCell<Arc<crate::syscalls::file::FilesState<FS>>>,
     ) -> Option<Arc<NetworkProxy<Platform>>> {
+        {
+            let files_ref = files.borrow();
+            let rds = files_ref.raw_descriptor_store.read();
+            if rds
+                .fd_from_raw_integer::<crate::syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(
+                    raw_fd as usize,
+                )
+                .is_ok()
+            {
+                return None;
+            }
+        }
         files
             .borrow()
             .with_socket(
@@ -1315,6 +1329,17 @@ impl<FS: ShimFS> Task<FS> {
         broker_tcp.map(|typed| op(typed.as_ref()))
     }
 
+    fn broker_tcp_conn_handle(
+        &self,
+        typed: &BrokerTcpConnTypedFd,
+    ) -> Result<BrokerTcpConnHandle, Errno> {
+        self.global
+            .litebox
+            .descriptor_table()
+            .entry_handle(typed)
+            .ok_or(Errno::EBADF)
+    }
+
     fn try_with_broker_inet_listener<R>(
         &self,
         sockfd: u32,
@@ -1384,6 +1409,37 @@ impl<FS: ShimFS> Task<FS> {
                     SockType::Stream => {
                         if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
                             return Err(Errno::EINVAL);
+                        }
+                        if crate::syscalls::broker_tcp_conn::broker_inet_tcp_conn_provider_outbound_enabled()
+                            && crate::syscalls::broker_inet_listener::broker_inet_listener_provider()
+                                .is_none()
+                            && let Some(provider) =
+                                crate::syscalls::broker_tcp_conn::broker_tcp_conn_provider()
+                        {
+                            let mut status = OFlags::empty();
+                            status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
+                            let handle = provider
+                                .create(0)
+                                .map_err(super::broker_backed::broker_err_to_errno)?;
+                            let conn = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<
+                                Platform,
+                            >::new(provider, handle, status);
+                            let mut dt = self.global.litebox.descriptor_table_mut();
+                            let typed = dt
+                                .insert::<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                                    conn,
+                                );
+                            if flags.contains(SockFlags::CLOEXEC) {
+                                let old =
+                                    dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                                assert!(old.is_none());
+                            }
+                            drop(dt);
+                            let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+                                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                                Errno::EMFILE
+                            })?;
+                            return Ok(u32::try_from(raw_fd).unwrap());
                         }
                         if let Some(provider) =
                             crate::syscalls::broker_inet_listener::broker_inet_listener_provider()
@@ -2137,12 +2193,66 @@ impl<FS: ShimFS> Task<FS> {
         self.do_connect(fd, sockaddr)
     }
     pub(super) fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
-        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |_typed| {
+        if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
+            let handle = self.broker_tcp_conn_handle(typed)?;
+            handle.with_entry(|entry| entry.connect(&self.wait_cx(), &raw))
+        }) {
+            return result;
+        }
+        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
             let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
             let SocketAddr::V4(addr) = addr else {
                 return Err(Errno::EAFNOSUPPORT);
             };
             let raw_fd = usize::try_from(sockfd).map_err(|_| Errno::EBADF)?;
+            if crate::syscalls::broker_tcp_conn::broker_inet_tcp_conn_provider_outbound_enabled()
+                && let Some(tcp_provider) =
+                    crate::syscalls::broker_tcp_conn::broker_tcp_conn_provider()
+            {
+                let fd_flags = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(typed, |flags: &FileDescriptorFlags| *flags)
+                    .unwrap_or_else(|_| FileDescriptorFlags::empty());
+                let listener_handle = self.broker_inet_listener_handle(typed)?;
+                let status = listener_handle.with_entry(|entry| entry.get_status());
+                let tcp_handle = tcp_provider
+                    .create(0)
+                    .map_err(super::broker_backed::broker_err_to_errno)?;
+                let tcp_fd = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+                    tcp_provider,
+                    tcp_handle,
+                    status,
+                );
+                let typed_tcp = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let typed_tcp = dt
+                        .insert::<crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(tcp_fd);
+                    if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
+                        let old = dt.set_fd_metadata(&typed_tcp, FileDescriptorFlags::FD_CLOEXEC);
+                        assert!(old.is_none());
+                    }
+                    typed_tcp
+                };
+                let tcp_handle = self.broker_tcp_conn_handle(&typed_tcp)?;
+                {
+                    let files = self.files.borrow();
+                    let mut rds = files.raw_descriptor_store.write();
+                    let _old_fd = rds
+                        .fd_consume_raw_integer::<
+                            super::broker_inet_listener::BrokerInetListenerSubsystem,
+                        >(raw_fd)
+                        .map_err(|_| Errno::EBADF)?;
+                    assert!(rds.fd_into_specific_raw_integer(typed_tcp, raw_fd));
+                }
+                let _ = self.global.litebox.descriptor_table_mut().remove(typed);
+                let raw = socket_address_to_inet_listener_wire(SocketAddress::Inet(
+                    SocketAddr::V4(addr),
+                ))?;
+                return tcp_handle.with_entry(|entry| entry.connect(&self.wait_cx(), &raw));
+            }
             const SOCK_CLOEXEC: usize = 0o2000000;
             let host_fd = unsafe {
                 syscalls::syscall3(
@@ -2228,6 +2338,57 @@ impl<FS: ShimFS> Task<FS> {
                 .unwrap()
                 .bind();
             return Ok(());
+        }
+        if let Some(result) =
+            self.try_with_broker_tcp_conn(sockfd, |typed| {
+                let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
+                let listener_provider =
+                    crate::syscalls::broker_inet_listener::broker_inet_listener_provider()
+                        .ok_or(Errno::EINVAL)?;
+                let raw_fd = usize::try_from(sockfd).map_err(|_| Errno::EBADF)?;
+                let tcp_handle = self.broker_tcp_conn_handle(typed)?;
+                let status = tcp_handle.with_entry(|entry| entry.get_status());
+                let fd_flags = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(typed, |flags: &FileDescriptorFlags| *flags)
+                    .unwrap_or_else(|_| FileDescriptorFlags::empty());
+                let listener_handle = listener_provider
+                    .create(0)
+                    .map_err(super::broker_backed::broker_err_to_errno)?;
+                let listener = crate::syscalls::broker_inet_listener::BrokerInetListenerFd::<
+                    Platform,
+                >::new(listener_provider, listener_handle, 0, status);
+                listener.bind(&raw)?;
+                let typed_listener = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let typed_listener = dt
+                    .insert::<crate::syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(
+                        listener,
+                    );
+                    if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
+                        let old =
+                            dt.set_fd_metadata(&typed_listener, FileDescriptorFlags::FD_CLOEXEC);
+                        assert!(old.is_none());
+                    }
+                    typed_listener
+                };
+                {
+                    let files = self.files.borrow();
+                    let mut rds = files.raw_descriptor_store.write();
+                    let _old_fd = rds
+                        .fd_consume_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                            raw_fd,
+                        )
+                        .map_err(|_| Errno::EBADF)?;
+                    assert!(rds.fd_into_specific_raw_integer(typed_listener, raw_fd));
+                }
+                let _ = self.global.litebox.descriptor_table_mut().remove(typed);
+                Ok(())
+            })
+        {
+            return result;
         }
         if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
             let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
@@ -2364,24 +2525,10 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Get the local port for an INET socket. Returns None if not bound.
     pub(super) fn do_getsockname_inet_port(&self, sockfd: u32) -> Option<u16> {
-        self.files
-            .borrow()
-            .with_socket(
-                &self.global,
-                sockfd,
-                |fd| {
-                    Ok(self
-                        .global
-                        .net
-                        .lock()
-                        .get_local_addr(fd)
-                        .ok()
-                        .map(|a| a.port()))
-                },
-                |_| Ok(None),
-            )
+        self.do_getsockname(sockfd)
             .ok()
-            .flatten()
+            .and_then(SocketAddress::inet)
+            .map(|addr| addr.port())
     }
 
     /// Handle syscall `shutdown`
@@ -2804,9 +2951,28 @@ impl<FS: ShimFS> Task<FS> {
                             // Broker socketpairs are not broker-token-transferable over SCM yet.
                             Ok(false)
                         }
-                        crate::RawFdRef::BrokerTcpConn(_) => {
-                            // Broker TCP connections are not broker-token-transferable over SCM yet.
-                            Ok(false)
+                        crate::RawFdRef::BrokerTcpConn(typed) => {
+                            let entry_handle = dt
+                                .entry_handle::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(typed)
+                                .ok_or(Errno::EBADF)?;
+                            let (handle_id, provider) = entry_handle.with_entry(|e| {
+                                (
+                                    e.handle(),
+                                    super::broker_tcp_conn::broker_tcp_conn_provider(),
+                                )
+                            });
+                            let Some(provider) = provider else {
+                                return Ok(false);
+                            };
+                            provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                            passed_tokens.push(
+                                litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::TcpSocket,
+                                    handle_id,
+                                )
+                                .map_err(|_| Errno::EINVAL)?,
+                            );
+                            Ok(true)
                         }
                         crate::RawFdRef::BrokerPty(_) => {
                             // Broker ptys are not broker-token-transferable over SCM yet.
@@ -3490,7 +3656,46 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                     }
-                    SubsystemTag::TcpSocket | SubsystemTag::Process | SubsystemTag::Unknown(_) => {
+                    SubsystemTag::TcpSocket => {
+                        let Some(provider) = super::broker_tcp_conn::broker_tcp_conn_provider()
+                        else {
+                            continue;
+                        };
+                        let handle_id = token.id();
+                        if provider.dup_handle(handle_id).is_err() {
+                            continue;
+                        }
+                        let status_flags = litebox::fs::OFlags::empty();
+                        let conn = super::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
+                            provider,
+                            handle_id,
+                            status_flags,
+                        );
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed =
+                            dt.insert::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(conn);
+                        if cloexec {
+                            let _ = dt.set_fd_metadata(
+                                &typed,
+                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                            );
+                        }
+                        drop(dt);
+                        let files = self.files.borrow();
+                        match files.insert_raw_fd(typed) {
+                            Ok(raw_fd) => {
+                                installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                            }
+                            Err(typed) => {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .remove(&typed)
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    SubsystemTag::Process | SubsystemTag::Unknown(_) => {
                         // Unsupported token kind on this worker; drop.
                     }
                     SubsystemTag::Pidfd
@@ -3902,9 +4107,12 @@ impl<FS: ShimFS> Task<FS> {
         }) {
             return result;
         }
-        if let Some(result) =
-            self.try_with_broker_tcp_conn(sockfd, |_typed| Ok(SocketAddress::default()))
-        {
+        if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            let handle = self.broker_tcp_conn_handle(typed)?;
+            handle
+                .with_entry(|entry| entry.getsockname())
+                .and_then(inet_listener_wire_to_socket_address)
+        }) {
             return result;
         }
         if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
@@ -3957,9 +4165,12 @@ impl<FS: ShimFS> Task<FS> {
         }) {
             return result;
         }
-        if let Some(result) =
-            self.try_with_broker_tcp_conn(sockfd, |_typed| Ok(SocketAddress::default()))
-        {
+        if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            let handle = self.broker_tcp_conn_handle(typed)?;
+            handle
+                .with_entry(|entry| entry.getpeername())
+                .and_then(inet_listener_wire_to_socket_address)
+        }) {
             return result;
         }
         self.files.borrow().with_socket(
