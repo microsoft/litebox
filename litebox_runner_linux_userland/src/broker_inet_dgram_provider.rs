@@ -167,6 +167,7 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
         ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
         ClientError::Protocol(_) => BrokerOpError::InvalidValue,
+        ClientError::PermissionDenied | ClientError::ProtocolNotSupported => BrokerOpError::Io,
         ClientError::Io(_)
         | ClientError::UnexpectedOpcode { .. }
         | ClientError::BrokerRejectedProtocol
