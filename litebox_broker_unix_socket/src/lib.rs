@@ -71,6 +71,8 @@ impl ServerControlChannel for UnixStreamServerControlChannel {
     type Error = io::Error;
 
     fn peer_credential(&self) -> io::Result<PeerCredential> {
+        // TODO(split-broker): replace the PoC placeholder with Unix peer credential extraction
+        // before this channel is used as an authenticated deployment boundary.
         Ok(PeerCredential::Unauthenticated)
     }
 
