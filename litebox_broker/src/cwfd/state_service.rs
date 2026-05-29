@@ -1992,7 +1992,21 @@ fn handle_inet_listener_bind(
         Ok(s) => s,
         Err(r) => return r,
     };
-    match state.bind(&sockaddr) {
+    // If the requested port is already owned by the broker's net_proxy
+    // inbound forwarder, use a virtual bind: inbound traffic flows in
+    // via accept_inbound, so binding the host port (which would EADDRINUSE)
+    // is both unnecessary and wrong.
+    let requested_port = decode_sockaddr(&sockaddr).ok().map(|a| a.port());
+    let use_virtual = match requested_port {
+        Some(port) if port != 0 => registry.is_inbound_forwarded(port),
+        _ => false,
+    };
+    let bind_result = if use_virtual {
+        state.virtual_bind(&sockaddr)
+    } else {
+        state.bind(&sockaddr)
+    };
+    match bind_result {
         Ok(actual) => {
             let actual_addr = match decode_sockaddr(&actual) {
                 Ok(addr) => addr,

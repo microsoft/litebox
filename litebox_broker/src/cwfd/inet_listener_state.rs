@@ -124,6 +124,31 @@ impl InetListenerState {
         encode_sockaddr(actual)
     }
 
+    /// "Virtual bind" — register a bound address without actually binding
+    /// a host TCP listener. Used when the broker `net_proxy` already owns
+    /// the inbound host-port socket and will deliver accepted streams via
+    /// [`accept_inbound`]. Sets `bound_addr` and leaves `listener` as
+    /// `None`. [`listen`] handles both real-bind and virtual-bind cases.
+    pub fn virtual_bind(
+        &self,
+        sockaddr: &[u8; SOCKADDR_WIRE_LEN],
+    ) -> Result<[u8; SOCKADDR_WIRE_LEN], InetListenerError> {
+        let addr = decode_sockaddr(sockaddr)?;
+        match (self.family, addr) {
+            (AddressFamily::V4, SocketAddr::V4(_)) | (AddressFamily::V6, SocketAddr::V6(_)) => {}
+            _ => return Err(InetListenerError::InvalidSockaddr),
+        }
+        let mut slot = self
+            .bound_addr
+            .lock()
+            .expect("InetListenerState bound_addr poisoned");
+        if slot.is_some() {
+            return Err(InetListenerError::AlreadyBound);
+        }
+        *slot = Some(addr);
+        encode_sockaddr(addr)
+    }
+
     pub fn setsockopt(
         &self,
         level: u32,
@@ -166,15 +191,31 @@ impl InetListenerState {
         {
             return Err(InetListenerError::AlreadyListening);
         }
-        let listener = self
-            .listener
-            .lock()
-            .expect("InetListenerState listener poisoned")
-            .as_ref()
-            .ok_or(InetListenerError::NotBound)?
-            .try_clone()?;
-        listen_on_socket(listener.as_raw_fd(), _backlog)?;
-        listener.set_nonblocking(true)?;
+        // Two cases:
+        //   * Real bind  → self.listener is Some(TcpListener); spawn an
+        //     accept_loop thread that pulls from the host listener.
+        //   * Virtual bind → self.listener is None; just wire the
+        //     accept_tx/accept_rx channel pair so net_proxy can deliver
+        //     streams via accept_inbound.
+        let maybe_listener = {
+            self.listener
+                .lock()
+                .expect("InetListenerState listener poisoned")
+                .as_ref()
+                .map(|l| l.try_clone())
+                .transpose()?
+        };
+        if maybe_listener.is_none() {
+            // Verify a bound_addr exists (virtual bind path).
+            if self
+                .bound_addr
+                .lock()
+                .expect("InetListenerState bound_addr poisoned")
+                .is_none()
+            {
+                return Err(InetListenerError::NotBound);
+            }
+        }
         let (tx, rx) = channel::sync_channel(ACCEPT_QUEUE_CAP);
         *self
             .accept_tx
@@ -184,15 +225,19 @@ impl InetListenerState {
             .accept_rx
             .lock()
             .expect("InetListenerState accept_rx poisoned") = Some(rx);
-        let weak = Arc::downgrade(self);
-        let stop = Arc::clone(&self.stop_accept);
-        let handle = thread::Builder::new()
-            .name("litebox-inet-listener-accept".into())
-            .spawn(move || accept_loop(listener, tx, weak, stop))?;
-        *self
-            .accept_thread
-            .lock()
-            .expect("InetListenerState accept_thread poisoned") = Some(handle);
+        if let Some(listener) = maybe_listener {
+            listen_on_socket(listener.as_raw_fd(), _backlog)?;
+            listener.set_nonblocking(true)?;
+            let weak = Arc::downgrade(self);
+            let stop = Arc::clone(&self.stop_accept);
+            let handle = thread::Builder::new()
+                .name("litebox-inet-listener-accept".into())
+                .spawn(move || accept_loop(listener, tx, weak, stop))?;
+            *self
+                .accept_thread
+                .lock()
+                .expect("InetListenerState accept_thread poisoned") = Some(handle);
+        }
         Ok(())
     }
 
@@ -582,6 +627,45 @@ mod tests {
                 Err(err) => panic!("accept failed: {err:?}"),
             }
         }
+    }
+
+    #[test]
+    fn inet_listener_virtual_bind_skips_host_bind_and_accepts_inbound() {
+        let state = InetListenerState::new(AddressFamily::V4);
+        // Virtual bind: no host port grabbed, but a bound_addr is recorded
+        // so listen() can proceed with channel-only setup.
+        let requested = encode_sockaddr(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(127, 0, 0, 1),
+            42424,
+        )))
+        .unwrap();
+        let actual = state.virtual_bind(&requested).unwrap();
+        let actual_addr = decode_sockaddr(&actual).unwrap();
+        assert_eq!(actual_addr.port(), 42424);
+        // Second virtual_bind on the same state should fail.
+        assert!(matches!(
+            state.virtual_bind(&requested),
+            Err(InetListenerError::AlreadyBound)
+        ));
+
+        // listen() should set up the channels without binding any host fd.
+        state.listen(5).unwrap();
+
+        // accept_inbound delivers a stream that accept() can retrieve.
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Use a real TCP pair via local loopback so accept_inbound's
+        // set_nonblocking call works; we synthesize a connected client.
+        let host_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host_addr = host_listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(host_addr).unwrap();
+        let (server_side, _) = host_listener.accept().unwrap();
+        let _ = (a, b); // unused, just demonstrating pair available
+        state
+            .accept_inbound(server_side, host_addr)
+            .expect("accept_inbound should queue");
+        let (_stream, peer) = accept_wait(&state);
+        assert_eq!(peer, host_addr);
+        drop(client);
     }
 
     #[test]

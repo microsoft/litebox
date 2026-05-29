@@ -1018,6 +1018,13 @@ fn run_inner(
                     guest_ip: *guest_ip,
                     guest_port: *guest_port,
                 });
+                // Tell the broker state registry that this guest port is
+                // already serviced by an inbound forwarder so any worker
+                // `bind(guest_port)` virtual-binds instead of trying to
+                // grab the (already-in-use) host port.
+                if let Some(registry) = state_registry.as_deref() {
+                    registry.add_inbound_forwarded_port(*guest_port);
+                }
             }
             Err(e) => {
                 error!("failed to bind inbound forward on port {host_port}: {e}");
