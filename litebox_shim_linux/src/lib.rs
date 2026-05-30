@@ -57,7 +57,7 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::layered::FileSystem<
         Platform,
-        litebox::fs::devices::FileSystem<Platform>,
+        litebox::fs::resolver::Resolver<Platform, litebox::fs::devices::Devices<Platform>>,
         litebox::fs::tar_ro::FileSystem<Platform>,
     >,
 >;
@@ -334,7 +334,10 @@ fn default_fs(
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
 ) -> LinuxFS {
-    let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
+    let dev_stdio = litebox::fs::resolver::Resolver::new(
+        litebox,
+        litebox::fs::devices::Devices::migration_helper_standalone_new(litebox),
+    );
     litebox::fs::layered::FileSystem::new(
         litebox,
         in_mem_fs,
