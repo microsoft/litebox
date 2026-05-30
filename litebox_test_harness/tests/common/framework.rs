@@ -44,7 +44,6 @@
 
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // `cleanup` is a sibling-module inside `tests/integration.rs`.
@@ -52,38 +51,13 @@ use std::time::Duration;
 // the integration test binary.
 use crate::cleanup;
 
-static NAME_COUNTER: AtomicU64 = AtomicU64::new(1);
+// Pure helpers (no crate-private deps) live in framework_core so
+// they can be unit-tested from tests/dashboard_store.rs.
+#[path = "framework_core.rs"]
+mod core;
 
-/// Build the canonical container name. See module docs for
-/// uniqueness analysis.
-pub fn container_name(pass: &str, test_id: &str) -> String {
-    let safe_tid: String = test_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let counter = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let harness_pid = std::process::id();
-    format!("litebox-{pass}-{safe_tid}-{harness_pid}-{counter}")
-}
-
-/// Per-test-family container description. Plus how to invoke the
-/// container — `detached=true` for `docker run -d`, false for
-/// foreground (the docker-run process stays alive until the
-/// container exits).
-pub struct ContainerSpec {
-    pub image: String,
-    /// Extra `docker run` arguments between `--name X` and the
-    /// image — e.g. `-v`, `-e`, `--cap-add`, `-p`,
-    /// `--security-opt`.
-    pub docker_args: Vec<String>,
-    /// The container command (after the image, what to run inside).
-    pub command: Vec<String>,
-    pub detached: bool,
-    /// If `Some(secs)`, wrap `command` with `timeout(1)` for a
-    /// hard per-trial cap. Set to `None` to let the inner command
-    /// manage its own timeout.
-    pub timeout_secs: Option<u64>,
-}
+use core::build_docker_run_args;
+pub use core::{ContainerSpec, container_name};
 
 /// What a `drive` closure receives once the container is running.
 pub struct DispatchedContainer {
@@ -137,25 +111,14 @@ fn apply_pdeathsig(cmd: &mut Command) {
 }
 
 /// Build the full `docker run` command from a `ContainerSpec` +
-/// the framework-allocated container name. Inserts `--name`,
-/// `--rm` (unless `LITEBOX_KEEP_CONTAINER`), and the `-d` flag for
-/// detached specs.
+/// the framework-allocated container name. Delegates argument
+/// layout to `build_docker_run_args` (pure, testable) and adds
+/// the side-effectful `pre_exec(PDEATHSIG)` hook.
 fn build_command(spec: &ContainerSpec, name: &str) -> Command {
+    let keep_containers = std::env::var("LITEBOX_KEEP_CONTAINER").is_ok();
+    let args = build_docker_run_args(spec, name, keep_containers);
     let mut cmd = Command::new("docker");
-    cmd.arg("run");
-    if spec.detached {
-        cmd.arg("-d");
-    }
-    if std::env::var("LITEBOX_KEEP_CONTAINER").is_err() {
-        cmd.arg("--rm");
-    }
-    cmd.args(["--name", name]);
-    cmd.args(&spec.docker_args);
-    cmd.arg(&spec.image);
-    if let Some(secs) = spec.timeout_secs {
-        cmd.args(["timeout", "--signal=KILL", &secs.to_string()]);
-    }
-    cmd.args(&spec.command);
+    cmd.args(&args);
     apply_pdeathsig(&mut cmd);
     cmd
 }
@@ -206,12 +169,19 @@ fn query_published_ports(name: &str) -> HashMap<u16, u16> {
 /// Force-remove a container by name and deregister from cleanup.
 /// Idempotent. Caller invokes this for detached containers after
 /// `drive` returns, regardless of verdict.
+///
+/// Respects `LITEBOX_KEEP_CONTAINER`: if set, we deregister from
+/// the cleanup module's tracking (so SIGTERM-time reap doesn't
+/// later remove it either) but skip the `docker rm -f`. The
+/// container remains in `docker ps -a` for post-mortem inspection.
 fn tear_down_detached(name: &str) {
-    let _ = Command::new("timeout")
-        .args(["10", "docker", "rm", "-f", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    if std::env::var("LITEBOX_KEEP_CONTAINER").is_err() {
+        let _ = Command::new("timeout")
+            .args(["10", "docker", "rm", "-f", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     cleanup::deregister_docker_child(name);
 }
 
@@ -271,7 +241,14 @@ where
     let name = container_name(pass, test_id);
     let mut cmd = build_command(&spec, &name);
     if spec.detached {
-        // No stdout/stderr piping — daemonized container.
+        // For detached spawn: pipe stderr so we can capture the
+        // docker daemon's error message on failure (e.g. "image
+        // not found", "port already allocated"). Stdout for `-d`
+        // is just the container ID; pipe + drain so the pipe
+        // buffer doesn't fill.
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
     } else {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -290,20 +267,35 @@ where
 
     let dispatched = if spec.detached {
         // Wait for the docker-run process to return (it exits as
-        // soon as the container starts). Then query the published
-        // ports if any.
-        let status = child.wait();
-        if status.as_ref().map(|s| !s.success()).unwrap_or(true) {
+        // soon as the container starts), collecting its stdout/stderr.
+        // `wait_with_output` consumes the Child so we can capture
+        // both streams + status in one go.
+        let out = child.wait_with_output();
+        let failed = out.as_ref().map(|o| !o.status.success()).unwrap_or(true);
+        if failed {
             // docker run -d failed; tear down (just in case the
-            // container partially started) and bail.
-            let _ = Command::new("docker")
-                .args(["rm", "-f", &name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            // container partially started) and bail with the
+            // captured stderr so the user can see what docker said.
+            // Respect LITEBOX_KEEP_CONTAINER even on the bail path:
+            // a partially-failed spawn might leave debug breadcrumbs.
+            if std::env::var("LITEBOX_KEEP_CONTAINER").is_err() {
+                let _ = Command::new("docker")
+                    .args(["rm", "-f", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
             guard.armed = false;
             cleanup::deregister_docker_child(&name);
-            return Err(format!("docker run -d failed for {name}: {status:?}").into());
+            let detail = match out {
+                Ok(o) => format!(
+                    "docker run -d failed for {name} (exit {}): {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim(),
+                ),
+                Err(e) => format!("docker run -d wait failed for {name}: {e}"),
+            };
+            return Err(detail.into());
         }
         // The detached docker-run host PID is now invalid; mark the
         // cleanup entry so reap_all skips the kill step.
