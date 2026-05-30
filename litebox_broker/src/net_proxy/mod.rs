@@ -17,9 +17,10 @@
 
 mod device;
 pub mod dns_tracker;
+mod inbound_forward;
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -139,14 +140,6 @@ const MAX_ADDITIONAL_LBNP_SESSIONS: usize = 32;
 /// Maximum accepted-but-not-yet-classified listener sockets kept in the
 /// pending handshake queue at once.
 const MAX_PENDING_ACCEPTED_HANDSHAKES: usize = 32;
-
-/// An inbound TCP port forward: host listens on a port and relays connections
-/// to a guest IP:port inside the smoltcp virtual network.
-struct InboundForward {
-    listener: std::net::TcpListener,
-    guest_ip: Ipv4Addr,
-    guest_port: u16,
-}
 
 /// Routes inbound TCP connections to the correct worker's smoltcp proxy.
 ///
@@ -1006,31 +999,8 @@ fn run_inner(
     let mut dns_tracker = dns_tracker::DnsTracker::new();
 
     // Inbound TCP port forwards: host listeners that relay to guest ports.
-    let mut inbound_listeners: Vec<InboundForward> = Vec::new();
-
-    for (host_port, guest_ip, guest_port) in &inbound_forwards {
-        match std::net::TcpListener::bind(format!("0.0.0.0:{host_port}")) {
-            Ok(listener) => {
-                listener.set_nonblocking(true).ok();
-                info!("inbound TCP forward: host:{host_port} → {guest_ip}:{guest_port}");
-                inbound_listeners.push(InboundForward {
-                    listener,
-                    guest_ip: *guest_ip,
-                    guest_port: *guest_port,
-                });
-                // Tell the broker state registry that this guest port is
-                // already serviced by an inbound forwarder so any worker
-                // `bind(guest_port)` virtual-binds instead of trying to
-                // grab the (already-in-use) host port.
-                if let Some(registry) = state_registry.as_deref() {
-                    registry.add_inbound_forwarded_port(*guest_port);
-                }
-            }
-            Err(e) => {
-                error!("failed to bind inbound forward on port {host_port}: {e}");
-            }
-        }
-    }
+    let inbound_listeners =
+        inbound_forward::setup_inbound_listeners(&inbound_forwards, state_registry.as_deref());
     // Host DNS resolver for forwarding guest DNS queries.
     let host_dns = discover_host_dns();
     // Pending LB9P handshakes — drained non-blocking each loop iteration.
@@ -1762,20 +1732,15 @@ fn run_inner(
                             fwd.guest_ip, fwd.guest_port
                         );
 
-                        if let Some(listener) = state_registry.as_deref().and_then(|registry| {
-                            registry.resolve_broker_held_inet_listener_for_inbound(fwd.guest_port)
-                        }) {
-                            match listener.accept_inbound(stream, peer) {
-                                Ok(()) => continue,
-                                Err(e) => {
-                                    warn!(
-                                        "broker-held listener rejected host-inbound stream for port {}: {e}",
-                                        fwd.guest_port
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
+                        let stream = match inbound_forward::try_accept_broker_held(
+                            fwd,
+                            stream,
+                            peer,
+                            state_registry.as_deref(),
+                        ) {
+                            None => continue,
+                            Some(stream) => stream,
+                        };
 
                         // Check if a worker has registered for this port.
                         // If so, route the stream to the worker's proxy.
