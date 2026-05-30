@@ -238,12 +238,17 @@ impl InetListenerState {
         //     accept_tx/accept_rx channel pair so net_proxy can deliver
         //     streams via accept_inbound.
         let maybe_listener = {
-            self.listener
+            let guard = self
+                .listener
                 .lock()
-                .expect("InetListenerState listener poisoned")
-                .as_ref()
-                .map(|l| l.try_clone())
-                .transpose()?
+                .expect("InetListenerState listener poisoned");
+            if let Some(listener) = guard.as_ref() {
+                listen_on_socket(listener.as_raw_fd(), _backlog)?;
+                listener.set_nonblocking(true)?;
+                Some(listener.try_clone()?)
+            } else {
+                None
+            }
         };
         if maybe_listener.is_none() {
             // Verify a bound_addr exists (virtual bind path).
@@ -266,8 +271,6 @@ impl InetListenerState {
             .lock()
             .expect("InetListenerState accept_rx poisoned") = Some(rx);
         if let Some(listener) = maybe_listener {
-            listen_on_socket(listener.as_raw_fd(), _backlog)?;
-            listener.set_nonblocking(true)?;
             let weak = Arc::downgrade(self);
             let stop = Arc::clone(&self.stop_accept);
             let handle = thread::Builder::new()
@@ -363,6 +366,7 @@ impl InetListenerState {
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => return,
                 Err(_) => {
                     self.accept_error.store(true, Ordering::Release);
                     return;
@@ -465,6 +469,9 @@ fn accept_loop(
                 thread::sleep(Duration::from_millis(10));
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                thread::sleep(Duration::from_millis(10));
+            }
             Err(_) => {
                 if let Some(state) = state.upgrade() {
                     state.accept_error.store(true, Ordering::Release);
