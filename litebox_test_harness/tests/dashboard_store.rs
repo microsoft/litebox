@@ -251,6 +251,389 @@ fn harness_leases_table_round_trip_and_prune() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+// ── framework_core: pure-helper unit tests ──────────────────────────
+//
+// Tests the deterministic, no-side-effect building blocks that
+// framework.rs delegates to. Catches regressions in container
+// naming + docker-args layout (e.g. the keep_containers bug that
+// shipped because no test asserted "--rm" placement).
+
+#[allow(dead_code)]
+#[path = "common/framework_core.rs"]
+mod framework_core;
+
+#[test]
+fn container_name_is_unique_in_tight_loop() {
+    let names: std::collections::HashSet<String> = (0..10_000)
+        .map(|_| framework_core::container_name("native", "FOO.bar"))
+        .collect();
+    assert_eq!(
+        names.len(),
+        10_000,
+        "10k tight-loop calls should produce 10k distinct names \
+         (no within-harness collision via the monotonic counter)"
+    );
+}
+
+#[test]
+fn container_name_matches_canonical_pattern() {
+    let n = framework_core::container_name("litebox", "INHERIT.pipe.dpg1_dpg1");
+    // Regex: litebox-<pass>-<sanitized_tid>-<harness_pid>-<counter>
+    let parts: Vec<&str> = n.rsplitn(3, '-').collect();
+    // Right-split: [counter, harness_pid, prefix...]
+    assert_eq!(
+        parts.len(),
+        3,
+        "name should have at least 3 dash-segments: {n}"
+    );
+    let counter: u64 = parts[0].parse().expect("counter should parse as u64");
+    let harness_pid: u32 = parts[1].parse().expect("harness_pid should parse as u32");
+    assert!(counter >= 1, "counter starts at 1");
+    assert_eq!(harness_pid, std::process::id());
+    let prefix = parts[2];
+    assert!(
+        prefix.starts_with("litebox-litebox-"),
+        "prefix should start with litebox-{{pass}}-: {prefix}"
+    );
+    // test_id sanitization: dots and underscores become dashes.
+    assert!(
+        prefix.contains("INHERIT-pipe-dpg1-dpg1"),
+        "tid should be sanitized: {prefix}"
+    );
+}
+
+#[test]
+fn container_name_sweep_regex_matches() {
+    // The dashboard's cleanup sweep uses docker's name filter
+    // `name=-{harness_pid}-` (substring match). Verify our names
+    // contain that pattern.
+    let pid = std::process::id();
+    let n = framework_core::container_name("native", "X.y");
+    assert!(
+        n.contains(&format!("-{pid}-")),
+        "name {n} must contain -{pid}- for sweep"
+    );
+}
+
+#[test]
+fn build_docker_run_args_foreground_with_rm() {
+    let spec = framework_core::ContainerSpec {
+        image: "litebox-test".into(),
+        docker_args: vec!["-v".into(), "/host:/c:ro".into()],
+        command: vec!["echo".into(), "hi".into()],
+        detached: false,
+        timeout_secs: None,
+    };
+    let args = framework_core::build_docker_run_args(&spec, "litebox-foo", /*keep*/ false);
+    assert_eq!(
+        args,
+        vec![
+            "run",
+            "--rm",
+            "--name",
+            "litebox-foo",
+            "-v",
+            "/host:/c:ro",
+            "litebox-test",
+            "echo",
+            "hi",
+        ],
+        "foreground spec without keep_containers: run --rm --name … args image command"
+    );
+}
+
+#[test]
+fn build_docker_run_args_detached() {
+    let spec = framework_core::ContainerSpec {
+        image: "litebox-agent-cli".into(),
+        docker_args: vec!["-p".into(), "127.0.0.1:0:22".into()],
+        command: vec!["/usr/sbin/dropbear".into(), "-F".into()],
+        detached: true,
+        timeout_secs: None,
+    };
+    let args = framework_core::build_docker_run_args(&spec, "litebox-dbear", /*keep*/ false);
+    assert_eq!(
+        args[..3],
+        ["run", "-d", "--rm"],
+        "detached: run -d --rm first"
+    );
+    assert!(args.contains(&"-p".to_string()));
+}
+
+#[test]
+fn build_docker_run_args_keep_containers_omits_rm() {
+    let spec = framework_core::ContainerSpec {
+        image: "img".into(),
+        docker_args: vec![],
+        command: vec![],
+        detached: false,
+        timeout_secs: None,
+    };
+    let args = framework_core::build_docker_run_args(&spec, "n", /*keep*/ true);
+    assert!(
+        !args.contains(&"--rm".to_string()),
+        "keep_containers=true should omit --rm: {args:?}"
+    );
+    assert!(args.contains(&"--name".to_string()));
+}
+
+#[test]
+fn build_docker_run_args_timeout_wraps_command() {
+    let spec = framework_core::ContainerSpec {
+        image: "img".into(),
+        docker_args: vec![],
+        command: vec!["/inner".into(), "--flag".into()],
+        detached: false,
+        timeout_secs: Some(75),
+    };
+    let args = framework_core::build_docker_run_args(&spec, "n", false);
+    // Find the image position, then assert timeout wraps after it.
+    let img_idx = args.iter().position(|a| a == "img").unwrap();
+    assert_eq!(
+        &args[img_idx..img_idx + 4],
+        &["img", "timeout", "--signal=KILL", "75"]
+    );
+    assert_eq!(&args[img_idx + 4..], &["/inner", "--flag"]);
+}
+
+#[test]
+fn build_docker_run_args_no_timeout_no_wrap() {
+    let spec = framework_core::ContainerSpec {
+        image: "img".into(),
+        docker_args: vec![],
+        command: vec!["/inner".into()],
+        detached: false,
+        timeout_secs: None,
+    };
+    let args = framework_core::build_docker_run_args(&spec, "n", false);
+    assert!(
+        !args.contains(&"timeout".to_string()),
+        "timeout_secs=None should not emit timeout: {args:?}"
+    );
+}
+
+// ── select_fill_batch: class-based selector unit tests ──────────────
+//
+// Validates the two-class strategy (class 1: uncovered;
+// class 2: failed-with-retries-left) against a synthetic database.
+// Verifies the just-shipped behavior + would catch regressions
+// (e.g. retries cap removed, class 2 always re-runs, passing-at-
+// sha incorrectly re-selected).
+
+use libtest_mimic::Trial;
+
+fn mk_trial(name: &str) -> Trial {
+    Trial::test(name.to_string(), || Ok(()))
+}
+
+/// Set up a fresh dashboard sqlite at `tmp` with the canonical
+/// SCHEMA_DDL applied and ONE `runs` row at the given commit_sha
+/// (clean). Returns (db_path, run_id). Caller opens its own
+/// Connection to pass to `select_fill_batch_inner`. For multiple
+/// attempts at the same sha, call `insert_run_at` to get more
+/// run_ids (each insert_result needs a unique run_id per
+/// (test_id, pass) due to the table's PK).
+fn setup_fill_db(tmp: &str, commit_sha: &str) -> (PathBuf, i64) {
+    std::fs::create_dir_all(tmp).unwrap();
+    let db = PathBuf::from(tmp).join("results.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "busy_timeout", 5000).unwrap();
+    conn.execute_batch(dashboard_store::SCHEMA_DDL).unwrap();
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES('schema_version', ?1)",
+        params![dashboard_store::SCHEMA_VERSION],
+    )
+    .unwrap();
+    let run_id = insert_run_at(&conn, commit_sha, 1000);
+    (db, run_id)
+}
+
+fn insert_run_at(conn: &Connection, commit_sha: &str, started_ts_ms: i64) -> i64 {
+    conn.execute(
+        "INSERT INTO runs(started_ts_ms, hostname, worktree_path, commit_sha, branch)
+         VALUES (?1, 'host', '/wt', ?2, 'main')",
+        params![started_ts_ms, commit_sha],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+fn insert_result(
+    conn: &Connection,
+    run_id: i64,
+    test_id: &str,
+    pass: &str,
+    verdict: &str,
+    finished_ts_ms: i64,
+) {
+    conn.execute(
+        "INSERT INTO run_results(run_id, test_id, pass, verdict, finished_ts_ms,
+                                 suite, \"group\",
+                                 t_acquire_ms, t_docker_start_ms, t_useful_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'fork', 'fork_matrix', 0, 0, 100)",
+        params![run_id, test_id, pass, verdict, finished_ts_ms],
+    )
+    .unwrap();
+}
+
+#[test]
+fn select_fill_batch_class1_picks_uncovered() {
+    let tmp = tempdir_marker("fillc1");
+    let (db, run_id) = setup_fill_db(&tmp, "abc1234");
+    let conn = Connection::open(&db).unwrap();
+
+    let trials = vec![
+        mk_trial("native::FOO.bar"),
+        mk_trial("litebox::FOO.bar"),
+        mk_trial("native::BAR.qux"),
+    ];
+    let picked = dashboard_store::select_fill_batch_inner(
+        &conn,
+        run_id,
+        &trials,
+        dashboard_store::FillCap::Count(10),
+    );
+    assert_eq!(
+        picked.len(),
+        3,
+        "all uncovered trials should be picked: {picked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn select_fill_batch_skips_passing_at_current_sha() {
+    let tmp = tempdir_marker("fillpass");
+    let (db, run_id) = setup_fill_db(&tmp, "abc1234");
+    let conn = Connection::open(&db).unwrap();
+    insert_result(&conn, run_id, "FOO.bar", "native", "pass", 5000);
+
+    let trials = vec![mk_trial("native::FOO.bar"), mk_trial("litebox::FOO.bar")];
+    let picked = dashboard_store::select_fill_batch_inner(
+        &conn,
+        run_id,
+        &trials,
+        dashboard_store::FillCap::Count(10),
+    );
+    assert!(
+        !picked.contains(&"native::FOO.bar".to_string()),
+        "passing-at-sha should be skipped: {picked:?}"
+    );
+    assert!(
+        picked.contains(&"litebox::FOO.bar".to_string()),
+        "uncovered should be picked: {picked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn select_fill_batch_class2_retries_failed_under_cap() {
+    let tmp = tempdir_marker("fillretry");
+    let (db, run_id) = setup_fill_db(&tmp, "abc1234");
+    let conn = Connection::open(&db).unwrap();
+    // Two attempts at the same sha → two separate run rows.
+    insert_result(&conn, run_id, "FOO.bar", "native", "FAIL", 5000);
+    let run2 = insert_run_at(&conn, "abc1234", 2000);
+    insert_result(&conn, run2, "FOO.bar", "native", "FAIL", 6000);
+
+    let trials = vec![mk_trial("native::FOO.bar")];
+    let picked = dashboard_store::select_fill_batch_inner(
+        &conn,
+        run_id,
+        &trials,
+        dashboard_store::FillCap::Count(10),
+    );
+    assert!(
+        picked.contains(&"native::FOO.bar".to_string()),
+        "failed-at-sha with retries left should be picked: {picked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn select_fill_batch_class2_caps_retries() {
+    let tmp = tempdir_marker("fillcap");
+    let (db, run_id) = setup_fill_db(&tmp, "abc1234");
+    let conn = Connection::open(&db).unwrap();
+    // Three attempts at same sha (== default cap).
+    insert_result(&conn, run_id, "FOO.bar", "native", "FAIL", 5000);
+    let run2 = insert_run_at(&conn, "abc1234", 2000);
+    insert_result(&conn, run2, "FOO.bar", "native", "FAIL", 6000);
+    let run3 = insert_run_at(&conn, "abc1234", 3000);
+    insert_result(&conn, run3, "FOO.bar", "native", "FAIL", 7000);
+
+    let trials = vec![mk_trial("native::FOO.bar")];
+    let picked = dashboard_store::select_fill_batch_inner(
+        &conn,
+        run_id,
+        &trials,
+        dashboard_store::FillCap::Count(10),
+    );
+    assert!(
+        !picked.contains(&"native::FOO.bar".to_string()),
+        "attempts == cap should NOT be re-selected: {picked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn select_fill_batch_class1_before_class2() {
+    let tmp = tempdir_marker("fillorder");
+    let (db, run_id) = setup_fill_db(&tmp, "abc1234");
+    let conn = Connection::open(&db).unwrap();
+    insert_result(&conn, run_id, "FOO.bar", "native", "FAIL", 5000);
+
+    let trials = vec![mk_trial("native::FOO.bar"), mk_trial("native::BAR.qux")];
+    let picked = dashboard_store::select_fill_batch_inner(
+        &conn,
+        run_id,
+        &trials,
+        dashboard_store::FillCap::Count(1),
+    );
+    assert_eq!(
+        picked,
+        vec!["native::BAR.qux".to_string()],
+        "class 1 (uncovered) should drain before class 2 (failed): {picked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn select_fill_batch_respects_retries_env() {
+    let tmp = tempdir_marker("fillenvcap");
+    let (db, run_id) = setup_fill_db(&tmp, "abc1234");
+    let conn = Connection::open(&db).unwrap();
+    insert_result(&conn, run_id, "FOO.bar", "native", "FAIL", 5000);
+    let run2 = insert_run_at(&conn, "abc1234", 2000);
+    insert_result(&conn, run2, "FOO.bar", "native", "FAIL", 6000);
+
+    // LITEBOX_FILL_FAIL_RETRIES is a process-global env; each
+    // env-sensitive test must set + restore. Tests that don't
+    // touch this env see the default (3).
+    unsafe { std::env::set_var("LITEBOX_FILL_FAIL_RETRIES", "2") };
+    let trials = vec![mk_trial("native::FOO.bar")];
+    let picked = dashboard_store::select_fill_batch_inner(
+        &conn,
+        run_id,
+        &trials,
+        dashboard_store::FillCap::Count(10),
+    );
+    unsafe { std::env::remove_var("LITEBOX_FILL_FAIL_RETRIES") };
+
+    assert!(
+        !picked.contains(&"native::FOO.bar".to_string()),
+        "LITEBOX_FILL_FAIL_RETRIES=2 with 2 attempts → no re-select: {picked:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn tempdir_marker(tag: &str) -> String {
     let dir = std::env::temp_dir().join(format!(
         "litebox-dashboard-test-{}-{tag}",
