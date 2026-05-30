@@ -172,7 +172,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         }
 
         let outcome = self.backend.walk_directories(from, components)?;
-        self.check_walk_permissions(
+        Self::check_walk_permissions(
             context,
             #[cfg(debug_assertions)]
             absolute_components,
@@ -188,7 +188,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn check_walk_permissions(
-        &self,
         context: &Context,
         #[cfg(debug_assertions)] absolute_components: &[&str],
         outcome: &WalkOutcome<Backend::WalkingDirHandle<'_>>,
@@ -295,7 +294,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
-                return Ok(insert(OwnedHandle::File(file)));
+                Ok(insert(OwnedHandle::File(file)))
             }
             Err(
                 error @ OpenError::PathError(
@@ -314,20 +313,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                             return Err(OpenError::AlreadyExists);
                         }
-                        return Ok(insert(OwnedHandle::Dir(self.backend.owned_dir_at(dir))));
+                        Ok(insert(OwnedHandle::Dir(self.backend.owned_dir_at(dir))))
                     }
                     Err(_) if flags.contains(OFlags::CREAT) => match error {
                         OpenError::PathError(PathError::NoSuchFileOrDirectory) => {
-                            return Ok(insert(OwnedHandle::File(
+                            Ok(insert(OwnedHandle::File(
                                 self.backend.create_file_at(parent, name, mode)?,
-                            )));
+                            )))
                         }
-                        _ => return Err(error),
+                        _ => Err(error),
                     },
-                    Err(_) => return Err(error),
+                    Err(_) => Err(error),
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
     }
 
@@ -591,9 +590,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         let fd = self
             .open(path, OFlags::RDONLY, Mode::empty())
             .map_err(|error| match error {
-                OpenError::Io => FileStatusError::Io,
                 OpenError::PathError(error) => error.into(),
-                OpenError::AccessNotAllowed
+                OpenError::Io
+                | OpenError::AccessNotAllowed
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
@@ -629,6 +628,10 @@ enum OwnedHandle<Backend: super::backend::Backend> {
     Dir(Backend::DirHandle),
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "resolver fd entries carry independent descriptor flags"
+)]
 struct ResolverEntry<Backend: super::backend::Backend> {
     handle: OwnedHandle<Backend>,
     read_allowed: bool,
