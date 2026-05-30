@@ -1518,9 +1518,7 @@ impl<FS: ShimFS> Task<FS> {
                     log_unsupported!("protocol = {protocol}");
                     Errno::EPROTONOSUPPORT
                 })?;
-                // reason: unsupported variants intentionally share this fallback path.
-                #[allow(clippy::wildcard_enum_match_arm)]
-                let protocol = match ty {
+                match ty {
                     SockType::Stream => {
                         if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
                             return Err(Errno::EINVAL);
@@ -1582,7 +1580,7 @@ impl<FS: ShimFS> Task<FS> {
                             })?;
                             return Ok(u32::try_from(raw_fd).unwrap());
                         }
-                        litebox::net::Protocol::Tcp
+                        Err(Errno::EAFNOSUPPORT)
                     }
                     SockType::Datagram => {
                         if !matches!(protocol, IPProtocol::Default | IPProtocol::UDP) {
@@ -1617,7 +1615,7 @@ impl<FS: ShimFS> Task<FS> {
                             })?;
                             return Ok(u32::try_from(raw_fd).unwrap());
                         }
-                        litebox::net::Protocol::Udp
+                        Err(Errno::EAFNOSUPPORT)
                     }
                     SockType::Raw => {
                         if !matches!(protocol, IPProtocol::ICMP) {
@@ -1656,53 +1654,10 @@ impl<FS: ShimFS> Task<FS> {
                             })?;
                             return Ok(u32::try_from(raw_fd).unwrap());
                         }
-                        return Err(Errno::EPROTONOSUPPORT);
+                        Err(Errno::EPROTONOSUPPORT)
                     }
-                    _ => unimplemented!(),
-                };
-                if !crate::WORKER_LOCAL_INET {
-                    if matches!(protocol, litebox::net::Protocol::Tcp) {
-                        unreachable!(
-                            "worker-local Network::socket called for AF_INET TCP — broker-held InetListener/TcpConn is the only valid path under linux_userland default-on"
-                        );
-                    }
-                    if matches!(protocol, litebox::net::Protocol::Udp) {
-                        unreachable!(
-                            "worker-local Network::socket called for AF_INET UDP — broker-held InetDgram is the only valid path under linux_userland default-on"
-                        );
-                    }
-                    if matches!(protocol, litebox::net::Protocol::Icmp) {
-                        unreachable!(
-                            "worker-local Network::socket called for AF_INET raw ICMP — broker-held InetRaw is the only valid path under linux_userland default-on"
-                        );
-                    }
-                    if matches!(protocol, litebox::net::Protocol::Raw { .. }) {
-                        unreachable!(
-                            "worker-local Network::socket called for AF_INET raw — broker-held InetRaw is the only valid path under linux_userland default-on"
-                        );
-                    }
-                }
-                let socket = self.global.net.lock().socket(protocol)?;
-                let _ = self.global.initialize_socket(&socket, ty, flags);
-                #[cfg(feature = "trace_syscalls")]
-                let object_id = socket.object_id().as_u64();
-                let Ok(raw_fd) = files.insert_raw_fd(socket) else {
-                    unimplemented!()
-                };
-                #[cfg(feature = "trace_syscalls")]
-                if raw_fd <= 20 {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[FD-TRACE] pid={} socket raw_fd={} object_id={} domain={:?} type={:?} flags={:?}",
-                        self.pid,
-                        raw_fd,
-                        object_id,
-                        domain,
-                        ty,
-                        flags,
-                    );
-                }
-                raw_fd
+                    SockType::SeqPacket => Err(Errno::ESOCKTNOSUPPORT),
+                }?
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
@@ -1751,9 +1706,7 @@ impl<FS: ShimFS> Task<FS> {
                     log_unsupported!("protocol = {protocol}");
                     Errno::EPROTONOSUPPORT
                 })?;
-                // reason: unsupported variants intentionally share this fallback path.
-                #[allow(clippy::wildcard_enum_match_arm)]
-                let protocol = match ty {
+                match ty {
                     SockType::Stream => {
                         if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
                             return Err(Errno::EINVAL);
@@ -1821,7 +1774,7 @@ impl<FS: ShimFS> Task<FS> {
                                 .insert(u32::try_from(raw_fd).unwrap());
                             return Ok(u32::try_from(raw_fd).unwrap());
                         }
-                        litebox::net::Protocol::Tcp
+                        Err(Errno::EAFNOSUPPORT)
                     }
                     SockType::Datagram => {
                         if !matches!(protocol, IPProtocol::Default | IPProtocol::UDP) {
@@ -1859,21 +1812,11 @@ impl<FS: ShimFS> Task<FS> {
                                 .insert(u32::try_from(raw_fd).unwrap());
                             return Ok(u32::try_from(raw_fd).unwrap());
                         }
-                        litebox::net::Protocol::Udp
+                        Err(Errno::EAFNOSUPPORT)
                     }
-                    _ => return Err(Errno::ESOCKTNOSUPPORT),
-                };
-                let socket = self.global.net.lock().socket(protocol)?;
-                let _ = self.global.initialize_socket(&socket, ty, flags);
-                let Ok(raw_fd) = files.insert_raw_fd(socket) else {
-                    unimplemented!()
-                };
-                // Track this fd as AF_INET6 so getsockname/getpeername
-                // return sockaddr_in6 with v4-mapped addresses.
-                self.inet6_fds
-                    .borrow_mut()
-                    .insert(u32::try_from(raw_fd).unwrap());
-                raw_fd
+                    SockType::Raw => Err(Errno::EPROTONOSUPPORT),
+                    SockType::SeqPacket => Err(Errno::ESOCKTNOSUPPORT),
+                }?
             }
             AddressFamily::NETLINK => {
                 // Create a pipe pair to reserve an fd number. The writer is
