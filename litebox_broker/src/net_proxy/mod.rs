@@ -17,10 +17,13 @@
 
 mod device;
 pub mod dns_tracker;
+mod host_dns;
 mod inbound_forward;
+mod lb9p_handshake;
+mod lbnp_handshake;
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};

@@ -25,4 +25,3 @@ pub(super) fn discover_host_dns() -> Ipv4Addr {
     info!("no host DNS resolver found, using fallback: {fallback}");
     fallback
 }
-

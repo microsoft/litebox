@@ -135,4 +135,3 @@ pub(super) fn send_handshake_response(fd: &IpcStream) -> Result<(), Box<dyn std:
 
     Ok(())
 }
-

@@ -467,4 +467,3 @@ fn spawn_shared_memory_lb9p_connection(stream: IpcStream, ring_spawner: RingServ
         warn!("failed to spawn LB9P ring upgrade thread: {e}");
     }
 }
-
