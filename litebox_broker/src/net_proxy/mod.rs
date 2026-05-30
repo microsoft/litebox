@@ -39,6 +39,7 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Ad
 use tracing::{debug, error, info, trace, warn};
 
 use device::{DEVICE_MTU, IpcDevice};
+use host_dns::discover_host_dns;
 use lb9p_handshake::{PendingLb9pResult, RingServiceSpawner};
 use lbnp_handshake::{
     HANDSHAKE_MAGIC, HANDSHAKE_VERSION, perform_handshake, send_handshake_response,
@@ -2483,27 +2484,6 @@ fn build_udp_packet(
     packet[28..].copy_from_slice(payload);
 
     packet
-}
-
-/// Discover the host's DNS resolver by parsing `/etc/resolv.conf`.
-///
-/// Returns the first `nameserver` entry found, or `8.8.8.8` as a fallback.
-fn discover_host_dns() -> Ipv4Addr {
-    if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
-        for line in content.lines() {
-            let line = line.trim();
-            if let Some(addr_str) = line.strip_prefix("nameserver") {
-                let addr_str = addr_str.trim();
-                if let Ok(addr) = addr_str.parse::<Ipv4Addr>() {
-                    info!("host DNS resolver: {addr}");
-                    return addr;
-                }
-            }
-        }
-    }
-    let fallback = Ipv4Addr::new(8, 8, 8, 8);
-    info!("no host DNS resolver found, using fallback: {fallback}");
-    fallback
 }
 
 #[cfg(test)]
