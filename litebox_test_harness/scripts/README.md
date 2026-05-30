@@ -51,10 +51,13 @@ Each layer cleans up what it started:
 | Harness ↔ cargo bridge | parent-death notification | `PR_SET_PDEATHSIG=SIGTERM` on harness self: cargo SIGKILL → kernel SIGTERMs harness → handler fires |
 
 **Container naming.** Every container is named
-`litebox-{pass}-{test_id}-{harness_pid}-{nanos}`. The `{harness_pid}`
-salt uniquely identifies all containers from one harness invocation,
-which is how the supervisor escalates to cleanup-by-name without
-a shared registry.
+`litebox-{pass}-{test_id}-{harness_pid}-{counter}` where
+`{counter}` is a process-static monotonic `AtomicU64`. The
+`{harness_pid}` salt uniquely identifies all containers from one
+harness invocation (so the supervisor's cleanup-by-name sweep
+finds them); the `{counter}` guarantees uniqueness across
+concurrent dispatches within the same wall-second (the old
+`subsec_nanos()` suffix could collide at high jobs).
 
 **Pidfile.** `<state_dir>/auto.pidfile` is JSON: `{supervisor_pid,
 cargo_pid, cargo_pgid, harness_pid}`. Written when the supervisor
@@ -67,6 +70,48 @@ the harness `setsid`'d into their own sessions, neither could reach
 the other via `killpg`. So only the supervisor creates a new
 session; the harness stays in cargo's PGID and handles its own
 children via the registry + PDEATHSIG bridge.
+
+### Per-trial container lifecycle: `framework::run_trial`
+
+Inside the harness, every test family routes its container
+lifecycle through a single entry point —
+`framework::run_trial(pass, test_id, suite, group, ContainerSpec,
+drive)` (see `tests/common/framework.rs`). It owns:
+
+- dispatch-gate acquire (lease-aware: `LITEBOX_GLOBAL_JOBS / N`)
+- canonical container name allocation
+- `PR_SET_PDEATHSIG=SIGTERM` via `pre_exec` on the docker-run child
+- cleanup-registry register/deregister (keyed by container name
+  so detached and foreground containers coexist cleanly)
+- spawn-drain handoff (foreground) or explicit `docker rm -f`
+  (detached) after the trial's driver returns
+- result recording via the same `emit_timing_main` path used by
+  the standard tests
+
+Per-family variation is **only** the `ContainerSpec` (image,
+container command, docker args, foreground-or-detached, timeout)
+and the `drive` closure (how to obtain a verdict from the running
+container). Adding a new test family (e.g. VS Code) is a new
+image stage in the Dockerfile + a new module that builds its
+`ContainerSpec` + writes a drive closure + calls
+`framework::run_trial` — no new cleanup or throttling code.
+
+Current callers — **all three test families** in the harness now
+go through `framework::run_trial`. No bespoke container lifecycle
+code remains:
+
+- `run_pass_group` (standard coordinator tests) — image
+  `litebox-test`, foreground, drive closure parses JSON line on
+  stdout and scrapes timing markers from stderr.
+- `dropbear_bash::run_scenario` — image `litebox-agent-cli`,
+  detached, drive closure SSHes to the published port and checks
+  bash output. Host-side SSH driving preserved so the test
+  exercises the same docker-bridge → litebox-inbound-TCP path a
+  real user hits.
+- `copilot_cli::run_scenario` — image `litebox-agent-cli`,
+  detached, drive closure runs the Copilot CLI through SSH (pminus
+  or tui mode) and checks the response canary. `CopilotPermit`
+  (Copilot-API rate-limiter) sits above `framework::run_trial`.
 
 ### Sqlite schema (minimal — facts + one config table)
 

@@ -393,6 +393,17 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
         " ORDER BY run_id DESC LIMIT 1"
     ).fetchone()
     universe_n = (universe[0] if universe else 0) or 0
+    # Per-pass universe: distinct test_ids ever observed per pass.
+    # See _render_result_groups for rationale (universe_size from runs
+    # is the grand total across passes — using it as per-pass total
+    # makes coverage look ~50% even at full per-pass coverage).
+    per_pass_universe: dict[str, int] = {
+        r["pass"]: r["n"]
+        for r in conn.execute(
+            'SELECT pass, COUNT(DISTINCT test_id) AS n '
+            'FROM run_results GROUP BY pass'
+        )
+    }
 
     lines = ["## Tracked refs\n",
              "| Ref | Worktree | Pass | HEAD | Coverage trend "
@@ -416,8 +427,9 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
             covered, n_pass, n_fail = _coverage_pass_fail(
                 conn, head_sha, pass_name
             )
+            total = per_pass_universe.get(pass_name) or (universe_n // 2 if universe_n else 0)
             cells.extend([
-                str(universe_n) if universe_n else "?",
+                str(total) if total else "?",
                 str(covered),
                 str(n_pass),
                 str(n_fail),
@@ -578,6 +590,20 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     ).fetchone()
     universe_n = (universe[0] if universe else 0) or 0
 
+    # Per-pass universe: count of distinct test_ids ever observed
+    # per pass. The harness's `universe_size` is the grand total
+    # across both passes (native + litebox + host::fwd) and using it
+    # as the "native total" / "litebox total" column makes coverage
+    # look like ~50% even at full per-pass coverage. Per-pass totals
+    # are stable observables: distinct test_ids per pass.
+    per_pass_universe: dict[str, int] = {
+        r["pass"]: r["n"]
+        for r in conn.execute(
+            'SELECT pass, COUNT(DISTINCT test_id) AS n '
+            'FROM run_results GROUP BY pass'
+        )
+    }
+
     now = now_ms()
     lines = ["## Result groups (per commit × dirty-state)\n",
              "| Tracked ref | Sha | Dirty | Worktree(s) "
@@ -602,8 +628,11 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
         cells: list[str] = []
         for pass_name in ("native", "litebox"):
             cov, n_pass, n_fail = _counts_from_verdicts(g["verdicts"], pass_name)
+            # Per-pass universe; fall back to halved grand total if
+            # the table is empty (very fresh DB).
+            total = per_pass_universe.get(pass_name) or (universe_n // 2 if universe_n else 0)
             cells.extend([
-                str(universe_n) if universe_n else "?",
+                str(total) if total else "?",
                 str(cov),
                 str(n_pass),
                 str(n_fail),
@@ -702,31 +731,122 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
 
 
 def _render_current_fails(conn: sqlite3.Connection) -> str:
-    rows = conn.execute(
-        """
-        SELECT lr.test_id, lr.pass, lr.suite, lr."group",
-               lr.finished_ts_ms,
-               r.commit_sha, r.dirty_hash, r.worktree_path
-          FROM latest_results lr
-          JOIN runs r ON r.run_id = lr.run_id
-         WHERE lr.verdict <> 'pass'
-         ORDER BY lr.pass, lr.suite, lr."group", lr.test_id
-        """
-    ).fetchall()
-    if not rows:
+    """Tests currently FAILING at any active worktree's current head.
+
+    "Current head" is:
+      * Tracked refs: `git rev-parse <ref>` (canonical, authoritative).
+      * Non-tracked worktrees: the commit_sha of that worktree's
+        most-recent run in the last 24 h (best inference — we
+        can't read non-tracked worktrees' git state).
+
+    Filters out **stale-old-sha** fails (worktree has produced
+    newer runs at a different sha — the old fail isn't actionable
+    because the worktree has moved on) while keeping
+    **actively-failing-on-someone's-branch** fails.
+
+    Tracked-ref fails are clearly the canonical CI signal; the
+    non-tracked rows are tagged `_(non-tracked)_` so they're
+    visually distinguishable. Both are useful: tracked tells you
+    "is canonical CI green?", non-tracked tells you "what is
+    another active session currently hitting?".
+
+    A test with mixed last-10 history (both ✓ and ✗) is tagged
+    `_(flaky)_` so flakes are distinguishable from fresh
+    regressions at a glance.
+    """
+    # Tracked refs: authoritative via on-disk git.
+    tracked: dict[str, str] = {}  # worktree_path → ref label
+    tracked_shas: dict[str, str] = {}  # worktree_path → current sha
+    for r in conn.execute("SELECT ref, ci_worktree FROM tracked_refs"):
+        sha = _git_head(r["ci_worktree"])
+        if sha:
+            tracked[r["ci_worktree"]] = r["ref"]
+            tracked_shas[r["ci_worktree"]] = sha
+
+    # Non-tracked worktrees: infer current sha from most recent run.
+    # Limit to last 24 h so abandoned worktrees fall off.
+    now = now_ms()
+    cutoff = now - 24 * 3600 * 1000
+    worktree_shas: dict[str, str] = dict(tracked_shas)
+    for r in conn.execute(
+        "SELECT worktree_path, commit_sha FROM runs WHERE started_ts_ms > ? "
+        "AND (worktree_path, started_ts_ms) IN "
+        "  (SELECT worktree_path, MAX(started_ts_ms) FROM runs "
+        "    WHERE started_ts_ms > ? GROUP BY worktree_path)",
+        (cutoff, cutoff),
+    ):
+        wt = r["worktree_path"]
+        if wt and wt not in worktree_shas and r["commit_sha"]:
+            worktree_shas[wt] = r["commit_sha"]
+
+    if not worktree_shas:
         return "## Current FAILs\n\n_None._\n"
+
+    # For each (worktree, current_sha) pair, find tests whose
+    # freshest verdict at that (clean) state is non-pass.
+    # Dedupe per (test_id, pass, worktree) so the same test
+    # failing on multiple worktrees shows once per worktree.
+    out_rows: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for wt, sha in worktree_shas.items():
+        for r in conn.execute(
+            """
+            SELECT rr.test_id, rr.pass, rr.verdict, rr.suite, rr."group",
+                   rr.finished_ts_ms, r.commit_sha, r.dirty_hash, r.worktree_path
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.commit_sha = ?
+               AND r.worktree_path = ?
+               AND r.dirty_hash IS NULL
+               AND (rr.test_id, rr.pass, rr.finished_ts_ms) IN (
+                    SELECT rr2.test_id, rr2.pass, MAX(rr2.finished_ts_ms)
+                      FROM run_results rr2
+                      JOIN runs r2 ON r2.run_id = rr2.run_id
+                     WHERE r2.commit_sha = ?
+                       AND r2.worktree_path = ?
+                       AND r2.dirty_hash IS NULL
+                     GROUP BY rr2.test_id, rr2.pass
+                   )
+               AND rr.verdict <> 'pass'
+            """,
+            (sha, wt, sha, wt),
+        ):
+            key = (r["test_id"], r["pass"], wt)
+            if key in seen:
+                continue
+            seen.add(key)
+            out_rows.append(dict(r))
+
+    if not out_rows:
+        return "## Current FAILs\n\n_None at any active worktree's current head._\n"
+    out_rows.sort(
+        key=lambda r: (r["pass"], r["suite"], r["group"], r["test_id"], r["worktree_path"])
+    )
+
+    n_tracked = len(tracked_shas)
+    n_other = len(worktree_shas) - n_tracked
+    intro = (
+        f"_Freshest verdict at each worktree's current head (clean). "
+        f"{n_tracked} tracked + {n_other} non-tracked worktree(s) "
+        f"active in last 24 h. Stale fails from older shas "
+        f"(worktree has moved on) are excluded._\n"
+    )
     lines = ["## Current FAILs\n",
+             intro,
              "| Pass | Suite | Group | Test | Worktree | Sha | Dirty "
              "| Last 10 | Age |",
              "|---|---|---|---|---|---|---:|---|---|"]
-    now = now_ms()
-    for r in rows:
+    for r in out_rows:
         dirty = "⚠" if r["dirty_hash"] else ""
         wt_short = os.path.basename(r["worktree_path"] or "?")
+        tracked_marker = "" if r["worktree_path"] in tracked else " _(non-tracked)_"
         history = _verdict_history(conn, r["test_id"], r["pass"], n=10)
+        flaky = ("✓" in history) and ("✗" in history)
+        flaky_marker = " _(flaky)_" if flaky else ""
         lines.append(
             f"| `{r['pass']}` | {r['suite']} | {r['group']} | "
-            f"`{r['test_id']}` | `{wt_short}` | "
+            f"`{r['test_id']}`{flaky_marker} | "
+            f"`{wt_short}`{tracked_marker} | "
             f"`{short_sha(r['commit_sha'])}` | {dirty} | "
             f"`{history}` | {fmt_age_ms(now - r['finished_ts_ms'])} |"
         )

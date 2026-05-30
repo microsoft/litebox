@@ -143,6 +143,16 @@ mod dashboard_store;
 #[path = "common/lease.rs"]
 mod lease;
 
+// ── Per-trial container lifecycle framework ──────────────────────────
+// Single entry point `framework::run_trial(...)` that every test
+// family uses. Owns the dispatch-gate acquire, canonical container
+// name allocation, PR_SET_PDEATHSIG, cleanup-registry registration,
+// spawn_drain / explicit teardown, and emit_timing_main recording.
+// See `tests/common/framework.rs` for the surface + rationale.
+#[allow(dead_code)]
+#[path = "common/framework.rs"]
+mod framework;
+
 fn emit_timing_main(
     test: &str,
     pass: &str,
@@ -676,17 +686,28 @@ fn current_jobs_cap() -> usize {
 }
 
 /// Host-wide budget on concurrent docker children, summed across
-/// all live harnesses. Default `nproc`. Override via
-/// `LITEBOX_GLOBAL_JOBS`.
+/// all live harnesses.
+///
+/// Default `(nproc * 2) / 3` (e.g. 21 on a 32-CPU box). Lower than
+/// raw `nproc` because each litebox-mode container is a small
+/// process stack (PID1 → tool_executor → broker → runner →
+/// test binary), averaging ~1.5 CPU in steady state. At raw nproc
+/// dispatches, the effective load lands around 50, which causes
+/// poll-wakeup-sensitive tests (`SCM.pass_eventfd_poll_wake`,
+/// pty/signalfd timing) to flake. Capping at 2/3 keeps effective
+/// load near nproc.
+///
+/// Override via `LITEBOX_GLOBAL_JOBS` for stress runs.
 fn global_cap() -> usize {
     *GLOBAL_CAP.get_or_init(|| {
         std::env::var("LITEBOX_GLOBAL_JOBS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| {
-                std::thread::available_parallelism()
+                let n = std::thread::available_parallelism()
                     .map(|n| n.get())
-                    .unwrap_or(8)
+                    .unwrap_or(8);
+                (n * 2 / 3).max(2)
             })
     })
 }
@@ -750,24 +771,43 @@ mod cleanup {
     use std::process::{Command, Stdio};
     use std::sync::{Mutex, OnceLock};
 
-    static CHILDREN: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+    /// Per-registered container: the host docker-run PID (used for
+    /// graceful SIGTERM during foreground drain) and a hint about
+    /// whether the docker-run host process is still expected to be
+    /// alive. Detached containers (`docker run -d`) record the
+    /// short-lived docker-run PID which exits as soon as the
+    /// container starts; the `pid_alive` field is set false for
+    /// those so reap_all skips the SIGTERM step.
+    pub(crate) struct ChildEntry {
+        pub pid: u32,
+        pub pid_alive: bool,
+    }
 
-    fn registry() -> &'static Mutex<HashMap<u32, String>> {
+    /// Keyed by **container name** so detached and foreground
+    /// containers coexist cleanly (PID alone is ambiguous: a
+    /// detached docker-run PID exits and may be reused).
+    static CHILDREN: OnceLock<Mutex<HashMap<String, ChildEntry>>> = OnceLock::new();
+
+    fn registry() -> &'static Mutex<HashMap<String, ChildEntry>> {
         CHILDREN.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Register a live `docker run` child + the container name it was
-    /// launched with. Called immediately after `Command::spawn()`.
-    pub(crate) fn register_docker_child(pid: u32, container_name: &str) {
+    /// Register a live container. `pid` is the docker-run host
+    /// process's PID; `pid_alive=true` means it's still running and
+    /// reap_all should SIGTERM it (foreground), `false` means the
+    /// docker-run process already exited (detached) so reap_all
+    /// should only do `docker rm -f`.
+    pub(crate) fn register_docker_child(pid: u32, container_name: &str, pid_alive: bool) {
         if let Ok(mut g) = registry().lock() {
-            g.insert(pid, container_name.to_string());
+            g.insert(container_name.to_string(), ChildEntry { pid, pid_alive });
         }
     }
 
-    /// Deregister a `docker run` child after `wait()` returns.
-    pub(crate) fn deregister_docker_child(pid: u32) {
+    /// Deregister a container after it's been cleaned up (graceful
+    /// drain, explicit teardown, or signal-handler reap).
+    pub(crate) fn deregister_docker_child(container_name: &str) {
         if let Ok(mut g) = registry().lock() {
-            g.remove(&pid);
+            g.remove(container_name);
         }
     }
 
@@ -785,20 +825,25 @@ mod cleanup {
         }
     }
 
-    /// Snapshot the registry and run `docker rm -f` + SIGTERM on each
-    /// entry in parallel-bounded fashion. Best-effort: any individual
-    /// failure is logged and skipped. Returns when all entries have
-    /// been processed (or 30 s elapsed, whichever first).
+    /// Snapshot the registry and run `docker rm -f` + (for
+    /// foreground entries) SIGTERM on each entry in parallel-bounded
+    /// fashion. Best-effort: any individual failure is logged and
+    /// skipped. Returns when all entries have been processed (or
+    /// 30 s elapsed, whichever first).
     pub(crate) fn reap_all() {
-        let snapshot: Vec<(u32, String)> = registry()
+        let snapshot: Vec<(String, u32, bool)> = registry()
             .lock()
-            .map(|g| g.iter().map(|(k, v)| (*k, v.clone())).collect())
+            .map(|g| {
+                g.iter()
+                    .map(|(name, e)| (name.clone(), e.pid, e.pid_alive))
+                    .collect()
+            })
             .unwrap_or_default();
         if snapshot.is_empty() {
             return;
         }
         eprintln!(
-            "[cleanup] reaping {} in-flight docker run children",
+            "[cleanup] reaping {} in-flight docker containers",
             snapshot.len()
         );
         // Bound parallelism to 8: each `docker rm -f` is a daemon RPC
@@ -806,8 +851,9 @@ mod cleanup {
         let chunk = 8usize;
         for batch in snapshot.chunks(chunk) {
             let mut threads = Vec::with_capacity(batch.len());
-            for (pid, name) in batch {
+            for (name, pid, pid_alive) in batch {
                 let pid = *pid;
+                let pid_alive = *pid_alive;
                 let name = name.clone();
                 threads.push(std::thread::spawn(move || {
                     // 5 s timeout on the docker call via timeout(1).
@@ -816,11 +862,15 @@ mod cleanup {
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
-                    // SAFETY: pid came from std::process::Child::id()
-                    // of a child we own; SIGTERM is the documented
-                    // signal for orderly shutdown.
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
+                    if pid_alive {
+                        // SAFETY: pid came from std::process::Child::id()
+                        // of a child we own; SIGTERM is the documented
+                        // signal for orderly shutdown. For detached
+                        // entries (pid_alive=false) the PID was already
+                        // reaped and could be reused — skip the kill.
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGTERM);
+                        }
                     }
                 }));
             }
@@ -864,228 +914,126 @@ fn sanitize_id(id: &str) -> String {
         .collect()
 }
 
-fn test_container_suffix(test_id: &str) -> &'static str {
-    if test_id.starts_with("IOR.") {
-        "-ior"
-    } else if test_id.starts_with("RAND.") {
-        "-rand"
-    } else if test_id.starts_with("CL3.vfork.") {
-        "-cl3v"
-    } else if test_id.starts_with("INO.") {
-        "-ino"
-    } else if test_id.starts_with("SCM.") {
-        "-scm"
-    } else {
-        ""
+/// Build the inner docker-run args (everything after `docker run`
+/// `[--rm]`) for a standard coordinator-suite trial. Mirrors what
+/// the now-deleted `build_docker_cmd` constructed, but as data
+/// (Vec<String>) so `framework::run_trial` can own the actual
+/// docker invocation.
+fn build_standard_docker_args(pass: &str, test_id: &str, bins: &BinaryPaths) -> Vec<String> {
+    let mut v: Vec<String> = Vec::with_capacity(40);
+    // Skip the first two args of `docker_run_base_args` (`run` +
+    // possibly `--rm`) — framework owns those. Everything after
+    // that is uniform across families and we want to preserve it.
+    let mut base = docker_run_base_args().into_iter();
+    let _ = base.next(); // "run"
+    if !keep_containers() {
+        let _ = base.next(); // "--rm"
     }
+    v.extend(base);
+    if test_id.starts_with("IOR.") {
+        // Docker's default seccomp profile blocks io_uring_setup
+        // with EPERM, hiding the WSL2/native kernel baseline this
+        // family is meant to test.
+        v.push("--security-opt".into());
+        v.push("seccomp=unconfined".into());
+    }
+    let mounts = [
+        (&bins.pie_glibc, "/opt/litebox"),
+        (&bins.nonpie_glibc, "/opt/nonpie"),
+        (&bins.static_pie_glibc, "/opt/static-pie-glibc"),
+        (&bins.static_pie_musl, "/opt/static-pie-musl"),
+        (&bins.non_pie_static_musl, "/opt/non-pie-static-musl"),
+    ];
+    for (src, dst) in mounts {
+        v.push("-v".into());
+        v.push(format!("{}:{dst}:ro", src.display()));
+    }
+    v.push("-v".into());
+    v.push(format!("{}:/litebox-test-logs", log_dir().display()));
+    v.push("-e".into());
+    v.push(format!(
+        "LITEBOX_TIMING_PATH=/litebox-test-logs/{}",
+        timing_log_path_for(pass, test_id)
+            .file_name()
+            .expect("timing_log_path_for has file name")
+            .to_string_lossy(),
+    ));
+    v.push("-v".into());
+    v.push(format!(
+        "{}:/litebox-broker-elf-cache",
+        broker_elf_cache_dir().display()
+    ));
+    v.push("-e".into());
+    v.push("LITEBOX_BROKER_ELF_CACHE_DIR=/litebox-broker-elf-cache".into());
+    if pass == "native" {
+        v.push("-e".into());
+        v.push("LITEBOX_TIMING_CONTAINER_PID1=1".into());
+    }
+    v
 }
 
-/// Build the docker command for a single-test run. We pass `--name`
-/// so the container is identifiable in `docker ps` and so
-/// `LITEBOX_KEEP_CONTAINER` users can find it after the test
-/// finishes; the orchestrator never force-kills it externally.
-fn build_docker_cmd(
-    pass: &str,
-    test_id: &str,
-    container_name: &str,
-    bins: &BinaryPaths,
-) -> Command {
+/// Build the full `ContainerSpec` for a standard coordinator-suite
+/// trial. Native pass: bare `litebox_test_harness spawn-tree`. Litebox
+/// pass: wrap with `timeout --signal=KILL N litebox_tool_executor … --
+/// litebox_test_harness spawn-tree`. The inner `timeout` is embedded
+/// in `spec.command` rather than using `spec.timeout_secs` because
+/// only the litebox path needs it (and only around the inner
+/// tool_executor command).
+fn build_standard_spec(pass: &str, test_id: &str) -> framework::ContainerSpec {
+    let (_, bins) = setup();
+    let docker_args = build_standard_docker_args(pass, test_id, &bins);
     let filter = format!("--filter={test_id}");
-    let mut cmd = Command::new("docker");
-    // Set PR_SET_PDEATHSIG=SIGTERM on the docker-run child so it
-    // self-terminates if this harness dies abruptly (e.g. cargo
-    // SIGKILL'd by dashboard timeout escalation, before the harness's
-    // own signal handler ran). With `--rm` set on the run, the
-    // ensuing exit cleans up the container.
-    //
-    // SAFETY: `pre_exec` runs after `fork(2)` and before `execve(2)`
-    // in a single-threaded post-fork context where the only safe
-    // operations are async-signal-safe ones. `prctl(2)` is
-    // async-signal-safe (see signal-safety(7)). The flag is process-
-    // private and has no global side effects beyond this child.
-    use std::os::unix::process::CommandExt;
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
-            Ok(())
-        });
-    }
-    cmd.args(docker_run_base_args())
-        .arg("--name")
-        .arg(container_name);
-    if test_id.starts_with("IOR.") {
-        // Docker's default seccomp profile blocks io_uring_setup with EPERM,
-        // hiding the WSL2/native kernel baseline this family is meant to test.
-        cmd.args(["--security-opt", "seccomp=unconfined"]);
-    }
-    // Each binary-type leg is mounted at `/opt/<label>/` so the
-    // corresponding `find_*_binary()` helpers in lib.rs find them.
-    cmd.arg("-v")
-        .arg(format!("{}:/opt/litebox:ro", bins.pie_glibc.display()))
-        .arg("-v")
-        .arg(format!("{}:/opt/nonpie:ro", bins.nonpie_glibc.display()))
-        .arg("-v")
-        .arg(format!(
-            "{}:/opt/static-pie-glibc:ro",
-            bins.static_pie_glibc.display()
-        ))
-        .arg("-v")
-        .arg(format!(
-            "{}:/opt/static-pie-musl:ro",
-            bins.static_pie_musl.display()
-        ))
-        .arg("-v")
-        .arg(format!(
-            "{}:/opt/non-pie-static-musl:ro",
-            bins.non_pie_static_musl.display()
-        ));
-    // For litebox pass, no additional mounts are needed for the
-    // harness binaries — pre-rewriting is amortised in the broker's
-    // persistent ELF cache (LITEBOX_BROKER_ELF_CACHE_DIR) which
-    // setup() pre-populates from rewrites of all 5 variants. The
-    // broker hits the disk cache on first 9P read and never invokes
-    // the rewriter at runtime. Native pass gets the original
-    // (unmodified) binaries via the directory bind mounts above.
-    cmd.arg("-v")
-        // Bind-mount the host test-logs/ directory into the container so
-        // all in-container processes (tool_executor, broker, runner, the
-        // in-guest harness) can append timing markers via
-        // `litebox_timing::emit` to a per-trial file. WSL2 + Docker
-        // returns EACCES on a single-file bind-mount even when the
-        // container runs as root, so we bind-mount the directory and
-        // each component opens the per-trial file name.
-        .arg(format!("{}:/litebox-test-logs", log_dir().display()))
-        .args([
-            "-e",
-            &format!(
-                "LITEBOX_TIMING_PATH=/litebox-test-logs/{}",
-                timing_log_path_for(pass, test_id)
-                    .file_name()
-                    .expect("timing_log_path_for has file name")
-                    .to_string_lossy(),
-            ),
-        ])
-        // Bind-mount a persistent host directory for the broker's
-        // pre-warmed ELF cache. Without this, each test pays
-        // ~400ms in pre_warm_elf_cache for libc/ld-linux/libstdc++/etc.
-        // because the broker is per-container and its in-memory
-        // cache is cold on every spawn.
-        .arg("-v")
-        .arg(format!(
-            "{}:/litebox-broker-elf-cache",
-            broker_elf_cache_dir().display()
-        ))
-        .args([
-            "-e",
-            "LITEBOX_BROKER_ELF_CACHE_DIR=/litebox-broker-elf-cache",
-        ]);
-    if pass == "native" {
-        cmd.args(["-e", "LITEBOX_TIMING_CONTAINER_PID1=1"]);
-    }
-    cmd.arg("litebox-test");
-    match pass {
-        "native" => {
-            cmd.arg("/opt/litebox/litebox_test_harness")
-                .arg("spawn-tree")
-                .arg(&filter);
-        }
+    let command: Vec<String> = match pass {
+        "native" => vec![
+            "/opt/litebox/litebox_test_harness".into(),
+            "spawn-tree".into(),
+            filter,
+        ],
         "litebox" => {
-            // Outer timeout = per-test harness budget + 15 s grace
-            // for teardown_tree (5 s cap) and container shutdown.
-            // Replaces the previous blanket 120 s, which made
-            // failing fast-tests cost 120 s each.
             let outer = test_timeout_secs(test_id).saturating_add(15);
-            let outer_str = outer.to_string();
-            cmd.args(["timeout", "--signal=KILL"])
-                .arg(&outer_str)
-                .args([
-                    "/opt/litebox/litebox_tool_executor",
-                    "--rootfs",
-                    "/",
-                    "--record-baseline",
-                    "--",
-                    "/opt/litebox/litebox_test_harness",
-                    "spawn-tree",
-                ])
-                .arg(&filter);
+            vec![
+                "timeout".into(),
+                "--signal=KILL".into(),
+                outer.to_string(),
+                "/opt/litebox/litebox_tool_executor".into(),
+                "--rootfs".into(),
+                "/".into(),
+                "--record-baseline".into(),
+                "--".into(),
+                "/opt/litebox/litebox_test_harness".into(),
+                "spawn-tree".into(),
+                filter,
+            ]
         }
         _ => panic!("unknown pass: {pass}"),
+    };
+    framework::ContainerSpec {
+        image: "litebox-test".to_string(),
+        docker_args,
+        command,
+        detached: false,
+        timeout_secs: None,
     }
-    cmd
 }
 
-/// Per-trial log directory. Each Trial writes its docker stdout +
-/// stderr here so failure investigation is trivial. libtest-mimic
-/// captures test-function stdout (where the harness emits its JSON
-/// result detail), so without these files the only thing visible in
-/// `cargo test` output for a failed trial is the bare "FAILED" line.
-fn log_dir() -> &'static PathBuf {
-    static LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    LOG_DIR.get_or_init(|| {
-        let dir = target_dir().join("test-logs");
-        let _ = std::fs::create_dir_all(&dir);
-        dir
-    })
-}
-
-/// Path to a per-Trial log file. `kind` is "stdout" or "stderr".
-/// Overwritten on every run; we don't accumulate across runs.
-fn log_path_for(pass: &str, test_id: &str, kind: &str) -> PathBuf {
-    log_dir().join(format!("{pass}-{}.{kind}.log", sanitize_id(test_id)))
-}
-
-/// Run one test and return its JSON result. Holds an `active_jobs`
-/// Run one test and return its JSON result. Holds an `active_jobs`
-/// permit for the duration of the result-bearing phase, then hands
-/// the still-running child off to a background drain thread that
-/// holds a `drain_backlog` permit until the container exits.
-///
-/// Per-Trial logs (`target/test-logs/<pass>-<id>.{stdout,stderr}.log`)
-/// are written via the OS:
-///   * stderr — `Stdio::from(File::create(...))` so the docker
-///     daemon writes straight to disk; no in-process forwarding.
-///   * stdout — we still parse line by line for the JSON result,
-///     but each line is written to the stdout log file as it
-///     arrives.
-///
-/// Both files are populated synchronously while we still hold the
-/// `active_jobs` permit, so they're durable even if cargo-test exits
-/// the moment we return — no need for a drain-side join hook.
-fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> {
+/// Drive closure body for a standard coordinator-suite trial.
+/// Owns: stderr-thread for timing-marker scraping, stdout-line
+/// parse for the JSON verdict, file-based timing marker
+/// computation, runtime-rewrite invariant check. Returns a
+/// `DriveResult` for `framework::run_trial` to record + spawn_drain
+/// the still-running child.
+fn parse_standard_verdict(
+    pass: &str,
+    test_id: &str,
+    child: &mut std::process::Child,
+) -> framework::DriveResult {
     use std::io::Write as _;
-    let t_start = Instant::now();
-    let permit = active_jobs().acquire();
-    let t_acquired = Instant::now();
-    let t_acquire_ms = t_acquired.duration_since(t_start).as_millis();
-    let (_, bins) = setup();
-    let container_name = format!(
-        "litebox-{}-{}{}-{}-{}",
-        pass,
-        sanitize_id(test_id),
-        test_container_suffix(test_id),
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    );
-
+    let t_spawn = Instant::now();
+    let docker_run_invoke_ns = monotonic_nanos();
     let stdout_log = log_path_for(pass, test_id, "stdout");
     let stderr_log = log_path_for(pass, test_id, "stderr");
     let timing_log = timing_log_path_for(pass, test_id);
     ensure_timing_log_file(&timing_log);
-
-    let mut cmd = build_docker_cmd(pass, test_id, &container_name, &bins);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let label = format!("{pass}[{test_id}]");
-    let t_spawn = Instant::now();
-    let docker_run_invoke_ns = monotonic_nanos();
-    let mut child = cmd
-        .spawn()
-        .unwrap_or_else(|e| panic!("docker spawn failed for {label}: {e}"));
-
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
     let timing_markers = Arc::new(Mutex::new(TimingMarkers::default()));
@@ -1104,10 +1052,6 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
             let _ = writeln!(stderr_log_file, "{line}");
         }
     });
-
-    // Read stdout line by line; tee each line to the stdout log
-    // file, and record the first JSON line whose "test" field
-    // matches our test_id.
     let mut stdout_log_file = std::fs::File::create(&stdout_log)
         .unwrap_or_else(|e| panic!("create {}: {e}", stdout_log.display()));
     let mut found: Option<serde_json::Value> = None;
@@ -1123,34 +1067,12 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
             && v.get("test").and_then(|t| t.as_str()) == Some(test_id)
         {
             found = Some(v);
-            // Don't break — keep tee'ing later lines into
-            // the log so post-result harness output (e.g.
-            // teardown_tree messages) is captured for
-            // forensics. The drain thread takes over when
-            // we return and finishes draining the rest.
             break;
         }
     }
     let t_json = Instant::now();
     let t_json_ns = monotonic_nanos();
-
     let t_first_byte = t_first_byte.unwrap_or(t_json);
-    // Markers come from two sources:
-    //   * The bind-mounted timing-log file: tool_executor + broker +
-    //     runner + in-guest harness append `name=ns\n` via
-    //     `litebox_timing::emit`. All on host CLOCK_MONOTONIC EXCEPT
-    //     the in-guest harness in litebox pass, whose clock is
-    //     virtualized.
-    //   * The stderr `[TIMING] harness_first_output_ns=` proxy line
-    //     from the harness — used as a host-side arrival_ns boundary
-    //     for `harness_first_output_ns` in litebox pass (where the
-    //     guest's CLOCK_MONOTONIC value is not comparable to the
-    //     host-side markers).
-    // We pre-populate from the file first (all init markers are
-    // flushed by the time the JSON result line arrives on stdout),
-    // then merge the stderr snapshot — `record_timing_marker` is
-    // first-wins so the stderr arrival_ns proxy overrides the
-    // file's virtual-clock value when both are present.
     let mut markers = TimingMarkers::default();
     let mut runtime_rewrites: Vec<String> = Vec::new();
     {
@@ -1187,14 +1109,6 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         .harness_first_output_ns
         .and_then(|ns| ns_delta_ms(ns, t_json_ns))
         .unwrap_or_else(|| t_json.duration_since(t_first_byte).as_millis());
-    // Runtime-rewrite assertion: every binary the test loaded should
-    // have been pre-populated in the broker ELF cache (harness
-    // variants from setup(), shared libraries from
-    // pre_warm_elf_cache). A non-empty list means some binary was
-    // rewritten in-band, which costs ~hundreds of ms per file —
-    // worth surfacing as a perf bug to investigate, not silently
-    // tolerating. Override with `LITEBOX_ALLOW_RUNTIME_REWRITES=1`
-    // for one-off debugging.
     let allow_runtime_rewrites = std::env::var_os("LITEBOX_ALLOW_RUNTIME_REWRITES").is_some();
     if pass == "litebox" && !runtime_rewrites.is_empty() && !allow_runtime_rewrites {
         let mut unique: Vec<String> = runtime_rewrites.clone();
@@ -1213,7 +1127,6 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
             "detail": detail,
         }));
     }
-
     let verdict: &'static str = match &found {
         Some(v) => match v.get("result").and_then(|r| r.as_str()) {
             Some("pass") => "pass",
@@ -1222,63 +1135,55 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         },
         None => "no_result",
     };
-    let pass_static: &'static str = match pass {
-        "native" => "native",
-        "litebox" => "litebox",
-        _ => "unknown",
-    };
-    let jobs = current_jobs_cap();
-
     let sub_phases = SubPhaseMs::compute(&markers);
-
-    // Suite/group come from the canonical in-process registry, not
-    // from the in-container JSON line — so even if the container is
-    // reaped before printing (timeout, etc), the dashboard rows are
-    // always labeled correctly.
-    let (suite_static, group_static) = test_suite_group(test_id).expect(
-        "test_id missing from registry — emit_timing_main only \
-                 reachable from run_pass_group, which iterates get_test_ids",
-    );
-
-    // Emit the main timing line synchronously (drain may get cut off
-    // if cargo-test exits early).
-    emit_timing_main(
-        test_id,
-        pass_static,
-        suite_static,
-        group_static,
-        t_acquire_ms,
+    let detail = match (verdict, &found) {
+        ("pass", _) => None,
+        ("FAIL", Some(v)) => Some(format!(
+            "{pass}::{test_id}: {} (logs: {} {})",
+            v.get("detail").and_then(|d| d.as_str()).unwrap_or(""),
+            stdout_log.display(),
+            stderr_log.display(),
+        )),
+        ("no_result", _) => Some(format!(
+            "{pass}[{test_id}]: no JSON result for {test_id} on stdout (full log: {})",
+            stdout_log.display(),
+        )),
+        _ => Some(format!(
+            "{pass}::{test_id}: unexpected verdict {verdict} (logs: {} {})",
+            stdout_log.display(),
+            stderr_log.display(),
+        )),
+    };
+    framework::DriveResult {
+        verdict,
+        detail,
         t_docker_start_ms,
+        t_useful_ms,
+        sub_phases,
         t_docker_spawn_ms,
         t_litebox_init_ms,
         t_harness_load_ms,
-        &sub_phases,
-        t_useful_ms,
-        verdict,
-        jobs,
-    );
+    }
+}
 
-    // Hand off the still-running child to a drain worker. It just
-    // waits for clean exit so we bound zombies / per-host docker
-    // population. Logs are already on disk (stderr via Stdio::from,
-    // stdout via the tee above). The drain thread emits its own
-    // t_drain_ms line when wait() returns.
-    spawn_drain(
-        child,
-        container_name.clone(),
-        test_id.to_string(),
-        pass_static,
-        t_json,
-    );
-    drop(permit);
-
-    found.ok_or_else(|| {
-        format!(
-            "{label}: no JSON result for {test_id} on stdout (full log: {})",
-            stdout_log.display(),
-        )
-        .into()
+/// Per-trial log directory. Each Trial writes its docker stdout +
+/// stderr here so failure investigation is trivial. libtest-mimic
+/// captures test-function stdout (where the harness emits its JSON
+/// result detail), so without these files the only thing visible in
+/// `cargo test` output for a failed trial is the bare "FAILED" line.
+fn log_dir() -> &'static PathBuf {
+    static LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    LOG_DIR.get_or_init(|| {
+        let dir = target_dir().join("test-logs");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
     })
+}
+
+/// Path to a per-Trial log file. `kind` is "stdout" or "stderr".
+/// Overwritten on every run; we don't accumulate across runs.
+fn log_path_for(pass: &str, test_id: &str, kind: &str) -> PathBuf {
+    log_dir().join(format!("{pass}-{}.{kind}.log", sanitize_id(test_id)))
 }
 
 /// Wall-clock cap on the post-result drain phase. The drain thread
@@ -1334,7 +1239,7 @@ fn spawn_drain(
         let cname = container_name;
         // Register so the top-level SIGTERM handler can reap us if the
         // harness is asked to shut down before this drain completes.
-        cleanup::register_docker_child(pid as u32, &cname);
+        cleanup::register_docker_child(pid as u32, &cname, /* pid_alive */ true);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let cname_for_watchdog = cname.clone();
         let watchdog = std::thread::spawn(move || {
@@ -1360,7 +1265,7 @@ fn spawn_drain(
         let _ = child.wait();
         let _ = tx.send(());
         let _ = watchdog.join();
-        cleanup::deregister_docker_child(pid as u32);
+        cleanup::deregister_docker_child(&cname);
         let t_drain_ms = t_drain_start.elapsed().as_millis();
         emit_timing_drain(&test_id, pass, t_drain_ms);
     });
@@ -1640,23 +1545,27 @@ fn is_fill_arg(a: &str) -> bool {
 
 // ── Per-Trial runner ─────────────────────────────────────────────────
 
-/// Run one Trial: spawn its own `docker run` with `--filter=<test_id>`,
-/// read the JSON result, return pass/fail.
-fn run_pass_group(pass: &str, test_id: &str) -> Result<(), Failed> {
-    let result = run_one_test(pass, test_id)?;
-    let outcome = result["result"].as_str().unwrap_or("?");
-    if outcome == "FAIL" {
-        let detail = result["detail"].as_str().unwrap_or("");
-        let stdout_log = log_path_for(pass, test_id, "stdout");
-        let stderr_log = log_path_for(pass, test_id, "stderr");
-        return Err(format!(
-            "{pass}::{test_id}: {detail} (logs: {} {})",
-            stdout_log.display(),
-            stderr_log.display(),
-        )
-        .into());
-    }
-    Ok(())
+/// Run one Trial: build a `ContainerSpec` + drive closure + call
+/// `framework::run_trial`. The framework owns the entire trial
+/// lifecycle (gate, name, PDEATHSIG, registry, spawn-drain handoff,
+/// recording). The drive closure does the standard-family work:
+/// parse the in-container JSON verdict from stdout + scrape timing
+/// markers from stderr. See `parse_standard_verdict` and
+/// `tests/common/framework.rs`.
+fn run_pass_group(pass: &'static str, test_id: &str) -> Result<(), Failed> {
+    let (suite, group) = test_suite_group(test_id).expect(
+        "test_id missing from registry — run_pass_group only \
+         reachable from Trials generated over get_test_ids()",
+    );
+    let test_id_owned = test_id.to_string();
+    let spec = build_standard_spec(pass, test_id);
+    framework::run_trial(pass, test_id, suite, group, spec, move |container| {
+        let child = container
+            .child
+            .as_mut()
+            .expect("foreground spec → child is Some");
+        parse_standard_verdict(pass, &test_id_owned, child)
+    })
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -2833,12 +2742,6 @@ mod copilot {
             }
             std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
         }
-        // For `build`, the workspace itself needs to be visible inside
-        // the container. Symlinks won't work (target path doesn't
-        // exist inside container). Bind-mount the host workspace at
-        // /workspace/litebox-src via an extra `-v` flag in the
-        // container spawn. The flag is added at ContainerHandle::spawn
-        // time based on scenario_id.
         // Token env file inside the bind-mounted workspace. Mode 0600.
         // dropbear strips env vars from session children (only PATH /
         // HOME / SHELL / USER / LOGNAME / MAIL survive), so we can't
@@ -2847,188 +2750,205 @@ mod copilot {
         let token_env_path = fixture_dir.join(".copilot-env");
         super::write_token_env(&token_env_path, token())?;
 
-        // Spawn container.
-        let container =
-            ContainerHandle::spawn(pass, scenario_id, mode, &fixture_dir, scn.id == "build")?;
-        let port = container.ssh_port;
+        let pass_static: &'static str = match pass {
+            "native" => "native",
+            "litebox" => "litebox",
+            _ => "unknown",
+        };
+        let test_id = format!("copilot::{mode}.{scenario_id}");
+        let mount_workspace_src = scn.id == "build";
+        let spec = build_copilot_spec(pass, &fixture_dir, mount_workspace_src);
 
-        // Wait for sshd to listen.
-        wait_for_sshd(port, Duration::from_secs(30))?;
-
-        // Build the response by running the appropriate mode.
         let prompt_text = (scn.prompt)(&canary);
-        let response = match mode {
-            "pminus" => drive_pminus(port, &prompt_text, scn.timeout_secs)?,
-            "tui" => drive_tui(port, &prompt_text, scn.timeout_secs)?,
-            _ => return Err(format!("unknown mode {mode}").into()),
+        let check: fn(&str, &str) -> bool = scn.check;
+        let timeout_secs = scn.timeout_secs;
+        let canary_clone = canary.clone();
+        let pass_owned = pass.to_string();
+        let mode_owned = mode.to_string();
+        let scenario_id_owned = scenario_id.to_string();
+        let prompt_text_for_log = prompt_text.clone();
+        let canary_for_log = canary.clone();
+
+        let group_static: &'static str = match mode {
+            "pminus" => "pminus",
+            "tui" => "tui",
+            _ => "unknown",
         };
 
-        // Persist the raw + ANSI-stripped transcript for forensics.
-        // Path mirrors test-logs convention so debuggers know where
-        // to look.
-        let log_dir = super::log_dir();
-        let _ = std::fs::create_dir_all(&log_dir);
-        let safe = format!("copilot-{pass}-{mode}-{scenario_id}");
-        let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &response);
-        let _ = std::fs::write(
-            log_dir.join(format!("{safe}.stripped.log")),
-            strip_ansi(&response),
-        );
-        let _ = std::fs::write(
-            log_dir.join(format!("{safe}.prompt.txt")),
-            format!("canary={canary}\n\n--- prompt ---\n{prompt_text}\n"),
-        );
+        super::framework::run_trial(
+            pass_static,
+            &test_id,
+            "copilot_cli",
+            group_static,
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!(
+                            "container {} did not publish port 22",
+                            container.name
+                        )),
+                        t_docker_start_ms: 0,
+                        t_useful_ms: 0,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                };
+                if let Err(e) = wait_for_sshd(port, Duration::from_secs(30)) {
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!("wait_for_sshd port {port}: {e}")),
+                        t_docker_start_ms: t_dispatch.elapsed().as_millis(),
+                        t_useful_ms: 0,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
 
-        // Verdict.
-        let ok = (scn.check)(&canary, &response);
-        if !ok {
-            let preview: String = strip_ansi(&response).chars().take(800).collect();
-            return Err(format!(
-                "{pass}::copilot::{mode}.{scenario_id} \
-                 canary check failed.\n\
-                 canary={canary}\n\
-                 transcript: {}\n\
-                 first 800 chars of response (ANSI-stripped):\n{preview}",
-                log_dir.join(format!("{safe}.stripped.log")).display(),
-            )
-            .into());
+                let response = match mode_owned.as_str() {
+                    "pminus" => drive_pminus(port, &prompt_text, timeout_secs),
+                    "tui" => drive_tui(port, &prompt_text, timeout_secs),
+                    _ => Err(format!("unknown mode {mode_owned}")),
+                };
+                let response = match response {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return super::framework::DriveResult {
+                            verdict: "FAIL",
+                            detail: Some(format!("drive: {e}")),
+                            t_docker_start_ms,
+                            t_useful_ms: t_useful_start.elapsed().as_millis(),
+                            sub_phases: super::SubPhaseMs::default(),
+                            t_docker_spawn_ms: None,
+                            t_litebox_init_ms: None,
+                            t_harness_load_ms: None,
+                        };
+                    }
+                };
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("copilot-{pass_owned}-{mode_owned}-{scenario_id_owned}");
+                let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &response);
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.stripped.log")),
+                    strip_ansi(&response),
+                );
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.prompt.txt")),
+                    format!("canary={canary_for_log}\n\n--- prompt ---\n{prompt_text_for_log}\n"),
+                );
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+
+                let ok = check(&canary_clone, &response);
+                if !ok {
+                    let preview: String = strip_ansi(&response).chars().take(800).collect();
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!(
+                            "copilot::{mode_owned}.{scenario_id_owned} canary check failed.\n\
+                             canary={canary_clone}\n\
+                             transcript: {}\n\
+                             first 800 chars of response (ANSI-stripped):\n{preview}",
+                            log_dir.join(format!("{safe}.stripped.log")).display(),
+                        )),
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+                super::framework::DriveResult {
+                    verdict: "pass",
+                    detail: None,
+                    t_docker_start_ms,
+                    t_useful_ms,
+                    sub_phases: super::SubPhaseMs::default(),
+                    t_docker_spawn_ms: None,
+                    t_litebox_init_ms: None,
+                    t_harness_load_ms: None,
+                }
+            },
+        )
+    }
+
+    /// Build the `ContainerSpec` for a copilot_cli scenario. Mirrors
+    /// what `ContainerHandle::spawn` used to construct, but returns
+    /// data instead of spawning — `framework::run_trial` owns the
+    /// docker invocation + lifecycle.
+    fn build_copilot_spec(
+        pass: &str,
+        fixture_dir: &Path,
+        mount_workspace_src: bool,
+    ) -> super::framework::ContainerSpec {
+        let ws_root = super::workspace_root();
+        let bin_dir = super::debug_dir();
+        let mut docker_args: Vec<String> = vec![
+            "--cap-add".into(),
+            "SYS_PTRACE".into(),
+            "-p".into(),
+            "127.0.0.1:0:22".into(),
+            "-v".into(),
+            format!("{}:/opt/litebox:ro", bin_dir.display()),
+            "-v".into(),
+            format!("{}:/workspace", fixture_dir.display()),
+        ];
+        for var in [
+            "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+            "LITEBOX_BROKER_TCP_CONN",
+            "LITEBOX_BROKER_INET_RAW",
+            "LITEBOX_BROKER_INET_DELAY_NS",
+            "LITEBOX_PE10_DIAG",
+            "LITEBOX_PE5_DIAG",
+            "LITEBOX_CLEANUP_DELAY_MS",
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                docker_args.push("-e".into());
+                docker_args.push(format!("{var}={val}"));
+            }
         }
-        Ok(())
-    }
-
-    /// Owned container that destroys itself on Drop.
-    pub(super) struct ContainerHandle {
-        name: String,
-        pub(super) ssh_port: u16,
-    }
-
-    impl ContainerHandle {
-        pub(super) fn spawn(
-            pass: &str,
-            scenario_id: &str,
-            mode: &str,
-            fixture_dir: &Path,
-            mount_workspace_src: bool,
-        ) -> Result<Self, String> {
-            let ws_root = super::workspace_root();
-            let bin_dir = super::debug_dir();
-            let pid = std::process::id();
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let name = format!("litebox-copilot-{pass}-{mode}-{scenario_id}-{pid}-{nanos}");
-
-            // CMD per pass.
-            let mut cmd = Command::new("docker");
-            cmd.arg("run").arg("-d");
-            if !super::keep_containers() {
-                cmd.arg("--rm");
-            }
-            cmd.args(["--name", &name])
-                .args(["--cap-add", "SYS_PTRACE"])
-                .args(["-p", "127.0.0.1:0:22"])
-                .arg("-v")
-                .arg(format!("{}:/opt/litebox:ro", bin_dir.display()))
-                .arg("-v")
-                .arg(format!("{}:/workspace", fixture_dir.display()));
-            // Forward selected LITEBOX_* env vars into the container.
-            for var in [
-                "LITEBOX_EAGER_BROKER_SOCKETPAIR",
-                "LITEBOX_BROKER_TCP_CONN",
-                "LITEBOX_BROKER_INET_RAW",
-                "LITEBOX_BROKER_INET_DELAY_NS",
-                "LITEBOX_PE10_DIAG",
-                "LITEBOX_PE5_DIAG",
-                "LITEBOX_CLEANUP_DELAY_MS",
-                "RUST_LOG",
-                "RUST_BACKTRACE",
-            ] {
-                if let Ok(val) = std::env::var(var) {
-                    cmd.args(["-e", &format!("{var}={val}")]);
-                }
-            }
-            if mount_workspace_src {
-                cmd.arg("-v")
-                    .arg(format!("{}:/workspace/litebox-src:ro", ws_root.display()));
-            }
-            cmd.arg(super::copilot_image_name());
-            match pass {
-                "native" => {
-                    cmd.args(["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"]);
-                }
-                "litebox" => {
-                    // Use `--ssh` (no `--ssh-command`) so litebox sets
-                    // up the host:22 → sandbox:22 port forward AND lets
-                    // the ssh client choose the per-session remote
-                    // command. `--record-baseline` is the unconstrained
-                    // audit-only mode (no policy file) — this iteration
-                    // is about validating Copilot under litebox, not
-                    // policy enforcement.
-                    cmd.args([
-                        "/opt/litebox/litebox_tool_executor",
-                        "--rootfs",
-                        "/",
-                        "--record-baseline",
-                        "--ssh",
-                        "--ssh-port",
-                        "22",
-                    ]);
-                }
-                _ => return Err(format!("unknown pass {pass}")),
-            }
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-
-            let out = cmd.output().map_err(|e| format!("docker run spawn: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "docker run failed (exit {}): {}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr)
-                ));
-            }
-
-            // Find the host port mapped to container port 22.
-            let port_out = Command::new("docker")
-                .args(["port", &name, "22"])
-                .output()
-                .map_err(|e| format!("docker port: {e}"))?;
-            if !port_out.status.success() {
-                let _ = Command::new("docker").args(["rm", "-f", &name]).output();
-                return Err(format!(
-                    "docker port {name} 22 failed: {}",
-                    String::from_utf8_lossy(&port_out.stderr)
-                ));
-            }
-            let mapping = String::from_utf8_lossy(&port_out.stdout);
-            let port = mapping
-                .lines()
-                .find_map(|l| {
-                    l.rsplit(':')
-                        .next()
-                        .and_then(|p| p.trim().parse::<u16>().ok())
-                })
-                .ok_or_else(|| format!("could not parse host port from `{mapping}`"))?;
-
-            Ok(ContainerHandle {
-                name,
-                ssh_port: port,
-            })
+        if mount_workspace_src {
+            docker_args.push("-v".into());
+            docker_args.push(format!("{}:/workspace/litebox-src:ro", ws_root.display()));
         }
-    }
-
-    impl Drop for ContainerHandle {
-        fn drop(&mut self) {
-            if super::keep_containers() {
-                return;
-            }
-            let _ = Command::new("docker")
-                .args(["rm", "-f", &self.name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        let command: Vec<String> = match pass {
+            "native" => vec![
+                "/usr/sbin/dropbear".into(),
+                "-F".into(),
+                "-E".into(),
+                "-B".into(),
+                "-R".into(),
+                "-p".into(),
+                "22".into(),
+            ],
+            "litebox" => vec![
+                "/opt/litebox/litebox_tool_executor".into(),
+                "--rootfs".into(),
+                "/".into(),
+                "--record-baseline".into(),
+                "--ssh".into(),
+                "--ssh-port".into(),
+                "22".into(),
+            ],
+            _ => panic!("unknown pass {pass}"),
+        };
+        super::framework::ContainerSpec {
+            image: super::copilot_image_name().to_string(),
+            docker_args,
+            command,
+            detached: true,
+            timeout_secs: None,
         }
     }
 
@@ -3409,7 +3329,8 @@ mod copilot {
 mod dropbear_bash {
     use super::{Failed, Trial, copilot};
     use litebox_test_harness::os::pty::Pty;
-    use std::time::Duration;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
 
     struct Scenario {
         id: &'static str,
@@ -3506,10 +3427,25 @@ mod dropbear_bash {
     }
 
     fn run_scenario(pass: &str, scenario_id: &str) -> Result<(), Failed> {
+        // Build fixtures + ensure prerequisites, then hand off to the
+        // shared `framework::run_trial` which owns the entire trial
+        // lifecycle: gate acquire, canonical container name, PDEATHSIG
+        // pre_exec, cleanup-registry registration, docker spawn +
+        // teardown, and `emit_timing_main` recording. The driver
+        // closure does the family-specific work: open SSH to the
+        // published port (host-side, preserving the docker-bridge →
+        // litebox-inbound-TCP test semantics), drive bash, check
+        // output. See `tests/common/framework.rs` for the lifecycle.
         let scn = scenarios()
             .iter()
             .find(|s| s.id == scenario_id)
             .expect("scenario lookup");
+        let pass_static: &'static str = match pass {
+            "native" => "native",
+            "litebox" => "litebox",
+            _ => "unknown",
+        };
+        let test_id = format!("dropbear_bash.{scenario_id}");
 
         let fixture_dir = super::fixture_dir(pass, "dropbear_bash", scenario_id);
         let _ = std::fs::remove_dir_all(&fixture_dir);
@@ -3522,46 +3458,182 @@ mod dropbear_bash {
             }
             std::fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
         }
-
         if pass == "litebox" {
             let _ = super::setup();
         }
         super::ensure_copilot_image(&super::workspace_root());
-        let container = copilot::ContainerHandle::spawn(
-            pass,
-            scenario_id,
+
+        let spec = build_dropbear_spec(pass, &fixture_dir, false);
+        let expected: Vec<&'static str> = scn.expected.to_vec();
+        let command = scn.command;
+        let pass_owned = pass.to_string();
+        let scenario_id_owned = scenario_id.to_string();
+
+        super::framework::run_trial(
+            pass_static,
+            &test_id,
             "dropbear_bash",
-            &fixture_dir,
-            false,
-        )?;
-        let port = container.ssh_port;
-        copilot::wait_for_sshd(port, Duration::from_secs(30))?;
+            "phase_h",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!(
+                            "container {} did not publish port 22 (ports={:?})",
+                            container.name, container.published_ports,
+                        )),
+                        t_docker_start_ms: 0,
+                        t_useful_ms: 0,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!("wait_for_sshd port {port}: {e}")),
+                        t_docker_start_ms: t_dispatch.elapsed().as_millis(),
+                        t_useful_ms: 0,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
 
-        let response = drive_bash(port, scn.command)?;
-        let stripped = copilot::strip_ansi(&response);
-        persist_transcript(pass, scenario_id, &response, &stripped);
+                let response = match drive_bash(port, command) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return super::framework::DriveResult {
+                            verdict: "FAIL",
+                            detail: Some(format!("drive_bash: {e}")),
+                            t_docker_start_ms,
+                            t_useful_ms: t_useful_start.elapsed().as_millis(),
+                            sub_phases: super::SubPhaseMs::default(),
+                            t_docker_spawn_ms: None,
+                            t_litebox_init_ms: None,
+                            t_harness_load_ms: None,
+                        };
+                    }
+                };
+                let stripped = copilot::strip_ansi(&response);
+                persist_transcript(&pass_owned, &scenario_id_owned, &response, &stripped);
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
 
-        let missing: Vec<&str> = scn
-            .expected
-            .iter()
-            .copied()
-            .filter(|expected| !stripped.contains(expected))
-            .collect();
-        if !missing.is_empty() {
-            let preview: String = stripped.chars().take(800).collect();
-            return Err(format!(
-                "{pass}::dropbear_bash.{scenario_id} missing expected output {:?}.\n\
-                 transcript: {}\n\
-                 first 800 chars of ANSI-stripped response:\n{preview}",
-                missing,
-                super::log_dir()
-                    .join(format!("dropbear_bash-{pass}-{scenario_id}.stripped.log"))
-                    .display(),
-            )
-            .into());
+                let missing: Vec<&str> = expected
+                    .iter()
+                    .copied()
+                    .filter(|exp| !stripped.contains(exp))
+                    .collect();
+                if !missing.is_empty() {
+                    let preview: String = stripped.chars().take(800).collect();
+                    let log_path = super::log_dir().join(format!(
+                        "dropbear_bash-{pass_owned}-{scenario_id_owned}.stripped.log"
+                    ));
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!(
+                            "dropbear_bash.{scenario_id_owned} missing expected output {:?}.\n\
+                             transcript: {}\n\
+                             first 800 chars of ANSI-stripped response:\n{preview}",
+                            missing,
+                            log_path.display(),
+                        )),
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+                super::framework::DriveResult {
+                    verdict: "pass",
+                    detail: None,
+                    t_docker_start_ms,
+                    t_useful_ms,
+                    sub_phases: super::SubPhaseMs::default(),
+                    t_docker_spawn_ms: None,
+                    t_litebox_init_ms: None,
+                    t_harness_load_ms: None,
+                }
+            },
+        )
+    }
+
+    /// Build the `ContainerSpec` for a dropbear scenario. Mirrors
+    /// what `copilot::ContainerHandle::spawn` used to construct, but
+    /// returns data instead of spawning — `framework::run_trial`
+    /// owns the spawn + lifecycle.
+    fn build_dropbear_spec(
+        pass: &str,
+        fixture_dir: &Path,
+        mount_workspace_src: bool,
+    ) -> super::framework::ContainerSpec {
+        let ws_root = super::workspace_root();
+        let bin_dir = super::debug_dir();
+        let mut docker_args: Vec<String> = vec![
+            "--cap-add".into(),
+            "SYS_PTRACE".into(),
+            "-p".into(),
+            "127.0.0.1:0:22".into(),
+            "-v".into(),
+            format!("{}:/opt/litebox:ro", bin_dir.display()),
+            "-v".into(),
+            format!("{}:/workspace", fixture_dir.display()),
+        ];
+        for var in [
+            "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+            "LITEBOX_BROKER_TCP_CONN",
+            "LITEBOX_PE10_DIAG",
+            "LITEBOX_PE5_DIAG",
+            "LITEBOX_CLEANUP_DELAY_MS",
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                docker_args.push("-e".into());
+                docker_args.push(format!("{var}={val}"));
+            }
         }
-
-        Ok(())
+        if mount_workspace_src {
+            docker_args.push("-v".into());
+            docker_args.push(format!("{}:/workspace/litebox-src:ro", ws_root.display()));
+        }
+        let command: Vec<String> = match pass {
+            "native" => vec![
+                "/usr/sbin/dropbear".into(),
+                "-F".into(),
+                "-E".into(),
+                "-B".into(),
+                "-R".into(),
+                "-p".into(),
+                "22".into(),
+            ],
+            "litebox" => vec![
+                "/opt/litebox/litebox_tool_executor".into(),
+                "--rootfs".into(),
+                "/".into(),
+                "--record-baseline".into(),
+                "--ssh".into(),
+                "--ssh-port".into(),
+                "22".into(),
+            ],
+            _ => panic!("unknown pass {pass}"),
+        };
+        super::framework::ContainerSpec {
+            image: super::copilot_image_name().to_string(),
+            docker_args,
+            command,
+            detached: true,
+            timeout_secs: None,
+        }
     }
 
     fn drive_bash(port: u16, command: &str) -> Result<String, String> {
