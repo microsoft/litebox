@@ -61,16 +61,6 @@ macro_rules! convert_flags {
     };
 }
 
-macro_rules! worker_local_network_unreachable {
-    ($path:literal) => {
-        unreachable!(concat!(
-            "worker-local Network::",
-            $path,
-            " called — broker-held inet is the only valid path under linux_userland default-on"
-        ))
-    };
-}
-
 pub(crate) type SocketFd = litebox::net::SocketFd<Platform>;
 type BrokerSocketPairTypedFd =
     litebox::fd::TypedFd<crate::syscalls::broker_socketpair::BrokerSocketPairSubsystem>;
@@ -322,15 +312,13 @@ pub(super) enum SocketOptionValue {
 /// change if the nature of the litebox descriptor table changes, or if network
 /// namespaces are implemented.
 impl<FS: ShimFS> GlobalState<FS> {
+    #[cfg(feature = "worker_local_inet")]
     pub(crate) fn initialize_socket(
         &self,
         fd: &SocketFd,
         sock_type: SockType,
         flags: SockFlags,
     ) -> Arc<NetworkProxy<litebox_platform_multiplex::Platform>> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("set_socket_proxy during socket initialization");
-        }
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
 
@@ -374,12 +362,14 @@ impl<FS: ShimFS> GlobalState<FS> {
         proxy
     }
 
+    #[cfg(feature = "worker_local_inet")]
     fn with_socket_options<R>(&self, fd: &SocketFd, f: impl FnOnce(&SocketOptions) -> R) -> R {
         self.litebox
             .descriptor_table()
             .with_metadata(fd, |opt| f(opt))
             .unwrap()
     }
+    #[cfg(feature = "worker_local_inet")]
     fn with_socket_options_mut<R>(
         &self,
         fd: &SocketFd,
@@ -455,6 +445,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             _ => Err(Errno::ENOPROTOOPT),
         }
     }
+    #[cfg(feature = "worker_local_inet")]
     fn setsockopt(
         &self,
         fd: &SocketFd,
@@ -462,9 +453,6 @@ impl<FS: ShimFS> GlobalState<FS> {
         optval: ConstPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("setsockopt");
-        }
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
             // Collect any TCP option that needs to be applied via Network after
             // releasing the descriptor table write lock, to avoid a deadlock:
@@ -714,6 +702,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             _ => Err(Errno::ENOPROTOOPT),
         }
     }
+    #[cfg(feature = "worker_local_inet")]
     fn getsockopt(
         &self,
         fd: &SocketFd,
@@ -721,9 +710,6 @@ impl<FS: ShimFS> GlobalState<FS> {
         optval: MutPtr<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("getsockopt");
-        }
         match self.getsockopt_common(optname, optval, len, |sopt| {
             // reason: unsupported variants intentionally share this fallback path.
             #[allow(clippy::wildcard_enum_match_arm)]
@@ -854,14 +840,12 @@ impl<FS: ShimFS> GlobalState<FS> {
         super::write_to_user(val, optval, len)
     }
 
+    #[cfg(feature = "worker_local_inet")]
     pub(super) fn try_accept(
         &self,
         fd: &SocketFd,
         peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, TryOpError<Errno>> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("accept");
-        }
         // Drive smoltcp explicitly — platform_interaction is Manual, so
         // automated_platform_interaction inside accept() is a no-op.
         // Without this, the network thread's poll results aren't visible
@@ -880,6 +864,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         result
     }
 
+    #[cfg(feature = "worker_local_inet")]
     pub(super) fn accept(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -899,10 +884,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         .map_err(Errno::from)
     }
 
+    #[cfg(feature = "worker_local_inet")]
     fn bind(&self, fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("bind");
-        }
         let reuse_port = self.with_socket_options(fd, |options| options.reuse_port);
         self.net
             .lock()
@@ -912,14 +895,12 @@ impl<FS: ShimFS> GlobalState<FS> {
 
     /// Non-blocking TCP accept by raw guest fd number. Looks up the SocketFd
     /// through the FilesState fd table, then calls try_accept.
+    #[cfg(feature = "worker_local_inet")]
     pub(super) fn try_accept_by_raw_fd(
         &self,
         raw_fd: u32,
         files: &core::cell::RefCell<alloc::sync::Arc<crate::syscalls::file::FilesState<FS>>>,
     ) -> Result<SocketFd, Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("accept by raw fd");
-        }
         files.borrow().with_socket(
             self,
             raw_fd,
@@ -934,15 +915,13 @@ impl<FS: ShimFS> GlobalState<FS> {
         )
     }
 
+    #[cfg(feature = "worker_local_inet")]
     pub(super) fn connect(
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("connect");
-        }
         if sockaddr.port() == 0 {
             return Err(Errno::ECONNREFUSED);
         }
@@ -1011,23 +990,20 @@ impl<FS: ShimFS> GlobalState<FS> {
         })
     }
 
+    #[cfg(feature = "worker_local_inet")]
     fn listen(&self, fd: &SocketFd, backlog: u16) -> Result<(), Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("listen");
-        }
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
+    #[cfg(feature = "worker_local_inet")]
     pub(super) fn send_listen_route_transfer(&self, port: u16) -> Result<(), Errno> {
         self.platform
             .send_port_listen_transfer(port)
             .map_err(|_| Errno::EIO)
     }
 
+    #[cfg(feature = "worker_local_inet")]
     fn shutdown(&self, fd: &SocketFd, read: bool, write: bool) -> Result<(), Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("shutdown");
-        }
         let result = self
             .net
             .lock()
@@ -1047,6 +1023,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     ///
     /// This uses the channel-based approach where the user writes to a TX ring buffer,
     /// and the network worker later drains it.
+    #[cfg(feature = "worker_local_inet")]
     pub(crate) fn sendto(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -1055,9 +1032,6 @@ impl<FS: ShimFS> GlobalState<FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddr>,
     ) -> Result<usize, Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("sendto");
-        }
         let proxy = self.get_proxy(fd)?;
 
         // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
@@ -1135,6 +1109,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     ///
     /// This uses the channel-based approach where the user reads from an RX ring buffer
     /// that the network worker populates.
+    #[cfg(feature = "worker_local_inet")]
     pub(crate) fn receive(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -1143,9 +1118,6 @@ impl<FS: ShimFS> GlobalState<FS> {
         flags: ReceiveFlags,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("receive");
-        }
         let timeout = self.with_socket_options(fd, |opt| opt.recv_timeout);
         let is_nonblock = self.get_status(fd).contains(OFlags::NONBLOCK)
             || flags.contains(ReceiveFlags::DONTWAIT);
@@ -1212,6 +1184,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             .map_err(Errno::from)
     }
 
+    #[cfg(feature = "worker_local_inet")]
     fn get_socket_type(&self, fd: &SocketFd) -> Result<SockType, Errno> {
         self.litebox
             .descriptor_table()
@@ -1222,6 +1195,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             })
     }
 
+    #[cfg(feature = "worker_local_inet")]
     fn get_status(&self, fd: &SocketFd) -> litebox::fs::OFlags {
         self.litebox
             .descriptor_table()
@@ -1230,6 +1204,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             & litebox::fs::OFlags::STATUS_FLAGS_MASK
     }
 
+    #[cfg(feature = "worker_local_inet")]
     pub(crate) fn get_proxy(&self, fd: &SocketFd) -> Result<Arc<NetworkProxy<Platform>>, Errno> {
         self.litebox
             .descriptor_table()
@@ -1241,6 +1216,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     }
 
     /// Look up the network proxy for a socket given its raw fd integer.
+    #[cfg(feature = "worker_local_inet")]
     pub(super) fn get_proxy_by_raw_fd(
         &self,
         raw_fd: u32,
@@ -1270,14 +1246,12 @@ impl<FS: ShimFS> GlobalState<FS> {
             .flatten()
     }
 
+    #[cfg(feature = "worker_local_inet")]
     pub(crate) fn close_socket(
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: Arc<SocketFd>,
     ) -> Result<(), Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("close");
-        }
         let linger_timeout = self.with_socket_options(&fd, |opt| opt.linger_timeout);
         let behavior = match linger_timeout {
             Some(timeout) if timeout.is_zero() => CloseBehavior::Immediate,
@@ -2276,9 +2250,6 @@ impl<FS: ShimFS> Task<FS> {
         flags: SockFlags,
         files: &crate::syscalls::file::FilesState<FS>,
     ) -> Result<Option<usize>, Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("accepted local TCP broker conversion");
-        }
         if !crate::syscalls::broker_tcp_conn::broker_tcp_conn_accept_enabled() {
             return Ok(None);
         }
@@ -2386,31 +2357,39 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| {
-                let sock_type = self.global.get_socket_type(fd)?;
-                let mut socket_addr =
-                    want_peer.then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
-                let accepted_file =
-                    self.global
-                        .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
-                let peer_addr = socket_addr.map(SocketAddress::Inet);
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    let sock_type = self.global.get_socket_type(fd)?;
+                    let mut socket_addr = want_peer
+                        .then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+                    let accepted_file =
+                        self.global
+                            .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
+                    let peer_addr = socket_addr.map(SocketAddress::Inet);
 
-                if let Some(raw_fd) = self.try_install_broker_tcp_accept(
-                    &accepted_file,
-                    peer_addr.as_ref(),
-                    flags,
-                    files.as_ref(),
-                )? {
-                    return Ok((raw_fd, peer_addr));
+                    if let Some(raw_fd) = self.try_install_broker_tcp_accept(
+                        &accepted_file,
+                        peer_addr.as_ref(),
+                        flags,
+                        files.as_ref(),
+                    )? {
+                        return Ok((raw_fd, peer_addr));
+                    }
+
+                    let proxy = self
+                        .global
+                        .initialize_socket(&accepted_file, sock_type, flags);
+                    proxy.set_state(SocketState::Connected);
+                    let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
+                        unimplemented!()
+                    };
+                    Ok((raw_fd, peer_addr))
                 }
-
-                let proxy = self
-                    .global
-                    .initialize_socket(&accepted_file, sock_type, flags);
-                proxy.set_state(SocketState::Connected);
-                let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
-                    unimplemented!()
-                };
-                Ok((raw_fd, peer_addr))
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    let _ = (fd, files);
+                    Err(Errno::ENOTSOCK)
+                }
             },
             |file| {
                 let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
@@ -2575,8 +2554,16 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| {
-                let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
-                self.global.connect(&self.wait_cx(), fd, addr)
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
+                    self.global.connect(&self.wait_cx(), fd, addr)
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    let _ = fd;
+                    Err(Errno::ENOTSOCK)
+                }
             },
             |file| {
                 let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -2683,8 +2670,16 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| {
-                let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
-                self.global.bind(fd, addr)
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
+                    self.global.bind(fd, addr)
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    let _ = fd;
+                    Err(Errno::ENOTSOCK)
+                }
             },
             |file| {
                 let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -2710,15 +2705,22 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |fd| self.global.listen(fd, backlog),
+            |fd| {
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    self.global.listen(fd, backlog)
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    let _ = fd;
+                    Err(Errno::ENOTSOCK)
+                }
+            },
             |file| file.listen(self, backlog, &self.global),
         )
     }
 
     pub(crate) fn tcp_listen_worker_exec_bridge_spec(&self, raw_fd: usize) -> Option<String> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("worker-exec listen bridge spec");
-        }
         let fd = {
             let files = self.files.borrow();
             files
@@ -2751,9 +2753,6 @@ impl<FS: ShimFS> Task<FS> {
         port: u16,
         reuse_port: bool,
     ) -> Result<(), Errno> {
-        if !crate::WORKER_LOCAL_INET {
-            worker_local_network_unreachable!("install worker-exec listen bridge fd");
-        }
         let created_fd = self.do_socket(
             AddressFamily::INET,
             SockType::Stream,
@@ -3491,28 +3490,36 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| {
-                // Inet sockets do not support ancillary data.
-                if msg.msg_controllen != 0 {
-                    return Err(Errno::EOPNOTSUPP);
-                }
-                let sock_addr = sock_addr
-                    .clone()
-                    .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
-                    .transpose()?;
-                if self.global.get_socket_type(fd)? == SockType::Stream {
-                    if total_len == 0 {
-                        return self
-                            .global
-                            .sendto(&self.wait_cx(), fd, &[], flags, sock_addr);
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    // Inet sockets do not support ancillary data.
+                    if msg.msg_controllen != 0 {
+                        return Err(Errno::EOPNOTSUPP);
                     }
-                    Self::sendmsg_stream_iovs(&iovs, |chunk| {
+                    let sock_addr = sock_addr
+                        .clone()
+                        .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                        .transpose()?;
+                    if self.global.get_socket_type(fd)? == SockType::Stream {
+                        if total_len == 0 {
+                            return self
+                                .global
+                                .sendto(&self.wait_cx(), fd, &[], flags, sock_addr);
+                        }
+                        Self::sendmsg_stream_iovs(&iovs, |chunk| {
+                            self.global
+                                .sendto(&self.wait_cx(), fd, chunk, flags, sock_addr)
+                        })
+                    } else {
+                        let buf = Self::copy_sendmsg_iovs(&iovs)?;
                         self.global
-                            .sendto(&self.wait_cx(), fd, chunk, flags, sock_addr)
-                    })
-                } else {
-                    let buf = Self::copy_sendmsg_iovs(&iovs)?;
-                    self.global
-                        .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)
+                            .sendto(&self.wait_cx(), fd, &buf, flags, sock_addr)
+                    }
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    let _ = fd;
+                    Err(Errno::ENOTSOCK)
                 }
             },
             |file| {
@@ -4224,16 +4231,24 @@ impl<FS: ShimFS> Task<FS> {
                 &self.global,
                 raw_fd.truncate(),
                 |fd| {
-                    let mut addr = None;
-                    let size = self.global.receive(
-                        &self.wait_cx(),
-                        fd,
-                        &mut buf.borrow_mut(),
-                        flags,
-                        if want_source { Some(&mut addr) } else { None },
-                    )?;
-                    let src_addr = addr.map(SocketAddress::Inet);
-                    Ok((size, src_addr))
+                    #[cfg(feature = "worker_local_inet")]
+                    {
+                        let mut addr = None;
+                        let size = self.global.receive(
+                            &self.wait_cx(),
+                            fd,
+                            &mut buf.borrow_mut(),
+                            flags,
+                            if want_source { Some(&mut addr) } else { None },
+                        )?;
+                        let src_addr = addr.map(SocketAddress::Inet);
+                        Ok((size, src_addr))
+                    }
+                    #[cfg(not(feature = "worker_local_inet"))]
+                    {
+                        let _ = fd;
+                        Err(Errno::ENOTSOCK)
+                    }
                 },
                 |entry| {
                     let mut addr = None;
@@ -4355,7 +4370,17 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |fd| self.global.setsockopt(fd, optname, optval, optlen),
+            |fd| {
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    self.global.setsockopt(fd, optname, optval, optlen)
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    let _ = fd;
+                    Err(Errno::ENOTSOCK)
+                }
+            },
             |file| file.setsockopt(&self.global, optname, optval, optlen),
         )
     }
@@ -4480,7 +4505,17 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |fd| self.global.getsockopt(fd, optname, optval, len),
+            |fd| {
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    self.global.getsockopt(fd, optname, optval, len)
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    let _ = fd;
+                    Err(Errno::ENOTSOCK)
+                }
+            },
             |file| file.getsockopt(&self.global, optname, optval, len),
         )
     }
@@ -4558,8 +4593,18 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |_fd| {
-                worker_local_network_unreachable!("get_local_addr via getsockname");
+            |fd| {
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    Ok(SocketAddress::Inet(
+                        self.global.net.lock().get_local_addr(fd)?,
+                    ))
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    let _ = fd;
+                    Err(Errno::ENOTSOCK)
+                }
             },
             |file| Ok(SocketAddress::Unix(file.get_local_addr())),
         )
@@ -4608,8 +4653,18 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |_fd| {
-                worker_local_network_unreachable!("get_remote_addr via getpeername");
+            |fd| {
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    Ok(SocketAddress::Inet(
+                        self.global.net.lock().get_remote_addr(fd)?,
+                    ))
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    let _ = fd;
+                    Err(Errno::ENOTSOCK)
+                }
             },
             |file| {
                 file.get_peer_addr()
