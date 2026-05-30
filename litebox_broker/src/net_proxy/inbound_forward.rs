@@ -7,8 +7,8 @@ use tracing::{error, info, warn};
 
 use crate::state_registry::BrokerStateRegistry;
 
-/// An inbound TCP port forward: host listens on a port and relays connections
-/// to a guest IP:port inside the smoltcp virtual network.
+/// An inbound TCP port forward: host listens on a port and hands accepted
+/// connections to a matching broker-held listener.
 pub(super) struct InboundForward {
     pub(super) listener: TcpListener,
     pub(super) guest_ip: Ipv4Addr,
