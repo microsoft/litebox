@@ -684,17 +684,28 @@ fn current_jobs_cap() -> usize {
 }
 
 /// Host-wide budget on concurrent docker children, summed across
-/// all live harnesses. Default `nproc`. Override via
-/// `LITEBOX_GLOBAL_JOBS`.
+/// all live harnesses.
+///
+/// Default `(nproc * 2) / 3` (e.g. 21 on a 32-CPU box). Lower than
+/// raw `nproc` because each litebox-mode container is a small
+/// process stack (PID1 → tool_executor → broker → runner →
+/// test binary), averaging ~1.5 CPU in steady state. At raw nproc
+/// dispatches, the effective load lands around 50, which causes
+/// poll-wakeup-sensitive tests (`SCM.pass_eventfd_poll_wake`,
+/// pty/signalfd timing) to flake. Capping at 2/3 keeps effective
+/// load near nproc.
+///
+/// Override via `LITEBOX_GLOBAL_JOBS` for stress runs.
 fn global_cap() -> usize {
     *GLOBAL_CAP.get_or_init(|| {
         std::env::var("LITEBOX_GLOBAL_JOBS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| {
-                std::thread::available_parallelism()
+                let n = std::thread::available_parallelism()
                     .map(|n| n.get())
-                    .unwrap_or(8)
+                    .unwrap_or(8);
+                (n * 2 / 3).max(2)
             })
     })
 }
