@@ -4,8 +4,8 @@
 //! Litebox Broker — standalone 9P2000.L file server and network proxy.
 //!
 //! Serves files from a host directory with policy enforcement and optional
-//! ELF syscall rewriting. Optionally runs a network proxy that bridges guest
-//! TCP/UDP over an IPC pipe using smoltcp.
+//! ELF syscall rewriting. Optionally runs broker-side network session and
+//! inbound-forward listeners.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -158,7 +158,7 @@ fn build_local_services(
 
     let mut registry = litebox_broker::net_proxy::LocalServiceRegistry::new();
 
-    // Register TCP spawner for smoltcp bridge connections.
+    // Register TCP spawner for direct LB9P byte-stream connections.
     {
         let root = root.clone();
         let policy = Arc::clone(&policy);

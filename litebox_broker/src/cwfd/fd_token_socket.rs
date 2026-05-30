@@ -12,7 +12,8 @@ use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_req
 use crate::fd_tokens::BrokerFdTokenRegistry;
 use crate::inotify_dispatcher::InotifyDispatcher;
 use crate::pgrp_signal_inbox::PgrpSignalInbox;
-use crate::state_registry::{BrokerStateRegistry, StateHandle};
+use crate::process_state::ProcessState;
+use crate::state_registry::{BrokerStateRegistry, StateHandle, StateRegistryError};
 use crate::state_service::{
     ConnState, SubscriptionRegistry, handle_deliver_signal_inbox, handle_pty_ioctl,
     handle_pty_write, handle_request as state_handle_request, handle_set_pgid, handle_set_sid,
@@ -21,7 +22,7 @@ use crate::state_service::{
 use litebox_common_linux::fd_token_protocol::{
     BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, StatusCode, build_error_response,
     decode, parse_create_pidfd_response_ok, parse_create_pty_response_ok, parse_handle_body,
-    parse_open_pty_slave_response_ok,
+    parse_inet_listener_accept_response_ok, parse_open_pty_slave_response_ok,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use std::collections::HashMap;
@@ -453,6 +454,50 @@ fn peer_cred_fields(peer_cred: Option<PeerCred>) -> String {
     }
 }
 
+fn ensure_process_registered_for_caller(
+    process_registry: &BrokerStateRegistry,
+    tracker: &mut ConnRefTracker,
+    caller_scope: CallerScope,
+) {
+    let CallerScope::Owned(pid) = caller_scope else {
+        return;
+    };
+    let id = u64::from(pid.get());
+    if tracker.owns_process(caller_scope, id) {
+        return;
+    }
+
+    let handle = StateHandle::from_id(id);
+    match process_registry.resolve(handle, SubsystemTag::Process) {
+        Ok(_) => match process_registry.dup(handle) {
+            Ok(_) => tracker.record_process(caller_scope, id),
+            Err(err) => {
+                warn!(pid = pid.get(), error = ?err, "fd-token control: failed to dup caller process handle")
+            }
+        },
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            match process_registry.register_with_id(id, ProcessState::arc()) {
+                Ok(registered) => {
+                    debug_assert_eq!(registered.id(), id);
+                    tracker.record_process(caller_scope, id);
+                }
+                Err(err) => {
+                    warn!(pid = pid.get(), error = ?err, "fd-token control: failed to auto-register caller process handle")
+                }
+            }
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            warn!(
+                pid = pid.get(),
+                "fd-token control: caller pid handle is not a Process"
+            );
+        }
+        Err(err) => {
+            warn!(pid = pid.get(), error = ?err, "fd-token control: failed to resolve caller process handle")
+        }
+    }
+}
+
 /// Inspect a successful response frame and record this connection's
 /// net contribution to broker registry refcounts. Called once per
 /// request/response round on the socket loop.
@@ -473,7 +518,11 @@ fn update_tracker_from_response(
         Opcode::CreateEventfd
         | Opcode::CreatePidfd
         | Opcode::CreateSignalfd
-        | Opcode::InotifyInit1 => {
+        | Opcode::InotifyInit1
+        | Opcode::InetListenerCreate
+        | Opcode::InetTcpConnCreate
+        | Opcode::InetDgramCreate
+        | Opcode::InetRawCreate => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
                 tracker.record_state(caller_scope, id);
             }
@@ -505,6 +554,11 @@ fn update_tracker_from_response(
         Opcode::OpenPtySlave => {
             if let Ok((slave, _pty_id)) = parse_open_pty_slave_response_ok(&response.body) {
                 tracker.record_state(caller_scope, slave);
+            }
+        }
+        Opcode::InetListenerAccept => {
+            if let Ok((conn, _peer)) = parse_inet_listener_accept_response_ok(&response.body) {
+                tracker.record_state(caller_scope, conn);
             }
         }
         // Process-registry creator.
@@ -934,6 +988,15 @@ fn handle_control_connection_inner(
                 let request_body = frame.body.to_vec();
                 let caller_pid = frame.caller_pid;
                 let caller_scope = tracker.note_caller_scope(CallerScope::from_wire(caller_pid));
+                if matches!(
+                    request_opcode,
+                    Opcode::SetSid
+                        | Opcode::SetPgid
+                        | Opcode::SubscribeProcessExit
+                        | Opcode::MarkProcessExited
+                ) {
+                    ensure_process_registered_for_caller(process_registry, tracker, caller_scope);
+                }
                 // PE.12 diag: log every frame received, gated on
                 // LITEBOX_PE10_DIAG. Tracker state pid_count helps
                 // identify which conn (by tracker fingerprint) the
@@ -1251,6 +1314,34 @@ fn handle_control_connection_inner(
                     | Opcode::InotifyRmWatch
                     | Opcode::InotifyRead
                     | Opcode::InotifyQueryEvents
+                    | Opcode::InetListenerCreate
+                    | Opcode::InetListenerBind
+                    | Opcode::InetListenerListen
+                    | Opcode::InetListenerAccept
+                    | Opcode::InetListenerQueryEvents
+                    | Opcode::InetListenerSetSockOpt
+                    | Opcode::InetRawCreate
+                    | Opcode::InetRawSendTo
+                    | Opcode::InetRawRecvFrom
+                    | Opcode::InetRawQueryEvents
+                    | Opcode::InetTcpConnCreate
+                    | Opcode::InetTcpConnConnect
+                    | Opcode::InetTcpConnQueryEvents
+                    | Opcode::InetTcpConnGetSockName
+                    | Opcode::InetTcpConnGetPeerName
+                    | Opcode::InetDgramCreate
+                    | Opcode::InetDgramBind
+                    | Opcode::InetDgramConnect
+                    | Opcode::InetDgramSendTo
+                    | Opcode::InetDgramRecvFrom
+                    | Opcode::InetDgramShutdown
+                    | Opcode::InetDgramGetSockName
+                    | Opcode::InetDgramGetPeerName
+                    | Opcode::InetDgramSetSockOpt
+                    | Opcode::InetDgramGetSockOpt
+                    | Opcode::InetDgramQueryEvents
+                    | Opcode::InetTcpConnSetSockOpt
+                    | Opcode::InetTcpConnGetSockOpt
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe
@@ -1569,11 +1660,13 @@ mod tests {
         let fd_registry = Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = Arc::new(BrokerStateRegistry::new());
         let process_registry = Arc::new(BrokerStateRegistry::new());
+        let inotify_dispatcher = Arc::new(InotifyDispatcher::new());
         let _ = spawn_control_listener(
             &path,
             Arc::clone(&fd_registry),
             Arc::clone(&state_registry),
             Arc::clone(&process_registry),
+            inotify_dispatcher,
         )
         .expect("spawn");
         for _ in 0..100 {

@@ -1,11 +1,26 @@
 # Cross-Worker fd Transport: Architecture as of `bf3e60f1`
 
 > **Status:** Audit notes (Phase 0 of the cross-worker fd transport
-> workstream). This document describes what the code does **today**, not
-> what it should do. Use as the reference baseline for design changes.
+> workstream). This document describes what the code did **at
+> commit `bf3e60f1`**, not what it should do. Use as the reference
+> baseline for design changes.
+>
+> **Update 2026-05-30 (Phase F.3 landed):** the "Path B — broker TCP
+> via smoltcp" and "Broker port routing (PortRouter)" sections below
+> describe code that has been DELETED. Broker-held inet is now the
+> only path under linux_userland: TCP listener/connect, UDP, and
+> ICMP all live as `StateObject`s in the broker's
+> `BrokerStateRegistry`, and host-inbound connections are routed
+> through `BrokerHeldListenerRegistry` (broker `accept_inbound` →
+> per-listener queue → worker `accept()` RPC). PortRouter and
+> `litebox_broker::net_proxy`'s smoltcp paths are gone. The shim
+> no longer constructs `litebox::net::Network<Platform>` for
+> linux_userland builds. See `PHASE_F3_SCOPING.md` for the
+> deletion inventory.
 >
 > See also: `expanded-fd-support-delayed-fork.md`,
-> `inter-process-stream-multiplexer.md`, `mux-mesh-pipe-bridging.md`.
+> `inter-process-stream-multiplexer.md`, `mux-mesh-pipe-bridging.md`,
+> `PHASE_F2_SCOPING.md`, `PHASE_F3_SCOPING.md`.
 
 ## Problem the audit is scoped to
 

@@ -6,9 +6,9 @@
 //! # The "broker hosts the kernel state" model
 //!
 //! Litebox's worker shims emulate kernel-managed resources (eventfd,
-//! timerfd, signalfd, smoltcp TCP/UDP, in-memory unix-socket channels)
-//! in *worker* userspace. That's fine for resources used inside a
-//! single worker process: state lives where the operations happen.
+//! timerfd, signalfd, in-memory unix-socket channels) in *worker*
+//! userspace. That's fine for resources used inside a single worker
+//! process: state lives where the operations happen.
 //!
 //! It breaks the moment a resource has to be observed by *more than
 //! one* worker process — across fork/exec, across `SCM_RIGHTS`
@@ -17,10 +17,9 @@
 //!
 //! Litebox already solves this for two big surfaces: the **9P
 //! filesystem** is broker-hosted (the directory tree + open file
-//! handles live in the broker; workers RPC into them), and the
-//! **smoltcp networking stack** is broker-hosted (TCP/UDP state lives
-//! in the broker's `SocketSet`; workers hold smoltcp handles that
-//! RPC into the broker).
+//! handles live in the broker; workers RPC into them), and broker-held
+//! **inet sockets** are broker-hosted (TCP/UDP state lives in broker
+//! state objects; workers hold opaque handles that RPC into the broker).
 //!
 //! This module is the foundation for extending that pattern to the
 //! rest of the shim-emulated subsystems. A [`StateObject`] is some
@@ -61,13 +60,18 @@
 //! synchronization — the registry is just a table.
 
 use core::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+#[cfg(debug_assertions)]
+use std::string::{String, ToString as _};
 use std::sync::{Arc, Mutex};
 
 use litebox_common_linux::cwfd::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::cwfd::notification_ring::NotificationSender;
 
 use crate::cwfd::eventfd_state::EventfdState;
+use crate::cwfd::inet_dgram_state::InetDgramState;
+use crate::cwfd::inet_listener_state::{AddressFamily, InetListenerState};
+use crate::cwfd::inet_raw_state::InetRawState;
 use crate::cwfd::inotify_state::InotifyState;
 use crate::cwfd::pidfd_state::PidfdState;
 use crate::cwfd::pipe_state::{PipeReadEnd, PipeWriteEnd};
@@ -152,6 +156,11 @@ pub trait StateObject: Any + Send + Sync + core::fmt::Debug {
     /// subscription-mirror cache — the broker is the single source of
     /// truth for broker-held resources.
     fn current_events(&self) -> u32;
+
+    #[cfg(debug_assertions)]
+    fn debug_repr(&self) -> String {
+        core::any::type_name::<Self>().to_string()
+    }
 }
 
 /// Closed set of broker-hosted state object variants.
@@ -162,6 +171,9 @@ pub enum StateKind {
     PipeWriteEnd,
     SocketPairEnd,
     TcpConn,
+    InetListener,
+    InetDgram,
+    InetRaw,
     Signalfd,
     Inotify,
     Pty,
@@ -177,6 +189,9 @@ pub enum StateObjectEnum {
     PipeWriteEnd(Arc<PipeWriteEnd>),
     SocketPairEnd(Arc<SocketPairEnd>),
     TcpConn(Arc<TcpConnState>),
+    InetListener(Arc<InetListenerState>),
+    InetDgram(Arc<InetDgramState>),
+    InetRaw(Arc<InetRawState>),
     Signalfd(Arc<SignalfdState>),
     Inotify(Arc<InotifyState>),
     Pty(Arc<PtyState>),
@@ -192,6 +207,9 @@ impl StateObjectEnum {
             StateObjectEnum::PipeWriteEnd(_) => StateKind::PipeWriteEnd,
             StateObjectEnum::SocketPairEnd(_) => StateKind::SocketPairEnd,
             StateObjectEnum::TcpConn(_) => StateKind::TcpConn,
+            StateObjectEnum::InetListener(_) => StateKind::InetListener,
+            StateObjectEnum::InetDgram(_) => StateKind::InetDgram,
+            StateObjectEnum::InetRaw(_) => StateKind::InetRaw,
             StateObjectEnum::Signalfd(_) => StateKind::Signalfd,
             StateObjectEnum::Inotify(_) => StateKind::Inotify,
             StateObjectEnum::Pty(_) => StateKind::Pty,
@@ -207,6 +225,9 @@ impl StateObjectEnum {
             StateObjectEnum::PipeWriteEnd(state) => state.subsystem_tag(),
             StateObjectEnum::SocketPairEnd(state) => state.subsystem_tag(),
             StateObjectEnum::TcpConn(state) => state.subsystem_tag(),
+            StateObjectEnum::InetListener(state) => state.subsystem_tag(),
+            StateObjectEnum::InetDgram(state) => state.subsystem_tag(),
+            StateObjectEnum::InetRaw(state) => state.subsystem_tag(),
             StateObjectEnum::Signalfd(state) => state.subsystem_tag(),
             StateObjectEnum::Inotify(state) => state.subsystem_tag(),
             StateObjectEnum::Pty(state) => state.subsystem_tag(),
@@ -237,6 +258,15 @@ impl StateObjectEnum {
             StateObjectEnum::TcpConn(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
+            StateObjectEnum::InetListener(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
+            StateObjectEnum::InetDgram(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
+            StateObjectEnum::InetRaw(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
             StateObjectEnum::Signalfd(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
@@ -258,6 +288,9 @@ impl StateObjectEnum {
             StateObjectEnum::PipeWriteEnd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::SocketPairEnd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::TcpConn(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::InetListener(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::InetDgram(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::InetRaw(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Signalfd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Inotify(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::Pty(state) => state.unsubscribe(subscription_id),
@@ -273,11 +306,33 @@ impl StateObjectEnum {
             StateObjectEnum::PipeWriteEnd(state) => state.current_events(),
             StateObjectEnum::SocketPairEnd(state) => state.current_events(),
             StateObjectEnum::TcpConn(state) => state.current_events(),
+            StateObjectEnum::InetListener(state) => state.current_events(),
+            StateObjectEnum::InetDgram(state) => state.current_events(),
+            StateObjectEnum::InetRaw(state) => state.current_events(),
             StateObjectEnum::Signalfd(state) => state.current_events(),
             StateObjectEnum::Inotify(state) => state.current_events(),
             StateObjectEnum::Pty(state) => state.current_events(),
             StateObjectEnum::Pidfd(state) => state.current_events(),
             StateObjectEnum::Process(state) => state.current_events(),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn debug_repr(&self) -> String {
+        match self {
+            StateObjectEnum::Eventfd(state) => state.debug_repr(),
+            StateObjectEnum::PipeReadEnd(state) => state.debug_repr(),
+            StateObjectEnum::PipeWriteEnd(state) => state.debug_repr(),
+            StateObjectEnum::SocketPairEnd(state) => state.debug_repr(),
+            StateObjectEnum::TcpConn(state) => state.debug_repr(),
+            StateObjectEnum::InetListener(state) => state.debug_repr(),
+            StateObjectEnum::InetDgram(state) => state.debug_repr(),
+            StateObjectEnum::InetRaw(state) => state.debug_repr(),
+            StateObjectEnum::Signalfd(state) => state.debug_repr(),
+            StateObjectEnum::Inotify(state) => state.debug_repr(),
+            StateObjectEnum::Pty(state) => state.debug_repr(),
+            StateObjectEnum::Pidfd(state) => state.debug_repr(),
+            StateObjectEnum::Process(state) => state.debug_repr(),
         }
     }
 }
@@ -306,6 +361,11 @@ impl StateObject for StateObjectEnum {
 
     fn current_events(&self) -> u32 {
         StateObjectEnum::current_events(self)
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_repr(&self) -> String {
+        StateObjectEnum::debug_repr(self)
     }
 }
 
@@ -336,6 +396,24 @@ impl From<Arc<SocketPairEnd>> for StateObjectEnum {
 impl From<Arc<TcpConnState>> for StateObjectEnum {
     fn from(state: Arc<TcpConnState>) -> Self {
         StateObjectEnum::TcpConn(state)
+    }
+}
+
+impl From<Arc<InetListenerState>> for StateObjectEnum {
+    fn from(state: Arc<InetListenerState>) -> Self {
+        StateObjectEnum::InetListener(state)
+    }
+}
+
+impl From<Arc<InetDgramState>> for StateObjectEnum {
+    fn from(state: Arc<InetDgramState>) -> Self {
+        StateObjectEnum::InetDgram(state)
+    }
+}
+
+impl From<Arc<InetRawState>> for StateObjectEnum {
+    fn from(state: Arc<InetRawState>) -> Self {
+        StateObjectEnum::InetRaw(state)
     }
 }
 
@@ -406,6 +484,12 @@ struct Entry {
 struct State {
     next_id: u64,
     table: HashMap<u64, Entry>,
+    broker_held_inet_listeners: HashMap<(u16, AddressFamily), u64>,
+    /// Ports already owned by the broker's `net_proxy` inbound forwarders.
+    /// Worker-side `bind(port)` requests for these ports use a virtual bind
+    /// (no host `bind()` call) because the broker already owns the host
+    /// listener and will deliver accepted streams via `accept_inbound`.
+    inbound_forwarded_ports: HashSet<u16>,
 }
 
 /// Snapshot of one live registry entry, for diagnostic dumps and
@@ -441,8 +525,25 @@ impl BrokerStateRegistry {
             state: Mutex::new(State {
                 next_id: 1,
                 table: HashMap::new(),
+                broker_held_inet_listeners: HashMap::new(),
+                inbound_forwarded_ports: HashSet::new(),
             }),
         }
+    }
+
+    /// Records the set of guest ports that the broker's `net_proxy`
+    /// already owns inbound host listeners for. Workers that
+    /// `bind(port)` for these ports get a "virtual bind" (no host
+    /// `bind()` call) because the broker already accepts on the host
+    /// port and delivers accepted streams via `accept_inbound`.
+    pub fn add_inbound_forwarded_port(&self, port: u16) {
+        let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        s.inbound_forwarded_ports.insert(port);
+    }
+
+    pub fn is_inbound_forwarded(&self, port: u16) -> bool {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        s.inbound_forwarded_ports.contains(&port)
     }
 
     /// Returns the number of currently-registered handles.
@@ -462,6 +563,23 @@ impl BrokerStateRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn debug_query(
+        &self,
+        handle: StateHandle,
+    ) -> Result<(SubsystemTag, u32, String), StateRegistryError> {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        let entry = s
+            .table
+            .get(&handle.0)
+            .ok_or(StateRegistryError::UnknownHandle(handle))?;
+        Ok((
+            entry.state.subsystem_tag(),
+            entry.refcount,
+            entry.state.debug_repr(),
+        ))
     }
 
     /// Returns a per-entry snapshot suitable for diagnostic logging.
@@ -512,6 +630,101 @@ impl BrokerStateRegistry {
                 .expect("BrokerStateRegistry id space exhausted");
         }
         Ok(Self::insert_locked(&mut s, id, state))
+    }
+
+    pub fn register_broker_held_inet_listener(
+        &self,
+        port: u16,
+        family: AddressFamily,
+        handle: StateHandle,
+    ) -> Result<(), StateRegistryError> {
+        let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        let entry = s
+            .table
+            .get(&handle.0)
+            .ok_or(StateRegistryError::UnknownHandle(handle))?;
+        match entry.state.as_ref() {
+            StateObjectEnum::InetListener(listener) => {
+                debug_assert_eq!(listener.family(), family);
+            }
+            StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeReadEnd(_)
+            | StateObjectEnum::PipeWriteEnd(_)
+            | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::TcpConn(_)
+            | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
+            | StateObjectEnum::Pty(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::Process(_) => {
+                return Err(StateRegistryError::TagMismatch {
+                    handle,
+                    expected: SubsystemTag::InetListener,
+                    actual: entry.state.subsystem_tag(),
+                });
+            }
+        }
+        s.broker_held_inet_listeners
+            .insert((port, family), handle.0);
+        Ok(())
+    }
+
+    pub fn resolve_broker_held_inet_listener(
+        &self,
+        port: u16,
+        family: AddressFamily,
+    ) -> Option<Arc<InetListenerState>> {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        let handle = *s.broker_held_inet_listeners.get(&(port, family))?;
+        let entry = s.table.get(&handle)?;
+        Some(Self::inet_listener_from_entry_or_panic(
+            entry, handle, port, family,
+        ))
+    }
+
+    pub fn resolve_broker_held_inet_listener_for_inbound(
+        &self,
+        port: u16,
+    ) -> Option<Arc<InetListenerState>> {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        for family in [AddressFamily::V4, AddressFamily::V6] {
+            if let Some(handle) = s.broker_held_inet_listeners.get(&(port, family)).copied() {
+                let entry = s.table.get(&handle)?;
+                return Some(Self::inet_listener_from_entry_or_panic(
+                    entry, handle, port, family,
+                ));
+            }
+        }
+        None
+    }
+
+    fn inet_listener_from_entry_or_panic(
+        entry: &Entry,
+        handle: u64,
+        port: u16,
+        family: AddressFamily,
+    ) -> Arc<InetListenerState> {
+        match entry.state.as_ref() {
+            StateObjectEnum::InetListener(listener) => Arc::clone(listener),
+            StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeReadEnd(_)
+            | StateObjectEnum::PipeWriteEnd(_)
+            | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::TcpConn(_)
+            | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
+            | StateObjectEnum::Pty(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::Process(_) => {
+                panic!(
+                    "broker-held inet listener route for port {port} family {family:?} points at non-listener handle {handle}"
+                );
+            }
+        }
     }
 
     fn insert_locked(s: &mut State, id: u64, state: Arc<StateObjectEnum>) -> StateHandle {
@@ -594,6 +807,8 @@ impl BrokerStateRegistry {
         let tag = entry.state.subsystem_tag();
         if new_rc == 0 {
             s.table.remove(&handle.0);
+            s.broker_held_inet_listeners
+                .retain(|_, registered| *registered != handle.0);
         }
         drop(s);
         // PE.10 diag: log every release with the new rc. Opt-in via
@@ -821,6 +1036,46 @@ mod tests {
 
         reg.release(h_ev).unwrap();
         reg.release(h_proc).unwrap();
+    }
+
+    #[test]
+    fn inet_listener_registry_v4_and_v6_coexist_on_same_port() {
+        let reg = BrokerStateRegistry::new();
+        let v4 = InetListenerState::new(AddressFamily::V4);
+        let v6 = InetListenerState::new(AddressFamily::V6);
+        let h4 = reg.register(Arc::clone(&v4));
+        let h6 = reg.register(Arc::clone(&v6));
+
+        reg.register_broker_held_inet_listener(22, AddressFamily::V4, h4)
+            .unwrap();
+        reg.register_broker_held_inet_listener(22, AddressFamily::V6, h6)
+            .unwrap();
+
+        let inbound = reg
+            .resolve_broker_held_inet_listener_for_inbound(22)
+            .unwrap();
+        assert!(Arc::ptr_eq(&inbound, &v4));
+
+        let v4_specific = reg
+            .resolve_broker_held_inet_listener(22, AddressFamily::V4)
+            .unwrap();
+        assert!(Arc::ptr_eq(&v4_specific, &v4));
+
+        let v6_specific = reg
+            .resolve_broker_held_inet_listener(22, AddressFamily::V6)
+            .unwrap();
+        assert!(Arc::ptr_eq(&v6_specific, &v6));
+
+        reg.release(h4).unwrap();
+        let inbound = reg
+            .resolve_broker_held_inet_listener_for_inbound(22)
+            .unwrap();
+        assert!(Arc::ptr_eq(&inbound, &v6));
+
+        reg.release(h6).unwrap();
+        assert!(reg
+            .resolve_broker_held_inet_listener_for_inbound(22)
+            .is_none());
     }
 
     #[test]

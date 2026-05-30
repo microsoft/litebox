@@ -4,6 +4,9 @@
 //! Syscalls Handlers
 
 pub(crate) mod broker_backed;
+pub(crate) mod broker_inet_dgram;
+pub(crate) mod broker_inet_listener;
+pub(crate) mod broker_inet_raw;
 pub(crate) mod broker_pipe;
 pub(crate) mod broker_pty;
 pub(crate) mod broker_socketpair;
@@ -17,6 +20,12 @@ pub(crate) mod inotify;
 /// calls this at bootstrap if a broker fd-token control socket is
 /// available; the shim consults the registered provider from
 /// `sys_eventfd2`.
+pub use broker_inet_dgram::{
+    broker_inet_dgram_enabled, broker_inet_dgram_provider, set_broker_inet_dgram_enabled,
+    set_broker_inet_dgram_provider,
+};
+pub use broker_inet_listener::{broker_inet_listener_provider, set_broker_inet_listener_provider};
+pub use broker_inet_raw::{broker_inet_raw_provider, set_broker_inet_raw_provider};
 pub use broker_pipe::{broker_pipe_provider, set_broker_pipe_provider};
 pub use broker_pty::{broker_pty_provider, set_broker_pty_provider};
 pub use broker_socketpair::{
@@ -24,7 +33,9 @@ pub use broker_socketpair::{
     set_eager_broker_socketpair_enabled,
 };
 pub use broker_tcp_conn::{
-    broker_tcp_conn_provider, set_broker_tcp_conn_accept_enabled, set_broker_tcp_conn_provider,
+    broker_inet_tcp_conn_provider_outbound_enabled, broker_tcp_conn_provider,
+    set_broker_inet_tcp_conn_provider_outbound_enabled, set_broker_tcp_conn_accept_enabled,
+    set_broker_tcp_conn_provider,
 };
 pub use eventfd::broker_eventfd_provider;
 pub use eventfd::broker_pgrp_signal_provider;
@@ -55,6 +66,16 @@ pub(crate) mod unix;
 pub(crate) mod signal;
 #[cfg(test)]
 pub(crate) mod tests;
+
+static BROKER_INET_DELAY_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_broker_inet_delay_ns(ns: u64) {
+    BROKER_INET_DELAY_NS.store(ns, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn broker_inet_delay_ns() -> u64 {
+    BROKER_INET_DELAY_NS.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 macro_rules! common_functions_for_file_status {
     () => {

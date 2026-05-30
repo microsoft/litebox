@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
+pub mod broker_inet_dgram_provider;
+pub mod broker_inet_listener_provider;
+pub mod broker_inet_raw_provider;
 pub mod broker_inotify_provider;
 pub mod broker_pgrp_signal_provider;
 pub mod broker_pidfd_provider;
@@ -315,6 +318,8 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         "pipe" => BrokerHandleKind::Pipe,
         "unix_socket" => BrokerHandleKind::UnixSocket,
         "tcp_conn" => BrokerHandleKind::TcpConn,
+        "inet_listener" => BrokerHandleKind::InetListener,
+        "inet_dgram" => BrokerHandleKind::InetDgram,
         other => anyhow::bail!("broker-fd-bridge: bad kind {other:?}"),
     };
     let handle_id: u64 = parts[2]
@@ -358,7 +363,9 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Eventfd, Some(extra))
         | (BrokerHandleKind::Pidfd, Some(extra))
         | (BrokerHandleKind::Signalfd, Some(extra))
-        | (BrokerHandleKind::TcpConn, Some(extra)) => {
+        | (BrokerHandleKind::TcpConn, Some(extra))
+        | (BrokerHandleKind::InetListener, Some(extra))
+        | (BrokerHandleKind::InetDgram, Some(extra)) => {
             anyhow::bail!(
                 "broker-fd-bridge: unexpected direction {extra:?} for kind {:?}",
                 parts[1]
@@ -367,7 +374,9 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Eventfd, None)
         | (BrokerHandleKind::Pidfd, None)
         | (BrokerHandleKind::Signalfd, None)
-        | (BrokerHandleKind::TcpConn, None) => (None, None, None),
+        | (BrokerHandleKind::TcpConn, None)
+        | (BrokerHandleKind::InetListener, None)
+        | (BrokerHandleKind::InetDgram, None) => (None, None, None),
     };
     let pty_id = if kind == BrokerHandleKind::Pty {
         match parts.get(4) {
@@ -770,15 +779,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_eager_broker_socketpair_enabled(enabled);
     }
 
-    // Stage 3a: broker-backed TCP accept is opt-in while the matrix is
-    // validated. The broker process reads the same environment variable.
+    if let Ok(s) = std::env::var("LITEBOX_BROKER_INET_DELAY_NS")
+        && let Ok(ns) = s.parse::<u64>()
     {
-        let enabled = std::env::var("LITEBOX_BROKER_TCP_CONN")
-            .ok()
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        litebox_shim_linux::syscalls::set_broker_tcp_conn_accept_enabled(enabled);
+        litebox_shim_linux::syscalls::set_broker_inet_delay_ns(ns);
     }
+
+    // Stage 3a/Phase B: broker-backed TCP accept promotion remains opt-in.
+    // Phase B's outbound-TCP gate also enables the accept-promoted path.
+    litebox_shim_linux::syscalls::set_broker_tcp_conn_accept_enabled(
+        broker_tcp_conn_accept_or_outbound_enabled(),
+    );
+    litebox_shim_linux::syscalls::set_broker_inet_tcp_conn_provider_outbound_enabled(
+        broker_inet_tcp_enabled(),
+    );
 
     // Phase B-Step8c: if --fd-token-broker is supplied, connect to
     // the broker's fd-token control socket and register a
@@ -1682,12 +1696,20 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     // Fork-restore replays a snapshot whose process identity may differ from
     // the runner's default worker task params. Seed the local registry with the
-    // restored pid so any subsequent fork can register children with this
-    // process as their parent.
+    // restored pid AND the inherited pgid/sid so any subsequent guest setsid()
+    // can become its own session leader (would otherwise EPERM).
     {
         let pid = u32::try_from(snapshot.identity.pid)
             .expect("fork-restore snapshot pid must be non-negative");
-        shim_builder.init_with_pid(litebox::process::ProcessId(pid));
+        let pgid = u32::try_from(snapshot.identity.pgid)
+            .expect("fork-restore snapshot pgid must be non-negative");
+        let sid = u32::try_from(snapshot.identity.sid)
+            .expect("fork-restore snapshot sid must be non-negative");
+        shim_builder.init_for_fork_restore(
+            litebox::process::ProcessId(pid),
+            litebox::process::ProcessGroupId(pgid),
+            litebox::process::SessionId(sid),
+        );
     }
     let litebox = shim_builder.litebox();
 
@@ -3243,7 +3265,9 @@ fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
     shim: &litebox_shim_linux::LinuxShim<FS>,
     shutdown: &std::sync::Arc<core::sync::atomic::AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    if !litebox_platform_multiplex::platform().has_network() {
+    if !litebox_shim_linux::WORKER_LOCAL_INET
+        || !litebox_platform_multiplex::platform().has_network()
+    {
         return None;
     }
     let shim = shim.clone();
@@ -3370,6 +3394,40 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
 /// `RunnerBrokerEventfdProvider` as the shim's global provider.
 ///
 /// Called from `run()` when `--fd-token-broker <path>` is supplied.
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Like `env_flag_enabled` but defaults to `true` when the env var is
+/// unset. Returns `false` only when the var is explicitly set to a
+/// recognised off-value (`"0"`, `"false"`, `"no"`). Use for opt-out
+/// flags where the broker-held codepath is the new default.
+fn env_flag_enabled_default_on(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true)
+}
+
+fn broker_inet_tcp_enabled() -> bool {
+    // Broker-held outbound TCP is the only linux_userland path; worker-local
+    // inet is no longer available to opt back into.
+    true
+}
+
+fn broker_inet_udp_enabled() -> bool {
+    // Broker-held UDP is the only linux_userland path; worker-local inet is no
+    // longer available to opt back into.
+    true
+}
+
+fn broker_tcp_conn_accept_or_outbound_enabled() -> bool {
+    env_flag_enabled("LITEBOX_BROKER_TCP_CONN") || broker_inet_tcp_enabled()
+}
+
 fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     use litebox_common_linux::broker_eventfd::NotificationDispatcher;
     use litebox_common_linux::fd_token_client::FdTokenClient;
@@ -3423,14 +3481,29 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     litebox_shim_linux::syscalls::set_broker_socketpair_provider(socketpair_provider)
         .map_err(|_| anyhow!("socketpair provider already set"))?;
 
-    let tcp_conn_provider = Arc::new(
-        crate::broker_tcp_conn_provider::RunnerBrokerTcpConnProvider::new(
-            Arc::clone(&client),
-            Arc::clone(&dispatcher),
-        ),
-    );
-    litebox_shim_linux::syscalls::set_broker_tcp_conn_provider(tcp_conn_provider)
-        .map_err(|_| anyhow!("tcp conn provider already set"))?;
+    litebox_shim_linux::syscalls::set_broker_inet_dgram_enabled(broker_inet_udp_enabled());
+
+    if broker_inet_udp_enabled() {
+        let inet_dgram_provider = Arc::new(
+            crate::broker_inet_dgram_provider::RunnerBrokerInetDgramProvider::new(
+                Arc::clone(&client),
+                Arc::clone(&dispatcher),
+            ),
+        );
+        litebox_shim_linux::syscalls::set_broker_inet_dgram_provider(inet_dgram_provider)
+            .map_err(|_| anyhow!("inet dgram provider already set"))?;
+    }
+
+    if broker_tcp_conn_accept_or_outbound_enabled() {
+        let tcp_conn_provider = Arc::new(
+            crate::broker_tcp_conn_provider::RunnerBrokerTcpConnProvider::new(
+                Arc::clone(&client),
+                Arc::clone(&dispatcher),
+            ),
+        );
+        litebox_shim_linux::syscalls::set_broker_tcp_conn_provider(tcp_conn_provider)
+            .map_err(|_| anyhow!("tcp conn provider already set"))?;
+    }
 
     let pgrp_signal_provider = Arc::new(
         crate::broker_pgrp_signal_provider::RunnerBrokerPgrpSignalProvider::new(
@@ -3469,6 +3542,62 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_inotify_provider(inotify_provider)
         .map_err(|_| anyhow!("inotify provider already set"))?;
+
+    if broker_inet_listener_enabled() {
+        if let Err(e) = setup_broker_inet_listener_provider(&client, &dispatcher) {
+            tracing::warn!(error = %e, "broker_inet_listener provider setup failed");
+        }
+    }
+    if broker_inet_raw_enabled() {
+        if let Err(e) = setup_broker_inet_raw_provider(&client, &dispatcher) {
+            tracing::warn!(error = %e, "broker_inet_raw provider setup failed");
+        }
+    }
+
+    fn broker_inet_listener_enabled() -> bool {
+        // Broker-held TCP listeners are the only linux_userland path;
+        // worker-local inet is no longer available to opt back into.
+        true
+    }
+
+    fn broker_inet_raw_enabled() -> bool {
+        // Default OFF: raw sockets usually require CAP_NET_RAW which most
+        // sandbox environments don't grant. Opt-in only when the host
+        // explicitly enables it via LITEBOX_BROKER_INET_RAW=1.
+        env_flag_enabled("LITEBOX_BROKER_INET_RAW")
+    }
+
+    fn setup_broker_inet_listener_provider(
+        client: &Arc<litebox_common_linux::fd_token_client::FdTokenClient>,
+        dispatcher: &Arc<litebox_common_linux::broker_eventfd::NotificationDispatcher>,
+    ) -> anyhow::Result<()> {
+        let provider: Arc<
+            dyn litebox_common_linux::broker_inet_listener_provider::BrokerInetListenerProvider,
+        > = Arc::new(
+            crate::broker_inet_listener_provider::RunnerBrokerInetListenerProvider::new(
+                Arc::clone(client),
+                Arc::clone(dispatcher),
+            ),
+        );
+        litebox_shim_linux::syscalls::set_broker_inet_listener_provider(provider)
+            .map_err(|_| anyhow!("inet listener provider already set"))
+    }
+
+    fn setup_broker_inet_raw_provider(
+        client: &Arc<litebox_common_linux::fd_token_client::FdTokenClient>,
+        dispatcher: &Arc<litebox_common_linux::broker_eventfd::NotificationDispatcher>,
+    ) -> anyhow::Result<()> {
+        let provider: Arc<
+            dyn litebox_common_linux::broker_inet_raw_provider::BrokerInetRawProvider,
+        > = Arc::new(
+            crate::broker_inet_raw_provider::RunnerBrokerInetRawProvider::new(
+                Arc::clone(client),
+                Arc::clone(dispatcher),
+            ),
+        );
+        litebox_shim_linux::syscalls::set_broker_inet_raw_provider(provider)
+            .map_err(|_| anyhow!("inet raw provider already set"))
+    }
 
     // Install the guest-pid provider against the same fd-token client.
     // The shim's `do_fork` consults it; if missing, do_fork falls back

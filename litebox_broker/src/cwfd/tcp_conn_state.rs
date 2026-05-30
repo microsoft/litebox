@@ -5,10 +5,11 @@
 
 use core::any::Any;
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
@@ -17,10 +18,13 @@ use litebox_common_linux::notification_frame::{
 };
 use litebox_common_linux::notification_ring::NotificationSender;
 
+use crate::cwfd::inet_listener_state::{AddressFamily, encode_sockaddr, family_from_u8};
 use crate::state_registry::StateObject;
 use crate::subscription_list::{SubscribeError, SubscriptionList, UnsubscribeError};
 
+const SOCKADDR_WIRE_LEN: usize = 28;
 pub const NOTIFY_EVENT_RDHUP: u32 = 0x2000;
+pub const NOTIFY_EVENT_NVAL: u32 = libc::POLLNVAL as u32;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TcpConnError {
@@ -30,30 +34,60 @@ pub enum TcpConnError {
     PeerClosed,
     #[error("tcp connection I/O error")]
     Io,
+    #[error("tcp connection OS error {0}")]
+    Errno(i32),
 }
 
-/// Broker-owned host TCP stream plus readiness subscribers.
+/// Broker-owned host TCP connection plus readiness subscribers.
 #[derive(Debug)]
 pub struct TcpConnState {
-    stream: Mutex<TcpStream>,
+    inner: Mutex<TcpConnInner>,
     subject: SubscriptionList,
+}
+
+#[derive(Debug)]
+enum TcpConnInner {
+    /// Created by InetTcpConnCreate; not yet connected.
+    /// `getsockname` returns 0.0.0.0:0; `getpeername` returns ENOTCONN.
+    Unconnected {
+        family: u8,
+        pending_sockopts: Vec<StoredSockOpt>,
+    },
+    /// Mid-connect. The background thread runs connect_timeout off-thread;
+    /// completion is reaped by a subsequent start_connect call.
+    Connecting {
+        family: u8,
+        target: SocketAddr,
+        pending_sockopts: Vec<StoredSockOpt>,
+        thread: JoinHandle<std::io::Result<TcpStream>>,
+    },
+    /// Normal connected state.
+    Connected(TcpConnConnected),
+}
+
+/// Today's connected TCP socket payload.
+#[derive(Debug)]
+struct TcpConnConnected {
+    stream: Mutex<TcpStream>,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
 }
 
+#[derive(Clone, Debug)]
+struct StoredSockOpt {
+    level: libc::c_int,
+    optname: libc::c_int,
+    value: Vec<u8>,
+}
+
 impl TcpConnState {
     pub fn new(stream: TcpStream) -> Arc<Self> {
-        let _ = stream.set_nonblocking(true);
-        let poll_stream = stream.try_clone().ok();
+        let (connected, poll_stream) = TcpConnConnected::new(stream);
         let state = Arc::new(Self {
-            local_addr: stream.local_addr().ok(),
-            peer_addr: stream.peer_addr().ok(),
-            stream: Mutex::new(stream),
+            inner: Mutex::new(TcpConnInner::Connected(connected)),
             subject: SubscriptionList::new(),
-            read_shutdown: AtomicBool::new(false),
-            write_shutdown: AtomicBool::new(false),
         });
         if let Some(poll_stream) = poll_stream {
             Self::spawn_poll_thread(Arc::downgrade(&state), poll_stream);
@@ -61,23 +95,124 @@ impl TcpConnState {
         state
     }
 
+    pub fn new_unconnected(family: u8) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(TcpConnInner::Unconnected {
+                family,
+                pending_sockopts: Vec::new(),
+            }),
+            subject: SubscriptionList::new(),
+        })
+    }
+
     pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.local_addr
+        match &*self.inner.lock().expect("TcpConnState inner poisoned") {
+            TcpConnInner::Connected(connected) => connected.local_addr,
+            TcpConnInner::Unconnected { .. } | TcpConnInner::Connecting { .. } => None,
+        }
     }
 
     pub fn peer_addr(&self) -> Option<SocketAddr> {
-        self.peer_addr
+        match &*self.inner.lock().expect("TcpConnState inner poisoned") {
+            TcpConnInner::Connected(connected) => connected.peer_addr,
+            TcpConnInner::Unconnected { .. } | TcpConnInner::Connecting { .. } => None,
+        }
     }
 
-    pub fn read(&self, max_len: usize) -> Result<Vec<u8>, TcpConnError> {
+    pub fn start_connect(
+        self: &Arc<Self>,
+        target: SocketAddr,
+        timeout: Duration,
+    ) -> Result<(), TcpConnError> {
+        if let Some(result) = self.finish_completed_connect() {
+            return result;
+        }
+
+        let mut inner = self.inner.lock().expect("TcpConnState inner poisoned");
+        match &*inner {
+            TcpConnInner::Unconnected {
+                family,
+                pending_sockopts,
+            } => {
+                validate_target_family(*family, target)?;
+                let family = *family;
+                let pending_sockopts = pending_sockopts.clone();
+                let weak = Arc::downgrade(self);
+                let thread = std::thread::Builder::new()
+                    .name("litebox-tcp-conn-connect".into())
+                    .spawn(move || {
+                        let result = TcpStream::connect_timeout(&target, timeout);
+                        if let Some(state) = weak.upgrade() {
+                            let events = match &result {
+                                Ok(_) => NOTIFY_EVENT_OUT,
+                                Err(_) => NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR,
+                            };
+                            state.subject.notify(events);
+                        }
+                        result
+                    })
+                    .map_err(|_| TcpConnError::Io)?;
+                *inner = TcpConnInner::Connecting {
+                    family,
+                    target,
+                    pending_sockopts,
+                    thread,
+                };
+                Err(TcpConnError::WouldBlock)
+            }
+            TcpConnInner::Connecting { .. } => Err(TcpConnError::WouldBlock),
+            TcpConnInner::Connected(_) => Ok(()),
+        }
+    }
+
+    pub fn getsockname(&self) -> Result<[u8; SOCKADDR_WIRE_LEN], TcpConnError> {
+        match &*self.inner.lock().expect("TcpConnState inner poisoned") {
+            TcpConnInner::Unconnected { family, .. } | TcpConnInner::Connecting { family, .. } => {
+                encode_unspecified_sockaddr(*family)
+            }
+            TcpConnInner::Connected(connected) => encode_sockaddr(
+                connected
+                    .local_addr
+                    .ok_or(TcpConnError::Errno(libc::EINVAL))?,
+            )
+            .map_err(|_| TcpConnError::Errno(libc::EINVAL)),
+        }
+    }
+
+    pub fn getpeername(&self) -> Result<[u8; SOCKADDR_WIRE_LEN], TcpConnError> {
+        match &*self.inner.lock().expect("TcpConnState inner poisoned") {
+            TcpConnInner::Unconnected { .. } | TcpConnInner::Connecting { .. } => {
+                Err(TcpConnError::Errno(libc::ENOTCONN))
+            }
+            TcpConnInner::Connected(connected) => encode_sockaddr(
+                connected
+                    .peer_addr
+                    .ok_or(TcpConnError::Errno(libc::ENOTCONN))?,
+            )
+            .map_err(|_| TcpConnError::Errno(libc::EINVAL)),
+        }
+    }
+
+    pub fn read(self: &Arc<Self>, max_len: usize) -> Result<Vec<u8>, TcpConnError> {
         if max_len == 0 {
             return Ok(Vec::new());
         }
-        if self.read_shutdown.load(Ordering::Acquire) {
+        if let Some(result) = self.finish_completed_connect() {
+            result?;
+        }
+        let mut guard = self.inner.lock().expect("TcpConnState inner poisoned");
+        let TcpConnInner::Connected(connected) = &mut *guard else {
+            return match &*guard {
+                TcpConnInner::Connecting { .. } => Err(TcpConnError::WouldBlock),
+                TcpConnInner::Unconnected { .. } => Err(TcpConnError::Errno(libc::ENOTCONN)),
+                TcpConnInner::Connected(_) => unreachable!("matched Connected in else branch"),
+            };
+        };
+        if connected.read_shutdown.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
         let mut buf = vec![0u8; max_len];
-        let result = self
+        let result = connected
             .stream
             .lock()
             .expect("TcpConnState stream poisoned")
@@ -85,6 +220,7 @@ impl TcpConnState {
         match result {
             Ok(n) => {
                 buf.truncate(n);
+                drop(guard);
                 self.notify_current();
                 if n == 0 {
                     self.subject.notify(NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP);
@@ -108,20 +244,32 @@ impl TcpConnState {
         }
     }
 
-    pub fn write(&self, bytes: &[u8]) -> Result<usize, TcpConnError> {
+    pub fn write(self: &Arc<Self>, bytes: &[u8]) -> Result<usize, TcpConnError> {
         if bytes.is_empty() {
             return Ok(0);
         }
-        if self.write_shutdown.load(Ordering::Acquire) {
+        if let Some(result) = self.finish_completed_connect() {
+            result?;
+        }
+        let mut guard = self.inner.lock().expect("TcpConnState inner poisoned");
+        let TcpConnInner::Connected(connected) = &mut *guard else {
+            return match &*guard {
+                TcpConnInner::Connecting { .. } => Err(TcpConnError::WouldBlock),
+                TcpConnInner::Unconnected { .. } => Err(TcpConnError::Errno(libc::ENOTCONN)),
+                TcpConnInner::Connected(_) => unreachable!("matched Connected in else branch"),
+            };
+        };
+        if connected.write_shutdown.load(Ordering::Acquire) {
             return Err(TcpConnError::PeerClosed);
         }
-        let result = self
+        let result = connected
             .stream
             .lock()
             .expect("TcpConnState stream poisoned")
             .write(bytes);
         match result {
             Ok(n) => {
+                drop(guard);
                 self.notify_current();
                 Ok(n)
             }
@@ -148,32 +296,198 @@ impl TcpConnState {
             (false, true) => Some(Shutdown::Write),
             (false, false) => None,
         };
+        let mut guard = self.inner.lock().expect("TcpConnState inner poisoned");
+        let TcpConnInner::Connected(connected) = &mut *guard else {
+            return Err(TcpConnError::Errno(libc::ENOTCONN));
+        };
         if read {
-            self.read_shutdown.store(true, Ordering::Release);
+            connected.read_shutdown.store(true, Ordering::Release);
         }
         if write {
-            self.write_shutdown.store(true, Ordering::Release);
+            connected.write_shutdown.store(true, Ordering::Release);
         }
         if let Some(how) = how {
-            self.stream
+            connected
+                .stream
                 .lock()
                 .expect("TcpConnState stream poisoned")
                 .shutdown(how)
                 .map_err(|_| TcpConnError::Io)?;
         }
+        drop(guard);
         self.notify_current();
         Ok(())
     }
 
+    pub fn setsockopt(&self, level: u32, optname: u32, optval: &[u8]) -> Result<(), TcpConnError> {
+        let level = level
+            .try_into()
+            .map_err(|_| TcpConnError::Errno(libc::EINVAL))?;
+        let optname = optname
+            .try_into()
+            .map_err(|_| TcpConnError::Errno(libc::EINVAL))?;
+        ensure_supported_sockopt(level, optname, false)?;
+        let mut inner = self.inner.lock().expect("TcpConnState inner poisoned");
+        match &mut *inner {
+            TcpConnInner::Unconnected {
+                pending_sockopts, ..
+            }
+            | TcpConnInner::Connecting {
+                pending_sockopts, ..
+            } => {
+                upsert_pending_sockopt(pending_sockopts, level, optname, optval);
+                Ok(())
+            }
+            TcpConnInner::Connected(connected) => {
+                let stream = connected
+                    .stream
+                    .lock()
+                    .expect("TcpConnState stream poisoned");
+                apply_setsockopt(stream.as_raw_fd(), level, optname, optval)
+            }
+        }
+    }
+
+    pub fn getsockopt(
+        &self,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, TcpConnError> {
+        let level = level
+            .try_into()
+            .map_err(|_| TcpConnError::Errno(libc::EINVAL))?;
+        let optname = optname
+            .try_into()
+            .map_err(|_| TcpConnError::Errno(libc::EINVAL))?;
+        ensure_supported_sockopt(level, optname, true)?;
+        let inner = self.inner.lock().expect("TcpConnState inner poisoned");
+        match &*inner {
+            TcpConnInner::Unconnected {
+                pending_sockopts, ..
+            } => pending_sockopts
+                .iter()
+                .rev()
+                .find(|opt| opt.level == level && opt.optname == optname)
+                .map(|opt| opt.value.clone())
+                .ok_or(TcpConnError::Errno(libc::ENOTCONN)),
+            TcpConnInner::Connecting { .. } => Err(TcpConnError::WouldBlock),
+            TcpConnInner::Connected(connected) => {
+                let stream = connected
+                    .stream
+                    .lock()
+                    .expect("TcpConnState stream poisoned");
+                read_getsockopt(stream.as_raw_fd(), level, optname, optlen)
+            }
+        }
+    }
+
     pub fn current_events(&self) -> u32 {
-        let stream = self.stream.lock().expect("TcpConnState stream poisoned");
-        poll_stream_events(&stream)
+        let inner = self.inner.lock().expect("TcpConnState inner poisoned");
+        match &*inner {
+            TcpConnInner::Unconnected { .. } => NOTIFY_EVENT_NVAL,
+            TcpConnInner::Connecting { thread, .. } => {
+                if thread.is_finished() {
+                    NOTIFY_EVENT_OUT
+                } else {
+                    0
+                }
+            }
+            TcpConnInner::Connected(connected) => {
+                let stream = connected
+                    .stream
+                    .lock()
+                    .expect("TcpConnState stream poisoned");
+                poll_stream_events(&stream)
+            }
+        }
     }
 
     fn notify_current(&self) {
         let events = notification_events(self.current_events());
         if events != 0 {
             self.subject.notify(events);
+        }
+    }
+
+    fn finish_completed_connect(self: &Arc<Self>) -> Option<Result<(), TcpConnError>> {
+        let pending = {
+            let mut inner = self.inner.lock().expect("TcpConnState inner poisoned");
+            match &*inner {
+                TcpConnInner::Connecting { thread, .. } if thread.is_finished() => {}
+                TcpConnInner::Unconnected { .. }
+                | TcpConnInner::Connecting { .. }
+                | TcpConnInner::Connected(_) => return None,
+            }
+            let previous = std::mem::replace(
+                &mut *inner,
+                TcpConnInner::Unconnected {
+                    family: 0,
+                    pending_sockopts: Vec::new(),
+                },
+            );
+            match previous {
+                TcpConnInner::Connecting {
+                    family,
+                    target,
+                    pending_sockopts,
+                    thread,
+                } => {
+                    *inner = TcpConnInner::Unconnected {
+                        family,
+                        pending_sockopts: pending_sockopts.clone(),
+                    };
+                    (family, target, pending_sockopts, thread)
+                }
+                TcpConnInner::Unconnected { .. } | TcpConnInner::Connected(_) => {
+                    unreachable!("non-connecting TcpConnInner after Connecting match")
+                }
+            }
+        };
+
+        let (family, _target, pending_sockopts, thread) = pending;
+        match thread.join() {
+            Ok(Ok(stream)) => {
+                for opt in &pending_sockopts {
+                    if let Err(err) =
+                        apply_setsockopt(stream.as_raw_fd(), opt.level, opt.optname, &opt.value)
+                    {
+                        *self.inner.lock().expect("TcpConnState inner poisoned") =
+                            TcpConnInner::Unconnected {
+                                family,
+                                pending_sockopts,
+                            };
+                        self.subject.notify(NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR);
+                        return Some(Err(err));
+                    }
+                }
+                let (connected, poll_stream) = TcpConnConnected::new(stream);
+                *self.inner.lock().expect("TcpConnState inner poisoned") =
+                    TcpConnInner::Connected(connected);
+                if let Some(poll_stream) = poll_stream {
+                    Self::spawn_poll_thread(Arc::downgrade(self), poll_stream);
+                }
+                self.notify_current();
+                Some(Ok(()))
+            }
+            Ok(Err(err)) => {
+                *self.inner.lock().expect("TcpConnState inner poisoned") =
+                    TcpConnInner::Unconnected {
+                        family,
+                        pending_sockopts,
+                    };
+                self.subject.notify(NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR);
+                Some(Err(io_error_to_tcp_error(err)))
+            }
+            Err(_) => {
+                *self.inner.lock().expect("TcpConnState inner poisoned") =
+                    TcpConnInner::Unconnected {
+                        family,
+                        pending_sockopts,
+                    };
+                self.subject.notify(NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR);
+                Some(Err(TcpConnError::Io))
+            }
         }
     }
 
@@ -188,12 +502,14 @@ impl TcpConnState {
                     };
                     let events = poll_stream_events(&stream);
                     let notify = notification_events(events);
-                    if notify != 0 && notify != last {
+                    // Data/HUP/error readiness is level-triggered; repeat it so a read
+                    // that drained data between poll samples cannot mask the next arrival.
+                    let level_triggered =
+                        notify & (NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR) != 0;
+                    if notify != 0 && (notify != last || level_triggered) {
                         state.subject.notify(notify);
-                        last = notify;
-                    } else if notify == 0 {
-                        last = 0;
                     }
+                    last = notify;
                     drop(state);
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -201,14 +517,132 @@ impl TcpConnState {
     }
 }
 
+impl TcpConnConnected {
+    fn new(stream: TcpStream) -> (Self, Option<TcpStream>) {
+        let _ = stream.set_nonblocking(true);
+        let poll_stream = stream.try_clone().ok();
+        (
+            Self {
+                local_addr: stream.local_addr().ok(),
+                peer_addr: stream.peer_addr().ok(),
+                stream: Mutex::new(stream),
+                read_shutdown: AtomicBool::new(false),
+                write_shutdown: AtomicBool::new(false),
+            },
+            poll_stream,
+        )
+    }
+}
+
 impl Drop for TcpConnState {
     fn drop(&mut self) {
-        if let Ok(stream) = self.stream.lock() {
-            let _ = stream.shutdown(Shutdown::Both);
+        if let Ok(inner) = self.inner.lock() {
+            match &*inner {
+                TcpConnInner::Connected(connected) => {
+                    if let Ok(stream) = connected.stream.lock() {
+                        let _ = stream.shutdown(Shutdown::Both);
+                    }
+                }
+                TcpConnInner::Unconnected { .. } | TcpConnInner::Connecting { .. } => {}
+            }
         }
         self.subject
             .notify(NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR);
     }
+}
+
+fn ensure_supported_sockopt(
+    level: libc::c_int,
+    optname: libc::c_int,
+    is_get: bool,
+) -> Result<(), TcpConnError> {
+    match (level, optname, is_get) {
+        (libc::SOL_SOCKET, libc::SO_REUSEADDR, _)
+        | (libc::SOL_SOCKET, libc::SO_REUSEPORT, _)
+        | (libc::SOL_SOCKET, libc::SO_KEEPALIVE, _)
+        | (libc::SOL_SOCKET, libc::SO_SNDBUF, _)
+        | (libc::SOL_SOCKET, libc::SO_RCVBUF, _)
+        | (libc::SOL_SOCKET, libc::SO_LINGER, _)
+        | (libc::SOL_SOCKET, libc::SO_RCVTIMEO, _)
+        | (libc::SOL_SOCKET, libc::SO_SNDTIMEO, _)
+        | (libc::SOL_SOCKET, libc::SO_ERROR, true)
+        | (libc::IPPROTO_TCP, libc::TCP_NODELAY, _)
+        | (libc::IPPROTO_IP, libc::IP_TTL, _)
+        | (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, false) => Ok(()),
+        (libc::SOL_SOCKET, libc::SO_ERROR, false) => Err(TcpConnError::Errno(libc::ENOPROTOOPT)),
+        _ => Err(TcpConnError::Errno(libc::EOPNOTSUPP)),
+    }
+}
+
+fn upsert_pending_sockopt(
+    pending: &mut Vec<StoredSockOpt>,
+    level: libc::c_int,
+    optname: libc::c_int,
+    optval: &[u8],
+) {
+    if let Some(existing) = pending
+        .iter_mut()
+        .find(|opt| opt.level == level && opt.optname == optname)
+    {
+        existing.value.clear();
+        existing.value.extend_from_slice(optval);
+    } else {
+        pending.push(StoredSockOpt {
+            level,
+            optname,
+            value: optval.to_vec(),
+        });
+    }
+}
+
+fn apply_setsockopt(
+    fd: libc::c_int,
+    level: libc::c_int,
+    optname: libc::c_int,
+    optval: &[u8],
+) -> Result<(), TcpConnError> {
+    if (level, optname) == (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) {
+        return Ok(());
+    }
+    // SAFETY: `fd` is a live socket fd and `optval` is a valid readable buffer.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            optval.as_ptr().cast(),
+            optval
+                .len()
+                .try_into()
+                .map_err(|_| TcpConnError::Errno(libc::EINVAL))?,
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(last_errno()) }
+}
+
+fn read_getsockopt(
+    fd: libc::c_int,
+    level: libc::c_int,
+    optname: libc::c_int,
+    optlen: u32,
+) -> Result<Vec<u8>, TcpConnError> {
+    let mut buf = vec![0u8; optlen as usize];
+    let mut len: libc::socklen_t = optlen;
+    // SAFETY: `fd` is a live socket fd; `buf` and `len` point to writable storage.
+    let rc = unsafe { libc::getsockopt(fd, level, optname, buf.as_mut_ptr().cast(), &raw mut len) };
+    if rc == 0 {
+        buf.truncate(len as usize);
+        Ok(buf)
+    } else {
+        Err(last_errno())
+    }
+}
+
+fn last_errno() -> TcpConnError {
+    let errno = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO);
+    TcpConnError::Errno(errno)
 }
 
 impl StateObject for TcpConnState {
@@ -252,12 +686,167 @@ fn notification_events(events: u32) -> u32 {
     out
 }
 
+fn validate_target_family(family: u8, target: SocketAddr) -> Result<(), TcpConnError> {
+    match (family_from_u8(family), target) {
+        (Ok(AddressFamily::V4), SocketAddr::V4(_)) | (Ok(AddressFamily::V6), SocketAddr::V6(_)) => {
+            Ok(())
+        }
+        (Ok(AddressFamily::V4), SocketAddr::V6(_)) | (Ok(AddressFamily::V6), SocketAddr::V4(_)) => {
+            Err(TcpConnError::Errno(libc::EAFNOSUPPORT))
+        }
+        (Err(_), SocketAddr::V4(_) | SocketAddr::V6(_)) => {
+            Err(TcpConnError::Errno(libc::EAFNOSUPPORT))
+        }
+    }
+}
+
+fn encode_unspecified_sockaddr(family: u8) -> Result<[u8; SOCKADDR_WIRE_LEN], TcpConnError> {
+    match family_from_u8(family) {
+        Ok(AddressFamily::V4) => {
+            encode_sockaddr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+                .map_err(|_| TcpConnError::Errno(libc::EINVAL))
+        }
+        Ok(AddressFamily::V6) => encode_sockaddr(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::UNSPECIFIED,
+            0,
+            0,
+            0,
+        )))
+        .map_err(|_| TcpConnError::Errno(libc::EINVAL)),
+        Err(_) => Err(TcpConnError::Errno(libc::EAFNOSUPPORT)),
+    }
+}
+
+fn io_error_to_tcp_error(err: std::io::Error) -> TcpConnError {
+    match err.raw_os_error() {
+        Some(errno) => TcpConnError::Errno(errno),
+        None if err.kind() == std::io::ErrorKind::TimedOut => TcpConnError::Errno(libc::ETIMEDOUT),
+        None => TcpConnError::Io,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cwfd::inet_listener_state::decode_sockaddr;
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    fn wait_for_connect(
+        state: &Arc<TcpConnState>,
+        target: SocketAddr,
+        timeout: Duration,
+    ) -> Result<(), TcpConnError> {
+        assert!(matches!(
+            state.start_connect(target, timeout),
+            Err(TcpConnError::WouldBlock)
+        ));
+        let deadline = Instant::now() + timeout + Duration::from_secs(2);
+        loop {
+            if state.current_events() & NOTIFY_EVENT_OUT != 0 {
+                return state.start_connect(target, timeout);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "connect did not complete before deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn read_wait(state: &Arc<TcpConnState>, max_len: usize) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match state.read(max_len) {
+                Ok(bytes) => return bytes,
+                Err(TcpConnError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("tcp_conn read failed: {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_conn_new_unconnected_getpeername_returns_enotconn() {
+        let state = TcpConnState::new_unconnected(0);
+        assert_eq!(
+            state.getpeername(),
+            Err(TcpConnError::Errno(libc::ENOTCONN))
+        );
+        let local = decode_sockaddr(&state.getsockname().unwrap()).unwrap();
+        assert_eq!(
+            local,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        );
+    }
+
+    #[test]
+    fn tcp_conn_start_connect_to_host_listener_completes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+        let state = TcpConnState::new_unconnected(0);
+
+        wait_for_connect(&state, target, Duration::from_secs(2)).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let peer = decode_sockaddr(&state.getpeername().unwrap()).unwrap();
+        assert_eq!(peer, target);
+        assert_eq!(state.peer_addr(), Some(target));
+        drop(server);
+    }
+
+    #[test]
+    fn tcp_conn_start_connect_to_unbound_port_returns_econnrefused() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+        drop(listener);
+        let state = TcpConnState::new_unconnected(0);
+
+        assert_eq!(
+            wait_for_connect(&state, target, Duration::from_secs(2)),
+            Err(TcpConnError::Errno(libc::ECONNREFUSED))
+        );
+    }
+
+    #[test]
+    fn tcp_conn_start_connect_timeout_returns_etimedout() {
+        let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 1));
+        let state = TcpConnState::new_unconnected(0);
+
+        assert_eq!(
+            wait_for_connect(&state, target, Duration::from_millis(100)),
+            Err(TcpConnError::Errno(libc::ETIMEDOUT))
+        );
+    }
+
+    #[test]
+    fn tcp_conn_connected_state_read_write_shutdown_still_work() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(target).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let state = TcpConnState::new(server);
+
+        client.write_all(b"ping").unwrap();
+        assert_eq!(read_wait(&state, 4), b"ping");
+
+        assert_eq!(state.write(b"pong").unwrap(), 4);
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
+
+        state.shutdown(false, true).unwrap();
+        assert_eq!(state.write(b"again"), Err(TcpConnError::PeerClosed));
+    }
+}
+
 fn poll_stream_events(stream: &TcpStream) -> u32 {
     let mut pfd = libc::pollfd {
         fd: stream.as_raw_fd(),
         events: libc::POLLIN | libc::POLLOUT | libc::POLLERR | libc::POLLHUP | libc::POLLRDHUP,
         revents: 0,
     };
+    // SAFETY: `pfd` points to one initialized pollfd and the timeout is zero.
     let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
     if rc <= 0 {
         return 0;

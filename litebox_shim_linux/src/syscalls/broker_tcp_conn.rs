@@ -3,7 +3,7 @@
 
 //! Broker-backed TCP connection file descriptors.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use litebox::{
@@ -27,6 +27,7 @@ use super::fork_snapshot::BrokerHandleKind;
 static BROKER_TCP_CONN_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerTcpConnProvider>> =
     once_cell::race::OnceBox::new();
 static BROKER_TCP_CONN_ACCEPT_ENABLED: AtomicBool = AtomicBool::new(false);
+static BROKER_INET_TCP_CONN_OUTBOUND_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_broker_tcp_conn_accept_enabled(enabled: bool) {
     BROKER_TCP_CONN_ACCEPT_ENABLED.store(enabled, Ordering::Release);
@@ -34,6 +35,14 @@ pub fn set_broker_tcp_conn_accept_enabled(enabled: bool) {
 
 pub fn broker_tcp_conn_accept_enabled() -> bool {
     BROKER_TCP_CONN_ACCEPT_ENABLED.load(Ordering::Acquire)
+}
+
+pub fn set_broker_inet_tcp_conn_provider_outbound_enabled(enabled: bool) {
+    BROKER_INET_TCP_CONN_OUTBOUND_ENABLED.store(enabled, Ordering::Release);
+}
+
+pub fn broker_inet_tcp_conn_provider_outbound_enabled() -> bool {
+    BROKER_INET_TCP_CONN_OUTBOUND_ENABLED.load(Ordering::Acquire)
 }
 
 pub fn set_broker_tcp_conn_provider(
@@ -116,6 +125,99 @@ where
 }
 
 impl BrokerTcpConnFd<Platform> {
+    pub(crate) fn connect(
+        &self,
+        _cx: &WaitContext<'_, Platform>,
+        sockaddr: &[u8],
+    ) -> Result<(), Errno> {
+        const CONNECT_TIMEOUT_MS: u32 = 30_000;
+        self.common.ensure_subscribed(&self.pollee);
+        let nonblock = self.get_status().contains(OFlags::NONBLOCK);
+        if nonblock {
+            return match self
+                .provider
+                .connect(self.handle(), sockaddr, CONNECT_TIMEOUT_MS)
+            {
+                Ok(()) => Ok(()),
+                Err(BrokerOpError::WouldBlock) => Err(Errno::EINPROGRESS),
+                Err(e) => Err(broker_err_to_errno(e)),
+            };
+        }
+        loop {
+            match self
+                .provider
+                .connect(self.handle(), sockaddr, CONNECT_TIMEOUT_MS)
+            {
+                Ok(()) => return Ok(()),
+                Err(BrokerOpError::WouldBlock) => core::hint::spin_loop(),
+                Err(e) => return Err(broker_err_to_errno(e)),
+            }
+        }
+    }
+
+    pub(crate) fn getsockname(&self) -> Result<[u8; 28], Errno> {
+        self.provider
+            .getsockname(self.handle())
+            .map_err(broker_err_to_errno)
+    }
+
+    pub(crate) fn getpeername(&self) -> Result<[u8; 28], Errno> {
+        self.provider
+            .getpeername(self.handle())
+            .map_err(broker_err_to_errno)
+    }
+
+    pub(crate) fn setsockopt(&self, level: u32, optname: u32, optval: &[u8]) -> Result<(), Errno> {
+        self.provider
+            .setsockopt(self.handle(), level, optname, optval)
+            .map_err(|err| match err {
+                BrokerOpError::InvalidValue => Errno::EOPNOTSUPP,
+                other => broker_err_to_errno(other),
+            })
+    }
+
+    pub(crate) fn getsockopt(
+        &self,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, Errno> {
+        self.provider
+            .getsockopt(self.handle(), level, optname, optlen)
+            .map_err(|err| match err {
+                BrokerOpError::InvalidValue => Errno::EOPNOTSUPP,
+                other => broker_err_to_errno(other),
+            })
+    }
+
+    pub(crate) fn try_read_now(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        const READ_TCP_CONN_CHUNK: usize = 60 * 1024;
+        let capped_len = core::cmp::min(buf.len(), READ_TCP_CONN_CHUNK);
+        match self
+            .provider
+            .read_tcp_conn(self.handle(), capped_len as u64)
+        {
+            Ok(bytes) => {
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            Err(BrokerOpError::WouldBlock) => Err(Errno::EAGAIN),
+            Err(e) => Err(broker_err_to_errno(e)),
+        }
+    }
+
+    pub(crate) fn try_write_now(&self, buf: &[u8]) -> Result<usize, Errno> {
+        const WRITE_TCP_CONN_CHUNK: usize = 60 * 1024;
+        let chunk = &buf[..core::cmp::min(buf.len(), WRITE_TCP_CONN_CHUNK)];
+        match self.provider.write_tcp_conn(self.handle(), chunk) {
+            Ok(n) => Ok(n),
+            Err(BrokerOpError::WouldBlock) => Err(Errno::EAGAIN),
+            Err(BrokerOpError::InvalidValue) => Err(Errno::EPIPE),
+            Err(e) => Err(broker_err_to_errno(e)),
+        }
+    }
+
     pub(crate) fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -128,29 +230,12 @@ impl BrokerTcpConnFd<Platform> {
             return Ok(0);
         }
         self.common.ensure_subscribed(&self.pollee);
-        const READ_TCP_CONN_CHUNK: usize = 60 * 1024;
-        let capped_len = core::cmp::min(buf.len(), READ_TCP_CONN_CHUNK);
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
-            .wait(cx, nonblock, Events::IN, || {
-                match self
-                    .provider
-                    .read_tcp_conn(self.handle(), capped_len as u64)
-                {
-                    Ok(bytes) => {
-                        let n = bytes.len().min(buf.len());
-                        buf[..n].copy_from_slice(&bytes[..n]);
-                        if n == 0 {
-                        }
-                        Ok(n)
-                    }
-                    Err(BrokerOpError::WouldBlock) => {
-                        Err(litebox::event::polling::TryOpError::TryAgain)
-                    }
-                    Err(e) => Err(litebox::event::polling::TryOpError::Other(
-                        broker_err_to_errno(e),
-                    )),
-                }
+            .wait(cx, nonblock, Events::IN, || match self.try_read_now(buf) {
+                Ok(n) => Ok(n),
+                Err(Errno::EAGAIN) => Err(litebox::event::polling::TryOpError::TryAgain),
+                Err(e) => Err(litebox::event::polling::TryOpError::Other(e)),
             })
             .map_err(|e| match e {
                 litebox::event::polling::TryOpError::TryAgain => Errno::EAGAIN,
@@ -167,22 +252,13 @@ impl BrokerTcpConnFd<Platform> {
             return Err(Errno::EPIPE);
         }
         self.common.ensure_subscribed(&self.pollee);
-        const WRITE_TCP_CONN_CHUNK: usize = 60 * 1024;
-        let chunk = &buf[..core::cmp::min(buf.len(), WRITE_TCP_CONN_CHUNK)];
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::OUT, || {
-                match self.provider.write_tcp_conn(self.handle(), chunk) {
+                match self.try_write_now(buf) {
                     Ok(n) => Ok(n),
-                    Err(BrokerOpError::WouldBlock) => {
-                        Err(litebox::event::polling::TryOpError::TryAgain)
-                    }
-                    Err(BrokerOpError::InvalidValue) => {
-                        Err(litebox::event::polling::TryOpError::Other(Errno::EPIPE))
-                    }
-                    Err(e) => Err(litebox::event::polling::TryOpError::Other(
-                        broker_err_to_errno(e),
-                    )),
+                    Err(Errno::EAGAIN) => Err(litebox::event::polling::TryOpError::TryAgain),
+                    Err(e) => Err(litebox::event::polling::TryOpError::Other(e)),
                 }
             })
             .map_err(|e| match e {

@@ -27,7 +27,6 @@ use litebox::{
     LiteBox,
     fd::TypedFd,
     mm::{PageManager, linux::PAGE_SIZE},
-    net::Network,
     pipes::Pipes,
     platform::{RawConstPointer as _, RawMutPointer as _, TimeProvider},
     shim::ContinueOperation,
@@ -36,6 +35,29 @@ use litebox::{
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
+
+/// Whether this shim build includes the worker-local smoltcp network stack.
+pub const WORKER_LOCAL_INET: bool = cfg!(feature = "worker_local_inet");
+
+#[cfg(feature = "worker_local_inet")]
+struct LocalNetwork {
+    inner: litebox::sync::Mutex<Platform, litebox::net::Network<Platform>>,
+}
+
+#[cfg(feature = "worker_local_inet")]
+impl LocalNetwork {
+    fn new(litebox: &LiteBox<Platform>) -> Self {
+        let mut net = litebox::net::Network::new(litebox);
+        net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        Self {
+            inner: litebox::sync::Mutex::new(net),
+        }
+    }
+
+    fn lock(&self) -> litebox::sync::MutexGuard<'_, Platform, litebox::net::Network<Platform>> {
+        self.inner.lock()
+    }
+}
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 // DEVNOTE: this is before the `mod` declarations so that it can be used within them.
@@ -586,6 +608,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                         .descriptor_table_mut()
                         .insert(tcp_fd);
                 let mut rds = files.raw_descriptor_store.write();
+                #[cfg(feature = "worker_local_inet")]
                 if let Ok(old_sock) =
                     rds.fd_consume_raw_integer::<litebox::net::Network<Platform>>(guest_fd)
                 {
@@ -597,7 +620,8 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                         .lock()
                         .close(&old_sock, litebox::net::CloseBehavior::Immediate);
                     rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+                }
+                if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
                     drop(rds);
                     let _ = files.fs.close(&old_fs);
                     rds = files.raw_descriptor_store.write();
@@ -688,6 +712,87 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 debug_assert!(
                     ok,
                     "install_broker_bridge_fd(tcp_conn): slot {guest_fd} still occupied"
+                );
+                Ok(())
+            }
+            BrokerHandleKind::InetDgram => {
+                let provider =
+                    syscalls::broker_inet_dgram::broker_inet_dgram_provider().ok_or(())?;
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(handle_id);
+                let dgram = syscalls::broker_inet_dgram::BrokerInetDgramFd::<Platform>::new(
+                    provider,
+                    handle_id,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<
+                    syscalls::broker_inet_dgram::BrokerInetDgramSubsystem,
+                > = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(dgram);
+                let mut rds = files.raw_descriptor_store.write();
+                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
+                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+                debug_assert!(
+                    ok,
+                    "install_broker_bridge_fd(inet_dgram): slot {guest_fd} still occupied"
+                );
+                Ok(())
+            }
+            BrokerHandleKind::InetListener => {
+                let provider =
+                    syscalls::broker_inet_listener::broker_inet_listener_provider().ok_or(())?;
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(handle_id);
+                let listener =
+                    syscalls::broker_inet_listener::BrokerInetListenerFd::<Platform>::new(
+                        provider,
+                        handle_id,
+                        0,
+                        litebox::fs::OFlags::empty(),
+                    );
+                let typed: litebox::fd::TypedFd<
+                    syscalls::broker_inet_listener::BrokerInetListenerSubsystem,
+                > = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(listener);
+                let mut rds = files.raw_descriptor_store.write();
+                if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+                    drop(rds);
+                    let _ = files.fs.close(&old_fs);
+                    rds = files.raw_descriptor_store.write();
+                } else if let Ok(old_host) = rds
+                    .fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
+                {
+                    drop(rds);
+                    if let Some(entry) = self
+                        .task
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .remove(&old_host)
+                    {
+                        let host_fd = entry.take_fd();
+                        if host_fd >= 0 {
+                            self.task.global.platform.close_host_fd(host_fd);
+                        }
+                    }
+                    rds = files.raw_descriptor_store.write();
+                }
+                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+                debug_assert!(
+                    ok,
+                    "install_broker_bridge_fd(inet_listener): slot {guest_fd} still occupied"
                 );
                 Ok(())
             }
@@ -934,6 +1039,24 @@ impl LinuxShimBuilder {
             .expect("init process creation must succeed");
     }
 
+    /// Like [`init_with_pid`] but for fork-restored child workers that
+    /// inherit pgid/sid from their parent's snapshot. Without this, the
+    /// child registry entry would default to pgid=sid=pid, making any
+    /// subsequent guest `setsid()` fail with EPERM ("already group
+    /// leader"). This is required for any guest fork-then-setsid pattern,
+    /// notably dropbear SSH session children.
+    pub fn init_for_fork_restore(
+        &self,
+        pid: litebox::process::ProcessId,
+        pgid: litebox::process::ProcessGroupId,
+        sid: litebox::process::SessionId,
+    ) {
+        self.litebox
+            .process_registry()
+            .create_process_with_id_and_pgrp(pid, None, Some((pgid, sid)), 0)
+            .expect("fork-restored process creation must succeed");
+    }
+
     /// Returns the litebox object for the shim.
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.litebox
@@ -961,8 +1084,8 @@ impl LinuxShimBuilder {
         use litebox::platform::AddressSpaceProvider;
         use litebox::platform::RawMutex as _;
 
-        let mut net = Network::new(&self.litebox);
-        net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+        #[cfg(feature = "worker_local_inet")]
+        let net = LocalNetwork::new(&self.litebox);
 
         // Allocate the init process's address space (slot 0 on userland).
         let init_as_id = self
@@ -1004,7 +1127,8 @@ impl LinuxShimBuilder {
             platform: self.platform,
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
-            net: litebox::sync::Mutex::new(net),
+            #[cfg(feature = "worker_local_inet")]
+            net,
             boot_time: self.platform.now(),
             load_filter: self.load_filter,
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
@@ -1180,6 +1304,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
     /// When called from a guest thread (e.g. via `try_accept`), this also
     /// wakes the network worker so it can handle any follow-up transmissions
     /// (ACKs, retransmissions) without waiting for its poll timeout.
+    #[cfg(feature = "worker_local_inet")]
     pub fn perform_network_interaction(
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
@@ -1205,10 +1330,27 @@ impl<FS: ShimFS> LinuxShim<FS> {
         result
     }
 
+    #[cfg(not(feature = "worker_local_inet"))]
+    pub fn perform_network_interaction(
+        &self,
+    ) -> litebox::net::PlatformInteractionReinvocationAdvice {
+        let _ = self;
+        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction {
+            timeout: None,
+        }
+    }
+
     /// Returns `true` if there are TCP sockets still closing in the
     /// background (data being flushed, FIN handshake in progress).
+    #[cfg(feature = "worker_local_inet")]
     pub fn has_pending_network_closes(&self) -> bool {
         self.global.net.lock().has_pending_closes()
+    }
+
+    #[cfg(not(feature = "worker_local_inet"))]
+    pub fn has_pending_network_closes(&self) -> bool {
+        let _ = self;
+        false
     }
 
     /// Re-send port-listen notifications for all active listen sockets.
@@ -1217,14 +1359,21 @@ impl<FS: ShimFS> LinuxShim<FS> {
     /// sockets from the parent's snapshot but the parent already registered
     /// them through ITS IPC. This re-registers through the child's IPC so
     /// the broker routes inbound connections to the correct worker.
+    #[cfg(feature = "worker_local_inet")]
     pub fn reannounce_listen_ports(&self) {
         self.global.net.lock().reannounce_listen_ports();
+    }
+
+    #[cfg(not(feature = "worker_local_inet"))]
+    pub fn reannounce_listen_ports(&self) {
+        let _ = self;
     }
 
     /// Establish a TCP connection to the given address.
     ///
     /// Returns a [`transport::ShimTransport`] that can be used as a
     /// byte-stream transport (e.g., for a 9P filesystem client).
+    #[cfg(feature = "worker_local_inet")]
     pub fn tcp_connection(
         &self,
         addr: core::net::SocketAddr,
@@ -1235,6 +1384,15 @@ impl<FS: ShimFS> LinuxShim<FS> {
             self.global.transport_interrupt.clone(),
             self.process_state.vfork_parking.clone(),
         )
+    }
+
+    #[cfg(not(feature = "worker_local_inet"))]
+    pub fn tcp_connection(
+        &self,
+        addr: core::net::SocketAddr,
+    ) -> Result<transport::ShimTransport, Errno> {
+        let _ = (self, addr);
+        Err(Errno::EOPNOTSUPP)
     }
 
     /// Create a direct message channel for 9P (bypasses smoltcp).
@@ -1919,6 +2077,55 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }
         }
 
+        // Restore broker-backed inet listener fds by re-attaching to the broker handle.
+        {
+            use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::InetListener {
+                    continue;
+                }
+                let Some(broker_handle) = entry.metadata.broker_handle else {
+                    continue;
+                };
+                if broker_handle.kind != BrokerHandleKind::InetListener {
+                    continue;
+                }
+                let Some(provider) =
+                    syscalls::broker_inet_listener::broker_inet_listener_provider()
+                else {
+                    continue;
+                };
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                let _ = releaser.dup_handle(broker_handle.handle_id);
+                let listener =
+                    syscalls::broker_inet_listener::BrokerInetListenerFd::<Platform>::new(
+                        provider,
+                        broker_handle.handle_id,
+                        0,
+                        litebox::fs::OFlags::from_bits_retain(entry.status_flags),
+                    );
+                let typed = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(
+                    listener,
+                );
+                let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
+                let success = rds.fd_into_specific_raw_integer(typed, entry.fd);
+                debug_assert!(
+                    success,
+                    "broker inet listener fd slot {} occupied during restore",
+                    entry.fd
+                );
+            }
+        }
+
         // Phase 2.F.3: Recreate EventFd entries that carry a broker_handle
         // reference. Re-attach to the same broker handle via the local
         // provider's `dup_handle` semantics — the parent already dup'd
@@ -1970,6 +2177,8 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         // exist yet — handled near the FdClass::Pipe block).
                         BrokerHandleKind::UnixSocket => None,
                         BrokerHandleKind::TcpConn => None,
+                        BrokerHandleKind::InetListener => None,
+                        BrokerHandleKind::InetDgram => None,
                         // `Signalfd` is restored by its dedicated FdClass branch below.
                         BrokerHandleKind::Signalfd => todo!(
                             "fork-snapshot restore for BrokerHandleKind::Signalfd \
@@ -2769,6 +2978,7 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             drop(rds);
             return Ok(f(RawFdRef::Fs(&fd)));
         }
+        #[cfg(feature = "worker_local_inet")]
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
             return Ok(f(RawFdRef::Net(&fd)));
@@ -2817,6 +3027,18 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             drop(rds);
             return Ok(f(RawFdRef::Inotify(&fd)));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(f(RawFdRef::BrokerInetListener(&fd)));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(f(RawFdRef::BrokerInetDgram(&fd)));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(f(RawFdRef::BrokerInetRaw(&fd)));
+        }
         Err(Errno::EBADF)
     }
 }
@@ -2829,7 +3051,8 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
 /// invariant the dispatcher exists to enforce.
 pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     Fs(&'a Arc<TypedFd<FS>>),
-    Net(&'a Arc<TypedFd<Network<Platform>>>),
+    #[cfg(feature = "worker_local_inet")]
+    Net(&'a Arc<TypedFd<litebox::net::Network<Platform>>>),
     Pipes(&'a Arc<TypedFd<Pipes<Platform>>>),
     Eventfd(&'a Arc<TypedFd<syscalls::eventfd::EventfdSubsystem>>),
     Epoll(&'a Arc<TypedFd<syscalls::epoll::EpollSubsystem<FS>>>),
@@ -2841,6 +3064,11 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     BrokerPty(&'a Arc<TypedFd<syscalls::broker_pty::BrokerPtySubsystem>>),
     Signalfd(&'a Arc<TypedFd<syscalls::signalfd::SignalfdSubsystem>>),
     Inotify(&'a Arc<TypedFd<syscalls::inotify::InotifySubsystem>>),
+    BrokerInetListener(
+        &'a Arc<TypedFd<syscalls::broker_inet_listener::BrokerInetListenerSubsystem>>,
+    ),
+    BrokerInetDgram(&'a Arc<TypedFd<syscalls::broker_inet_dgram::BrokerInetDgramSubsystem>>),
+    BrokerInetRaw(&'a Arc<TypedFd<syscalls::broker_inet_raw::BrokerInetRawSubsystem>>),
 }
 
 /// Planned worker-exec fd-bridge decision for a `RawFdRef`.
@@ -2901,6 +3129,7 @@ impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
     pub(crate) fn worker_exec_bridge_decision(&self) -> WorkerExecBridgeDecision {
         match self {
             RawFdRef::Fs(_fd) => todo!("encode BrokerFileBridgeState when fs fd is broker-backed"),
+            #[cfg(feature = "worker_local_inet")]
             RawFdRef::Net(_fd) => {
                 todo!("encode TcpListenBridgeState when socket is a bridged listener")
             }
@@ -2935,6 +3164,15 @@ impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
                 todo!("encode SignalfdBridgeState from broker-backed signalfd")
             }
             RawFdRef::Inotify(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::BrokerInetListener(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::BrokerInetDgram(_fd) => {
+                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
+            }
+            RawFdRef::BrokerInetRaw(_fd) => {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
             }
         }
@@ -3171,6 +3409,7 @@ impl<FS: ShimFS> Task<FS> {
                         None => alloc::format!("raw={raw_fd} fs"),
                     }
                 }
+                #[cfg(feature = "worker_local_inet")]
                 crate::RawFdRef::Net(_fd) => alloc::format!("raw={raw_fd} net"),
                 crate::RawFdRef::Pipes(_fd) => alloc::format!("raw={raw_fd} pipes"),
                 crate::RawFdRef::Eventfd(_fd) => alloc::format!("raw={raw_fd} eventfd"),
@@ -3187,6 +3426,15 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerPty(_fd) => alloc::format!("raw={raw_fd} broker_pty"),
                 crate::RawFdRef::Signalfd(_fd) => alloc::format!("raw={raw_fd} signalfd"),
                 crate::RawFdRef::Inotify(_fd) => alloc::format!("raw={raw_fd} inotify"),
+                crate::RawFdRef::BrokerInetListener(_fd) => {
+                    alloc::format!("raw={raw_fd} broker-inet-listener")
+                }
+                crate::RawFdRef::BrokerInetDgram(_fd) => {
+                    alloc::format!("raw={raw_fd} broker-inet-dgram")
+                }
+                crate::RawFdRef::BrokerInetRaw(_fd) => {
+                    alloc::format!("raw={raw_fd} broker-inet-raw")
+                }
             })
             .unwrap_or_else(|_| alloc::format!("raw={raw_fd} invalid"))
     }
@@ -4712,8 +4960,9 @@ struct GlobalState<FS: ShimFS> {
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
     pipes: Pipes<Platform>,
-    /// The network subsystem.
-    net: litebox::sync::Mutex<Platform, Network<Platform>>,
+    /// The optional worker-local network subsystem.
+    #[cfg(feature = "worker_local_inet")]
+    net: LocalNetwork,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
     /// Optional load filter function to modify environment variables during program loading.

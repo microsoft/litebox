@@ -67,7 +67,7 @@ impl From<ProcessId> for ProcessGroupId {
 
 /// A session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SessionId(u32);
+pub struct SessionId(pub u32);
 
 impl SessionId {
     /// Returns the raw numeric value.
@@ -554,18 +554,38 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         parent: Option<ProcessId>,
         exit_signal: i32,
     ) -> Result<ProcessId, CreateProcessError> {
+        self.create_process_with_id_and_pgrp(pid, parent, None, exit_signal)
+    }
+
+    /// Like [`create_process_with_id`] but allows the caller to override
+    /// the inherited (pgid, sid). This is required for fork-restored
+    /// worker init: the new worker process has no parent in *its own*
+    /// local registry, but it inherits the parent's pgid/sid from the
+    /// fork snapshot. Without this override, the default (pgid=sid=pid)
+    /// would make the new worker its own session leader, which breaks
+    /// subsequent `setsid()` (returns EPERM "already group leader").
+    pub fn create_process_with_id_and_pgrp(
+        &self,
+        pid: ProcessId,
+        parent: Option<ProcessId>,
+        pgid_sid_override: Option<(ProcessGroupId, SessionId)>,
+        exit_signal: i32,
+    ) -> Result<ProcessId, CreateProcessError> {
         let mut table = self.table.write();
 
         if table.contains_key(&pid) {
             return Err(CreateProcessError::PidAlreadyExists);
         }
 
+        let is_fork_restore = parent.is_none() && pgid_sid_override.is_some();
         let (pgid, sid) = if let Some(parent_pid) = parent {
             let parent_entry = table
                 .get_mut(&parent_pid)
                 .ok_or(CreateProcessError::NoSuchParent)?;
             parent_entry.children.push(pid);
             (parent_entry.context.pgid, parent_entry.context.sid)
+        } else if let Some(over) = pgid_sid_override {
+            over
         } else {
             if table.values().any(|e| e.context.parent.is_none()) {
                 return Err(CreateProcessError::InitAlreadyExists);
@@ -591,8 +611,11 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         let prev = table.insert(pid, entry);
         debug_assert!(prev.is_none(), "PID collision: {}", pid.0);
 
-        // Record root pid the first time a parent-less process is added.
-        if parent.is_none() {
+        // Record root pid the first time a true root (parent-less AND
+        // no pgid_sid_override) is added. fork-restored workers have
+        // parent=None locally but their pgid/sid come from the parent
+        // worker's snapshot — they are NOT process-tree roots.
+        if parent.is_none() && !is_fork_restore {
             self.root.store(pid.0, Ordering::Release);
         }
 

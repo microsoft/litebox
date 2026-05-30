@@ -65,6 +65,12 @@ default-members = [
 # but not _too_ ridiculous.
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+# Match catch-alls are denied. See `AGENTS.md` § "Match exhaustiveness,
+# no catch-alls, loud failure for logic errors" for the rationale and
+# the companion patterns (exhaustive enums; `unreachable!()` over
+# silent error returns at internal-consistency-bug sites). New
+# wildcards require a narrowly-scoped `#[allow(clippy::wildcard_enum_match_arm)]`
+# with a `// reason:` comment.
 wildcard_enum_match_arm = "deny"
 unreadable_literal = "allow"
 doc_markdown = "allow"

@@ -134,6 +134,12 @@ pub enum SubsystemTag {
     /// Phase E reserves this tag for PTY master/slave identity that
     /// must survive cross-worker `exec_on_remote_host`.
     Pty,
+    /// Broker-hosted TCP listener. Wire value `11`. Phase A.
+    InetListener,
+    /// Broker-hosted UDP datagram socket. Wire value `12`. Phase C.
+    InetDgram,
+    /// Broker-hosted raw IPv4 socket. Wire value `13`. Phase D.
+    InetRaw,
     /// Tag that this receiver doesn't recognise. Carries the raw u8
     /// value so the receiver can log diagnostics; callers should reject
     /// the specific fd while continuing to deliver the rest of the
@@ -155,6 +161,9 @@ impl SubsystemTag {
             SubsystemTag::Process => 8,
             SubsystemTag::Pipe => 9,
             SubsystemTag::Pty => 10,
+            SubsystemTag::InetListener => 11,
+            SubsystemTag::InetDgram => 12,
+            SubsystemTag::InetRaw => 13,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -174,6 +183,9 @@ impl SubsystemTag {
             8 => SubsystemTag::Process,
             9 => SubsystemTag::Pipe,
             10 => SubsystemTag::Pty,
+            11 => SubsystemTag::InetListener,
+            12 => SubsystemTag::InetDgram,
+            13 => SubsystemTag::InetRaw,
             other => SubsystemTag::Unknown(other),
         }
     }

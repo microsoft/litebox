@@ -30,8 +30,9 @@ pub mod vmap;
 // `litebox_common_linux::broker_eventfd_provider::*` etc. import
 // paths working.
 pub use cwfd::{
-    broker_eventfd_provider, broker_inotify_provider, broker_pgrp_signal_provider,
-    broker_pidfd_provider, broker_pipe_provider, broker_pty_provider, broker_signalfd_provider,
+    broker_eventfd_provider, broker_inet_listener_provider, broker_inet_raw_provider,
+    broker_inotify_provider, broker_pgrp_signal_provider, broker_pidfd_provider,
+    broker_pipe_provider, broker_pty_provider, broker_signalfd_provider,
     broker_socketpair_provider, broker_tcp_conn_provider, fd_token_protocol, fd_transfer_frame,
     guest_pid_provider, notification_frame,
 };
@@ -886,7 +887,7 @@ pub struct Linger {
 /// IP Protocols
 #[repr(u8)]
 #[non_exhaustive]
-#[derive(IntEnum, Debug)]
+#[derive(IntEnum, Debug, Clone, Copy)]
 pub enum IPProtocol {
     Default = 0,
     ICMP = 1,
@@ -912,6 +913,12 @@ pub enum IpOption {
     RECVERR = 11,
     /// IP_PKTINFO
     PKTINFO = 8,
+}
+
+#[repr(u32)]
+#[derive(Debug, IntEnum, Clone, Copy)]
+pub enum Ipv6Option {
+    V6ONLY = 26,
 }
 
 #[repr(u32)]
@@ -953,6 +960,7 @@ pub enum TcpOption {
 #[derive(Debug, Clone, Copy)]
 pub enum SocketOptionName {
     IP(IpOption),
+    IPv6(Ipv6Option),
     Socket(SocketOption),
     TCP(TcpOption),
 }
@@ -964,6 +972,7 @@ pub enum SocketOptionLevel {
     SOCKET = 1,
     TCP = 6,
     UDP = 17,
+    IPV6 = 41,
     RAW = 255,
 }
 
@@ -974,6 +983,7 @@ impl SocketOptionName {
             SocketOptionLevel::IP => Some(Self::IP(IpOption::try_from(optname).ok()?)),
             SocketOptionLevel::SOCKET => Some(Self::Socket(SocketOption::try_from(optname).ok()?)),
             SocketOptionLevel::TCP => Some(Self::TCP(TcpOption::try_from(optname).ok()?)),
+            SocketOptionLevel::IPV6 => Some(Self::IPv6(Ipv6Option::try_from(optname).ok()?)),
             SocketOptionLevel::UDP | SocketOptionLevel::RAW => None,
         }
     }

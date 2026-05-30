@@ -68,6 +68,30 @@ impl BrokerSubscribable for RunnerBrokerTcpConnProvider {
 }
 
 impl BrokerTcpConnProvider for RunnerBrokerTcpConnProvider {
+    fn create(&self, family: u8) -> Result<u64, BrokerOpError> {
+        self.client
+            .tcp_conn_create(family)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn connect(&self, handle: u64, sockaddr: &[u8], timeout_ms: u32) -> Result<(), BrokerOpError> {
+        self.client
+            .tcp_conn_connect(handle, sockaddr, timeout_ms)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn getsockname(&self, handle: u64) -> Result<[u8; 28], BrokerOpError> {
+        self.client
+            .tcp_conn_getsockname(handle)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn getpeername(&self, handle: u64) -> Result<[u8; 28], BrokerOpError> {
+        self.client
+            .tcp_conn_getpeername(handle)
+            .map_err(client_err_to_broker_err)
+    }
+
     fn read_tcp_conn(&self, handle: u64, max_len: u64) -> Result<Vec<u8>, BrokerOpError> {
         self.client
             .read_tcp_conn(handle, max_len)
@@ -83,6 +107,30 @@ impl BrokerTcpConnProvider for RunnerBrokerTcpConnProvider {
     fn shutdown_tcp_conn(&self, handle: u64, read: bool, write: bool) -> Result<(), BrokerOpError> {
         self.client
             .shutdown_tcp_conn(handle, read, write)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn setsockopt(
+        &self,
+        handle: u64,
+        level: u32,
+        optname: u32,
+        optval: &[u8],
+    ) -> Result<(), BrokerOpError> {
+        self.client
+            .tcp_conn_setsockopt(handle, level, optname, optval)
+            .map_err(client_err_to_broker_err)
+    }
+
+    fn getsockopt(
+        &self,
+        handle: u64,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, BrokerOpError> {
+        self.client
+            .tcp_conn_getsockopt(handle, level, optname, optlen)
             .map_err(client_err_to_broker_err)
     }
 
@@ -116,6 +164,8 @@ fn client_err_to_broker_err(e: ClientError) -> BrokerOpError {
         | ClientError::UnknownSubscription(_)
         | ClientError::SubsystemMismatch
         | ClientError::NoNotificationRing
+        | ClientError::PermissionDenied
+        | ClientError::ProtocolNotSupported
         | ClientError::BrokerInternal { .. }
         | ClientError::OtherStatus { .. }
         | ClientError::UnexpectedFdAttachment { .. }

@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![cfg_attr(
+    not(feature = "worker_local_inet"),
+    allow(unused_assignments, unused_mut, unused_variables)
+)]
 //! Unix domain socket implementation for the Linux shim layer.
 
 use core::{
@@ -277,6 +281,7 @@ impl<FS: ShimFS> UnixInitStream<FS> {
             tcp_port: 0,
             tcp_raw_fd: None,
             tcp_proxy: None,
+            tcp_broker_listener: None,
             _tcp_bridge: None,
         })
     }
@@ -414,6 +419,12 @@ struct UnixListenStream<FS: ShimFS> {
     tcp_raw_fd: Option<u32>,
     /// TCP proxy for the cross-worker listener (for observer registration).
     tcp_proxy: Option<Arc<litebox::net::socket_channel::NetworkProxy<crate::Platform>>>,
+    tcp_broker_listener: Option<
+        litebox::fd::EntryHandle<
+            crate::Platform,
+            crate::syscalls::broker_inet_listener::BrokerInetListenerSubsystem,
+        >,
+    >,
     /// Bridge observer kept alive to forward TCP events to backlog pollee.
     _tcp_bridge: Option<Arc<BacklogTcpBridge<FS>>>,
 }
@@ -445,18 +456,22 @@ impl<FS: ShimFS> UnixListenStream<FS> {
     /// Returns the allocated port number (0 on failure).
     fn start_tcp_listener(&mut self, global: &Arc<GlobalState<FS>>, task: &Task<FS>) -> u16 {
         use litebox::platform::DebugLogProvider as _;
-        use litebox_common_linux::{AddressFamily, SockFlags, SockType};
+        use litebox_common_linux::SockFlags;
 
         // Create TCP socket via guest syscall path.
-        let raw_fd =
-            match task.do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    let msg = alloc::format!("UNIX TCP LISTENER: socket failed: {:?}\n", e);
-                    litebox_platform_multiplex::platform().debug_log_print(&msg);
-                    return 0;
-                }
-            };
+        let raw_fd = match task.do_socket(
+            litebox_common_linux::AddressFamily::INET,
+            litebox_common_linux::SockType::Stream,
+            SockFlags::NONBLOCK,
+            0,
+        ) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let msg = alloc::format!("UNIX TCP LISTENER: socket failed: {:?}\n", e);
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
+                return 0;
+            }
+        };
 
         // Bind to ephemeral port (port 0 = kernel picks).
         let bind_addr = crate::syscalls::net::SocketAddress::Inet(core::net::SocketAddr::V4(
@@ -481,32 +496,58 @@ impl<FS: ShimFS> UnixListenStream<FS> {
             Some(_) | None => return 0,
         };
 
+        #[cfg(feature = "worker_local_inet")]
+        {
+            if let Err(e) = global.send_listen_route_transfer(port) {
+                let msg = alloc::format!("UNIX TCP LISTENER: route transfer failed: {:?}\n", e);
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
+                return 0;
+            }
+
+            litebox_platform_multiplex::platform().wake_network_worker();
+        }
+
         let msg = alloc::format!("UNIX TCP LISTENER: port={} started\n", port);
         litebox_platform_multiplex::platform().debug_log_print(&msg);
 
-        // Get the proxy for the TCP socket.
-        let tcp_proxy = match global.get_proxy_by_raw_fd(raw_fd, &task.files) {
-            Some(p) => p,
-            None => return 0,
-        };
-
-        // Register a bridge observer: when the TCP proxy fires IN events
-        // (new connection ready), accept the TCP connection and push it into
-        // the backlog directly from the network thread.
-        {
+        let bridge = Arc::new(BacklogTcpBridge {
+            backlog: self.backlog.clone(),
+        });
+        let bridge_weak =
+            Arc::downgrade(&bridge) as Weak<dyn litebox::event::observer::Observer<Events>>;
+        let mut tcp_proxy = None;
+        let mut tcp_broker_listener = None;
+        #[cfg(feature = "worker_local_inet")]
+        if let Some(proxy) = global.get_proxy_by_raw_fd(raw_fd, &task.files) {
             use litebox::event::IOPollable;
-            let bridge = Arc::new(BacklogTcpBridge {
-                backlog: self.backlog.clone(),
-            });
-            let bridge_weak =
-                Arc::downgrade(&bridge) as Weak<dyn litebox::event::observer::Observer<Events>>;
-            tcp_proxy.register_observer(bridge_weak, Events::IN);
-            self._tcp_bridge = Some(bridge);
+            proxy.register_observer(bridge_weak, Events::IN);
+            tcp_proxy = Some(proxy);
         }
+        {
+            let files = task.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            let typed = match rds
+                .fd_from_raw_integer::<super::broker_inet_listener::BrokerInetListenerSubsystem>(
+                    raw_fd as usize,
+                ) {
+                Ok(typed) => typed,
+                Err(_) => return 0,
+            };
+            let Some(handle) = global.litebox.descriptor_table().entry_handle(&typed) else {
+                return 0;
+            };
+            handle.with_entry(|entry| {
+                use litebox::event::IOPollable;
+                entry.register_observer(bridge_weak, Events::IN);
+            });
+            tcp_broker_listener = Some(handle);
+        }
+        self._tcp_bridge = Some(bridge);
 
         self.tcp_port = port;
         self.tcp_raw_fd = Some(raw_fd);
-        self.tcp_proxy = Some(tcp_proxy);
+        self.tcp_proxy = tcp_proxy;
+        self.tcp_broker_listener = tcp_broker_listener;
         port
     }
 
@@ -635,6 +676,13 @@ enum UnixTransport {
         proxy: Arc<litebox::net::socket_channel::NetworkProxy<crate::Platform>>,
         recv_reader: Arc<litebox::sync::Mutex<crate::Platform, FdTransferReader>>,
     },
+    BrokerTcp {
+        handle: litebox::fd::EntryHandle<
+            crate::Platform,
+            crate::syscalls::broker_tcp_conn::BrokerTcpConnSubsystem,
+        >,
+        recv_reader: Arc<litebox::sync::Mutex<crate::Platform, FdTransferReader>>,
+    },
 }
 
 const UNIX_BUF_SIZE: usize = 65536;
@@ -660,6 +708,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 core::cmp::min(recv_ptr, send_peer_ptr)
             }
             UnixTransport::Tcp { proxy, .. } => Arc::as_ptr(proxy) as usize,
+            UnixTransport::BrokerTcp { handle, .. } => handle.object_id().as_u64() as usize,
         }
     }
 
@@ -724,16 +773,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
             UnixTransport::Channel { send, .. } => send.try_write_one(msg),
             UnixTransport::Tcp { proxy, .. } => {
                 use litebox::net::socket_channel::NetworkProxy;
-                // Phase B-Step8e: always-LBFD-frame on the cross-worker
-                // TCP transport. Sender encodes the data plus any
-                // pre-extracted broker handle tokens (built by
-                // parse_sendmsg_cmsg). Receiver mirrors this via
-                // FdTransferReader and the recv-side materialisation.
-                //
-                // passed_fds is for the in-worker `Channel` arm and is
-                // discarded here — the sender's task context already
-                // converted broker-backed entries into `passed_tokens`
-                // before reaching this point.
+                // Phase B-Step8e: always-LBFD-frame on cross-worker transports.
                 let frame = FdTransferFrame {
                     tokens: &msg.passed_tokens,
                     data: &msg.data,
@@ -751,16 +791,29 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                             litebox_platform_multiplex::platform().wake_network_worker();
                             Ok(())
                         }
-                        // Partial write on TCP: not handled in this
-                        // path today (the previous code only handled
-                        // n>0 vs n==0). Surface EAGAIN; the caller
-                        // will retry the whole Message. Smoltcp TCP
-                        // generally accepts the entire chunk so this
-                        // is rare in practice.
                         Ok(_) => Err((msg, Errno::EAGAIN)),
                         Err(_) => Err((msg, Errno::EPIPE)),
                     },
                     NetworkProxy::Datagram(_) | NetworkProxy::Raw => Err((msg, Errno::EINVAL)),
+                }
+            }
+            UnixTransport::BrokerTcp { handle, .. } => {
+                let frame = FdTransferFrame {
+                    tokens: &msg.passed_tokens,
+                    data: &msg.data,
+                };
+                let bytes = {
+                    let mut buf = alloc::vec::Vec::new();
+                    match frame.encode(&mut buf) {
+                        Ok(_) => buf,
+                        Err(_) => return Err((msg, Errno::EMSGSIZE)),
+                    }
+                };
+                match handle.with_entry(|entry| entry.try_write_now(&bytes)) {
+                    Ok(n) if n == bytes.len() => Ok(()),
+                    Ok(_) => Err((msg, Errno::EAGAIN)),
+                    Err(Errno::EAGAIN) => Err((msg, Errno::EAGAIN)),
+                    Err(e) => Err((msg, e)),
                 }
             }
         }
@@ -808,6 +861,34 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                     reader.push(&staging[..read_n]);
                 }
 
+                match Self::try_emit_from_reader(&mut reader, buf, received_fds, received_tokens)? {
+                    Some(n) => Ok(n),
+                    None if read_n == 0 => Ok(0),
+                    None => {
+                        let _ = seqpacket;
+                        Err(TryOpError::TryAgain)
+                    }
+                }
+            }
+            UnixTransport::BrokerTcp {
+                handle,
+                recv_reader,
+            } => {
+                let mut reader = recv_reader.lock();
+                if let Some(n) =
+                    Self::try_emit_from_reader(&mut reader, buf, received_fds, received_tokens)?
+                {
+                    return Ok(n);
+                }
+                let mut staging = alloc::vec![0u8; UNIX_BUF_SIZE];
+                let read_n = match handle.with_entry(|entry| entry.try_read_now(&mut staging)) {
+                    Ok(n) => n,
+                    Err(Errno::EAGAIN) => return Err(TryOpError::TryAgain),
+                    Err(e) => return Err(TryOpError::Other(e)),
+                };
+                if read_n > 0 {
+                    reader.push(&staging[..read_n]);
+                }
                 match Self::try_emit_from_reader(&mut reader, buf, received_fds, received_tokens)? {
                     Some(n) => Ok(n),
                     None if read_n == 0 => Ok(0),
@@ -935,6 +1016,12 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 use litebox::event::IOPollable;
                 proxy.register_observer(observer, mask);
             }
+            UnixTransport::BrokerTcp { handle, .. } => {
+                handle.with_entry(|entry| {
+                    use litebox::event::IOPollable;
+                    entry.register_observer(observer, mask);
+                });
+            }
             UnixTransport::Channel { .. } => self.pollee.register_observer(observer, mask),
         }
     }
@@ -942,6 +1029,10 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
     fn check_io_events(&self) -> Events {
         match &self.transport {
             UnixTransport::Tcp { proxy, .. } => proxy.check_io_events(),
+            UnixTransport::BrokerTcp { handle, .. } => handle.with_entry(|entry| {
+                use litebox::event::IOPollable;
+                entry.check_io_events()
+            }),
             UnixTransport::Channel { recv, send } => {
                 let mut events = Events::empty();
                 let is_read_shutdown = recv.is_shutdown();
@@ -1194,15 +1285,46 @@ impl<FS: ShimFS> UnixStream<FS> {
         ));
         task.do_connect(tcp_raw_fd, connect_addr)?;
 
-        // Get the proxy for the connected TCP socket.
-        let proxy = task.files.borrow().with_socket(
-            &task.global,
-            tcp_raw_fd,
-            |fd| task.global.get_proxy(fd),
-            |_| Err(Errno::EINVAL),
-        )?;
+        let transport = {
+            let files = task.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            if let Ok(typed) = rds
+                .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(
+                    tcp_raw_fd as usize,
+                )
+            {
+                let handle = task
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(&typed)
+                    .ok_or(Errno::EBADF)?;
+                UnixTransport::BrokerTcp {
+                    handle,
+                    recv_reader: Arc::new(litebox::sync::Mutex::new(FdTransferReader::new())),
+                }
+            } else {
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    let proxy = files.with_socket(
+                        &task.global,
+                        tcp_raw_fd,
+                        |fd| task.global.get_proxy(fd),
+                        |_| Err(Errno::EINVAL),
+                    )?;
+                    UnixTransport::Tcp {
+                        proxy,
+                        recv_reader: Arc::new(litebox::sync::Mutex::new(FdTransferReader::new())),
+                    }
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    return Err(Errno::EINVAL);
+                }
+            }
+        };
 
-        // Wrap the TCP proxy in a unix-socket connected stream.
+        // Wrap the TCP transport in a unix-socket connected stream.
         let peer_addr = match addr {
             UnixSocketAddr::Path(sock_path) => UnixBoundSocketAddr::Path((
                 sock_path.clone(),
@@ -1227,10 +1349,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                         addr: init.addr.map(Arc::new),
                         peer: Some(Arc::new(peer_addr)),
                     },
-                    transport: UnixTransport::Tcp {
-                        proxy,
-                        recv_reader: Arc::new(litebox::sync::Mutex::new(FdTransferReader::new())),
-                    },
+                    transport,
                     peer_cred: task.current_ucred(),
                     pollee: Arc::new(Pollee::new()),
                 };
@@ -1247,12 +1366,13 @@ impl<FS: ShimFS> UnixStream<FS> {
         mut peer: Option<&mut UnixSocketAddr>,
         is_nonblocking: bool,
     ) -> Result<UnixSocketInner<FS>, Errno> {
-        let (backlog, tcp_proxy, tcp_raw_fd, listen_addr, listener_cred) =
+        let (backlog, tcp_proxy, tcp_broker_listener, tcp_raw_fd, listen_addr, listener_cred) =
             self.with_state_ref(|state| -> Result<_, Errno> {
                 let listen = state.listen().ok_or(Errno::EINVAL)?;
                 Ok((
                     listen.backlog.clone(),
                     listen.tcp_proxy.clone(),
+                    listen.tcp_broker_listener.clone(),
                     listen.tcp_raw_fd,
                     listen.backlog.addr.clone(),
                     listen.backlog.listener_cred,
@@ -1269,7 +1389,13 @@ impl<FS: ShimFS> UnixStream<FS> {
                 backlog.pollee.register_observer(observer.clone(), mask);
                 if let Some(ref proxy) = tcp_proxy {
                     use litebox::event::IOPollable;
-                    proxy.register_observer(observer, mask);
+                    proxy.register_observer(observer.clone(), mask);
+                }
+                if let Some(ref handle) = tcp_broker_listener {
+                    let _ = handle.with_entry(|entry| {
+                        use litebox::event::IOPollable;
+                        entry.register_observer(observer, mask);
+                    });
                 }
                 Ok(())
             },
@@ -1290,42 +1416,74 @@ impl<FS: ShimFS> UnixStream<FS> {
 
                 // Try cross-worker TCP accept (non-blocking).
                 if let (Some(task), Some(raw_fd)) = (task, tcp_raw_fd) {
-                    match task.files.borrow().with_socket(
-                        &task.global,
-                        raw_fd,
-                        |fd| {
-                            task.global.try_accept(fd, None).map_err(|e| match e {
-                                TryOpError::TryAgain => Errno::EAGAIN,
-                                TryOpError::Other(e) => e,
-                                TryOpError::WaitError(_) => Errno::EINTR,
-                            })
-                        },
-                        |_| Err(Errno::EINVAL),
-                    ) {
-                        Ok(accepted_tcp_fd) => {
+                    match task.do_accept(raw_fd, None, SockFlags::NONBLOCK) {
+                        Ok(accepted_raw_fd) => {
                             backlog
                                 .pending_tcp_connections
                                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
                                     pending.checked_sub(1)
                                 })
                                 .ok();
-                            let proxy = task.global.initialize_socket(
-                                &accepted_tcp_fd,
-                                SockType::Stream,
-                                SockFlags::empty(),
-                            );
-                            proxy.set_state(litebox::net::socket_channel::SocketState::Connected);
+                            let transport = {
+                                let files = task.files.borrow();
+                                let rds = files.raw_descriptor_store.read();
+                                if let Ok(typed) = rds.fd_from_raw_integer::<
+                                    super::broker_tcp_conn::BrokerTcpConnSubsystem,
+                                >(accepted_raw_fd as usize)
+                                {
+                                    let handle = task
+                                        .global
+                                        .litebox
+                                        .descriptor_table()
+                                        .entry_handle(&typed)
+                                        .ok_or(TryOpError::Other(Errno::EBADF))?;
+                                    UnixTransport::BrokerTcp {
+                                        handle,
+                                        recv_reader: Arc::new(litebox::sync::Mutex::new(
+                                            FdTransferReader::new(),
+                                        )),
+                                    }
+                                } else {
+                                    let fd = rds
+                                        .fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(
+                                            accepted_raw_fd as usize,
+                                        )
+                                        .map_err(|_| TryOpError::Other(Errno::EBADF))?;
+                                    let proxy = task
+                                        .global
+                                        .litebox
+                                        .descriptor_table()
+                                        .with_metadata(&fd, |p: &crate::syscalls::net::SocketProxy| {
+                                            p.0.clone()
+                                        })
+                                        .map_err(|_| TryOpError::Other(Errno::EBADF))?;
+                                    proxy.set_state(
+                                        litebox::net::socket_channel::SocketState::Connected,
+                                    );
+                                    UnixTransport::Tcp {
+                                        proxy,
+                                        recv_reader: Arc::new(litebox::sync::Mutex::new(
+                                            FdTransferReader::new(),
+                                        )),
+                                    }
+                                }
+                            };
+                            {
+                                let files = task.files.borrow();
+                                let mut rds = files.raw_descriptor_store.write();
+                                let _ = rds.fd_consume_raw_integer::<
+                                    super::broker_tcp_conn::BrokerTcpConnSubsystem,
+                                >(accepted_raw_fd as usize);
+                                let _ = rds.fd_consume_raw_integer::<
+                                    litebox::net::Network<crate::Platform>,
+                                >(accepted_raw_fd as usize);
+                            }
                             let connected = UnixConnectedStream {
                                 addr: AddrView {
                                     addr: Some(listen_addr.clone()),
                                     peer: None,
                                 },
-                                transport: UnixTransport::Tcp {
-                                    proxy,
-                                    recv_reader: Arc::new(litebox::sync::Mutex::new(
-                                        FdTransferReader::new(),
-                                    )),
-                                },
+                                transport,
                                 peer_cred: listener_cred,
                                 pollee: Arc::new(Pollee::new()),
                             };
@@ -1471,6 +1629,12 @@ impl<FS: ShimFS> UnixStream<FS> {
                         // pollee so we get woken when data arrives from smoltcp.
                         use litebox::event::IOPollable;
                         proxy.register_observer(observer, mask);
+                    }
+                    UnixTransport::BrokerTcp { handle, .. } => {
+                        handle.with_entry(|entry| {
+                            use litebox::event::IOPollable;
+                            entry.register_observer(observer, mask);
+                        });
                     }
                     UnixTransport::Channel { .. } => {
                         connect.pollee.register_observer(observer, mask);
@@ -1970,6 +2134,20 @@ impl<FS: ShimFS> UnixSocket<FS> {
                             None
                         }
                     }
+                    UnixTransport::BrokerTcp { handle, .. } => {
+                        let mut buf = alloc::vec![0u8; UNIX_BUF_SIZE];
+                        match handle.with_entry(|entry| entry.try_read_now(&mut buf)) {
+                            Ok(n) => {
+                                buf.truncate(n);
+                                Some(Message {
+                                    data: buf,
+                                    passed_fds: Vec::new(),
+                                    passed_tokens: Vec::new(),
+                                })
+                            }
+                            Err(_) => None,
+                        }
+                    }
                 })
             }),
             UnixSocketInner::Datagram(_) => None,
@@ -2154,6 +2332,9 @@ impl<FS: ShimFS> UnixSocket<FS> {
                             }
                         }
                     }
+                    UnixTransport::BrokerTcp { handle, .. } => {
+                        let _ = handle.with_entry(|entry| entry.shutdown(read, write));
+                    }
                 }
             }
         }
@@ -2276,7 +2457,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 // the precedent in net.rs for TCP/UDP sockets.
                 SocketOption::RCVBUF | SocketOption::SNDBUF => Ok(()),
             },
-            SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
+            SocketOptionName::IPv6(_) | SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }
     }
     pub(super) fn getsockopt(
@@ -2347,7 +2528,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                     return super::write_to_user(ucred, optval, len);
                 }
             },
-            SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
+            SocketOptionName::IPv6(_) | SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         };
         super::write_to_user(val, optval, len)
     }

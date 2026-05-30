@@ -183,3 +183,41 @@ See the module-level doc comment for details.
 See the per-crate `CLAUDE.md` / `README.md` files and the repository-wide
 custom instructions (cargo fmt → build → clippy → nextest, minimal
 `unsafe`, `no_std` where feasible, justify new dependencies).
+
+### Match exhaustiveness, no catch-alls, loud failure for logic errors
+
+Three intentional patterns that compose to make missing-case bugs hard
+to ship and easy to diagnose when they do:
+
+1. **Match exhaustiveness, enforced by Rust.** Don't add `#[non_exhaustive]`
+   to enums whose variants are owned in this repo. New variants then
+   trip E0004 at every match site at build time — the cheapest possible
+   gate against the "added a subsystem, forgot to update X dispatch
+   table" bug class that wave-1, wave-2, and Phase A all hit.
+2. **No wildcard catch-alls.** `Cargo.toml`'s
+   `[workspace.lints.clippy] wildcard_enum_match_arm = "deny"`
+   (commit `3d51e5cd merge: narrow-wildcard-allows-shim`) blocks the
+   `_ => ...` arm by default; you must `#[allow(clippy::wildcard_enum_match_arm)]`
+   the rare match where a wildcard is legitimate (most opcodes don't
+   need creator-tracking, for instance — see
+   `litebox_broker/src/cwfd/fd_token_socket.rs:470`). The narrow allow
+   is a deliberate choice that survives review; an unscoped allow is
+   not.
+3. **Loud panic for internal-consistency bugs, errno for runtime
+   conditions.** When a code path can only be reached because our own
+   dispatch is wrong (e.g., a fd in the descriptor store with no
+   matching subsystem arm in `sys_close`), use `unreachable!()` /
+   `panic!()` with a message that names what's missing. The
+   stack trace is the fastest path to the missing arm. **Don't**
+   convert these to silent error returns "for safety" — silent EBADF
+   on `sys_close` leaks the descriptor entry, lies to the caller, and
+   turns an obvious-stack-trace bug into "fds leak slowly until
+   something downstream fails." Reserve `Err(ENOSYS)` /
+   `Err(EOPNOTSUPP)` for unimplemented-but-valid runtime conditions
+   that callers can document and handle — e.g.,
+   `litebox_shim_linux/src/syscalls/process.rs:1928` returns `ENOSYS`
+   for `CLONE_PIDFD` because the `CL3.with_pidfd` tests explicitly
+   accept it as a documented native outcome (commit `94ebe20a`).
+
+The decision rule: **can this only be reached if our code is wrong?**
+If yes, panic loudly. If no, return the right errno.

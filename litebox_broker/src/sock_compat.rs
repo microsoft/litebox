@@ -501,8 +501,8 @@ pub fn poll_fds_timeout(fds: &mut [PollFd], timeout: std::time::Duration) -> i32
 // ---------------------------------------------------------------------------
 // Non-blocking recv / send on raw sockets
 //
-// Used by the IPC device (smoltcp Device trait) where only a RawSock is
-// available.  Higher-level code should prefer IpcStream's Read/Write impls.
+// Used by low-level IPC framing helpers where only a RawSock is available.
+// Higher-level code should prefer IpcStream's Read/Write impls.
 // ---------------------------------------------------------------------------
 
 /// Flags for recv.

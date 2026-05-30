@@ -63,6 +63,12 @@ pub enum SubsystemKind {
     Signalfd,
     /// Inotify descriptors.
     Inotify,
+    /// Broker TCP listener descriptors.
+    BrokerInetListener,
+    /// Broker UDP datagram descriptors.
+    BrokerInetDgram,
+    /// Broker raw IPv4 socket descriptors.
+    BrokerInetRaw,
     /// Broker TCP connection descriptors.
     BrokerTcpConn,
 }
@@ -296,6 +302,20 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 } else {
                     None
                 }
+            })
+        })
+    }
+
+    /// Iterator over all live descriptors and their unchecked subsystem tag/type pair.
+    pub fn iter_with_kind(&self) -> impl Iterator<Item = (u32, SubsystemKind, TypeId)> + '_ {
+        self.entries.iter().enumerate().filter_map(|(i, entry)| {
+            entry.as_ref().map(|e| {
+                let entry = e.read();
+                (
+                    i.try_into().unwrap(),
+                    entry.subsystem_kind,
+                    (entry.entry.as_ref() as &dyn core::any::Any).type_id(),
+                )
             })
         })
     }
