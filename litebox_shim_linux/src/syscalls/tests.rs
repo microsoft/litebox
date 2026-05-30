@@ -241,7 +241,15 @@ fn test_getdent64() {
     entry_names.sort();
     assert_eq!(
         entry_names,
-        alloc::vec![".", "..", "bar", "foo", "test_file1.txt", "test_file2.txt"]
+        alloc::vec![
+            ".",
+            "..",
+            "bar",
+            "dev",
+            "foo",
+            "test_file1.txt",
+            "test_file2.txt"
+        ]
     );
 
     // Verify that our test files have the correct type (regular file)
@@ -395,7 +403,15 @@ fn test_getdent64() {
     all_entries.sort();
     assert_eq!(
         all_entries,
-        alloc::vec![".", "..", "bar", "foo", "test_file1.txt", "test_file2.txt"]
+        alloc::vec![
+            ".",
+            "..",
+            "bar",
+            "dev",
+            "foo",
+            "test_file1.txt",
+            "test_file2.txt"
+        ]
     );
 }
 
