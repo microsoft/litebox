@@ -3413,15 +3413,15 @@ fn env_flag_enabled_default_on(name: &str) -> bool {
 }
 
 fn broker_inet_tcp_enabled() -> bool {
-    // Phase F.1: broker-held outbound TCP is the linux_userland default.
-    // Set LITEBOX_BROKER_INET_TCP=0 to opt back to worker-local smoltcp.
-    env_flag_enabled_default_on("LITEBOX_BROKER_INET_TCP")
+    // Broker-held outbound TCP is the only linux_userland path; worker-local
+    // inet is no longer available to opt back into.
+    true
 }
 
 fn broker_inet_udp_enabled() -> bool {
-    // Phase F.1: broker-held UDP is the linux_userland default.
-    // Set LITEBOX_BROKER_INET_UDP=0 to opt back to worker-local smoltcp.
-    env_flag_enabled_default_on("LITEBOX_BROKER_INET_UDP")
+    // Broker-held UDP is the only linux_userland path; worker-local inet is no
+    // longer available to opt back into.
+    true
 }
 
 fn broker_tcp_conn_accept_or_outbound_enabled() -> bool {
@@ -3555,9 +3555,9 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     }
 
     fn broker_inet_listener_enabled() -> bool {
-        // Phase F.1: broker-held TCP listeners are the linux_userland default.
-        // Set LITEBOX_BROKER_INET_LISTENER=0 to opt back to worker-local smoltcp.
-        env_flag_enabled_default_on("LITEBOX_BROKER_INET_LISTENER")
+        // Broker-held TCP listeners are the only linux_userland path;
+        // worker-local inet is no longer available to opt back into.
+        true
     }
 
     fn broker_inet_raw_enabled() -> bool {
