@@ -2465,6 +2465,29 @@ impl<FS: ShimFS> Task<FS> {
         self.do_connect(fd, sockaddr)
     }
     pub(super) fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
+        // Linux treats connect(0.0.0.0:port) as connect(127.0.0.1:port).
+        // Similarly, connect to the guest's own virtual interface IP
+        // (10.0.0.2) should be treated as loopback so the broker-held
+        // TCP path reaches the broker's actual host listener bound on
+        // 0.0.0.0:port. Apply this remap up-front so both the broker-
+        // backed paths (BrokerTcpConn / BrokerInetListener) and the
+        // remaining worker-local fallback see the resolved address.
+        // (The old worker-local path also did this remap at line ~957;
+        // duplicate here so broker paths benefit too.)
+        let sockaddr = if let SocketAddress::Inet(SocketAddr::V4(v4)) = &sockaddr {
+            if v4.ip().is_unspecified()
+                || *v4.ip() == core::net::Ipv4Addr::new(10, 0, 0, 2)
+            {
+                SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+                    core::net::Ipv4Addr::LOCALHOST,
+                    v4.port(),
+                )))
+            } else {
+                sockaddr
+            }
+        } else {
+            sockaddr
+        };
         if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
             let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
             let handle = self.broker_tcp_conn_handle(typed)?;
