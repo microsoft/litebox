@@ -6,9 +6,9 @@
 //! # The "broker hosts the kernel state" model
 //!
 //! Litebox's worker shims emulate kernel-managed resources (eventfd,
-//! timerfd, signalfd, smoltcp TCP/UDP, in-memory unix-socket channels)
-//! in *worker* userspace. That's fine for resources used inside a
-//! single worker process: state lives where the operations happen.
+//! timerfd, signalfd, in-memory unix-socket channels) in *worker*
+//! userspace. That's fine for resources used inside a single worker
+//! process: state lives where the operations happen.
 //!
 //! It breaks the moment a resource has to be observed by *more than
 //! one* worker process — across fork/exec, across `SCM_RIGHTS`
@@ -17,10 +17,9 @@
 //!
 //! Litebox already solves this for two big surfaces: the **9P
 //! filesystem** is broker-hosted (the directory tree + open file
-//! handles live in the broker; workers RPC into them), and the
-//! **smoltcp networking stack** is broker-hosted (TCP/UDP state lives
-//! in the broker's `SocketSet`; workers hold smoltcp handles that
-//! RPC into the broker).
+//! handles live in the broker; workers RPC into them), and broker-held
+//! **inet sockets** are broker-hosted (TCP/UDP state lives in broker
+//! state objects; workers hold opaque handles that RPC into the broker).
 //!
 //! This module is the foundation for extending that pattern to the
 //! rest of the shim-emulated subsystems. A [`StateObject`] is some
@@ -1074,10 +1073,9 @@ mod tests {
         assert!(Arc::ptr_eq(&inbound, &v6));
 
         reg.release(h6).unwrap();
-        assert!(
-            reg.resolve_broker_held_inet_listener_for_inbound(22)
-                .is_none()
-        );
+        assert!(reg
+            .resolve_broker_held_inet_listener_for_inbound(22)
+            .is_none());
     }
 
     #[test]

@@ -17,10 +17,9 @@
 //!
 //! This decouples *fd identity* (the kernel object the receiver must observe)
 //! from *fd location* (the worker process that currently owns a host fd
-//! pointing at it). The existing transports (smoltcp port routing, mux mesh
-//! pipe bridging, 9P paths) all carry bytes or path-identified resources;
-//! none can carry an opaque kernel-object handle. This registry fills that
-//! gap.
+//! pointing at it). The existing transports (mux mesh pipe bridging, 9P paths)
+//! carry bytes or path-identified resources; none can carry an opaque
+//! kernel-object handle. This registry fills that gap.
 //!
 //! # Concurrency
 //!
