@@ -731,6 +731,87 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
 
 
 def _render_current_fails(conn: sqlite3.Connection) -> str:
+    """Tests that are currently FAILING at a tracked-ref tip
+    (clean, freshest verdict). Filters out stale failures from
+    older commits that haven't been re-run at the current tip —
+    those would show up in the global `latest_results` VIEW but
+    don't represent the current state of any active worktree.
+
+    A test that has mixed history (both ✓ and ✗ in the last 10
+    runs) is marked _(flaky)_ so it's visually distinguishable
+    from a fresh regression.
+    """
+    # Resolve each tracked ref's current HEAD sha.
+    tracked = []
+    for r in conn.execute("SELECT ref, ci_worktree FROM tracked_refs"):
+        sha = _git_head(r["ci_worktree"])
+        if sha:
+            tracked.append((r["ref"], r["ci_worktree"], sha))
+    if not tracked:
+        # No tracked refs — fall back to global latest_results so
+        # the section is useful in ad-hoc/standalone mode too.
+        return _render_current_fails_global(conn)
+
+    seen: set[tuple[str, str]] = set()
+    out_rows: list[dict] = []
+    for ref, ci_worktree, sha in tracked:
+        # Per-test freshest verdict at this sha (clean only).
+        for r in conn.execute(
+            """
+            SELECT rr.test_id, rr.pass, rr.verdict, rr.suite, rr."group",
+                   rr.finished_ts_ms, r.commit_sha, r.dirty_hash, r.worktree_path
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.commit_sha = ?
+               AND r.dirty_hash IS NULL
+               AND (rr.test_id, rr.pass, rr.finished_ts_ms) IN (
+                    SELECT rr2.test_id, rr2.pass, MAX(rr2.finished_ts_ms)
+                      FROM run_results rr2
+                      JOIN runs r2 ON r2.run_id = rr2.run_id
+                     WHERE r2.commit_sha = ? AND r2.dirty_hash IS NULL
+                     GROUP BY rr2.test_id, rr2.pass
+                   )
+               AND rr.verdict <> 'pass'
+            """,
+            (sha, sha),
+        ):
+            key = (r["test_id"], r["pass"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out_rows.append(dict(r))
+
+    if not out_rows:
+        return "## Current FAILs\n\n_None at any tracked-ref tip._\n"
+    out_rows.sort(key=lambda r: (r["pass"], r["suite"], r["group"], r["test_id"]))
+
+    lines = ["## Current FAILs\n",
+             "_Freshest verdict at a tracked-ref tip (clean). Excludes "
+             "stale failures from older commits that haven't been re-run._\n",
+             "| Pass | Suite | Group | Test | Worktree | Sha | Dirty "
+             "| Last 10 | Age |",
+             "|---|---|---|---|---|---|---:|---|---|"]
+    now = now_ms()
+    for r in out_rows:
+        dirty = "⚠" if r["dirty_hash"] else ""
+        wt_short = os.path.basename(r["worktree_path"] or "?")
+        history = _verdict_history(conn, r["test_id"], r["pass"], n=10)
+        flaky = ("✓" in history) and ("✗" in history)
+        flaky_marker = " _(flaky)_" if flaky else ""
+        lines.append(
+            f"| `{r['pass']}` | {r['suite']} | {r['group']} | "
+            f"`{r['test_id']}`{flaky_marker} | `{wt_short}` | "
+            f"`{short_sha(r['commit_sha'])}` | {dirty} | "
+            f"`{history}` | {fmt_age_ms(now - r['finished_ts_ms'])} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _render_current_fails_global(conn: sqlite3.Connection) -> str:
+    """Fallback for when there are no tracked refs: use the global
+    `latest_results` VIEW. Identical to the old behavior; only
+    invoked when no `dashboard.py track` has been called yet.
+    """
     rows = conn.execute(
         """
         SELECT lr.test_id, lr.pass, lr.suite, lr."group",
@@ -745,6 +826,9 @@ def _render_current_fails(conn: sqlite3.Connection) -> str:
     if not rows:
         return "## Current FAILs\n\n_None._\n"
     lines = ["## Current FAILs\n",
+             "_No tracked refs configured — falling back to global "
+             "latest_results (freshest verdict per test across all "
+             "commits)._\n",
              "| Pass | Suite | Group | Test | Worktree | Sha | Dirty "
              "| Last 10 | Age |",
              "|---|---|---|---|---|---|---:|---|---|"]
@@ -753,9 +837,11 @@ def _render_current_fails(conn: sqlite3.Connection) -> str:
         dirty = "⚠" if r["dirty_hash"] else ""
         wt_short = os.path.basename(r["worktree_path"] or "?")
         history = _verdict_history(conn, r["test_id"], r["pass"], n=10)
+        flaky = ("✓" in history) and ("✗" in history)
+        flaky_marker = " _(flaky)_" if flaky else ""
         lines.append(
             f"| `{r['pass']}` | {r['suite']} | {r['group']} | "
-            f"`{r['test_id']}` | `{wt_short}` | "
+            f"`{r['test_id']}`{flaky_marker} | `{wt_short}` | "
             f"`{short_sha(r['commit_sha'])}` | {dirty} | "
             f"`{history}` | {fmt_age_ms(now - r['finished_ts_ms'])} |"
         )
