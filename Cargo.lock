@@ -1678,7 +1678,6 @@ dependencies = [
  "serde",
  "serde_json",
  "simple-dns",
- "smoltcp",
  "tempfile",
  "thiserror",
  "tracing",
