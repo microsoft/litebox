@@ -349,7 +349,7 @@ impl TcpConnState {
     }
 
     pub fn getsockopt(
-        &self,
+        self: &Arc<Self>,
         level: u32,
         optname: u32,
         optlen: u32,
@@ -361,17 +361,45 @@ impl TcpConnState {
             .try_into()
             .map_err(|_| TcpConnError::Errno(libc::EINVAL))?;
         ensure_supported_sockopt(level, optname, true)?;
+        // If a previous non-blocking connect() returned EINPROGRESS and the
+        // worker has now woken on POLLOUT (we report NOTIFY_EVENT_OUT once
+        // the connect thread finishes), it will check connect status via
+        // getsockopt(SOL_SOCKET, SO_ERROR). Transition the Connecting state
+        // here so SO_ERROR observes the real result instead of the stale
+        // "still in progress" view.
+        let connect_result = self.finish_completed_connect();
         let inner = self.inner.lock().expect("TcpConnState inner poisoned");
         match &*inner {
             TcpConnInner::Unconnected {
                 pending_sockopts, ..
-            } => pending_sockopts
-                .iter()
-                .rev()
-                .find(|opt| opt.level == level && opt.optname == optname)
-                .map(|opt| opt.value.clone())
-                .ok_or(TcpConnError::Errno(libc::ENOTCONN)),
-            TcpConnInner::Connecting { .. } => Err(TcpConnError::WouldBlock),
+            } => {
+                // SO_ERROR after a failed connect: surface the connect errno
+                // exactly once, mirroring real Linux. Other sockopts on an
+                // unconnected socket still need an explicit pending value.
+                if level == libc::SOL_SOCKET && optname == libc::SO_ERROR {
+                    let raw = match connect_result {
+                        Some(Err(TcpConnError::Errno(errno))) => errno as u32,
+                        Some(Err(_)) => libc::EIO as u32,
+                        Some(Ok(())) | None => 0u32,
+                    };
+                    return Ok(raw.to_ne_bytes().to_vec());
+                }
+                pending_sockopts
+                    .iter()
+                    .rev()
+                    .find(|opt| opt.level == level && opt.optname == optname)
+                    .map(|opt| opt.value.clone())
+                    .ok_or(TcpConnError::Errno(libc::ENOTCONN))
+            }
+            TcpConnInner::Connecting { .. } => {
+                // Real Linux: getsockopt(SO_ERROR) on a still-pending
+                // nonblocking connect returns 0 (no error yet). Match it
+                // so callers don't treat "still connecting" as failure.
+                if level == libc::SOL_SOCKET && optname == libc::SO_ERROR {
+                    return Ok(0u32.to_ne_bytes().to_vec());
+                }
+                Err(TcpConnError::WouldBlock)
+            }
             TcpConnInner::Connected(connected) => {
                 let stream = connected
                     .stream
