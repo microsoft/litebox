@@ -278,7 +278,14 @@ where
     let name = container_name(pass, test_id);
     let mut cmd = build_command(&spec, &name);
     if spec.detached {
-        // No stdout/stderr piping — daemonized container.
+        // For detached spawn: pipe stderr so we can capture the
+        // docker daemon's error message on failure (e.g. "image
+        // not found", "port already allocated"). Stdout for `-d`
+        // is just the container ID; pipe + drain so the pipe
+        // buffer doesn't fill.
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
     } else {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -297,20 +304,35 @@ where
 
     let dispatched = if spec.detached {
         // Wait for the docker-run process to return (it exits as
-        // soon as the container starts). Then query the published
-        // ports if any.
-        let status = child.wait();
-        if status.as_ref().map(|s| !s.success()).unwrap_or(true) {
+        // soon as the container starts), collecting its stdout/stderr.
+        // `wait_with_output` consumes the Child so we can capture
+        // both streams + status in one go.
+        let out = child.wait_with_output();
+        let failed = out.as_ref().map(|o| !o.status.success()).unwrap_or(true);
+        if failed {
             // docker run -d failed; tear down (just in case the
-            // container partially started) and bail.
-            let _ = Command::new("docker")
-                .args(["rm", "-f", &name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            // container partially started) and bail with the
+            // captured stderr so the user can see what docker said.
+            // Respect LITEBOX_KEEP_CONTAINER even on the bail path:
+            // a partially-failed spawn might leave debug breadcrumbs.
+            if std::env::var("LITEBOX_KEEP_CONTAINER").is_err() {
+                let _ = Command::new("docker")
+                    .args(["rm", "-f", &name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
             guard.armed = false;
             cleanup::deregister_docker_child(&name);
-            return Err(format!("docker run -d failed for {name}: {status:?}").into());
+            let detail = match out {
+                Ok(o) => format!(
+                    "docker run -d failed for {name} (exit {}): {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim(),
+                ),
+                Err(e) => format!("docker run -d wait failed for {name}: {e}"),
+            };
+            return Err(detail.into());
         }
         // The detached docker-run host PID is now invalid; mark the
         // cleanup entry so reap_all skips the kill step.
