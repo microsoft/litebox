@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![cfg_attr(not(feature = "worker_local_inet"), allow(unused_imports))]
 //! Spin-polling TCP transport over the shim's internal network stack.
 
 use alloc::boxed::Box;

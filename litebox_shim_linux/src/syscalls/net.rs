@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![cfg_attr(
+    not(feature = "worker_local_inet"),
+    allow(dead_code, unused_imports, unused_macros)
+)]
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
 use core::{

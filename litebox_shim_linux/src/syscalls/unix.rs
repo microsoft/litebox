@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![cfg_attr(
+    not(feature = "worker_local_inet"),
+    allow(unused_assignments, unused_mut, unused_variables)
+)]
 //! Unix domain socket implementation for the Linux shim layer.
 
 use core::{
