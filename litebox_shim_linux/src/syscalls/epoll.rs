@@ -337,7 +337,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
         match self {
             EpollDescriptor::Signalfd(_) => false,
             EpollDescriptor::Inotify(_) => false,
-            EpollDescriptor::BrokerInetListener(_) => false,
+            EpollDescriptor::BrokerInetListener(_) => true,
             EpollDescriptor::BrokerInetDgram(_) => false,
             EpollDescriptor::BrokerInetRaw(_) => false,
             EpollDescriptor::Eventfd(fd) => global
