@@ -548,20 +548,49 @@ pub enum FillCap {
 /// for litebox docker-run + setup overhead on top of a small test.
 const DEFAULT_TEST_COST_MS: u64 = 5_000;
 
-/// Select trial *names* (e.g. `native::PIDF.spawn_and_open`) that
-/// have no clean-state result at the current `commit_sha`,
-/// capped by `cap`.
+/// Maximum number of attempts per (test_id, pass) at the current
+/// clean sha before we stop re-running it. A persistently-failing
+/// test gets confirmed after this many tries (likely a real
+/// regression, not a flake); further re-runs would just churn.
 ///
-/// Priority order within the candidate set:
-/// 1. Never seen anywhere (`latest_results` has no row).
-/// 2. Stalest by `latest_results.finished_ts_ms` ascending.
-/// 3. The rest, sorted alphabetically.
+/// Override via `LITEBOX_FILL_FAIL_RETRIES`.
+const DEFAULT_FAIL_RETRIES: i64 = 3;
+
+fn fail_retries_cap() -> i64 {
+    std::env::var("LITEBOX_FILL_FAIL_RETRIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_FAIL_RETRIES)
+}
+
+/// Select trial *names* (e.g. `native::PIDF.spawn_and_open`) for
+/// the autonomous fill, capped by `cap`.
 ///
-/// Within each band the candidates are interleaved by `suite`
-/// (round-robin) so a slow family can't permanently starve fast
-/// ones. Trial names that don't follow `<pass>::<id>` are
-/// ignored (host::fwd, dropbear_bash trials, etc. — those are
-/// out of scope for the autonomous fill).
+/// Selection bands, drained in order:
+///
+///   * **Class 1 — uncovered at current sha** (no `run_results`
+///     row at the current clean `commit_sha`). The historical
+///     default behavior: get basic coverage at the current state.
+///     Within the band: never-seen-anywhere first, then
+///     stalest-by-latest_results.finished_ts_ms. Round-robin by
+///     suite so a slow family can't starve fast ones.
+///   * **Class 2 — re-confirm fails at current sha**: trials
+///     whose freshest verdict at the current clean sha is
+///     non-pass AND fewer than `LITEBOX_FILL_FAIL_RETRIES`
+///     (default 3) attempts have been recorded at this sha.
+///     Ordered stalest-first within the sha (longest-ago last
+///     attempt). After the cap is exhausted for a test, it's
+///     considered confirmed-failing and stops being re-selected
+///     (until the sha changes).
+///
+/// Trials that are covered + passing at the current sha are NOT
+/// re-selected — the assumption is "pass at clean sha is stable
+/// unless a new sha arrives." Drift detection (re-running passing
+/// tests to catch silent rot) is a future class-3 expansion.
+///
+/// Trial names that don't follow `<pass>::<id>` are ignored
+/// (host::fwd, dropbear_bash, copilot::* — those are out of scope
+/// for the autonomous fill).
 pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<String> {
     let count_cap = match cap {
         FillCap::Count(n) => n,
@@ -590,26 +619,41 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<S
         )
         .unwrap_or_default();
 
-    let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per-(pass, test_id) at the current clean sha:
+    //   attempts        — how many rows we have at this sha
+    //   freshest_verdict — verdict of the most recent attempt
+    //   freshest_ts     — finished_ts_ms of that attempt
+    //                     (used as the "stalest-first" key in class 2)
+    let mut at_sha: std::collections::HashMap<String, (i64, String, i64)> =
+        std::collections::HashMap::new();
     if !commit_sha.is_empty() {
         let mut stmt = conn
             .prepare(
-                "SELECT rr.pass, rr.test_id
+                "SELECT rr.pass, rr.test_id, rr.verdict, rr.finished_ts_ms
                    FROM run_results rr
                    JOIN runs r ON r.run_id = rr.run_id
                   WHERE r.commit_sha = ?1
-                    AND r.dirty_hash IS NULL",
+                    AND r.dirty_hash IS NULL
+                  ORDER BY rr.finished_ts_ms DESC",
             )
-            .expect("dashboard: prepare covered query");
+            .expect("dashboard: prepare at-sha query");
         let rows = stmt
             .query_map(params![commit_sha], |r| {
                 let pass: String = r.get(0)?;
                 let id: String = r.get(1)?;
-                Ok(format!("{pass}::{id}"))
+                let verdict: String = r.get(2)?;
+                let ts: i64 = r.get(3)?;
+                Ok((format!("{pass}::{id}"), verdict, ts))
             })
-            .expect("dashboard: covered query");
+            .expect("dashboard: at-sha query");
         for row in rows.flatten() {
-            covered.insert(row);
+            // Iteration is newest-first; the first row per name
+            // captures the freshest verdict + ts. Subsequent rows
+            // just bump the attempt counter.
+            let e = at_sha
+                .entry(row.0)
+                .or_insert_with(|| (0, row.1.clone(), row.2));
+            e.0 += 1;
         }
     }
 
@@ -650,10 +694,14 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<S
     }
     drop(conn);
 
-    // Candidate set: trials that are <pass>::<id> shaped and not
-    // already covered at current sha.
-    let mut never_run: Vec<String> = Vec::new();
-    let mut seen_before: Vec<(String, i64)> = Vec::new();
+    // Class 1 (uncovered at current sha) and class 2 (covered but
+    // freshest verdict is non-pass at current sha, with retries
+    // remaining). Already-passing trials at current sha are
+    // dropped from the candidate set.
+    let retries_cap = fail_retries_cap();
+    let mut class1_never_run: Vec<String> = Vec::new();
+    let mut class1_seen_before: Vec<(String, i64)> = Vec::new();
+    let mut class2: Vec<(String, i64)> = Vec::new();
     for t in trials {
         let name = t.name().to_string();
         // Out-of-scope trial shapes (host::, dropbear_bash, copilot::)
@@ -662,20 +710,35 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<S
         if !(name.starts_with("native::") || name.starts_with("litebox::")) {
             continue;
         }
-        if covered.contains(&name) {
-            continue;
-        }
-        match stalest.get(&name) {
-            None => never_run.push(name),
-            Some(ts) => seen_before.push((name, *ts)),
+        match at_sha.get(&name) {
+            None => match stalest.get(&name) {
+                None => class1_never_run.push(name),
+                Some(ts) => class1_seen_before.push((name, *ts)),
+            },
+            Some((attempts, verdict, freshest_ts)) => {
+                if verdict == "pass" {
+                    // Already passing at current sha — skip.
+                    continue;
+                }
+                if *attempts >= retries_cap {
+                    // Confirmed failing at current sha — stop
+                    // re-running. Future sha will re-include.
+                    continue;
+                }
+                class2.push((name, *freshest_ts));
+            }
         }
     }
-    seen_before.sort_by_key(|(_, ts)| *ts);
+    class1_seen_before.sort_by_key(|(_, ts)| *ts);
+    class2.sort_by_key(|(_, ts)| *ts);
 
-    // Suite-aware round-robin within each band.
-    let mut ordered: Vec<String> = round_robin_by_suite(&never_run, &suites);
-    let stalest_names: Vec<String> = seen_before.into_iter().map(|(n, _)| n).collect();
-    ordered.extend(round_robin_by_suite(&stalest_names, &suites));
+    // Suite-aware round-robin within each band so a slow family
+    // can't permanently starve fast ones. Class 1 drains first.
+    let mut ordered: Vec<String> = round_robin_by_suite(&class1_never_run, &suites);
+    let class1_stale: Vec<String> = class1_seen_before.into_iter().map(|(n, _)| n).collect();
+    ordered.extend(round_robin_by_suite(&class1_stale, &suites));
+    let class2_names: Vec<String> = class2.into_iter().map(|(n, _)| n).collect();
+    ordered.extend(round_robin_by_suite(&class2_names, &suites));
 
     // Apply the cap.
     match cap {
