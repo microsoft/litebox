@@ -563,7 +563,7 @@ impl<FS: ShimFS> EpollFile<FS> {
     }
 
     fn drive_network_for_socket_interests(&self, global: &GlobalState<FS>) {
-        if self.has_socket_interests() {
+        if crate::WORKER_LOCAL_INET && self.has_socket_interests() {
             Self::drive_network_until_idle(global);
         }
     }
@@ -1228,7 +1228,7 @@ impl PollSet {
         files: &FilesState<FS>,
         waker: Option<&Waker<Platform>>,
     ) -> bool {
-        if self.has_socket_entries(global, files) {
+        if crate::WORKER_LOCAL_INET && self.has_socket_entries(global, files) {
             EpollFile::<FS>::drive_network_until_idle(global);
         }
 
