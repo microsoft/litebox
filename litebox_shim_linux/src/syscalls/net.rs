@@ -1631,6 +1631,7 @@ impl<FS: ShimFS> Task<FS> {
                         Err(Errno::EPROTONOSUPPORT)
                     }
                     SockType::SeqPacket => Err(Errno::ESOCKTNOSUPPORT),
+                    _ => Err(Errno::ESOCKTNOSUPPORT),
                 }?
             }
             AddressFamily::UNIX => {
@@ -1790,6 +1791,7 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     SockType::Raw => Err(Errno::EPROTONOSUPPORT),
                     SockType::SeqPacket => Err(Errno::ESOCKTNOSUPPORT),
+                    _ => Err(Errno::ESOCKTNOSUPPORT),
                 }?
             }
             AddressFamily::NETLINK => {
@@ -2243,6 +2245,7 @@ impl<FS: ShimFS> Task<FS> {
         }
         Ok(fd)
     }
+    #[cfg(feature = "worker_local_inet")]
     fn try_install_broker_tcp_accept(
         &self,
         accepted_file: &SocketFd,
@@ -2387,7 +2390,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 #[cfg(not(feature = "worker_local_inet"))]
                 {
-                    let _ = (fd, files);
+                    let _ = fd;
                     Err(Errno::ENOTSOCK)
                 }
             },
@@ -2720,6 +2723,7 @@ impl<FS: ShimFS> Task<FS> {
         )
     }
 
+    #[cfg(feature = "worker_local_inet")]
     pub(crate) fn tcp_listen_worker_exec_bridge_spec(&self, raw_fd: usize) -> Option<String> {
         let fd = {
             let files = self.files.borrow();
@@ -2747,6 +2751,13 @@ impl<FS: ShimFS> Task<FS> {
         Some(alloc::format!("{raw_fd}:tcp_listen:{port}:1"))
     }
 
+    #[cfg(not(feature = "worker_local_inet"))]
+    pub(crate) fn tcp_listen_worker_exec_bridge_spec(&self, raw_fd: usize) -> Option<String> {
+        let _ = (self, raw_fd);
+        None
+    }
+
+    #[cfg(feature = "worker_local_inet")]
     pub(crate) fn install_tcp_listen_bridge_fd(
         &self,
         guest_fd: usize,
@@ -2810,6 +2821,17 @@ impl<FS: ShimFS> Task<FS> {
         self.global.send_listen_route_transfer(port)
     }
 
+    #[cfg(not(feature = "worker_local_inet"))]
+    pub(crate) fn install_tcp_listen_bridge_fd(
+        &self,
+        guest_fd: usize,
+        port: u16,
+        reuse_port: bool,
+    ) -> Result<(), Errno> {
+        let _ = (self, guest_fd, port, reuse_port);
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Get the local port for an INET socket. Returns None if not bound.
     pub(super) fn do_getsockname_inet_port(&self, sockfd: u32) -> Option<u16> {
         self.do_getsockname(sockfd)
@@ -2837,6 +2859,7 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         files.run_on_raw_fd(sockfd as usize, |raw_fd_ref| match raw_fd_ref {
             crate::RawFdRef::Fs(_) => Err(Errno::ENOTSOCK),
+            #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(fd) => self.global.shutdown(fd, read, write),
             crate::RawFdRef::Pipes(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTSOCK),
@@ -2981,12 +3004,20 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| {
-                let sockaddr = sockaddr
-                    .clone()
-                    .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
-                    .transpose()?;
-                self.global
-                    .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    let sockaddr = sockaddr
+                        .clone()
+                        .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
+                        .transpose()?;
+                    self.global
+                        .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    let _ = fd;
+                    Err(Errno::ENOTSOCK)
+                }
             },
             |file| {
                 let addr = sockaddr
@@ -3193,6 +3224,7 @@ impl<FS: ShimFS> Task<FS> {
                             // Filesystem descriptors are kernel-backed and transfer as PassedFd.
                             Ok(false)
                         }
+                        #[cfg(feature = "worker_local_inet")]
                         crate::RawFdRef::Net(_) => {
                             // Network descriptors are kernel-backed and transfer as PassedFd.
                             Ok(false)

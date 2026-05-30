@@ -4434,8 +4434,9 @@ impl<FS: ShimFS> Task<FS> {
                 let _ = files.run_on_raw_fd(raw_fd, |raw_fd_ref| {
                     #[deny(clippy::wildcard_enum_match_arm)]
                     match raw_fd_ref {
+                        #[cfg(feature = "worker_local_inet")]
+                        crate::RawFdRef::Net(_) => {}
                         crate::RawFdRef::Fs(_)
-                        | crate::RawFdRef::Net(_)
                         | crate::RawFdRef::Eventfd(_)
                         | crate::RawFdRef::Epoll(_)
                         | crate::RawFdRef::Unix(_)
@@ -6673,6 +6674,7 @@ impl<FS: ShimFS> Task<FS> {
                                 };
                             (FdClass::FilesystemFd, oid, meta, None)
                         }
+                        #[cfg(feature = "worker_local_inet")]
                         crate::RawFdRef::Net(fd) => {
                             (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
                         }
@@ -10661,6 +10663,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 // with a HostStdio binding.
                 false
             },
+    #[cfg(feature = "worker_local_inet")]
     crate::RawFdRef::Net(_net) => {
                 log_worker_exec_stdio_unsupported(global, raw_fd, "network socket-backed stdio");
                 true
@@ -10908,6 +10911,7 @@ fn worker_exec_input_binding<FS: ShimFS>(
             }
 
             // Network sockets: not supported across worker exec.
+            #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(_net) => WorkerExecInputBinding::Close,
             crate::RawFdRef::Pipes(fd) => match global.pipes.half_pipe_type(fd) {
                 Ok(HalfPipeType::ReceiverHalf) => WorkerExecInputBinding::Pipe {
@@ -11068,6 +11072,7 @@ fn worker_exec_output_binding<FS: ShimFS>(
             }
 
             // Network sockets: not supported as stdout/stderr across worker exec.
+            #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(_net) => WorkerExecOutputBinding::Close,
             crate::RawFdRef::Pipes(fd) => match global.pipes.half_pipe_type(fd) {
                 Ok(HalfPipeType::SenderHalf) => WorkerExecOutputBinding::Pipe {

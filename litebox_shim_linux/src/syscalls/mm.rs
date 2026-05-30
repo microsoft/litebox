@@ -239,6 +239,7 @@ impl<FS: ShimFS> Task<FS> {
                     .map_err(Errno::from)?;
                 Ok(())
             }
+            #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::Pipes(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::Eventfd(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
@@ -253,7 +254,7 @@ impl<FS: ShimFS> Task<FS> {
             | crate::RawFdRef::Inotify(_)
             | crate::RawFdRef::BrokerInetListener(_)
             | crate::RawFdRef::BrokerInetDgram(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
-            | crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
         })?
     }
 
@@ -268,11 +269,12 @@ impl<FS: ShimFS> Task<FS> {
         files
             .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                 crate::RawFdRef::Fs(typed_fd) => files.fs.fd_path(typed_fd),
+                #[cfg(feature = "worker_local_inet")]
                 crate::RawFdRef::Net(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::Pipes(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::Eventfd(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::Epoll(_) => None, // non-FS descriptor has no filesystem path
-                crate::RawFdRef::Unix(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::Unix(_) => None,  // non-FS descriptor has no filesystem path
                 crate::RawFdRef::ExternalFd(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::BrokerPipe(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::BrokerSocketPair(_) => None, // non-FS descriptor has no filesystem path
@@ -282,7 +284,7 @@ impl<FS: ShimFS> Task<FS> {
                 | crate::RawFdRef::Inotify(_)
                 | crate::RawFdRef::BrokerInetListener(_)
                 | crate::RawFdRef::BrokerInetDgram(_) => None, // non-FS descriptor has no filesystem path,
-                | crate::RawFdRef::BrokerInetRaw(_) => None, // non-FS descriptor has no filesystem path,
+                crate::RawFdRef::BrokerInetRaw(_) => None, // non-FS descriptor has no filesystem path,
             })
             .ok()
             .flatten()
@@ -933,6 +935,7 @@ impl<FS: ShimFS> Task<FS> {
         let static_data = files
             .run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
                 crate::RawFdRef::Fs(typed_fd) => files.fs.get_static_backing_data(typed_fd),
+                #[cfg(feature = "worker_local_inet")]
                 crate::RawFdRef::Net(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::Pipes(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::Eventfd(_) => None, // CoW fast path only supports FS static backing
@@ -947,7 +950,7 @@ impl<FS: ShimFS> Task<FS> {
                 | crate::RawFdRef::Inotify(_)
                 | crate::RawFdRef::BrokerInetListener(_)
                 | crate::RawFdRef::BrokerInetDgram(_) => None, // CoW fast path only supports FS static backing,
-                | crate::RawFdRef::BrokerInetRaw(_) => None, // CoW fast path only supports FS static backing,
+                crate::RawFdRef::BrokerInetRaw(_) => None, // CoW fast path only supports FS static backing,
             })
             .ok()??;
 
