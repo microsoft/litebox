@@ -1696,12 +1696,20 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     // Fork-restore replays a snapshot whose process identity may differ from
     // the runner's default worker task params. Seed the local registry with the
-    // restored pid so any subsequent fork can register children with this
-    // process as their parent.
+    // restored pid AND the inherited pgid/sid so any subsequent guest setsid()
+    // can become its own session leader (would otherwise EPERM).
     {
         let pid = u32::try_from(snapshot.identity.pid)
             .expect("fork-restore snapshot pid must be non-negative");
-        shim_builder.init_with_pid(litebox::process::ProcessId(pid));
+        let pgid = u32::try_from(snapshot.identity.pgid)
+            .expect("fork-restore snapshot pgid must be non-negative");
+        let sid = u32::try_from(snapshot.identity.sid)
+            .expect("fork-restore snapshot sid must be non-negative");
+        shim_builder.init_for_fork_restore(
+            litebox::process::ProcessId(pid),
+            litebox::process::ProcessGroupId(pgid),
+            litebox::process::SessionId(sid),
+        );
     }
     let litebox = shim_builder.litebox();
 
@@ -3257,7 +3265,9 @@ fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
     shim: &litebox_shim_linux::LinuxShim<FS>,
     shutdown: &std::sync::Arc<core::sync::atomic::AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    if !litebox_platform_multiplex::platform().has_network() {
+    if !litebox_shim_linux::WORKER_LOCAL_INET
+        || !litebox_platform_multiplex::platform().has_network()
+    {
         return None;
     }
     let shim = shim.clone();
@@ -3403,15 +3413,15 @@ fn env_flag_enabled_default_on(name: &str) -> bool {
 }
 
 fn broker_inet_tcp_enabled() -> bool {
-    // Phase F.1: broker-held outbound TCP is the linux_userland default.
-    // Set LITEBOX_BROKER_INET_TCP=0 to opt back to worker-local smoltcp.
-    env_flag_enabled_default_on("LITEBOX_BROKER_INET_TCP")
+    // Broker-held outbound TCP is the only linux_userland path; worker-local
+    // inet is no longer available to opt back into.
+    true
 }
 
 fn broker_inet_udp_enabled() -> bool {
-    // Phase F.1: broker-held UDP is the linux_userland default.
-    // Set LITEBOX_BROKER_INET_UDP=0 to opt back to worker-local smoltcp.
-    env_flag_enabled_default_on("LITEBOX_BROKER_INET_UDP")
+    // Broker-held UDP is the only linux_userland path; worker-local inet is no
+    // longer available to opt back into.
+    true
 }
 
 fn broker_tcp_conn_accept_or_outbound_enabled() -> bool {
@@ -3545,9 +3555,9 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     }
 
     fn broker_inet_listener_enabled() -> bool {
-        // Phase F.1: broker-held TCP listeners are the linux_userland default.
-        // Set LITEBOX_BROKER_INET_LISTENER=0 to opt back to worker-local smoltcp.
-        env_flag_enabled_default_on("LITEBOX_BROKER_INET_LISTENER")
+        // Broker-held TCP listeners are the only linux_userland path;
+        // worker-local inet is no longer available to opt back into.
+        true
     }
 
     fn broker_inet_raw_enabled() -> bool {

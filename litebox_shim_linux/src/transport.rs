@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![cfg_attr(not(feature = "worker_local_inet"), allow(unused_imports))]
 //! Spin-polling TCP transport over the shim's internal network stack.
 
 use alloc::boxed::Box;
@@ -10,8 +11,11 @@ use core::sync::atomic::Ordering;
 use litebox::fs::nine_p::transport;
 use litebox::net::socket_channel::NetworkProxy;
 use litebox::net::{ReceiveFlags, SendFlags};
-use litebox_common_linux::{SockFlags, SockType, errno::Errno};
+use litebox_common_linux::errno::Errno;
+#[cfg(feature = "worker_local_inet")]
+use litebox_common_linux::{SockFlags, SockType};
 
+#[cfg(feature = "worker_local_inet")]
 use crate::syscalls::net::SocketFd;
 use crate::{GlobalState, Platform, ShimFS, VforkParking};
 
@@ -24,11 +28,13 @@ trait DropGuard: Send + Sync {
 }
 
 /// Concrete, generic implementation of [`DropGuard`].
+#[cfg(feature = "worker_local_inet")]
 struct SocketDropGuard<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
     sockfd: SocketFd,
 }
 
+#[cfg(feature = "worker_local_inet")]
 impl<FS: ShimFS> DropGuard for SocketDropGuard<FS> {
     fn close(&mut self) {
         let _ = self
@@ -70,6 +76,7 @@ impl ShimTransport {
     ///
     /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,
     /// spin-polling when the operation cannot complete immediately.
+    #[cfg(feature = "worker_local_inet")]
     pub(crate) fn connect<FS: ShimFS>(
         global: Arc<GlobalState<FS>>,
         addr: core::net::SocketAddr,

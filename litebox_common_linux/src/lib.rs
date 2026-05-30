@@ -917,6 +917,12 @@ pub enum IpOption {
 
 #[repr(u32)]
 #[derive(Debug, IntEnum, Clone, Copy)]
+pub enum Ipv6Option {
+    V6ONLY = 26,
+}
+
+#[repr(u32)]
+#[derive(Debug, IntEnum, Clone, Copy)]
 pub enum SocketOption {
     REUSEADDR = 2,
     TYPE = 3,
@@ -954,6 +960,7 @@ pub enum TcpOption {
 #[derive(Debug, Clone, Copy)]
 pub enum SocketOptionName {
     IP(IpOption),
+    IPv6(Ipv6Option),
     Socket(SocketOption),
     TCP(TcpOption),
 }
@@ -965,6 +972,7 @@ pub enum SocketOptionLevel {
     SOCKET = 1,
     TCP = 6,
     UDP = 17,
+    IPV6 = 41,
     RAW = 255,
 }
 
@@ -975,6 +983,7 @@ impl SocketOptionName {
             SocketOptionLevel::IP => Some(Self::IP(IpOption::try_from(optname).ok()?)),
             SocketOptionLevel::SOCKET => Some(Self::Socket(SocketOption::try_from(optname).ok()?)),
             SocketOptionLevel::TCP => Some(Self::TCP(TcpOption::try_from(optname).ok()?)),
+            SocketOptionLevel::IPV6 => Some(Self::IPv6(Ipv6Option::try_from(optname).ok()?)),
             SocketOptionLevel::UDP | SocketOptionLevel::RAW => None,
         }
     }

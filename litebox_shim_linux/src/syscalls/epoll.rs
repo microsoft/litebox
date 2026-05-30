@@ -59,6 +59,7 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
     BrokerInetRaw(Arc<TypedFd<super::broker_inet_raw::BrokerInetRawSubsystem>>),
     Epoll(EntryHandle<Platform, super::epoll::EpollSubsystem<FS>>),
     File(Arc<crate::FileFd<FS>>),
+    #[cfg(feature = "worker_local_inet")]
     Socket(Arc<super::net::SocketFd>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
@@ -78,6 +79,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
     ) -> Result<Self, Errno> {
         files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
             crate::RawFdRef::Fs(fd) => Ok(EpollDescriptor::File(Arc::clone(fd))),
+            #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(fd) => Ok(EpollDescriptor::Socket(Arc::clone(fd))),
             crate::RawFdRef::Pipes(fd) => Ok(EpollDescriptor::Pipe(Arc::clone(fd))),
             crate::RawFdRef::Eventfd(fd) => Ok(EpollDescriptor::Eventfd(Arc::clone(fd))),
@@ -123,6 +125,7 @@ enum DescriptorRef<FS: ShimFS> {
     BrokerInetRaw(Weak<TypedFd<super::broker_inet_raw::BrokerInetRawSubsystem>>),
     Epoll(WeakEntryHandle<Platform, super::epoll::EpollSubsystem<FS>>),
     File(Weak<crate::FileFd<FS>>),
+    #[cfg(feature = "worker_local_inet")]
     Socket(Weak<super::net::SocketFd>),
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
     Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
@@ -146,6 +149,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             EpollDescriptor::BrokerInetRaw(file) => Self::BrokerInetRaw(Arc::downgrade(file)),
             EpollDescriptor::Epoll(file) => Self::Epoll(file.downgrade()),
             EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
+            #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
             EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
             EpollDescriptor::Unix(unix) => Self::Unix(Arc::downgrade(unix)),
@@ -171,6 +175,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerInetRaw(raw) => raw.upgrade().map(EpollDescriptor::BrokerInetRaw),
             DescriptorRef::Epoll(epoll) => epoll.upgrade().map(EpollDescriptor::Epoll),
             DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
+            #[cfg(feature = "worker_local_inet")]
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
             DescriptorRef::Pipe(pipe) => pipe.upgrade().map(EpollDescriptor::Pipe),
             DescriptorRef::Unix(unix) => unix.upgrade().map(EpollDescriptor::Unix),
@@ -194,6 +199,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::BrokerInetRaw(_) => "BrokerInetRaw",
             DescriptorRef::Epoll(_) => "Epoll",
             DescriptorRef::File(_) => "File",
+            #[cfg(feature = "worker_local_inet")]
             DescriptorRef::Socket(_) => "Socket",
             DescriptorRef::Pipe(_) => "Pipe",
             DescriptorRef::Unix(_) => "Unix",
@@ -207,6 +213,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
 
     fn needs_network_drive(&self) -> bool {
         match self {
+            #[cfg(feature = "worker_local_inet")]
             DescriptorRef::Socket(socket) => socket.upgrade().is_some(),
             DescriptorRef::BrokerTcpConn(tcp_conn) => tcp_conn.upgrade().is_some(),
             DescriptorRef::BrokerInetDgram(dgram) => dgram.upgrade().is_some(),
@@ -285,6 +292,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 // and writable, matching Linux kernel behaviour.
                 Some((Events::IN | Events::OUT) & mask)
             }
+            #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(fd) => {
                 let proxy = match global.get_proxy(fd) {
                     Ok(p) => p,
@@ -350,6 +358,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             EpollDescriptor::BrokerPty(_) => false,
             EpollDescriptor::BrokerSocketPair(_) => false,
             EpollDescriptor::BrokerTcpConn(_) => false,
+            #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(_) => false,
             EpollDescriptor::Pipe(_) => false,
             EpollDescriptor::Unix(_) => false,
@@ -563,7 +572,7 @@ impl<FS: ShimFS> EpollFile<FS> {
     }
 
     fn drive_network_for_socket_interests(&self, global: &GlobalState<FS>) {
-        if self.has_socket_interests() {
+        if crate::WORKER_LOCAL_INET && self.has_socket_interests() {
             Self::drive_network_until_idle(global);
         }
     }
@@ -593,12 +602,19 @@ impl<FS: ShimFS> EpollFile<FS> {
     }
 
     fn drive_network_poll_loop(global: &GlobalState<FS>) {
-        const MAX_NETWORK_POLLS: usize = 8;
-        for _ in 0..MAX_NETWORK_POLLS {
-            let advice = global.net.lock().perform_platform_interaction();
-            if !advice.call_again_immediately() {
-                break;
+        #[cfg(feature = "worker_local_inet")]
+        {
+            const MAX_NETWORK_POLLS: usize = 8;
+            for _ in 0..MAX_NETWORK_POLLS {
+                let advice = global.net.lock().perform_platform_interaction();
+                if !advice.call_again_immediately() {
+                    break;
+                }
             }
+        }
+        #[cfg(not(feature = "worker_local_inet"))]
+        {
+            let _ = global;
         }
     }
 
@@ -873,6 +889,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                 EpollDescriptor::BrokerInetRaw(_) => "BrokerInetRaw",
                 EpollDescriptor::Epoll(_) => "Epoll",
                 EpollDescriptor::File(_) => "File",
+                #[cfg(feature = "worker_local_inet")]
                 EpollDescriptor::Socket(_) => "Socket",
                 EpollDescriptor::Pipe(_) => "Pipe",
                 EpollDescriptor::Unix(_) => "Unix",
@@ -969,6 +986,7 @@ impl EpollEntryKey {
             EpollDescriptor::BrokerInetRaw(file) => file.object_id(),
             EpollDescriptor::Epoll(file) => file.object_id(),
             EpollDescriptor::File(file) => file.object_id(),
+            #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(socket_fd) => socket_fd.object_id(),
             EpollDescriptor::Pipe(pipe_fd) => pipe_fd.object_id(),
             EpollDescriptor::Unix(unix) => unix.object_id(),
@@ -1228,7 +1246,7 @@ impl PollSet {
         files: &FilesState<FS>,
         waker: Option<&Waker<Platform>>,
     ) -> bool {
-        if self.has_socket_entries(global, files) {
+        if crate::WORKER_LOCAL_INET && self.has_socket_entries(global, files) {
             EpollFile::<FS>::drive_network_until_idle(global);
         }
 
@@ -1259,7 +1277,10 @@ impl PollSet {
                     None
                 };
                 // TODO: add machinery to unregister the observer to avoid leaks.
+                #[cfg(feature = "worker_local_inet")]
                 let is_socket = matches!(poll_descriptor, EpollDescriptor::Socket(_));
+                #[cfg(not(feature = "worker_local_inet"))]
+                let is_socket = false;
                 let mut revents = poll_descriptor
                     .poll(global, &*files.fs, entry.mask, observer)
                     .unwrap_or(Events::NVAL);
@@ -1367,10 +1388,12 @@ impl PollSet {
                 return false;
             }
             let raw_fd = entry.fd.reinterpret_as_unsigned() as usize;
-            matches!(
-                EpollDescriptor::try_from(global, files, raw_fd),
-                Ok(EpollDescriptor::Socket(_) | EpollDescriptor::BrokerTcpConn(_))
-            )
+            match EpollDescriptor::try_from(global, files, raw_fd) {
+                #[cfg(feature = "worker_local_inet")]
+                Ok(EpollDescriptor::Socket(_)) => true,
+                Ok(EpollDescriptor::BrokerTcpConn(_)) => true,
+                _ => false,
+            }
         })
     }
 

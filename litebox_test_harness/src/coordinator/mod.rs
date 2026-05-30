@@ -1012,6 +1012,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
     inotify::register_inotify_tests(&mut registry::Registry::new(&mut tests));
     broker_listener_tests::register_broker_listener_tests(&mut registry::Registry::new(&mut tests));
+    special_cases::register_process_tests(&mut registry::Registry::new(&mut tests));
     invariants::register_invariant_tests(&mut registry::Registry::new(&mut tests));
     inherit_matrix::register_inherit_matrix_tests(&mut registry::Registry::new(&mut tests));
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));

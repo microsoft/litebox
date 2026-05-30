@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![cfg_attr(
+    not(feature = "worker_local_inet"),
+    allow(unused_assignments, unused_mut, unused_variables)
+)]
 //! Unix domain socket implementation for the Linux shim layer.
 
 use core::{
@@ -492,13 +496,16 @@ impl<FS: ShimFS> UnixListenStream<FS> {
             Some(_) | None => return 0,
         };
 
-        if let Err(e) = global.send_listen_route_transfer(port) {
-            let msg = alloc::format!("UNIX TCP LISTENER: route transfer failed: {:?}\n", e);
-            litebox_platform_multiplex::platform().debug_log_print(&msg);
-            return 0;
-        }
+        #[cfg(feature = "worker_local_inet")]
+        {
+            if let Err(e) = global.send_listen_route_transfer(port) {
+                let msg = alloc::format!("UNIX TCP LISTENER: route transfer failed: {:?}\n", e);
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
+                return 0;
+            }
 
-        litebox_platform_multiplex::platform().wake_network_worker();
+            litebox_platform_multiplex::platform().wake_network_worker();
+        }
 
         let msg = alloc::format!("UNIX TCP LISTENER: port={} started\n", port);
         litebox_platform_multiplex::platform().debug_log_print(&msg);
@@ -510,11 +517,13 @@ impl<FS: ShimFS> UnixListenStream<FS> {
             Arc::downgrade(&bridge) as Weak<dyn litebox::event::observer::Observer<Events>>;
         let mut tcp_proxy = None;
         let mut tcp_broker_listener = None;
+        #[cfg(feature = "worker_local_inet")]
         if let Some(proxy) = global.get_proxy_by_raw_fd(raw_fd, &task.files) {
             use litebox::event::IOPollable;
             proxy.register_observer(bridge_weak, Events::IN);
             tcp_proxy = Some(proxy);
-        } else {
+        }
+        {
             let files = task.files.borrow();
             let rds = files.raw_descriptor_store.read();
             let typed = match rds
@@ -1295,15 +1304,22 @@ impl<FS: ShimFS> UnixStream<FS> {
                     recv_reader: Arc::new(litebox::sync::Mutex::new(FdTransferReader::new())),
                 }
             } else {
-                let proxy = files.with_socket(
-                    &task.global,
-                    tcp_raw_fd,
-                    |fd| task.global.get_proxy(fd),
-                    |_| Err(Errno::EINVAL),
-                )?;
-                UnixTransport::Tcp {
-                    proxy,
-                    recv_reader: Arc::new(litebox::sync::Mutex::new(FdTransferReader::new())),
+                #[cfg(feature = "worker_local_inet")]
+                {
+                    let proxy = files.with_socket(
+                        &task.global,
+                        tcp_raw_fd,
+                        |fd| task.global.get_proxy(fd),
+                        |_| Err(Errno::EINVAL),
+                    )?;
+                    UnixTransport::Tcp {
+                        proxy,
+                        recv_reader: Arc::new(litebox::sync::Mutex::new(FdTransferReader::new())),
+                    }
+                }
+                #[cfg(not(feature = "worker_local_inet"))]
+                {
+                    return Err(Errno::EINVAL);
                 }
             }
         };
@@ -2441,7 +2457,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 // the precedent in net.rs for TCP/UDP sockets.
                 SocketOption::RCVBUF | SocketOption::SNDBUF => Ok(()),
             },
-            SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
+            SocketOptionName::IPv6(_) | SocketOptionName::TCP(_) => Err(Errno::EOPNOTSUPP),
         }
     }
     pub(super) fn getsockopt(
@@ -2512,7 +2528,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                     return super::write_to_user(ucred, optval, len);
                 }
             },
-            SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
+            SocketOptionName::IPv6(_) | SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         };
         super::write_to_user(val, optval, len)
     }

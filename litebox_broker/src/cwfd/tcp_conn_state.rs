@@ -567,7 +567,8 @@ fn ensure_supported_sockopt(
         | (libc::SOL_SOCKET, libc::SO_SNDTIMEO, _)
         | (libc::SOL_SOCKET, libc::SO_ERROR, true)
         | (libc::IPPROTO_TCP, libc::TCP_NODELAY, _)
-        | (libc::IPPROTO_IP, libc::IP_TTL, _) => Ok(()),
+        | (libc::IPPROTO_IP, libc::IP_TTL, _)
+        | (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, false) => Ok(()),
         (libc::SOL_SOCKET, libc::SO_ERROR, false) => Err(TcpConnError::Errno(libc::ENOPROTOOPT)),
         _ => Err(TcpConnError::Errno(libc::EOPNOTSUPP)),
     }
@@ -600,6 +601,9 @@ fn apply_setsockopt(
     optname: libc::c_int,
     optval: &[u8],
 ) -> Result<(), TcpConnError> {
+    if (level, optname) == (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) {
+        return Ok(());
+    }
     // SAFETY: `fd` is a live socket fd and `optval` is a valid readable buffer.
     let rc = unsafe {
         libc::setsockopt(
