@@ -167,7 +167,6 @@ pub trait Backend: private::Sealed + Send + Sync + 'static {
 }
 
 /// A successful walk of directories through the backend
-#[expect(dead_code, reason = "this expect should go away before PR is ready")]
 pub struct WalkOutcome<Walking> {
     /// A component per walked element.
     ///
@@ -191,7 +190,6 @@ pub struct WalkOutcome<Walking> {
 /// Per-component status returned by a backend walk
 #[derive(Clone, Debug)]
 #[must_use]
-#[expect(dead_code, reason = "this expect should go away before PR is ready")]
 pub(super) struct WalkedComponent {
     /// Permissions that the resolver must check; if this is `None`, the backend has is
     /// self-enforcing permissions for this component, and the resolver need not check it.
@@ -200,7 +198,6 @@ pub(super) struct WalkedComponent {
 
 /// Permission information for a particular component of the walk.
 #[derive(Clone, Debug)]
-#[expect(dead_code, reason = "this expect should go away before PR is ready")]
 pub(super) struct PermissionInfo {
     pub(super) mode: Mode,
     pub(super) owner: UserInfo,
