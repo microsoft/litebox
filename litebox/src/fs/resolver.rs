@@ -251,7 +251,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
         let append_mode = flags.contains(OFlags::APPEND);
-        let insert = |handle| {
+        let insert = |handle, seek_behavior| {
             self.litebox.descriptor_table_mut().insert(ResolverEntry {
                 handle,
                 read_allowed,
@@ -259,6 +259,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 position: 0,
                 append_mode,
                 path_only,
+                seek_behavior,
             })
         };
 
@@ -266,9 +267,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                 return Err(OpenError::AlreadyExists);
             }
-            return Ok(insert(OwnedHandle::Dir(
-                self.backend.owned_dir_at(self.backend.root()),
-            )));
+            return Ok(insert(
+                OwnedHandle::Dir(self.backend.owned_dir_at(self.backend.root())),
+                SeekBehavior::NonSeekable,
+            ));
         }
 
         let Some((parent_components, name)) = path.parent_and_name() else {
@@ -294,7 +296,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
-                Ok(insert(OwnedHandle::File(file)))
+                let seek_behavior = self.backend.seek_behavior(&file);
+                Ok(insert(OwnedHandle::File(file), seek_behavior))
             }
             Err(
                 error @ OpenError::PathError(
@@ -313,13 +316,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                             return Err(OpenError::AlreadyExists);
                         }
-                        Ok(insert(OwnedHandle::Dir(self.backend.owned_dir_at(dir))))
+                        Ok(insert(
+                            OwnedHandle::Dir(self.backend.owned_dir_at(dir)),
+                            SeekBehavior::NonSeekable,
+                        ))
                     }
                     Err(_) if flags.contains(OFlags::CREAT) => match error {
                         OpenError::PathError(PathError::NoSuchFileOrDirectory) => {
-                            Ok(insert(OwnedHandle::File(
-                                self.backend.create_file_at(parent, name, mode)?,
-                            )))
+                            let file = self.backend.create_file_at(parent, name, mode)?;
+                            let seek_behavior = self.backend.seek_behavior(&file);
+                            Ok(insert(OwnedHandle::File(file), seek_behavior))
                         }
                         _ => Err(error),
                     },
@@ -347,6 +353,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             OwnedHandle::File(file) => file,
             OwnedHandle::Dir(_) => return Err(ReadError::NotAFile),
         };
+        let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.read_allowed {
             return Err(ReadError::NotForReading);
         }
@@ -355,9 +362,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             unimplemented!("read from O_PATH fd")
         }
 
-        let read_offset = offset.unwrap_or(entry.entry.position);
+        let read_offset = match seek_behavior {
+            SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
+            SeekBehavior::PositionBased => offset.unwrap_or(entry.entry.position),
+        };
         let read = self.backend.read(file, buf, read_offset)?;
-        if offset.is_none() {
+        if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
             entry.entry.position = read_offset.checked_add(read).unwrap();
         }
         Ok(read)
@@ -375,6 +385,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             OwnedHandle::File(file) => file,
             OwnedHandle::Dir(_) => return Err(WriteError::NotAFile),
         };
+        let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.write_allowed {
             return Err(WriteError::NotForWriting);
         }
@@ -383,16 +394,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             unimplemented!("write to O_PATH fd")
         }
 
-        let write_offset = if entry.entry.append_mode && offset.is_none() {
-            self.backend
-                .file_status(file)
-                .map_err(|_| WriteError::Io)?
-                .size
-        } else {
-            offset.unwrap_or(entry.entry.position)
+        let write_offset = match seek_behavior {
+            SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
+            SeekBehavior::PositionBased if entry.entry.append_mode && offset.is_none() => {
+                self.backend
+                    .file_status(file)
+                    .map_err(|_| WriteError::Io)?
+                    .size
+            }
+            SeekBehavior::PositionBased => offset.unwrap_or(entry.entry.position),
         };
         let written = self.backend.write(file, buf, write_offset)?;
-        if offset.is_none() {
+        if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
             entry.entry.position = write_offset.checked_add(written).unwrap();
         }
         Ok(written)
@@ -415,7 +428,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             unimplemented!("seek on O_PATH fd")
         }
 
-        match self.backend.seek_behavior(file) {
+        match entry.entry.seek_behavior {
             SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
             SeekBehavior::ZeroPosition => Ok(0),
             SeekBehavior::PositionBased => {
@@ -639,6 +652,7 @@ struct ResolverEntry<Backend: super::backend::Backend> {
     position: usize,
     append_mode: bool,
     path_only: bool,
+    seek_behavior: SeekBehavior,
 }
 
 crate::fd::enable_fds_for_subsystem! {
