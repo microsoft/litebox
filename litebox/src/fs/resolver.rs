@@ -445,6 +445,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 let new_position = base
                     .checked_add_signed(offset)
                     .ok_or(SeekError::InvalidOffset)?;
+                // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
+                // file types may not. Model that distinction instead of using one resolver rule.
                 if new_position > file_len {
                     return Err(SeekError::InvalidOffset);
                 }

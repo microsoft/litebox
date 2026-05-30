@@ -132,7 +132,7 @@ where
 {
     /// Construct a new `Devices` backend.
     #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
+    pub(crate) fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
         let dev_dir_inode = allocator.next();
         Self {
             litebox: litebox.clone(),
@@ -255,13 +255,6 @@ where
             )
         {
             unimplemented!("Non-blocking I/O is not yet supported for {:?}", device);
-        }
-
-        let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
-        match device {
-            Device::Stdin if access_mode != OFlags::RDONLY => unimplemented!(),
-            Device::Stdout | Device::Stderr if access_mode != OFlags::WRONLY => unimplemented!(),
-            _ => {}
         }
 
         if flags.contains(OFlags::TRUNC) {

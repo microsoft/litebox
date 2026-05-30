@@ -33,12 +33,6 @@ impl InodeAllocator {
         Self::for_device(STANDALONE_DEVICE_ID)
     }
 
-    /// The `device_id` assigned to this allocator.
-    #[must_use]
-    pub fn device_id(&self) -> u64 {
-        self.device_id
-    }
-
     /// Allocate a fresh `NodeInfo` for a new entry on this backend.
     #[must_use]
     pub fn next(&self) -> NodeInfo {
