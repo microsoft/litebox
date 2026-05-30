@@ -44,7 +44,6 @@
 
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // `cleanup` is a sibling-module inside `tests/integration.rs`.
@@ -52,38 +51,13 @@ use std::time::Duration;
 // the integration test binary.
 use crate::cleanup;
 
-static NAME_COUNTER: AtomicU64 = AtomicU64::new(1);
+// Pure helpers (no crate-private deps) live in framework_core so
+// they can be unit-tested from tests/dashboard_store.rs.
+#[path = "framework_core.rs"]
+mod core;
 
-/// Build the canonical container name. See module docs for
-/// uniqueness analysis.
-pub fn container_name(pass: &str, test_id: &str) -> String {
-    let safe_tid: String = test_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let counter = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let harness_pid = std::process::id();
-    format!("litebox-{pass}-{safe_tid}-{harness_pid}-{counter}")
-}
-
-/// Per-test-family container description. Plus how to invoke the
-/// container — `detached=true` for `docker run -d`, false for
-/// foreground (the docker-run process stays alive until the
-/// container exits).
-pub struct ContainerSpec {
-    pub image: String,
-    /// Extra `docker run` arguments between `--name X` and the
-    /// image — e.g. `-v`, `-e`, `--cap-add`, `-p`,
-    /// `--security-opt`.
-    pub docker_args: Vec<String>,
-    /// The container command (after the image, what to run inside).
-    pub command: Vec<String>,
-    pub detached: bool,
-    /// If `Some(secs)`, wrap `command` with `timeout(1)` for a
-    /// hard per-trial cap. Set to `None` to let the inner command
-    /// manage its own timeout.
-    pub timeout_secs: Option<u64>,
-}
+use core::build_docker_run_args;
+pub use core::{ContainerSpec, container_name};
 
 /// What a `drive` closure receives once the container is running.
 pub struct DispatchedContainer {
@@ -137,25 +111,14 @@ fn apply_pdeathsig(cmd: &mut Command) {
 }
 
 /// Build the full `docker run` command from a `ContainerSpec` +
-/// the framework-allocated container name. Inserts `--name`,
-/// `--rm` (unless `LITEBOX_KEEP_CONTAINER`), and the `-d` flag for
-/// detached specs.
+/// the framework-allocated container name. Delegates argument
+/// layout to `build_docker_run_args` (pure, testable) and adds
+/// the side-effectful `pre_exec(PDEATHSIG)` hook.
 fn build_command(spec: &ContainerSpec, name: &str) -> Command {
+    let keep_containers = std::env::var("LITEBOX_KEEP_CONTAINER").is_ok();
+    let args = build_docker_run_args(spec, name, keep_containers);
     let mut cmd = Command::new("docker");
-    cmd.arg("run");
-    if spec.detached {
-        cmd.arg("-d");
-    }
-    if std::env::var("LITEBOX_KEEP_CONTAINER").is_err() {
-        cmd.arg("--rm");
-    }
-    cmd.args(["--name", name]);
-    cmd.args(&spec.docker_args);
-    cmd.arg(&spec.image);
-    if let Some(secs) = spec.timeout_secs {
-        cmd.args(["timeout", "--signal=KILL", &secs.to_string()]);
-    }
-    cmd.args(&spec.command);
+    cmd.args(&args);
     apply_pdeathsig(&mut cmd);
     cmd
 }

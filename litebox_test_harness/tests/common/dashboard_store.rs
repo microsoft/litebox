@@ -608,13 +608,33 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<S
             .collect();
     };
     let conn = ctx.conn.lock().expect("dashboard: conn lock");
+    select_fill_batch_inner(&conn, ctx.run_id, trials, cap)
+}
+
+/// Test-friendly variant: takes the connection + run_id explicitly
+/// instead of going through the process-singleton `ctx()`. The
+/// real `select_fill_batch` is a thin wrapper around this; tests
+/// bypass `ctx()` and call this directly with their own DB.
+pub fn select_fill_batch_inner(
+    conn: &Connection,
+    run_id: i64,
+    trials: &[libtest_mimic::Trial],
+    cap: FillCap,
+) -> Vec<String> {
+    let count_cap = match cap {
+        FillCap::Count(n) => n,
+        FillCap::BudgetSecs { .. } => usize::MAX,
+    };
+    if count_cap == 0 {
+        return Vec::new();
+    }
 
     // The producer's own runs row records `commit_sha`; reuse it
     // so this works even when `git` is not on PATH at fill time.
     let commit_sha: String = conn
         .query_row(
             "SELECT commit_sha FROM runs WHERE run_id = ?1",
-            params![ctx.run_id],
+            params![run_id],
             |r| r.get(0),
         )
         .unwrap_or_default();
@@ -692,7 +712,6 @@ pub fn select_fill_batch(trials: &[libtest_mimic::Trial], cap: FillCap) -> Vec<S
             costs.insert(row.0, row.3);
         }
     }
-    drop(conn);
 
     // Class 1 (uncovered at current sha) and class 2 (covered but
     // freshest verdict is non-pass at current sha, with retries
