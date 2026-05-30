@@ -9,6 +9,8 @@ use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
+mod split_broker;
+
 extern crate alloc;
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
@@ -77,6 +79,15 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// Connect to an already-running split broker Unix socket and verify the control path.
+    #[arg(
+        long = "split-broker-socket",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub split_broker_socket: Option<PathBuf>,
 }
 
 struct MmappedFile {
@@ -201,6 +212,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     litebox_platform_multiplex::set_platform(platform);
+    let split_broker = split_broker::connect(cli_args.split_broker_socket.as_deref())?;
+
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
     // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
@@ -414,7 +427,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
-    std::process::exit(program.process.wait())
+    let exit_status = program.process.wait();
+    if let Some(split_broker) = split_broker {
+        split_broker.shutdown();
+    }
+    std::process::exit(exit_status)
 }
 
 /// Pin the current thread to a specific CPU core

@@ -46,6 +46,11 @@ impl<T> BrokerClient<T> {
             state: ConnectionState::AwaitingNegotiation,
         }
     }
+
+    /// Returns the underlying control channel for deployment-specific configuration.
+    pub fn control_channel_mut(&mut self) -> &mut T {
+        &mut self.channel
+    }
 }
 
 impl<T: ClientControlChannel> BrokerClient<T> {
