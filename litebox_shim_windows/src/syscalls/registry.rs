@@ -40,7 +40,6 @@ use litebox::fs::{FileSystem as _, FileType, Mode, OFlags};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt;
 use litebox_common_windows::nt_status::NtStatus;
-use litebox_platform_multiplex::Platform;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::Handle;
@@ -62,14 +61,14 @@ struct RegistryKeyObject {
     path: String,
 }
 
-type RegistryFileSystem = litebox::fs::layered::FileSystem<
+type RegistryFileSystem<Platform> = litebox::fs::layered::FileSystem<
     Platform,
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::tar_ro::FileSystem<Platform>,
 >;
 
-pub(crate) struct RegistryStore {
-    fs: RegistryFileSystem,
+pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
+    fs: RegistryFileSystem<Platform>,
 }
 
 const VALUES_DIR_NAME: &str = ".values";
@@ -179,7 +178,7 @@ struct RegistryValue {
     data: Vec<u8>,
 }
 
-impl RegistryStore {
+impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
         in_mem.with_root_privileges(|fs| {
@@ -273,24 +272,24 @@ impl RegistryStore {
     }
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_nt_open_key(
         &self,
-        key_handle: MutPtr<Handle>,
+        key_handle: MutPtr<Platform, Handle>,
         desired_access: u32,
-        object_attributes: Option<ConstPtr<ObjectAttributes>>,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
     ) -> NtStatus {
         let Some(object_attributes) = object_attributes else {
             return NtStatus::INVALID_PARAMETER;
         };
-        let object_attributes = match read_object_attributes(object_attributes) {
+        let object_attributes = match read_object_attributes::<Platform>(object_attributes) {
             Ok(object_attributes) => object_attributes,
             Err(status) => return status,
         };
         match self.do_nt_open_key(desired_access, object_attributes) {
             Ok(handle) => {
                 if key_handle.write_at_offset(0, handle).is_none() {
-                    remove_raw_handle::<RegistryKeySubsystem>(
+                    remove_raw_handle::<Platform, RegistryKeySubsystem>(
                         &self.global.litebox,
                         &self.process.handles,
                         handle,
@@ -313,15 +312,16 @@ impl<FS: ShimFS> Task<FS> {
             return Err(NtStatus::INVALID_PARAMETER);
         }
 
-        let object_name_ptr = ConstPtr::<UnicodeString>::from_usize(object_attributes.object_name);
+        let object_name_ptr =
+            ConstPtr::<Platform, UnicodeString>::from_usize(object_attributes.object_name);
         let object_name = object_name_ptr
             .read_at_offset(0)
             .ok_or(NtStatus::ACCESS_VIOLATION)?;
-        let key_name = String::try_from(object_name)?;
+        let key_name = object_name.read_string::<Platform>()?;
         let path = if object_attributes.root_directory.is_null() || key_name.starts_with('\\') {
             absolute_nt_key_name_to_fs_path(&key_name)?
         } else {
-            let root_key = raw_handle_entry::<RegistryKeySubsystem>(
+            let root_key = raw_handle_entry::<Platform, RegistryKeySubsystem>(
                 &self.global.litebox,
                 &self.process.handles,
                 object_attributes.root_directory,
@@ -354,17 +354,17 @@ impl<FS: ShimFS> Task<FS> {
         let typed = descriptor_table.insert::<RegistryKeySubsystem>(key);
         drop(descriptor_table);
 
-        insert_raw_handle(&self.global.litebox, &self.process.handles, typed)
+        insert_raw_handle::<Platform, _>(&self.global.litebox, &self.process.handles, typed)
     }
 
     pub(crate) fn sys_nt_query_value_key(
         &self,
         key_handle: Handle,
-        value_name: ConstPtr<UnicodeString>,
+        value_name: ConstPtr<Platform, UnicodeString>,
         key_value_information_class: u32,
-        key_value_information: MutPtr<u8>,
+        key_value_information: MutPtr<Platform, u8>,
         length: u32,
-        result_length: MutPtr<u32>,
+        result_length: MutPtr<Platform, u32>,
     ) -> NtStatus {
         let Some(value_name) = value_name.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
@@ -396,17 +396,17 @@ impl<FS: ShimFS> Task<FS> {
         key_handle: Handle,
         value_name: UnicodeString,
         key_value_information_class: KeyValueInformationClass,
-        key_value_information: MutPtr<u8>,
+        key_value_information: MutPtr<Platform, u8>,
         length: u32,
-        result_length: MutPtr<u32>,
+        result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
-        let key = raw_handle_entry::<RegistryKeySubsystem>(
+        let key = raw_handle_entry::<Platform, RegistryKeySubsystem>(
             &self.global.litebox,
             &self.process.handles,
             key_handle,
         )
         .ok_or(NtStatus::INVALID_HANDLE)?;
-        let value_name = String::try_from(value_name)?;
+        let value_name = value_name.read_string::<Platform>()?;
         let value =
             key.with_entry(|key| self.global.registry.read_value(&key.path, &value_name))?;
         let name = utf16le(&value_name);
@@ -421,8 +421,8 @@ impl<FS: ShimFS> Task<FS> {
                     name_length: name.len().trunc(),
                     name: [0u8; 0],
                 };
-                write_query_result_length(result_length, length, required_length)?;
-                write_query_information(
+                write_query_result_length::<Platform>(result_length, length, required_length)?;
+                write_query_information::<Platform>(
                     key_value_information,
                     information.as_bytes(),
                     &[(offset_of!(KeyValueBasicInformation, name), name.as_slice())],
@@ -438,7 +438,7 @@ impl<FS: ShimFS> Task<FS> {
                 let required_length = data_offset
                     .checked_add(value.data.len())
                     .ok_or(NtStatus::UNSUCCESSFUL)?;
-                write_query_result_length(result_length, length, required_length)?;
+                write_query_result_length::<Platform>(result_length, length, required_length)?;
                 let information = KeyValueFullInformation {
                     title_index: 0,
                     value_type: value.value_type.into(),
@@ -448,7 +448,7 @@ impl<FS: ShimFS> Task<FS> {
                     name: [0u8; 0],
                 };
 
-                write_query_information(
+                write_query_information::<Platform>(
                     key_value_information,
                     information.as_bytes(),
                     &[
@@ -461,7 +461,7 @@ impl<FS: ShimFS> Task<FS> {
                 let required_length = size_of::<KeyValuePartialInformation>()
                     .checked_add(value.data.len())
                     .ok_or(NtStatus::UNSUCCESSFUL)?;
-                write_query_result_length(result_length, length, required_length)?;
+                write_query_result_length::<Platform>(result_length, length, required_length)?;
                 let information = KeyValuePartialInformation {
                     title_index: 0,
                     value_type: value.value_type.into(),
@@ -469,7 +469,7 @@ impl<FS: ShimFS> Task<FS> {
                     data: [0u8; 0],
                 };
 
-                write_query_information(
+                write_query_information::<Platform>(
                     key_value_information,
                     information.as_bytes(),
                     &[(
@@ -492,8 +492,8 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-fn write_query_result_length(
-    result_length: MutPtr<u32>,
+fn write_query_result_length<Platform: litebox::platform::RawPointerProvider>(
+    result_length: MutPtr<Platform, u32>,
     buffer_length: u32,
     required_length: usize,
 ) -> Result<(), NtStatus> {
@@ -506,8 +506,8 @@ fn write_query_result_length(
     Ok(())
 }
 
-fn write_query_information(
-    key_value_information: MutPtr<u8>,
+fn write_query_information<Platform: litebox::platform::RawPointerProvider>(
+    key_value_information: MutPtr<Platform, u8>,
     header: &[u8],
     trailing_slices: &[(usize, &[u8])],
 ) -> Result<(), NtStatus> {
@@ -731,7 +731,7 @@ fn map_read_error(error: ReadError) -> NtStatus {
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::init_platform;
+    use crate::tests::{TestFS, TestPlatform, test_platform};
 
     use super::*;
     use core::mem::size_of;
@@ -774,16 +774,16 @@ mod tests {
         fn RegCloseKey(hKey: *mut core::ffi::c_void) -> i32;
     }
 
-    fn const_ptr<T: FromBytes>(value: &T) -> ConstPtr<T> {
-        ConstPtr::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+    fn const_ptr<T: FromBytes>(value: &T) -> ConstPtr<TestPlatform, T> {
+        ConstPtr::<TestPlatform, T>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
     }
 
-    fn mut_ptr<T: FromBytes + IntoBytes>(value: &mut T) -> MutPtr<T> {
-        MutPtr::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
+    fn mut_ptr<T: FromBytes + IntoBytes>(value: &mut T) -> MutPtr<TestPlatform, T> {
+        MutPtr::<TestPlatform, T>::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
     }
 
-    fn mut_byte_ptr<T>(value: &mut T) -> MutPtr<u8> {
-        MutPtr::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
+    fn mut_byte_ptr<T>(value: &mut T) -> MutPtr<TestPlatform, u8> {
+        MutPtr::<TestPlatform, u8>::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
     }
 
     fn unicode_string(value: &[u16]) -> UnicodeString {
@@ -811,21 +811,20 @@ mod tests {
         }
     }
 
-    fn test_registry() -> (LiteBox<Platform>, RegistryStore) {
-        init_platform();
-        let litebox = LiteBox::new(litebox_platform_multiplex::platform());
+    fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
+        let litebox = LiteBox::new(test_platform());
         let registry = RegistryStore::new(&litebox);
         (litebox, registry)
     }
 
     fn open_key(
-        task: &Task<crate::DefaultFS>,
+        task: &Task<TestPlatform, TestFS>,
         object_attributes: ObjectAttributes,
     ) -> Result<Handle, NtStatus> {
         task.do_nt_open_key(0x20019, object_attributes)
     }
 
-    fn open_code_page_key(task: &Task<crate::DefaultFS>) -> Handle {
+    fn open_code_page_key(task: &Task<TestPlatform, TestFS>) -> Handle {
         let code_page_name = utf16(DEFAULT_CODE_PAGE_KEY);
         let code_page_name = unicode_string(&code_page_name);
         let object_attributes = object_attributes(&code_page_name);

@@ -2,7 +2,8 @@
 // Licensed under the MIT license.
 
 use alloc::{sync::Arc, vec::Vec};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
+use core::marker::PhantomData;
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox::{
     fs::{Mode, OFlags},
@@ -16,7 +17,6 @@ use litebox_common_windows::loader::{
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, MapMemory, MappingInfo, PAGE_SIZE, PeExportError,
     PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt, page_align_down,
 };
-use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
 use crate::ShimFS;
@@ -34,20 +34,34 @@ pub(crate) struct PeLoadInfo {
     pub(crate) ntdll_mapping: Option<MappingInfo>,
 }
 
-pub(crate) struct PeLoader<'a, FS: ShimFS> {
+pub(crate) struct PeLoader<'a, Platform: crate::ShimPlatform, FS: ShimFS> {
+    platform: &'static Platform,
     fs: Arc<FS>,
-    page_manager: &'a crate::WindowsPageManager,
+    page_manager: &'a crate::WindowsPageManager<Platform>,
 }
 
-impl<'a, FS: ShimFS> PeLoader<'a, FS> {
-    pub(crate) fn new(fs: Arc<FS>, page_manager: &'a crate::WindowsPageManager) -> Self {
-        Self { fs, page_manager }
+impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
+    pub(crate) fn new(
+        platform: &'static Platform,
+        fs: Arc<FS>,
+        page_manager: &'a crate::WindowsPageManager<Platform>,
+    ) -> Self {
+        Self {
+            platform,
+            fs,
+            page_manager,
+        }
     }
 
     pub(crate) fn load(&self, path: &str) -> Result<PeLoadInfo, WindowsLoadError> {
-        let image = load_image(self.fs.clone(), path, self.page_manager)?;
+        let image = load_image(self.platform, self.fs.clone(), path, self.page_manager)?;
         let application_entry_point = image.mapping.entry_point;
-        let ntdll = load_ntdll(self.fs.clone(), self.page_manager, NTDLL_PATHS)?;
+        let ntdll = load_ntdll(
+            self.platform,
+            self.fs.clone(),
+            self.page_manager,
+            NTDLL_PATHS,
+        )?;
 
         if let Some(ntdll) = &ntdll {
             if !ntdll.image.parsed.has_trampoline() {
@@ -105,11 +119,13 @@ impl<'a, FS: ShimFS> PeLoader<'a, FS> {
         };
 
         // `KI_USER_INVERTED_FUNCTION_TABLE` lives in ntdll's writable `.mrdata` section.
-        crate::write_value(table_address, header).ok_or(PeImageAccessError::MemoryAccess)?;
+        crate::write_value::<Platform, _>(table_address, header)
+            .ok_or(PeImageAccessError::MemoryAccess)?;
         let entries_address = table_address
             .checked_add(core::mem::size_of::<KiUserInvertedFunctionTableHeader>())
             .ok_or(PeImageAccessError::AddressOverflow)?;
-        crate::write_slice(entries_address, &entries).ok_or(PeImageAccessError::MemoryAccess)?;
+        crate::write_slice::<Platform, _>(entries_address, &entries)
+            .ok_or(PeImageAccessError::MemoryAccess)?;
 
         litebox_util_log::debug!(
             table:% = format_args!("{table_address:#x}");
@@ -167,20 +183,22 @@ struct NtDllExports {
     ki_user_inverted_function_table: usize,
 }
 
-fn load_ntdll<FS: crate::ShimFS>(
+fn load_ntdll<Platform: crate::ShimPlatform, FS: crate::ShimFS>(
+    platform: &'static Platform,
     fs: Arc<FS>,
-    page_manager: &crate::WindowsPageManager,
+    page_manager: &crate::WindowsPageManager<Platform>,
     ntdll_paths: &[&str],
 ) -> Result<Option<LoadedNtDll>, WindowsLoadError> {
     for path in ntdll_paths {
         match load_image_with_writable_sections(
             fs.clone(),
             path,
+            platform,
             page_manager,
             NTDLL_WRITABLE_SECTIONS,
         ) {
             Ok(image) => {
-                let exports = ntdll_exports(&image)?;
+                let exports = ntdll_exports::<Platform>(&image)?;
                 litebox_util_log::debug!(path:% = path; "Loaded guest ntdll.dll");
                 return Ok(Some(LoadedNtDll { image, exports }));
             }
@@ -193,47 +211,48 @@ fn load_ntdll<FS: crate::ShimFS>(
     Ok(None)
 }
 
-fn load_image<FS: ShimFS>(
+fn load_image<Platform: crate::ShimPlatform, FS: ShimFS>(
+    platform: &'static Platform,
     fs: Arc<FS>,
     path: &str,
-    page_manager: &crate::WindowsPageManager,
+    page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Result<LoadedImage, WindowsLoadError> {
-    load_image_with_writable_sections(fs, path, page_manager, &[])
+    load_image_with_writable_sections(fs, path, platform, page_manager, &[])
 }
 
-fn load_image_with_writable_sections<FS: ShimFS>(
+fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(
     fs: Arc<FS>,
     path: &str,
-    page_manager: &crate::WindowsPageManager,
+    platform: &'static Platform,
+    page_manager: &crate::WindowsPageManager<Platform>,
     writable_section_names: &[&[u8]],
 ) -> Result<LoadedImage, WindowsLoadError> {
     let file = PeImageFile::open(fs, path)?;
     let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
     parsed
-        .parse_trampoline(
-            &mut &file,
-            litebox_platform_multiplex::platform().get_syscall_entry_point(),
-        )
+        .parse_trampoline(&mut &file, platform.get_syscall_entry_point())
         .map_err(WindowsLoadError::Parse)?;
     let mut mapper = PeImageMapper {
         file: &file,
         page_manager,
         chunk: alloc::vec![0u8; FILE_CHUNK_BYTES],
     };
-    let mut memory = PeImageMemory;
+    let mut memory = PeImageMemory::<Platform>(PhantomData);
     let mapping = parsed
         .load_with_writable_sections(&mut mapper, &mut memory, writable_section_names)
         .map_err(WindowsLoadError::Load)?;
     Ok(LoadedImage { mapping, parsed })
 }
 
-fn ntdll_exports(image: &LoadedImage) -> Result<NtDllExports, WindowsLoadError> {
+fn ntdll_exports<Platform: RawPointerProvider>(
+    image: &LoadedImage,
+) -> Result<NtDllExports, WindowsLoadError> {
     let export_names = [
         "LdrInitializeThunk",
         "RtlUserThreadStart",
         "KiUserInvertedFunctionTable",
     ];
-    let mut memory = PeImageMemory;
+    let mut memory = PeImageMemory::<Platform>(PhantomData);
     let addresses = image
         .parsed
         .find_export_addresses(image.mapping.base_addr, &mut memory, &export_names)
@@ -358,14 +377,14 @@ impl<FS: ShimFS> ReadAt for &'_ PeImageFile<FS> {
     }
 }
 
-struct PeImageMapper<'a, FS: ShimFS> {
+struct PeImageMapper<'a, Platform: crate::ShimPlatform, FS: ShimFS> {
     file: &'a PeImageFile<FS>,
-    page_manager: &'a crate::WindowsPageManager,
+    page_manager: &'a crate::WindowsPageManager<Platform>,
     /// Reusable per-call I/O staging buffer for [`MapMemory::map_file`].
     chunk: Vec<u8>,
 }
 
-impl<FS: ShimFS> MapMemory for PeImageMapper<'_, FS> {
+impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, Platform, FS> {
     type Error = PeImageAccessError;
 
     fn reserve(
@@ -475,9 +494,9 @@ pub enum PeImageAccessError {
     MemoryAccess,
 }
 
-struct PeImageMemory;
+struct PeImageMemory<Platform>(PhantomData<Platform>);
 
-impl AccessMemory for PeImageMemory {
+impl<Platform: RawPointerProvider> AccessMemory for PeImageMemory<Platform> {
     fn read(&mut self, address: usize, buf: &mut [u8]) -> Result<(), Fault> {
         let ptr = <Platform as RawPointerProvider>::RawConstPointer::<u8>::from_usize(address);
         buf.copy_from_slice(&ptr.to_owned_slice(buf.len()).ok_or(Fault)?);
@@ -490,8 +509,8 @@ impl AccessMemory for PeImageMemory {
     }
 }
 
-fn make_pages_writable(
-    page_manager: &crate::WindowsPageManager,
+fn make_pages_writable<Platform: crate::ShimPlatform>(
+    page_manager: &crate::WindowsPageManager<Platform>,
     address: usize,
     len: usize,
 ) -> Result<(), PeImageAccessError> {
@@ -505,8 +524,8 @@ fn make_pages_writable(
     Ok(())
 }
 
-fn protect_pages(
-    page_manager: &crate::WindowsPageManager,
+fn protect_pages<Platform: crate::ShimPlatform>(
+    page_manager: &crate::WindowsPageManager<Platform>,
     address: usize,
     len: usize,
     prot: Protection,
@@ -572,7 +591,8 @@ mod tests {
         let ntdll = ntdll_module_base();
         let loaded_ntdll = loaded_module_image(ntdll);
 
-        let exports = ntdll_exports(&loaded_ntdll).expect("failed to parse ntdll exports");
+        let exports = ntdll_exports::<crate::tests::TestPlatform>(&loaded_ntdll)
+            .expect("failed to parse ntdll exports");
         let expected_table = own_inverted_function_table() as usize;
 
         assert_eq!(

@@ -9,7 +9,7 @@ extern crate alloc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use litebox_platform_multiplex::Platform;
+use litebox_platform_windows_userland::WindowsUserland;
 use std::path::PathBuf;
 
 /// Run Windows PE programs with LiteBox on unmodified Windows.
@@ -67,9 +67,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let tar_data = std::fs::read(tar_file)
         .with_context(|| format!("Could not read tar file at {}", tar_file.display()))?;
 
-    let platform = Platform::new();
-    litebox_platform_multiplex::set_platform(platform);
-    let shim_builder = litebox_shim_windows::WindowsShimBuilder::new();
+    let platform = WindowsUserland::new();
+    let shim_builder = litebox_shim_windows::WindowsShimBuilder::new(platform);
     let litebox = shim_builder.litebox();
 
     let (program_path, program_args) = cli_args

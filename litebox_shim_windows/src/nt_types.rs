@@ -2,9 +2,8 @@
 // Licensed under the MIT license.
 
 use alloc::string::String;
-use litebox::platform::RawConstPointer as _;
+use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
-use litebox_platform_multiplex::Platform;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{ConstPtr, syscalls::Handle};
@@ -20,8 +19,8 @@ pub(crate) struct ObjectAttributes {
     pub(crate) security_quality_of_service: usize,
 }
 
-pub(crate) fn read_object_attributes(
-    object_attributes: ConstPtr<ObjectAttributes>,
+pub(crate) fn read_object_attributes<Platform: RawPointerProvider>(
+    object_attributes: ConstPtr<Platform, ObjectAttributes>,
 ) -> Result<ObjectAttributes, NtStatus> {
     let Some(object_attributes) = object_attributes.read_at_offset(0) else {
         return Err(NtStatus::ACCESS_VIOLATION);
@@ -41,24 +40,22 @@ pub(crate) struct UnicodeString {
     pub(crate) buffer: usize,
 }
 
-impl TryFrom<UnicodeString> for String {
-    type Error = NtStatus;
-
-    fn try_from(unicode_string: UnicodeString) -> Result<Self, Self::Error> {
-        if !unicode_string.length.is_multiple_of(2) {
+impl UnicodeString {
+    pub(crate) fn read_string<Platform: RawPointerProvider>(self) -> Result<String, NtStatus> {
+        if !self.length.is_multiple_of(2) {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        if unicode_string.length == 0 {
+        if self.length == 0 {
             return Ok(String::new());
         }
-        if unicode_string.buffer == 0 {
+        if self.buffer == 0 {
             return Err(NtStatus::ACCESS_VIOLATION);
         }
 
-        let chars = usize::from(unicode_string.length / 2);
+        let chars = usize::from(self.length / 2);
         let buffer =
             <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<u16>::from_usize(
-                unicode_string.buffer,
+                self.buffer,
             );
         let Some(units) = buffer.to_owned_slice(chars) else {
             return Err(NtStatus::ACCESS_VIOLATION);

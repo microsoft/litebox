@@ -11,26 +11,32 @@ use litebox::fd::RawDescriptorStorage;
 
 use crate::{DefaultFS, GlobalState, Process, Task, WindowsHandleStore, WindowsPageManager};
 
-pub(crate) fn init_platform() {
-    static PLATFORM_INIT: std::sync::Once = std::sync::Once::new();
-    PLATFORM_INIT.call_once(|| {
+#[cfg(target_os = "linux")]
+pub(crate) type TestPlatform = litebox_platform_linux_userland::LinuxUserland;
+#[cfg(target_os = "windows")]
+pub(crate) type TestPlatform = litebox_platform_windows_userland::WindowsUserland;
+pub(crate) type TestFS = DefaultFS<TestPlatform>;
+
+pub(crate) fn test_platform() -> &'static TestPlatform {
+    static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
+    PLATFORM.get_or_init(|| {
         #[cfg(target_os = "linux")]
-        let platform = crate::Platform::new(None);
+        let platform = TestPlatform::new(None);
 
-        #[cfg(not(target_os = "linux"))]
-        let platform = crate::Platform::new();
+        #[cfg(target_os = "windows")]
+        let platform = TestPlatform::new();
 
-        litebox_platform_multiplex::set_platform(platform);
-    });
+        platform
+    })
 }
 
-pub(crate) fn test_task() -> Task<DefaultFS> {
-    init_platform();
-    let platform = litebox_platform_multiplex::platform();
+pub(crate) fn test_task() -> Task<TestPlatform, TestFS> {
+    let platform = test_platform();
     let litebox = LiteBox::new(platform);
-    let page_manager = WindowsPageManager::new(&litebox);
+    let page_manager = WindowsPageManager::<TestPlatform>::new(&litebox);
     Task {
         global: Arc::new(GlobalState {
+            platform,
             registry: crate::syscalls::registry::RegistryStore::new(&litebox),
             litebox,
             page_manager,
@@ -38,7 +44,7 @@ pub(crate) fn test_task() -> Task<DefaultFS> {
         }),
         process: Arc::new(Process {
             ntdll_mapping: None,
-            handles: WindowsHandleStore::new(RawDescriptorStorage::new()),
+            handles: WindowsHandleStore::<TestPlatform>::new(RawDescriptorStorage::new()),
             exit_code: AtomicI32::new(0),
         }),
         entry_point: 0,

@@ -15,15 +15,18 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicI32, Ordering};
-use litebox::platform::RawConstPointer as _;
 use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
 use litebox::mm::PageManager;
+use litebox::platform::{
+    CrngProvider, PageManagementProvider, RawConstPointer as _, RawMutPointer as _,
+    RawPointerProvider, StdioProvider, SystemInfoProvider,
+};
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+use litebox::sync::RawSyncPrimitivesProvider;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
-use litebox_platform_multiplex::Platform;
 
 use crate::syscalls::SyscallRequest;
 
@@ -36,16 +39,34 @@ mod tests;
 
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 
-pub(crate) type ConstPtr<T> =
+/// A LiteBox platform with the services required by the Windows shim.
+pub trait ShimPlatform:
+    RawSyncPrimitivesProvider
+    + RawPointerProvider
+    + PageManagementProvider<PAGE_SIZE>
+    + SystemInfoProvider
+{
+}
+
+impl<T> ShimPlatform for T where
+    T: RawSyncPrimitivesProvider
+        + RawPointerProvider
+        + PageManagementProvider<PAGE_SIZE>
+        + SystemInfoProvider
+{
+}
+
+pub(crate) type ConstPtr<Platform, T> =
     <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
-pub(crate) type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
-pub(crate) type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
-pub(crate) type WindowsHandleStore =
+pub(crate) type MutPtr<Platform, T> =
+    <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
+pub(crate) type WindowsPageManager<Platform> = PageManager<Platform, PAGE_SIZE>;
+pub(crate) type WindowsHandleStore<Platform> =
     litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
 
-pub type DefaultFS = WindowsFS;
+pub type DefaultFS<Platform> = WindowsFS<Platform>;
 
-pub(crate) type WindowsFS = litebox::fs::layered::FileSystem<
+pub type WindowsFS<Platform> = litebox::fs::layered::FileSystem<
     Platform,
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::layered::FileSystem<
@@ -59,22 +80,22 @@ pub(crate) type WindowsFS = litebox::fs::layered::FileSystem<
 pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
 impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
-fn write_value<T>(address: usize, value: T) -> Option<()>
+fn write_value<Platform, T>(address: usize, value: T) -> Option<()>
 where
+    Platform: RawPointerProvider,
     T: zerocopy::FromBytes + zerocopy::IntoBytes,
 {
-    use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
     let ptr = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<T>::from_usize(
         address,
     );
     ptr.write_at_offset(0, value)
 }
 
-fn write_slice<T>(address: usize, values: &[T]) -> Option<()>
+fn write_slice<Platform, T>(address: usize, values: &[T]) -> Option<()>
 where
+    Platform: RawPointerProvider,
     T: Copy + zerocopy::FromBytes + zerocopy::IntoBytes,
 {
-    use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
     let ptr = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<T>::from_usize(
         address,
     );
@@ -84,11 +105,14 @@ where
     Some(())
 }
 
-pub(crate) fn insert_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
+pub(crate) fn insert_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
-    handles: &WindowsHandleStore,
+    handles: &WindowsHandleStore<Platform>,
     typed: litebox::fd::TypedFd<Subsystem>,
-) -> Result<syscalls::Handle, NtStatus> {
+) -> Result<syscalls::Handle, NtStatus>
+where
+    Platform: RawSyncPrimitivesProvider,
+{
     let mut handles = handles.write();
     let raw_fd = handles.fd_into_raw_integer(typed);
     let Some(handle) = syscalls::Handle::from_raw_fd(raw_fd) else {
@@ -102,11 +126,14 @@ pub(crate) fn insert_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
     Ok(handle)
 }
 
-pub(crate) fn raw_handle_entry<Subsystem: litebox::fd::FdEnabledSubsystem>(
+pub(crate) fn raw_handle_entry<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
-    handles: &WindowsHandleStore,
+    handles: &WindowsHandleStore<Platform>,
     handle: syscalls::Handle,
-) -> Option<litebox::fd::EntryHandle<Platform, Subsystem>> {
+) -> Option<litebox::fd::EntryHandle<Platform, Subsystem>>
+where
+    Platform: RawSyncPrimitivesProvider,
+{
     let raw_fd = handle.raw_fd()?;
     let typed = {
         let handles = handles.read();
@@ -115,11 +142,13 @@ pub(crate) fn raw_handle_entry<Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox.descriptor_table().entry_handle(&typed)
 }
 
-pub(crate) fn remove_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
+pub(crate) fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
-    handles: &WindowsHandleStore,
+    handles: &WindowsHandleStore<Platform>,
     handle: syscalls::Handle,
-) {
+) where
+    Platform: RawSyncPrimitivesProvider,
+{
     let Some(raw_fd) = handle.raw_fd() else {
         return;
     };
@@ -133,21 +162,16 @@ pub(crate) fn remove_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
 }
 
 /// Builds a Windows NT shim instance.
-pub struct WindowsShimBuilder {
+pub struct WindowsShimBuilder<Platform: ShimPlatform> {
+    platform: &'static Platform,
     litebox: LiteBox<Platform>,
 }
 
-impl Default for WindowsShimBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WindowsShimBuilder {
+impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     #[must_use]
-    pub fn new() -> Self {
-        let platform = litebox_platform_multiplex::platform();
+    pub fn new(platform: &'static Platform) -> Self {
         Self {
+            platform,
             litebox: LiteBox::new(platform),
         }
     }
@@ -163,13 +187,17 @@ impl WindowsShimBuilder {
         &self,
         in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
         tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
-    ) -> DefaultFS {
+    ) -> DefaultFS<Platform>
+    where
+        Platform: CrngProvider + StdioProvider,
+    {
         default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
     }
 
     #[must_use]
-    pub fn build<FS: ShimFS>(self) -> WindowsShim<FS> {
+    pub fn build<FS: ShimFS>(self) -> WindowsShim<Platform, FS> {
         let global = Arc::new(GlobalState {
+            platform: self.platform,
             page_manager: PageManager::new(&self.litebox),
             registry: syscalls::registry::RegistryStore::new(&self.litebox),
             litebox: self.litebox,
@@ -179,9 +207,9 @@ impl WindowsShimBuilder {
     }
 }
 
-pub struct WindowsShim<FS: ShimFS>(Arc<GlobalState<FS>>);
+pub struct WindowsShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platform, FS>>);
 
-impl<FS: ShimFS> WindowsShim<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
     /// Loads the program at `path` as the shim's initial task.
     ///
     /// TODO: PEB/TEB setup and initial handle table state are not yet implemented.
@@ -191,11 +219,12 @@ impl<FS: ShimFS> WindowsShim<FS> {
         path: &str,
         _argv: Vec<alloc::ffi::CString>,
         _envp: Vec<alloc::ffi::CString>,
-    ) -> Result<LoadedProgram<FS>, loader::WindowsLoadError> {
-        let load_info = loader::PeLoader::new(fs, &self.0.page_manager).load(path)?;
+    ) -> Result<LoadedProgram<Platform, FS>, loader::WindowsLoadError> {
+        let load_info =
+            loader::PeLoader::new(self.0.platform, fs, &self.0.page_manager).load(path)?;
         let process = Arc::new(Process {
             ntdll_mapping: load_info.ntdll_mapping,
-            handles: WindowsHandleStore::new(litebox::fd::RawDescriptorStorage::new()),
+            handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
         });
         Ok(LoadedProgram {
@@ -215,21 +244,22 @@ impl<FS: ShimFS> WindowsShim<FS> {
 }
 
 /// Global shim state shared by all Windows tasks loaded by this shim.
-struct GlobalState<FS: ShimFS> {
-    page_manager: WindowsPageManager,
-    registry: syscalls::registry::RegistryStore,
+struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
+    platform: &'static Platform,
+    page_manager: WindowsPageManager<Platform>,
+    registry: syscalls::registry::RegistryStore<Platform>,
     litebox: LiteBox<Platform>,
     _fs: PhantomData<FS>,
 }
 
 /// Per-process Windows state shared by every thread in the process.
-pub struct Process {
+pub struct Process<Platform: RawSyncPrimitivesProvider> {
     ntdll_mapping: Option<MappingInfo>,
-    handles: WindowsHandleStore,
+    handles: WindowsHandleStore<Platform>,
     exit_code: AtomicI32,
 }
 
-impl Process {
+impl<Platform: RawSyncPrimitivesProvider> Process<Platform> {
     /// Wait for the process to exit, returning its exit code.
     ///
     /// Currently a placeholder that returns a fixed exit code immediately.
@@ -241,15 +271,15 @@ impl Process {
     }
 }
 
-struct Task<FS: ShimFS> {
-    global: Arc<GlobalState<FS>>,
-    process: Arc<Process>,
+struct Task<Platform: ShimPlatform, FS: ShimFS> {
+    global: Arc<GlobalState<Platform, FS>>,
+    process: Arc<Process<Platform>>,
     entry_point: usize,
     stack_top: usize,
     _phantom: PhantomData<FS>,
 }
 
-impl<FS: ShimFS> Task<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn init(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         ctx.rip = self.entry_point;
         let stack_top_alignment = self.stack_top % 16;
@@ -283,8 +313,8 @@ impl<FS: ShimFS> Task<FS> {
             return ContinueOperation::Terminate;
         };
         litebox_util_log::debug!(
-            syscall:? = req;
-            "Handling Windows"
+            syscall:? = NtSysno::from_raw(ctx.orig_rax);
+            "Handling Windows syscall"
         );
         let (result, op) = match req {
             SyscallRequest::NtOpenKey {
@@ -366,12 +396,12 @@ impl<FS: ShimFS> Task<FS> {
 }
 
 /// The shim entrypoint object passed to the platform.
-pub struct WindowsShimEntrypoints<FS: ShimFS> {
-    task: Task<FS>,
+pub struct WindowsShimEntrypoints<Platform: ShimPlatform, FS: ShimFS> {
+    task: Task<Platform, FS>,
     _not_send: PhantomData<*const ()>,
 }
 
-impl<FS: ShimFS> EnterShim for WindowsShimEntrypoints<FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> EnterShim for WindowsShimEntrypoints<Platform, FS> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -403,25 +433,28 @@ impl<FS: ShimFS> EnterShim for WindowsShimEntrypoints<FS> {
 }
 
 /// A loaded Windows program and the process handle used to wait for it.
-pub struct LoadedProgram<FS: ShimFS> {
+pub struct LoadedProgram<Platform: ShimPlatform, FS: ShimFS> {
     /// The initial-thread entrypoint state passed to the platform's `run_thread`.
-    pub entrypoints: WindowsShimEntrypoints<FS>,
+    pub entrypoints: WindowsShimEntrypoints<Platform, FS>,
     /// Handle used to wait for the loaded program to exit.
-    pub process: Arc<Process>,
+    pub process: Arc<Process<Platform>>,
 }
 
-fn default_fs(
+fn default_fs<Platform>(
     litebox: &LiteBox<Platform>,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,
-) -> WindowsFS {
-    let dev_stdio = litebox::fs::devices::FileSystem::new(litebox);
+) -> WindowsFS<Platform>
+where
+    Platform: ShimPlatform + CrngProvider + StdioProvider,
+{
+    let devices = litebox::fs::devices::FileSystem::new(litebox);
     litebox::fs::layered::FileSystem::new(
         litebox,
         in_mem_fs,
         litebox::fs::layered::FileSystem::new(
             litebox,
-            dev_stdio,
+            devices,
             tar_ro_fs,
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         ),
