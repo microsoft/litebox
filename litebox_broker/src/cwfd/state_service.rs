@@ -2153,7 +2153,8 @@ fn handle_inet_listener_bind(
         Some(port) if port != 0 => registry.is_inbound_forwarded(port),
         _ => false,
     };
-    if let Some(port) = requested_port
+    if use_virtual
+        && let Some(port) = requested_port
         && port != 0
         && registry.has_broker_held_inet_listener(
             port,
@@ -2183,13 +2184,14 @@ fn handle_inet_listener_bind(
                     return status_err(Opcode::InetListenerBindResponse, StatusCode::Internal);
                 }
             };
-            if registry
-                .register_broker_held_inet_listener(
-                    actual_addr.port(),
-                    state.family(),
-                    StateHandle::from_id(handle_id),
-                )
-                .is_err()
+            if use_virtual
+                && registry
+                    .register_broker_held_inet_listener(
+                        actual_addr.port(),
+                        state.family(),
+                        StateHandle::from_id(handle_id),
+                    )
+                    .is_err()
             {
                 return status_err(Opcode::InetListenerBindResponse, StatusCode::InvalidValue);
             }
