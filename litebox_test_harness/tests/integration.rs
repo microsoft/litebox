@@ -906,6 +906,15 @@ mod cleanup {
             if let Some(sig) = signals.forever().next() {
                 eprintln!("[cleanup] received signal {sig}; reaping");
                 reap_all();
+                // Finalize the dashboard run row so pass_count /
+                // fail_count get stamped before we exit. Without
+                // this, supervisor-induced timeouts (cycle exceeds
+                // wall budget → SIGTERM) leave runs marked OPEN
+                // forever (finished_ts_ms IS NULL), even though
+                // thousands of result rows landed. The fields are
+                // computed from existing run_results so the call
+                // is safe + idempotent.
+                crate::dashboard_store::finalize();
                 // Also deregister our cross-session lease so peers
                 // see the live count drop immediately (rather than
                 // waiting for STALE_THRESHOLD_MS to prune us).
