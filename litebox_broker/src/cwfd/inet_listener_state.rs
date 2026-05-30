@@ -91,6 +91,11 @@ impl InetListenerState {
             .expect("InetListenerState bound_addr poisoned")
     }
 
+    pub fn getsockname(&self) -> Result<[u8; SOCKADDR_WIRE_LEN], InetListenerError> {
+        let addr = self.bound_addr().ok_or(InetListenerError::NotBound)?;
+        encode_sockaddr(addr)
+    }
+
     pub fn bind(
         &self,
         sockaddr: &[u8; SOCKADDR_WIRE_LEN],
@@ -162,13 +167,13 @@ impl InetListenerState {
             .try_into()
             .map_err(|_| InetListenerError::InvalidSockaddr)?;
         ensure_supported_sockopt(level, optname)?;
-        if self
+        if let Some(listener) = self
             .listener
             .lock()
             .expect("InetListenerState listener poisoned")
-            .is_some()
+            .as_ref()
         {
-            return Err(InetListenerError::AlreadyBound);
+            apply_setsockopt(listener.as_raw_fd(), level, optname, optval)?;
         }
         upsert_pending_sockopt(
             &mut self
@@ -180,6 +185,41 @@ impl InetListenerState {
             optval,
         );
         Ok(())
+    }
+
+    pub fn getsockopt(
+        &self,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, InetListenerError> {
+        let level = level
+            .try_into()
+            .map_err(|_| InetListenerError::InvalidSockaddr)?;
+        let optname = optname
+            .try_into()
+            .map_err(|_| InetListenerError::InvalidSockaddr)?;
+        ensure_supported_sockopt(level, optname)?;
+        if let Some(listener) = self
+            .listener
+            .lock()
+            .expect("InetListenerState listener poisoned")
+            .as_ref()
+        {
+            return read_getsockopt(listener.as_raw_fd(), level, optname, optlen);
+        }
+        let pending = self
+            .pending_sockopts
+            .lock()
+            .expect("InetListenerState pending_sockopts poisoned");
+        let default = 0i32.to_ne_bytes();
+        let value = pending
+            .iter()
+            .find(|opt| opt.level == level && opt.optname == optname)
+            .map(|opt| opt.value.as_slice())
+            .unwrap_or(&default);
+        let len = usize::try_from(optlen).map_err(|_| InetListenerError::InvalidSockaddr)?;
+        Ok(value[..value.len().min(len)].to_vec())
     }
 
     pub fn listen(self: &Arc<Self>, _backlog: u32) -> Result<(), InetListenerError> {
@@ -198,12 +238,17 @@ impl InetListenerState {
         //     accept_tx/accept_rx channel pair so net_proxy can deliver
         //     streams via accept_inbound.
         let maybe_listener = {
-            self.listener
+            let guard = self
+                .listener
                 .lock()
-                .expect("InetListenerState listener poisoned")
-                .as_ref()
-                .map(|l| l.try_clone())
-                .transpose()?
+                .expect("InetListenerState listener poisoned");
+            if let Some(listener) = guard.as_ref() {
+                listen_on_socket(listener.as_raw_fd(), _backlog)?;
+                listener.set_nonblocking(true)?;
+                Some(listener.try_clone()?)
+            } else {
+                None
+            }
         };
         if maybe_listener.is_none() {
             // Verify a bound_addr exists (virtual bind path).
@@ -226,8 +271,6 @@ impl InetListenerState {
             .lock()
             .expect("InetListenerState accept_rx poisoned") = Some(rx);
         if let Some(listener) = maybe_listener {
-            listen_on_socket(listener.as_raw_fd(), _backlog)?;
-            listener.set_nonblocking(true)?;
             let weak = Arc::downgrade(self);
             let stop = Arc::clone(&self.stop_accept);
             let handle = thread::Builder::new()
@@ -285,7 +328,55 @@ impl InetListenerState {
         }
     }
 
+    fn drain_host_listener(&self) {
+        let listener = {
+            self.listener
+                .lock()
+                .expect("InetListenerState listener poisoned")
+                .as_ref()
+                .map(|listener| listener.try_clone())
+                .transpose()
+        };
+        let Ok(Some(listener)) = listener else {
+            return;
+        };
+        loop {
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    let _ = stream.set_nonblocking(true);
+                    let Some(tx) = self
+                        .accept_tx
+                        .lock()
+                        .expect("InetListenerState accept_tx poisoned")
+                        .as_ref()
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    match tx.try_send((stream, peer)) {
+                        Ok(()) => {
+                            self.queued_accepts.fetch_add(1, Ordering::AcqRel);
+                        }
+                        Err(channel::TrySendError::Full(_)) => return,
+                        Err(channel::TrySendError::Disconnected(_)) => {
+                            self.accept_error.store(true, Ordering::Release);
+                            return;
+                        }
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => return,
+                Err(_) => {
+                    self.accept_error.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn current_events(&self) -> u32 {
+        self.drain_host_listener();
         let mut events = 0;
         if self.queued_accepts.load(Ordering::Acquire) != 0 {
             events |= NOTIFY_EVENT_IN;
@@ -378,6 +469,9 @@ fn accept_loop(
                 thread::sleep(Duration::from_millis(10));
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                thread::sleep(Duration::from_millis(10));
+            }
             Err(_) => {
                 if let Some(state) = state.upgrade() {
                     state.accept_error.store(true, Ordering::Release);
@@ -400,10 +494,10 @@ fn bind_tcp_listener_socket(
     addr: SocketAddr,
     pending_sockopts: &[StoredSockOpt],
 ) -> Result<TcpListener, InetListenerError> {
-    let SocketAddr::V6(_) = addr else {
-        return Ok(TcpListener::bind(addr)?);
+    let domain = match addr {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
     };
-    let domain = libc::AF_INET6;
     // SAFETY: `socket` is called with constant domain/type/protocol arguments.
     let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -541,6 +635,35 @@ fn apply_setsockopt(
     } else {
         Err(std::io::Error::last_os_error().into())
     }
+}
+
+fn read_getsockopt(
+    fd: libc::c_int,
+    level: libc::c_int,
+    optname: libc::c_int,
+    optlen: u32,
+) -> Result<Vec<u8>, InetListenerError> {
+    let len = usize::try_from(optlen).map_err(|_| InetListenerError::InvalidSockaddr)?;
+    let mut buf = vec![0u8; len];
+    let mut raw_len: libc::socklen_t = len
+        .try_into()
+        .map_err(|_| InetListenerError::InvalidSockaddr)?;
+    // SAFETY: `fd` is a live socket; `buf` is valid for `raw_len` bytes; `raw_len` is writable.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            optname,
+            buf.as_mut_ptr().cast(),
+            &raw mut raw_len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let raw_len = usize::try_from(raw_len).map_err(|_| InetListenerError::InvalidSockaddr)?;
+    buf.truncate(raw_len.min(buf.len()));
+    Ok(buf)
 }
 
 pub fn family_from_u8(raw: u8) -> Result<AddressFamily, InetListenerError> {

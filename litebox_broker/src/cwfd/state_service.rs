@@ -21,7 +21,8 @@
 
 use crate::cwfd::inet_dgram_state::{InetDgramError, InetDgramState};
 use crate::cwfd::inet_listener_state::{
-    InetListenerError, InetListenerState, decode_sockaddr, encode_sockaddr, family_from_u8,
+    AddressFamily, InetListenerError, InetListenerState, decode_sockaddr, encode_sockaddr,
+    family_from_u8,
 };
 use crate::cwfd::inet_raw_state::{InetRawError, InetRawState};
 use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
@@ -50,7 +51,8 @@ use litebox_common_linux::fd_token_protocol::{
     build_create_signalfd_response_ok, build_create_socketpair_response_ok,
     build_deliver_signal_inbox_response_ok, build_error_response,
     build_inet_listener_accept_response_ok, build_inet_listener_bind_response_ok,
-    build_inet_listener_create_response_ok, build_inet_listener_listen_response_ok,
+    build_inet_listener_create_response_ok, build_inet_listener_getsockname_response_ok,
+    build_inet_listener_getsockopt_response_ok, build_inet_listener_listen_response_ok,
     build_inet_listener_query_events_response_ok, build_inet_raw_query_events_response_ok,
     build_inet_raw_recvfrom_response_ok, build_inet_raw_sendto_response_ok,
     build_inet_tcp_conn_getsockopt_response_ok, build_inet_tcp_conn_setsockopt_response_ok,
@@ -73,6 +75,7 @@ use litebox_common_linux::fd_token_protocol::{
     parse_create_pipe_body, parse_create_signalfd_body, parse_create_socketpair_body,
     parse_deliver_signal_inbox_body, parse_handle_body, parse_inet_listener_accept_body,
     parse_inet_listener_bind_body, parse_inet_listener_create_body,
+    parse_inet_listener_getsockname_body, parse_inet_listener_getsockopt_body,
     parse_inet_listener_listen_body, parse_inet_listener_query_events_body,
     parse_inet_raw_create_body, parse_inet_raw_query_events_body, parse_inet_raw_recvfrom_body,
     parse_inet_raw_sendto_body, parse_inet_tcp_conn_getsockopt_body,
@@ -224,6 +227,12 @@ pub fn handle_request(
         }
         Opcode::InetListenerSetSockOpt => {
             handle_inet_listener_setsockopt(registry, request, in_fds)
+        }
+        Opcode::InetListenerGetSockName => {
+            handle_inet_listener_getsockname(registry, request, in_fds)
+        }
+        Opcode::InetListenerGetSockOpt => {
+            handle_inet_listener_getsockopt(registry, request, in_fds)
         }
         Opcode::InetRawCreate => handle_inet_raw_create(registry, request, in_fds),
         Opcode::InetRawSendTo => handle_inet_raw_sendto(registry, request, in_fds),
@@ -1136,6 +1145,30 @@ fn handle_inet_tcp_conn_connect(
         Ok(state) => state,
         Err(status) => return status_err(response_opcode, status),
     };
+    if let Some(listener) = registry.resolve_broker_held_inet_listener(
+        target.port(),
+        match target {
+            std::net::SocketAddr::V4(_) => AddressFamily::V4,
+            std::net::SocketAddr::V6(_) => AddressFamily::V6,
+        },
+    ) {
+        match connect_to_broker_held_listener(&state, &listener) {
+            Ok(()) => {
+                return HandlerResult {
+                    frame: build_empty_response_ok(response_opcode),
+                    out_fd: None,
+                };
+            }
+            Err(TcpConnError::WouldBlock) => {
+                return status_err(response_opcode, StatusCode::WouldBlock);
+            }
+            Err(TcpConnError::PeerClosed | TcpConnError::Errno(_)) => {
+                return status_err(response_opcode, StatusCode::InvalidValue);
+            }
+            Err(TcpConnError::Io) => return status_err(response_opcode, StatusCode::Internal),
+        }
+    }
+
     match state.start_connect(target, Duration::from_millis(u64::from(timeout_ms))) {
         Ok(()) => HandlerResult {
             frame: build_empty_response_ok(response_opcode),
@@ -1146,6 +1179,36 @@ fn handle_inet_tcp_conn_connect(
             status_err(response_opcode, StatusCode::InvalidValue)
         }
         Err(TcpConnError::Io) => status_err(response_opcode, StatusCode::Internal),
+    }
+}
+
+fn connect_to_broker_held_listener(
+    state: &Arc<TcpConnState>,
+    listener: &Arc<InetListenerState>,
+) -> Result<(), TcpConnError> {
+    let pair_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .map_err(|_| TcpConnError::Io)?;
+    pair_listener
+        .set_nonblocking(false)
+        .map_err(|_| TcpConnError::Io)?;
+    let addr = pair_listener.local_addr().map_err(|_| TcpConnError::Io)?;
+    let client = std::net::TcpStream::connect(addr).map_err(|_| TcpConnError::Io)?;
+    let (server, peer) = pair_listener.accept().map_err(|_| TcpConnError::Io)?;
+    listener
+        .accept_inbound(server, peer)
+        .map_err(inet_listener_error_to_tcp_conn_error)?;
+    state.adopt_connected_stream(client)
+}
+
+fn inet_listener_error_to_tcp_conn_error(err: InetListenerError) -> TcpConnError {
+    match err {
+        InetListenerError::WouldBlock => TcpConnError::WouldBlock,
+        InetListenerError::Io(_) => TcpConnError::Io,
+        InetListenerError::InvalidFamily
+        | InetListenerError::InvalidSockaddr
+        | InetListenerError::AlreadyBound
+        | InetListenerError::NotBound
+        | InetListenerError::AlreadyListening => TcpConnError::Errno(libc::EINVAL),
     }
 }
 
@@ -1987,6 +2050,84 @@ fn handle_inet_listener_setsockopt(
     }
 }
 
+fn handle_inet_listener_getsockname(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetListenerGetSockNameResponse);
+    }
+    let handle_id = match parse_inet_listener_getsockname_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::InetListenerGetSockNameResponse),
+    };
+    let state =
+        match resolve_inet_listener(registry, handle_id, Opcode::InetListenerGetSockNameResponse) {
+            Ok(s) => s,
+            Err(r) => return r,
+        };
+    match state.getsockname() {
+        Ok(sockaddr) => HandlerResult {
+            frame: build_inet_listener_getsockname_response_ok(&sockaddr),
+            out_fd: None,
+        },
+        Err(InetListenerError::NotBound) => status_err(
+            Opcode::InetListenerGetSockNameResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(InetListenerError::InvalidFamily | InetListenerError::InvalidSockaddr) => status_err(
+            Opcode::InetListenerGetSockNameResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(InetListenerError::Io(_)) => status_err(
+            Opcode::InetListenerGetSockNameResponse,
+            StatusCode::Internal,
+        ),
+        Err(_) => status_err(
+            Opcode::InetListenerGetSockNameResponse,
+            StatusCode::InvalidValue,
+        ),
+    }
+}
+
+fn handle_inet_listener_getsockopt(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::InetListenerGetSockOptResponse);
+    }
+    let (handle_id, level, optname, optlen) =
+        match parse_inet_listener_getsockopt_body(request.body) {
+            Ok(parts) => parts,
+            Err(_) => return protocol_err(Opcode::InetListenerGetSockOptResponse),
+        };
+    let state =
+        match resolve_inet_listener(registry, handle_id, Opcode::InetListenerGetSockOptResponse) {
+            Ok(s) => s,
+            Err(r) => return r,
+        };
+    match state.getsockopt(level, optname, optlen) {
+        Ok(value) => HandlerResult {
+            frame: build_inet_listener_getsockopt_response_ok(&value),
+            out_fd: None,
+        },
+        Err(InetListenerError::InvalidFamily | InetListenerError::InvalidSockaddr) => status_err(
+            Opcode::InetListenerGetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+        Err(InetListenerError::Io(_)) => {
+            status_err(Opcode::InetListenerGetSockOptResponse, StatusCode::Internal)
+        }
+        Err(_) => status_err(
+            Opcode::InetListenerGetSockOptResponse,
+            StatusCode::InvalidValue,
+        ),
+    }
+}
+
 fn handle_inet_listener_bind(
     registry: &BrokerStateRegistry,
     request: &Frame<'_>,
@@ -2012,6 +2153,17 @@ fn handle_inet_listener_bind(
         Some(port) if port != 0 => registry.is_inbound_forwarded(port),
         _ => false,
     };
+    if use_virtual
+        && let Some(port) = requested_port
+        && port != 0
+        && registry.has_broker_held_inet_listener(
+            port,
+            state.family(),
+            StateHandle::from_id(handle_id),
+        )
+    {
+        return status_err(Opcode::InetListenerBindResponse, StatusCode::InvalidValue);
+    }
     let bind_result = if use_virtual {
         state.virtual_bind(&sockaddr)
     } else {
@@ -2032,15 +2184,16 @@ fn handle_inet_listener_bind(
                     return status_err(Opcode::InetListenerBindResponse, StatusCode::Internal);
                 }
             };
-            if registry
-                .register_broker_held_inet_listener(
-                    actual_addr.port(),
-                    state.family(),
-                    StateHandle::from_id(handle_id),
-                )
-                .is_err()
+            if use_virtual
+                && registry
+                    .register_broker_held_inet_listener(
+                        actual_addr.port(),
+                        state.family(),
+                        StateHandle::from_id(handle_id),
+                    )
+                    .is_err()
             {
-                return status_err(Opcode::InetListenerBindResponse, StatusCode::Internal);
+                return status_err(Opcode::InetListenerBindResponse, StatusCode::InvalidValue);
             }
             HandlerResult {
                 frame: build_inet_listener_bind_response_ok(&actual),

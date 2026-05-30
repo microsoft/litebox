@@ -143,6 +143,8 @@ pub enum Opcode {
     InetListenerAccept = 0x4B,
     InetListenerQueryEvents = 0x4C,
     InetListenerSetSockOpt = 0x4D,
+    InetListenerGetSockName = 0x4E,
+    InetListenerGetSockOpt = 0x4F,
     CreatePipe = 0x50,
     ReadPipe = 0x51,
     WritePipe = 0x52,
@@ -245,6 +247,8 @@ pub enum Opcode {
     InetListenerAcceptResponse = 0xCB,
     InetListenerQueryEventsResponse = 0xCC,
     InetListenerSetSockOptResponse = 0xCD,
+    InetListenerGetSockNameResponse = 0xCE,
+    InetListenerGetSockOptResponse = 0xCF,
     CreatePipeResponse = 0xD0,
     ReadPipeResponse = 0xD1,
     WritePipeResponse = 0xD2,
@@ -436,6 +440,8 @@ impl Opcode {
             Opcode::InetListenerAccept => Some(Opcode::InetListenerAcceptResponse),
             Opcode::InetListenerQueryEvents => Some(Opcode::InetListenerQueryEventsResponse),
             Opcode::InetListenerSetSockOpt => Some(Opcode::InetListenerSetSockOptResponse),
+            Opcode::InetListenerGetSockName => Some(Opcode::InetListenerGetSockNameResponse),
+            Opcode::InetListenerGetSockOpt => Some(Opcode::InetListenerGetSockOptResponse),
             Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
             Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
             Opcode::WritePipe => Some(Opcode::WritePipeResponse),
@@ -625,6 +631,8 @@ impl TryFrom<u8> for Opcode {
             0x4B => Ok(Opcode::InetListenerAccept),
             0x4C => Ok(Opcode::InetListenerQueryEvents),
             0x4D => Ok(Opcode::InetListenerSetSockOpt),
+            0x4E => Ok(Opcode::InetListenerGetSockName),
+            0x4F => Ok(Opcode::InetListenerGetSockOpt),
             0x50 => Ok(Opcode::CreatePipe),
             0x51 => Ok(Opcode::ReadPipe),
             0x52 => Ok(Opcode::WritePipe),
@@ -702,6 +710,8 @@ impl TryFrom<u8> for Opcode {
             0xCB => Ok(Opcode::InetListenerAcceptResponse),
             0xCC => Ok(Opcode::InetListenerQueryEventsResponse),
             0xCD => Ok(Opcode::InetListenerSetSockOptResponse),
+            0xCE => Ok(Opcode::InetListenerGetSockNameResponse),
+            0xCF => Ok(Opcode::InetListenerGetSockOptResponse),
             0xD0 => Ok(Opcode::CreatePipeResponse),
             0xD1 => Ok(Opcode::ReadPipeResponse),
             0xD2 => Ok(Opcode::WritePipeResponse),
@@ -2323,6 +2333,122 @@ pub fn build_inet_listener_setsockopt_response_ok() -> OwnedFrame {
         caller_pid: 0,
         body: Vec::new(),
     }
+}
+
+/// Body for [`Opcode::InetListenerGetSockName`]: handle id.
+pub fn build_inet_listener_getsockname_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetListenerGetSockName,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_inet_listener_getsockname_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::InetListenerGetSockName)
+}
+
+pub fn build_inet_listener_getsockname_response_ok(sockaddr: &[u8; 28]) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::InetListenerGetSockNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: sockaddr.to_vec(),
+    }
+}
+
+pub fn parse_inet_listener_getsockname_response_ok(body: &[u8]) -> Result<[u8; 28], ProtocolError> {
+    if body.len() != 28 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetListenerGetSockNameResponse,
+            got: body.len(),
+            want: 28,
+        });
+    }
+    let mut sockaddr = [0u8; 28];
+    sockaddr.copy_from_slice(body);
+    Ok(sockaddr)
+}
+
+/// Body for [`Opcode::InetListenerGetSockOpt`]: handle, level, optname, optlen.
+pub fn build_inet_listener_getsockopt_request(
+    handle_id: u64,
+    level: u32,
+    optname: u32,
+    optlen: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&level.to_le_bytes());
+    body.extend_from_slice(&optname.to_le_bytes());
+    body.extend_from_slice(&optlen.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::InetListenerGetSockOpt,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_listener_getsockopt_body(
+    body: &[u8],
+) -> Result<(u64, u32, u32, u32), ProtocolError> {
+    if body.len() != 24 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetListenerGetSockOpt,
+            got: body.len(),
+            want: 24,
+        });
+    }
+    let reserved = u32::from_le_bytes(body[20..24].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+        u32::from_le_bytes(body[12..16].try_into().unwrap()),
+        u32::from_le_bytes(body[16..20].try_into().unwrap()),
+    ))
+}
+
+pub fn build_inet_listener_getsockopt_response_ok(value: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + value.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(value);
+    OwnedFrame {
+        opcode: Opcode::InetListenerGetSockOptResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_inet_listener_getsockopt_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetListenerGetSockOptResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let reserved = u32::from_le_bytes(body[4..8].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::InetListenerGetSockOptResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
 }
 
 /// Body for [`Opcode::InetListenerQueryEvents`]: handle id.

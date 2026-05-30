@@ -577,7 +577,6 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             return Err(CreateProcessError::PidAlreadyExists);
         }
 
-        let is_fork_restore = parent.is_none() && pgid_sid_override.is_some();
         let (pgid, sid) = if let Some(parent_pid) = parent {
             let parent_entry = table
                 .get_mut(&parent_pid)
@@ -611,12 +610,13 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         let prev = table.insert(pid, entry);
         debug_assert!(prev.is_none(), "PID collision: {}", pid.0);
 
-        // Record root pid the first time a true root (parent-less AND
-        // no pgid_sid_override) is added. fork-restored workers have
-        // parent=None locally but their pgid/sid come from the parent
-        // worker's snapshot — they are NOT process-tree roots.
-        if parent.is_none() && !is_fork_restore {
-            self.root.store(pid.0, Ordering::Release);
+        // Record the first parent-less process as this registry's local root.
+        // Fork-restored workers inherit pgid/sid from a parent in another
+        // worker, but they are still the local root for this worker registry.
+        if parent.is_none() {
+            let _ = self
+                .root
+                .compare_exchange(0, pid.0, Ordering::AcqRel, Ordering::Acquire);
         }
 
         // Keep next_pid ahead of any externally-allocated pid so subsequent
@@ -1223,6 +1223,7 @@ mod tests {
         let (_platform, registry) = setup();
         let pid = registry.create_process(None, 0).unwrap();
         assert_eq!(pid, ProcessId::INIT);
+        assert_eq!(registry.root_pid(), Some(pid));
 
         registry
             .with_context(pid, |ctx| {
@@ -1234,6 +1235,28 @@ mod tests {
                 assert_eq!(ctx.state, ProcessState::Running);
             })
             .expect("init process should exist");
+    }
+
+    #[test]
+    fn test_create_fork_restore_root_with_inherited_pgrp() {
+        let (_platform, registry) = setup();
+        let pid = ProcessId(42);
+        let pgid = ProcessGroupId(7);
+        let sid = SessionId(3);
+
+        registry
+            .create_process_with_id_and_pgrp(pid, None, Some((pgid, sid)), 17)
+            .unwrap();
+
+        assert_eq!(registry.root_pid(), Some(pid));
+        registry
+            .with_context(pid, |ctx| {
+                assert_eq!(ctx.parent, None);
+                assert_eq!(ctx.pgid, pgid);
+                assert_eq!(ctx.sid, sid);
+                assert_eq!(ctx.exit_signal, 17);
+            })
+            .expect("fork-restored root should exist");
     }
 
     #[test]

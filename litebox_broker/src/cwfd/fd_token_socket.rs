@@ -1320,6 +1320,8 @@ fn handle_control_connection_inner(
                     | Opcode::InetListenerAccept
                     | Opcode::InetListenerQueryEvents
                     | Opcode::InetListenerSetSockOpt
+                    | Opcode::InetListenerGetSockName
+                    | Opcode::InetListenerGetSockOpt
                     | Opcode::InetRawCreate
                     | Opcode::InetRawSendTo
                     | Opcode::InetRawRecvFrom
