@@ -4,6 +4,18 @@ Status: **complete** — discovery-only inventory grounded in the VS Code
 remote server scenario. Eleven categories filled with citations into
 the litebox tree, the combined-trace summaries, and the audit docs.
 
+> **Update 2026-05-30 (Phase F.3 landed):** all references below to
+> `net_proxy/` smoltcp internals and `PortRouter` describe code that
+> has been DELETED. Inet sockets (TCP listener, outbound TCP, UDP,
+> raw) are now broker-held `StateObject`s under `cwfd/`; host-inbound
+> connections route through `BrokerHeldListenerRegistry`. The
+> `net_proxy/` directory now contains only post-F.3 survivors:
+> `inbound_forward.rs`, `lbnp_handshake.rs`, `lb9p_handshake.rs`,
+> `host_dns.rs`. The shim no longer constructs
+> `litebox::net::Network<Platform>` for linux_userland builds. See
+> `PHASE_F2_SCOPING.md` and `PHASE_F3_SCOPING.md` for the deletion
+> inventory.
+
 This document inventories every category of Linux state that litebox's
 multi-worker model has to share (or knowingly diverge from), grounded
 in the **VS Code remote server (VSCS)** workload.
