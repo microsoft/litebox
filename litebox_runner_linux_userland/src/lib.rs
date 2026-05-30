@@ -3265,7 +3265,9 @@ fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
     shim: &litebox_shim_linux::LinuxShim<FS>,
     shutdown: &std::sync::Arc<core::sync::atomic::AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    if !litebox_platform_multiplex::platform().has_network() {
+    if !litebox_shim_linux::WORKER_LOCAL_INET
+        || !litebox_platform_multiplex::platform().has_network()
+    {
         return None;
     }
     let shim = shim.clone();
