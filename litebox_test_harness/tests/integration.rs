@@ -848,6 +848,13 @@ mod cleanup {
         );
         // Bound parallelism to 8: each `docker rm -f` is a daemon RPC
         // and we don't want to amplify daemon load during shutdown.
+        // Respect LITEBOX_KEEP_CONTAINER: if set, skip the rm so the
+        // user can inspect containers post-mortem even after an
+        // unclean shutdown. Foreground SIGTERM is still sent so the
+        // docker-run host process can exit cleanly (which lets its
+        // container drain naturally; `--rm` was already absent at
+        // spawn time so the container survives in `docker ps -a`).
+        let keep_containers = std::env::var("LITEBOX_KEEP_CONTAINER").is_ok();
         let chunk = 8usize;
         for batch in snapshot.chunks(chunk) {
             let mut threads = Vec::with_capacity(batch.len());
@@ -856,12 +863,14 @@ mod cleanup {
                 let pid_alive = *pid_alive;
                 let name = name.clone();
                 threads.push(std::thread::spawn(move || {
-                    // 5 s timeout on the docker call via timeout(1).
-                    let _ = Command::new("timeout")
-                        .args(["5", "docker", "rm", "-f", &name])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
+                    if !keep_containers {
+                        // 5 s timeout on the docker call via timeout(1).
+                        let _ = Command::new("timeout")
+                            .args(["5", "docker", "rm", "-f", &name])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                    }
                     if pid_alive {
                         // SAFETY: pid came from std::process::Child::id()
                         // of a child we own; SIGTERM is the documented
@@ -1250,11 +1259,13 @@ fn spawn_drain(
                 "[drain] timeout after {} s; forcing teardown of {cname_for_watchdog}",
                 timeout.as_secs()
             );
-            let _ = Command::new("docker")
-                .args(["rm", "-f", &cname_for_watchdog])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            if !keep_containers() {
+                let _ = Command::new("docker")
+                    .args(["rm", "-f", &cname_for_watchdog])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
             // SAFETY: PID came from std::process::Child::id() of a child we
             // own; signal delivery is synchronous and side-effect-free
             // beyond what we want here.

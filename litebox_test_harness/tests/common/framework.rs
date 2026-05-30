@@ -206,12 +206,19 @@ fn query_published_ports(name: &str) -> HashMap<u16, u16> {
 /// Force-remove a container by name and deregister from cleanup.
 /// Idempotent. Caller invokes this for detached containers after
 /// `drive` returns, regardless of verdict.
+///
+/// Respects `LITEBOX_KEEP_CONTAINER`: if set, we deregister from
+/// the cleanup module's tracking (so SIGTERM-time reap doesn't
+/// later remove it either) but skip the `docker rm -f`. The
+/// container remains in `docker ps -a` for post-mortem inspection.
 fn tear_down_detached(name: &str) {
-    let _ = Command::new("timeout")
-        .args(["10", "docker", "rm", "-f", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    if std::env::var("LITEBOX_KEEP_CONTAINER").is_err() {
+        let _ = Command::new("timeout")
+            .args(["10", "docker", "rm", "-f", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     cleanup::deregister_docker_child(name);
 }
 
