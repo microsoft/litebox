@@ -105,6 +105,25 @@ impl TcpConnState {
         })
     }
 
+    pub fn adopt_connected_stream(self: &Arc<Self>, stream: TcpStream) -> Result<(), TcpConnError> {
+        let mut guard = self.inner.lock().expect("TcpConnState inner poisoned");
+        match &*guard {
+            TcpConnInner::Unconnected { .. } => {
+                let (connected, poll_stream) = TcpConnConnected::new(stream);
+                *guard = TcpConnInner::Connected(connected);
+                drop(guard);
+                if let Some(poll_stream) = poll_stream {
+                    Self::spawn_poll_thread(Arc::downgrade(self), poll_stream);
+                }
+                self.subject.notify(NOTIFY_EVENT_OUT);
+                Ok(())
+            }
+            TcpConnInner::Connecting { .. } | TcpConnInner::Connected(_) => {
+                Err(TcpConnError::Errno(libc::EISCONN))
+            }
+        }
+    }
+
     pub fn local_addr(&self) -> Option<SocketAddr> {
         match &*self.inner.lock().expect("TcpConnState inner poisoned") {
             TcpConnInner::Connected(connected) => connected.local_addr,

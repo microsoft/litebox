@@ -31,6 +31,7 @@ use crate::fd_token_protocol::{
     build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
     build_deliver_signal_inbox_request, build_inet_listener_accept_request,
     build_inet_listener_bind_request, build_inet_listener_create_request,
+    build_inet_listener_getsockname_request, build_inet_listener_getsockopt_request,
     build_inet_listener_listen_request, build_inet_listener_query_events_request,
     build_inet_listener_setsockopt_request, build_inet_raw_create_request,
     build_inet_raw_query_events_request, build_inet_raw_recvfrom_request,
@@ -54,7 +55,8 @@ use crate::fd_token_protocol::{
     parse_create_pidfd_response_ok, parse_create_pty_response_ok,
     parse_create_socketpair_response_body, parse_handle_body,
     parse_inet_listener_accept_response_ok, parse_inet_listener_bind_response_ok,
-    parse_inet_listener_create_response_ok, parse_inet_listener_query_events_response_ok,
+    parse_inet_listener_create_response_ok, parse_inet_listener_getsockname_response_ok,
+    parse_inet_listener_getsockopt_response_ok, parse_inet_listener_query_events_response_ok,
     parse_inet_raw_create_response_ok, parse_inet_raw_query_events_response_ok,
     parse_inet_raw_recvfrom_response_ok, parse_inet_raw_sendto_response_ok,
     parse_inet_tcp_conn_create_response_ok, parse_inet_tcp_conn_getpeername_response_ok,
@@ -1065,6 +1067,63 @@ impl FdTokenClient {
         }
         match resp.status {
             StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue {
+                value: optname as u64,
+            }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_listener_getsockname(&self, handle_id: u64) -> Result<[u8; 28], ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_listener_getsockname_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetListenerGetSockNameResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_inet_listener_getsockname_response_ok(resp.body)
+                .map_err(ClientError::Protocol),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            StatusCode::InvalidValue => Err(ClientError::InvalidValue { value: handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    pub fn inet_listener_getsockopt(
+        &self,
+        handle_id: u64,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_inet_listener_getsockopt_request(handle_id, level, optname, optlen),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::InetListenerGetSockOptResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_inet_listener_getsockopt_response_ok(resp.body).map_err(ClientError::Protocol)
+            }
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             StatusCode::InvalidValue => Err(ClientError::InvalidValue {
                 value: optname as u64,

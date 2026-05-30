@@ -4533,9 +4533,16 @@ impl<FS: ShimFS> Task<FS> {
         }) {
             return result;
         }
-        if let Some(result) =
-            self.try_with_broker_inet_listener(sockfd, |_typed| broker_getsockopt(optname))
-        {
+        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
+            let (level, raw_optname) = socket_option_raw(optname);
+            let handle = self.broker_inet_listener_handle(typed)?;
+            let value = handle.with_entry(|entry| entry.getsockopt(level, raw_optname, len))?;
+            let write_len = value.len().min(len as usize);
+            optval
+                .write_slice_at_offset(0, &value[..write_len])
+                .ok_or(Errno::EFAULT)?;
+            Ok(write_len)
+        }) {
             return result;
         }
         self.files.borrow().with_socket(
@@ -4609,12 +4616,9 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
             let handle = self.broker_inet_listener_handle(typed)?;
-            handle.with_entry(|entry| {
-                entry
-                    .bound_addr()
-                    .map(inet_listener_wire_to_socket_address)
-                    .unwrap_or_else(|| Ok(SocketAddress::default()))
-            })
+            handle
+                .with_entry(|entry| entry.getsockname())
+                .and_then(inet_listener_wire_to_socket_address)
         }) {
             return result;
         }
