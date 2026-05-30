@@ -90,7 +90,8 @@ pub trait Backend: private::Sealed + Send + Sync + 'static {
     /// Read at `offset` into `buf`, returning the number of bytes read.
     ///
     /// Backends do not have an internal notion of offsets; instead the resolver maintains offsets
-    /// as needed. For special files (e.g., `stdin`), the offset parameter may be ignored.
+    /// as needed. For files with non-position-based [`SeekBehavior`], such as `stdin`, the resolver
+    /// passes zero and the backend should ignore the offset.
     fn read(&self, h: &Self::FileHandle, buf: &mut [u8], offset: usize)
     -> Result<usize, ReadError>;
 

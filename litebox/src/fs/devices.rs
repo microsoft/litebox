@@ -291,22 +291,17 @@ where
         &self,
         h: &Self::FileHandle,
         buf: &mut [u8],
-        offset: usize,
+        _offset: usize,
     ) -> Result<usize, ReadError> {
         match h.device {
-            Device::Stdin => {
-                if offset != 0 {
-                    // XXX: Need to update ReadError to say "invalid offset" or something.
-                    unimplemented!()
-                }
-                self.litebox
-                    .x
-                    .platform
-                    .read_from_stdin(buf)
-                    .map_err(|e| match e {
-                        crate::platform::StdioReadError::Closed => ReadError::Io,
-                    })
-            }
+            Device::Stdin => self
+                .litebox
+                .x
+                .platform
+                .read_from_stdin(buf)
+                .map_err(|e| match e {
+                    crate::platform::StdioReadError::Closed => ReadError::Io,
+                }),
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => {
                 // /dev/null read returns EOF
@@ -319,7 +314,7 @@ where
         }
     }
 
-    fn write(&self, h: &Self::FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(&self, h: &Self::FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
         let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout => crate::platform::StdioOutStream::Stdout,
@@ -336,10 +331,6 @@ where
                 return Ok(buf.len());
             }
         };
-        if offset != 0 {
-            // XXX: Need to update WriteError to say "invalid offset" or something.
-            unimplemented!()
-        }
         self.litebox
             .x
             .platform
