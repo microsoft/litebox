@@ -945,15 +945,33 @@ async fn drive_rendezvous(
 /// Check whether a Test matches the --filter argument.
 /// Matches by suite, suite.group, or test ID prefix. The filter may be
 /// a comma-separated list of parts; the test matches if **any** part
-/// matches by suite, suite.group, or test ID prefix.
-fn matches_test(filter: Option<&str>, test: &Test) -> bool {
+/// matches by suite, suite.group, or test ID prefix. When a part is
+/// itself a complete registered test ID, keep the match exact so IDs
+/// like `...dpg1` do not also select `...dpg1_dpg1` and `...dpg1_dpg2`.
+fn matches_test(
+    filter: Option<&str>,
+    test: &Test,
+    exact_test_ids: &std::collections::HashSet<String>,
+) -> bool {
+    matches_test_parts(filter, test.suite, test.group, &test.id, exact_test_ids)
+}
+
+fn matches_test_parts(
+    filter: Option<&str>,
+    suite: &'static str,
+    group: &'static str,
+    test_id: &str,
+    exact_test_ids: &std::collections::HashSet<String>,
+) -> bool {
     match filter {
         None => true,
         Some(f) => f.split(',').any(|part| {
-            // Try suite or suite.group exact match for this part.
-            matches_filter(Some(part), test.suite, test.group)
-                // Fall back to test ID prefix match for this part.
-                || test.id.starts_with(part)
+            matches_filter(Some(part), suite, group)
+                || if exact_test_ids.contains(part) {
+                    test_id == part
+                } else {
+                    test_id.starts_with(part)
+                }
         }),
     }
 }
@@ -1072,9 +1090,11 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     }
     eprintln!("TEST_IDS_END {}", new_tests.len());
 
+    let exact_test_ids: std::collections::HashSet<String> =
+        new_tests.iter().map(|t| t.id.clone()).collect();
     let new_filtered: Vec<Test> = new_tests
         .into_iter()
-        .filter(|t| matches_test(filter, t))
+        .filter(|t| matches_test(filter, t, &exact_test_ids))
         .collect();
 
     if !new_filtered.is_empty() {
@@ -1337,6 +1357,7 @@ pub(crate) async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
                     ..
                 } => break Some(*t),
                 Command::Spawn { .. } | Command::SpawnRemote { .. } => break Some(60),
+                Command::Run { timeout_secs, .. } => break *timeout_secs,
                 _ => break None,
             }
         }
@@ -1412,6 +1433,39 @@ mod tests {
             spawned_agents: std::collections::HashSet::new(),
             declared_union: std::collections::HashSet::new(),
         }
+    }
+
+    #[test]
+    fn complete_test_id_filter_is_exact() {
+        let exact_ids = [
+            "RL.parent_exits_first.pipe.pie-glibc.pie-glibc.dpg1".to_string(),
+            "RL.parent_exits_first.pipe.pie-glibc.pie-glibc.dpg1_dpg1".to_string(),
+            "RL.parent_exits_first.pipe.pie-glibc.pie-glibc.dpg1_dpg2".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(matches_test_parts(
+            Some("RL.parent_exits_first.pipe.pie-glibc.pie-glibc.dpg1"),
+            "resource_lifetime",
+            "rl",
+            "RL.parent_exits_first.pipe.pie-glibc.pie-glibc.dpg1",
+            &exact_ids,
+        ));
+        assert!(!matches_test_parts(
+            Some("RL.parent_exits_first.pipe.pie-glibc.pie-glibc.dpg1"),
+            "resource_lifetime",
+            "rl",
+            "RL.parent_exits_first.pipe.pie-glibc.pie-glibc.dpg1_dpg1",
+            &exact_ids,
+        ));
+        assert!(matches_test_parts(
+            Some("RL.parent_exits_first.pipe."),
+            "resource_lifetime",
+            "rl",
+            "RL.parent_exits_first.pipe.pie-glibc.pie-glibc.dpg1_dpg1",
+            &exact_ids,
+        ));
     }
 
     #[tokio::test]

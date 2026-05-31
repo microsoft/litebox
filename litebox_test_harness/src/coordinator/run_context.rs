@@ -171,6 +171,7 @@ impl<'a> RunContext<'a> {
         let cmd = Command::Run {
             handler: handler.to_string(),
             args,
+            timeout_secs: None,
         };
         match self.send(handle, cmd).await {
             Response::Result {
@@ -284,6 +285,7 @@ impl<'a> RunContext<'a> {
             Command::Run {
                 handler: token.name().to_string(),
                 args: args_value,
+                timeout_secs: None,
             },
             true,
         )
@@ -388,6 +390,20 @@ impl<'a> RunContext<'a> {
         A: serde::Serialize,
         O: serde::de::DeserializeOwned,
     {
+        self.run_leaf_with_timeout(leaf, token, args, None).await
+    }
+
+    pub async fn run_leaf_with_timeout<A, O>(
+        &mut self,
+        leaf: &EphemeralHandle,
+        token: &crate::handlers::HandlerToken<A, O>,
+        args: A,
+        timeout_secs: Option<u64>,
+    ) -> Result<O, String>
+    where
+        A: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
         // Step 1: fork+exec the leaf agent under its declared parent.
         let spawn_resp = self.spawn_ephemeral(leaf).await;
         if !matches!(&spawn_resp, Response::Ok { .. }) {
@@ -405,6 +421,7 @@ impl<'a> RunContext<'a> {
                 Command::Run {
                     handler: token.name().to_string(),
                     args: args_value,
+                    timeout_secs,
                 },
             )
             .await;
@@ -465,6 +482,7 @@ impl<'a> RunContext<'a> {
         let cmd = Command::Run {
             handler: handler.to_string(),
             args,
+            timeout_secs: None,
         };
         self.write_routed(handle, cmd).await?;
         self.in_flight_directs.insert(direct.to_string());

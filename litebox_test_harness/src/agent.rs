@@ -289,7 +289,11 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
-            Command::Run { handler, args } => {
+            Command::Run {
+                handler,
+                args,
+                timeout_secs: _,
+            } => {
                 let resp = litebox_test_harness::handlers::dispatch_run(
                     &handler,
                     args,
@@ -812,8 +816,33 @@ async fn send_to_child(child: &mut ChildHandle, cmd: &Command) -> Response {
     }
     let _ = child.stdin.flush().await;
 
+    let response_timeout = {
+        let mut current = cmd;
+        loop {
+            match current {
+                Command::Forward { inner, .. } => current = inner,
+                Command::Exec {
+                    timeout_secs: Some(timeout),
+                    ..
+                }
+                | Command::ExecReady {
+                    timeout_secs: Some(timeout),
+                    ..
+                }
+                | Command::Run {
+                    timeout_secs: Some(timeout),
+                    ..
+                } => break Duration::from_secs(timeout + 5),
+                Command::Spawn { .. } | Command::SpawnRemote { .. } => {
+                    break Duration::from_secs(65);
+                }
+                _ => break Duration::from_secs(60),
+            }
+        }
+    };
+
     let mut line = String::new();
-    match tokio::time::timeout(Duration::from_secs(60), child.stdout.read_line(&mut line)).await {
+    match tokio::time::timeout(response_timeout, child.stdout.read_line(&mut line)).await {
         Ok(Ok(n)) if n > 0 => match serde_json::from_str(line.trim()) {
             Ok(resp) => resp,
             Err(e) => Response::Error {

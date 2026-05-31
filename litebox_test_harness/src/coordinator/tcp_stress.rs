@@ -741,6 +741,7 @@ where
             Command::Run {
                 handler: token.name().to_string(),
                 args,
+                timeout_secs: None,
             },
         )
         .await
