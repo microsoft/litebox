@@ -384,6 +384,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "/usr/bin/cat",
                         "/usr/bin/echo",
                         "/usr/bin/grep",
+                        "/usr/bin/tr",
                         "/usr/bin/true",
                         "/usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.11.2",
                         "/usr/lib/x86_64-linux-gnu/libtinfo.so.6.4",
