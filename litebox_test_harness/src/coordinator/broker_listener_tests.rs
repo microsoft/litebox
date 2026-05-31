@@ -793,7 +793,18 @@ async fn handle_dns_resolve(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<DnsO
             "api.github.com DNS probe failed: {raw_dns}; resolv.conf={resolv_conf:?}"
         )));
     }
-    let remote_addrs = vec![raw_dns];
+    let mut remote_addrs = vec![raw_dns];
+    let getaddrinfo_addrs: Vec<String> = ("api.github.com", 443)
+        .to_socket_addrs()
+        .map_err(|e| HandlerError(format!("getaddrinfo api.github.com: {e}")))?
+        .map(|addr| addr.to_string())
+        .collect();
+    if getaddrinfo_addrs.is_empty() {
+        return Err(HandlerError(
+            "getaddrinfo api.github.com returned no addresses".into(),
+        ));
+    }
+    remote_addrs.push(format!("getaddrinfo={}", getaddrinfo_addrs.join(",")));
 
     let localhost_addrs: Vec<String> = ("localhost", 0)
         .to_socket_addrs()

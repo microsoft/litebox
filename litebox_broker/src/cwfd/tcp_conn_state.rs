@@ -613,6 +613,9 @@ fn ensure_supported_sockopt(
         | (libc::SOL_SOCKET, libc::SO_RCVTIMEO, _)
         | (libc::SOL_SOCKET, libc::SO_SNDTIMEO, _)
         | (libc::SOL_SOCKET, libc::SO_ERROR, true)
+        | (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, _)
+        | (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, _)
+        | (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, _)
         | (libc::IPPROTO_TCP, libc::TCP_NODELAY, _)
         | (libc::IPPROTO_IP, libc::IP_TTL, _)
         | (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, false) => Ok(()),

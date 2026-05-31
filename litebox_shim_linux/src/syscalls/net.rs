@@ -1724,7 +1724,7 @@ impl<FS: ShimFS> Task<FS> {
                             let mut status = OFlags::empty();
                             status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
                             let handle = provider
-                                .create(1)
+                                .create(0)
                                 .map_err(super::broker_backed::broker_err_to_errno)?;
                             let conn = crate::syscalls::broker_tcp_conn::BrokerTcpConnFd::<
                                 Platform,
@@ -2475,9 +2475,7 @@ impl<FS: ShimFS> Task<FS> {
         // (The old worker-local path also did this remap at line ~957;
         // duplicate here so broker paths benefit too.)
         let sockaddr = if let SocketAddress::Inet(SocketAddr::V4(v4)) = &sockaddr {
-            if v4.ip().is_unspecified()
-                || *v4.ip() == core::net::Ipv4Addr::new(10, 0, 0, 2)
-            {
+            if v4.ip().is_unspecified() || *v4.ip() == core::net::Ipv4Addr::new(10, 0, 0, 2) {
                 SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
                     core::net::Ipv4Addr::LOCALHOST,
                     v4.port(),
@@ -3568,6 +3566,20 @@ impl<FS: ShimFS> Task<FS> {
                     super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
                 );
             }
+            return ret;
+        }
+        if let Some(ret) = self.try_with_broker_inet_dgram(sockfd, |typed| {
+            if msg.msg_controllen != 0 {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let raw = match sock_addr.clone() {
+                Some(addr) => socket_address_to_inet_listener_wire(addr)?.to_vec(),
+                None => Vec::new(),
+            };
+            let buf = Self::copy_sendmsg_iovs(&iovs)?;
+            let handle = self.broker_inet_dgram_handle(typed)?;
+            handle.with_entry(|entry| entry.sendto(&self.wait_cx(), &raw, &buf))
+        }) {
             return ret;
         }
         let ret = self.files.borrow().with_socket(
