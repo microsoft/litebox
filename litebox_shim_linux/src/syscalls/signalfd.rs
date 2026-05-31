@@ -57,13 +57,14 @@ impl SignalfdFile {
         > = Arc::clone(&provider) as _;
         let mut status = OFlags::RDONLY;
         status.set(OFlags::NONBLOCK, nonblock);
+        let common =
+            super::broker_backed::BrokerBackedCommon::new(subscribable, handle, NOTIFY_EVENT_IN);
+        // Signalfd handles are also tracked by the broker connection; releasing from Drop can
+        // tear down inherited state while a fork/exec child still owns the descriptor.
+        common.disable_release_on_drop();
         Self {
             provider,
-            common: super::broker_backed::BrokerBackedCommon::new(
-                subscribable,
-                handle,
-                NOTIFY_EVENT_IN,
-            ),
+            common,
             mask,
             status: core::sync::atomic::AtomicU32::new(status.bits()),
             pollee: Arc::new(Pollee::new()),
@@ -128,10 +129,9 @@ impl SignalfdFile {
                 buf[..n].copy_from_slice(&payload[..n]);
                 return Ok(n);
             }
-            if self.get_status().contains(OFlags::NONBLOCK) {
-                return Err(Errno::EAGAIN);
-            }
-            core::hint::spin_loop();
+            // The broker side is queue-backed; without a queued siginfo there is
+            // nothing to block on locally.
+            return Err(Errno::EAGAIN);
         }
     }
 

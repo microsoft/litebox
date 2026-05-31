@@ -6874,6 +6874,15 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 })
                 .unwrap_or(0)
+            } else if class == FdClass::Signalfd {
+                rds.fd_from_raw_integer::<super::signalfd::SignalfdSubsystem>(raw_fd)
+                    .ok()
+                    .and_then(|typed| {
+                        dt.with_entry(&typed, |fd: &super::signalfd::SignalfdFile| {
+                            fd.get_status().bits()
+                        })
+                    })
+                    .unwrap_or(0)
             } else {
                 0
             };
