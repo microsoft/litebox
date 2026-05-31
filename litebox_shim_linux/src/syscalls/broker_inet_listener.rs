@@ -4,6 +4,7 @@
 //! Broker-backed TCP listener file support.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use litebox::{
@@ -138,6 +139,29 @@ impl BrokerInetListenerFd<Platform> {
             .map_err(broker_err_to_errno)
     }
 
+    pub(crate) fn getsockopt(
+        &self,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, litebox_common_linux::errno::Errno> {
+        self.provider
+            .getsockopt(self.handle(), level, optname, optlen)
+            .map_err(broker_err_to_errno)
+    }
+
+    pub(crate) fn getsockname(&self) -> Result<[u8; 28], litebox_common_linux::errno::Errno> {
+        if let Some(addr) = self.bound_addr() {
+            return Ok(addr);
+        }
+        let addr = self
+            .provider
+            .getsockname(self.handle())
+            .map_err(broker_err_to_errno)?;
+        self.set_bound_addr(addr);
+        Ok(addr)
+    }
+
     pub(crate) fn bind(
         &self,
         sockaddr: &[u8],
@@ -151,6 +175,7 @@ impl BrokerInetListenerFd<Platform> {
     }
 
     pub(crate) fn listen(&self, backlog: u32) -> Result<(), litebox_common_linux::errno::Errno> {
+        self.common.ensure_subscribed(&self.pollee);
         self.provider
             .listen(self.handle(), backlog)
             .map_err(broker_err_to_errno)

@@ -3,6 +3,8 @@
 
 //! Trait abstraction for broker-hosted TCP listener operations.
 
+use alloc::vec::Vec;
+
 use crate::cwfd::broker_subscribable::BrokerSubscribable;
 
 #[doc(inline)]
@@ -21,6 +23,18 @@ pub trait BrokerInetListenerProvider: BrokerSubscribable {
         optname: u32,
         optval: &[u8],
     ) -> Result<(), BrokerOpError>;
+
+    /// Reads a socket option from the broker-hosted listener.
+    fn getsockopt(
+        &self,
+        handle: u64,
+        level: u32,
+        optname: u32,
+        optlen: u32,
+    ) -> Result<Vec<u8>, BrokerOpError>;
+
+    /// Returns the broker-hosted listener's bound address.
+    fn getsockname(&self, handle: u64) -> Result<[u8; 28], BrokerOpError>;
 
     /// Binds a broker-hosted listener and returns the actual bound address.
     fn bind(&self, handle: u64, sockaddr: &[u8]) -> Result<[u8; 28], BrokerOpError>;

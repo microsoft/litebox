@@ -264,6 +264,14 @@ fn socket_option_raw(optname: SocketOptionName) -> (u32, u32) {
     }
 }
 
+fn passthrough_sockopt_value(level: u32, optname: u32) -> Option<u32> {
+    match SocketOptionName::try_from(level, optname)? {
+        SocketOptionName::Socket(SocketOption::SNDBUF | SocketOption::RCVBUF) => Some(64u32 * 1024),
+        SocketOptionName::TCP(TcpOption::NODELAY) => Some(1),
+        _ => None,
+    }
+}
+
 impl SocketAddress {
     pub(crate) fn inet(self) -> Option<SocketAddr> {
         // reason: unsupported variants intentionally share this fallback path.
@@ -290,6 +298,8 @@ pub(super) struct SocketOptions {
     pub(super) reuse_port: bool,
     pub(super) keep_alive: bool,
     pub(super) broadcast: bool,
+    pub(super) send_buffer_size: Option<u32>,
+    pub(super) recv_buffer_size: Option<u32>,
     /// Receiving timeout, None (default value) means no timeout
     pub(super) recv_timeout: Option<core::time::Duration>,
     /// Sending timeout, None (default value) means no timeout
@@ -440,7 +450,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                 SocketOption::REUSEADDR
                 | SocketOption::REUSEPORT
                 | SocketOption::BROADCAST
-                | SocketOption::KEEPALIVE => {
+                | SocketOption::KEEPALIVE
+                | SocketOption::SNDBUF
+                | SocketOption::RCVBUF => {
                     let val: u32 = super::read_from_user(optval, optlen)?;
                     set_option(sopt, SocketOptionValue::U32(val))
                 }
@@ -485,6 +497,12 @@ impl<FS: ShimFS> GlobalState<FS> {
                         if val == 0 {
                             todo!("disable SO_BROADCAST");
                         }
+                    }
+                    (SocketOption::SNDBUF, SocketOptionValue::U32(val)) => {
+                        opt.send_buffer_size = Some(linux_set_to_reported_socket_buffer_value(val));
+                    }
+                    (SocketOption::RCVBUF, SocketOptionValue::U32(val)) => {
+                        opt.recv_buffer_size = Some(linux_set_to_reported_socket_buffer_value(val));
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
@@ -547,14 +565,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                 | SocketOption::REUSEADDR
                 | SocketOption::REUSEPORT
                 | SocketOption::BROADCAST
-                | SocketOption::KEEPALIVE => unreachable!(),
-                // SO_RCVBUF / SO_SNDBUF are advisory hints on Linux (the kernel
-                // may clip to /proc/sys/net/core/{r,w}mem_max), and Node's TLS
-                // socket code treats EOPNOTSUPP as fatal in some paths
-                // (cascading to "fetch failed" / "uncaught exception"). Silently
-                // accept; we use a fixed buffer size internally, which is what
-                // getsockopt(2) will report. Same precedent as IP_TOS above.
-                SocketOption::RCVBUF | SocketOption::SNDBUF => return Ok(()),
+                | SocketOption::KEEPALIVE
+                | SocketOption::RCVBUF
+                | SocketOption::SNDBUF => unreachable!(),
                 // Socket does not support these options
                 SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
                     return Err(Errno::ENOPROTOOPT);
@@ -725,6 +738,16 @@ impl<FS: ShimFS> GlobalState<FS> {
                 SocketOption::REUSEPORT => SocketOptionValue::U32(u32::from(options.reuse_port)),
                 SocketOption::KEEPALIVE => SocketOptionValue::U32(u32::from(options.keep_alive)),
                 SocketOption::BROADCAST => SocketOptionValue::U32(u32::from(options.broadcast)),
+                SocketOption::SNDBUF => SocketOptionValue::U32(
+                    options
+                        .send_buffer_size
+                        .unwrap_or_else(|| litebox::net::SOCKET_BUFFER_SIZE.truncate()),
+                ),
+                SocketOption::RCVBUF => SocketOptionValue::U32(
+                    options
+                        .recv_buffer_size
+                        .unwrap_or_else(|| litebox::net::SOCKET_BUFFER_SIZE.truncate()),
+                ),
                 _ => unreachable!(),
             })
         }) {
@@ -747,7 +770,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                 | SocketOption::REUSEADDR
                 | SocketOption::REUSEPORT
                 | SocketOption::KEEPALIVE
-                | SocketOption::BROADCAST => {
+                | SocketOption::BROADCAST
+                | SocketOption::RCVBUF
+                | SocketOption::SNDBUF => {
                     unreachable!()
                 }
                 SocketOption::ERROR => {
@@ -2440,6 +2465,29 @@ impl<FS: ShimFS> Task<FS> {
         self.do_connect(fd, sockaddr)
     }
     pub(super) fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
+        // Linux treats connect(0.0.0.0:port) as connect(127.0.0.1:port).
+        // Similarly, connect to the guest's own virtual interface IP
+        // (10.0.0.2) should be treated as loopback so the broker-held
+        // TCP path reaches the broker's actual host listener bound on
+        // 0.0.0.0:port. Apply this remap up-front so both the broker-
+        // backed paths (BrokerTcpConn / BrokerInetListener) and the
+        // remaining worker-local fallback see the resolved address.
+        // (The old worker-local path also did this remap at line ~957;
+        // duplicate here so broker paths benefit too.)
+        let sockaddr = if let SocketAddress::Inet(SocketAddr::V4(v4)) = &sockaddr {
+            if v4.ip().is_unspecified()
+                || *v4.ip() == core::net::Ipv4Addr::new(10, 0, 0, 2)
+            {
+                SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+                    core::net::Ipv4Addr::LOCALHOST,
+                    v4.port(),
+                )))
+            } else {
+                sockaddr
+            }
+        } else {
+            sockaddr
+        };
         if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
             let raw = socket_address_to_inet_listener_wire(sockaddr.clone())?;
             let handle = self.broker_tcp_conn_handle(typed)?;
@@ -4324,6 +4372,10 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
+        if passthrough_sockopt_value(level, optname).is_some() {
+            let _val: u32 = super::read_from_user(optval, optlen)?;
+            return Ok(());
+        }
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
             if level == 41 {
                 return Errno::ENOPROTOOPT;
@@ -4381,6 +4433,13 @@ impl<FS: ShimFS> Task<FS> {
             return result;
         }
         if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            if matches!(
+                optname,
+                SocketOptionName::Socket(SocketOption::RCVBUF | SocketOption::SNDBUF)
+            ) {
+                let _val: u32 = super::read_from_user(optval, optlen)?;
+                return Ok(());
+            }
             let (level, raw_optname) = socket_option_raw(optname);
             let value = optval.to_owned_slice(optlen).ok_or(Errno::EFAULT)?;
             let handle = self.broker_tcp_conn_handle(typed)?;
@@ -4433,6 +4492,17 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
+        if let Some(value) = passthrough_sockopt_value(level, optname) {
+            let len = optlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
+            if len > i32::MAX as u32 {
+                return Err(Errno::EINVAL);
+            }
+            let new_len = super::write_to_user(value, optval, len)?;
+            optlen
+                .write_at_offset(0, new_len.truncate())
+                .ok_or(Errno::EFAULT)?;
+            return Ok(());
+        }
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
             log_unsupported!("getsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
@@ -4522,6 +4592,12 @@ impl<FS: ShimFS> Task<FS> {
             return result;
         }
         if let Some(result) = self.try_with_broker_tcp_conn(sockfd, |typed| {
+            if matches!(
+                optname,
+                SocketOptionName::Socket(SocketOption::RCVBUF | SocketOption::SNDBUF)
+            ) {
+                return super::write_to_user(64u32 * 1024, optval, len);
+            }
             let (level, raw_optname) = socket_option_raw(optname);
             let handle = self.broker_tcp_conn_handle(typed)?;
             let value = handle.with_entry(|entry| entry.getsockopt(level, raw_optname, len))?;
@@ -4533,9 +4609,16 @@ impl<FS: ShimFS> Task<FS> {
         }) {
             return result;
         }
-        if let Some(result) =
-            self.try_with_broker_inet_listener(sockfd, |_typed| broker_getsockopt(optname))
-        {
+        if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
+            let (level, raw_optname) = socket_option_raw(optname);
+            let handle = self.broker_inet_listener_handle(typed)?;
+            let value = handle.with_entry(|entry| entry.getsockopt(level, raw_optname, len))?;
+            let write_len = value.len().min(len as usize);
+            optval
+                .write_slice_at_offset(0, &value[..write_len])
+                .ok_or(Errno::EFAULT)?;
+            Ok(write_len)
+        }) {
             return result;
         }
         self.files.borrow().with_socket(
@@ -4609,12 +4692,9 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Some(result) = self.try_with_broker_inet_listener(sockfd, |typed| {
             let handle = self.broker_inet_listener_handle(typed)?;
-            handle.with_entry(|entry| {
-                entry
-                    .bound_addr()
-                    .map(inet_listener_wire_to_socket_address)
-                    .unwrap_or_else(|| Ok(SocketAddress::default()))
-            })
+            handle
+                .with_entry(|entry| entry.getsockname())
+                .and_then(inet_listener_wire_to_socket_address)
         }) {
             return result;
         }

@@ -632,6 +632,18 @@ impl BrokerStateRegistry {
         Ok(Self::insert_locked(&mut s, id, state))
     }
 
+    pub fn has_broker_held_inet_listener(
+        &self,
+        port: u16,
+        family: AddressFamily,
+        except: StateHandle,
+    ) -> bool {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        s.broker_held_inet_listeners
+            .get(&(port, family))
+            .is_some_and(|handle| *handle != except.0)
+    }
+
     pub fn register_broker_held_inet_listener(
         &self,
         port: u16,
@@ -639,6 +651,12 @@ impl BrokerStateRegistry {
         handle: StateHandle,
     ) -> Result<(), StateRegistryError> {
         let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        if s.broker_held_inet_listeners
+            .get(&(port, family))
+            .is_some_and(|registered| *registered != handle.0)
+        {
+            return Err(StateRegistryError::RefcountOverflow(handle));
+        }
         let entry = s
             .table
             .get(&handle.0)
@@ -1073,9 +1091,10 @@ mod tests {
         assert!(Arc::ptr_eq(&inbound, &v6));
 
         reg.release(h6).unwrap();
-        assert!(reg
-            .resolve_broker_held_inet_listener_for_inbound(22)
-            .is_none());
+        assert!(
+            reg.resolve_broker_held_inet_listener_for_inbound(22)
+                .is_none()
+        );
     }
 
     #[test]
