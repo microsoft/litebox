@@ -199,7 +199,15 @@ impl InetDgramState {
         encode_sockaddr(peer).map_err(|_| InetDgramError::InvalidSockaddr)
     }
 
-    pub fn setsockopt(&self, level: i32, name: i32, value: &[u8]) -> Result<(), InetDgramError> {
+    pub fn setsockopt(self: &Arc<Self>, level: i32, name: i32, value: &[u8]) -> Result<(), InetDgramError> {
+        // Real Linux: setsockopt works on an unbound socket (kernel just sets
+        // an option on the socket struct, lazy-creates if needed). Match that
+        // by ensuring the host socket exists before applying the option.
+        // glibc's DNS resolver calls setsockopt(SOL_IP, IP_RECVERR) immediately
+        // after socket() to enable extended error reporting; without this
+        // ensure_socket, the call returned NotBound→EINVAL and the resolver
+        // bailed before sending any DNS query.
+        self.ensure_socket()?;
         let socket = self.clone_socket()?;
         let optlen: libc::socklen_t = value
             .len()
