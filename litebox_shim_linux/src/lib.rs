@@ -3838,6 +3838,10 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::sched_setparam
                 // Resource limits.
                 | Sysno::setrlimit | Sysno::prlimit64
+                // Relative sleeps are safe in the delayed-fork window: they do
+                // not mutate the shared address space, and keeping the parent
+                // parked preserves vfork-style ordering until real work starts.
+                | Sysno::clock_nanosleep | Sysno::nanosleep
                 // No-ops (read-only queries).
                 | Sysno::getpid | Sysno::getppid | Sysno::gettid
                 | Sysno::getuid | Sysno::geteuid | Sysno::getgid | Sysno::getegid
@@ -5893,6 +5897,14 @@ mod tests {
         use ::syscalls::Sysno;
         assert_allowed(Sysno::setrlimit);
         assert_allowed(Sysno::prlimit64);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_relative_sleeps() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::clock_nanosleep);
+        assert_allowed(Sysno::nanosleep);
     }
 
     #[test]
