@@ -4340,6 +4340,7 @@ impl<FS: ShimFS> Task<FS> {
             &mut fc.fork_snapshot_pidfd_process_transit,
             &mut fc.fork_snapshot_fd_token_transit,
             true,
+            Self::delayed_fork_trigger_fd(ctx),
         );
         let memory = self.snapshot_memory(&mut reject);
 
@@ -6230,6 +6231,7 @@ impl<FS: ShimFS> Task<FS> {
             &mut _true_fork_pidfd_process_transit,
             &mut _true_fork_fd_token_transit,
             false,
+            None,
         );
         let memory = self.snapshot_memory(&mut reject);
 
@@ -6574,6 +6576,15 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    fn delayed_fork_trigger_fd(ctx: &litebox_common_linux::ExecutionContext) -> Option<usize> {
+        use ::syscalls::Sysno;
+
+        match Sysno::new(ctx.orig_rax) {
+            Some(Sysno::bind | Sysno::connect | Sysno::listen) => usize::try_from(ctx.rdi).ok(),
+            _ => None,
+        }
+    }
+
     /// Snapshot the FD table and populate the reject gate for unsupported types.
     ///
     /// In v1, only stdio fds (identified by matching their object ID against the
@@ -6586,6 +6597,7 @@ impl<FS: ShimFS> Task<FS> {
         pidfd_process_transit: &mut Vec<super::guest_pid::BrokerProcessExitWake>,
         fd_token_transit: &mut Vec<super::fork_snapshot::ForkSnapshotFdTokenTransit>,
         skip_cloexec: bool,
+        preserve_cloexec_fd: Option<usize>,
     ) -> super::fork_snapshot::FdTableSnapshot {
         use super::fork_snapshot::{
             BrokerFdTokenSnapshot, BrokerHandleKind, BrokerHandleSnapshot, FdClass,
@@ -6627,7 +6639,21 @@ impl<FS: ShimFS> Task<FS> {
                 .get(&raw_fd)
                 .copied()
                 .unwrap_or_else(FileDescriptorFlags::empty);
-            if skip_cloexec && fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
+            let preserve_cloexec_broker_pty = if skip_cloexec
+                && fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC)
+                && Some(raw_fd) != preserve_cloexec_fd
+            {
+                let rds = files.raw_descriptor_store.read();
+                rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
+                    .is_ok()
+            } else {
+                false
+            };
+            if skip_cloexec
+                && fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC)
+                && Some(raw_fd) != preserve_cloexec_fd
+                && !preserve_cloexec_broker_pty
+            {
                 continue;
             }
 
