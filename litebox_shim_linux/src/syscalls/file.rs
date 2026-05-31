@@ -2137,7 +2137,16 @@ impl<FS: ShimFS> Task<FS> {
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
-                    handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut buf.borrow_mut()))
+                    loop {
+                        match handle
+                            .with_entry(|entry| entry.read(&self.wait_cx(), &mut buf.borrow_mut()))
+                        {
+                            Err(Errno::EINTR) if self.pending_signals_all_ignored() => {
+                                self.drain_ignored_pending();
+                            }
+                            result => return result,
+                        }
+                    }
                 }
                 crate::RawFdRef::BrokerSocketPair(fd) => {
                     let handle = self
