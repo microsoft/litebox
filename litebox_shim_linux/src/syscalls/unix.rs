@@ -551,14 +551,23 @@ impl<FS: ShimFS> UnixListenStream<FS> {
         port
     }
 
-    /// Drain pending TCP connections from the internal TCP listener and push
-    /// them into the unix socket backlog as TCP-backed connected streams.
-    ///
-    /// Note: With the guest syscall path, TCP accept is handled in
-    /// `UnixStream::accept()` using `task.do_accept()`. This method is
-    /// retained for potential future use.
-    fn drain_tcp_to_backlog(&self) {
-        // TCP accept is now done via guest syscall path in UnixStream::accept().
+    fn check_io_events(&self) -> Events {
+        let mut events = self.backlog.check_io_events();
+        if let Some(handle) = &self.tcp_broker_listener {
+            let has_tcp_connection =
+                handle.with_entry(|entry| entry.check_io_events().contains(Events::IN));
+            if has_tcp_connection {
+                self.backlog
+                    .pending_tcp_connections
+                    .store(1, Ordering::Relaxed);
+                events |= Events::IN;
+            }
+        }
+        events
+    }
+
+    fn needs_host_poll(&self) -> bool {
+        self.tcp_broker_listener.is_some()
     }
 }
 
@@ -1646,8 +1655,15 @@ impl<FS: ShimFS> UnixStream<FS> {
     fn check_io_events(&self) -> Events {
         self.with_state_ref(|state| match state {
             UnixStreamState::Init(_) => Events::OUT | Events::HUP,
-            UnixStreamState::Listen(listen) => listen.backlog.check_io_events(),
+            UnixStreamState::Listen(listen) => listen.check_io_events(),
             UnixStreamState::Connected(conn) => conn.check_io_events(),
+        })
+    }
+
+    fn needs_host_poll(&self) -> bool {
+        self.with_state_ref(|state| match state {
+            UnixStreamState::Listen(listen) => listen.needs_host_poll(),
+            UnixStreamState::Init(_) | UnixStreamState::Connected(_) => false,
         })
     }
 }
@@ -2534,6 +2550,15 @@ impl<FS: ShimFS> UnixSocket<FS> {
     }
 
     super::common_functions_for_file_status!();
+}
+
+impl<FS: ShimFS> UnixSocket<FS> {
+    pub(crate) fn needs_host_poll(&self) -> bool {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.needs_host_poll(),
+            UnixSocketInner::Datagram(_) => false,
+        }
+    }
 }
 
 impl<FS: ShimFS> IOPollable for UnixSocket<FS> {

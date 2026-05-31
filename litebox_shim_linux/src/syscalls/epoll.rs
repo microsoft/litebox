@@ -361,7 +361,11 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(_) => false,
             EpollDescriptor::Pipe(_) => false,
-            EpollDescriptor::Unix(_) => false,
+            EpollDescriptor::Unix(fd) => global
+                .litebox
+                .descriptor_table()
+                .entry_handle(fd)
+                .is_some_and(|handle| handle.with_entry(super::unix::UnixSocket::needs_host_poll)),
         }
     }
 }
