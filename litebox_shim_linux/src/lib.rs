@@ -3808,10 +3808,12 @@ impl<FS: ShimFS> Task<FS> {
                 Sysno::execve | Sysno::execveat | Sysno::exit | Sysno::exit_group
                 // FD plumbing.  `read` is needed for nested $() — the
                 // outer subshell reads the inner capture pipe's output
-                // before writing it to its own stdout.
+                // before writing it to its own stdout. `socket` is safe to
+                // defer because later bind/connect migrates the child with
+                // the new descriptor preserved.
                 | Sysno::close | Sysno::close_range | Sysno::dup | Sysno::dup2 | Sysno::dup3
                 | Sysno::open | Sysno::openat | Sysno::openat2 | Sysno::pipe2 | Sysno::write
-                | Sysno::read
+                | Sysno::read | Sysno::socket
                 // A nested fork or wait is real post-fork shell work.  Commit
                 // delayed fork first so the parent shell can resume and service
                 // command-substitution pipes while the child shell runs.
