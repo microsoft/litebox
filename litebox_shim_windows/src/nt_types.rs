@@ -8,6 +8,33 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{ConstPtr, syscalls::Handle};
 
+bitflags::bitflags! {
+    /// Common Windows object-manager `ACCESS_MASK` rights shared by NT object types.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct AccessMask: u32 {
+        const DELETE = 0x0001_0000;
+        const READ_CONTROL = 0x0002_0000;
+        const WRITE_DAC = 0x0004_0000;
+        const WRITE_OWNER = 0x0008_0000;
+        const SYNCHRONIZE = 0x0010_0000;
+        const STANDARD_RIGHTS_READ = Self::READ_CONTROL.bits();
+        const STANDARD_RIGHTS_WRITE = Self::READ_CONTROL.bits();
+        const STANDARD_RIGHTS_EXECUTE = Self::READ_CONTROL.bits();
+        const STANDARD_RIGHTS_ALL = Self::DELETE.bits()
+            | Self::READ_CONTROL.bits()
+            | Self::WRITE_DAC.bits()
+            | Self::WRITE_OWNER.bits()
+            | Self::SYNCHRONIZE.bits();
+
+        const GENERIC_ALL = 0x1000_0000;
+        const GENERIC_EXECUTE = 0x2000_0000;
+        const GENERIC_WRITE = 0x4000_0000;
+        const GENERIC_READ = 0x8000_0000;
+
+        const _ = !0;
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable)]
 pub(crate) struct ObjectAttributes {

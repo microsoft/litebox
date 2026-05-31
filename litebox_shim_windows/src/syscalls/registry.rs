@@ -24,6 +24,7 @@
 //! This is only an implementation detail: syscall handlers must expose registry
 //! object semantics rather than file semantics.
 
+use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
 
 use alloc::string::String;
@@ -32,7 +33,7 @@ use alloc::vec::Vec;
 
 use int_enum::IntEnum;
 use litebox::LiteBox;
-use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
+use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadError, WriteError,
 };
@@ -47,25 +48,27 @@ use crate::{
     ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, raw_handle_entry, remove_raw_handle,
 };
 
-use crate::nt_types::{ObjectAttributes, UnicodeString, read_object_attributes};
-
-struct RegistryKeySubsystem;
-
-impl FdEnabledSubsystem for RegistryKeySubsystem {
-    type Entry = RegistryKeyObject;
-}
-
-impl FdEnabledSubsystemEntry for RegistryKeyObject {}
-
-struct RegistryKeyObject {
-    path: String,
-}
+use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
 
 type RegistryFileSystem<Platform> = litebox::fs::layered::FileSystem<
     Platform,
     litebox::fs::in_mem::FileSystem<Platform>,
     litebox::fs::tar_ro::FileSystem<Platform>,
 >;
+
+struct RegistryKeySubsystem<Platform>(PhantomData<fn(Platform)>);
+
+impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for RegistryKeySubsystem<Platform> {
+    type Entry = RegistryKeyObject<Platform>;
+}
+
+impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for RegistryKeyObject<Platform> {}
+
+struct RegistryKeyObject<Platform: crate::ShimPlatform> {
+    path: String,
+    fd: TypedFd<RegistryFileSystem<Platform>>,
+    granted_access: RegistryKeyAccess,
+}
 
 pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
     fs: RegistryFileSystem<Platform>,
@@ -83,6 +86,77 @@ const DEFAULT_ACP_VALUE: &[u8] = &[b'1', 0, b'2', 0, b'5', 0, b'2', 0, 0, 0];
 const DEFAULT_OEMCP_VALUE: &[u8] = &[b'4', 0, b'3', 0, b'7', 0, 0, 0];
 const DEFAULT_MACCP_VALUE: &[u8] = &[b'1', 0, b'0', 0, b'0', 0, b'0', 0, b'0', 0, 0, 0];
 const REGISTRY_VALUE_TYPE_SIZE: usize = size_of::<u32>();
+
+bitflags::bitflags! {
+    /// Registry key `ACCESS_MASK` rights accepted by `NtOpenKey`/`NtCreateKey`.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RegistryKeyAccess: u32 {
+        const QUERY_VALUE = 0x0001;
+        const SET_VALUE = 0x0002;
+        const CREATE_SUB_KEY = 0x0004;
+        const ENUMERATE_SUB_KEYS = 0x0008;
+        const NOTIFY = 0x0010;
+        const CREATE_LINK = 0x0020;
+
+        const READ = AccessMask::STANDARD_RIGHTS_READ.bits()
+            | Self::QUERY_VALUE.bits()
+            | Self::ENUMERATE_SUB_KEYS.bits()
+            | Self::NOTIFY.bits();
+        const WRITE = AccessMask::STANDARD_RIGHTS_WRITE.bits()
+            | Self::SET_VALUE.bits()
+            | Self::CREATE_SUB_KEY.bits();
+        const EXECUTE = Self::READ.bits();
+        const ALL_ACCESS = (AccessMask::STANDARD_RIGHTS_ALL.bits()
+            | Self::QUERY_VALUE.bits()
+            | Self::SET_VALUE.bits()
+            | Self::CREATE_SUB_KEY.bits()
+            | Self::ENUMERATE_SUB_KEYS.bits()
+            | Self::NOTIFY.bits()
+            | Self::CREATE_LINK.bits())
+            & !AccessMask::SYNCHRONIZE.bits();
+
+        const FS_READ_ACCESS = Self::QUERY_VALUE.bits()
+            | Self::ENUMERATE_SUB_KEYS.bits()
+            | Self::NOTIFY.bits()
+            | AccessMask::GENERIC_READ.bits()
+            | AccessMask::GENERIC_EXECUTE.bits()
+            | AccessMask::GENERIC_ALL.bits();
+        const FS_WRITE_ACCESS = Self::SET_VALUE.bits()
+            | Self::CREATE_SUB_KEY.bits()
+            | Self::CREATE_LINK.bits()
+            | AccessMask::DELETE.bits()
+            | AccessMask::WRITE_DAC.bits()
+            | AccessMask::WRITE_OWNER.bits()
+            | AccessMask::GENERIC_WRITE.bits()
+            | AccessMask::GENERIC_ALL.bits();
+
+        const _ = !0;
+    }
+}
+
+impl From<RegistryKeyAccess> for OFlags {
+    fn from(desired_access: RegistryKeyAccess) -> Self {
+        let wants_read = desired_access.intersects(RegistryKeyAccess::FS_READ_ACCESS);
+        let wants_write = desired_access.intersects(RegistryKeyAccess::FS_WRITE_ACCESS);
+
+        let access = match (wants_read, wants_write) {
+            (true, true) => OFlags::RDWR,
+            (false, true) => OFlags::WRONLY,
+            _ => OFlags::RDONLY,
+        };
+        access | OFlags::DIRECTORY
+    }
+}
+
+impl RegistryKeyAccess {
+    fn can_query_value(self) -> bool {
+        const QUERY_ACCESS_BITS: u32 = RegistryKeyAccess::QUERY_VALUE.bits()
+            | AccessMask::GENERIC_READ.bits()
+            | AccessMask::GENERIC_EXECUTE.bits()
+            | AccessMask::GENERIC_ALL.bits();
+        self.intersects(Self::from_bits_retain(QUERY_ACCESS_BITS))
+    }
+}
 
 /// System-defined `REG_*` value types stored in `KEY_VALUE_*_INFORMATION::Type`.
 #[repr(u32)]
@@ -220,20 +294,21 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         Self { fs }
     }
 
-    fn key_exists(&self, path: &str) -> Result<bool, NtStatus> {
-        match self.fs.file_status(path) {
-            Ok(status) => Ok(status.file_type == FileType::Directory),
-            Err(FileStatusError::PathError(
-                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-            )) => Ok(false),
-            Err(FileStatusError::PathError(error)) => {
-                Err(map_path_error(error, NtStatus::OBJECT_NAME_NOT_FOUND))
-            }
-            Err(_) => Err(NtStatus::UNSUCCESSFUL),
-        }
+    fn open_key(
+        &self,
+        path: &str,
+        desired_access: RegistryKeyAccess,
+    ) -> Result<TypedFd<RegistryFileSystem<Platform>>, NtStatus> {
+        self.fs
+            .open(path, desired_access.into(), Mode::empty())
+            .map_err(map_open_error)
     }
 
-    fn read_value(&self, key_path: &str, value_name: &str) -> Result<RegistryValue, NtStatus> {
+    fn read_value_at_path(
+        &self,
+        key_path: &str,
+        value_name: &str,
+    ) -> Result<RegistryValue, NtStatus> {
         let value_path = value_path(key_path, value_name)?;
         let status = self
             .fs
@@ -273,6 +348,48 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    fn registry_key_entry(
+        &self,
+        handle: Handle,
+    ) -> Result<litebox::fd::EntryHandle<Platform, RegistryKeySubsystem<Platform>>, NtStatus> {
+        raw_handle_entry::<Platform, RegistryKeySubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            handle,
+        )
+        .ok_or(NtStatus::INVALID_HANDLE)
+    }
+
+    fn insert_registry_key_handle(
+        &self,
+        key: RegistryKeyObject<Platform>,
+    ) -> Result<Handle, NtStatus> {
+        let typed = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert::<RegistryKeySubsystem<Platform>>(key);
+        insert_raw_handle::<Platform, RegistryKeySubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            typed,
+            |key| self.close_registry_key(key),
+        )
+    }
+
+    fn remove_registry_key_handle(&self, handle: Handle) {
+        remove_raw_handle::<Platform, RegistryKeySubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            handle,
+            |key| self.close_registry_key(key),
+        );
+    }
+
+    fn close_registry_key(&self, key: RegistryKeyObject<Platform>) {
+        let _ = self.global.registry.fs.close(&key.fd);
+    }
+
     pub(crate) fn sys_nt_open_key(
         &self,
         key_handle: MutPtr<Platform, Handle>,
@@ -289,11 +406,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match self.do_nt_open_key(desired_access, object_attributes) {
             Ok(handle) => {
                 if key_handle.write_at_offset(0, handle).is_none() {
-                    remove_raw_handle::<Platform, RegistryKeySubsystem>(
-                        &self.global.litebox,
-                        &self.process.handles,
-                        handle,
-                    );
+                    self.remove_registry_key_handle(handle);
                     return NtStatus::ACCESS_VIOLATION;
                 }
 
@@ -321,40 +434,33 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let path = if object_attributes.root_directory.is_null() || key_name.starts_with('\\') {
             absolute_nt_key_name_to_fs_path(&key_name)?
         } else {
-            let root_key = raw_handle_entry::<Platform, RegistryKeySubsystem>(
-                &self.global.litebox,
-                &self.process.handles,
-                object_attributes.root_directory,
-            )
-            .ok_or(NtStatus::INVALID_HANDLE)?;
+            let root_key = self.registry_key_entry(object_attributes.root_directory)?;
             root_key
                 .with_entry(|root_key| relative_nt_key_name_to_fs_path(&root_key.path, &key_name))?
         };
 
-        match self.global.registry.key_exists(&path) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(NtStatus::OBJECT_NAME_NOT_FOUND);
-            }
-            Err(status) => {
-                litebox_util_log::debug!(
-                    desired_access:% = format_args!("{desired_access:#x}"),
-                    root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
-                    name:% = key_name,
-                    path:% = path,
-                    status:? = status;
-                    "NtOpenKey failed"
-                );
-                return Err(status);
-            }
-        }
-
-        let key = RegistryKeyObject { path };
-        let mut descriptor_table = self.global.litebox.descriptor_table_mut();
-        let typed = descriptor_table.insert::<RegistryKeySubsystem>(key);
-        drop(descriptor_table);
-
-        insert_raw_handle::<Platform, _>(&self.global.litebox, &self.process.handles, typed)
+        let desired_access = RegistryKeyAccess::from_bits_retain(desired_access);
+        let fd = self
+            .global
+            .registry
+            .open_key(&path, desired_access)
+            .inspect_err(|status| {
+                if *status != NtStatus::OBJECT_NAME_NOT_FOUND {
+                    litebox_util_log::debug!(
+                        desired_access:? = desired_access,
+                        root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
+                        name:% = key_name,
+                        path:% = path,
+                        status:? = status;
+                        "NtOpenKey failed"
+                    );
+                }
+            })?;
+        self.insert_registry_key_handle(RegistryKeyObject {
+            path,
+            fd,
+            granted_access: desired_access,
+        })
     }
 
     pub(crate) fn sys_nt_query_value_key(
@@ -400,15 +506,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         length: u32,
         result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
-        let key = raw_handle_entry::<Platform, RegistryKeySubsystem>(
-            &self.global.litebox,
-            &self.process.handles,
-            key_handle,
-        )
-        .ok_or(NtStatus::INVALID_HANDLE)?;
+        let key = self.registry_key_entry(key_handle)?;
         let value_name = value_name.read_string::<Platform>()?;
-        let value =
-            key.with_entry(|key| self.global.registry.read_value(&key.path, &value_name))?;
+        let value = key.with_entry(|key| {
+            if !key.granted_access.can_query_value() {
+                return Err(NtStatus::ACCESS_DENIED);
+            }
+            // TODO: Open the value relative to `key.fd` once the FS has an openat-style API.
+            self.global
+                .registry
+                .read_value_at_path(&key.path, &value_name)
+        })?;
         let name = utf16le(&value_name);
         match key_value_information_class {
             KeyValueInformationClass::Basic => {
@@ -741,13 +849,17 @@ mod tests {
     extern crate std;
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     const ERROR_SUCCESS: i32 = 0;
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    const HKEY_CURRENT_USER: *mut core::ffi::c_void = 0xffffffff80000001usize as _;
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     const HKEY_LOCAL_MACHINE: *mut core::ffi::c_void = 0xffffffff80000002usize as _;
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    const KEY_QUERY_VALUE: u32 = 0x0001;
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     const HOST_CODE_PAGE_KEY: &str = "SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage";
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    const HOST_ACCESS_TEST_KEY: &str = "Software\\LiteBoxRegistryAccessTest";
 
     const KEY_VALUE_PARTIAL_INFORMATION_DATA_OFFSET: usize =
         offset_of!(KeyValuePartialInformation, data);
@@ -756,6 +868,17 @@ mod tests {
     #[allow(non_snake_case)]
     #[link(name = "advapi32")]
     unsafe extern "system" {
+        fn RegCreateKeyExW(
+            hKey: *mut core::ffi::c_void,
+            lpSubKey: *const u16,
+            Reserved: u32,
+            lpClass: *const u16,
+            dwOptions: u32,
+            samDesired: u32,
+            lpSecurityAttributes: *const core::ffi::c_void,
+            phkResult: *mut *mut core::ffi::c_void,
+            lpdwDisposition: *mut u32,
+        ) -> i32;
         fn RegOpenKeyExW(
             hKey: *mut core::ffi::c_void,
             lpSubKey: *const u16,
@@ -771,7 +894,16 @@ mod tests {
             lpData: *mut u8,
             lpcbData: *mut u32,
         ) -> i32;
+        fn RegSetValueExW(
+            hKey: *mut core::ffi::c_void,
+            lpValueName: *const u16,
+            Reserved: u32,
+            dwType: u32,
+            lpData: *const u8,
+            cbData: u32,
+        ) -> i32;
         fn RegCloseKey(hKey: *mut core::ffi::c_void) -> i32;
+        fn RegDeleteTreeW(hKey: *mut core::ffi::c_void, lpSubKey: *const u16) -> i32;
     }
 
     fn const_ptr<T: FromBytes>(value: &T) -> ConstPtr<TestPlatform, T> {
@@ -821,7 +953,7 @@ mod tests {
         task: &Task<TestPlatform, TestFS>,
         object_attributes: ObjectAttributes,
     ) -> Result<Handle, NtStatus> {
-        task.do_nt_open_key(0x20019, object_attributes)
+        task.do_nt_open_key(RegistryKeyAccess::READ.bits(), object_attributes)
     }
 
     fn open_code_page_key(task: &Task<TestPlatform, TestFS>) -> Handle {
@@ -850,7 +982,7 @@ mod tests {
                 HKEY_LOCAL_MACHINE,
                 key_path.as_ptr(),
                 0,
-                KEY_QUERY_VALUE,
+                RegistryKeyAccess::QUERY_VALUE.bits(),
                 &raw mut key,
             )
         };
@@ -898,13 +1030,95 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    fn host_query_value_with_set_only_access() -> i32 {
+        let key_path = nul_terminated_utf16(HOST_ACCESS_TEST_KEY);
+        let value_name = nul_terminated_utf16("Value");
+        let mut key = core::ptr::null_mut();
+        // SAFETY: The key path is NUL-terminated, output pointers are live slots,
+        // and `HKEY_CURRENT_USER` is the documented predefined registry handle.
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                key_path.as_ptr(),
+                0,
+                core::ptr::null(),
+                0,
+                RegistryKeyAccess::QUERY_VALUE.bits() | RegistryKeyAccess::SET_VALUE.bits(),
+                core::ptr::null(),
+                &raw mut key,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS, "failed to create host test key");
+
+        let data = [b'x', 0, 0, 0];
+        // SAFETY: The key handle was returned by `RegCreateKeyExW`, the value name
+        // is NUL-terminated, and `data` is valid for the specified byte length.
+        let status = unsafe {
+            RegSetValueExW(
+                key,
+                value_name.as_ptr(),
+                0,
+                RegistryValueType::Sz.into(),
+                data.as_ptr(),
+                data.len().trunc(),
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS, "failed to seed host test value");
+        // SAFETY: The key handle was returned by `RegCreateKeyExW` and has not
+        // been closed yet.
+        let status = unsafe { RegCloseKey(key) };
+        assert_eq!(status, ERROR_SUCCESS, "failed to close host test key");
+
+        // SAFETY: The key path is NUL-terminated, `phkResult` points to a live
+        // output slot, and `HKEY_CURRENT_USER` is the documented predefined handle.
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                key_path.as_ptr(),
+                0,
+                RegistryKeyAccess::SET_VALUE.bits(),
+                &raw mut key,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS, "failed to reopen host test key");
+
+        let mut value_type = 0;
+        let mut data_len = 0;
+        // SAFETY: The key handle was returned by `RegOpenKeyExW`, the value name
+        // is NUL-terminated, and the null data buffer requests the required length.
+        let query_status = unsafe {
+            RegQueryValueExW(
+                key,
+                value_name.as_ptr(),
+                core::ptr::null_mut(),
+                &raw mut value_type,
+                core::ptr::null_mut(),
+                &raw mut data_len,
+            )
+        };
+
+        // SAFETY: The key handle was returned by `RegOpenKeyExW` and has not been closed yet.
+        let close_status = unsafe { RegCloseKey(key) };
+        assert_eq!(close_status, ERROR_SUCCESS, "failed to close host test key");
+        // SAFETY: The key path is NUL-terminated and rooted under the documented
+        // predefined `HKEY_CURRENT_USER` handle.
+        let delete_status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key_path.as_ptr()) };
+        assert_eq!(
+            delete_status, ERROR_SUCCESS,
+            "failed to delete host test key"
+        );
+
+        query_status
+    }
+
     #[test]
     fn registry_store_separates_values_from_subkeys() {
         let (_litebox, registry) = test_registry();
         let key_path = absolute_nt_key_name_to_fs_path(DEFAULT_CODE_PAGE_KEY).unwrap();
         let value_path = value_path(&key_path, "ACP").unwrap();
 
-        assert_eq!(registry.key_exists(&key_path), Ok(true));
         assert_eq!(
             registry.fs.file_status(&*value_path).unwrap().file_type,
             FileType::RegularFile
@@ -913,7 +1127,7 @@ mod tests {
             registry.fs.file_status(&*value_path).unwrap().size,
             REGISTRY_VALUE_TYPE_SIZE + DEFAULT_ACP_VALUE.len()
         );
-        let value = registry.read_value(&key_path, "ACP").unwrap();
+        let value = registry.read_value_at_path(&key_path, "ACP").unwrap();
         assert_eq!(value.value_type, RegistryValueType::Sz);
         assert_eq!(value.data, DEFAULT_ACP_VALUE);
 
@@ -1003,6 +1217,34 @@ mod tests {
     }
 
     #[test]
+    fn nt_open_key_checks_backing_fs_permissions() {
+        let task = crate::tests::test_task();
+        let private_key = "\\Registry\\Machine\\Software\\Private";
+        let private_path = create_key_in_fs(&task.global.registry.fs, private_key).unwrap();
+        task.global
+            .registry
+            .fs
+            .chmod(&*private_path, Mode::WUSR | Mode::XUSR)
+            .unwrap();
+
+        let private_name = utf16(private_key);
+        let private_name = unicode_string(&private_name);
+        let read_object_attributes = object_attributes(&private_name);
+        assert_eq!(
+            open_key(&task, read_object_attributes).unwrap_err(),
+            NtStatus::ACCESS_DENIED
+        );
+
+        let private_name = utf16(private_key);
+        let private_name = unicode_string(&private_name);
+        let write_object_attributes = object_attributes(&private_name);
+        let handle = task
+            .do_nt_open_key(RegistryKeyAccess::SET_VALUE.bits(), write_object_attributes)
+            .expect("write-only access should use write filesystem permissions");
+        assert_ne!(handle, Handle::default());
+    }
+
+    #[test]
     fn nt_query_value_key_reports_partial_information() {
         let task = crate::tests::test_task();
         let key_handle = open_code_page_key(&task);
@@ -1037,6 +1279,37 @@ mod tests {
             u32::try_from(DEFAULT_ACP_VALUE.len()).unwrap()
         );
         assert_eq!(data, DEFAULT_ACP_VALUE);
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn nt_query_value_key_without_query_access_matches_host() {
+        assert_eq!(host_query_value_with_set_only_access(), ERROR_ACCESS_DENIED);
+
+        let task = crate::tests::test_task();
+        let code_page_name = utf16(DEFAULT_CODE_PAGE_KEY);
+        let code_page_name = unicode_string(&code_page_name);
+        let object_attributes = object_attributes(&code_page_name);
+        let key_handle = task
+            .do_nt_open_key(RegistryKeyAccess::SET_VALUE.bits(), object_attributes)
+            .expect("write-only open should succeed against the seeded registry store");
+        let value_name = utf16("ACP");
+        let value_name = unicode_string(&value_name);
+        let mut information = [0u8; 64];
+        let mut result_length = 0;
+
+        assert_eq!(
+            task.do_nt_query_value_key(
+                key_handle,
+                value_name,
+                KeyValueInformationClass::Partial,
+                mut_byte_ptr(&mut information),
+                u32::try_from(information.len()).unwrap(),
+                mut_ptr(&mut result_length),
+            )
+            .unwrap_err(),
+            NtStatus::ACCESS_DENIED
+        );
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub trait ShimPlatform:
     + RawPointerProvider
     + PageManagementProvider<PAGE_SIZE>
     + SystemInfoProvider
+    + 'static
 {
 }
 
@@ -53,6 +54,7 @@ impl<T> ShimPlatform for T where
         + RawPointerProvider
         + PageManagementProvider<PAGE_SIZE>
         + SystemInfoProvider
+        + 'static
 {
 }
 
@@ -109,6 +111,7 @@ pub(crate) fn insert_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsy
     litebox: &LiteBox<Platform>,
     handles: &WindowsHandleStore<Platform>,
     typed: litebox::fd::TypedFd<Subsystem>,
+    cleanup_entry: impl FnOnce(Subsystem::Entry),
 ) -> Result<syscalls::Handle, NtStatus>
 where
     Platform: RawSyncPrimitivesProvider,
@@ -118,8 +121,8 @@ where
     let Some(handle) = syscalls::Handle::from_raw_fd(raw_fd) else {
         let typed = handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok();
         drop(handles);
-        if let Some(typed) = typed {
-            let _ = litebox.descriptor_table_mut().remove(&typed);
+        if let Some(entry) = typed.and_then(|typed| litebox.descriptor_table_mut().remove(&typed)) {
+            cleanup_entry(entry);
         }
         return Err(NtStatus::QUOTA_EXCEEDED);
     };
@@ -146,6 +149,7 @@ pub(crate) fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsy
     litebox: &LiteBox<Platform>,
     handles: &WindowsHandleStore<Platform>,
     handle: syscalls::Handle,
+    cleanup_entry: impl FnOnce(Subsystem::Entry),
 ) where
     Platform: RawSyncPrimitivesProvider,
 {
@@ -156,8 +160,8 @@ pub(crate) fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsy
         let mut handles = handles.write();
         handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok()
     };
-    if let Some(typed) = typed {
-        let _ = litebox.descriptor_table_mut().remove(&typed);
+    if let Some(entry) = typed.and_then(|typed| litebox.descriptor_table_mut().remove(&typed)) {
+        cleanup_entry(entry);
     }
 }
 
