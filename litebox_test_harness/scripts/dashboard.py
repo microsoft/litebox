@@ -1124,11 +1124,24 @@ def cmd_auto(args: argparse.Namespace) -> int:
                     print(f"[auto] {ref}: worktree {wt} missing, skipping",
                           file=sys.stderr)
                     continue
-                ok = _drive_ref(
-                    ref, wt, args,
-                    pidfile=pidfile,
-                    supervisor_state=_supervisor_state,
-                )
+                # Wrap each ref's drive in try/except so a single
+                # ref's failure (or an unexpected exception in
+                # _drive_ref's recovery paths) doesn't take down
+                # the whole supervisor. The auto-loop's value is in
+                # being long-running; one bad cycle shouldn't
+                # require manual restart.
+                try:
+                    ok = _drive_ref(
+                        ref, wt, args,
+                        pidfile=pidfile,
+                        supervisor_state=_supervisor_state,
+                    )
+                except Exception as e:
+                    print(f"[auto] {ref}: _drive_ref crashed: "
+                          f"{type(e).__name__}: {e}", file=sys.stderr)
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+                    ok = False
                 if not args.quiet:
                     print(f"[auto] {ref} @ {wt}: {'ok' if ok else 'failed'}")
             # Re-render after every full pass — and again every ~10s
@@ -1338,9 +1351,15 @@ def _pids_in_pgid(pgid: int) -> list[int]:
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
+        # Race window: the proc directory listing can include a PID
+        # whose entire /proc/<pid>/ tree disappears before we read
+        # stat. Both FileNotFoundError and ProcessLookupError
+        # (errno=ESRCH from open) are valid "process exited" signals;
+        # PermissionError can also surface for processes the current
+        # user can't inspect — treat all three as "skip, not in PGID".
         try:
             stat = (entry / "stat").read_text()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
             continue
         # /proc/<pid>/stat fields: pid, (comm), state, ppid, pgrp, ...
         # comm can contain spaces and parens, so split on the last ')'.
