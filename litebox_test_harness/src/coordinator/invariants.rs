@@ -38,6 +38,7 @@ struct GetifaddrsEntry {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct GetifaddrsSandboxView {
     entries: Vec<GetifaddrsEntry>,
+    in_litebox: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -141,6 +142,12 @@ async fn handle_kind_typeid_match(
     })
 }
 
+fn running_under_litebox() -> bool {
+    std::env::var_os("LITEBOX_RUNNER").is_some()
+        || std::fs::read_to_string("/proc/self/maps")
+            .is_ok_and(|maps| maps.contains("litebox_rtld_audit") || maps.contains("[trampoline]"))
+}
+
 async fn handle_getifaddrs_sandbox_view(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
@@ -189,7 +196,10 @@ async fn handle_getifaddrs_sandbox_view(
     unsafe { libc::freeifaddrs(ifaddr) };
 
     entries.sort_by(|a, b| a.name.cmp(&b.name).then(a.addr.cmp(&b.addr)));
-    Ok(GetifaddrsSandboxView { entries })
+    Ok(GetifaddrsSandboxView {
+        entries,
+        in_litebox: running_under_litebox(),
+    })
 }
 
 fn check_getifaddrs_sandbox_view(view: &GetifaddrsSandboxView) -> Result<String, String> {
@@ -205,11 +215,32 @@ fn check_getifaddrs_sandbox_view(view: &GetifaddrsSandboxView) -> Result<String,
             prefix: 8,
         },
     ];
-    if view.entries == want {
-        Ok(format!("sandbox getifaddrs view: {:?}", view.entries))
+    if view.in_litebox {
+        if view.entries == want {
+            Ok(format!("sandbox getifaddrs view: {:?}", view.entries))
+        } else {
+            Err(format!(
+                "unexpected sandbox getifaddrs view: {:?}",
+                view.entries
+            ))
+        }
+    } else if native_getifaddrs_view_is_sane(&view.entries) {
+        Ok(format!("native getifaddrs view: {:?}", view.entries))
     } else {
-        Err(format!("unexpected getifaddrs view: {:?}", view.entries))
+        Err(format!(
+            "unexpected native getifaddrs view: {:?}",
+            view.entries
+        ))
     }
+}
+
+fn native_getifaddrs_view_is_sane(entries: &[GetifaddrsEntry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.name == "lo" && entry.addr == [127, 0, 0, 1] && entry.prefix == 8)
+        && entries
+            .iter()
+            .any(|entry| entry.name != "lo" && entry.addr != [0, 0, 0, 0] && entry.prefix <= 32)
 }
 
 async fn handle_setsockopt_passthrough(
