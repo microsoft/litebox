@@ -1103,6 +1103,7 @@ async fn fklc_child_accept_ready(
             InfraCommand::Run {
                 handler: ACCEPT_INHERITED.name().to_string(),
                 args,
+                timeout_secs: None,
             },
         )
         .await;
@@ -1497,6 +1498,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                             handler: CLOSE_INHERITED.name().to_string(),
                             args: serde_json::to_value(ClosePortArgs { port })
                                 .expect("close args serialize"),
+                            timeout_secs: None,
                         },
                     )
                     .await;
@@ -1524,6 +1526,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                             inner: Box::new(InfraCommand::Run {
                                 handler: ACCEPT_INHERITED.name().to_string(),
                                 args: ready_args,
+                                timeout_secs: None,
                             }),
                         },
                     )

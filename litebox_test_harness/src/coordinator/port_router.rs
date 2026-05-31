@@ -494,6 +494,7 @@ async fn forward_child_listen(
             Command::Run {
                 handler: CHILD_LISTEN_ONCE.name().to_string(),
                 args,
+                timeout_secs: None,
             },
         )
         .await
