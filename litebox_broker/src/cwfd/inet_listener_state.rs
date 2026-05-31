@@ -584,6 +584,11 @@ fn ensure_supported_sockopt(
 ) -> Result<(), InetListenerError> {
     match (level, optname) {
         (libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)
+        | (libc::IPPROTO_TCP, libc::TCP_KEEPCNT)
+        | (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE)
+        | (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL)
+        | (libc::IPPROTO_TCP, libc::TCP_NODELAY)
+        | (libc::SOL_SOCKET, libc::SO_KEEPALIVE)
         | (libc::SOL_SOCKET, libc::SO_REUSEADDR)
         | (libc::SOL_SOCKET, libc::SO_REUSEPORT) => Ok(()),
         _ => Err(InetListenerError::InvalidSockaddr),

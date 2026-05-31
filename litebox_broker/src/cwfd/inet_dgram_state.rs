@@ -199,7 +199,12 @@ impl InetDgramState {
         encode_sockaddr(peer).map_err(|_| InetDgramError::InvalidSockaddr)
     }
 
-    pub fn setsockopt(self: &Arc<Self>, level: i32, name: i32, value: &[u8]) -> Result<(), InetDgramError> {
+    pub fn setsockopt(
+        self: &Arc<Self>,
+        level: i32,
+        name: i32,
+        value: &[u8],
+    ) -> Result<(), InetDgramError> {
         // Real Linux: setsockopt works on an unbound socket (kernel just sets
         // an option on the socket struct, lazy-creates if needed). Match that
         // by ensuring the host socket exists before applying the option.
@@ -346,7 +351,7 @@ impl InetDgramState {
     /// Preserve the legacy Litebox resolver address after smoltcp removal by
     /// forwarding guest UDP DNS packets for 10.0.0.1:53 through the host resolver.
     fn forward_dns_query(
-        &self,
+        self: &Arc<Self>,
         payload: &[u8],
         virtual_peer: SocketAddr,
     ) -> Result<usize, InetDgramError> {
@@ -354,14 +359,34 @@ impl InetDgramState {
             crate::net_proxy::host_dns::discover_host_dns(),
             DNS_PORT,
         ));
-        let forwarder = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
-        forwarder.set_read_timeout(Some(DNS_FORWARD_TIMEOUT))?;
-        forwarder.send_to(payload, host_dns)?;
+        let query = payload.to_vec();
+        let state = Arc::downgrade(self);
+        thread::Builder::new()
+            .name("litebox-dns-forward".into())
+            .spawn(move || {
+                let Ok(forwarder) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+                else {
+                    return;
+                };
+                if forwarder
+                    .set_read_timeout(Some(DNS_FORWARD_TIMEOUT))
+                    .is_err()
+                {
+                    return;
+                }
+                if forwarder.send_to(&query, host_dns).is_err() {
+                    return;
+                }
 
-        let mut response = vec![0u8; UDP_RECV_BUF_LEN];
-        let (len, _) = forwarder.recv_from(&mut response)?;
-        response.truncate(len);
-        self.enqueue_datagram(response, virtual_peer)?;
+                let mut response = vec![0u8; UDP_RECV_BUF_LEN];
+                let Ok((len, _)) = forwarder.recv_from(&mut response) else {
+                    return;
+                };
+                response.truncate(len);
+                if let Some(state) = state.upgrade() {
+                    let _ = state.enqueue_datagram(response, virtual_peer);
+                }
+            })?;
         Ok(payload.len())
     }
 
