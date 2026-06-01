@@ -1145,6 +1145,20 @@ def cmd_auto(args: argparse.Namespace) -> int:
 
     _write_pidfile(pidfile, supervisor_pid=os.getpid())
 
+    # Initial render before the first cycle starts. Re-renders the
+    # summary with whatever's already in the store, so a freshly
+    # (re)started supervisor — e.g., after a renderer bug fix or a
+    # WSL restart — reflects the latest schema/code immediately
+    # instead of showing the stale summary.md (or no summary at
+    # all) for one full cycle (which can be 10+ min on a cold build).
+    try:
+        conn = open_db(state_dir)
+        write_summary(conn, state_dir)
+        conn.close()
+    except Exception as e:
+        print(f"[auto] initial render failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+
     try:
         while True:
             conn = open_db(state_dir)
