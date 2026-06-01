@@ -595,8 +595,19 @@ def _dirty_only_coverage(
 
 
 def _last_run_age_for_ci_worktree(conn: sqlite3.Connection, wt: str) -> str:
+    # Read from run_results, not runs, so the displayed "age" reflects
+    # the most recent individual test completion — not the most recent
+    # cargo-invocation completion. The supervisor doesn't write a
+    # `runs` row until the whole cargo cycle ends (which can be 10+
+    # min), so anchoring the headline on `runs` makes the dashboard
+    # look idle while tests are actively streaming results in. The
+    # user's intuition is "Pass = how recently did anything happen
+    # here," and that's a `run_results` question.
     row = conn.execute(
-        "SELECT MAX(finished_ts_ms) FROM runs WHERE worktree_path = ?",
+        "SELECT MAX(rr.finished_ts_ms)"
+        "  FROM run_results rr"
+        "  JOIN runs r ON r.run_id = rr.run_id"
+        " WHERE r.worktree_path = ?",
         (wt,),
     ).fetchone()
     if not row or row[0] is None:
