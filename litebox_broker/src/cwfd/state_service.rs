@@ -2584,8 +2584,18 @@ fn handle_create_pty(
     static NEXT_PTY_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
     let pty_id = NEXT_PTY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pair = PtyState::new_pair(pty_id);
+    let master_arc = std::sync::Arc::clone(&pair.master);
+    let slave_arc = std::sync::Arc::clone(&pair.slave);
     let master = registry.register(pair.master);
     let slave = registry.register(pair.slave);
+    // Record the registry handle ids on the shared PtyPairState so
+    // handle_release_state can compute
+    // `user_slave_count = rc(slave) - rc(master)` and fire master
+    // POLLHUP only when the last user-space slave fd closes — not
+    // when a fork-dup'd anchor ref incidentally brings rc(slave) to
+    // 1, which was the previous (buggy) heuristic.
+    master_arc.record_handles(master.id(), slave.id());
+    drop(slave_arc);
     HandlerResult {
         frame: build_create_pty_response_ok(master.id(), slave.id(), pair.pty_id),
         out_fd: None,
@@ -2914,9 +2924,24 @@ fn handle_release_state(
     };
     // Before release, peek at the handle's PtyState (if any) so we
     // can apply endpoint-specific post-release semantics.
-    // Specifically: when a slave handle's refcount drops to 1, only
-    // the master's anchor remains — no user-space slave fd-holders.
-    // Notify master with POLLHUP+POLLIN (kernel-PTY semantic).
+    //
+    // For slave releases: fire master POLLHUP only when the last
+    // user-space slave fd closes. Each master shim fd holds an
+    // anchor on the slave (broker_pty.rs `slave_anchor_handle`), so
+    // each master contributes +1 to both rc(master) and rc(slave).
+    // Therefore the number of user-space slave fds is
+    //   user_slave_count = rc(slave) - rc(master)
+    // After this release, if user_slave_count transitions to 0 (and
+    // the slave handle is still alive — rc(slave) > 0, otherwise
+    // `Drop` will fire HUP on its own), notify the master.
+    //
+    // The previous heuristic ("fire when rc(slave) == 1 after
+    // release") worked for single-worker setups where rc(slave) was
+    // exactly 1 user-fd + 1 anchor. It failed under fork-inherit
+    // (multiple workers each holding an anchor) and nested PTYs:
+    // rc(slave) could transition through 1 incidentally during
+    // anchor cycling, firing bogus POLLHUP that made `script(1)`
+    // busy-loop on poll() and never exit — the Copilot CLI TUI hang.
     let pty_state: Option<Arc<StateObjectEnum>> = registry
         .resolve(StateHandle::from_id(handle_id), SubsystemTag::Pty)
         .ok();
@@ -2925,11 +2950,20 @@ fn handle_release_state(
             if let Some(state) = pty_state
                 && let StateObjectEnum::Pty(pty) = state.as_ref()
                 && pty.endpoint() == PtyEndpoint::Slave
-                && new_rc == 1
+                && new_rc > 0
             {
-                // Last user-space slave fd-holder released; only the
-                // master's anchor remains. Notify master with HUP+IN.
-                pty.notify_slave_close_to_master();
+                let master_handle_id = pty.master_handle_id();
+                if master_handle_id != 0 {
+                    let rc_master =
+                        registry.refcount(StateHandle::from_id(master_handle_id));
+                    let user_slave_count = new_rc.saturating_sub(rc_master);
+                    if user_slave_count == 0 {
+                        // Last user-space slave fd-holder released;
+                        // remaining slave rcs are all master anchors.
+                        // Notify master with HUP+IN.
+                        pty.notify_slave_close_to_master();
+                    }
+                }
             }
             HandlerResult {
                 frame: build_release_response_ok(),

@@ -12,7 +12,10 @@
 
 use core::any::Any;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use litebox_common_linux::fd_token_protocol::{PtyEndpoint, PtyIoctlOp};
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
@@ -102,6 +105,16 @@ struct PtyPairState {
     inner: Mutex<PtyInner>,
     master_subject: SubscriptionList,
     slave_subject: SubscriptionList,
+    /// Registry handle ids, populated by `PtyState::record_handles`
+    /// immediately after both endpoints are registered. Used by the
+    /// broker's `handle_release_state` to compute
+    /// `user_slave_count = rc(slave) - rc(master)` and fire the
+    /// master's POLLHUP only when the last user-space slave fd closes
+    /// — not when an anchor or fork-dup'd ref drops. 0 means "not
+    /// yet recorded" (early Release attempts will fall back to the
+    /// safe no-op path).
+    master_handle_id: AtomicU64,
+    slave_handle_id: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -178,6 +191,8 @@ impl PtyState {
             }),
             master_subject: SubscriptionList::new(),
             slave_subject: SubscriptionList::new(),
+            master_handle_id: AtomicU64::new(0),
+            slave_handle_id: AtomicU64::new(0),
         });
         PtyPairHandles {
             master: Arc::new(Self {
@@ -198,6 +213,33 @@ impl PtyState {
 
     pub fn pty_id(&self) -> u32 {
         self.pair.pty_id
+    }
+
+    /// Records the broker registry handle ids for the master and
+    /// slave endpoints. Must be called once, immediately after both
+    /// endpoints are registered with the `BrokerStateRegistry`. Used
+    /// by `handle_release_state` to derive
+    /// `user_slave_count = rc(slave) - rc(master)` for the
+    /// fire-master-POLLHUP-when-last-user-slave-closes invariant.
+    pub fn record_handles(&self, master_handle_id: u64, slave_handle_id: u64) {
+        self.pair
+            .master_handle_id
+            .store(master_handle_id, Ordering::Relaxed);
+        self.pair
+            .slave_handle_id
+            .store(slave_handle_id, Ordering::Relaxed);
+    }
+
+    /// Returns the recorded master handle id, or 0 if not yet
+    /// recorded (early-failure path in CreatePty).
+    pub fn master_handle_id(&self) -> u64 {
+        self.pair.master_handle_id.load(Ordering::Relaxed)
+    }
+
+    /// Returns the recorded slave handle id, or 0 if not yet
+    /// recorded.
+    pub fn slave_handle_id(&self) -> u64 {
+        self.pair.slave_handle_id.load(Ordering::Relaxed)
     }
 
     pub fn read(&self, max_len: usize) -> Result<Vec<u8>, PtyError> {
