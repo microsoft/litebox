@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-fn objdump(binary: &[u8]) -> String {
+fn objdump(objdump_cmd: &str, binary: &[u8]) -> String {
     use std::io::Write;
     use std::process::Command;
     use tempfile::NamedTempFile;
@@ -11,7 +11,7 @@ fn objdump(binary: &[u8]) -> String {
     temp_file.write_all(binary).unwrap();
 
     // Run objdump on the temporary file and capture the output
-    let output = Command::new("objdump")
+    let output = Command::new(objdump_cmd)
         .arg("-d")
         .arg(temp_file.path())
         .output()
@@ -23,6 +23,21 @@ fn objdump(binary: &[u8]) -> String {
         .map(|line| normalize_objdump_line(line, trampoline_range.as_ref()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Return the first objdump-like command that exists on the host from
+/// `candidates`, or `None` if none are available.
+fn find_objdump(candidates: &[&str]) -> Option<String> {
+    use std::process::Command;
+    candidates
+        .iter()
+        .find(|cmd| {
+            Command::new(cmd)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+        .map(|cmd| (*cmd).to_owned())
 }
 
 fn trampoline_range(binary: &[u8]) -> Option<std::ops::Range<u64>> {
@@ -49,33 +64,38 @@ fn normalize_objdump_line(line: &str, trampoline_range: Option<&std::ops::Range<
         return line.trim_end().to_owned();
     };
     let tokens: Vec<_> = rest.split_whitespace().collect();
-    let Some((mnemonic_idx, mnemonic)) = tokens
-        .iter()
-        .enumerate()
-        .find(|(_, token)| !token.chars().all(|ch| ch.is_ascii_hexdigit()))
-    else {
-        return line.trim_end().to_owned();
-    };
-    if *mnemonic == "jmp"
-        && let Some(target) = tokens
-            .get(mnemonic_idx + 1)
-            .and_then(|token| u64::from_str_radix(token.trim_start_matches("0x"), 16).ok())
-        && trampoline_range.contains(&target)
-    {
-        let offset = target - trampoline_range.start;
-        return format!("{address}:\t<trampoline-jmp+0x{offset:x}>");
+
+    // A control-transfer into the trampoline appears as a branch mnemonic
+    // (`jmp` on x86, `b`/`bl` on AArch64) followed by an absolute target. When
+    // that target lands in the trampoline region, render it relative to the
+    // trampoline base so the snapshot is independent of the trampoline's exact
+    // address. Other branches (and same-mnemonic branches that stay in the
+    // original code) are left untouched.
+    for (i, token) in tokens.iter().enumerate() {
+        if !matches!(*token, "jmp" | "b" | "bl") {
+            continue;
+        }
+        if let Some(target) = tokens
+            .get(i + 1)
+            .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+            && trampoline_range.contains(&target)
+        {
+            let offset = target - trampoline_range.start;
+            return format!("{address}:\t<trampoline-{token}+0x{offset:x}>");
+        }
     }
     line.trim_end().to_owned()
 }
 
 const HELLO_INPUT_64: &[u8] = include_bytes!("hello");
+const HELLO_INPUT_AARCH64: &[u8] = include_bytes!("hello-aarch64");
 
-fn run_snapshot_test(input: &[u8], snapshot: &str) {
+fn run_snapshot_test(objdump_cmd: &str, input: &[u8], snapshot: &str) {
     let output = litebox_syscall_rewriter::hook_syscalls_in_elf(input, None).unwrap();
     let diff = similar::udiff::unified_diff(
         similar::Algorithm::Myers,
-        &objdump(input),
-        &objdump(&output),
+        &objdump(objdump_cmd, input),
+        &objdump(objdump_cmd, &output),
         3,
         Some(("original", "rewritten")),
     );
@@ -85,5 +105,27 @@ fn run_snapshot_test(input: &[u8], snapshot: &str) {
 
 #[test]
 fn snapshot_test_hello_world_x86_64() {
-    run_snapshot_test(HELLO_INPUT_64, "hello-diff");
+    run_snapshot_test("objdump", HELLO_INPUT_64, "hello-diff");
+}
+
+#[test]
+fn snapshot_test_hello_world_aarch64() {
+    // The `hello-aarch64` fixture exercises every rewrite path: an `MSR
+    // TPIDR_EL0` write (→ branch into an MSR gate), an `MRS TPIDR_EL0` read
+    // (→ branch into an MRS gate), and several `SVC #0`s. Only `MRS XZR,
+    // TPIDR_EL0` is left native, and the fixture has none.
+    // objdump only disassembles the original `.text`, so the diff captures the
+    // call-site rewriting, not the appended trampoline's gate internals.
+    //
+    // The host objdump usually cannot disassemble AArch64; prefer a cross or
+    // LLVM objdump. Skip (rather than fail) when no capable tool is installed,
+    // so x86-only dev environments still pass.
+    let Some(objdump_cmd) = find_objdump(&["aarch64-linux-gnu-objdump", "llvm-objdump"]) else {
+        eprintln!(
+            "skipping snapshot_test_hello_world_aarch64: no AArch64-capable objdump \
+             (install binutils-aarch64-linux-gnu or llvm)"
+        );
+        return;
+    };
+    run_snapshot_test(&objdump_cmd, HELLO_INPUT_AARCH64, "hello-aarch64-diff");
 }

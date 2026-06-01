@@ -49,6 +49,9 @@ jobs:
       - name: Install diod
         run: |
           sudo apt install -y diod
+      - name: Install AArch64 binutils
+        run: |
+          sudo apt install -y binutils-aarch64-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Cache custom out directories
         uses: actions/cache@v5

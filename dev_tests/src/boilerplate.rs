@@ -141,4 +141,5 @@ const SKIP_FILES: &[&str] = &[
     "litebox_runner_linux_on_windows_userland/tests/test-bins/thread_static",
     "litebox_syscall_rewriter/tests/hello",
     "litebox_syscall_rewriter/tests/hello-32",
+    "litebox_syscall_rewriter/tests/hello-aarch64",
 ];
