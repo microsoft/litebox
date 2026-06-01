@@ -11,7 +11,8 @@ Subcommands (stdlib only — no third-party deps):
     dashboard.py untrack <ref>                   # remove a tracked ref
     dashboard.py refs                            # list tracked refs
     dashboard.py auto [--interval SECS]          # autonomous fill driver
-    dashboard.py stop                            # stop the auto driver + reap descendants
+    dashboard.py drain [--wait]                  # graceful shutdown (SIGUSR1; current cycle finishes)
+    dashboard.py stop                            # hard stop: reap cargo + harness + containers
 
 The autonomous `auto` driver iterates round-robin over the rows in
 the `tracked_refs` table. For each ref it does:
@@ -215,6 +216,20 @@ def fmt_age_ms(delta_ms: int) -> str:
 
 def short_sha(sha: Optional[str]) -> str:
     return (sha or "?")[:8]
+
+
+def _branch_display(branch: Optional[str]) -> str:
+    """Normalize stale `runs.branch="HEAD"` sentinel values for
+    display. Pre-fix producer wrote the literal string "HEAD" for
+    any detached-HEAD worktree (most CI runs), so already-recorded
+    rows have `branch="HEAD"`. Render those as `<detached>` so the
+    table doesn't pretend "HEAD" is a real branch name.
+    """
+    if branch is None or branch == "":
+        return "—"
+    if branch == "HEAD":
+        return "<detached>"
+    return branch
 
 
 # ─── Trend helpers ───────────────────────────────────────────────────
@@ -738,13 +753,17 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
             "verdicts": verdicts,
         }
 
-    # Tracked-ref overlay so the table can mark which partitions are
-    # produced by the autonomous driver vs ad-hoc / agent runs.
-    tracked: dict[str, str] = {}  # commit_sha → ref label
+    # Tracked-ref overlay: a row gets tagged with the tracked ref's
+    # label only when the row's worktree matches the tracked ref's
+    # `ci_worktree` AND the row is clean. Otherwise a different
+    # worktree (e.g. an agent session) that happens to be checked
+    # out at the same commit_sha as a tracked ref would inherit the
+    # ref's tag and falsely implicate it in unrelated dirty work.
+    tracked_by_sha: dict[str, tuple[str, str]] = {}  # sha → (ref, ci_worktree)
     for r in conn.execute("SELECT ref, ci_worktree FROM tracked_refs"):
         head = _git_head(r["ci_worktree"])
         if head:
-            tracked[head] = r["ref"]
+            tracked_by_sha[head] = (r["ref"], r["ci_worktree"])
 
     universe = conn.execute(
         "SELECT universe_size FROM runs WHERE universe_size IS NOT NULL"
@@ -803,13 +822,22 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
         visible.append(entry)
 
     for i, ((sha, dirty_hash), g) in enumerate(visible):
-        tag = f"_{tracked[sha]}_" if sha in tracked else ""
+        # Tag only when this row's worktree IS the tracked ref's
+        # ci_worktree AND the row is clean. Bare sha-match would
+        # falsely attribute another worktree's (dirty) work to the
+        # tracked ref just because both are sitting on the same
+        # commit.
+        tag = ""
+        if sha in tracked_by_sha and dirty_hash is None:
+            ref_name, ci_wt = tracked_by_sha[sha]
+            if ci_wt in g["worktrees"]:
+                tag = f"_{ref_name}_"
         dirty = "⚠" if dirty_hash else ""
         wt_short = ", ".join(
             sorted(os.path.basename(w) for w in g["worktrees"])
         )
         wt_paths = ", ".join(f"`{w}`" for w in sorted(g["worktrees"]))
-        branches = ", ".join(f"`{b}`" for b in sorted(g["branches"])) or "—"
+        branches = ", ".join(f"`{_branch_display(b)}`" for b in sorted(g["branches"])) or "—"
         cells: list[str] = []
         for pass_name in ("native", "litebox"):
             cov, n_pass, n_fail = _counts_from_verdicts(g["verdicts"], pass_name)
@@ -935,7 +963,8 @@ def _format_state_header(state: dict, now: int) -> str:
     """`### sha=... · branch=... · worktree=... (path) · clean|dirty=... · (newest <age> ago)`"""
     sha = short_sha(state["commit_sha"])
     branches = (
-        ",".join(sorted(state["branches"])) if state["branches"] else "—"
+        ",".join(_branch_display(b) for b in sorted(state["branches"]))
+        if state["branches"] else "—"
     )
     wts = sorted(state["worktrees"])
     wt_basenames = ",".join(os.path.basename(w) for w in wts) if wts else "—"
@@ -1213,7 +1242,7 @@ def _render_recent_runs(conn: sqlite3.Connection) -> str:
         dirty = "⚠" if r["dirty_hash"] else ""
         wt_path = r["worktree_path"] or "?"
         wt_short = os.path.basename(wt_path)
-        branch = r["branch"] or "—"
+        branch = _branch_display(r["branch"])
         age = fmt_age_ms(now - (r["started_ts_ms"] or now))
         lines.append(
             f"| {r['run_id']} | {age} ago | `{wt_short}` | `{wt_path}` | "
@@ -1417,6 +1446,21 @@ def cmd_auto(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
 
+    # Soft-close: SIGUSR1 sets a flag that the auto-loop checks at
+    # cycle boundaries. The current cargo cycle runs to completion
+    # (so no in-flight trials are killed mid-execution), then the
+    # supervisor exits cleanly. Use `dashboard.py drain` from
+    # another shell to send it without remembering the PID.
+    drain_requested = threading.Event()
+
+    def _drain_handler(_signum, _frame):
+        if not args.quiet:
+            print("[auto] SIGUSR1 received — will exit after current cycle",
+                  file=sys.stderr)
+        drain_requested.set()
+
+    signal.signal(signal.SIGUSR1, _drain_handler)
+
     _write_pidfile(pidfile, supervisor_pid=os.getpid())
 
     # Initial render before the first cycle starts. Re-renders the
@@ -1516,6 +1560,11 @@ def cmd_auto(args: argparse.Namespace) -> int:
             # render-spaced intervals. Just sleep until the next cycle.
             if args.once:
                 return 0
+            if drain_requested.is_set():
+                if not args.quiet:
+                    print("[auto] drain requested — exiting cleanly",
+                          file=sys.stderr)
+                return 0
             time.sleep(args.interval)
     finally:
         freshness_stop.set()
@@ -1585,6 +1634,10 @@ def _drive_ref(
         cargo_args.append(f"--fill={args.cycle_budget_secs}s")
     if args.jobs:
         env["LITEBOX_TEST_JOBS"] = str(args.jobs)
+    # Communicate the tracked ref to the producer so it can record
+    # something more informative than "HEAD" (the detached-state
+    # sentinel) in `runs.branch`. See dashboard_store::insert_run_row.
+    env["LITEBOX_DASHBOARD_REF"] = ref
 
     # Outer wall-time budget: cycle budget + generous grace for
     # cargo's own startup, drain, etc.
@@ -1807,6 +1860,59 @@ def _sweep_containers(harness_pid: int, *, quiet: bool = False) -> None:
 # ─── stop subcommand ─────────────────────────────────────────────────
 
 
+def cmd_drain(args: argparse.Namespace) -> int:
+    """Ask a running `dashboard.py auto` supervisor to exit cleanly
+    after its current cycle. Sends SIGUSR1, then optionally polls
+    for the supervisor to exit.
+
+    Use this instead of `stop` when you want to deploy a new
+    version of the script without killing in-flight trials. Trials
+    that have already streamed verdicts to `run_results` are
+    persisted; trials still executing when stop is sent would be
+    lost.
+    """
+    state_dir = resolve_state_dir(args.state_dir)
+    pidfile = state_dir / "auto.pidfile"
+    state = _read_pidfile(pidfile)
+    if state is None:
+        print(f"[drain] no pidfile at {pidfile}; nothing to drain",
+              file=sys.stderr)
+        return 0
+    sup = state.get("supervisor_pid")
+    if not sup:
+        print("[drain] pidfile has no supervisor_pid", file=sys.stderr)
+        return 1
+    try:
+        os.kill(sup, signal.SIGUSR1)
+    except ProcessLookupError:
+        print(f"[drain] supervisor {sup} already gone", file=sys.stderr)
+        return 0
+    if not args.quiet:
+        print(f"[drain] SIGUSR1 → supervisor pid {sup}; will exit "
+              f"after current cycle completes", file=sys.stderr)
+    if not args.wait:
+        return 0
+    # Poll until supervisor exits. Cycle budget can be 10-30 min;
+    # don't bound the wait — the user explicitly asked for --wait.
+    if not args.quiet:
+        print("[drain] waiting for supervisor to exit "
+              "(Ctrl-C to detach)…", file=sys.stderr)
+    try:
+        while True:
+            try:
+                os.kill(sup, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("[drain] detached; supervisor will still exit at "
+              "cycle boundary", file=sys.stderr)
+        return 0
+    if not args.quiet:
+        print("[drain] supervisor exited cleanly", file=sys.stderr)
+    return 0
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     """Stop a running `dashboard.py auto` supervisor and reap all its
     descendants + containers.
@@ -1953,6 +2059,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stop.add_argument("--quiet", "-q", action="store_true")
     p_stop.set_defaults(func=cmd_stop)
+
+    p_drain = sub.add_parser(
+        "drain",
+        help="ask a running `dashboard.py auto` supervisor to exit "
+             "cleanly after its current cargo cycle (SIGUSR1). "
+             "Use this instead of `stop` when redeploying so that "
+             "in-flight trials are not killed.",
+    )
+    p_drain.add_argument("--wait", action="store_true",
+                         help="block until the supervisor exits")
+    p_drain.add_argument("--quiet", "-q", action="store_true")
+    p_drain.set_defaults(func=cmd_drain)
 
     return p
 

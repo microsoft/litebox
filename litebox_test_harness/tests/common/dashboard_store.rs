@@ -359,7 +359,27 @@ fn insert_run_row(conn: &Connection) -> i64 {
         })
         .unwrap_or_else(|| "unknown".to_string());
     let commit_sha = git_capture(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
-    let branch = git_capture(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    // `git rev-parse --abbrev-ref HEAD` returns the literal string
+    // "HEAD" when the worktree is in a detached-HEAD state. That's
+    // a sentinel, not a real branch — recording it as the branch
+    // name is misleading (it dominates the histogram and renders
+    // as `branch=HEAD` in the dashboard).
+    //
+    // Prefer in order:
+    //   1. `LITEBOX_DASHBOARD_REF` — set by `dashboard.py auto` to
+    //      the tracked ref it just checked out. Most informative
+    //      when the supervisor drove the run.
+    //   2. The output of `--abbrev-ref` if it isn't the "HEAD"
+    //      sentinel (i.e., the worktree is on a real branch).
+    //   3. None — better to omit than to lie. The renderer can
+    //      display "—" for missing branch.
+    let branch = std::env::var("LITEBOX_DASHBOARD_REF")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            git_capture(&["rev-parse", "--abbrev-ref", "HEAD"])
+                .filter(|s| s != "HEAD")
+        });
     let worktree_path =
         git_capture(&["rev-parse", "--show-toplevel"]).unwrap_or_else(|| "unknown".to_string());
     let dirty_status = git_capture(&["status", "--porcelain"]).unwrap_or_default();
