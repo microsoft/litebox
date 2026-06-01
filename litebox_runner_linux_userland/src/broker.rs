@@ -7,9 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result};
 use litebox_broker_client::BrokerClient;
-use litebox_broker_protocol::{ReadinessState, WaitOutcome};
 use litebox_broker_unix_socket::UnixStreamClientControlChannel;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,7 +43,6 @@ fn connect_to_endpoint(socket_path: &Path) -> Result<BrokerConnection> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let mut client = connect_with_retry(socket_path, setup_deadline)
         .with_context(|| format!("failed to connect to broker at {}", socket_path.display()))?;
-    verify_broker_connection(&mut client)?;
     client
         .control_channel_mut()
         .set_io_deadline(None)
@@ -74,34 +72,4 @@ fn connect_with_retry(socket_path: &Path, setup_deadline: Instant) -> Result<Cli
         let remaining = setup_deadline.saturating_duration_since(Instant::now());
         thread::sleep(RETRY_DELAY.min(remaining));
     }
-}
-
-fn verify_broker_connection(client: &mut Client) -> Result<()> {
-    let handle = client
-        .create_event()
-        .context("broker event create verification failed")?;
-    let outcome = client
-        .wait_event(handle)
-        .context("broker event wait verification failed")?;
-    ensure!(
-        outcome == WaitOutcome::WouldBlock(ReadinessState::new(false, 0)),
-        "new broker event had unexpected wait outcome: {outcome:?}"
-    );
-
-    let readiness = client
-        .signal_event(handle)
-        .context("broker event signal verification failed")?;
-    ensure!(
-        readiness == ReadinessState::new(true, 1),
-        "broker event signal returned unexpected readiness: {readiness:?}"
-    );
-
-    let outcome = client
-        .wait_event(handle)
-        .context("broker event ready-wait verification failed")?;
-    ensure!(
-        outcome == WaitOutcome::Ready(readiness),
-        "signaled broker event had unexpected wait outcome: {outcome:?}"
-    );
-    Ok(())
 }
