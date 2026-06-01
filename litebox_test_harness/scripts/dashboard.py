@@ -11,7 +11,8 @@ Subcommands (stdlib only — no third-party deps):
     dashboard.py untrack <ref>                   # remove a tracked ref
     dashboard.py refs                            # list tracked refs
     dashboard.py auto [--interval SECS]          # autonomous fill driver
-    dashboard.py stop                            # stop the auto driver + reap descendants
+    dashboard.py drain [--wait]                  # graceful shutdown (SIGUSR1; current cycle finishes)
+    dashboard.py stop                            # hard stop: reap cargo + harness + containers
 
 The autonomous `auto` driver iterates round-robin over the rows in
 the `tracked_refs` table. For each ref it does:
@@ -28,6 +29,53 @@ Bootstrap a tracked ref:
 
     git worktree add --detach /path/to/litebox-ci origin/<branch>
     dashboard.py track origin/<branch> /path/to/litebox-ci
+
+──────────────────────────────────────────────────────────────────
+Data model — two tables, two aggregation rules
+──────────────────────────────────────────────────────────────────
+
+The store has two primary tables (see
+`tests/common/dashboard_store.rs` for canonical DDL):
+
+  * `runs`        — one row per **cargo invocation**. Carries
+                    attribution metadata: commit_sha, branch,
+                    worktree_path, dirty_hash, plus rollup
+                    counts (pass_count/fail_count) written
+                    when the cargo process completes.
+  * `run_results` — one row per **trial outcome**
+                    `(run_id, test_id, pass)`. Streamed
+                    continuously as each trial finishes,
+                    carrying its verdict + per-stage timings.
+                    THIS is the primary signal everything
+                    aggregates over.
+
+`pass` (native | litebox) is a separate column from `test_id`;
+the aggregation unit throughout the renderer is `(test_id, pass)`.
+
+**Every renderer aggregates the same way:** scope `run_results`
+by `(commit_sha, dirty_hash)` via a JOIN to `runs`, then take
+the freshest verdict per `(test_id, pass)` within that state.
+That's "state-scoped freshest" — class-2 retries (a test that
+failed then recovered at the same sha) are counted as one pass,
+not pass+fail.
+
+The `latest_results` VIEW (globally-freshest per (test_id, pass)
+across all shas) is defined in the schema but **no longer used**
+by this renderer — it could contaminate today's view with stale
+verdicts from old commits. Left defined for now; removable in a
+future schema bump.
+
+`runs.pass_count` / `fail_count` (per-cargo-invocation rollups)
+are NOT a source of truth for any verdict count — they were
+the source of the misleading `0→3941` sparkline artefact when
+a partial cycle wrote `pass_count=0`. The only places `runs`
+is used for *summary* (not attribution) are:
+
+  * `_render_recent_runs` — "what cycles ran where" (legit
+    time-ordered table).
+  * `_render_velocity` — "N runs in 24h" (loose time pulse).
+
+Every other renderer uses per-state freshest semantics.
 """
 
 from __future__ import annotations
@@ -47,11 +95,6 @@ from typing import Iterable, Optional
 
 SCHEMA_VERSION_EXPECTED = 3
 DEFAULT_FILL_BATCH = 300
-
-# Container-name salt prefix the harness uses
-# (see tests/integration.rs build of container_name: "litebox-{pass}-{tid}-{harness_pid}-{nanos}").
-# We sweep by `litebox-*-{harness_pid}-*` on cleanup escalation.
-CONTAINER_NAME_PREFIX = "litebox-"
 
 # Reap timing knobs.
 _PGID_SIGTERM_GRACE_SECS = 10
@@ -175,22 +218,46 @@ def short_sha(sha: Optional[str]) -> str:
     return (sha or "?")[:8]
 
 
+def _branch_display(branch: Optional[str]) -> str:
+    """Normalize stale `runs.branch="HEAD"` sentinel values for
+    display. Pre-fix producer wrote the literal string "HEAD" for
+    any detached-HEAD worktree (most CI runs), so already-recorded
+    rows have `branch="HEAD"`. Render those as `<detached>` so the
+    table doesn't pretend "HEAD" is a real branch name.
+    """
+    if branch is None or branch == "":
+        return "—"
+    if branch == "HEAD":
+        return "<detached>"
+    return branch
+
+
 # ─── Trend helpers ───────────────────────────────────────────────────
 
 
 def state_verdicts(
     conn: sqlite3.Connection, commit_sha: str, dirty_hash: Optional[str],
+    worktree_path: Optional[str] = None,
 ) -> dict[tuple[str, str], str]:
     """Return `{(test_id, pass): verdict}` for the freshest verdict
-    per (test_id, pass) at this `(commit_sha, dirty_hash)` state.
+    per (test_id, pass) at this state.
+
+    State key shape:
+      * clean: `(commit_sha,)` — all clean rows at this sha collapse
+        regardless of worktree (a clean tree IS the same artifact).
+      * dirty: `(commit_sha, dirty_hash, worktree_path)` — dirty work
+        in two worktrees is materially different even if their
+        tracked diffs happen to collide (untracked files / build
+        artifacts / operational context differ).
+
+    For dirty lookups, callers must pass `worktree_path`; passing
+    None for a dirty state would silently pool dirty rows from all
+    worktrees sharing that diff (the same false-attribution bug
+    that the strict result-groups tag and worktree-scoped
+    dirty-only count guard against).
 
     Handles dirty_hash NULL semantics correctly (`IS NULL` vs `= ?`)
     so a clean-state lookup doesn't accidentally include dirty runs.
-
-    Used by Result groups + Commit-delta rendering. Computing the
-    freshest verdict per (test_id, pass) within a state means counts
-    are always consistent (`cov = pass + fail`, no double-count when
-    the same test ran twice at the same sha with different outcomes).
     """
     if dirty_hash is None:
         sql = (
@@ -199,7 +266,7 @@ def state_verdicts(
             "  JOIN runs r ON r.run_id = rr.run_id "
             " WHERE r.commit_sha = ? AND r.dirty_hash IS NULL"
         )
-        params = (commit_sha,)
+        params: tuple = (commit_sha,)
     else:
         sql = (
             "SELECT rr.test_id, rr.pass, rr.verdict, rr.finished_ts_ms "
@@ -208,6 +275,9 @@ def state_verdicts(
             " WHERE r.commit_sha = ? AND r.dirty_hash = ?"
         )
         params = (commit_sha, dirty_hash)
+        if worktree_path is not None:
+            sql += " AND r.worktree_path = ?"
+            params = (*params, worktree_path)
     freshest: dict[tuple[str, str], tuple[str, int]] = {}
     for r in conn.execute(sql, params):
         key = (r["test_id"], r["pass"])
@@ -429,7 +499,9 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
                 conn, head_sha, pass_name
             )
             total = per_pass_universe.get(pass_name) or (universe_n // 2 if universe_n else 0)
-            dirty_extra = _dirty_only_coverage(conn, head_sha, pass_name)
+            dirty_extra = _dirty_only_coverage(
+                conn, head_sha, pass_name, ci_wt
+            )
             cov_cell = (
                 f"{covered} (+{dirty_extra} dirty)"
                 if dirty_extra else str(covered)
@@ -454,11 +526,18 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
         "pass-only tests, e.g. litebox-only `copilot::tui.*`). "
         "`cov` = test_ids with a verdict at **this** sha (clean only). "
         "`+N dirty` next to `cov` = test_ids with sha-matching rows "
-        "from sessions with uncommitted changes (clean re-run would "
-        "likely add them to `cov` immediately). "
+        "from this tracked ref's own worktree with uncommitted "
+        "changes (almost always 0 for a checkout-only `ci_worktree`; "
+        "non-zero would mean someone edited files in the tracked "
+        "worktree itself — a clean re-run there would add them to "
+        "`cov`). Dirty work from sibling worktrees on the same sha "
+        "is **not** counted here — that bookkeeping belongs to those "
+        "worktrees, not to the tracked ref. "
         "`known − cov − dirty` = tests in the historical universe "
-        "that this sha hasn't run at all (e.g. extra-cost classes "
-        "off by default, or copilot trials in token-less envs)._"
+        "this sha hasn't run cleanly in this worktree (e.g. "
+        "extra-cost classes off by default, copilot trials in "
+        "token-less envs, or tests so far only seen in other "
+        "worktrees' dirty work)._"
     )
     return "\n".join(lines) + "\n"
 
@@ -466,20 +545,55 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
 def _coverage_sparkline_for_worktree(
     conn: sqlite3.Connection, ci_worktree: str, n: int = 10,
 ) -> str:
-    """Per-tracked-ref coverage trend: last `n` clean runs from this
-    CI worktree, plotted as a unicode sparkline of pass_count. Tells
-    you "are we going up, flat, or falling" without needing a chart.
+    """Per-tracked-ref coverage trend: pass-counts at successive
+    clean `(commit_sha)` cycles observed from this CI worktree,
+    derived from `run_results` (per-trial signal) rather than
+    `runs.pass_count` (per-cargo-invocation summary that can
+    bake in a 0 from a half-finished cycle).
+
+    A "cycle" here is a distinct `commit_sha` produced by this
+    worktree, clean state only. For each such sha we count
+    distinct test_ids whose freshest verdict (within that sha,
+    this worktree, clean) is `pass`. Last `n` cycles
+    chronological.
     """
-    rows = conn.execute(
-        "SELECT pass_count FROM runs"
-        " WHERE worktree_path = ? AND dirty_hash IS NULL"
-        "   AND pass_count IS NOT NULL"
-        " ORDER BY started_ts_ms DESC LIMIT ?",
+    sha_rows = conn.execute(
+        """
+        SELECT r.commit_sha, MAX(rr.finished_ts_ms) AS newest_ms
+          FROM run_results rr
+          JOIN runs r ON r.run_id = rr.run_id
+         WHERE r.worktree_path = ? AND r.dirty_hash IS NULL
+         GROUP BY r.commit_sha
+         ORDER BY newest_ms DESC
+         LIMIT ?
+        """,
         (ci_worktree, n),
     ).fetchall()
-    values = [r[0] for r in reversed(rows)]  # chronological for display
-    if not values:
+    if not sha_rows:
         return ""
+    shas = [r["commit_sha"] for r in reversed(sha_rows)]  # chronological
+    values: list[int] = []
+    for sha in shas:
+        n_pass = conn.execute(
+            """
+            WITH freshest AS (
+                SELECT rr.test_id, rr.pass, rr.verdict,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY rr.test_id, rr.pass
+                           ORDER BY rr.finished_ts_ms DESC
+                       ) AS rn
+                  FROM run_results rr
+                  JOIN runs r ON r.run_id = rr.run_id
+                 WHERE r.commit_sha = ?
+                   AND r.worktree_path = ?
+                   AND r.dirty_hash IS NULL
+            )
+            SELECT COUNT(*) FROM freshest
+             WHERE rn = 1 AND verdict = 'pass'
+            """,
+            (sha, ci_worktree),
+        ).fetchone()[0] or 0
+        values.append(n_pass)
     return f"{sparkline(values)}  {values[0]}→{values[-1]}"
 
 
@@ -558,17 +672,24 @@ def _coverage_pass_fail(
 
 def _dirty_only_coverage(
     conn: sqlite3.Connection, commit_sha: str, pass_name: str,
+    worktree_path: str,
 ) -> int:
     """Return the count of test_ids that have a `dirty_hash IS NOT
-    NULL` row at this sha but NO `dirty_hash IS NULL` row at the
-    same sha. These represent evidence-from-dirty-sessions that the
-    clean `cov` column intentionally hides.
+    NULL` row at this sha **in this worktree** but NO `dirty_hash IS
+    NULL` row at the same (sha, worktree). These represent
+    evidence-from-dirty-sessions-here that the clean `cov` column
+    intentionally hides.
 
     A non-zero return is a signal that running the suite clean
     (e.g. via the supervisor's `--fill`) would likely add these to
     `cov` immediately. Surfaces "we have evidence at this sha, but
     only from sessions with uncommitted changes" — so the user can
     tell apart "untested" gaps from "tested-dirty" gaps.
+
+    Scoped to `worktree_path` so a sibling worktree sitting on the
+    same commit_sha with WIP doesn't get attributed to this tracked
+    ref — same false-attribution shape the tracked-ref tag in
+    result-groups guards against.
     """
     row = conn.execute(
         """
@@ -577,6 +698,7 @@ def _dirty_only_coverage(
               FROM run_results rr
               JOIN runs r ON r.run_id = rr.run_id
              WHERE r.commit_sha = ? AND r.dirty_hash IS NOT NULL
+               AND r.worktree_path = ?
                AND rr.pass = ?
         ),
         clean_ids AS (
@@ -584,19 +706,32 @@ def _dirty_only_coverage(
               FROM run_results rr
               JOIN runs r ON r.run_id = rr.run_id
              WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
+               AND r.worktree_path = ?
                AND rr.pass = ?
         )
         SELECT COUNT(*) FROM dirty_ids
          WHERE test_id NOT IN (SELECT test_id FROM clean_ids)
         """,
-        (commit_sha, pass_name, commit_sha, pass_name),
+        (commit_sha, worktree_path, pass_name,
+         commit_sha, worktree_path, pass_name),
     ).fetchone()
     return (row[0] if row else 0) or 0
 
 
 def _last_run_age_for_ci_worktree(conn: sqlite3.Connection, wt: str) -> str:
+    # Read from run_results, not runs, so the displayed "age" reflects
+    # the most recent individual test completion — not the most recent
+    # cargo-invocation completion. The supervisor doesn't write a
+    # `runs` row until the whole cargo cycle ends (which can be 10+
+    # min), so anchoring the headline on `runs` makes the dashboard
+    # look idle while tests are actively streaming results in. The
+    # user's intuition is "Pass = how recently did anything happen
+    # here," and that's a `run_results` question.
     row = conn.execute(
-        "SELECT MAX(finished_ts_ms) FROM runs WHERE worktree_path = ?",
+        "SELECT MAX(rr.finished_ts_ms)"
+        "  FROM run_results rr"
+        "  JOIN runs r ON r.run_id = rr.run_id"
+        " WHERE r.worktree_path = ?",
         (wt,),
     ).fetchone()
     if not row or row[0] is None:
@@ -616,43 +751,65 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
 
     Sorted newest-first so the current state is on top.
     """
-    # Discover all (commit_sha, dirty_hash) states + their newest_ms
-    # and contributing worktrees.
+    # Discover all states + their newest_ms and contributing
+    # branches. Grouping key:
+    #   clean: (commit_sha,)            — collapse all worktrees
+    #   dirty: (commit_sha, dirty_hash, worktree_path)
+    # The CASE expression makes worktree_path part of the key only
+    # when the row is dirty, so clean rows from multiple worktrees
+    # still collapse to one state (a clean tree at a sha IS the
+    # same artifact) but dirty work in worktree A vs worktree B is
+    # kept distinct even if their tracked diffs happen to collide.
     state_rows = conn.execute(
         """
         SELECT r.commit_sha, r.dirty_hash,
+               CASE WHEN r.dirty_hash IS NULL
+                    THEN NULL ELSE r.worktree_path END AS state_wt,
                MAX(rr.finished_ts_ms) AS newest_ms,
-               GROUP_CONCAT(DISTINCT r.worktree_path) AS worktrees
+               GROUP_CONCAT(DISTINCT r.worktree_path) AS worktrees,
+               GROUP_CONCAT(DISTINCT r.branch)        AS branches
           FROM run_results rr
           JOIN runs r ON r.run_id = rr.run_id
-         GROUP BY r.commit_sha, r.dirty_hash
+         GROUP BY r.commit_sha, r.dirty_hash,
+                  CASE WHEN r.dirty_hash IS NULL
+                       THEN NULL ELSE r.worktree_path END
         """
     ).fetchall()
     if not state_rows:
         return ""
 
-    # Build the per-state verdicts dict once per (sha, dirty_hash).
+    # Build the per-state verdicts dict once per state key.
     # Use freshest-per-(test_id, pass)-within-state semantics so
     # counts and delta computations agree.
-    states: dict[tuple[str, Optional[str]], dict] = {}
+    states: dict[tuple[str, Optional[str], Optional[str]], dict] = {}
     for r in state_rows:
-        key = (r["commit_sha"], r["dirty_hash"])
-        verdicts = state_verdicts(conn, r["commit_sha"], r["dirty_hash"])
+        key = (r["commit_sha"], r["dirty_hash"], r["state_wt"])
+        verdicts = state_verdicts(
+            conn, r["commit_sha"], r["dirty_hash"], r["state_wt"]
+        )
         states[key] = {
             "newest_ms": r["newest_ms"] or 0,
+            "worktree_path": r["state_wt"],
             "worktrees": set(
                 w for w in (r["worktrees"] or "").split(",") if w
+            ),
+            "branches": set(
+                b for b in (r["branches"] or "").split(",") if b
             ),
             "verdicts": verdicts,
         }
 
-    # Tracked-ref overlay so the table can mark which partitions are
-    # produced by the autonomous driver vs ad-hoc / agent runs.
-    tracked: dict[str, str] = {}  # commit_sha → ref label
+    # Tracked-ref overlay: a row gets tagged with the tracked ref's
+    # label only when the row's worktree matches the tracked ref's
+    # `ci_worktree` AND the row is clean. Otherwise a different
+    # worktree (e.g. an agent session) that happens to be checked
+    # out at the same commit_sha as a tracked ref would inherit the
+    # ref's tag and falsely implicate it in unrelated dirty work.
+    tracked_by_sha: dict[str, tuple[str, str]] = {}  # sha → (ref, ci_worktree)
     for r in conn.execute("SELECT ref, ci_worktree FROM tracked_refs"):
         head = _git_head(r["ci_worktree"])
         if head:
-            tracked[head] = r["ref"]
+            tracked_by_sha[head] = (r["ref"], r["ci_worktree"])
 
     universe = conn.execute(
         "SELECT universe_size FROM runs WHERE universe_size IS NOT NULL"
@@ -676,17 +833,17 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
 
     now = now_ms()
     lines = ["## Result groups (per commit × dirty-state)\n",
-             "| Tracked ref | Sha | Dirty | Worktree(s) "
+             "| Tracked ref | Sha | Dirty | Branch(es) | Worktree(s) | Path(s) "
              "| native known | native cov | native pass | native fail "
              "| litebox known | litebox cov | litebox pass | litebox fail "
              "| Newest | Δ vs prior |",
-             "|---|---|---|---"
+             "|---|---|---|---|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|---|---|"]
 
     # Sort newest-first; for each row, the "prior" state is the
     # next entry in the list (one older in time).
-    ordered: list[tuple[tuple[str, Optional[str]], dict]] = sorted(
+    ordered: list[tuple[tuple[str, Optional[str], Optional[str]], dict]] = sorted(
         states.items(), key=lambda kv: kv[1]["newest_ms"], reverse=True
     )
 
@@ -697,9 +854,9 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     # LITEBOX_DASHBOARD_DIRTY_MIN_COV=N (set to 0 to disable filtering).
     dirty_min_cov = int(os.environ.get("LITEBOX_DASHBOARD_DIRTY_MIN_COV", "10"))
     hidden = 0
-    visible: list[tuple[tuple[str, Optional[str]], dict]] = []
+    visible: list[tuple[tuple[str, Optional[str], Optional[str]], dict]] = []
     for entry in ordered:
-        (_sha, dirty_hash), g = entry
+        (_sha, dirty_hash, _wt), g = entry
         if dirty_hash and dirty_min_cov > 0:
             max_cov = max(
                 _counts_from_verdicts(g["verdicts"], p)[0]
@@ -710,12 +867,23 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
                 continue
         visible.append(entry)
 
-    for i, ((sha, dirty_hash), g) in enumerate(visible):
-        tag = f"_{tracked[sha]}_" if sha in tracked else ""
+    for i, ((sha, dirty_hash, _state_wt), g) in enumerate(visible):
+        # Tag only when this row's worktree IS the tracked ref's
+        # ci_worktree AND the row is clean. Bare sha-match would
+        # falsely attribute another worktree's (dirty) work to the
+        # tracked ref just because both are sitting on the same
+        # commit.
+        tag = ""
+        if sha in tracked_by_sha and dirty_hash is None:
+            ref_name, ci_wt = tracked_by_sha[sha]
+            if ci_wt in g["worktrees"]:
+                tag = f"_{ref_name}_"
         dirty = "⚠" if dirty_hash else ""
         wt_short = ", ".join(
             sorted(os.path.basename(w) for w in g["worktrees"])
         )
+        wt_paths = ", ".join(f"`{w}`" for w in sorted(g["worktrees"]))
+        branches = ", ".join(f"`{_branch_display(b)}`" for b in sorted(g["branches"])) or "—"
         cells: list[str] = []
         for pass_name in ("native", "litebox"):
             cov, n_pass, n_fail = _counts_from_verdicts(g["verdicts"], pass_name)
@@ -740,7 +908,8 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
         else:
             delta = "_(oldest)_"
         lines.append(
-            f"| {tag} | `{short_sha(sha)}` | {dirty} | `{wt_short}` | "
+            f"| {tag} | `{short_sha(sha)}` | {dirty} | "
+            f"{branches} | `{wt_short}` | {wt_paths} | "
             + " | ".join(cells) + f" | {age} | {delta} |"
         )
     if hidden:
@@ -781,172 +950,313 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
     producer reads them straight from the in-process registry, so we
     no longer need cross-row fallback or prefix-map inference here.
     """
-    from collections import defaultdict
-    per_bucket_pass: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
-        lambda: {"covered": 0, "pass": 0, "fail": 0}
+def _top_n_states(
+    conn: sqlite3.Connection, n: int = 5,
+) -> list[dict]:
+    """Return the top-N states (newest first), with their newest_ms
+    + contributing branches/worktrees. State key shape:
+
+      * clean: `(commit_sha,)`            — collapse all worktrees
+      * dirty: `(commit_sha, dirty_hash, worktree_path)`
+
+    Honors `LITEBOX_DASHBOARD_DIRTY_MIN_COV` so trivial ad-hoc dev
+    partitions don't crowd out real states.
+
+    Each returned dict has: commit_sha, dirty_hash (None for
+    clean), worktree_path (None for clean; the state-defining
+    worktree when dirty), newest_ms, branches (set), worktrees
+    (set — same single value when dirty, possibly multiple when
+    clean).
+    """
+    raw = conn.execute(
+        """
+        SELECT r.commit_sha, r.dirty_hash,
+               CASE WHEN r.dirty_hash IS NULL
+                    THEN NULL ELSE r.worktree_path END AS state_wt,
+               MAX(rr.finished_ts_ms) AS newest_ms,
+               GROUP_CONCAT(DISTINCT r.worktree_path) AS worktrees,
+               GROUP_CONCAT(DISTINCT r.branch)        AS branches
+          FROM run_results rr
+          JOIN runs r ON r.run_id = rr.run_id
+         GROUP BY r.commit_sha, r.dirty_hash,
+                  CASE WHEN r.dirty_hash IS NULL
+                       THEN NULL ELSE r.worktree_path END
+         ORDER BY newest_ms DESC
+        """
+    ).fetchall()
+    dirty_min_cov = int(
+        os.environ.get("LITEBOX_DASHBOARD_DIRTY_MIN_COV", "10")
     )
-    per_bucket_ids: dict[tuple[str, str], set] = defaultdict(set)
+    out: list[dict] = []
+    for r in raw:
+        sha = r["commit_sha"]
+        dirty_hash = r["dirty_hash"]
+        state_wt = r["state_wt"]
+        if dirty_hash and dirty_min_cov > 0:
+            verdicts = state_verdicts(conn, sha, dirty_hash, state_wt)
+            max_cov = max(
+                _counts_from_verdicts(verdicts, p)[0]
+                for p in ("native", "litebox")
+            )
+            if max_cov < dirty_min_cov:
+                continue
+        out.append({
+            "commit_sha": sha,
+            "dirty_hash": dirty_hash,
+            "worktree_path": state_wt,
+            "newest_ms": r["newest_ms"] or 0,
+            "branches": set(
+                b for b in (r["branches"] or "").split(",") if b
+            ),
+            "worktrees": set(
+                w for w in (r["worktrees"] or "").split(",") if w
+            ),
+        })
+        if len(out) >= n:
+            break
+    return out
+
+
+def _format_state_header(state: dict, now: int) -> str:
+    """`### sha=... · branch=... · worktree=... (path) · clean|dirty=... · (newest <age> ago)`"""
+    sha = short_sha(state["commit_sha"])
+    branches = (
+        ",".join(_branch_display(b) for b in sorted(state["branches"]))
+        if state["branches"] else "—"
+    )
+    wts = sorted(state["worktrees"])
+    wt_basenames = ",".join(os.path.basename(w) for w in wts) if wts else "—"
+    wt_paths = ",".join(wts) if wts else "—"
+    if state["dirty_hash"]:
+        kind = f"dirty={state['dirty_hash'][:8]}"
+    else:
+        kind = "clean"
+    age = (
+        fmt_age_ms(now - state["newest_ms"])
+        if state["newest_ms"] else "—"
+    )
+    return (
+        f"### sha=`{sha}` · branch=`{branches}` · "
+        f"worktree=`{wt_basenames}` (`{wt_paths}`) · "
+        f"{kind} · (newest {age} ago)"
+    )
+
+
+def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
+    """Per-(suite, group) coverage broken out for the **5 most
+    recent (commit_sha, dirty_hash) states**, each as its own
+    sub-table.
+
+    State-scoped (filtered by sha+dirty THEN freshest per
+    (test_id, pass)) so verdicts from old shas can't contaminate
+    the current view. The headline state may have partial
+    coverage during a long cycle — that's the honest answer;
+    older complete states sit below for context.
+
+    Total = observed universe per (suite, group) across ALL
+    history — a stable denominator so a half-finished cycle
+    doesn't make the totals shrink. The producer doesn't carry
+    a per-suite universe count.
+
+    Schema v3+: suite/group are NOT NULL on `run_results`.
+    """
+    from collections import defaultdict
+
+    # Per-(suite,group) universe is global (across all states)
+    # so denominators are stable across the stacked sub-tables.
+    bucket_universe: dict[tuple[str, str], set] = defaultdict(set)
     for r in conn.execute(
-        'SELECT test_id, pass, verdict, suite, "group" FROM latest_results'
+        'SELECT DISTINCT test_id, suite, "group" FROM run_results'
     ):
-        suite = r["suite"]
-        group = r["group"]
-        key = (suite, group, r["pass"])
-        per_bucket_pass[key]["covered"] += 1
-        if r["verdict"] == "pass":
-            per_bucket_pass[key]["pass"] += 1
-        else:
-            per_bucket_pass[key]["fail"] += 1
-        per_bucket_ids[(suite, group)].add(r["test_id"])
-    if not per_bucket_pass:
+        bucket_universe[(r["suite"], r["group"])].add(r["test_id"])
+    if not bucket_universe:
         return ""
 
-    totals = {k: len(v) for k, v in per_bucket_ids.items()}
-    buckets: dict[tuple[str, str], dict] = {}
-    for (suite, group, pass_name), counts in per_bucket_pass.items():
-        b = buckets.setdefault(
-            (suite, group),
-            {"native": (0, 0, 0), "litebox": (0, 0, 0)},
-        )
-        b[pass_name] = (counts["covered"], counts["pass"], counts["fail"])
+    states = _top_n_states(conn, n=5)
+    if not states:
+        return ""
 
-    lines = ["## By suite × group (observed universe)\n",
-             "| Suite | Group "
-             "| native total | native cov | native pass | native fail "
-             "| litebox total | litebox cov | litebox pass | litebox fail |",
-             "|---|---"
-             "|---:|---:|---:|---:"
-             "|---:|---:|---:|---:|"]
-    for (suite, group), b in sorted(buckets.items()):
-        total = totals.get((suite, group), 0)
-        cells: list[str] = []
-        for pass_name in ("native", "litebox"):
-            cov, p, f = b[pass_name]
-            cells.extend([str(total), str(cov), str(p), str(f)])
-        lines.append(f"| {suite} | {group} | " + " | ".join(cells) + " |")
-    return "\n".join(lines) + "\n"
+    now = now_ms()
+    out_lines = ["## By suite × group (per state, 5 most recent)\n",
+                 "_Total = distinct test_ids ever observed per (suite, "
+                 "group). Cov/pass/fail = freshest verdict per "
+                 "(test_id, pass) within this state._\n"]
+    for state in states:
+        out_lines.append(_format_state_header(state, now))
+        verdicts = state_verdicts(
+            conn, state["commit_sha"], state["dirty_hash"],
+            state["worktree_path"],
+        )
+        # Bucket verdicts by (suite, group, pass).
+        # state_verdicts gives {(test_id, pass): verdict}; we need
+        # the test_id's (suite, group) too. Pull from run_results
+        # (any row will do — suite/group are per-test invariants).
+        suite_for: dict[str, tuple[str, str]] = {}
+        for r in conn.execute(
+            'SELECT DISTINCT test_id, suite, "group" FROM run_results'
+        ):
+            suite_for[r["test_id"]] = (r["suite"], r["group"])
+
+        per: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
+            lambda: {"covered": 0, "pass": 0, "fail": 0}
+        )
+        for (test_id, pass_name), verdict in verdicts.items():
+            sg = suite_for.get(test_id)
+            if sg is None:
+                continue
+            key = (sg[0], sg[1], pass_name)
+            per[key]["covered"] += 1
+            if verdict == "pass":
+                per[key]["pass"] += 1
+            else:
+                per[key]["fail"] += 1
+
+        if not per:
+            out_lines.append("\n_No coverage at this state yet._\n")
+            continue
+
+        buckets: dict[tuple[str, str], dict] = {}
+        for (suite, group, pass_name), counts in per.items():
+            b = buckets.setdefault(
+                (suite, group),
+                {"native": (0, 0, 0), "litebox": (0, 0, 0)},
+            )
+            b[pass_name] = (
+                counts["covered"], counts["pass"], counts["fail"],
+            )
+
+        out_lines.append(
+            "\n| Suite | Group "
+            "| native total | native cov | native pass | native fail "
+            "| litebox total | litebox cov | litebox pass | litebox fail |"
+        )
+        out_lines.append(
+            "|---|---"
+            "|---:|---:|---:|---:"
+            "|---:|---:|---:|---:|"
+        )
+        for (suite, group), b in sorted(buckets.items()):
+            total = len(bucket_universe.get((suite, group), set()))
+            cells: list[str] = []
+            for pass_name in ("native", "litebox"):
+                cov, p, f = b[pass_name]
+                cells.extend([str(total), str(cov), str(p), str(f)])
+            out_lines.append(
+                f"| {suite} | {group} | " + " | ".join(cells) + " |"
+            )
+        out_lines.append("")
+    return "\n".join(out_lines) + "\n"
 
 
 def _render_current_fails(conn: sqlite3.Connection) -> str:
-    """Tests currently FAILING at any active worktree's current head.
+    """FAILs at the 5 most recent `(commit_sha, dirty_hash)`
+    states, each as its own sub-table. Cross-state recurrence
+    `[k/N]` annotates how many of the 5 visible states this
+    test failed in — separates durable fails from transient
+    ones.
 
-    "Current head" is:
-      * Tracked refs: `git rev-parse <ref>` (canonical, authoritative).
-      * Non-tracked worktrees: the commit_sha of that worktree's
-        most-recent run in the last 24 h (best inference — we
-        can't read non-tracked worktrees' git state).
-
-    Filters out **stale-old-sha** fails (worktree has produced
-    newer runs at a different sha — the old fail isn't actionable
-    because the worktree has moved on) while keeping
-    **actively-failing-on-someone's-branch** fails.
-
-    Tracked-ref fails are clearly the canonical CI signal; the
-    non-tracked rows are tagged `_(non-tracked)_` so they're
-    visually distinguishable. Both are useful: tracked tells you
-    "is canonical CI green?", non-tracked tells you "what is
-    another active session currently hitting?".
-
-    A test with mixed last-10 history (both ✓ and ✗) is tagged
-    `_(flaky)_` so flakes are distinguishable from fresh
-    regressions at a glance.
+    Per-state freshest-verdict-per-(test_id, pass) semantics so
+    a retry that passed at the same sha gets counted as a pass,
+    not a fail. A test with mixed last-10 verdicts (both ✓ and
+    ✗ globally) is marked `_(flaky)_`.
     """
-    # Tracked refs: authoritative via on-disk git.
-    tracked: dict[str, str] = {}  # worktree_path → ref label
-    tracked_shas: dict[str, str] = {}  # worktree_path → current sha
-    for r in conn.execute("SELECT ref, ci_worktree FROM tracked_refs"):
-        sha = _git_head(r["ci_worktree"])
-        if sha:
-            tracked[r["ci_worktree"]] = r["ref"]
-            tracked_shas[r["ci_worktree"]] = sha
+    states = _top_n_states(conn, n=5)
+    if not states:
+        return "## Current FAILs\n\n_No states._\n"
 
-    # Non-tracked worktrees: infer current sha from most recent run.
-    # Limit to last 24 h so abandoned worktrees fall off.
-    now = now_ms()
-    cutoff = now - 24 * 3600 * 1000
-    worktree_shas: dict[str, str] = dict(tracked_shas)
-    for r in conn.execute(
-        "SELECT worktree_path, commit_sha FROM runs WHERE started_ts_ms > ? "
-        "AND (worktree_path, started_ts_ms) IN "
-        "  (SELECT worktree_path, MAX(started_ts_ms) FROM runs "
-        "    WHERE started_ts_ms > ? GROUP BY worktree_path)",
-        (cutoff, cutoff),
-    ):
-        wt = r["worktree_path"]
-        if wt and wt not in worktree_shas and r["commit_sha"]:
-            worktree_shas[wt] = r["commit_sha"]
-
-    if not worktree_shas:
-        return "## Current FAILs\n\n_None._\n"
-
-    # For each (worktree, current_sha) pair, find tests whose
-    # freshest verdict at that (clean) state is non-pass.
-    # Dedupe per (test_id, pass, worktree) so the same test
-    # failing on multiple worktrees shows once per worktree.
-    out_rows: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
-    for wt, sha in worktree_shas.items():
-        for r in conn.execute(
-            """
-            SELECT rr.test_id, rr.pass, rr.verdict, rr.suite, rr."group",
-                   rr.finished_ts_ms, r.commit_sha, r.dirty_hash, r.worktree_path
-              FROM run_results rr
-              JOIN runs r ON r.run_id = rr.run_id
-             WHERE r.commit_sha = ?
-               AND r.worktree_path = ?
-               AND r.dirty_hash IS NULL
-               AND (rr.test_id, rr.pass, rr.finished_ts_ms) IN (
-                    SELECT rr2.test_id, rr2.pass, MAX(rr2.finished_ts_ms)
-                      FROM run_results rr2
-                      JOIN runs r2 ON r2.run_id = rr2.run_id
-                     WHERE r2.commit_sha = ?
-                       AND r2.worktree_path = ?
-                       AND r2.dirty_hash IS NULL
-                     GROUP BY rr2.test_id, rr2.pass
-                   )
-               AND rr.verdict <> 'pass'
-            """,
-            (sha, wt, sha, wt),
-        ):
-            key = (r["test_id"], r["pass"], wt)
-            if key in seen:
-                continue
-            seen.add(key)
-            out_rows.append(dict(r))
-
-    if not out_rows:
-        return "## Current FAILs\n\n_None at any active worktree's current head._\n"
-    out_rows.sort(
-        key=lambda r: (r["pass"], r["suite"], r["group"], r["test_id"], r["worktree_path"])
-    )
-
-    n_tracked = len(tracked_shas)
-    n_other = len(worktree_shas) - n_tracked
-    intro = (
-        f"_Freshest verdict at each worktree's current head (clean). "
-        f"{n_tracked} tracked + {n_other} non-tracked worktree(s) "
-        f"active in last 24 h. Stale fails from older shas "
-        f"(worktree has moved on) are excluded._\n"
-    )
-    lines = ["## Current FAILs\n",
-             intro,
-             "| Pass | Suite | Group | Test | Worktree | Sha | Dirty "
-             "| Last 10 | Age |",
-             "|---|---|---|---|---|---|---:|---|---|"]
-    for r in out_rows:
-        dirty = "⚠" if r["dirty_hash"] else ""
-        wt_short = os.path.basename(r["worktree_path"] or "?")
-        tracked_marker = "" if r["worktree_path"] in tracked else " _(non-tracked)_"
-        history = _verdict_history(conn, r["test_id"], r["pass"], n=10)
-        flaky = ("✓" in history) and ("✗" in history)
-        flaky_marker = " _(flaky)_" if flaky else ""
-        lines.append(
-            f"| `{r['pass']}` | {r['suite']} | {r['group']} | "
-            f"`{r['test_id']}`{flaky_marker} | "
-            f"`{wt_short}`{tracked_marker} | "
-            f"`{short_sha(r['commit_sha'])}` | {dirty} | "
-            f"`{history}` | {fmt_age_ms(now - r['finished_ts_ms'])} |"
+    # Per-state failing (test_id, pass) sets, for cross-state
+    # recurrence annotation.
+    fail_sets: list[set[tuple[str, str]]] = []
+    per_state_verdicts: list[dict] = []
+    for s in states:
+        v = state_verdicts(
+            conn, s["commit_sha"], s["dirty_hash"], s["worktree_path"]
         )
+        per_state_verdicts.append(v)
+        fail_sets.append(
+            {k for k, verdict in v.items() if verdict != "pass"}
+        )
+
+    if all(not fs for fs in fail_sets):
+        return (
+            "## Current FAILs\n\n"
+            "_No FAILs in any of the 5 most recent states._\n"
+        )
+
+    # test_id → (suite, group), pulled once.
+    suite_for: dict[str, tuple[str, str]] = {}
+    for r in conn.execute(
+        'SELECT DISTINCT test_id, suite, "group" FROM run_results'
+    ):
+        suite_for[r["test_id"]] = (r["suite"], r["group"])
+
+    # test_id → finished_ts_ms per state for age column. Pull
+    # once via a scoped query for each state.
+    now = now_ms()
+    lines = ["## Current FAILs (per state, 5 most recent)\n",
+             "_Cross-state recurrence `[k/N]` = failed in k of "
+             "the N visible states. `_(flaky)_` = global last-10 "
+             "history has both ✓ and ✗._\n"]
+    n_states = len(states)
+    for idx, state in enumerate(states):
+        lines.append(_format_state_header(state, now))
+        fails = fail_sets[idx]
+        if not fails:
+            lines.append("\n_No FAILs at this state._\n")
+            continue
+        # Per-test ts at this state for the Age column.
+        ts_for: dict[tuple[str, str], int] = {}
+        if state["dirty_hash"] is None:
+            ts_rows = conn.execute(
+                "SELECT rr.test_id, rr.pass, MAX(rr.finished_ts_ms) AS ts "
+                "  FROM run_results rr "
+                "  JOIN runs r ON r.run_id = rr.run_id "
+                " WHERE r.commit_sha = ? AND r.dirty_hash IS NULL "
+                " GROUP BY rr.test_id, rr.pass",
+                (state["commit_sha"],),
+            ).fetchall()
+        else:
+            # Match state_verdicts' state-scope semantics: a dirty
+            # state is (sha, dirty_hash, worktree_path), so the Age
+            # column must read only from that worktree's dirty rows.
+            ts_rows = conn.execute(
+                "SELECT rr.test_id, rr.pass, MAX(rr.finished_ts_ms) AS ts "
+                "  FROM run_results rr "
+                "  JOIN runs r ON r.run_id = rr.run_id "
+                " WHERE r.commit_sha = ? AND r.dirty_hash = ? "
+                "   AND r.worktree_path = ? "
+                " GROUP BY rr.test_id, rr.pass",
+                (state["commit_sha"], state["dirty_hash"],
+                 state["worktree_path"]),
+            ).fetchall()
+        for r in ts_rows:
+            ts_for[(r["test_id"], r["pass"])] = r["ts"] or 0
+
+        lines.append(
+            "\n| Pass | Suite | Group | Test | Verdict | Recurrence "
+            "| Last 10 | Age |"
+        )
+        lines.append("|---|---|---|---|---|---:|---|---|")
+        for (test_id, pass_name) in sorted(
+            fails, key=lambda k: (k[1], suite_for.get(k[0], ("?", "?")), k[0])
+        ):
+            sg = suite_for.get(test_id, ("?", "?"))
+            verdict = per_state_verdicts[idx][(test_id, pass_name)]
+            recur = sum(
+                1 for fs in fail_sets
+                if (test_id, pass_name) in fs
+            )
+            history = _verdict_history(conn, test_id, pass_name, n=10)
+            flaky = ("✓" in history) and ("✗" in history)
+            flaky_marker = " _(flaky)_" if flaky else ""
+            ts = ts_for.get((test_id, pass_name), 0)
+            age = fmt_age_ms(now - ts) if ts else "—"
+            lines.append(
+                f"| `{pass_name}` | {sg[0]} | {sg[1]} | "
+                f"`{test_id}`{flaky_marker} | `{verdict}` | "
+                f"[{recur}/{n_states}] | `{history}` | {age} |"
+            )
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 
@@ -981,7 +1291,7 @@ def _render_recent_runs(conn: sqlite3.Connection) -> str:
     rows = conn.execute(
         """
         SELECT run_id, started_ts_ms, finished_ts_ms, hostname,
-               worktree_path, commit_sha, dirty_hash,
+               worktree_path, branch, commit_sha, dirty_hash,
                pass_count, fail_count, universe_size
           FROM runs
          ORDER BY started_ts_ms DESC
@@ -991,16 +1301,18 @@ def _render_recent_runs(conn: sqlite3.Connection) -> str:
     if not rows:
         return ""
     lines = ["## Recent runs\n",
-             "| # | Started | Worktree | Sha | Dirty | Pass | FAIL | Universe |",
-             "|---|---|---|---|---:|---:|---:|---:|"]
+             "| # | Started | Worktree | Path | Branch | Sha | Dirty | Pass | FAIL | Universe |",
+             "|---|---|---|---|---|---|---:|---:|---:|---:|"]
     now = now_ms()
     for r in rows:
         dirty = "⚠" if r["dirty_hash"] else ""
-        wt_short = os.path.basename(r["worktree_path"] or "?")
+        wt_path = r["worktree_path"] or "?"
+        wt_short = os.path.basename(wt_path)
+        branch = _branch_display(r["branch"])
         age = fmt_age_ms(now - (r["started_ts_ms"] or now))
         lines.append(
-            f"| {r['run_id']} | {age} ago | `{wt_short}` | "
-            f"`{short_sha(r['commit_sha'])}` | {dirty} | "
+            f"| {r['run_id']} | {age} ago | `{wt_short}` | `{wt_path}` | "
+            f"`{branch}` | `{short_sha(r['commit_sha'])}` | {dirty} | "
             f"{r['pass_count'] or 0} | {r['fail_count'] or 0} | "
             f"{r['universe_size'] or '?'} |"
         )
@@ -1200,6 +1512,21 @@ def cmd_auto(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
 
+    # Soft-close: SIGUSR1 sets a flag that the auto-loop checks at
+    # cycle boundaries. The current cargo cycle runs to completion
+    # (so no in-flight trials are killed mid-execution), then the
+    # supervisor exits cleanly. Use `dashboard.py drain` from
+    # another shell to send it without remembering the PID.
+    drain_requested = threading.Event()
+
+    def _drain_handler(_signum, _frame):
+        if not args.quiet:
+            print("[auto] SIGUSR1 received — will exit after current cycle",
+                  file=sys.stderr)
+        drain_requested.set()
+
+    signal.signal(signal.SIGUSR1, _drain_handler)
+
     _write_pidfile(pidfile, supervisor_pid=os.getpid())
 
     # Initial render before the first cycle starts. Re-renders the
@@ -1299,6 +1626,11 @@ def cmd_auto(args: argparse.Namespace) -> int:
             # render-spaced intervals. Just sleep until the next cycle.
             if args.once:
                 return 0
+            if drain_requested.is_set():
+                if not args.quiet:
+                    print("[auto] drain requested — exiting cleanly",
+                          file=sys.stderr)
+                return 0
             time.sleep(args.interval)
     finally:
         freshness_stop.set()
@@ -1368,6 +1700,10 @@ def _drive_ref(
         cargo_args.append(f"--fill={args.cycle_budget_secs}s")
     if args.jobs:
         env["LITEBOX_TEST_JOBS"] = str(args.jobs)
+    # Communicate the tracked ref to the producer so it can record
+    # something more informative than "HEAD" (the detached-state
+    # sentinel) in `runs.branch`. See dashboard_store::insert_run_row.
+    env["LITEBOX_DASHBOARD_REF"] = ref
 
     # Outer wall-time budget: cycle budget + generous grace for
     # cargo's own startup, drain, etc.
@@ -1550,10 +1886,16 @@ def _reap_pgid_and_containers(
 def _sweep_containers(harness_pid: int, *, quiet: bool = False) -> None:
     """`docker rm -f` any container whose name embeds `harness_pid`.
 
-    Container names are `litebox-{pass}-{test_id}-{harness_pid}-{nanos}`
-    (see tests/integration.rs build_docker_cmd), so we filter by the
-    middle salt. We use `docker ps -aq --filter` rather than a glob
-    because docker's name filter is a substring match.
+    Container names are
+    `litebox-{pass}-{test_id}-{harness_pid}-{counter}` for BOTH
+    passes — native trials and litebox trials both run inside
+    docker. The `litebox-` prefix is just brand; the `{pass}`
+    segment is what differs (`native` vs `litebox`). See
+    `tests/common/framework_core::container_name`. We filter by
+    the `-{harness_pid}-` salt so the sweep covers every
+    container this harness spawned, regardless of pass. `docker
+    ps -aq --filter name=...` uses substring matching, which is
+    why the salt is bracketed by dashes for specificity.
     """
     try:
         out = subprocess.run(
@@ -1582,6 +1924,59 @@ def _sweep_containers(harness_pid: int, *, quiet: bool = False) -> None:
 
 
 # ─── stop subcommand ─────────────────────────────────────────────────
+
+
+def cmd_drain(args: argparse.Namespace) -> int:
+    """Ask a running `dashboard.py auto` supervisor to exit cleanly
+    after its current cycle. Sends SIGUSR1, then optionally polls
+    for the supervisor to exit.
+
+    Use this instead of `stop` when you want to deploy a new
+    version of the script without killing in-flight trials. Trials
+    that have already streamed verdicts to `run_results` are
+    persisted; trials still executing when stop is sent would be
+    lost.
+    """
+    state_dir = resolve_state_dir(args.state_dir)
+    pidfile = state_dir / "auto.pidfile"
+    state = _read_pidfile(pidfile)
+    if state is None:
+        print(f"[drain] no pidfile at {pidfile}; nothing to drain",
+              file=sys.stderr)
+        return 0
+    sup = state.get("supervisor_pid")
+    if not sup:
+        print("[drain] pidfile has no supervisor_pid", file=sys.stderr)
+        return 1
+    try:
+        os.kill(sup, signal.SIGUSR1)
+    except ProcessLookupError:
+        print(f"[drain] supervisor {sup} already gone", file=sys.stderr)
+        return 0
+    if not args.quiet:
+        print(f"[drain] SIGUSR1 → supervisor pid {sup}; will exit "
+              f"after current cycle completes", file=sys.stderr)
+    if not args.wait:
+        return 0
+    # Poll until supervisor exits. Cycle budget can be 10-30 min;
+    # don't bound the wait — the user explicitly asked for --wait.
+    if not args.quiet:
+        print("[drain] waiting for supervisor to exit "
+              "(Ctrl-C to detach)…", file=sys.stderr)
+    try:
+        while True:
+            try:
+                os.kill(sup, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("[drain] detached; supervisor will still exit at "
+              "cycle boundary", file=sys.stderr)
+        return 0
+    if not args.quiet:
+        print("[drain] supervisor exited cleanly", file=sys.stderr)
+    return 0
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -1730,6 +2125,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_stop.add_argument("--quiet", "-q", action="store_true")
     p_stop.set_defaults(func=cmd_stop)
+
+    p_drain = sub.add_parser(
+        "drain",
+        help="ask a running `dashboard.py auto` supervisor to exit "
+             "cleanly after its current cargo cycle (SIGUSR1). "
+             "Use this instead of `stop` when redeploying so that "
+             "in-flight trials are not killed.",
+    )
+    p_drain.add_argument("--wait", action="store_true",
+                         help="block until the supervisor exits")
+    p_drain.add_argument("--quiet", "-q", action="store_true")
+    p_drain.set_defaults(func=cmd_drain)
 
     return p
 
