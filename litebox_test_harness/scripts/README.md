@@ -24,6 +24,20 @@ Override:
   **and** the Rust producer — set it consistently)
 - `LITEBOX_DASHBOARD_DIR=""` (empty) — explicit producer opt-out
 
+### Other producer env vars
+
+- `LITEBOX_KEEP_CONTAINER=1` — suppress all framework-side
+  `docker rm` so containers survive for post-mortem `docker exec`.
+  Honored in foreground reap, detached tear-down, signal handler,
+  and the `spawn_drain` watchdog (the cleanup-contract paths above).
+- `LITEBOX_FILL_FAIL_RETRIES=N` (default `3`) — class-2 retry cap
+  for the `--fill` selector. After N attempts at the same clean sha
+  with no pass, the test is considered confirmed-failing and stops
+  being scheduled until the sha changes. Set to `1` to disable
+  retry-confirmation entirely; raise to absorb flakier suites.
+- `LITEBOX_GLOBAL_JOBS=N` (default `nproc`) — see "Cross-session
+  concurrency coordination" below.
+
 ### Subcommands
 
 ```
@@ -70,6 +84,19 @@ the harness `setsid`'d into their own sessions, neither could reach
 the other via `killpg`. So only the supervisor creates a new
 session; the harness stays in cargo's PGID and handles its own
 children via the registry + PDEATHSIG bridge.
+
+**Supervisor crash-resilience.** The per-ref drive loop wraps
+`_drive_ref` in `try/except` with a traceback to stderr, so a
+recoverable per-ref failure (network blip, transient sqlite lock)
+does not kill the supervisor. The `/proc` walk in
+`_pids_in_pgid` catches `FileNotFoundError`, `ProcessLookupError`,
+`PermissionError`, and `OSError` to tolerate the unavoidable race
+between `Path("/proc").iterdir()` and `read_text("/proc/<pid>/stat")`
+when a process exits mid-iteration. The `cleanup::install_signal_handler`
+in the harness calls `dashboard_store::finalize()` before
+`exit(130)`, so even SIGKILL'd cycles (e.g., the outer
+`cycle_budget_secs * 2 + 600` timeout) still stamp
+`runs.pass_count` / `fail_count` correctly.
 
 ### Per-trial container lifecycle: `framework::run_trial`
 
@@ -186,9 +213,27 @@ ref, in round-robin order:
 
 The integration runner's `--fill` flag (in
 `tests/integration.rs::dashboard_store::select_fill_batch`) picks
-up to N trials that have no clean-state result at the current
-`commit_sha`. Producer writes results synchronously via `rusqlite`,
-so coverage advances atomically.
+up to N trials using a two-class selector at the current
+`commit_sha`:
+
+- **Class 1 — uncovered:** no result yet at this sha. Within the
+  band, never-seen test IDs first, then stalest by
+  `latest_results.finished_ts_ms`. Round-robin by suite so no single
+  family monopolizes a batch.
+- **Class 2 — failed-at-sha, retry-capped:** freshest verdict at this
+  sha is fail/timeout/error and `attempts < LITEBOX_FILL_FAIL_RETRIES`
+  (default `3`). Stalest-first. Beyond the cap, treated as a
+  confirmed regression and skipped until the sha changes.
+- **Passing-at-sha** is skipped (clean-sha pass is assumed stable
+  until the sha moves; drift detection would be a future class 3).
+
+Empirically this keeps batches productive on both freshness and
+regression-confirmation: most multi-attempt observations resolve
+within the cap (the flake clears, or the regression confirms), so
+class 2 doesn't dominate.
+
+Producer writes results synchronously via `rusqlite`, so coverage
+advances atomically.
 
 After each full round-trip, the driver re-renders `summary.md`,
 sleeps `--interval` seconds, and repeats.
