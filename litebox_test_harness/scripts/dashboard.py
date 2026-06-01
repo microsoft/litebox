@@ -503,19 +503,32 @@ def _coverage_pass_fail(
     conn: sqlite3.Connection, commit_sha: str, pass_name: str,
 ) -> tuple[int, int, int]:
     """Return (covered_count, n_pass, n_fail) for a (commit_sha, pass).
-    Only counts clean-state runs (dirty_hash IS NULL). Anything that
-    didn't pass (FAIL, no_result, other) is counted as a fail so the
-    invariant `covered = pass + fail` always holds.
+    Only counts clean-state runs (dirty_hash IS NULL). Uses the
+    **freshest** verdict per test_id at this sha (matches
+    latest_results semantics) so the class-2 retry case — a test that
+    failed then recovered at the same sha — is counted as one pass,
+    not as pass+fail. Anything whose freshest verdict isn't 'pass'
+    (FAIL, timeout, error, etc.) counts as a fail, so the invariant
+    `covered = pass + fail` always holds.
     """
     row = conn.execute(
         """
-        SELECT COUNT(DISTINCT rr.test_id) AS covered,
-               COUNT(DISTINCT CASE WHEN rr.verdict = 'pass' THEN rr.test_id END) AS n_pass,
-               COUNT(DISTINCT CASE WHEN rr.verdict <> 'pass' THEN rr.test_id END) AS n_fail
-          FROM run_results rr
-          JOIN runs r ON r.run_id = rr.run_id
-         WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
-           AND rr.pass = ?
+        WITH freshest AS (
+            SELECT rr.test_id, rr.verdict,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY rr.test_id
+                       ORDER BY rr.finished_ts_ms DESC
+                   ) AS rn
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
+               AND rr.pass = ?
+        )
+        SELECT COUNT(*) AS covered,
+               SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) AS n_pass,
+               SUM(CASE WHEN verdict <> 'pass' THEN 1 ELSE 0 END) AS n_fail
+          FROM freshest
+         WHERE rn = 1
         """,
         (commit_sha, pass_name),
     ).fetchone()
