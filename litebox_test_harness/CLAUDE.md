@@ -974,10 +974,20 @@ writes to the main worktree's store. Override with
 minimal) schema, `dashboard.py` subcommands, and agent recipes.
 
 **Selective re-run via `--fill[=N]`**: the runner picks up to N
-trials that have no clean-state result at the current `commit_sha`
-and runs only those. Default N is 300 (sized to amortize
-`setup()`). Used by `dashboard.py auto` to autonomously fill
-coverage of tracked refs.
+trials prioritized by a two-class selector at the current `commit_sha`:
+
+- **Class 1 (uncovered):** no result yet at this sha. Round-robin by
+  suite, never-seen first then stalest by `latest_results.finished_ts_ms`.
+- **Class 2 (failed-at-sha, retry-capped):** freshest verdict at this
+  sha is fail/timeout/error and `attempts < LITEBOX_FILL_FAIL_RETRIES`
+  (default `3`). Stalest-first within sha. Beyond the cap, the test is
+  considered confirmed-failing and is skipped until the sha changes.
+
+Passing-at-sha trials are skipped (a clean-sha pass is assumed stable
+until the sha moves). Default N is 300 (sized to amortize `setup()`).
+Used by `dashboard.py auto` to autonomously fill coverage of tracked
+refs. See [`scripts/README.md`](scripts/README.md) for the full driver
+contract and tuning knobs.
 
 ```sh
 # run only the missing-at-HEAD trials, default batch size 300
@@ -1047,6 +1057,18 @@ Running `litebox_test_harness` directly (without `litebox_tool_executor`)
 tests the **native kernel**, NOT litebox's shim. The coordinator prints
 `[coord] runtime:` at startup to identify the environment.
 
+#### Keeping the container for post-mortem
+
+Set **`LITEBOX_KEEP_CONTAINER=1`** to suppress all framework-side
+`docker rm`s so the container stays around after the trial finishes,
+fails, or times out — for `docker exec`, log scraping, or
+`litebox_tool_executor`-side audit-log inspection. Honored in all
+four cleanup paths: the foreground reap, the detached
+`tear_down_detached`, the SIGTERM/INT signal handler, and the
+`spawn_drain` watchdog. Containers spawn without `--rm`; you remove
+them manually when done (`docker rm -f $(docker ps -aq --filter
+name=litebox-)`).
+
 #### Analyzing audit logs
 
 For quick checks, `grep` on the JSONL file is fine (e.g., `grep '"err"' audit.jsonl`).
@@ -1102,6 +1124,23 @@ When adding tests, verify:
 - [ ] No "expected fail" / skip / dynamic gate dressed up as a pass
 - [ ] VS Code concern has a corresponding minimal self-contained test
 - [ ] Passes on native baseline (WSL2 gold standard)
+
+### Dashboard schema coordination
+
+`.dashboard/results.sqlite` is shared across **all** worktrees of the
+clone (path resolved via `git rev-parse --git-common-dir`). The Rust
+producer (`tests/common/dashboard_store.rs`) and the Python consumer
+(`scripts/dashboard.py`) both pin a `SCHEMA_VERSION` constant and
+**panic on mismatch**. Any session running `cargo test --test
+integration` with an out-of-date binary will abort until rebuilt.
+
+**Do not bump `SCHEMA_VERSION` without explicit coordination across
+active sessions.** Bumps are warranted only for breaking changes
+(column removed, type changed, column added without a default).
+Additive schema with defaults, new indexes, and renderer-only
+changes do **not** require a bump — see the `harness_leases` table
+in `scripts/README.md` for the canonical "additive, no bump"
+precedent.
 
 ## fd Inheritance Pattern
 
