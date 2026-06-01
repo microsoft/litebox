@@ -401,6 +401,19 @@ impl From<litebox::net::errors::SocketAsyncError> for Errno {
     }
 }
 
+impl TryFrom<Errno> for litebox::net::errors::SocketAsyncError {
+    type Error = Errno;
+
+    fn try_from(value: Errno) -> Result<Self, Self::Error> {
+        match value {
+            Errno::ECONNREFUSED => Ok(litebox::net::errors::SocketAsyncError::ConnectionRefused),
+            Errno::ECONNRESET => Ok(litebox::net::errors::SocketAsyncError::ConnectionReset),
+            Errno::ETIMEDOUT => Ok(litebox::net::errors::SocketAsyncError::TimedOut),
+            _ => Err(value),
+        }
+    }
+}
+
 impl From<litebox::net::errors::LocalAddrError> for Errno {
     fn from(value: litebox::net::errors::LocalAddrError) -> Self {
         match value {
@@ -457,6 +470,21 @@ impl From<litebox::net::errors::SendError> for Errno {
             litebox::net::errors::SendError::UnnecessaryDestinationAddress => Errno::EISCONN,
             litebox::net::errors::SendError::DestinationAddressRequired => Errno::EDESTADDRREQ,
             _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::socket_channel::ChannelWriteError> for Errno {
+    fn from(value: litebox::net::socket_channel::ChannelWriteError) -> Self {
+        match value {
+            litebox::net::socket_channel::ChannelWriteError::WriteShutdown
+            | litebox::net::socket_channel::ChannelWriteError::NotConnected
+            | litebox::net::socket_channel::ChannelWriteError::ConnectionClosed => Errno::EPIPE,
+            litebox::net::socket_channel::ChannelWriteError::Unaddressable => Errno::EINVAL,
+            litebox::net::socket_channel::ChannelWriteError::BufferFull => Errno::EAGAIN,
+            litebox::net::socket_channel::ChannelWriteError::DestinationAddressRequired => {
+                Errno::EDESTADDRREQ
+            }
         }
     }
 }
