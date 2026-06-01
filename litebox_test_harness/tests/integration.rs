@@ -3430,6 +3430,118 @@ mod dropbear_bash {
                 expected: &["PRE", "POST"],
                 fixtures: &[],
             },
+            // Copilot CLI shell tool repro probes (added 2026-05-31).
+            // The copilot::tui.{read_file,find_head,build} and
+            // copilot::pminus.find_head trials regress because copilot's
+            // node-side "shell" tool reads child output by spawning
+            // bash, draining the child's stdout pipe to EOF, then
+            // calling waitpid. Several real shell idioms appear to
+            // deadlock that EOF wait under litebox while passing on
+            // native. These dropbear_bash probes exercise the same
+            // idioms over SSH+bash so the failure can be reproduced
+            // without copilot in the loop.
+            Scenario {
+                // Pipeline where downstream (head -1) exits early,
+                // sending SIGPIPE upstream. Copilot's find_head
+                // scenario uses this exact shape.
+                id: "pipe_head_early_exit",
+                command: "find /tmp -maxdepth 1 -type d | head -1; echo DONE",
+                expected: &["DONE"],
+                fixtures: &[],
+            },
+            Scenario {
+                // Pipeline with file producer + small consumer.
+                // Variant of pipe_head_early_exit where producer is
+                // 'cat' on a real file.
+                id: "pipe_cat_head",
+                command: "printf 'a\\nb\\nc\\n' > /tmp/p.txt; cat /tmp/p.txt | head -1; echo DONE",
+                expected: &["DONE"],
+                fixtures: &[],
+            },
+            Scenario {
+                // cat of a small bind-mounted file. Variant of
+                // pminus.read_file but via dropbear, no copilot. Mounted
+                // /workspace contains the fixture; same setup as
+                // copilot tests.
+                id: "cat_workspace_file",
+                command: "cat /workspace/cat-target.txt; echo DONE",
+                expected: &["L1", "L2", "DONE"],
+                fixtures: &[("cat-target.txt", "L1\nL2\n")],
+            },
+            // node `child_process.spawn` probes — copilot's shell tool
+            // runs commands by spawning bash via node's
+            // `child_process.spawn`, draining stdout to EOF, then
+            // waitpid'ing the bash. The pipeline probes above proved
+            // bash + pipeline works fine over SSH; these isolate the
+            // node-side drain path that copilot actually uses.
+            Scenario {
+                id: "node_spawn_bash_pipeline",
+                command: "node -e \"const{spawn}=require('child_process');\
+const c=spawn('bash',['-c','find /tmp -maxdepth 1 -type d | head -1; echo INNER_DONE']);\
+let o='';c.stdout.on('data',d=>o+=d);c.on('close',code=>{process.stdout.write('out=['+o.replace(/\\n/g,'|')+'] code='+code+' OUTER_DONE\\n');});\"",
+                expected: &["INNER_DONE", "OUTER_DONE"],
+                fixtures: &[],
+            },
+            Scenario {
+                id: "node_spawn_bash_cat",
+                command: "node -e \"const{spawn}=require('child_process');\
+const c=spawn('bash',['-c','cat /workspace/cat-target2.txt; echo INNER_DONE']);\
+let o='';c.stdout.on('data',d=>o+=d);c.on('close',code=>{process.stdout.write('out=['+o.replace(/\\n/g,'|')+'] code='+code+' OUTER_DONE\\n');});\"",
+                expected: &["L1", "L2", "INNER_DONE", "OUTER_DONE"],
+                fixtures: &[("cat-target2.txt", "L1\nL2\n")],
+            },
+            // Nested-PTY probes — copilot's shell tool spawns bash on
+            // a PTY allocated by node-pty (UnixTerminal). The dropbear
+            // SSH session also runs the outer shell on a PTY, so this
+            // is a nested-pty scenario: outer PTY (sshd → bash) hosts
+            // an inner PTY (script(1) → bash). `script -q` is the
+            // closest userland approximation of node-pty: it calls
+            // openpty + fork + setsid + dup2 in the child, then
+            // drains the master fd in the parent.
+            Scenario {
+                id: "nested_pty_pipeline",
+                command: "script -q -c 'find /tmp -maxdepth 1 -type d | head -1; echo INNER_DONE' /dev/null; echo OUTER_DONE",
+                expected: &["INNER_DONE", "OUTER_DONE"],
+                fixtures: &[],
+            },
+            Scenario {
+                id: "nested_pty_cat",
+                command: "script -q -c 'cat /workspace/cat-target3.txt; echo INNER_DONE' /dev/null; echo OUTER_DONE",
+                expected: &["L1", "L2", "INNER_DONE", "OUTER_DONE"],
+                fixtures: &[("cat-target3.txt", "L1\nL2\n")],
+            },
+            Scenario {
+                // Most minimal nested-pty case: script(1) running a
+                // bare echo. If this fails: foreground-pgrp / pty
+                // teardown bug. If it passes but other nested_pty_*
+                // fail: the bug needs the inner command to do real
+                // I/O.
+                id: "nested_pty_echo",
+                command: "script -q -c 'echo INNER_DONE' /dev/null; echo OUTER_DONE",
+                expected: &["INNER_DONE", "OUTER_DONE"],
+                fixtures: &[],
+            },
+            Scenario {
+                // Baseline: forked child that DOESN'T open /dev/ptmx,
+                // just inherits stdio. If this passes but
+                // nested_pty_echo fails: bug is specifically in
+                // /dev/ptmx open + close interaction with inherited
+                // pty slave fds.
+                id: "fork_no_ptmx",
+                command: "bash -c 'echo INNER_DONE'; echo OUTER_DONE",
+                expected: &["INNER_DONE", "OUTER_DONE"],
+                fixtures: &[],
+            },
+            Scenario {
+                // Forked child opens /dev/ptmx then immediately
+                // closes it (TIOCGPTPEER for inner slave omitted).
+                // Isolates "does open(/dev/ptmx) + close + child-exit
+                // corrupt parent's inherited slave fds?"
+                id: "fork_ptmx_open_close",
+                command: "bash -c 'exec 9<>/dev/ptmx; exec 9<&-; echo INNER_DONE'; echo OUTER_DONE",
+                expected: &["INNER_DONE", "OUTER_DONE"],
+                fixtures: &[],
+            },
         ]
     }
 
