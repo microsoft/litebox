@@ -478,11 +478,11 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
 
     lines = ["## Tracked refs\n",
              "| Ref | Worktree | Pass | HEAD | Coverage trend "
-             "| native known | native cov | native pass | native fail "
-             "| litebox known | litebox cov | litebox pass | litebox fail |",
+             "| native known | native cov | native pass | native fail | native flaky "
+             "| litebox known | litebox cov | litebox pass | litebox fail | litebox flaky |",
              "|---|---|---|---|---"
-             "|---:|---:|---:|---:"
-             "|---:|---:|---:|---:|"]
+             "|---:|---:|---:|---:|---:"
+             "|---:|---:|---:|---:|---:|"]
     for r in refs:
         ref = r["ref"]
         ci_wt = r["ci_worktree"]
@@ -490,7 +490,7 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
         if head_sha is None:
             lines.append(
                 f"| `{ref}` | `{ci_wt}` | — | _missing_ | — "
-                f"| — | — | — | — | — | — | — | — |"
+                f"| — | — | — | — | — | — | — | — | — | — |"
             )
             continue
         cells: list[str] = []
@@ -502,6 +502,7 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
             dirty_extra = _dirty_only_coverage(
                 conn, head_sha, pass_name, ci_wt
             )
+            flaky = _flaky_count(conn, head_sha, pass_name)
             cov_cell = (
                 f"{covered} (+{dirty_extra} dirty)"
                 if dirty_extra else str(covered)
@@ -511,6 +512,7 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
                 cov_cell,
                 str(n_pass),
                 str(n_fail),
+                str(flaky),
             ])
         last_run_age = _last_run_age_for_ci_worktree(conn, ci_wt)
         spark = _coverage_sparkline_for_worktree(conn, ci_wt)
@@ -525,6 +527,12 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
         "across all shas (so `native known` ≠ `litebox known` reflects "
         "pass-only tests, e.g. litebox-only `copilot::tui.*`). "
         "`cov` = test_ids with a verdict at **this** sha (clean only). "
+        "`pass`/`fail` = **freshest** verdict per test_id — so a test "
+        "that failed and then passed on retry counts as `pass`, not "
+        "`fail`. `cov = pass + fail` always holds. "
+        "`flaky` ⊆ `pass` = test_ids whose freshest is pass but had "
+        "at least one fail row at this sha (retry-recovered). High "
+        "`flaky` is a smell even if `fail` is 0. "
         "`+N dirty` next to `cov` = test_ids with sha-matching rows "
         "from this tracked ref's own worktree with uncommitted "
         "changes (almost always 0 for a checkout-only `ci_worktree`; "
@@ -714,6 +722,50 @@ def _dirty_only_coverage(
         """,
         (commit_sha, worktree_path, pass_name,
          commit_sha, worktree_path, pass_name),
+    ).fetchone()
+    return (row[0] if row else 0) or 0
+
+
+def _flaky_count(
+    conn: sqlite3.Connection, commit_sha: str, pass_name: str,
+) -> int:
+    """Return the count of test_ids at this sha (clean only) that had
+    at least one non-pass row but whose **freshest** verdict is pass
+    — i.e., class-2 flakes that retry-recovered.
+
+    Headline `fail` counts only freshest=fail (still broken). This
+    column surfaces "we got there in the end, but it took a retry"
+    so users can see flakiness without it inflating the fail
+    number. `cov = pass + fail` still holds; `flaky ⊆ pass`.
+
+    Clean-scope only because the Tracked refs table is clean-only
+    (matches `_coverage_pass_fail`'s semantics).
+    """
+    row = conn.execute(
+        """
+        WITH freshest AS (
+            SELECT rr.test_id, rr.verdict,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY rr.test_id
+                       ORDER BY rr.finished_ts_ms DESC
+                   ) AS rn
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
+               AND rr.pass = ?
+        ),
+        ever_failed AS (
+            SELECT DISTINCT rr.test_id
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
+               AND rr.pass = ? AND rr.verdict != 'pass'
+        )
+        SELECT COUNT(*) FROM freshest
+         WHERE rn = 1 AND verdict = 'pass'
+           AND test_id IN (SELECT test_id FROM ever_failed)
+        """,
+        (commit_sha, pass_name, commit_sha, pass_name),
     ).fetchone()
     return (row[0] if row else 0) or 0
 
