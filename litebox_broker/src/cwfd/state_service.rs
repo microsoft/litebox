@@ -2737,9 +2737,15 @@ pub fn handle_pty_write(
             }
         }
         Err(PtyError::WouldBlock) => status_err(Opcode::PtyWriteResponse, StatusCode::WouldBlock),
-        Err(PtyError::Invalid) | Err(PtyError::Closed) => {
-            status_err(Opcode::PtyWriteResponse, StatusCode::InvalidValue)
-        }
+        Err(PtyError::Invalid) => status_err(Opcode::PtyWriteResponse, StatusCode::InvalidValue),
+        // Real Linux PTY semantics: write to a slave whose master is
+        // closed (or master whose all-slaves are closed) returns EIO.
+        // Map `PtyError::Closed` → `StatusCode::Io` so the shim returns
+        // `Errno::EIO` rather than `EINVAL`. Reproduced headlessly by
+        // `PTYR.slave_write_after_master_close`; surfaced in
+        // `copilot::tui.find_head` as a blank TUI screen (copilot's
+        // render loop spun on unexpected EINVAL from `write(stdout)`).
+        Err(PtyError::Closed) => status_err(Opcode::PtyWriteResponse, StatusCode::Io),
     }
 }
 
@@ -2778,8 +2784,14 @@ pub fn handle_pty_ioctl(
             }
         }
         Err(PtyError::WouldBlock) => status_err(Opcode::PtyIoctlResponse, StatusCode::WouldBlock),
-        Err(PtyError::Invalid) | Err(PtyError::Closed) => {
-            status_err(Opcode::PtyIoctlResponse, StatusCode::InvalidValue)
+        Err(PtyError::Invalid) => status_err(Opcode::PtyIoctlResponse, StatusCode::InvalidValue),
+        // PTY ioctls currently never report `Closed` (lifetime is
+        // enforced by handle resolution above). If a future change to
+        // `PtyState::ioctl` introduces this path, decide explicitly
+        // whether it should map to `Io` or `InvalidValue` rather than
+        // silently collapsing into one of them.
+        Err(PtyError::Closed) => {
+            unreachable!("PtyState::ioctl never returns Closed under current impl")
         }
     }
 }

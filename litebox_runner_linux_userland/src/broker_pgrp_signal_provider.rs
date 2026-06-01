@@ -142,6 +142,7 @@ fn client_err_to_broker_err(
         | ClientError::UnexpectedFdAttachment { .. }
         | ClientError::MissingFdAttachment { .. }
         | ClientError::ShortRead { .. }
-        | ClientError::CmsgTruncated => BrokerOpError::Io,
+        | ClientError::CmsgTruncated
+        | ClientError::OperationIo { .. } => BrokerOpError::Io,
     }
 }
