@@ -120,8 +120,8 @@ impl Runner {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn split_broker_socket(&mut self, socket_path: &Path) -> &mut Self {
-        self.command.arg("--split-broker-socket").arg(socket_path);
+    fn broker_socket(&mut self, socket_path: &Path) -> &mut Self {
+        self.command.arg("--broker-socket").arg(socket_path);
         self
     }
 
@@ -246,15 +246,15 @@ fn unique_test_socket_path(name: &str) -> PathBuf {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
-fn test_runner_connects_to_split_broker() {
-    let socket_path = unique_test_socket_path("runner-split-broker");
+fn test_runner_connects_to_broker() {
+    let socket_path = unique_test_socket_path("runner-broker");
     let _ = std::fs::remove_file(&socket_path);
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let server_socket_path = socket_path.clone();
     let broker_thread = std::thread::spawn(move || {
         let listener = std::os::unix::net::UnixListener::bind(&server_socket_path)
-            .expect("failed to bind split broker test socket");
+            .expect("failed to bind broker test socket");
         ready_tx.send(()).expect("failed to report broker ready");
 
         let (stream, _) = listener.accept().expect("failed to accept broker client");
@@ -262,7 +262,7 @@ fn test_runner_connects_to_split_broker() {
             litebox_broker_unix_socket::UnixStreamServerControlChannel::from_accepted(stream);
         let mut core = litebox_broker_core::BrokerCore::new(litebox_broker_core::EventOnlyPolicy);
         let termination = litebox_broker_server::serve_connection(&mut core, &mut channel)
-            .expect("split broker server failed");
+            .expect("broker server failed");
         assert_eq!(
             termination,
             litebox_broker_server::ConnectionTermination::PeerClosed
@@ -272,14 +272,12 @@ fn test_runner_connects_to_split_broker() {
 
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("split broker test server did not start");
+        .expect("broker test server did not start");
     let true_path = run_which("true");
-    Runner::new(&true_path, "split_broker_true_rewriter")
-        .split_broker_socket(&socket_path)
+    Runner::new(&true_path, "broker_true_rewriter")
+        .broker_socket(&socket_path)
         .run();
-    broker_thread
-        .join()
-        .expect("split broker test server panicked");
+    broker_thread.join().expect("broker test server panicked");
     let _ = std::fs::remove_file(socket_path);
 }
 

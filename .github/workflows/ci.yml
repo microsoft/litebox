@@ -232,11 +232,11 @@ jobs:
           #
           # - `litebox_broker_unix_socket` is allowed to have `std` access,
           #   since it is the concrete Unix-domain-socket channel for the
-          #   userland split-broker proof of concept.
+          #   userland broker proof of concept.
           #
           # - `litebox_broker_userland` is allowed to have `std` access,
           #   since it is the hosted broker executable for the userland
-          #   split-broker proof of concept.
+          #   broker proof of concept.
           #
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.

@@ -1,8 +1,8 @@
-# Broker Split Implementation Plan
+# Broker Architecture Implementation Plan
 
 ## Goal
 
-Implement the broker split as incremental vertical slices while keeping the existing LiteBox behavior working.
+Implement the broker architecture as incremental vertical slices while keeping the existing LiteBox behavior working.
 
 The target architecture is:
 
@@ -95,7 +95,7 @@ Initial scope:
 
 Exit criteria:
 
-- UserLiteBox can connect and negotiate.
+- A user-side client can connect and negotiate. In the current hosted PoC, `litebox_runner_linux_userland` consumes an externally owned Unix-socket endpoint via `--broker-socket` and uses `litebox_broker_client` directly; routing through UserLiteBox remains part of Phase 3.
 - Broker binds caller identity to the authenticated channel endpoint. The first hosted executable passes the explicit unauthenticated placeholder through the same server API that later deployment-specific authentication will use.
 - Userland channel code only receives/sends decoded frames and supplies peer credentials; the generic server owns broker protocol dispatch and reports successful termination as peer-close or broker-close with a reason.
 - The Unix-socket channel adapter and hosted broker executable live in separate crates, so clients can depend on the channel without pulling in broker core/server deployment code.
@@ -146,7 +146,7 @@ UserLiteBox owns:
 Exit criteria:
 
 - Create, wait, and signal work through BrokerCore and the separate broker process.
-- Duplicate, close, explicit readiness queries, stale-handle tests, and process-disconnect cleanup are added after the first end-to-end path is proven.
+- BrokerCore and the server already release association-owned references on channel disconnect, and BrokerCore has an explicit in-domain `close_object_reference` operation. Protocol-level close, duplicate, explicit readiness queries, and broader stale-handle coverage remain future work after the first end-to-end path is proven.
 
 ## Phase 5: Broker-backed fd semantics
 
@@ -176,7 +176,7 @@ Exit criteria:
 
 ## Phase 6: Control/notification/data channels
 
-Add the durable-unicorn-style channel split.
+Add the durable-unicorn-style control/notification/data channel separation.
 
 Channels:
 
@@ -329,7 +329,7 @@ Exit criteria:
 
 Only after userland semantics are stable, implement broker-kernel deployment.
 
-Split trusted deployment code into:
+Separate trusted deployment code into:
 
 - BrokerHost: user-mode execution support and channel delivery;
 - BrokerPlatform: privileged backend execution;
