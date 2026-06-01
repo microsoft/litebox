@@ -129,6 +129,9 @@ fn client_err_to_broker_err(err: ClientError) -> BrokerOpError {
         ClientError::WouldBlock => BrokerOpError::WouldBlock,
         ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
         ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
+        ClientError::PermissionDenied => BrokerOpError::PermissionDenied,
+        ClientError::ProtocolNotSupported => BrokerOpError::ProtocolNotSupported,
+        ClientError::OperationIo { .. } => BrokerOpError::Io,
         ClientError::Io(_)
         | ClientError::Protocol(_)
         | ClientError::UnexpectedOpcode { .. }
@@ -137,8 +140,6 @@ fn client_err_to_broker_err(err: ClientError) -> BrokerOpError {
         | ClientError::UnknownSubscription(_)
         | ClientError::SubsystemMismatch
         | ClientError::NoNotificationRing
-        | ClientError::PermissionDenied
-        | ClientError::ProtocolNotSupported
         | ClientError::BrokerInternal { .. }
         | ClientError::OtherStatus { .. }
         | ClientError::UnexpectedFdAttachment { .. }

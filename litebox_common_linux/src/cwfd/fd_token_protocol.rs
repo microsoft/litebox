@@ -800,6 +800,13 @@ pub enum StatusCode {
     PermissionDenied = 0x0A,
     /// Requested protocol is not supported by this broker subsystem.
     ProtocolNotSupported = 0x0B,
+    /// Runtime I/O failure — the operation is well-formed and the
+    /// handle is known, but the underlying broker-hosted resource
+    /// cannot perform it. Distinct from `Internal` (broker bug) and
+    /// `InvalidValue` (caller error). The canonical case is a PTY
+    /// write when the peer endpoint is closed — Linux returns `EIO`
+    /// for this transition; the shim maps `Io` → `Errno::EIO`.
+    Io = 0x0C,
 
     /// Generic protocol violation.
     Protocol = 0x10,
@@ -824,6 +831,7 @@ impl TryFrom<u8> for StatusCode {
             0x09 => Ok(StatusCode::NoNotificationRing),
             0x0A => Ok(StatusCode::PermissionDenied),
             0x0B => Ok(StatusCode::ProtocolNotSupported),
+            0x0C => Ok(StatusCode::Io),
             0x10 => Ok(StatusCode::Protocol),
             0x11 => Ok(StatusCode::Internal),
             other => Err(ProtocolError::UnknownStatus { status: other }),

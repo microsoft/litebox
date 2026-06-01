@@ -125,6 +125,14 @@ pub enum ClientError {
     #[error("broker internal error for opcode {opcode:?}")]
     BrokerInternal { opcode: Opcode },
 
+    /// Runtime I/O failure reported by the broker (`StatusCode::Io`).
+    /// Maps to `Errno::EIO` at the shim's syscall boundary. Distinct
+    /// from `Io(io::Error)` (transport-level error talking to the
+    /// broker control socket) and from `BrokerInternal` (broker bug).
+    /// Canonical case: PTY write when the peer endpoint is closed.
+    #[error("broker reported runtime I/O failure for opcode {opcode:?}")]
+    OperationIo { opcode: Opcode },
+
     #[error("broker returned status {status:?} for opcode {opcode:?}")]
     OtherStatus { opcode: Opcode, status: StatusCode },
 
@@ -2238,6 +2246,7 @@ fn map_status_no_handle(opcode: Opcode, status: StatusCode) -> ClientError {
     match status {
         StatusCode::Protocol => ClientError::BrokerRejectedProtocol,
         StatusCode::Internal => ClientError::BrokerInternal { opcode },
+        StatusCode::Io => ClientError::OperationIo { opcode },
         StatusCode::PermissionDenied => ClientError::PermissionDenied,
         StatusCode::ProtocolNotSupported => ClientError::ProtocolNotSupported,
         s => ClientError::OtherStatus { opcode, status: s },
@@ -2248,6 +2257,7 @@ fn map_status_with_handle(opcode: Opcode, status: StatusCode, _handle: u64) -> C
     match status {
         StatusCode::Protocol => ClientError::BrokerRejectedProtocol,
         StatusCode::Internal => ClientError::BrokerInternal { opcode },
+        StatusCode::Io => ClientError::OperationIo { opcode },
         StatusCode::PermissionDenied => ClientError::PermissionDenied,
         StatusCode::ProtocolNotSupported => ClientError::ProtocolNotSupported,
         StatusCode::SubsystemMismatch => ClientError::SubsystemMismatch,

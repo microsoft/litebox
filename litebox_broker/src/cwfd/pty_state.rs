@@ -403,7 +403,16 @@ impl PtyState {
                     .get_or_insert(caller_pgrp.max(caller_pid));
                 Vec::new()
             }
-            PtyIoctlOp::Tiocgptn => self.pair.pty_id.to_le_bytes().to_vec(),
+            PtyIoctlOp::Tiocgptn => {
+                // TIOCGPTN is master-only; on real Linux, applying it
+                // to a slave fd returns ENOTTY. Returning the pty_id
+                // unconditionally let user code misclassify a slave as
+                // a master and then issue master-only operations.
+                if self.endpoint != PtyEndpoint::Master {
+                    return Err(PtyError::Invalid);
+                }
+                self.pair.pty_id.to_le_bytes().to_vec()
+            }
             PtyIoctlOp::Tiocsptlk => {
                 inner.unlocked = payload.first().copied().unwrap_or(0) == 0;
                 Vec::new()
