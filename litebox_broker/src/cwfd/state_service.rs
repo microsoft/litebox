@@ -2572,7 +2572,17 @@ fn handle_create_pty(
     if !in_fds.is_empty() || !request.body.is_empty() {
         return protocol_err(Opcode::CreatePtyResponse);
     }
-    let pty_id = u32::try_from(registry.live_handle_count() / 2).unwrap_or(u32::MAX);
+    // pty_id must be globally unique across the broker's lifetime so
+    // `open_pty_slave(pty_id)` can unambiguously identify the matching
+    // PtyPairState. The earlier `live_handle_count() / 2` formula
+    // collided across pairs (e.g., nested PTY in script(1) under
+    // dropbear yielded two pairs with pty_id=3), causing
+    // open_pty_slave to dup the WRONG slave handle and the
+    // user-slave-close detector to fire HUP on the wrong master —
+    // which manifested as script(1) busy-looping on POLLHUP and
+    // never exiting, breaking nested-PTY scenarios (Copilot CLI TUI).
+    static NEXT_PTY_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let pty_id = NEXT_PTY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pair = PtyState::new_pair(pty_id);
     let master = registry.register(pair.master);
     let slave = registry.register(pair.slave);
