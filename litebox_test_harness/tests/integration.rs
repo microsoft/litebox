@@ -1455,18 +1455,20 @@ fn main() {
     // and always registered so regular filters can select them.
     dropbear_bash::register_trials(&mut trials);
 
-    // Copilot CLI integration scenarios — only register when explicitly
-    // requested via filter or env. See `mod copilot` below for the full
-    // contract and the documented FAIL-today scenarios.
-    if copilot::requested(&positionals) {
-        // Run the canonical setup() too: copilot tests bind-mount
-        // /opt/litebox/litebox_tool_executor into the litebox-pass
-        // container, so all 5 binary-type debug builds must exist.
-        let _ = setup();
-        let ws_root = workspace_root();
-        ensure_copilot_image(&ws_root);
-        copilot::register_trials(&mut trials);
-    }
+    // Copilot CLI integration scenarios — always registered so the
+    // dashboard universe stays consistent and the autonomous `--fill`
+    // selector can pick them up. Missing GitHub token (a normal
+    // dev-environment state for sessions without `gh auth login`)
+    // fails each trial cheaply inside its body rather than panicking
+    // the whole process; see `mod copilot::run_scenario`.
+    //
+    // setup() is still called here so litebox-pass copilot trials
+    // have the bind-mountable binaries available. The docker image
+    // build is deferred to `ensure_copilot_image` inside each trial
+    // (idempotent inspect-then-build), so a token-less run incurs
+    // zero docker-build cost.
+    let _ = setup();
+    copilot::register_trials(&mut trials);
 
     // Record the universe size on the runs row so the renderer can
     // show "N covered of M known".
@@ -2243,10 +2245,15 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
 // `litebox_tool_executor --rootfs / -- dropbear ...`. The ssh client
 // invocation is identical in both passes.
 //
-// Conditional registration: only registers when a positional filter
-// contains `copilot::` or `LITEBOX_INCLUDE_COPILOT=1` is set, so the
-// canonical full-suite `cargo test -p litebox_test_harness --test
-// integration` runs are unaffected.
+// Unconditional registration: copilot trials are always part of the
+// trial set so the dashboard universe stays consistent and the
+// autonomous `--fill` selector picks them up like any other
+// `<pass>::<id>` trial. Missing GitHub token (a normal
+// dev-environment state) is reported as a per-trial Failed result
+// rather than panicking the test process at registration time —
+// see `mod copilot::token` and `run_scenario`. The docker image
+// build is deferred to the per-trial `ensure_copilot_image` call,
+// so token-less runs incur zero docker cost.
 //
 // Concurrency cap `LITEBOX_COPILOT_JOBS` (default 1) bounds
 // concurrent Copilot trials independently of `LITEBOX_TEST_JOBS`.
@@ -2427,16 +2434,6 @@ mod copilot {
         }
     }
 
-    /// Decision: should this `cargo test` invocation register the
-    /// Copilot Trials? Reads the env knob and scans the positional
-    /// filters (passed in from main()).
-    pub(super) fn requested(positionals: &[String]) -> bool {
-        if std::env::var_os("LITEBOX_INCLUDE_COPILOT").is_some() {
-            return true;
-        }
-        positionals.iter().any(|p| p.contains("copilot::"))
-    }
-
     /// Concurrency cap. Independent of `LITEBOX_TEST_JOBS` — the
     /// Copilot scenarios call the GitHub API, so default to serial.
     fn jobs_cap() -> usize {
@@ -2513,14 +2510,25 @@ mod copilot {
         }
     }
 
-    /// Token cached once per test process. Discovered up front when
-    /// Copilot trials are registered, so any failure surfaces before
-    /// libtest-mimic starts scheduling trials.
-    fn token() -> &'static str {
-        static TOKEN: OnceLock<String> = OnceLock::new();
-        TOKEN.get_or_init(|| {
-            discover_token().unwrap_or_else(|e| panic!("copilot token preflight: {e}"))
-        })
+    /// Token cached once per test process. First successful call to
+    /// `discover_token()` is memoized. Returns Err when the token is
+    /// not available so the per-trial body can fail gracefully
+    /// instead of panicking the whole test process — the previous
+    /// `panic!("copilot token preflight: ...")` behavior killed every
+    /// other trial in the run, which is the wrong tradeoff for
+    /// autonomous fill (where a missing token is a normal
+    /// environment state, not a logic error).
+    ///
+    /// Memoization rationale: `discover_token()` invokes `gh auth
+    /// token` as a fallback (subprocess fork+exec); caching avoids
+    /// re-invoking it per-trial.
+    fn token() -> Result<&'static str, &'static str> {
+        static TOKEN: OnceLock<Result<String, String>> = OnceLock::new();
+        TOKEN
+            .get_or_init(discover_token)
+            .as_ref()
+            .map(String::as_str)
+            .map_err(String::as_str)
     }
 
     /// One scenario: prompt template (canary → prompt text), how to
@@ -2713,9 +2721,15 @@ mod copilot {
     /// Register all Copilot Trials (24 = 6 scenarios × 2 modes × 2 passes).
     /// Called from `main()` only when `requested()` returned true.
     pub(super) fn register_trials(trials: &mut Vec<Trial>) {
-        // Eagerly run the token preflight so failure surfaces before
-        // any Trial begins.
-        let _ = token();
+        // Registration is unconditional and side-effect free: the
+        // copilot trial set should always be visible to the dashboard
+        // (and to the autonomous `--fill` selector) so coverage gaps
+        // surface as failing trials rather than as silently-missing
+        // universe entries. Token discovery is deferred to the
+        // per-trial body — see `run_scenario`. A missing token fails
+        // the individual trial cheaply (no docker spawn) with a clear
+        // diagnostic, instead of panicking the whole test process at
+        // registration time.
 
         for scn in scenarios() {
             for mode in ["pminus", "tui"] {
@@ -2734,6 +2748,19 @@ mod copilot {
     }
 
     fn run_scenario(pass: &str, mode: &str, scenario_id: &str) -> Result<(), Failed> {
+        // Fail-fast on missing token BEFORE acquiring the copilot
+        // permit, before touching fixtures, and before any docker
+        // work. Avoids burning the autonomous-fill budget on trials
+        // that cannot possibly run, and produces a single clean
+        // error message per trial in the dashboard.
+        let github_token = token().map_err(|e| {
+            Failed::from(format!(
+                "GitHub token not available: {e}. Set \
+                 COPILOT_GITHUB_TOKEN or GH_TOKEN, or run \
+                 `gh auth login`."
+            ))
+        })?;
+
         let _permit = CopilotPermit::acquire();
         let scn = scenarios()
             .iter()
@@ -2767,8 +2794,14 @@ mod copilot {
         // HOME / SHELL / USER / LOGNAME / MAIL survive), so we can't
         // rely on `docker run --env-file` reaching copilot. The remote
         // command sources this file before exec'ing copilot.
+        // Lazy docker image inspect/build. Eagerly run at main() in
+        // the previous gated-registration design; now per-trial so
+        // token-less runs (which return Err above) incur no docker
+        // build cost.
+        super::ensure_copilot_image(&super::workspace_root());
+
         let token_env_path = fixture_dir.join(".copilot-env");
-        super::write_token_env(&token_env_path, token())?;
+        super::write_token_env(&token_env_path, github_token)?;
 
         let pass_static: &'static str = match pass {
             "native" => "native",

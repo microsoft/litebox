@@ -407,8 +407,8 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
 
     lines = ["## Tracked refs\n",
              "| Ref | Worktree | Pass | HEAD | Coverage trend "
-             "| native total | native cov | native pass | native fail "
-             "| litebox total | litebox cov | litebox pass | litebox fail |",
+             "| native known | native cov | native pass | native fail "
+             "| litebox known | litebox cov | litebox pass | litebox fail |",
              "|---|---|---|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|"]
@@ -428,9 +428,14 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
                 conn, head_sha, pass_name
             )
             total = per_pass_universe.get(pass_name) or (universe_n // 2 if universe_n else 0)
+            dirty_extra = _dirty_only_coverage(conn, head_sha, pass_name)
+            cov_cell = (
+                f"{covered} (+{dirty_extra} dirty)"
+                if dirty_extra else str(covered)
+            )
             cells.extend([
                 str(total) if total else "?",
-                str(covered),
+                cov_cell,
                 str(n_pass),
                 str(n_fail),
             ])
@@ -441,6 +446,19 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
             f"`{short_sha(head_sha)}` | `{spark}` | "
             + " | ".join(cells) + " |"
         )
+    lines.append("")
+    lines.append(
+        "_`known` = distinct `test_id`s ever observed for that pass "
+        "across all shas (so `native known` ≠ `litebox known` reflects "
+        "pass-only tests, e.g. litebox-only `copilot::tui.*`). "
+        "`cov` = test_ids with a verdict at **this** sha (clean only). "
+        "`+N dirty` next to `cov` = test_ids with sha-matching rows "
+        "from sessions with uncommitted changes (clean re-run would "
+        "likely add them to `cov` immediately). "
+        "`known − cov − dirty` = tests in the historical universe "
+        "that this sha hasn't run at all (e.g. extra-cost classes "
+        "off by default, or copilot trials in token-less envs)._"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -503,25 +521,76 @@ def _coverage_pass_fail(
     conn: sqlite3.Connection, commit_sha: str, pass_name: str,
 ) -> tuple[int, int, int]:
     """Return (covered_count, n_pass, n_fail) for a (commit_sha, pass).
-    Only counts clean-state runs (dirty_hash IS NULL). Anything that
-    didn't pass (FAIL, no_result, other) is counted as a fail so the
-    invariant `covered = pass + fail` always holds.
+    Only counts clean-state runs (dirty_hash IS NULL). Uses the
+    **freshest** verdict per test_id at this sha (matches
+    latest_results semantics) so the class-2 retry case — a test that
+    failed then recovered at the same sha — is counted as one pass,
+    not as pass+fail. Anything whose freshest verdict isn't 'pass'
+    (FAIL, timeout, error, etc.) counts as a fail, so the invariant
+    `covered = pass + fail` always holds.
     """
     row = conn.execute(
         """
-        SELECT COUNT(DISTINCT rr.test_id) AS covered,
-               COUNT(DISTINCT CASE WHEN rr.verdict = 'pass' THEN rr.test_id END) AS n_pass,
-               COUNT(DISTINCT CASE WHEN rr.verdict <> 'pass' THEN rr.test_id END) AS n_fail
-          FROM run_results rr
-          JOIN runs r ON r.run_id = rr.run_id
-         WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
-           AND rr.pass = ?
+        WITH freshest AS (
+            SELECT rr.test_id, rr.verdict,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY rr.test_id
+                       ORDER BY rr.finished_ts_ms DESC
+                   ) AS rn
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
+               AND rr.pass = ?
+        )
+        SELECT COUNT(*) AS covered,
+               SUM(CASE WHEN verdict = 'pass' THEN 1 ELSE 0 END) AS n_pass,
+               SUM(CASE WHEN verdict <> 'pass' THEN 1 ELSE 0 END) AS n_fail
+          FROM freshest
+         WHERE rn = 1
         """,
         (commit_sha, pass_name),
     ).fetchone()
     if not row:
         return (0, 0, 0)
     return (row["covered"] or 0, row["n_pass"] or 0, row["n_fail"] or 0)
+
+
+def _dirty_only_coverage(
+    conn: sqlite3.Connection, commit_sha: str, pass_name: str,
+) -> int:
+    """Return the count of test_ids that have a `dirty_hash IS NOT
+    NULL` row at this sha but NO `dirty_hash IS NULL` row at the
+    same sha. These represent evidence-from-dirty-sessions that the
+    clean `cov` column intentionally hides.
+
+    A non-zero return is a signal that running the suite clean
+    (e.g. via the supervisor's `--fill`) would likely add these to
+    `cov` immediately. Surfaces "we have evidence at this sha, but
+    only from sessions with uncommitted changes" — so the user can
+    tell apart "untested" gaps from "tested-dirty" gaps.
+    """
+    row = conn.execute(
+        """
+        WITH dirty_ids AS (
+            SELECT DISTINCT rr.test_id
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.commit_sha = ? AND r.dirty_hash IS NOT NULL
+               AND rr.pass = ?
+        ),
+        clean_ids AS (
+            SELECT DISTINCT rr.test_id
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
+               AND rr.pass = ?
+        )
+        SELECT COUNT(*) FROM dirty_ids
+         WHERE test_id NOT IN (SELECT test_id FROM clean_ids)
+        """,
+        (commit_sha, pass_name, commit_sha, pass_name),
+    ).fetchone()
+    return (row[0] if row else 0) or 0
 
 
 def _last_run_age_for_ci_worktree(conn: sqlite3.Connection, wt: str) -> str:
@@ -607,8 +676,8 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     now = now_ms()
     lines = ["## Result groups (per commit × dirty-state)\n",
              "| Tracked ref | Sha | Dirty | Worktree(s) "
-             "| native total | native cov | native pass | native fail "
-             "| litebox total | litebox cov | litebox pass | litebox fail "
+             "| native known | native cov | native pass | native fail "
+             "| litebox known | litebox cov | litebox pass | litebox fail "
              "| Newest | Δ vs prior |",
              "|---|---|---|---"
              "|---:|---:|---:|---:"
@@ -619,7 +688,28 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     ordered: list[tuple[tuple[str, Optional[str]], dict]] = sorted(
         states.items(), key=lambda kv: kv[1]["newest_ms"], reverse=True
     )
-    for i, ((sha, dirty_hash), g) in enumerate(ordered):
+
+    # Filter noise: hide dirty partitions with very few covered tests.
+    # These come from ad-hoc `cargo test --test integration -- <filter>`
+    # invocations in dev worktrees and otherwise dominate the table.
+    # Clean partitions are always shown. Override with
+    # LITEBOX_DASHBOARD_DIRTY_MIN_COV=N (set to 0 to disable filtering).
+    dirty_min_cov = int(os.environ.get("LITEBOX_DASHBOARD_DIRTY_MIN_COV", "10"))
+    hidden = 0
+    visible: list[tuple[tuple[str, Optional[str]], dict]] = []
+    for entry in ordered:
+        (_sha, dirty_hash), g = entry
+        if dirty_hash and dirty_min_cov > 0:
+            max_cov = max(
+                _counts_from_verdicts(g["verdicts"], p)[0]
+                for p in ("native", "litebox")
+            )
+            if max_cov < dirty_min_cov:
+                hidden += 1
+                continue
+        visible.append(entry)
+
+    for i, ((sha, dirty_hash), g) in enumerate(visible):
         tag = f"_{tracked[sha]}_" if sha in tracked else ""
         dirty = "⚠" if dirty_hash else ""
         wt_short = ", ".join(
@@ -639,8 +729,8 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
             ])
         age = fmt_age_ms(now - g["newest_ms"]) if g["newest_ms"] else "—"
         # Δ vs the immediately-older state in the sort order.
-        if i + 1 < len(ordered):
-            prior = ordered[i + 1][1]["verdicts"]
+        if i + 1 < len(visible):
+            prior = visible[i + 1][1]["verdicts"]
             regressions, fixes, newly = state_delta(prior, g["verdicts"])
             delta = (
                 f"+{len(fixes)} fixed · −{len(regressions)} regressed · "
@@ -651,6 +741,12 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
         lines.append(
             f"| {tag} | `{short_sha(sha)}` | {dirty} | `{wt_short}` | "
             + " | ".join(cells) + f" | {age} | {delta} |"
+        )
+    if hidden:
+        lines.append(
+            f"\n_{hidden} dirty partition(s) hidden "
+            f"(cov < {dirty_min_cov}); set "
+            f"`LITEBOX_DASHBOARD_DIRTY_MIN_COV=0` to show all._"
         )
     return "\n".join(lines) + "\n"
 
@@ -1104,6 +1200,20 @@ def cmd_auto(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, _signal_handler)
 
     _write_pidfile(pidfile, supervisor_pid=os.getpid())
+
+    # Initial render before the first cycle starts. Re-renders the
+    # summary with whatever's already in the store, so a freshly
+    # (re)started supervisor — e.g., after a renderer bug fix or a
+    # WSL restart — reflects the latest schema/code immediately
+    # instead of showing the stale summary.md (or no summary at
+    # all) for one full cycle (which can be 10+ min on a cold build).
+    try:
+        conn = open_db(state_dir)
+        write_summary(conn, state_dir)
+        conn.close()
+    except Exception as e:
+        print(f"[auto] initial render failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
 
     try:
         while True:
