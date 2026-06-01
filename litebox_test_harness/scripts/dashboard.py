@@ -632,7 +632,28 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     ordered: list[tuple[tuple[str, Optional[str]], dict]] = sorted(
         states.items(), key=lambda kv: kv[1]["newest_ms"], reverse=True
     )
-    for i, ((sha, dirty_hash), g) in enumerate(ordered):
+
+    # Filter noise: hide dirty partitions with very few covered tests.
+    # These come from ad-hoc `cargo test --test integration -- <filter>`
+    # invocations in dev worktrees and otherwise dominate the table.
+    # Clean partitions are always shown. Override with
+    # LITEBOX_DASHBOARD_DIRTY_MIN_COV=N (set to 0 to disable filtering).
+    dirty_min_cov = int(os.environ.get("LITEBOX_DASHBOARD_DIRTY_MIN_COV", "10"))
+    hidden = 0
+    visible: list[tuple[tuple[str, Optional[str]], dict]] = []
+    for entry in ordered:
+        (_sha, dirty_hash), g = entry
+        if dirty_hash and dirty_min_cov > 0:
+            max_cov = max(
+                _counts_from_verdicts(g["verdicts"], p)[0]
+                for p in ("native", "litebox")
+            )
+            if max_cov < dirty_min_cov:
+                hidden += 1
+                continue
+        visible.append(entry)
+
+    for i, ((sha, dirty_hash), g) in enumerate(visible):
         tag = f"_{tracked[sha]}_" if sha in tracked else ""
         dirty = "⚠" if dirty_hash else ""
         wt_short = ", ".join(
@@ -652,8 +673,8 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
             ])
         age = fmt_age_ms(now - g["newest_ms"]) if g["newest_ms"] else "—"
         # Δ vs the immediately-older state in the sort order.
-        if i + 1 < len(ordered):
-            prior = ordered[i + 1][1]["verdicts"]
+        if i + 1 < len(visible):
+            prior = visible[i + 1][1]["verdicts"]
             regressions, fixes, newly = state_delta(prior, g["verdicts"])
             delta = (
                 f"+{len(fixes)} fixed · −{len(regressions)} regressed · "
@@ -664,6 +685,12 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
         lines.append(
             f"| {tag} | `{short_sha(sha)}` | {dirty} | `{wt_short}` | "
             + " | ".join(cells) + f" | {age} | {delta} |"
+        )
+    if hidden:
+        lines.append(
+            f"\n_{hidden} dirty partition(s) hidden "
+            f"(cov < {dirty_min_cov}); set "
+            f"`LITEBOX_DASHBOARD_DIRTY_MIN_COV=0` to show all._"
         )
     return "\n".join(lines) + "\n"
 
