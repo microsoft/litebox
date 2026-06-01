@@ -40,6 +40,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable, Optional
@@ -1215,6 +1216,43 @@ def cmd_auto(args: argparse.Namespace) -> int:
         print(f"[auto] initial render failed: {type(e).__name__}: {e}",
               file=sys.stderr)
 
+    # Background freshness thread. Long cargo cycles (copilot trials
+    # plus cold rebuilds easily hit 20-30 min) used to leave
+    # summary.md untouched until the cycle finished, so the displayed
+    # HEAD sha could lag the actual `litebox-ci` worktree HEAD by
+    # tens of minutes — confusing because the renderer always
+    # exact-matches `commit_sha` (so the numbers stayed truthful for
+    # the *displayed* sha while the displayed sha was itself stale).
+    # The thread re-renders against the live DB every
+    # FRESHNESS_INTERVAL_SECS regardless of cycle phase. Rendering
+    # is ~50 ms against the current store, so this is essentially
+    # free compared to a cargo cycle.
+    FRESHNESS_INTERVAL_SECS = 30
+    freshness_stop = threading.Event()
+
+    def _freshness_loop() -> None:
+        while not freshness_stop.wait(FRESHNESS_INTERVAL_SECS):
+            try:
+                conn = open_db(state_dir)
+                write_summary(conn, state_dir)
+                conn.close()
+            except Exception as e:
+                # Non-fatal — the next tick will retry. Keep the
+                # supervisor alive even if the renderer transiently
+                # fails (e.g., schema migration in flight).
+                print(
+                    f"[auto] freshness render failed: "
+                    f"{type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+
+    freshness_thread = threading.Thread(
+        target=_freshness_loop,
+        name="dashboard-freshness",
+        daemon=True,
+    )
+    freshness_thread.start()
+
     try:
         while True:
             conn = open_db(state_dir)
@@ -1254,24 +1292,16 @@ def cmd_auto(args: argparse.Namespace) -> int:
                     ok = False
                 if not args.quiet:
                     print(f"[auto] {ref} @ {wt}: {'ok' if ok else 'failed'}")
-            # Re-render after every full pass — and again every ~10s
-            # during the sleep window so ad-hoc session runs from other
-            # worktrees show up in summary.md within seconds of finishing,
-            # not at the end of the next cycle.
-            conn = open_db(state_dir)
-            write_summary(conn, state_dir)
-            conn.close()
+            # The background freshness thread (started above the loop)
+            # handles continuous summary.md updates every
+            # FRESHNESS_INTERVAL_SECS regardless of cycle phase, so we
+            # don't need to render here or chunk the sleep into
+            # render-spaced intervals. Just sleep until the next cycle.
             if args.once:
                 return 0
-            slept = 0
-            render_every = 10
-            while slept < args.interval:
-                time.sleep(min(render_every, args.interval - slept))
-                slept += render_every
-                conn = open_db(state_dir)
-                write_summary(conn, state_dir)
-                conn.close()
+            time.sleep(args.interval)
     finally:
+        freshness_stop.set()
         try:
             pidfile.unlink()
         except FileNotFoundError:
