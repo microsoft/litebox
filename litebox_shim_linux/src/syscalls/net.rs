@@ -41,7 +41,7 @@ use crate::{
 };
 
 /// Linux's hard cap on the number of iovecs per `*msg`-style call, and on the
-/// number of entries per `*mmsg`-style call. See `UIO_MAXIOV` in `<uapi/linux/uio.h>`.
+/// number of entries per `sendmmsg`. See `UIO_MAXIOV` in `<uapi/linux/uio.h>`.
 const UIO_MAXIOV: usize = 1024;
 
 macro_rules! convert_flags {
@@ -1786,7 +1786,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
 
-        let vlen = (vlen as usize).min(UIO_MAXIOV);
+        let vlen = vlen as usize;
 
         // Linux looks up the fd before touching vlen/msgvec, so a bogus fd
         // takes priority over a bogus msgvec pointer or vlen == 0.
@@ -1808,7 +1808,8 @@ impl<FS: ShimFS> Task<FS> {
         let stride = size_of::<UserMmsgHdr<Platform>>();
         let msg_len_off = offset_of!(UserMmsgHdr<Platform>, msg_len);
         let msgvec_base = msgvec.as_usize();
-        if msgvec_base.checked_add(vlen * stride).is_none() {
+        let msgvec_len = vlen.checked_mul(stride).ok_or(Errno::EFAULT)?;
+        if msgvec_base.checked_add(msgvec_len).is_none() {
             return Err(Errno::EFAULT);
         }
 
