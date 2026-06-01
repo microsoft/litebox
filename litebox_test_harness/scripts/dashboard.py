@@ -486,7 +486,9 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
                 conn, head_sha, pass_name
             )
             total = per_pass_universe.get(pass_name) or (universe_n // 2 if universe_n else 0)
-            dirty_extra = _dirty_only_coverage(conn, head_sha, pass_name)
+            dirty_extra = _dirty_only_coverage(
+                conn, head_sha, pass_name, ci_wt
+            )
             cov_cell = (
                 f"{covered} (+{dirty_extra} dirty)"
                 if dirty_extra else str(covered)
@@ -650,17 +652,24 @@ def _coverage_pass_fail(
 
 def _dirty_only_coverage(
     conn: sqlite3.Connection, commit_sha: str, pass_name: str,
+    worktree_path: str,
 ) -> int:
     """Return the count of test_ids that have a `dirty_hash IS NOT
-    NULL` row at this sha but NO `dirty_hash IS NULL` row at the
-    same sha. These represent evidence-from-dirty-sessions that the
-    clean `cov` column intentionally hides.
+    NULL` row at this sha **in this worktree** but NO `dirty_hash IS
+    NULL` row at the same (sha, worktree). These represent
+    evidence-from-dirty-sessions-here that the clean `cov` column
+    intentionally hides.
 
     A non-zero return is a signal that running the suite clean
     (e.g. via the supervisor's `--fill`) would likely add these to
     `cov` immediately. Surfaces "we have evidence at this sha, but
     only from sessions with uncommitted changes" — so the user can
     tell apart "untested" gaps from "tested-dirty" gaps.
+
+    Scoped to `worktree_path` so a sibling worktree sitting on the
+    same commit_sha with WIP doesn't get attributed to this tracked
+    ref — same false-attribution shape the tracked-ref tag in
+    result-groups guards against.
     """
     row = conn.execute(
         """
@@ -669,6 +678,7 @@ def _dirty_only_coverage(
               FROM run_results rr
               JOIN runs r ON r.run_id = rr.run_id
              WHERE r.commit_sha = ? AND r.dirty_hash IS NOT NULL
+               AND r.worktree_path = ?
                AND rr.pass = ?
         ),
         clean_ids AS (
@@ -676,12 +686,14 @@ def _dirty_only_coverage(
               FROM run_results rr
               JOIN runs r ON r.run_id = rr.run_id
              WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
+               AND r.worktree_path = ?
                AND rr.pass = ?
         )
         SELECT COUNT(*) FROM dirty_ids
          WHERE test_id NOT IN (SELECT test_id FROM clean_ids)
         """,
-        (commit_sha, pass_name, commit_sha, pass_name),
+        (commit_sha, worktree_path, pass_name,
+         commit_sha, worktree_path, pass_name),
     ).fetchone()
     return (row[0] if row else 0) or 0
 
