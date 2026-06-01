@@ -762,6 +762,16 @@ impl BrokerStateRegistry {
         StateHandle(id)
     }
 
+    /// Returns the current refcount of a handle, or 0 if the handle
+    /// is unknown. Used by subsystems that need to compare two
+    /// handles' refcounts to derive an invariant (e.g., PTY's
+    /// `user_slave_count = rc(slave) - rc(master)` after a slave
+    /// release).
+    pub fn refcount(&self, handle: StateHandle) -> u32 {
+        let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+        s.table.get(&handle.0).map(|e| e.refcount).unwrap_or(0)
+    }
+
     pub fn dup(&self, handle: StateHandle) -> Result<StateHandle, StateRegistryError> {
         let mut s = self.state.lock().expect("BrokerStateRegistry poisoned");
         let entry = s
