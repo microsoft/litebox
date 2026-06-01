@@ -237,17 +237,27 @@ def _branch_display(branch: Optional[str]) -> str:
 
 def state_verdicts(
     conn: sqlite3.Connection, commit_sha: str, dirty_hash: Optional[str],
+    worktree_path: Optional[str] = None,
 ) -> dict[tuple[str, str], str]:
     """Return `{(test_id, pass): verdict}` for the freshest verdict
-    per (test_id, pass) at this `(commit_sha, dirty_hash)` state.
+    per (test_id, pass) at this state.
+
+    State key shape:
+      * clean: `(commit_sha,)` — all clean rows at this sha collapse
+        regardless of worktree (a clean tree IS the same artifact).
+      * dirty: `(commit_sha, dirty_hash, worktree_path)` — dirty work
+        in two worktrees is materially different even if their
+        tracked diffs happen to collide (untracked files / build
+        artifacts / operational context differ).
+
+    For dirty lookups, callers must pass `worktree_path`; passing
+    None for a dirty state would silently pool dirty rows from all
+    worktrees sharing that diff (the same false-attribution bug
+    that the strict result-groups tag and worktree-scoped
+    dirty-only count guard against).
 
     Handles dirty_hash NULL semantics correctly (`IS NULL` vs `= ?`)
     so a clean-state lookup doesn't accidentally include dirty runs.
-
-    Used by Result groups + Commit-delta rendering. Computing the
-    freshest verdict per (test_id, pass) within a state means counts
-    are always consistent (`cov = pass + fail`, no double-count when
-    the same test ran twice at the same sha with different outcomes).
     """
     if dirty_hash is None:
         sql = (
@@ -256,7 +266,7 @@ def state_verdicts(
             "  JOIN runs r ON r.run_id = rr.run_id "
             " WHERE r.commit_sha = ? AND r.dirty_hash IS NULL"
         )
-        params = (commit_sha,)
+        params: tuple = (commit_sha,)
     else:
         sql = (
             "SELECT rr.test_id, rr.pass, rr.verdict, rr.finished_ts_ms "
@@ -265,6 +275,9 @@ def state_verdicts(
             " WHERE r.commit_sha = ? AND r.dirty_hash = ?"
         )
         params = (commit_sha, dirty_hash)
+        if worktree_path is not None:
+            sql += " AND r.worktree_path = ?"
+            params = (*params, worktree_path)
     freshest: dict[tuple[str, str], tuple[str, int]] = {}
     for r in conn.execute(sql, params):
         key = (r["test_id"], r["pass"])
@@ -731,31 +744,45 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
 
     Sorted newest-first so the current state is on top.
     """
-    # Discover all (commit_sha, dirty_hash) states + their newest_ms
-    # and contributing worktrees/branches.
+    # Discover all states + their newest_ms and contributing
+    # branches. Grouping key:
+    #   clean: (commit_sha,)            — collapse all worktrees
+    #   dirty: (commit_sha, dirty_hash, worktree_path)
+    # The CASE expression makes worktree_path part of the key only
+    # when the row is dirty, so clean rows from multiple worktrees
+    # still collapse to one state (a clean tree at a sha IS the
+    # same artifact) but dirty work in worktree A vs worktree B is
+    # kept distinct even if their tracked diffs happen to collide.
     state_rows = conn.execute(
         """
         SELECT r.commit_sha, r.dirty_hash,
+               CASE WHEN r.dirty_hash IS NULL
+                    THEN NULL ELSE r.worktree_path END AS state_wt,
                MAX(rr.finished_ts_ms) AS newest_ms,
                GROUP_CONCAT(DISTINCT r.worktree_path) AS worktrees,
                GROUP_CONCAT(DISTINCT r.branch)        AS branches
           FROM run_results rr
           JOIN runs r ON r.run_id = rr.run_id
-         GROUP BY r.commit_sha, r.dirty_hash
+         GROUP BY r.commit_sha, r.dirty_hash,
+                  CASE WHEN r.dirty_hash IS NULL
+                       THEN NULL ELSE r.worktree_path END
         """
     ).fetchall()
     if not state_rows:
         return ""
 
-    # Build the per-state verdicts dict once per (sha, dirty_hash).
+    # Build the per-state verdicts dict once per state key.
     # Use freshest-per-(test_id, pass)-within-state semantics so
     # counts and delta computations agree.
-    states: dict[tuple[str, Optional[str]], dict] = {}
+    states: dict[tuple[str, Optional[str], Optional[str]], dict] = {}
     for r in state_rows:
-        key = (r["commit_sha"], r["dirty_hash"])
-        verdicts = state_verdicts(conn, r["commit_sha"], r["dirty_hash"])
+        key = (r["commit_sha"], r["dirty_hash"], r["state_wt"])
+        verdicts = state_verdicts(
+            conn, r["commit_sha"], r["dirty_hash"], r["state_wt"]
+        )
         states[key] = {
             "newest_ms": r["newest_ms"] or 0,
+            "worktree_path": r["state_wt"],
             "worktrees": set(
                 w for w in (r["worktrees"] or "").split(",") if w
             ),
@@ -809,7 +836,7 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
 
     # Sort newest-first; for each row, the "prior" state is the
     # next entry in the list (one older in time).
-    ordered: list[tuple[tuple[str, Optional[str]], dict]] = sorted(
+    ordered: list[tuple[tuple[str, Optional[str], Optional[str]], dict]] = sorted(
         states.items(), key=lambda kv: kv[1]["newest_ms"], reverse=True
     )
 
@@ -820,9 +847,9 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     # LITEBOX_DASHBOARD_DIRTY_MIN_COV=N (set to 0 to disable filtering).
     dirty_min_cov = int(os.environ.get("LITEBOX_DASHBOARD_DIRTY_MIN_COV", "10"))
     hidden = 0
-    visible: list[tuple[tuple[str, Optional[str]], dict]] = []
+    visible: list[tuple[tuple[str, Optional[str], Optional[str]], dict]] = []
     for entry in ordered:
-        (_sha, dirty_hash), g = entry
+        (_sha, dirty_hash, _wt), g = entry
         if dirty_hash and dirty_min_cov > 0:
             max_cov = max(
                 _counts_from_verdicts(g["verdicts"], p)[0]
@@ -833,7 +860,7 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
                 continue
         visible.append(entry)
 
-    for i, ((sha, dirty_hash), g) in enumerate(visible):
+    for i, ((sha, dirty_hash, _state_wt), g) in enumerate(visible):
         # Tag only when this row's worktree IS the tracked ref's
         # ci_worktree AND the row is clean. Bare sha-match would
         # falsely attribute another worktree's (dirty) work to the
@@ -919,24 +946,34 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
 def _top_n_states(
     conn: sqlite3.Connection, n: int = 5,
 ) -> list[dict]:
-    """Return the top-N `(commit_sha, dirty_hash)` partitions
-    (newest first), with their newest_ms + contributing
-    branches/worktrees. Honors `LITEBOX_DASHBOARD_DIRTY_MIN_COV`
-    so trivial ad-hoc dev partitions don't crowd out real
-    states.
+    """Return the top-N states (newest first), with their newest_ms
+    + contributing branches/worktrees. State key shape:
+
+      * clean: `(commit_sha,)`            — collapse all worktrees
+      * dirty: `(commit_sha, dirty_hash, worktree_path)`
+
+    Honors `LITEBOX_DASHBOARD_DIRTY_MIN_COV` so trivial ad-hoc dev
+    partitions don't crowd out real states.
 
     Each returned dict has: commit_sha, dirty_hash (None for
-    clean), newest_ms, branches (set), worktrees (set).
+    clean), worktree_path (None for clean; the state-defining
+    worktree when dirty), newest_ms, branches (set), worktrees
+    (set — same single value when dirty, possibly multiple when
+    clean).
     """
     raw = conn.execute(
         """
         SELECT r.commit_sha, r.dirty_hash,
+               CASE WHEN r.dirty_hash IS NULL
+                    THEN NULL ELSE r.worktree_path END AS state_wt,
                MAX(rr.finished_ts_ms) AS newest_ms,
                GROUP_CONCAT(DISTINCT r.worktree_path) AS worktrees,
                GROUP_CONCAT(DISTINCT r.branch)        AS branches
           FROM run_results rr
           JOIN runs r ON r.run_id = rr.run_id
-         GROUP BY r.commit_sha, r.dirty_hash
+         GROUP BY r.commit_sha, r.dirty_hash,
+                  CASE WHEN r.dirty_hash IS NULL
+                       THEN NULL ELSE r.worktree_path END
          ORDER BY newest_ms DESC
         """
     ).fetchall()
@@ -947,8 +984,9 @@ def _top_n_states(
     for r in raw:
         sha = r["commit_sha"]
         dirty_hash = r["dirty_hash"]
+        state_wt = r["state_wt"]
         if dirty_hash and dirty_min_cov > 0:
-            verdicts = state_verdicts(conn, sha, dirty_hash)
+            verdicts = state_verdicts(conn, sha, dirty_hash, state_wt)
             max_cov = max(
                 _counts_from_verdicts(verdicts, p)[0]
                 for p in ("native", "litebox")
@@ -958,6 +996,7 @@ def _top_n_states(
         out.append({
             "commit_sha": sha,
             "dirty_hash": dirty_hash,
+            "worktree_path": state_wt,
             "newest_ms": r["newest_ms"] or 0,
             "branches": set(
                 b for b in (r["branches"] or "").split(",") if b
@@ -1038,7 +1077,8 @@ def _render_suite_group_breakdown(conn: sqlite3.Connection) -> str:
     for state in states:
         out_lines.append(_format_state_header(state, now))
         verdicts = state_verdicts(
-            conn, state["commit_sha"], state["dirty_hash"]
+            conn, state["commit_sha"], state["dirty_hash"],
+            state["worktree_path"],
         )
         # Bucket verdicts by (suite, group, pass).
         # state_verdicts gives {(test_id, pass): verdict}; we need
@@ -1122,7 +1162,9 @@ def _render_current_fails(conn: sqlite3.Connection) -> str:
     fail_sets: list[set[tuple[str, str]]] = []
     per_state_verdicts: list[dict] = []
     for s in states:
-        v = state_verdicts(conn, s["commit_sha"], s["dirty_hash"])
+        v = state_verdicts(
+            conn, s["commit_sha"], s["dirty_hash"], s["worktree_path"]
+        )
         per_state_verdicts.append(v)
         fail_sets.append(
             {k for k, verdict in v.items() if verdict != "pass"}
@@ -1167,13 +1209,18 @@ def _render_current_fails(conn: sqlite3.Connection) -> str:
                 (state["commit_sha"],),
             ).fetchall()
         else:
+            # Match state_verdicts' state-scope semantics: a dirty
+            # state is (sha, dirty_hash, worktree_path), so the Age
+            # column must read only from that worktree's dirty rows.
             ts_rows = conn.execute(
                 "SELECT rr.test_id, rr.pass, MAX(rr.finished_ts_ms) AS ts "
                 "  FROM run_results rr "
                 "  JOIN runs r ON r.run_id = rr.run_id "
                 " WHERE r.commit_sha = ? AND r.dirty_hash = ? "
+                "   AND r.worktree_path = ? "
                 " GROUP BY rr.test_id, rr.pass",
-                (state["commit_sha"], state["dirty_hash"]),
+                (state["commit_sha"], state["dirty_hash"],
+                 state["worktree_path"]),
             ).fetchall()
         for r in ts_rows:
             ts_for[(r["test_id"], r["pass"])] = r["ts"] or 0
