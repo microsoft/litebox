@@ -59,9 +59,6 @@ use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::{
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
     net::ReceiveFlags,
-};
-use crate::{
-    net::errors::{ReceiveError, SendError},
     platform::TimeProvider,
 };
 
@@ -120,8 +117,8 @@ impl SocketAsyncErrorState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum SocketState {
-    /// Socket is closed or in initial state
-    Closed = 0,
+    /// Socket is in initial state.
+    Initial = 0,
     /// Socket is connecting (TCP SYN sent)
     Connecting = 1,
     /// Socket is connected and ready for data transfer
@@ -130,15 +127,46 @@ pub enum SocketState {
     Listening = 3,
     /// Socket encountered an error
     Error = 4,
+    /// Socket is closed.
+    Closed = 5,
+}
+
+/// Possible errors from [`NetworkProxy::try_read`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelReadError {
+    /// The local read side has been shut down.
+    ReadShutdown,
+    /// The stream has not reached a connected state.
+    NotConnected,
+    /// The stream is closed.
+    ConnectionClosed,
+}
+
+/// Possible errors from [`NetworkProxy::try_write`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelWriteError {
+    /// The local write side has been shut down.
+    WriteShutdown,
+    /// The stream has not reached a connected state.
+    NotConnected,
+    /// The stream is closed.
+    ConnectionClosed,
+    /// The destination address cannot be used.
+    Unaddressable,
+    /// The transmit buffer is full.
+    BufferFull,
+    /// A destination address is required but was not provided.
+    DestinationAddressRequired,
 }
 
 impl From<u32> for SocketState {
     fn from(v: u32) -> Self {
         match v {
-            0 => SocketState::Closed,
+            0 => SocketState::Initial,
             1 => SocketState::Connecting,
             2 => SocketState::Connected,
             3 => SocketState::Listening,
+            5 => SocketState::Closed,
             _ => SocketState::Error,
         }
     }
@@ -175,14 +203,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
     }
 
     /// Set the async socket error.
-    pub(super) fn set_async_error(&self, error: super::errors::SocketAsyncError) {
+    pub fn set_async_error(&self, error: super::errors::SocketAsyncError) {
         match self {
-            NetworkProxy::Stream(channel) => {
-                channel.set_async_error(error);
-            }
-            NetworkProxy::Datagram(channel) => {
-                channel.set_async_error(error);
-            }
+            NetworkProxy::Stream(channel) => channel.set_async_error(error),
+            NetworkProxy::Datagram(channel) => channel.set_async_error(error),
             NetworkProxy::Raw => {}
         }
     }
@@ -205,7 +229,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         buf: &mut [u8],
         flags: super::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, ReceiveError> {
+    ) -> Result<usize, ChannelReadError> {
         match self {
             NetworkProxy::Stream(channel) => channel.try_read(buf, flags, source_addr),
             NetworkProxy::Datagram(channel) => channel.try_read(buf, flags, source_addr),
@@ -222,14 +246,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         buf: &[u8],
         flags: super::SendFlags,
         destination: Option<SocketAddr>,
-    ) -> Result<usize, SendError> {
+    ) -> Result<usize, ChannelWriteError> {
         if !flags.is_empty() {
             unimplemented!()
         }
         if let Some(addr) = destination
             && (addr.port() == 0 || addr.ip().is_unspecified())
         {
-            return Err(SendError::Unaddressable);
+            return Err(ChannelWriteError::Unaddressable);
         }
         match self {
             NetworkProxy::Stream(channel) => channel.try_write(buf),
@@ -331,7 +355,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             tx_prod: Mutex::new(tx_prod),
             tx_cons: Mutex::new(tx_cons),
 
-            state: AtomicU32::new(SocketState::Closed as u32),
+            state: AtomicU32::new(SocketState::Initial as u32),
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
             rx_available: AtomicUsize::new(0),
@@ -390,14 +414,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         buf: &mut [u8],
         flags: super::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, ReceiveError> {
+    ) -> Result<usize, ChannelReadError> {
         if self.inner.read_shutdown.load(Ordering::Acquire) {
-            return Err(ReceiveError::SocketInInvalidState);
-        }
-
-        match self.inner.state() {
-            SocketState::Connected => {}
-            _ => return Err(ReceiveError::SocketInInvalidState),
+            return Err(ChannelReadError::ReadShutdown);
         }
 
         let mut rx_cons = self.inner.rx_cons.lock();
@@ -418,7 +437,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
 
         // Update available count
         self.inner.rx_available.fetch_sub(n, Ordering::Release);
-        Ok(n)
+
+        if n > 0 {
+            return Ok(n);
+        }
+        match self.inner.state() {
+            SocketState::Connected => Ok(0),
+            SocketState::Closed | SocketState::Error => Err(ChannelReadError::ConnectionClosed),
+            _ => Err(ChannelReadError::NotConnected),
+        }
     }
 
     /// Write data to the socket from the provided buffer.
@@ -428,14 +455,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     ///
     /// Returns the number of bytes written, or an error if the socket is closed,
     /// not connected, or the buffer is full.
-    pub fn try_write(&self, buf: &[u8]) -> Result<usize, SendError> {
+    pub fn try_write(&self, buf: &[u8]) -> Result<usize, ChannelWriteError> {
         if self.inner.write_shutdown.load(Ordering::Acquire) {
-            return Err(SendError::SocketInInvalidState);
+            return Err(ChannelWriteError::WriteShutdown);
         }
 
         match self.state() {
             SocketState::Connected => {}
-            _ => return Err(SendError::SocketInInvalidState),
+            SocketState::Closed | SocketState::Error => {
+                return Err(ChannelWriteError::ConnectionClosed);
+            }
+            _ => return Err(ChannelWriteError::NotConnected),
         }
 
         let mut tx_prod = self.inner.tx_prod.lock();
@@ -446,7 +476,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
             self.inner.tx_available.fetch_sub(n, Ordering::Release);
             Ok(n)
         } else {
-            Err(SendError::BufferFull)
+            Err(ChannelWriteError::BufferFull)
         }
     }
 
@@ -481,7 +511,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
         }
 
         match self.inner.state() {
-            SocketState::Closed => events |= Events::HUP | Events::OUT,
+            SocketState::Initial | SocketState::Closed => events |= Events::HUP | Events::OUT,
             SocketState::Error => events |= Events::ERR | Events::OUT,
             SocketState::Connected if self.is_writable() => events |= Events::OUT,
             _ => {}
@@ -791,7 +821,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         buf: &mut [u8],
         flags: super::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
-    ) -> Result<usize, ReceiveError> {
+    ) -> Result<usize, ChannelReadError> {
         let mut rx_cons = self.inner.rx_cons.lock();
 
         if let Some(msg) = rx_cons.try_pop() {
@@ -814,10 +844,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     ///
     /// The datagram is queued for transmission by the network worker.
     /// Returns the number of bytes queued (always `data.len()` on success).
-    pub fn send_to(&self, data: &[u8], addr: Option<SocketAddr>) -> Result<usize, SendError> {
+    pub fn send_to(
+        &self,
+        data: &[u8],
+        addr: Option<SocketAddr>,
+    ) -> Result<usize, ChannelWriteError> {
         if addr.is_none() && !self.inner.is_connected.load(Ordering::Acquire) {
             // No destination specified and socket is not connected
-            return Err(SendError::DestinationAddressRequired);
+            return Err(ChannelWriteError::DestinationAddressRequired);
         }
 
         let size = data.len();
@@ -832,7 +866,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
                 self.inner.tx_space.fetch_sub(1, Ordering::Release);
                 Ok(size)
             }
-            Err(_) => Err(SendError::BufferFull),
+            Err(_) => Err(ChannelWriteError::BufferFull),
         }
     }
 
@@ -1006,8 +1040,7 @@ mod tests {
     fn stream_channel_initial_state() {
         let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
 
-        // Initial state should be Closed
-        assert_eq!(channel.state(), SocketState::Closed);
+        assert_eq!(channel.state(), SocketState::Initial);
 
         // Should not be readable initially
         assert!(!channel.is_readable());
@@ -1078,12 +1111,12 @@ mod tests {
         // Try to read while not connected
         let mut buf = [0u8; 32];
         let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
-        assert!(matches!(result, Err(ReceiveError::SocketInInvalidState)));
+        assert!(matches!(result, Err(ChannelReadError::NotConnected)));
 
         // Try to write while not connected
         let data = b"test";
         let result = channel.try_write(data);
-        assert!(matches!(result, Err(SendError::SocketInInvalidState)));
+        assert!(matches!(result, Err(ChannelWriteError::NotConnected)));
     }
 
     #[test]
@@ -1105,7 +1138,31 @@ mod tests {
         // Should fail to read
         let mut buf = [0u8; 32];
         let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
-        assert!(matches!(result, Err(ReceiveError::SocketInInvalidState)));
+        assert!(matches!(result, Err(ChannelReadError::ReadShutdown)));
+    }
+
+    #[test]
+    fn stream_channel_closed_after_connected_drains_rx_before_eof() {
+        let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
+        channel.set_state(SocketState::Connected);
+
+        let data = b"data";
+        channel.push_rx_data_with(|buf: &mut [u8]| {
+            let to_copy = core::cmp::min(buf.len(), data.len());
+            buf[..to_copy].copy_from_slice(&data[..to_copy]);
+            to_copy
+        });
+        channel.set_state(SocketState::Closed);
+
+        let mut buf = [0u8; 32];
+        let read = channel
+            .try_read(&mut buf, super::super::ReceiveFlags::empty(), None)
+            .unwrap();
+        assert_eq!(read, data.len());
+        assert_eq!(&buf[..read], data);
+
+        let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
+        assert!(matches!(result, Err(ChannelReadError::ConnectionClosed)));
     }
 
     #[test]
@@ -1118,7 +1175,7 @@ mod tests {
 
         // Should fail to write
         let result = channel.try_write(b"data");
-        assert!(matches!(result, Err(SendError::SocketInInvalidState)));
+        assert!(matches!(result, Err(ChannelWriteError::WriteShutdown)));
     }
 
     #[test]
@@ -1178,7 +1235,6 @@ mod tests {
     fn stream_channel_io_events() {
         let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
 
-        // Closed state should have HUP
         let events = channel.check_io_events();
         assert!(events.contains(Events::HUP));
 
@@ -1310,7 +1366,7 @@ mod tests {
 
         // Next send should fail
         let result = channel.send_to(&[99], Some(DUMMY_ADDR));
-        assert!(matches!(result, Err(SendError::BufferFull)));
+        assert!(matches!(result, Err(ChannelWriteError::BufferFull)));
     }
 
     #[test]
@@ -1319,7 +1375,10 @@ mod tests {
 
         // Sending without an address on an unconnected socket should fail
         let result = channel.send_to(&[1, 2, 3], None);
-        assert!(matches!(result, Err(SendError::DestinationAddressRequired)));
+        assert!(matches!(
+            result,
+            Err(ChannelWriteError::DestinationAddressRequired)
+        ));
     }
 
     #[test]

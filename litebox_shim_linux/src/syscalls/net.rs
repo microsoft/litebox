@@ -5,7 +5,7 @@
 
 use core::{
     ffi::CStr,
-    mem::offset_of,
+    mem::{offset_of, size_of},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
 };
 
@@ -21,15 +21,15 @@ use litebox::{
     net::{
         CloseBehavior, TcpOptionData,
         errors::AcceptError,
-        socket_channel::{NetworkProxy, SocketState},
+        socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy, SocketState},
     },
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
     AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, ShutdownHow,
-    SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
-    signal::Signal,
+    SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, UnixProtocol, UserMmsgHdr,
+    UserMsgHdr, errno::Errno, signal::Signal,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -772,7 +772,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                     Ok(0) if buf.is_empty() => Ok(0),
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
-                    Err(litebox::net::errors::SendError::BufferFull) if is_empty_stream => Ok(0),
+                    Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
@@ -830,7 +830,12 @@ impl<FS: ShimFS> GlobalState<FS> {
                 || match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
-                    Err(e) => Err(TryOpError::Other(Errno::from(e))),
+                    Err(ChannelReadError::ReadShutdown) => Ok(0),
+                    Err(ChannelReadError::ConnectionClosed) => match proxy.get_async_error(true) {
+                        Some(err) => Err(TryOpError::Other(err.into())),
+                        None => Ok(0),
+                    },
+                    Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(Errno::ENOTCONN)),
                 },
             )
             .map_err(Errno::from)
@@ -1785,11 +1790,11 @@ impl<FS: ShimFS> Task<FS> {
 
         // Linux looks up the fd before touching vlen/msgvec, so a bogus fd
         // takes priority over a bogus msgvec pointer or vlen == 0.
-        self.files.borrow().with_socket(
+        let inet_proxy = self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |_| Ok::<(), Errno>(()),
-            |_| Ok::<(), Errno>(()),
+            |fd| self.global.get_proxy(fd).map(Some),
+            |_| Ok(None),
         )?;
 
         if vlen == 0 {
@@ -1800,27 +1805,34 @@ impl<FS: ShimFS> Task<FS> {
         // — both are treated as "no deadline".
         let deadline = timeout_duration.and_then(|d| self.global.platform.now().checked_add(d));
 
-        let stride = core::mem::size_of::<litebox_common_linux::UserMmsgHdr<Platform>>();
-        let msg_len_off =
-            core::mem::offset_of!(litebox_common_linux::UserMmsgHdr<Platform>, msg_len);
+        let stride = size_of::<UserMmsgHdr<Platform>>();
+        let msg_len_off = offset_of!(UserMmsgHdr<Platform>, msg_len);
+        let msgvec_base = msgvec.as_usize();
+        if msgvec_base.checked_add(vlen * stride).is_none() {
+            return Err(Errno::EFAULT);
+        }
 
         // WAITFORONE is mmsg-only; the inner recvmsg doesn't recognize it.
         let waitforone = flags.contains(ReceiveFlags::WAITFORONE);
         let mut iter_flags = flags.difference(ReceiveFlags::WAITFORONE);
         let mut received: usize = 0;
         let mut last_err: Option<Errno> = None;
+        let mut async_error_to_restore = None;
         for i in 0..vlen {
-            let base = msgvec.as_usize() + i * stride;
-            let inner_ptr = MutPtr::<litebox_common_linux::UserMsgHdr<Platform>>::from_usize(base);
+            let base = msgvec_base + i * stride;
+            let inner_ptr = MutPtr::<UserMsgHdr<Platform>>::from_usize(base);
             let n = match self.do_recvmsg(sockfd, inner_ptr, iter_flags) {
                 Ok(n) => n,
                 Err(e) => {
+                    if received > 0 {
+                        async_error_to_restore = e.try_into().ok();
+                    }
                     last_err = Some(e);
                     break;
                 }
             };
             let msg_len_ptr = MutPtr::<u32>::from_usize(base + msg_len_off);
-            if msg_len_ptr.write_at_offset(0, n.truncate()).is_none() {
+            if msg_len_ptr.write_at_offset(0, n.trunc()).is_none() {
                 last_err = Some(Errno::EFAULT);
                 break;
             }
@@ -1842,6 +1854,11 @@ impl<FS: ShimFS> Task<FS> {
             // recvmsg error; EAGAIN is the conservative fallback for the
             // structurally unreachable case.
             return Err(last_err.unwrap_or(Errno::EAGAIN));
+        }
+
+        // Stash the suppressed async socket error back onto the socket.
+        if let (Some(async_error), Some(proxy)) = (async_error_to_restore, inet_proxy) {
+            proxy.set_async_error(async_error);
         }
 
         // Match Linux's `__sys_recvmmsg`: the remaining timespec is only

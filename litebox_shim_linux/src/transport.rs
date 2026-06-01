@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use litebox::fs::nine_p::transport;
-use litebox::net::socket_channel::NetworkProxy;
+use litebox::net::socket_channel::{ChannelWriteError, NetworkProxy};
 use litebox::net::{ReceiveFlags, SendFlags};
 use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
@@ -121,7 +121,7 @@ impl transport::Write for ShimTransport {
         loop {
             match self.proxy.try_write(buf, SendFlags::empty(), None) {
                 Ok(n) => return Ok(n),
-                Err(litebox::net::errors::SendError::BufferFull) => {
+                Err(ChannelWriteError::BufferFull) => {
                     // TX ring full — spin until space opens up.
                     core::hint::spin_loop();
                 }
