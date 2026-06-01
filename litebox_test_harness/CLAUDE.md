@@ -1186,28 +1186,33 @@ cargo test -p litebox_test_harness --test integration -- \
 LITEBOX_COPILOT_JOBS=1 cargo test -p litebox_test_harness --test integration -- \
   'copilot::'
 
-# Full Copilot suite without an explicit positional filter:
-LITEBOX_INCLUDE_COPILOT=1 LITEBOX_COPILOT_JOBS=1 \
+# Full Copilot suite without an explicit positional filter (now the
+# default — copilot trials register unconditionally):
+LITEBOX_COPILOT_JOBS=1 \
   cargo test -p litebox_test_harness --test integration
 ```
 
-**Token requirement (loud-FAIL preflight):** the trials need a
+**Token requirement (graceful per-trial fail):** the trials need a
 GitHub Copilot API token. Discovery order:
 `COPILOT_GITHUB_TOKEN` → `GH_TOKEN` → `gh auth token`. If none
-resolve, the suite panics at registration time with a remediation
-message. Tokens never appear in any host-visible argv (passed into
-the container via a 0600 bind-mounted env file that the remote
-shell sources before exec'ing copilot).
+resolve, each copilot trial fails individually with a remediation
+message (and incurs no docker-build / fixture-creation cost — the
+token check is the first thing `run_scenario` does). Tokens never
+appear in any host-visible argv (passed into the container via a
+0600 bind-mounted env file that the remote shell sources before
+exec'ing copilot).
 
 **Concurrency cap:** `LITEBOX_COPILOT_JOBS` (default `1`),
 independent of `LITEBOX_TEST_JOBS`. Avoids GitHub API throttling
 and reduces model-output flakiness.
 
-**Registration is conditional** — the trials only register when a
-positional filter contains `copilot::` or `LITEBOX_INCLUDE_COPILOT`
-is set. Default `cargo test --test integration` runs are
-unaffected and the canonical "0 FAIL on native" contract is
-preserved.
+**Registration is unconditional** — copilot trials are always part
+of the trial set so the dashboard universe stays consistent and
+the autonomous `--fill` selector picks them up like any other
+`<pass>::<id>` trial. Token-less environments see 24 graceful
+per-trial failures (6 scenarios × 2 modes × 2 passes) instead of
+silently-missing universe entries. The previous
+`LITEBOX_INCLUDE_COPILOT=1` env-var gate was removed.
 
 **Native is the gold standard.** Every scenario must pass under
 the native baseline; any native failure is a test bug, not a shim

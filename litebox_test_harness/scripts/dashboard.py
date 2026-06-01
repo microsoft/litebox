@@ -428,9 +428,14 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
                 conn, head_sha, pass_name
             )
             total = per_pass_universe.get(pass_name) or (universe_n // 2 if universe_n else 0)
+            dirty_extra = _dirty_only_coverage(conn, head_sha, pass_name)
+            cov_cell = (
+                f"{covered} (+{dirty_extra} dirty)"
+                if dirty_extra else str(covered)
+            )
             cells.extend([
                 str(total) if total else "?",
-                str(covered),
+                cov_cell,
                 str(n_pass),
                 str(n_fail),
             ])
@@ -446,10 +451,13 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
         "_`known` = distinct `test_id`s ever observed for that pass "
         "across all shas (so `native known` ≠ `litebox known` reflects "
         "pass-only tests, e.g. litebox-only `copilot::tui.*`). "
-        "`cov` = test_ids with a verdict at **this** sha. "
-        "`known − cov` = tests in the historical universe that this "
-        "sha's `--fill` selection didn't run (typically extra-cost "
-        "classes off by default)._"
+        "`cov` = test_ids with a verdict at **this** sha (clean only). "
+        "`+N dirty` next to `cov` = test_ids with sha-matching rows "
+        "from sessions with uncommitted changes (clean re-run would "
+        "likely add them to `cov` immediately). "
+        "`known − cov − dirty` = tests in the historical universe "
+        "that this sha hasn't run at all (e.g. extra-cost classes "
+        "off by default, or copilot trials in token-less envs)._"
     )
     return "\n".join(lines) + "\n"
 
@@ -545,6 +553,44 @@ def _coverage_pass_fail(
     if not row:
         return (0, 0, 0)
     return (row["covered"] or 0, row["n_pass"] or 0, row["n_fail"] or 0)
+
+
+def _dirty_only_coverage(
+    conn: sqlite3.Connection, commit_sha: str, pass_name: str,
+) -> int:
+    """Return the count of test_ids that have a `dirty_hash IS NOT
+    NULL` row at this sha but NO `dirty_hash IS NULL` row at the
+    same sha. These represent evidence-from-dirty-sessions that the
+    clean `cov` column intentionally hides.
+
+    A non-zero return is a signal that running the suite clean
+    (e.g. via the supervisor's `--fill`) would likely add these to
+    `cov` immediately. Surfaces "we have evidence at this sha, but
+    only from sessions with uncommitted changes" — so the user can
+    tell apart "untested" gaps from "tested-dirty" gaps.
+    """
+    row = conn.execute(
+        """
+        WITH dirty_ids AS (
+            SELECT DISTINCT rr.test_id
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.commit_sha = ? AND r.dirty_hash IS NOT NULL
+               AND rr.pass = ?
+        ),
+        clean_ids AS (
+            SELECT DISTINCT rr.test_id
+              FROM run_results rr
+              JOIN runs r ON r.run_id = rr.run_id
+             WHERE r.commit_sha = ? AND r.dirty_hash IS NULL
+               AND rr.pass = ?
+        )
+        SELECT COUNT(*) FROM dirty_ids
+         WHERE test_id NOT IN (SELECT test_id FROM clean_ids)
+        """,
+        (commit_sha, pass_name, commit_sha, pass_name),
+    ).fetchone()
+    return (row[0] if row else 0) or 0
 
 
 def _last_run_age_for_ci_worktree(conn: sqlite3.Connection, wt: str) -> str:
