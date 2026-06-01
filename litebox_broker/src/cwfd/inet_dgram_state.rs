@@ -7,7 +7,7 @@ use core::any::Any;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc as channel, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc as channel};
 use std::thread;
 use std::time::Duration;
 
@@ -16,13 +16,16 @@ use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
 use litebox_common_linux::notification_ring::NotificationSender;
 
-use crate::cwfd::inet_listener_state::{decode_sockaddr, encode_sockaddr, AddressFamily};
+use crate::cwfd::inet_listener_state::{AddressFamily, decode_sockaddr, encode_sockaddr};
 use crate::state_registry::StateObject;
 use crate::subscription_list::{SubscribeError, SubscriptionList, UnsubscribeError};
 
 const RECV_QUEUE_CAP: usize = 128;
 const SOCKADDR_WIRE_LEN: usize = 28;
 const UDP_RECV_BUF_LEN: usize = 65_536;
+const BROKER_DNS_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+const DNS_PORT: u16 = 53;
+const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum InetDgramError {
@@ -49,6 +52,7 @@ pub struct InetDgramState {
     socket: Mutex<Option<UdpSocket>>,
     connected_peer: Mutex<Option<SocketAddr>>,
     subject: SubscriptionList,
+    recv_tx: Mutex<Option<channel::SyncSender<(Vec<u8>, SocketAddr)>>>,
     recv_chan: Mutex<Option<channel::Receiver<(Vec<u8>, SocketAddr)>>>,
     recv_thread: Mutex<Option<thread::JoinHandle<()>>>,
     queued_recvs: AtomicUsize,
@@ -62,6 +66,7 @@ impl InetDgramState {
             socket: Mutex::new(None),
             connected_peer: Mutex::new(None),
             subject: SubscriptionList::new(),
+            recv_tx: Mutex::new(None),
             recv_chan: Mutex::new(None),
             recv_thread: Mutex::new(None),
             queued_recvs: AtomicUsize::new(0),
@@ -91,8 +96,10 @@ impl InetDgramState {
     ) -> Result<(), InetDgramError> {
         let peer = self.decode_family_sockaddr(sockaddr)?;
         self.ensure_socket()?;
-        let socket = self.clone_socket()?;
-        socket.connect(peer)?;
+        if !is_broker_dns_service(peer) {
+            let socket = self.clone_socket()?;
+            socket.connect(peer)?;
+        }
         *self
             .connected_peer
             .lock()
@@ -106,19 +113,22 @@ impl InetDgramState {
         payload: &[u8],
     ) -> Result<usize, InetDgramError> {
         self.ensure_socket()?;
-        let socket = self.clone_socket()?;
-        let result = if sockaddr.iter().all(|&b| b == 0) {
-            if self
-                .connected_peer
+        let peer = if sockaddr.iter().all(|&b| b == 0) {
+            self.connected_peer
                 .lock()
                 .expect("InetDgramState connected_peer poisoned")
-                .is_none()
-            {
-                return Err(InetDgramError::NotConnected);
-            }
+                .ok_or(InetDgramError::NotConnected)?
+        } else {
+            self.decode_family_sockaddr(sockaddr)?
+        };
+        if is_broker_dns_service(peer) {
+            return self.forward_dns_query(payload, peer);
+        }
+
+        let socket = self.clone_socket()?;
+        let result = if sockaddr.iter().all(|&b| b == 0) {
             socket.send(payload)
         } else {
-            let peer = self.decode_family_sockaddr(sockaddr)?;
             socket.send_to(payload, peer)
         };
         match result {
@@ -189,7 +199,20 @@ impl InetDgramState {
         encode_sockaddr(peer).map_err(|_| InetDgramError::InvalidSockaddr)
     }
 
-    pub fn setsockopt(&self, level: i32, name: i32, value: &[u8]) -> Result<(), InetDgramError> {
+    pub fn setsockopt(
+        self: &Arc<Self>,
+        level: i32,
+        name: i32,
+        value: &[u8],
+    ) -> Result<(), InetDgramError> {
+        // Real Linux: setsockopt works on an unbound socket (kernel just sets
+        // an option on the socket struct, lazy-creates if needed). Match that
+        // by ensuring the host socket exists before applying the option.
+        // glibc's DNS resolver calls setsockopt(SOL_IP, IP_RECVERR) immediately
+        // after socket() to enable extended error reporting; without this
+        // ensure_socket, the call returned NotBound→EINVAL and the resolver
+        // bailed before sending any DNS query.
+        self.ensure_socket()?;
         let socket = self.clone_socket()?;
         let optlen: libc::socklen_t = value
             .len()
@@ -296,6 +319,10 @@ impl InetDgramState {
         }
         let (tx, rx) = channel::sync_channel(RECV_QUEUE_CAP);
         *self
+            .recv_tx
+            .lock()
+            .expect("InetDgramState recv_tx poisoned") = Some(tx.clone());
+        *self
             .recv_chan
             .lock()
             .expect("InetDgramState recv_chan poisoned") = Some(rx);
@@ -320,12 +347,76 @@ impl InetDgramState {
             .try_clone()
             .map_err(InetDgramError::Io)
     }
+
+    /// Preserve the legacy Litebox resolver address after smoltcp removal by
+    /// forwarding guest UDP DNS packets for 10.0.0.1:53 through the host resolver.
+    fn forward_dns_query(
+        self: &Arc<Self>,
+        payload: &[u8],
+        virtual_peer: SocketAddr,
+    ) -> Result<usize, InetDgramError> {
+        let host_dns = SocketAddr::V4(SocketAddrV4::new(
+            crate::net_proxy::host_dns::discover_host_dns(),
+            DNS_PORT,
+        ));
+        let query = payload.to_vec();
+        let state = Arc::downgrade(self);
+        thread::Builder::new()
+            .name("litebox-dns-forward".into())
+            .spawn(move || {
+                let Ok(forwarder) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+                else {
+                    return;
+                };
+                if forwarder
+                    .set_read_timeout(Some(DNS_FORWARD_TIMEOUT))
+                    .is_err()
+                {
+                    return;
+                }
+                if forwarder.send_to(&query, host_dns).is_err() {
+                    return;
+                }
+
+                let mut response = vec![0u8; UDP_RECV_BUF_LEN];
+                let Ok((len, _)) = forwarder.recv_from(&mut response) else {
+                    return;
+                };
+                response.truncate(len);
+                if let Some(state) = state.upgrade() {
+                    let _ = state.enqueue_datagram(response, virtual_peer);
+                }
+            })?;
+        Ok(payload.len())
+    }
+
+    fn enqueue_datagram(&self, payload: Vec<u8>, peer: SocketAddr) -> Result<(), InetDgramError> {
+        let tx = self
+            .recv_tx
+            .lock()
+            .expect("InetDgramState recv_tx poisoned")
+            .as_ref()
+            .ok_or(InetDgramError::NotBound)?
+            .clone();
+        match tx.try_send((payload, peer)) {
+            Ok(()) => {
+                self.queued_recvs.fetch_add(1, Ordering::AcqRel);
+                self.subject.notify(NOTIFY_EVENT_IN);
+                Ok(())
+            }
+            Err(channel::TrySendError::Full(_)) => Err(InetDgramError::WouldBlock),
+            Err(channel::TrySendError::Disconnected(_)) => Err(InetDgramError::Io(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "recv queue disconnected"),
+            )),
+        }
+    }
 }
 
 impl Drop for InetDgramState {
     fn drop(&mut self) {
         self.stop_recv.store(true, Ordering::Release);
         let _ = self.socket.lock().map(|mut s| s.take());
+        let _ = self.recv_tx.lock().map(|mut tx| tx.take());
         let _ = self.recv_chan.lock().map(|mut rx| rx.take());
         if let Ok(mut thread) = self.recv_thread.lock() {
             if let Some(handle) = thread.take() {
@@ -365,6 +456,10 @@ impl StateObject for InetDgramState {
     fn current_events(&self) -> u32 {
         InetDgramState::current_events(self)
     }
+}
+
+fn is_broker_dns_service(peer: SocketAddr) -> bool {
+    matches!(peer, SocketAddr::V4(addr) if *addr.ip() == BROKER_DNS_ADDR && addr.port() == DNS_PORT)
 }
 
 fn recv_loop(

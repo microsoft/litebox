@@ -154,6 +154,7 @@ fn main() -> anyhow::Result<()> {
             cli.rootfs.display()
         );
     }
+    install_litebox_resolv_conf(&cli.rootfs)?;
 
     // Resolve audit log for all modes.
     let audit_log_file = resolve_audit_log(&cli)?;
@@ -171,6 +172,36 @@ fn main() -> anyhow::Result<()> {
     } else {
         direct(&cli, audit_log_file.as_deref())
     }
+}
+
+fn install_litebox_resolv_conf(rootfs: &std::path::Path) -> anyhow::Result<()> {
+    if !rootfs.is_dir() {
+        return Ok(());
+    }
+    let etc = rootfs.join("etc");
+    let litebox_resolv = etc.join("resolv.conf.litebox");
+    if !litebox_resolv.exists() {
+        return Ok(());
+    }
+    let host_resolv = etc.join("resolv.conf.host");
+    if !host_resolv.exists() {
+        let resolv = etc.join("resolv.conf");
+        if resolv.exists() {
+            std::fs::copy(&resolv, &host_resolv).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to preserve host resolv.conf at {}: {e}",
+                    host_resolv.display()
+                )
+            })?;
+        }
+    }
+    std::fs::copy(&litebox_resolv, etc.join("resolv.conf")).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to install Litebox resolv.conf from {}: {e}",
+            litebox_resolv.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Resolve the audit log file path for all modes.

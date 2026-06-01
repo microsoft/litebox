@@ -3808,10 +3808,12 @@ impl<FS: ShimFS> Task<FS> {
                 Sysno::execve | Sysno::execveat | Sysno::exit | Sysno::exit_group
                 // FD plumbing.  `read` is needed for nested $() — the
                 // outer subshell reads the inner capture pipe's output
-                // before writing it to its own stdout.
+                // before writing it to its own stdout. `socket` is safe to
+                // defer because later bind/connect migrates the child with
+                // the new descriptor preserved.
                 | Sysno::close | Sysno::close_range | Sysno::dup | Sysno::dup2 | Sysno::dup3
                 | Sysno::open | Sysno::openat | Sysno::openat2 | Sysno::pipe2 | Sysno::write
-                | Sysno::read
+                | Sysno::read | Sysno::socket
                 // A nested fork or wait is real post-fork shell work.  Commit
                 // delayed fork first so the parent shell can resume and service
                 // command-substitution pipes while the child shell runs.
@@ -3836,6 +3838,10 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::sched_setparam
                 // Resource limits.
                 | Sysno::setrlimit | Sysno::prlimit64
+                // Relative sleeps are safe in the delayed-fork window: they do
+                // not mutate the shared address space, and keeping the parent
+                // parked preserves vfork-style ordering until real work starts.
+                | Sysno::clock_nanosleep | Sysno::nanosleep
                 // No-ops (read-only queries).
                 | Sysno::getpid | Sysno::getppid | Sysno::gettid
                 | Sysno::getuid | Sysno::geteuid | Sysno::getgid | Sysno::getegid
@@ -5891,6 +5897,14 @@ mod tests {
         use ::syscalls::Sysno;
         assert_allowed(Sysno::setrlimit);
         assert_allowed(Sysno::prlimit64);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_relative_sleeps() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::clock_nanosleep);
+        assert_allowed(Sysno::nanosleep);
     }
 
     #[test]

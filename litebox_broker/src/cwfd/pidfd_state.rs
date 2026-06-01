@@ -213,22 +213,31 @@ fn spawn_exit_watcher(state: Arc<PidfdState>, pidfd: OwnedFd) {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // SAFETY: poll(2) takes a pointer to a pollfd array; we
-            // pass &mut to one initialised pollfd plus length 1.
-            // POLLIN on a pidfd fires once on exit (and stays ready
-            // thereafter); -1 means wait forever.
-            let rc = unsafe { libc::poll(&raw mut pfd, 1, -1) };
-            // poll returning <=0 here is unusual but possible (e.g.
-            // EINTR if a signal interrupts). On EINTR we'd want to
-            // retry; for the prototype we just bail and let the
-            // synchronous `exited()` query stay false. A future
-            // hardening pass should loop on EINTR.
-            if rc <= 0 {
+            let rc = loop {
+                // SAFETY: poll(2) takes a pointer to a pollfd array; we
+                // pass &mut to one initialised pollfd plus length 1.
+                // POLLIN on a pidfd fires once on exit (and stays ready
+                // thereafter); -1 means wait forever.
+                let rc = unsafe { libc::poll(&raw mut pfd, 1, -1) };
+                if rc >= 0 {
+                    break rc;
+                }
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::EINTR {
+                    continue;
+                }
                 tracing::warn!(
                     target_host_pid = target,
                     rc,
-                    errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                    "pidfd watcher: poll returned non-positive"
+                    errno,
+                    "pidfd watcher: poll failed"
+                );
+                return;
+            };
+            if rc == 0 {
+                tracing::warn!(
+                    target_host_pid = target,
+                    "pidfd watcher: poll returned zero"
                 );
                 return;
             }

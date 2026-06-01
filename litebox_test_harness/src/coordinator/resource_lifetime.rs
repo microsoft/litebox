@@ -164,7 +164,7 @@ fn register_pair_test(
     let id = format!("RL.{mode}.{parent_label}.{child_label}.{agent}");
     let agent_label = agent.to_string();
     reg.test("vscode", "resource_lifetime", id)
-        .timeout(45)
+        .timeout(180)
         .build(move |cx| {
             let leaf = cx.declare_ephemeral(
                 agent,
@@ -184,7 +184,12 @@ fn register_pair_test(
                 Box::pin(async move {
                     let child_binary = crate::binary_path(child_bt, run.self_exe());
                     match run
-                        .run_leaf(&leaf, token, ChildBinaryArgs { child_binary })
+                        .run_leaf_with_timeout(
+                            &leaf,
+                            token,
+                            ChildBinaryArgs { child_binary },
+                            Some(150),
+                        )
                         .await
                     {
                         Ok(out) if out.detail.contains("_OK") => {

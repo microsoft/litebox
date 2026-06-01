@@ -3035,7 +3035,7 @@ mod copilot {
         // before its SSH handshake path is fully ready; mirror the
         // `drive_bash` helper in the dropbear_bash suite.
         let first = drive_pminus_once(port, prompt, timeout_secs)?;
-        if first.contains("kex_exchange_identification") {
+        if first.contains("kex_exchange_identification") || first.trim().is_empty() {
             std::thread::sleep(Duration::from_secs(7));
             return drive_pminus_once(port, prompt, timeout_secs);
         }

@@ -3,7 +3,7 @@
 
 //! Broker-held TCP listener probes.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ const UDP_RECVFROM_REMOTE_ADDR: HandlerToken<(), BLOut> =
     HandlerToken::new("broker_listener.udp_recvfrom_remote_addr");
 const UDP_TRUNCATION: HandlerToken<(), BLOut> = HandlerToken::new("broker_listener.udp_truncation");
 const RAW_ICMP_ECHO: HandlerToken<(), RawOut> = HandlerToken::new("broker_listener.raw_icmp_echo");
+const DNS_RESOLVE: HandlerToken<(), DnsOut> = HandlerToken::new("broker_listener.dns_resolve");
 
 #[derive(Serialize, Deserialize, Debug)]
 struct BLOut {
@@ -33,6 +34,12 @@ struct BLOut {
 enum RawOut {
     PermissionDenied,
     EchoSucceeded,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct DnsOut {
+    localhost_addrs: Vec<String>,
+    remote_addrs: Vec<String>,
 }
 
 struct Fd(i32);
@@ -324,7 +331,10 @@ async fn handle_raw_icmp_echo(
         //     is unset / =0 (the F.1-flip default).
         // Both are accurate kernel-shaped errnos; the probe accepts
         // either as the same "raw is restricted/unavailable" outcome.
-        if matches!(err.raw_os_error(), Some(libc::EPERM) | Some(libc::EPROTONOSUPPORT)) {
+        if matches!(
+            err.raw_os_error(),
+            Some(libc::EPERM) | Some(libc::EPROTONOSUPPORT)
+        ) {
             return Ok(RawOut::PermissionDenied);
         }
         return Err(HandlerError(format!("socket failed: {err}")));
@@ -733,12 +743,96 @@ async fn handle_udp_truncation(
     })
 }
 
+fn dns_probe_server() -> Ipv4Addr {
+    std::fs::read_to_string("/etc/resolv.conf")
+        .ok()
+        .and_then(|content| {
+            content.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("nameserver")
+                    .and_then(|addr| addr.trim().parse::<Ipv4Addr>().ok())
+            })
+        })
+        .unwrap_or_else(|| Ipv4Addr::new(10, 0, 0, 1))
+}
+
+fn raw_dns_probe() -> String {
+    let server = dns_probe_server();
+    let mut query = vec![
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    for label in ["api", "github", "com"] {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+
+    let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+        Ok(socket) => socket,
+        Err(e) => return format!("bind failed: {e}"),
+    };
+    if let Err(e) = socket.set_read_timeout(Some(Duration::from_secs(3))) {
+        return format!("set_read_timeout failed: {e}");
+    }
+    if let Err(e) = socket.send_to(&query, (server, 53)) {
+        return format!("send_to failed: {e}");
+    }
+    let mut response = [0u8; 512];
+    match socket.recv_from(&mut response) {
+        Ok((n, peer)) => format!("ok bytes={n} peer={peer}"),
+        Err(e) => format!("recv_from failed: {e}"),
+    }
+}
+
+async fn handle_dns_resolve(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<DnsOut, HandlerError> {
+    let raw_dns = raw_dns_probe();
+    if !raw_dns.starts_with("ok ") {
+        let resolv_conf = std::fs::read_to_string("/etc/resolv.conf")
+            .unwrap_or_else(|e| format!("<read /etc/resolv.conf failed: {e}>"));
+        return Err(HandlerError(format!(
+            "api.github.com DNS probe failed: {raw_dns}; resolv.conf={resolv_conf:?}"
+        )));
+    }
+    let mut remote_addrs = vec![raw_dns];
+    let getaddrinfo_addrs: Vec<String> = ("api.github.com", 443)
+        .to_socket_addrs()
+        .map_err(|e| HandlerError(format!("getaddrinfo api.github.com: {e}")))?
+        .map(|addr| addr.to_string())
+        .collect();
+    if getaddrinfo_addrs.is_empty() {
+        return Err(HandlerError(
+            "getaddrinfo api.github.com returned no addresses".into(),
+        ));
+    }
+    remote_addrs.push(format!("getaddrinfo={}", getaddrinfo_addrs.join(",")));
+
+    let localhost_addrs: Vec<String> = ("localhost", 0)
+        .to_socket_addrs()
+        .map_err(|e| HandlerError(format!("resolve localhost: {e}")))?
+        .map(|addr| addr.ip().to_string())
+        .collect();
+    if !localhost_addrs
+        .iter()
+        .any(|addr| addr == "127.0.0.1" || addr == "::1")
+    {
+        return Err(HandlerError(format!(
+            "localhost did not resolve to loopback: {localhost_addrs:?}"
+        )));
+    }
+
+    Ok(DnsOut {
+        localhost_addrs,
+        remote_addrs,
+    })
+}
+
 pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
     register_handler!(LISTEN_BASIC, handle_listen_basic);
     register_handler!(CONNECT_BASIC, handle_connect_basic);
     register_handler!(UDP_RECVFROM_REMOTE_ADDR, handle_udp_recvfrom_remote_addr);
     register_handler!(UDP_TRUNCATION, handle_udp_truncation);
     register_handler!(RAW_ICMP_ECHO, handle_raw_icmp_echo);
+    register_handler!(DNS_RESOLVE, handle_dns_resolve);
     reg.single_agent_handler_test(
         "broker_listener",
         "listen_basic",
@@ -788,6 +882,20 @@ pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
             Ok(format!(
                 "bound={} peer={} bytes={}",
                 out.bound_port, out.peer_port, out.bytes
+            ))
+        },
+    );
+    reg.single_agent_handler_test(
+        "broker_listener",
+        "dns_resolve",
+        "BL.dns_resolve.pie-glibc.dpg1",
+        AgentName::Dpg1,
+        &DNS_RESOLVE,
+        |out| {
+            Ok(format!(
+                "localhost={} remote={}",
+                out.localhost_addrs.join(","),
+                out.remote_addrs.join(",")
             ))
         },
     );

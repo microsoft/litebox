@@ -93,6 +93,8 @@ pub enum Command {
     Run {
         handler: String,
         args: serde_json::Value,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
 
     /// Sent to an agent that is currently blocked at a handler's
