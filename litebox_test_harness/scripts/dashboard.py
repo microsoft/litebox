@@ -407,8 +407,8 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
 
     lines = ["## Tracked refs\n",
              "| Ref | Worktree | Pass | HEAD | Coverage trend "
-             "| native total | native cov | native pass | native fail "
-             "| litebox total | litebox cov | litebox pass | litebox fail |",
+             "| native known | native cov | native pass | native fail "
+             "| litebox known | litebox cov | litebox pass | litebox fail |",
              "|---|---|---|---|---"
              "|---:|---:|---:|---:"
              "|---:|---:|---:|---:|"]
@@ -441,6 +441,16 @@ def _render_tracked_refs(conn: sqlite3.Connection) -> str:
             f"`{short_sha(head_sha)}` | `{spark}` | "
             + " | ".join(cells) + " |"
         )
+    lines.append("")
+    lines.append(
+        "_`known` = distinct `test_id`s ever observed for that pass "
+        "across all shas (so `native known` ≠ `litebox known` reflects "
+        "pass-only tests, e.g. litebox-only `copilot::tui.*`). "
+        "`cov` = test_ids with a verdict at **this** sha. "
+        "`known − cov` = tests in the historical universe that this "
+        "sha's `--fill` selection didn't run (typically extra-cost "
+        "classes off by default)._"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -620,8 +630,8 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     now = now_ms()
     lines = ["## Result groups (per commit × dirty-state)\n",
              "| Tracked ref | Sha | Dirty | Worktree(s) "
-             "| native total | native cov | native pass | native fail "
-             "| litebox total | litebox cov | litebox pass | litebox fail "
+             "| native known | native cov | native pass | native fail "
+             "| litebox known | litebox cov | litebox pass | litebox fail "
              "| Newest | Δ vs prior |",
              "|---|---|---|---"
              "|---:|---:|---:|---:"
