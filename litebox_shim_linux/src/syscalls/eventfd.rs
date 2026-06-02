@@ -6,15 +6,15 @@
 use core::sync::atomic::AtomicU32;
 
 use litebox::{
-    LiteBox,
+    EventCounter, EventCounterConsumeMode, LiteBox,
     event::{
-        EventCounter, EventCounterConsumeMode, Events, IOPollable, observer::Observer,
+        Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
         wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::OFlags,
     platform::TimeProvider,
-    sync::RawSyncPrimitivesProvider,
+    sync::{Mutex, RawSyncPrimitivesProvider},
 };
 use litebox_common_linux::{EfdFlags, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -26,10 +26,12 @@ impl FdEnabledSubsystem for EventfdSubsystem {
 impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    event: EventCounter<Platform>,
+    local_counter: Mutex<Platform, u64>,
+    local_core_event: Option<EventCounter<Platform>>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     semaphore: bool,
+    pollee: Pollee<Platform>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
@@ -40,31 +42,97 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     ) -> Result<Self, Errno> {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
-        let event = litebox
-            .create_event_counter(count, !flags.contains(EfdFlags::NONBLOCK))
-            .map_err(Errno::from)?;
+        let local_core_event = if flags.contains(EfdFlags::NONBLOCK) {
+            litebox.create_event_counter(count).map_err(Errno::from)?
+        } else {
+            None
+        };
 
         Ok(Self {
-            event,
+            local_counter: Mutex::new(count),
+            local_core_event,
             status: AtomicU32::new(status.bits()),
             semaphore: flags.contains(EfdFlags::SEMAPHORE),
+            pollee: Pollee::new(),
         })
     }
 
-    pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
-        let mode = if self.semaphore {
+    fn consume_mode(&self) -> EventCounterConsumeMode {
+        if self.semaphore {
             EventCounterConsumeMode::One
         } else {
             EventCounterConsumeMode::All
+        }
+    }
+
+    fn try_read(&self) -> Result<u64, TryOpError<Errno>> {
+        let mut counter = self.local_counter.lock();
+        if *counter == 0 {
+            return Err(TryOpError::TryAgain);
+        }
+
+        let res = match self.consume_mode() {
+            EventCounterConsumeMode::All => *counter,
+            EventCounterConsumeMode::One => 1,
         };
-        self.event
-            .read(cx, self.get_status().contains(OFlags::NONBLOCK), mode)
+        *counter -= res;
+
+        drop(counter);
+        self.pollee.notify_observers(Events::OUT);
+        Ok(res)
+    }
+
+    pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
+        if let Some(event) = &self.local_core_event {
+            return event
+                .read(
+                    cx,
+                    self.get_status().contains(OFlags::NONBLOCK),
+                    self.consume_mode(),
+                )
+                .map_err(Errno::from);
+        }
+        self.pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
+                Events::IN,
+                || self.try_read(),
+            )
             .map_err(Errno::from)
     }
 
+    fn try_write(&self, value: u64) -> Result<usize, TryOpError<Errno>> {
+        if value == u64::MAX {
+            return Err(TryOpError::Other(Errno::EINVAL));
+        }
+
+        let mut counter = self.local_counter.lock();
+        if let Some(new_value) = (*counter).checked_add(value)
+            && new_value != u64::MAX
+        {
+            *counter = new_value;
+            drop(counter);
+            self.pollee.notify_observers(Events::IN);
+            return Ok(core::mem::size_of::<u64>());
+        }
+
+        Err(TryOpError::TryAgain)
+    }
+
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, value: u64) -> Result<usize, Errno> {
-        self.event
-            .write(cx, self.get_status().contains(OFlags::NONBLOCK), value)
+        if let Some(event) = &self.local_core_event {
+            return event
+                .write(cx, self.get_status().contains(OFlags::NONBLOCK), value)
+                .map_err(Errno::from);
+        }
+        self.pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
+                Events::OUT,
+                || self.try_write(value),
+            )
             .map_err(Errno::from)
     }
 
@@ -72,7 +140,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
 
     pub(crate) fn set_status_flags(&self, requested: OFlags, mask: OFlags) -> Result<(), Errno> {
         let new_status = (self.get_status() & mask.complement()) | (requested & mask);
-        if !new_status.contains(OFlags::NONBLOCK) && !self.event.supports_blocking_operations() {
+        if !new_status.contains(OFlags::NONBLOCK)
+            && self
+                .local_core_event
+                .as_ref()
+                .is_some_and(|event| !event.supports_blocking_operations())
+        {
             return Err(Errno::EINVAL);
         }
         self.set_status(requested & mask, true);
@@ -83,11 +156,27 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFile<Platform> {
     fn check_io_events(&self) -> Events {
-        self.event.check_io_events()
+        if let Some(event) = &self.local_core_event {
+            return event.check_io_events();
+        }
+
+        let counter = self.local_counter.lock();
+        let mut events = Events::empty();
+        if *counter != 0 {
+            events |= Events::IN;
+        }
+        if *counter < u64::MAX - 1 {
+            events |= Events::OUT;
+        }
+        events
     }
 
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
-        self.event.register_observer(observer, mask);
+        if let Some(event) = &self.local_core_event {
+            event.register_observer(observer, mask);
+        } else {
+            self.pollee.register_observer(observer, mask);
+        }
     }
 }
 

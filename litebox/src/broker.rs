@@ -10,7 +10,10 @@ use litebox_broker_protocol::{
 };
 
 use crate::{
-    event::{EventCounter, EventCounterConsumeMode, EventCounterError, EventCounterSource, Events},
+    event::{
+        Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
+        wait::WaitContext,
+    },
     platform::TimeProvider,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -32,6 +35,35 @@ pub trait BrokerControl: Send + Sync {
     ) -> core::result::Result<BrokerResponse, BrokerControlError>;
 }
 
+/// Errors returned by broker-backed local-core event counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EventCounterError {
+    /// The requested operation is invalid for this event counter.
+    InvalidInput,
+    /// The operation would block.
+    WouldBlock,
+    /// The event counter cannot accept more state.
+    ResourceExhausted,
+    /// The backing authority or transport failed.
+    Io,
+}
+
+/// How an event counter read should consume readiness credits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventCounterConsumeMode {
+    /// Consume all currently available credits.
+    All,
+    /// Consume one credit.
+    One,
+}
+
+/// A broker-backed local-core event counter.
+pub struct EventCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    event: BrokerEvent,
+    pollee: Pollee<Platform>,
+}
+
 pub(crate) struct BrokerState<Platform: RawSyncPrimitivesProvider> {
     control: RwLock<Platform, Option<Arc<dyn BrokerControl>>>,
 }
@@ -50,18 +82,14 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerState<Platform> {
     pub(crate) fn create_event_counter(
         &self,
         initial_count: u64,
-        requires_blocking: bool,
-    ) -> Result<EventCounter<Platform>, EventCounterError>
+    ) -> Result<Option<EventCounter<Platform>>, EventCounterError>
     where
-        Platform: TimeProvider + 'static,
+        Platform: TimeProvider,
     {
-        if requires_blocking {
-            return EventCounter::new_local(initial_count);
-        }
         let Some(control) = self.control.read().clone() else {
-            return EventCounter::new_local(initial_count);
+            return Ok(None);
         };
-        create_broker_event_counter(control, initial_count)
+        EventCounter::new(control, initial_count).map(Some)
     }
 }
 
@@ -69,10 +97,6 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerState<Platform> {
 struct BrokerEvent {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
-}
-
-struct BrokerEventCounter {
-    event: BrokerEvent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +107,72 @@ enum BrokerObjectError {
     ResourceExhausted,
     UnexpectedResponse,
     Internal,
+}
+
+impl<Platform> EventCounter<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
+{
+    fn new(broker: Arc<dyn BrokerControl>, initial_count: u64) -> Result<Self, EventCounterError> {
+        let event = BrokerEvent::create(broker, initial_count)
+            .map_err(broker_error_to_event_counter_error)?;
+        Ok(Self {
+            event,
+            pollee: Pollee::new(),
+        })
+    }
+
+    /// Returns whether blocking reads and writes are supported.
+    pub fn supports_blocking_operations(&self) -> bool {
+        false
+    }
+
+    /// Reads the event counter.
+    pub fn read(
+        &self,
+        _cx: &WaitContext<'_, Platform>,
+        _nonblock: bool,
+        mode: EventCounterConsumeMode,
+    ) -> Result<u64, TryOpError<EventCounterError>> {
+        let value = map_broker_result(self.event.consume(mode))?;
+        self.pollee.notify_observers(Events::OUT);
+        Ok(value)
+    }
+
+    /// Writes readiness credits to the event counter.
+    pub fn write(
+        &self,
+        _cx: &WaitContext<'_, Platform>,
+        _nonblock: bool,
+        value: u64,
+    ) -> Result<usize, TryOpError<EventCounterError>> {
+        if value == u64::MAX {
+            return Err(TryOpError::Other(EventCounterError::InvalidInput));
+        }
+        map_broker_result(self.event.add(value))?;
+        self.pollee.notify_observers(Events::IN);
+        Ok(core::mem::size_of::<u64>())
+    }
+}
+
+impl<Platform> IOPollable for EventCounter<Platform>
+where
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
+{
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
+        self.pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        // The broker protocol currently exposes read readiness only. Keep write
+        // readiness optimistic and surface counter-limit failures from write
+        // until broker write-readiness plumbing exists.
+        let mut events = Events::OUT;
+        if self.event.is_read_ready().unwrap_or(false) {
+            events |= Events::IN;
+        }
+        events
+    }
 }
 
 impl BrokerEvent {
@@ -135,50 +225,6 @@ impl BrokerEvent {
     }
 }
 
-impl<Platform> EventCounterSource<Platform> for BrokerEventCounter
-where
-    Platform: RawSyncPrimitivesProvider + TimeProvider,
-{
-    fn supports_blocking_operations(&self) -> bool {
-        false
-    }
-
-    fn read(&self, mode: EventCounterConsumeMode) -> Result<u64, EventCounterError> {
-        self.event
-            .consume(mode)
-            .map_err(broker_error_to_event_counter_error)
-    }
-
-    fn write(&self, value: u64) -> Result<(), EventCounterError> {
-        self.event
-            .add(value)
-            .map_err(broker_error_to_event_counter_error)
-    }
-
-    fn check_io_events(&self) -> Events {
-        // The broker protocol currently exposes read readiness only. Keep write
-        // readiness optimistic and surface counter-limit failures from write
-        // until broker write-readiness plumbing exists.
-        let mut events = Events::OUT;
-        if self.event.is_read_ready().unwrap_or(false) {
-            events |= Events::IN;
-        }
-        events
-    }
-}
-
-fn create_broker_event_counter<Platform>(
-    broker: Arc<dyn BrokerControl>,
-    initial_count: u64,
-) -> Result<EventCounter<Platform>, EventCounterError>
-where
-    Platform: RawSyncPrimitivesProvider + TimeProvider + 'static,
-{
-    let event =
-        BrokerEvent::create(broker, initial_count).map_err(broker_error_to_event_counter_error)?;
-    Ok(EventCounter::from_source(BrokerEventCounter { event }))
-}
-
 fn request_event(
     broker: &Arc<dyn BrokerControl>,
     request: EventRequest,
@@ -208,6 +254,18 @@ const fn error_to_object_error(error: ErrorCode) -> BrokerObjectError {
         ErrorCode::WouldBlock => BrokerObjectError::WouldBlock,
         ErrorCode::ResourceExhausted => BrokerObjectError::ResourceExhausted,
         _ => BrokerObjectError::Internal,
+    }
+}
+
+fn map_broker_result<T>(
+    result: Result<T, BrokerObjectError>,
+) -> Result<T, TryOpError<EventCounterError>> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(BrokerObjectError::WouldBlock) => Err(TryOpError::TryAgain),
+        Err(error) => Err(TryOpError::Other(broker_error_to_event_counter_error(
+            error,
+        ))),
     }
 }
 

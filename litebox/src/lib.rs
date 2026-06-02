@@ -41,4 +41,6 @@ mod utilities;
 pub mod utils;
 
 mod broker;
-pub use broker::{BrokerControl, BrokerControlError};
+pub use broker::{
+    BrokerControl, BrokerControlError, EventCounter, EventCounterConsumeMode, EventCounterError,
+};

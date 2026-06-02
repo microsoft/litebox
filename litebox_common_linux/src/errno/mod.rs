@@ -536,13 +536,13 @@ where
     }
 }
 
-impl From<litebox::event::EventCounterError> for Errno {
-    fn from(value: litebox::event::EventCounterError) -> Self {
+impl From<litebox::EventCounterError> for Errno {
+    fn from(value: litebox::EventCounterError) -> Self {
         match value {
-            litebox::event::EventCounterError::InvalidInput => Errno::EINVAL,
-            litebox::event::EventCounterError::WouldBlock
-            | litebox::event::EventCounterError::ResourceExhausted => Errno::EAGAIN,
-            litebox::event::EventCounterError::Io => Errno::EIO,
+            litebox::EventCounterError::InvalidInput => Errno::EINVAL,
+            litebox::EventCounterError::WouldBlock
+            | litebox::EventCounterError::ResourceExhausted => Errno::EAGAIN,
+            litebox::EventCounterError::Io => Errno::EIO,
             _ => Errno::EIO,
         }
     }
