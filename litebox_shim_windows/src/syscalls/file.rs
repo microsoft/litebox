@@ -954,6 +954,7 @@ mod tests {
     }
 
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
+        let _ = crate::tests::test_platform();
         <TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(f)
     }
 
