@@ -30,7 +30,7 @@ fn separate_process_broker_serves_event_object_requests() {
     );
 
     assert_eq!(
-        client.signal_event(handle).unwrap(),
+        client.add_event(handle, 1).unwrap(),
         ReadinessState::new(true, 1)
     );
 

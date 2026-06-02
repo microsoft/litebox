@@ -5,7 +5,7 @@
 //!
 //! The client owns request/response sequencing but does not own a channel.
 //! Userland, kernel, or ring-buffer deployments can provide channels by
-//! implementing [`litebox_broker_channel::ClientControlChannel`].
+//! implementing [`litebox_broker_protocol::ClientControlChannel`].
 
 #![no_std]
 
@@ -16,8 +16,9 @@ mod error;
 mod event;
 mod negotiate;
 
-use litebox_broker_channel::{ClientControlChannel, ReceivedBrokerResponse};
-use litebox_broker_protocol::{BrokerRequest, BrokerResponse, ProtocolVersion};
+use litebox_broker_protocol::{
+    BrokerRequest, BrokerResponse, ClientControlChannel, ProtocolVersion, ReceivedBrokerResponse,
+};
 
 pub use error::{ClientError, Result};
 
@@ -77,6 +78,13 @@ impl<T: ClientControlChannel> BrokerClient<T> {
     }
 
     pub(crate) fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
+        match self.raw_request(request)? {
+            BrokerResponse::Error(error) => Err(ClientError::Broker(error)),
+            response => Ok(response),
+        }
+    }
+
+    fn raw_request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
         self.channel
             .send_request(&request)
             .map_err(ClientError::Channel)?;
@@ -86,12 +94,18 @@ impl<T: ClientControlChannel> BrokerClient<T> {
             .map_err(ClientError::Channel)?
             .ok_or(ClientError::ChannelClosed)?
         {
-            ReceivedBrokerResponse::Response(BrokerResponse::Error(error)) => {
-                Err(ClientError::Broker(error))
-            }
             ReceivedBrokerResponse::Response(response) => Ok(response),
             _ => Err(ClientError::UnknownResponse),
         }
+    }
+
+    /// Sends one request on an active connection and returns the raw protocol response.
+    pub fn active_raw_request(
+        &mut self,
+        request: BrokerRequest,
+    ) -> Result<BrokerResponse, T::Error> {
+        self.ensure_negotiated()?;
+        self.raw_request(request)
     }
 }
 

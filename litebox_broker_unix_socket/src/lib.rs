@@ -5,18 +5,18 @@
 //!
 //! This crate deliberately uses `std` because Unix-domain sockets and `std::io`
 //! framing are hosted userland concerns. Portable broker interfaces live in the
-//! no_std protocol, wire, channel, client, core, and server crates.
+//! no_std protocol, wire, client, core, and server crates.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use litebox_broker_channel::{
+use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
+use litebox_broker_protocol::{
     ClientControlChannel, PeerCredential, ReceivedBrokerRequest, ReceivedBrokerResponse,
     ServerControlChannel,
 };
-use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
 use litebox_broker_wire::{decode_request, decode_response, encode_request, encode_response};
 
 const MAX_FRAME_LEN: usize = 64 * 1024;

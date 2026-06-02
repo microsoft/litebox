@@ -5,8 +5,8 @@
 //!
 //! `litebox_broker_core` owns broker-side object identity, reference lifetime,
 //! rights checks, reference generation checks, and policy calls. It deliberately has no
-//! dependency on protocol request/response types, Unix sockets, shared-memory
-//! rings, kernel traps, or any other channel implementation.
+//! dependency on protocol envelopes, Unix sockets, shared-memory rings, kernel
+//! traps, or any other channel implementation.
 
 #![no_std]
 
@@ -24,10 +24,12 @@ mod types;
 use alloc::collections::BTreeMap;
 
 pub use error::BrokerError;
-pub use event::{ReadinessState, WaitOutcome};
 pub use identity::{BrokerAssociation, CallerCredential};
+pub use litebox_broker_protocol::{
+    ConsumeEventResponse, EventConsumeMode, ObjectHandle, ObjectReferenceGeneration,
+    ObjectReferenceId, ReadinessState, WaitOutcome,
+};
 use object::{ObjectEntry, ObjectId, ObjectReference};
-pub use object::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
 pub use policy::{
     DefaultDenyPolicy, EventOnlyPolicy, ObjectOperation, PolicyDecision, PolicyEngine,
     PolicyOperation,

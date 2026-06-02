@@ -10,11 +10,13 @@ extern crate alloc;
 use core::fmt;
 
 use alloc::vec::Vec;
-use litebox_broker_channel::{ReceivedBrokerRequest, ReceivedBrokerResponse};
 use litebox_broker_protocol::{
-    BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, ErrorCode, EventRequest,
-    EventResponse, ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId, ProtocolVersion,
-    ReadinessState, WaitOutcome,
+    AddEventRequest, AddEventResponse, BrokerRequest, BrokerResponse, ConsumeEventRequest,
+    ConsumeEventResponse, CoreRequest, CoreResponse, CreateEventRequest, CreateEventResponse,
+    ErrorCode, EventConsumeMode, EventRequest, EventResponse, ObjectHandle,
+    ObjectReferenceGeneration, ObjectReferenceId, ProtocolVersion, ReadinessState,
+    ReceivedBrokerRequest, ReceivedBrokerResponse, WaitEventRequest, WaitEventResponse,
+    WaitOutcome,
 };
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
@@ -22,7 +24,8 @@ const REQUEST_TAG_CORE: u8 = 1;
 const CORE_REQUEST_TAG_EVENT: u8 = 0;
 const EVENT_REQUEST_TAG_CREATE: u8 = 0;
 const EVENT_REQUEST_TAG_WAIT: u8 = 1;
-const EVENT_REQUEST_TAG_SIGNAL: u8 = 2;
+const EVENT_REQUEST_TAG_ADD: u8 = 2;
+const EVENT_REQUEST_TAG_CONSUME: u8 = 3;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_CORE: u8 = 1;
@@ -30,11 +33,14 @@ const RESPONSE_TAG_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
 const CORE_RESPONSE_TAG_EVENT: u8 = 0;
 const EVENT_RESPONSE_TAG_CREATED: u8 = 0;
-const EVENT_RESPONSE_TAG_SIGNALED: u8 = 1;
-const EVENT_RESPONSE_TAG_WAITED: u8 = 2;
+const EVENT_RESPONSE_TAG_WAITED: u8 = 1;
+const EVENT_RESPONSE_TAG_ADDED: u8 = 2;
+const EVENT_RESPONSE_TAG_CONSUMED: u8 = 3;
 
 const WAIT_OUTCOME_TAG_READY: u8 = 1;
 const WAIT_OUTCOME_TAG_WOULD_BLOCK: u8 = 2;
+const EVENT_CONSUME_MODE_TAG_ALL: u8 = 1;
+const EVENT_CONSUME_MODE_TAG_ONE: u8 = 2;
 
 /// Error produced while encoding or decoding a broker wire message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +52,8 @@ pub enum WireError {
     EncodeUnknownResponseTag,
     /// The encoder was asked to emit a wait-outcome tag this codec does not own.
     EncodeUnknownWaitOutcome,
+    /// The encoder was asked to emit an event consume mode this codec does not own.
+    EncodeUnknownEventConsumeMode,
     /// The frame ended before a complete field could be decoded.
     TruncatedFrame,
     /// The frame contained bytes after the decoded message.
@@ -54,6 +62,8 @@ pub enum WireError {
     InvalidBoolean,
     /// The wait-outcome tag is unknown.
     UnknownWaitOutcome,
+    /// The event consume mode tag is unknown.
+    UnknownEventConsumeMode,
     /// A decoder offset overflowed.
     OffsetOverflow,
 }
@@ -71,9 +81,13 @@ impl fmt::Display for WireError {
             Self::EncodeUnknownWaitOutcome => {
                 f.write_str("cannot encode unknown broker wait outcome tag")
             }
+            Self::EncodeUnknownEventConsumeMode => {
+                f.write_str("cannot encode unknown broker event consume mode")
+            }
             Self::TrailingBytes => f.write_str("trailing broker wire bytes"),
             Self::InvalidBoolean => f.write_str("invalid broker wire boolean"),
             Self::UnknownWaitOutcome => f.write_str("unknown broker wait outcome"),
+            Self::UnknownEventConsumeMode => f.write_str("unknown broker event consume mode"),
             Self::OffsetOverflow => f.write_str("broker wire offset overflow"),
         }
     }
@@ -112,19 +126,26 @@ fn encode_core_request(encoder: &mut Encoder, request: CoreRequest) -> Result<()
 
 fn encode_event_request(encoder: &mut Encoder, request: EventRequest) -> Result<(), WireError> {
     match request {
-        EventRequest::Create => {
+        EventRequest::Create(request) => {
             encoder.u8(EVENT_REQUEST_TAG_CREATE);
+            encoder.u64(request.initial_count);
             Ok(())
         }
-        EventRequest::Wait { handle } => {
+        EventRequest::Wait(request) => {
             encoder.u8(EVENT_REQUEST_TAG_WAIT);
-            encoder.handle(handle);
+            encoder.handle(request.handle);
             Ok(())
         }
-        EventRequest::Signal { handle } => {
-            encoder.u8(EVENT_REQUEST_TAG_SIGNAL);
-            encoder.handle(handle);
+        EventRequest::Add(request) => {
+            encoder.u8(EVENT_REQUEST_TAG_ADD);
+            encoder.handle(request.handle);
+            encoder.u64(request.value);
             Ok(())
+        }
+        EventRequest::Consume(request) => {
+            encoder.u8(EVENT_REQUEST_TAG_CONSUME);
+            encoder.handle(request.handle);
+            encode_event_consume_mode(encoder, request.mode)
         }
         _ => Err(WireError::EncodeUnknownRequestTag),
     }
@@ -162,13 +183,15 @@ fn decode_core_request(decoder: &mut Decoder<'_>) -> Result<Option<CoreRequest>,
 
 fn decode_event_request(decoder: &mut Decoder<'_>) -> Result<Option<EventRequest>, WireError> {
     let request = match decoder.u8()? {
-        EVENT_REQUEST_TAG_CREATE => EventRequest::Create,
-        EVENT_REQUEST_TAG_WAIT => EventRequest::Wait {
-            handle: decoder.handle()?,
-        },
-        EVENT_REQUEST_TAG_SIGNAL => EventRequest::Signal {
-            handle: decoder.handle()?,
-        },
+        EVENT_REQUEST_TAG_CREATE => EventRequest::Create(CreateEventRequest::new(decoder.u64()?)),
+        EVENT_REQUEST_TAG_WAIT => EventRequest::Wait(WaitEventRequest::new(decoder.handle()?)),
+        EVENT_REQUEST_TAG_ADD => {
+            EventRequest::Add(AddEventRequest::new(decoder.handle()?, decoder.u64()?))
+        }
+        EVENT_REQUEST_TAG_CONSUME => EventRequest::Consume(ConsumeEventRequest::new(
+            decoder.handle()?,
+            decode_event_consume_mode(decoder)?,
+        )),
         _ => return Ok(None),
     };
 
@@ -219,19 +242,25 @@ fn encode_core_response(encoder: &mut Encoder, response: CoreResponse) -> Result
 
 fn encode_event_response(encoder: &mut Encoder, response: EventResponse) -> Result<(), WireError> {
     match response {
-        EventResponse::Created { handle } => {
+        EventResponse::Create(response) => {
             encoder.u8(EVENT_RESPONSE_TAG_CREATED);
-            encoder.handle(handle);
+            encoder.handle(response.handle);
             Ok(())
         }
-        EventResponse::Signaled { readiness } => {
-            encoder.u8(EVENT_RESPONSE_TAG_SIGNALED);
-            encoder.readiness(readiness);
-            Ok(())
-        }
-        EventResponse::Waited { outcome } => {
+        EventResponse::Wait(response) => {
             encoder.u8(EVENT_RESPONSE_TAG_WAITED);
-            encode_wait_outcome(encoder, outcome)
+            encode_wait_outcome(encoder, response.outcome)
+        }
+        EventResponse::Add(response) => {
+            encoder.u8(EVENT_RESPONSE_TAG_ADDED);
+            encoder.readiness(response.readiness);
+            Ok(())
+        }
+        EventResponse::Consume(response) => {
+            encoder.u8(EVENT_RESPONSE_TAG_CONSUMED);
+            encoder.u64(response.value);
+            encoder.readiness(response.readiness);
+            Ok(())
         }
         _ => Err(WireError::EncodeUnknownResponseTag),
     }
@@ -292,15 +321,17 @@ fn decode_core_response(decoder: &mut Decoder<'_>) -> Result<Option<CoreResponse
 
 fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<Option<EventResponse>, WireError> {
     let response = match decoder.u8()? {
-        EVENT_RESPONSE_TAG_CREATED => EventResponse::Created {
-            handle: decoder.handle()?,
-        },
-        EVENT_RESPONSE_TAG_SIGNALED => EventResponse::Signaled {
-            readiness: decoder.readiness()?,
-        },
-        EVENT_RESPONSE_TAG_WAITED => EventResponse::Waited {
-            outcome: decode_wait_outcome(decoder)?,
-        },
+        EVENT_RESPONSE_TAG_CREATED => {
+            EventResponse::Create(CreateEventResponse::new(decoder.handle()?))
+        }
+        EVENT_RESPONSE_TAG_WAITED => {
+            EventResponse::Wait(WaitEventResponse::new(decode_wait_outcome(decoder)?))
+        }
+        EVENT_RESPONSE_TAG_ADDED => EventResponse::Add(AddEventResponse::new(decoder.readiness()?)),
+        EVENT_RESPONSE_TAG_CONSUMED => EventResponse::Consume(ConsumeEventResponse::new(
+            decoder.u64()?,
+            decoder.readiness()?,
+        )),
         _ => return Ok(None),
     };
 
@@ -312,6 +343,31 @@ fn decode_wait_outcome(decoder: &mut Decoder<'_>) -> Result<WaitOutcome, WireErr
         WAIT_OUTCOME_TAG_READY => Ok(WaitOutcome::Ready(decoder.readiness()?)),
         WAIT_OUTCOME_TAG_WOULD_BLOCK => Ok(WaitOutcome::WouldBlock(decoder.readiness()?)),
         _ => Err(WireError::UnknownWaitOutcome),
+    }
+}
+
+fn encode_event_consume_mode(
+    encoder: &mut Encoder,
+    mode: EventConsumeMode,
+) -> Result<(), WireError> {
+    match mode {
+        EventConsumeMode::All => {
+            encoder.u8(EVENT_CONSUME_MODE_TAG_ALL);
+            Ok(())
+        }
+        EventConsumeMode::One => {
+            encoder.u8(EVENT_CONSUME_MODE_TAG_ONE);
+            Ok(())
+        }
+        _ => Err(WireError::EncodeUnknownEventConsumeMode),
+    }
+}
+
+fn decode_event_consume_mode(decoder: &mut Decoder<'_>) -> Result<EventConsumeMode, WireError> {
+    match decoder.u8()? {
+        EVENT_CONSUME_MODE_TAG_ALL => Ok(EventConsumeMode::All),
+        EVENT_CONSUME_MODE_TAG_ONE => Ok(EventConsumeMode::One),
+        _ => Err(WireError::UnknownEventConsumeMode),
     }
 }
 
@@ -431,9 +487,18 @@ mod tests {
             BrokerRequest::Negotiate {
                 protocol_version: ProtocolVersion::new(1, 0),
             },
-            event_request(EventRequest::Create),
-            event_request(EventRequest::Wait { handle }),
-            event_request(EventRequest::Signal { handle }),
+            event_request(EventRequest::Create(CreateEventRequest::new(0))),
+            event_request(EventRequest::Create(CreateEventRequest::new(7))),
+            event_request(EventRequest::Wait(WaitEventRequest::new(handle))),
+            event_request(EventRequest::Add(AddEventRequest::new(handle, 3))),
+            event_request(EventRequest::Consume(ConsumeEventRequest::new(
+                handle,
+                EventConsumeMode::All,
+            ))),
+            event_request(EventRequest::Consume(ConsumeEventRequest::new(
+                handle,
+                EventConsumeMode::One,
+            ))),
         ];
 
         for request in requests {
@@ -454,17 +519,22 @@ mod tests {
             BrokerResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion::new(1, 0),
             },
-            event_response(EventResponse::Created { handle }),
-            event_response(EventResponse::Signaled {
-                readiness: ReadinessState::new(false, 7),
-            }),
-            event_response(EventResponse::Waited {
-                outcome: WaitOutcome::Ready(ReadinessState::new(true, 8)),
-            }),
-            event_response(EventResponse::Waited {
-                outcome: WaitOutcome::WouldBlock(ReadinessState::new(false, 9)),
-            }),
+            event_response(EventResponse::Create(CreateEventResponse::new(handle))),
+            event_response(EventResponse::Wait(WaitEventResponse::new(
+                WaitOutcome::Ready(ReadinessState::new(true, 8)),
+            ))),
+            event_response(EventResponse::Wait(WaitEventResponse::new(
+                WaitOutcome::WouldBlock(ReadinessState::new(false, 9)),
+            ))),
+            event_response(EventResponse::Add(AddEventResponse::new(
+                ReadinessState::new(true, 10),
+            ))),
+            event_response(EventResponse::Consume(ConsumeEventResponse::new(
+                3,
+                ReadinessState::new(false, 11),
+            ))),
             BrokerResponse::Error(ErrorCode::PolicyDenied),
+            BrokerResponse::Error(ErrorCode::WouldBlock),
             BrokerResponse::Error(ErrorCode::Internal),
         ];
 
@@ -483,7 +553,10 @@ mod tests {
             Ok(ReceivedBrokerRequest::Unknown)
         );
         assert_eq!(decode_request(&[0, 1]), Err(WireError::TruncatedFrame));
-        let mut frame = encode_request(event_request(EventRequest::Create)).unwrap();
+        let mut frame = encode_request(event_request(EventRequest::Create(
+            CreateEventRequest::new(0),
+        )))
+        .unwrap();
         frame.push(0xff);
         assert_eq!(decode_request(&frame), Err(WireError::TrailingBytes));
     }
@@ -495,7 +568,7 @@ mod tests {
             Ok(ReceivedBrokerResponse::Unknown)
         );
         assert_eq!(
-            decode_response(&[1, 0, 2, 0xff]),
+            decode_response(&[1, 0, 1, 0xff]),
             Err(WireError::UnknownWaitOutcome)
         );
         assert_eq!(
@@ -505,7 +578,7 @@ mod tests {
             )))
         );
 
-        let mut invalid_bool = [1, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut invalid_bool = [1, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             decode_response(&invalid_bool),
             Err(WireError::InvalidBoolean)
@@ -521,11 +594,11 @@ mod tests {
     #[test]
     fn readiness_response_wire_shape_is_pinned() {
         assert_eq!(
-            encode_response(event_response(EventResponse::Signaled {
-                readiness: ReadinessState::new(true, 0x0102_0304_0506_0708)
-            }))
+            encode_response(event_response(EventResponse::Add(AddEventResponse::new(
+                ReadinessState::new(true, 0x0102_0304_0506_0708)
+            ))))
             .unwrap(),
-            [1, 0, 1, 1, 8, 7, 6, 5, 4, 3, 2, 1]
+            [1, 0, 2, 1, 8, 7, 6, 5, 4, 3, 2, 1]
         );
     }
 

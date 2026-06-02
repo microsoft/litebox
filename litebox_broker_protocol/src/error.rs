@@ -29,6 +29,8 @@ pub enum ErrorCode {
     InvalidRights,
     /// Broker-side resource exhaustion.
     ResourceExhausted,
+    /// The operation would block in the current event state.
+    WouldBlock,
     /// Error code emitted by a newer broker and not understood by this client.
     ///
     /// This variant is reserved for raw codes not assigned by this protocol
@@ -57,6 +59,7 @@ impl ErrorCode {
             7 => Self::WrongObjectType,
             8 => Self::InvalidRights,
             9 => Self::ResourceExhausted,
+            13 => Self::WouldBlock,
             raw => Self::Unknown(raw),
         }
     }
@@ -75,6 +78,7 @@ impl ErrorCode {
             Self::WrongObjectType => 7,
             Self::InvalidRights => 8,
             Self::ResourceExhausted => 9,
+            Self::WouldBlock => 13,
             Self::Unknown(raw) => raw,
         }
     }
@@ -94,6 +98,7 @@ impl fmt::Display for ErrorCode {
             Self::WrongObjectType => f.write_str("wrong broker object type"),
             Self::InvalidRights => f.write_str("invalid broker rights"),
             Self::ResourceExhausted => f.write_str("broker resource exhausted"),
+            Self::WouldBlock => f.write_str("broker operation would block"),
             Self::Unknown(raw) => write!(f, "unknown broker error code {raw}"),
         }
     }

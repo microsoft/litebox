@@ -3,19 +3,13 @@
 
 use core::fmt;
 
-use litebox_broker_channel::{PeerCredential, ReceivedBrokerRequest, ServerControlChannel};
 use litebox_broker_core::{
-    BrokerAssociation, BrokerCore, BrokerError, CallerCredential, ObjectHandle as CoreObjectHandle,
-    ObjectReferenceGeneration as CoreObjectReferenceGeneration,
-    ObjectReferenceId as CoreObjectReferenceId, PolicyEngine, ReadinessState as CoreReadinessState,
-    WaitOutcome as CoreWaitOutcome,
+    BrokerAssociation, BrokerCore, BrokerError, CallerCredential, PolicyEngine,
 };
 use litebox_broker_protocol::{
-    BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, ErrorCode, EventRequest,
-    EventResponse, ObjectHandle as ProtocolObjectHandle,
-    ObjectReferenceGeneration as ProtocolObjectReferenceGeneration,
-    ObjectReferenceId as ProtocolObjectReferenceId, ProtocolVersion,
-    ReadinessState as ProtocolReadinessState, WaitOutcome as ProtocolWaitOutcome,
+    AddEventResponse, BrokerRequest, BrokerResponse, CoreRequest, CoreResponse,
+    CreateEventResponse, ErrorCode, EventRequest, EventResponse, PeerCredential, ProtocolVersion,
+    ReceivedBrokerRequest, ServerControlChannel, WaitEventResponse,
 };
 
 /// Protocol version this broker server implementation supports.
@@ -139,21 +133,22 @@ fn handle_event_request<P: PolicyEngine>(
     request: EventRequest,
 ) -> BrokerResponse {
     match request {
-        EventRequest::Create => handle_core_result(core.create_event(association), |handle| {
-            event_response(EventResponse::Created {
-                handle: to_protocol_handle(handle),
+        EventRequest::Create(request) => handle_core_result(
+            core.create_event_with_count(association, request.initial_count),
+            |handle| event_response(EventResponse::Create(CreateEventResponse::new(handle))),
+        ),
+        EventRequest::Wait(request) => {
+            handle_core_result(core.wait_event(association, request.handle), |outcome| {
+                event_response(EventResponse::Wait(WaitEventResponse::new(outcome)))
             })
-        }),
-        EventRequest::Wait { handle } => {
-            handle_wait_result(core.wait_event(association, to_core_handle(handle)))
         }
-        EventRequest::Signal { handle } => handle_core_result(
-            core.signal_event(association, to_core_handle(handle)),
-            |readiness| {
-                event_response(EventResponse::Signaled {
-                    readiness: to_protocol_readiness_state(readiness),
-                })
-            },
+        EventRequest::Add(request) => handle_core_result(
+            core.add_event(association, request.handle, request.value),
+            |readiness| event_response(EventResponse::Add(AddEventResponse::new(readiness))),
+        ),
+        EventRequest::Consume(request) => handle_core_result(
+            core.consume_event(association, request.handle, request.mode),
+            |response| event_response(EventResponse::Consume(response)),
         ),
         _ => BrokerResponse::Error(ErrorCode::UnsupportedOperation),
     }
@@ -198,16 +193,6 @@ fn handle_core_result<T>(
     }
 }
 
-fn handle_wait_result(result: litebox_broker_core::Result<CoreWaitOutcome>) -> BrokerResponse {
-    match result {
-        Ok(outcome) => match to_protocol_wait_outcome(outcome) {
-            Some(outcome) => event_response(EventResponse::Waited { outcome }),
-            None => BrokerResponse::Error(ErrorCode::Internal),
-        },
-        Err(error) => BrokerResponse::Error(to_protocol_error(error)),
-    }
-}
-
 const fn event_response(response: EventResponse) -> BrokerResponse {
     BrokerResponse::Core(CoreResponse::Event(response))
 }
@@ -220,37 +205,9 @@ fn to_protocol_error(error: BrokerError) -> ErrorCode {
         BrokerError::WrongObjectType => ErrorCode::WrongObjectType,
         BrokerError::InvalidRights => ErrorCode::InvalidRights,
         BrokerError::ResourceExhausted => ErrorCode::ResourceExhausted,
+        BrokerError::WouldBlock => ErrorCode::WouldBlock,
+        BrokerError::UnsupportedOperation => ErrorCode::UnsupportedOperation,
         _ => ErrorCode::Internal,
-    }
-}
-
-fn to_core_handle(handle: ProtocolObjectHandle) -> CoreObjectHandle {
-    CoreObjectHandle::new(
-        CoreObjectReferenceId::new(handle.reference_id.get()),
-        CoreObjectReferenceGeneration::new(handle.reference_generation.get()),
-    )
-}
-
-fn to_protocol_handle(handle: CoreObjectHandle) -> ProtocolObjectHandle {
-    ProtocolObjectHandle::new(
-        ProtocolObjectReferenceId::new(handle.reference_id.get()),
-        ProtocolObjectReferenceGeneration::new(handle.reference_generation.get()),
-    )
-}
-
-fn to_protocol_readiness_state(readiness: CoreReadinessState) -> ProtocolReadinessState {
-    ProtocolReadinessState::new(readiness.ready, readiness.generation)
-}
-
-fn to_protocol_wait_outcome(outcome: CoreWaitOutcome) -> Option<ProtocolWaitOutcome> {
-    match outcome {
-        CoreWaitOutcome::Ready(readiness) => Some(ProtocolWaitOutcome::Ready(
-            to_protocol_readiness_state(readiness),
-        )),
-        CoreWaitOutcome::WouldBlock(readiness) => Some(ProtocolWaitOutcome::WouldBlock(
-            to_protocol_readiness_state(readiness),
-        )),
-        _ => None,
     }
 }
 
@@ -351,17 +308,15 @@ where
 mod tests {
     use super::*;
     use litebox_broker_core::EventOnlyPolicy;
+    use litebox_broker_protocol::{
+        AddEventRequest, CreateEventRequest, ReadinessState, WaitEventRequest, WaitOutcome,
+    };
 
     #[test]
     fn dispatch_enforces_negotiation_state() {
         let (mut core, association, mut state) = new_association();
 
-        let dispatch = handle_request(
-            &mut core,
-            &association,
-            &mut state,
-            event_request(EventRequest::Create),
-        );
+        let dispatch = handle_request(&mut core, &association, &mut state, event_create_request(0));
         assert_protocol_violation(dispatch);
         assert_eq!(state, ConnectionState::AwaitingNegotiation);
 
@@ -436,15 +391,12 @@ mod tests {
         let (mut core, association, mut state) = new_association();
         negotiate(&mut core, &association, &mut state);
 
-        let dispatch = handle_request(
-            &mut core,
-            &association,
-            &mut state,
-            event_request(EventRequest::Create),
-        );
+        let dispatch = handle_request(&mut core, &association, &mut state, event_create_request(0));
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
         let handle = match dispatch.response {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Created { handle })) => handle,
+            BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(response))) => {
+                response.handle
+            }
             response => panic!("unexpected response: {response:?}"),
         };
 
@@ -452,13 +404,13 @@ mod tests {
             &mut core,
             &association,
             &mut state,
-            event_request(EventRequest::Wait { handle }),
+            event_request(EventRequest::Wait(WaitEventRequest::new(handle))),
         );
         assert_eq!(
             dispatch.response,
-            event_response(EventResponse::Waited {
-                outcome: ProtocolWaitOutcome::WouldBlock(ProtocolReadinessState::new(false, 0))
-            })
+            event_response(EventResponse::Wait(WaitEventResponse::new(
+                WaitOutcome::WouldBlock(ReadinessState::new(false, 0))
+            )))
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
 
@@ -466,13 +418,13 @@ mod tests {
             &mut core,
             &association,
             &mut state,
-            event_request(EventRequest::Signal { handle }),
+            event_request(EventRequest::Add(AddEventRequest::new(handle, 1))),
         );
         assert_eq!(
             dispatch.response,
-            event_response(EventResponse::Signaled {
-                readiness: ProtocolReadinessState::new(true, 1)
-            })
+            event_response(EventResponse::Add(AddEventResponse::new(
+                ReadinessState::new(true, 1)
+            )))
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
 
@@ -480,13 +432,13 @@ mod tests {
             &mut core,
             &association,
             &mut state,
-            event_request(EventRequest::Wait { handle }),
+            event_request(EventRequest::Wait(WaitEventRequest::new(handle))),
         );
         assert_eq!(
             dispatch.response,
-            event_response(EventResponse::Waited {
-                outcome: ProtocolWaitOutcome::Ready(ProtocolReadinessState::new(true, 1))
-            })
+            event_response(EventResponse::Wait(WaitEventResponse::new(
+                WaitOutcome::Ready(ReadinessState::new(true, 1))
+            )))
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
     }
@@ -500,8 +452,8 @@ mod tests {
                     protocol_version: SUPPORTED_PROTOCOL_VERSION,
                 },
             ))),
-            Ok(Some(ReceivedBrokerRequest::Request(event_request(
-                EventRequest::Create,
+            Ok(Some(ReceivedBrokerRequest::Request(event_create_request(
+                0,
             )))),
             Ok(None),
         ]));
@@ -517,7 +469,9 @@ mod tests {
             }
         );
         let handle = match channel.responses[1] {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Created { handle })) => handle,
+            BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(response))) => {
+                response.handle
+            }
             response => panic!("unexpected response: {response:?}"),
         };
 
@@ -525,7 +479,7 @@ mod tests {
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
-            core.close_object_reference(&probe, to_core_handle(handle)),
+            core.close_object_reference(&probe, handle),
             Err(BrokerError::UnknownObject)
         );
     }
@@ -534,8 +488,8 @@ mod tests {
     fn serve_connection_closes_after_protocol_violation() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
         let mut channel = FakeServerChannel::new(std::vec::Vec::from([
-            Ok(Some(ReceivedBrokerRequest::Request(event_request(
-                EventRequest::Create,
+            Ok(Some(ReceivedBrokerRequest::Request(event_create_request(
+                0,
             )))),
             Ok(Some(ReceivedBrokerRequest::Request(
                 BrokerRequest::Negotiate {
@@ -564,8 +518,8 @@ mod tests {
                     protocol_version: SUPPORTED_PROTOCOL_VERSION,
                 },
             ))),
-            Ok(Some(ReceivedBrokerRequest::Request(event_request(
-                EventRequest::Create,
+            Ok(Some(ReceivedBrokerRequest::Request(event_create_request(
+                0,
             )))),
             Err(FakeChannelError::Recv),
         ]));
@@ -646,6 +600,10 @@ mod tests {
 
     const fn event_request(request: EventRequest) -> BrokerRequest {
         BrokerRequest::Core(CoreRequest::Event(request))
+    }
+
+    const fn event_create_request(initial_count: u64) -> BrokerRequest {
+        event_request(EventRequest::Create(CreateEventRequest::new(initial_count)))
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

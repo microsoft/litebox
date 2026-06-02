@@ -9,27 +9,7 @@ use crate::{
     BrokerCore, BrokerError, ObjectRights, ObjectType, PolicyDecision, PolicyEngine,
     PolicyOperation, Result, allocate_id,
 };
-
-macro_rules! id_type {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[repr(transparent)]
-        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(u64);
-
-        impl $name {
-            /// Creates an identifier from its raw value.
-            pub const fn new(raw: u64) -> Self {
-                Self(raw)
-            }
-
-            /// Returns the raw identifier value.
-            pub const fn get(self) -> u64 {
-                self.0
-            }
-        }
-    };
-}
+use litebox_broker_protocol::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
 
 /// Broker-owned object identifier.
 #[repr(transparent)]
@@ -40,42 +20,6 @@ impl ObjectId {
     /// Creates an object identifier from its raw value.
     const fn new(raw: u64) -> Self {
         Self(raw)
-    }
-}
-
-id_type! {
-    /// Broker-owned object reference identifier.
-    ObjectReferenceId
-}
-
-id_type! {
-    /// Generation attached to a broker object reference.
-    ObjectReferenceGeneration
-}
-
-/// Broker-owned reference handle returned by BrokerCore.
-///
-/// UserLiteBox may cache this value, but the broker remains authoritative for
-/// object identity, object lifetime, reference lifetime, type, rights, and
-/// reference generation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ObjectHandle {
-    /// Opaque broker reference identifier owned by one authenticated process association.
-    pub reference_id: ObjectReferenceId,
-    /// Reference generation used to reject stale handles after reference-slot reuse.
-    pub reference_generation: ObjectReferenceGeneration,
-}
-
-impl ObjectHandle {
-    /// Creates an object handle.
-    pub const fn new(
-        reference_id: ObjectReferenceId,
-        reference_generation: ObjectReferenceGeneration,
-    ) -> Self {
-        Self {
-            reference_id,
-            reference_generation,
-        }
     }
 }
 
@@ -308,7 +252,7 @@ mod tests {
         let handle = core
             .insert_object_with_reference(
                 &association,
-                ObjectKind::Event(EventObject::new()),
+                ObjectKind::Event(EventObject::new(0)),
                 ObjectType::Event,
                 ObjectRights::WAIT,
             )
@@ -320,7 +264,7 @@ mod tests {
         assert_eq!(
             core.insert_object_with_reference(
                 &association,
-                ObjectKind::Event(EventObject::new()),
+                ObjectKind::Event(EventObject::new(0)),
                 ObjectType::Event,
                 ObjectRights::WAIT,
             ),

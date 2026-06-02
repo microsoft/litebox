@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::{BrokerRequest, BrokerResponse, ProtocolVersion};
-
-use litebox_broker_channel::ClientControlChannel;
+use litebox_broker_protocol::{
+    BrokerRequest, BrokerResponse, ClientControlChannel, ProtocolVersion,
+};
 
 use crate::{BrokerClient, CLIENT_PROTOCOL_VERSION, ClientError, Result};
 

@@ -249,7 +249,7 @@ fn spawn_test_broker<P>(socket_path: &Path, policy: P) -> std::thread::JoinHandl
 where
     P: litebox_broker_core::PolicyEngine + Send + 'static,
 {
-    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(socket_path);
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let server_socket_path = socket_path.to_path_buf();
@@ -313,7 +313,7 @@ fn test_broker_event_path_over_unix_socket() {
         client.wait_event(handle).expect("event wait failed"),
         WaitOutcome::WouldBlock(ReadinessState::new(false, 0))
     );
-    let readiness = client.signal_event(handle).expect("event signal failed");
+    let readiness = client.add_event(handle, 1).expect("event add failed");
     assert_eq!(readiness, ReadinessState::new(true, 1));
     assert_eq!(
         client.wait_event(handle).expect("event ready-wait failed"),
@@ -321,6 +321,21 @@ fn test_broker_event_path_over_unix_socket() {
     );
 
     drop(client);
+    broker_thread.join().expect("broker test server panicked");
+    let _ = std::fs::remove_file(socket_path);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_broker_backed_eventfd_with_rewriter() {
+    let socket_path = unique_test_socket_path("broker-eventfd");
+    let broker_thread = spawn_test_broker(&socket_path, litebox_broker_core::EventOnlyPolicy);
+    let target = common::compile("./tests/eventfd.c", "broker_eventfd_rewriter", false, false);
+
+    Runner::new(&target, "broker_eventfd_rewriter")
+        .broker_socket(&socket_path)
+        .run();
+
     broker_thread.join().expect("broker test server panicked");
     let _ = std::fs::remove_file(socket_path);
 }

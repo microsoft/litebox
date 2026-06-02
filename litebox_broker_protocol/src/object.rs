@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-/// Broker object reference handle returned to UserLiteBox.
+/// Broker object reference handle returned to the local core.
 ///
-/// UserLiteBox may cache this value, but the broker remains authoritative for
+/// The local core may cache this value, but the broker remains authoritative for
 /// object identity, object lifetime, reference lifetime, type, rights, and
 /// reference generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

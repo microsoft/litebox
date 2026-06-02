@@ -1475,23 +1475,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "litebox_broker_channel"
-version = "0.1.0"
-dependencies = [
- "litebox_broker_protocol",
-]
-
-[[package]]
 name = "litebox_broker_client"
 version = "0.1.0"
 dependencies = [
- "litebox_broker_channel",
  "litebox_broker_protocol",
 ]
 
 [[package]]
 name = "litebox_broker_core"
 version = "0.1.0"
+dependencies = [
+ "litebox_broker_protocol",
+]
 
 [[package]]
 name = "litebox_broker_protocol"
@@ -1501,7 +1496,6 @@ version = "0.1.0"
 name = "litebox_broker_server"
 version = "0.1.0"
 dependencies = [
- "litebox_broker_channel",
  "litebox_broker_core",
  "litebox_broker_protocol",
 ]
@@ -1510,7 +1504,6 @@ dependencies = [
 name = "litebox_broker_unix_socket"
 version = "0.1.0"
 dependencies = [
- "litebox_broker_channel",
  "litebox_broker_protocol",
  "litebox_broker_wire",
 ]
@@ -1530,7 +1523,6 @@ dependencies = [
 name = "litebox_broker_wire"
 version = "0.1.0"
 dependencies = [
- "litebox_broker_channel",
  "litebox_broker_protocol",
 ]
 
@@ -1803,6 +1795,7 @@ dependencies = [
  "bitvec",
  "libc",
  "litebox",
+ "litebox_broker_protocol",
  "litebox_common_linux",
  "litebox_platform_multiplex",
  "litebox_syscall_rewriter",

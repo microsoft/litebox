@@ -1,33 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::{ErrorCode, ObjectHandle, ProtocolVersion};
-
-/// Broker-authoritative readiness state for one object.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReadinessState {
-    /// Whether the object is currently ready.
-    pub ready: bool,
-    /// Monotonic readiness generation used to invalidate user-side readiness caches.
-    pub generation: u64,
-}
-
-impl ReadinessState {
-    /// Creates a readiness state.
-    pub const fn new(ready: bool, generation: u64) -> Self {
-        Self { ready, generation }
-    }
-}
-
-/// Result of checking a wait condition in BrokerCore.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WaitOutcome {
-    /// The object is ready now.
-    Ready(ReadinessState),
-    /// The object is not ready; deployment-specific wait plumbing may block.
-    WouldBlock(ReadinessState),
-}
+use crate::ProtocolVersion;
+use crate::{
+    AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
+    CreateEventRequest, CreateEventResponse, ErrorCode, WaitEventRequest, WaitEventResponse,
+};
 
 /// Broker request sent over the control channel.
 ///
@@ -59,17 +37,13 @@ pub enum CoreRequest {
 #[non_exhaustive]
 pub enum EventRequest {
     /// Create a broker-owned event object.
-    Create,
+    Create(CreateEventRequest),
     /// Check whether an event wait would complete now.
-    Wait {
-        /// Event handle.
-        handle: ObjectHandle,
-    },
-    /// Signal an event.
-    Signal {
-        /// Event handle.
-        handle: ObjectHandle,
-    },
+    Wait(WaitEventRequest),
+    /// Add readiness credits to an event.
+    Add(AddEventRequest),
+    /// Consume readiness credits from an event.
+    Consume(ConsumeEventRequest),
 }
 
 /// Broker response sent over the control channel.
@@ -116,10 +90,12 @@ pub enum CoreResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EventResponse {
-    /// Operation returned a broker object handle.
-    Created { handle: ObjectHandle },
-    /// Operation returned readiness state.
-    Signaled { readiness: ReadinessState },
-    /// Wait operation returned wait state.
-    Waited { outcome: WaitOutcome },
+    /// Create operation response.
+    Create(CreateEventResponse),
+    /// Wait operation response.
+    Wait(WaitEventResponse),
+    /// Add operation response.
+    Add(AddEventResponse),
+    /// Consume operation response.
+    Consume(ConsumeEventResponse),
 }

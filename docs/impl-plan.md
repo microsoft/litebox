@@ -99,14 +99,14 @@ Exit criteria:
 - Broker binds caller identity to the authenticated channel endpoint. The first hosted executable passes the explicit unauthenticated placeholder through the same server API that later deployment-specific authentication will use.
 - Userland channel code only receives/sends decoded frames and supplies peer credentials; the generic server owns broker protocol dispatch and reports successful termination as peer-close or broker-close with a reason.
 - The Unix-socket channel adapter and hosted broker executable live in separate crates, so clients can depend on the channel without pulling in broker core/server deployment code.
-- BrokerCore has no dependency on `litebox_broker_protocol`, `litebox_broker_channel`, wire codecs, or concrete IPC crates.
+- BrokerCore depends only on shared broker value DTOs from `litebox_broker_protocol`; it does not depend on protocol envelopes, channel traits, wire codecs, or concrete IPC crates.
 - Client code does not need to depend on the userland broker server crate to use the first Unix socket channel.
 - The generic broker server library does not depend on concrete Unix socket channel code and remains `no_std`.
 - Malformed or unauthorized requests fail closed or return policy-denied according to explicit policy.
 - Unsupported future protocol operations return `UnsupportedOperation` without closing the connection so clients can probe optional features explicitly; newer core error categories or wait outcomes that the server adapter cannot represent return `Internal`.
 - Version-mismatch negotiation responses advertise the broker-supported version and keep the connection in negotiation state so clients can downgrade without reconnecting or guessing.
 - BrokerCore/object operations are grouped below the broker envelope instead of added as unrelated top-level `BrokerRequest` and `BrokerResponse` variants.
-- Control-channel contracts live in `litebox_broker_channel` and stay separate from semantic protocol messages. Future broker-initiated readiness, interrupt, fault, revocation, or session-failure traffic must use a separate notification channel/message family rather than unsolicited control-channel responses.
+- Control-channel contracts live in `litebox_broker_protocol::channel`, separate from semantic message DTO modules but in the same shared protocol crate. Future broker-initiated readiness, interrupt, fault, revocation, or session-failure traffic must use a separate notification channel/message family rather than unsolicited control-channel responses.
 
 ## Phase 3: UserLiteBox facade
 

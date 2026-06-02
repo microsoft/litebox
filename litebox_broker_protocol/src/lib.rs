@@ -1,22 +1,33 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Shared broker protocol types.
+//! Shared broker protocol types and channel contracts.
 //!
-//! This crate is intentionally channel-neutral. It describes broker-visible
-//! opaque handles, errors, and versions, but does not know whether the bytes
-//! move over Unix sockets, shared rings, kernel traps, or another IPC mechanism.
+//! This crate describes broker-visible opaque handles, errors, versions,
+//! request/response messages, and the transport-neutral control-channel
+//! contracts used to carry them. It does not know whether messages move over
+//! Unix sockets, shared rings, kernel traps, or another IPC mechanism.
 
 #![no_std]
 
+mod channel;
 mod error;
+mod event;
 mod message;
 mod object;
 
+pub use channel::{
+    ClientControlChannel, PeerCredential, ReceivedBrokerRequest, ReceivedBrokerResponse,
+    ServerControlChannel,
+};
 pub use error::ErrorCode;
+pub use event::{
+    AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
+    CreateEventRequest, CreateEventResponse, EventConsumeMode, ReadinessState, WaitEventRequest,
+    WaitEventResponse, WaitOutcome,
+};
 pub use message::{
     BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, EventRequest, EventResponse,
-    ReadinessState, WaitOutcome,
 };
 pub use object::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
 

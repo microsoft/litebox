@@ -1,27 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Shared broker channel contracts.
-//!
-//! This crate defines delivery contracts for broker authority messages. The
-//! current surface is intentionally limited to the paired control channel:
-//! one [`BrokerRequest`] produces one [`BrokerResponse`]. Concrete IPC
-//! implementations own framing, buffering, authentication, and the mechanism;
-//! non-blocking IPCs can provide a blocking adapter at this boundary.
-//! The current control channel is serial: clients should wait for the response
-//! to one request before sending the next. A future ring-buffer or multiplexed
-//! transport can preserve that shape with an adapter, or add correlation IDs in
-//! a protocol extension if concurrent in-flight control requests become
-//! necessary.
-//!
-//! Broker-initiated readiness, interrupt, fault, revocation, or session-failure
-//! traffic must use a separately named notification channel and notification
-//! message family when that lane is introduced. Such notifications must not be
-//! delivered as unsolicited control-channel responses.
-
-#![no_std]
-
-use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
+use crate::{BrokerRequest, BrokerResponse};
 
 /// Peer identity information supplied by the channel or host layer.
 ///
