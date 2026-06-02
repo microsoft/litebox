@@ -9,7 +9,7 @@ use std::{
 
 use alloc::sync::Arc;
 use anyhow::{Context as _, Result};
-use litebox::broker::{BrokerControl, BrokerControlError};
+use litebox::{BrokerControl, BrokerControlError};
 use litebox_broker_client::{BrokerClient, BrokerClientWorker};
 use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
 use litebox_broker_unix_socket::UnixStreamClientControlChannel;

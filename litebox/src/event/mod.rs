@@ -8,6 +8,7 @@ pub mod polling;
 pub mod wait;
 
 mod counter;
+pub(crate) use counter::EventCounterSource;
 pub use counter::{EventCounter, EventCounterConsumeMode, EventCounterError};
 
 bitflags::bitflags! {

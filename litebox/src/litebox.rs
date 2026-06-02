@@ -6,7 +6,7 @@
 use alloc::sync::Arc;
 
 use crate::{
-    broker::BrokerControl,
+    broker::{BrokerControl, BrokerState},
     event::{EventCounter, EventCounterError},
     fd::Descriptors,
     platform::TimeProvider,
@@ -68,7 +68,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         crate::sync::lock_tracing::LockTracker::init(platform);
 
         let descriptors = RwLock::new(Descriptors::new_from_litebox_creation());
-        let broker_control = RwLock::new(None);
+        let broker = BrokerState::new();
 
         litebox_util_log::trace!("LiteBox instance initialized");
 
@@ -76,7 +76,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             x: Arc::new(LiteBoxX {
                 platform,
                 descriptors,
-                broker_control,
+                broker,
             }),
         }
     }
@@ -114,7 +114,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 
     /// Installs broker control for broker-backed local-core objects.
     pub fn set_broker_control(&self, broker_control: Arc<dyn BrokerControl>) {
-        *self.x.broker_control.write() = Some(broker_control);
+        self.x.broker.set_control(broker_control);
     }
 
     /// Creates an event counter, using broker backing when available and compatible.
@@ -124,15 +124,11 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         requires_blocking: bool,
     ) -> Result<EventCounter<Platform>, EventCounterError>
     where
-        Platform: TimeProvider,
+        Platform: TimeProvider + 'static,
     {
-        if requires_blocking {
-            return EventCounter::new_local(initial_count);
-        }
-        let Some(broker) = self.x.broker_control.read().clone() else {
-            return EventCounter::new_local(initial_count);
-        };
-        EventCounter::new_broker_from_control(broker, initial_count)
+        self.x
+            .broker
+            .create_event_counter(initial_count, requires_blocking)
     }
 }
 
@@ -140,5 +136,5 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
-    broker_control: RwLock<Platform, Option<Arc<dyn BrokerControl>>>,
+    broker: BrokerState<Platform>,
 }
