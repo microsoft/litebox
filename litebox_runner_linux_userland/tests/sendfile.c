@@ -2,37 +2,13 @@
 // Licensed under the MIT license.
 
 #define _GNU_SOURCE
-#include <errno.h>
+#include "helpers.h"
+
 #include <fcntl.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/eventfd.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #define SRC_PATH "/tmp/lb_sendfile_src"
 #define DST_PATH "/tmp/lb_sendfile_dst"
-
-static void die(const char *msg) {
-    perror(msg);
-    exit(1);
-}
-
-static void fail(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void fail(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    fputs("FAIL: ", stderr);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
-    va_end(ap);
-    exit(1);
-}
 
 // Raw syscall — the shim intercepts SYS_sendfile.
 static ssize_t sys_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
@@ -59,12 +35,43 @@ static off_t fd_pos(int fd) {
     return p;
 }
 
+static void set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) die("fcntl F_GETFL");
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) die("fcntl F_SETFL O_NONBLOCK");
+}
+
+static void fill_pipe_until_eagain(int write_fd) {
+    char buf[4096];
+    memset(buf, 'p', sizeof(buf));
+
+    for (;;) {
+        ssize_t n = write(write_fd, buf, sizeof(buf));
+        if (n > 0) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        if (n < 0) die("fill pipe");
+        TEST_ASSERT(0, "fill pipe: zero-byte write");
+    }
+}
+
+static void drain_pipe_exact(int read_fd, size_t want) {
+    char buf[4096];
+
+    while (want > 0) {
+        size_t chunk = want < sizeof(buf) ? want : sizeof(buf);
+        ssize_t n = read(read_fd, buf, chunk);
+        if (n < 0) die("drain pipe");
+        TEST_ASSERT(n != 0, "drain pipe: EOF before requested bytes");
+        want -= (size_t)n;
+    }
+}
+
 static void read_full(int fd, char *buf, size_t want) {
     size_t got = 0;
     while (got < want) {
         ssize_t n = read(fd, buf + got, want - got);
         if (n < 0) die("read");
-        if (n == 0) fail("short read: got %zu of %zu", got, want);
+        TEST_ASSERT(n != 0, "short read");
         got += (size_t)n;
     }
 }
@@ -76,17 +83,14 @@ static void test_happy_null_offset(void) {
     int dst = make_dst_empty();
 
     ssize_t r = sys_sendfile(dst, src, NULL, len);
-    if (r != (ssize_t)len) fail("happy_null_offset: ret=%zd want=%zu", r, len);
-    if (fd_pos(src) != (off_t)len)
-        fail("happy_null_offset: src pos=%lld want=%zu", (long long)fd_pos(src), len);
-    if (fd_pos(dst) != (off_t)len)
-        fail("happy_null_offset: dst pos=%lld want=%zu", (long long)fd_pos(dst), len);
+    TEST_ASSERT(r == (ssize_t)len, "happy_null_offset: return count");
+    TEST_ASSERT(fd_pos(src) == (off_t)len, "happy_null_offset: source position");
+    TEST_ASSERT(fd_pos(dst) == (off_t)len, "happy_null_offset: destination position");
 
     if (lseek(dst, 0, SEEK_SET) < 0) die("lseek dst");
     char buf[64] = {0};
     read_full(dst, buf, len);
-    if (memcmp(buf, data, len) != 0)
-        fail("happy_null_offset: dst content mismatch");
+    TEST_ASSERT(memcmp(buf, data, len) == 0, "happy_null_offset: dst content");
 
     close(src);
     close(dst);
@@ -101,20 +105,16 @@ static void test_happy_with_offset(void) {
     if (lseek(src, 3, SEEK_SET) < 0) die("lseek src to 3");
     off_t off = 5;
     ssize_t r = sys_sendfile(dst, src, &off, 4);
-    if (r != 4) fail("happy_with_offset: ret=%zd want=4", r);
-    if (off != 9) fail("happy_with_offset: *offset=%lld want=9", (long long)off);
+    TEST_ASSERT(r == 4, "happy_with_offset: return count");
+    TEST_ASSERT(off == 9, "happy_with_offset: offset pointer");
     // src position must NOT have moved when an explicit offset was supplied.
-    if (fd_pos(src) != 3)
-        fail("happy_with_offset: src pos=%lld want=3 (must be unchanged)",
-             (long long)fd_pos(src));
-    if (fd_pos(dst) != 4)
-        fail("happy_with_offset: dst pos=%lld want=4", (long long)fd_pos(dst));
+    TEST_ASSERT(fd_pos(src) == 3, "happy_with_offset: source position unchanged");
+    TEST_ASSERT(fd_pos(dst) == 4, "happy_with_offset: destination position");
 
     if (lseek(dst, 0, SEEK_SET) < 0) die("lseek dst");
     char buf[8] = {0};
     read_full(dst, buf, 4);
-    if (memcmp(buf, "5678", 4) != 0)
-        fail("happy_with_offset: dst content = '%.4s' want '5678'", buf);
+    TEST_ASSERT(memcmp(buf, "5678", 4) == 0, "happy_with_offset: dst content");
 
     close(src);
     close(dst);
@@ -128,10 +128,8 @@ static void test_count_exceeds_remaining(void) {
 
     if (lseek(src, 5, SEEK_SET) < 0) die("lseek src to 5");
     ssize_t r = sys_sendfile(dst, src, NULL, 100);
-    if (r != 3) fail("count_exceeds_remaining: ret=%zd want=3", r);
-    if (fd_pos(src) != (off_t)len)
-        fail("count_exceeds_remaining: src pos=%lld want=%zu",
-             (long long)fd_pos(src), len);
+    TEST_ASSERT(r == 3, "count_exceeds_remaining: return count");
+    TEST_ASSERT(fd_pos(src) == (off_t)len, "count_exceeds_remaining: source position");
 
     close(src);
     close(dst);
@@ -144,9 +142,9 @@ static void test_offset_past_eof(void) {
 
     off_t off = 100;
     ssize_t r = sys_sendfile(dst, src, &off, 8);
-    if (r != 0) fail("offset_past_eof: ret=%zd want=0", r);
-    if (off != 100) fail("offset_past_eof: *offset=%lld want=100", (long long)off);
-    if (fd_pos(dst) != 0) fail("offset_past_eof: dst pos=%lld want=0", (long long)fd_pos(dst));
+    TEST_ASSERT(r == 0, "offset_past_eof: return count");
+    TEST_ASSERT(off == 100, "offset_past_eof: offset pointer unchanged");
+    TEST_ASSERT(fd_pos(dst) == 0, "offset_past_eof: destination position");
 
     close(src);
     close(dst);
@@ -158,19 +156,14 @@ static void test_count_zero(void) {
     int dst = make_dst_empty();
 
     ssize_t r = sys_sendfile(dst, src, NULL, 0);
-    if (r != 0) fail("count_zero_null_off: ret=%zd want=0", r);
-    if (fd_pos(src) != 0)
-        fail("count_zero_null_off: src pos=%lld want=0 (unchanged)",
-             (long long)fd_pos(src));
+    TEST_ASSERT(r == 0, "count_zero_null_off: return count");
+    TEST_ASSERT(fd_pos(src) == 0, "count_zero_null_off: source position unchanged");
 
     off_t off = 4;
     r = sys_sendfile(dst, src, &off, 0);
-    if (r != 0) fail("count_zero_with_off: ret=%zd want=0", r);
-    if (off != 4)
-        fail("count_zero_with_off: *offset=%lld want=4 (unchanged)", (long long)off);
-    if (fd_pos(src) != 0)
-        fail("count_zero_with_off: src pos=%lld want=0 (unchanged)",
-             (long long)fd_pos(src));
+    TEST_ASSERT(r == 0, "count_zero_with_off: return count");
+    TEST_ASSERT(off == 4, "count_zero_with_off: offset pointer unchanged");
+    TEST_ASSERT(fd_pos(src) == 0, "count_zero_with_off: source position unchanged");
 
     close(src);
     close(dst);
@@ -180,19 +173,32 @@ static void test_bad_in_fd(void) {
     int dst = make_dst_empty();
     errno = 0;
     ssize_t r = sys_sendfile(dst, 9999, NULL, 4);
-    if (r != -1 || errno != EBADF)
-        fail("bad_in_fd: ret=%zd errno=%d want -1/EBADF", r, errno);
+    TEST_ASSERT(r == -1 && errno == EBADF, "bad_in_fd: EBADF");
     close(dst);
 }
 
 static void test_bad_out_fd(void) {
     const char data[] = "data";
     int src = make_src_with_data(data, sizeof(data) - 1);
+    if (lseek(src, 2, SEEK_SET) < 0) die("lseek src to 2");
     errno = 0;
     ssize_t r = sys_sendfile(9999, src, NULL, 4);
-    if (r != -1 || errno != EBADF)
-        fail("bad_out_fd: ret=%zd errno=%d want -1/EBADF", r, errno);
+    TEST_ASSERT(r == -1 && errno == EBADF, "bad_out_fd: EBADF");
+    TEST_ASSERT(fd_pos(src) == 2, "bad_out_fd: source position unchanged");
     close(src);
+}
+
+static void test_bad_out_fd_checked_before_bad_in_fd_type(void) {
+    int pfd[2];
+    if (pipe(pfd) != 0) die("pipe");
+    if (write(pfd[1], "data", 4) != 4) die("write pipe");
+
+    errno = 0;
+    ssize_t r = sys_sendfile(9999, pfd[0], NULL, 4);
+    TEST_ASSERT(r == -1 && errno == EBADF, "bad_out_fd_before_bad_in_fd_type: EBADF");
+
+    close(pfd[0]);
+    close(pfd[1]);
 }
 
 static void test_negative_offset(void) {
@@ -202,8 +208,7 @@ static void test_negative_offset(void) {
     off_t off = -1;
     errno = 0;
     ssize_t r = sys_sendfile(dst, src, &off, 4);
-    if (r != -1 || errno != EINVAL)
-        fail("negative_offset: ret=%zd errno=%d want -1/EINVAL", r, errno);
+    TEST_ASSERT(r == -1 && errno == EINVAL, "negative_offset: EINVAL");
     close(src);
     close(dst);
 }
@@ -217,14 +222,66 @@ static void test_file_to_pipe_null_offset(void) {
 
     if (lseek(src, 2, SEEK_SET) < 0) die("lseek src to 2");
     ssize_t r = sys_sendfile(pfd[1], src, NULL, 5);
-    if (r != 5) fail("file_to_pipe_null_offset: ret=%zd want=5", r);
-    if (fd_pos(src) != 7)
-        fail("file_to_pipe_null_offset: src pos=%lld want=7", (long long)fd_pos(src));
+    TEST_ASSERT(r == 5, "file_to_pipe_null_offset: return count");
+    TEST_ASSERT(fd_pos(src) == 7, "file_to_pipe_null_offset: source position");
 
     char buf[8] = {0};
     read_full(pfd[0], buf, 5);
-    if (memcmp(buf, "cdefg", 5) != 0)
-        fail("file_to_pipe_null_offset: read '%.5s' want 'cdefg'", buf);
+    TEST_ASSERT(memcmp(buf, "cdefg", 5) == 0, "file_to_pipe_null_offset: pipe content");
+
+    close(src);
+    close(pfd[0]);
+    close(pfd[1]);
+}
+
+static void test_full_nonblocking_pipe_keeps_null_offset_position(void) {
+    char data[8192];
+    for (size_t i = 0; i < sizeof(data); i++) data[i] = (char)('A' + (i % 26));
+
+    int src = make_src_with_data(data, sizeof(data));
+    int pfd[2];
+    if (pipe(pfd) != 0) die("pipe");
+    set_nonblocking(pfd[1]);
+    fill_pipe_until_eagain(pfd[1]);
+
+    if (lseek(src, 123, SEEK_SET) < 0) die("lseek src to 123");
+    errno = 0;
+    ssize_t r = sys_sendfile(pfd[1], src, NULL, sizeof(data));
+    TEST_ASSERT(r == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
+                "full_nonblocking_pipe_null_offset: EAGAIN");
+    TEST_ASSERT(fd_pos(src) == 123,
+                "full_nonblocking_pipe_null_offset: source position unchanged");
+
+    close(src);
+    close(pfd[0]);
+    close(pfd[1]);
+}
+
+static void test_partial_nonblocking_pipe_error_is_deferred(void) {
+    char data[16384];
+    for (size_t i = 0; i < sizeof(data); i++) data[i] = (char)('a' + (i % 26));
+
+    int src = make_src_with_data(data, sizeof(data));
+    int pfd[2];
+    if (pipe(pfd) != 0) die("pipe");
+    set_nonblocking(pfd[1]);
+    fill_pipe_until_eagain(pfd[1]);
+    drain_pipe_exact(pfd[0], 4096);
+
+    if (lseek(src, 123, SEEK_SET) < 0) die("lseek src to 123");
+    errno = 0;
+    ssize_t r = sys_sendfile(pfd[1], src, NULL, sizeof(data));
+    TEST_ASSERT(r > 0, "partial_nonblocking_pipe_error_deferred: partial success");
+    off_t want_pos = 123 + r;
+    TEST_ASSERT(fd_pos(src) == want_pos,
+                "partial_nonblocking_pipe_error_deferred: source position");
+
+    errno = 0;
+    ssize_t retry = sys_sendfile(pfd[1], src, NULL, sizeof(data));
+    TEST_ASSERT(retry == -1 && (errno == EAGAIN || errno == EWOULDBLOCK),
+                "partial_nonblocking_pipe_error_deferred retry: EAGAIN");
+    TEST_ASSERT(fd_pos(src) == want_pos,
+                "partial_nonblocking_pipe_error_deferred retry: source position unchanged");
 
     close(src);
     close(pfd[0]);
@@ -242,16 +299,13 @@ static void test_file_to_pipe_with_offset(void) {
     if (lseek(src, 1, SEEK_SET) < 0) die("lseek src to 1");
     off_t off = 4;
     ssize_t r = sys_sendfile(pfd[1], src, &off, 3);
-    if (r != 3) fail("file_to_pipe_with_offset: ret=%zd want=3", r);
-    if (off != 7) fail("file_to_pipe_with_offset: *offset=%lld want=7", (long long)off);
-    if (fd_pos(src) != 1)
-        fail("file_to_pipe_with_offset: src pos=%lld want=1 (unchanged)",
-             (long long)fd_pos(src));
+    TEST_ASSERT(r == 3, "file_to_pipe_with_offset: return count");
+    TEST_ASSERT(off == 7, "file_to_pipe_with_offset: offset pointer");
+    TEST_ASSERT(fd_pos(src) == 1, "file_to_pipe_with_offset: source position unchanged");
 
     char buf[8] = {0};
     read_full(pfd[0], buf, 3);
-    if (memcmp(buf, "EFG", 3) != 0)
-        fail("file_to_pipe_with_offset: read '%.3s' want 'EFG'", buf);
+    TEST_ASSERT(memcmp(buf, "EFG", 3) == 0, "file_to_pipe_with_offset: pipe content");
 
     close(src);
     close(pfd[0]);
@@ -267,14 +321,12 @@ static void expect_einval_espipe_in_fd(int in_fd, const char *label) {
 
     errno = 0;
     ssize_t r = sys_sendfile(dst, in_fd, NULL, 4);
-    if (r != -1 || errno != EINVAL)
-        fail("%s: NULL offset got ret=%zd errno=%d want -1/EINVAL", label, r, errno);
+    TEST_ASSERT(r == -1 && errno == EINVAL, label);
 
     off_t off = 0;
     errno = 0;
     r = sys_sendfile(dst, in_fd, &off, 4);
-    if (r != -1 || errno != ESPIPE)
-        fail("%s: &offset got ret=%zd errno=%d want -1/ESPIPE", label, r, errno);
+    TEST_ASSERT(r == -1 && errno == ESPIPE, label);
 
     close(dst);
 }
@@ -323,8 +375,11 @@ int main(void) {
     test_count_zero();
     test_bad_in_fd();
     test_bad_out_fd();
+    test_bad_out_fd_checked_before_bad_in_fd_type();
     test_negative_offset();
     test_file_to_pipe_null_offset();
+    test_full_nonblocking_pipe_keeps_null_offset_position();
+    test_partial_nonblocking_pipe_error_is_deferred();
     test_file_to_pipe_with_offset();
     test_pipe_in_fd();
     test_eventfd_in_fd();

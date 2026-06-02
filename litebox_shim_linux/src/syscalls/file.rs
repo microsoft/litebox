@@ -518,6 +518,32 @@ impl<FS: ShimFS> Task<FS> {
         self.sys_write(fd, buf, Some(pos))
     }
 
+    fn rewind_sendfile_in_fd(&self, in_raw_fd: usize, unread_n: usize) -> Result<(), Errno> {
+        if unread_n == 0 {
+            return Ok(());
+        }
+
+        let rewind = isize::try_from(unread_n).map_err(|_| Errno::EOVERFLOW)?;
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                in_raw_fd,
+                |fd| {
+                    files
+                        .fs
+                        .seek(fd, -rewind, SeekWhence::RelativeToCurrentOffset)
+                        .map(|_| ())
+                        .map_err(Errno::from)
+                },
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()
+    }
+
     /// Handle syscall `sendfile`
     pub(crate) fn sys_sendfile(
         &self,
@@ -529,13 +555,26 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(in_raw_fd) = u32::try_from(in_fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
-        if u32::try_from(out_fd).is_err() {
+        let Ok(out_raw_fd) = u32::try_from(out_fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        // TODO: Linux rejects `sendfile` with `EINVAL` when `out_fd` has `O_APPEND` set.
+        if !self
+            .files
+            .borrow()
+            .raw_descriptor_store
+            .read()
+            .is_alive(out_raw_fd)
+        {
             return Err(Errno::EBADF);
         }
 
         let mut cur_off = offset_ptr
             .map(|p| {
                 let off = p.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                if off < 0 {
+                    return Err(Errno::EINVAL);
+                }
                 usize::try_from(off).map_err(|_| Errno::EINVAL)
             })
             .transpose()?;
@@ -578,8 +617,15 @@ impl<FS: ShimFS> Task<FS> {
             let write_result = self.sys_write(out_fd, &kernel_buf[..read_n], None);
             let write_n = match write_result {
                 Ok(n) => n,
-                Err(e) if total == 0 => return Err(e),
-                Err(_) => break,
+                Err(e) => {
+                    if offset_ptr.is_none() {
+                        self.rewind_sendfile_in_fd(in_raw_fd, read_n)?;
+                    }
+                    if total == 0 {
+                        return Err(e);
+                    }
+                    break;
+                }
             };
 
             total += write_n;
@@ -587,6 +633,9 @@ impl<FS: ShimFS> Task<FS> {
                 *off += write_n;
             }
             if write_n < read_n {
+                if offset_ptr.is_none() {
+                    self.rewind_sendfile_in_fd(in_raw_fd, read_n - write_n)?;
+                }
                 break;
             }
         }
