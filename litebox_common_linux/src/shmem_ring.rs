@@ -310,6 +310,93 @@ impl RingWriter {
         }
     }
 
+    /// Returns the most recently published writer cursor.
+    ///
+    /// Uses [`Ordering::Acquire`] so that any data the writer published
+    /// with a `Release` store on `writer_pos` is visible to threads that
+    /// then read additional state guarded by the cursor.
+    ///
+    /// Intended for protocol-level cursor inspection (e.g.
+    /// `SubscriptionList`'s ACK-detection path) where the caller wants
+    /// to know "what cursor does any observer see right now?". This is
+    /// distinct from the cached value used by [`push_bytes`].
+    pub fn writer_pos(&self) -> u32 {
+        self.mmap.header().writer_pos.load(Ordering::Acquire)
+    }
+
+    /// Returns the most recently published reader cursor.
+    ///
+    /// Uses [`Ordering::Acquire`] so that any reader-side memory operation
+    /// performed before the reader's `Release` store on `reader_pos`
+    /// happens-before our load. In particular, if `reader_pos()` returns
+    /// a value `R`, then every byte in the ring at positions less than
+    /// `R` has been read by the peer.
+    ///
+    /// **Intended use:** the broker compares this value against a
+    /// previously-recorded `last_send_writer_pos` to determine whether a
+    /// specific notification frame has been consumed by the worker's
+    /// notification reader. See `SubscriptionList`'s ACK invariants
+    /// (A1–A9) for the full contract.
+    pub fn reader_pos(&self) -> u32 {
+        self.mmap.header().reader_pos.load(Ordering::Acquire)
+    }
+
+    /// Non-blocking variant of `write_all` that writes the entire buffer
+    /// atomically iff the ring currently has sufficient space.
+    ///
+    /// Returns:
+    /// - `Ok(())` on success — `buf.len()` bytes were appended atomically.
+    /// - `Err(WouldBlock)` if there is insufficient space in the ring
+    ///   right now. **No bytes are appended in this case**; the caller
+    ///   may retry later.
+    /// - `Err(BrokenPipe)` if the peer reader is closed.
+    /// - Other errors propagate from `available_space` if the cursors
+    ///   are invalid (should never happen on a well-formed ring).
+    ///
+    /// **Why atomic-or-nothing?** The notification framing layer
+    /// requires that frame boundaries are never split: a partial-send
+    /// would leave a half-frame in the ring that the reader would
+    /// interpret as garbage on its next `recv`. Atomic-or-nothing makes
+    /// frame-level retry sound — the broker re-queues the frame's
+    /// content (or the bits it represents) and retries on the next
+    /// opportunity.
+    ///
+    /// **Why non-blocking?** The blocking `write` path can deadlock if
+    /// the broker is blocked waiting on a worker that is itself blocked
+    /// waiting on the broker. The notification path must never hold up
+    /// broker progress. Combined with the `SubscriptionList`'s
+    /// retain-on-defer policy, `WouldBlock` becomes a routine flow-
+    /// control signal rather than an error.
+    pub fn try_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // Check before mutating state. If anything goes wrong, we want
+        // to leave the ring exactly as we found it.
+        if self.mmap.header().reader_closed.load(Ordering::Acquire) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "ring reader closed",
+            ));
+        }
+        let space = self.available_space()?;
+        if (space as usize) < buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "ring full; would block on write_all",
+            ));
+        }
+        self.push_bytes(buf);
+        // Dekker fence + wake (same shape as the blocking path).
+        atomic::fence(Ordering::SeqCst);
+        let header = self.mmap.header();
+        if header.reader_sleeping.load(Ordering::Acquire) != 0 {
+            header.reader_sleeping.store(0, Ordering::Release);
+            futex_wake(&header.reader_sleeping);
+        }
+        Ok(())
+    }
+
     /// Returns the number of bytes the writer may currently append without
     /// blocking.
     fn available_space(&self) -> io::Result<u32> {
@@ -710,6 +797,18 @@ fn dup_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
 /// Compute the distance (in bytes) from `consumer_pos` to `producer_pos`,
 /// using wrapping subtraction so that u32 overflow is handled correctly.
 ///
+/// Returns the in-flight distance between a producer cursor and a
+/// consumer cursor, using wrapping subtraction.
+///
+/// Intended for callers that hold both cursors (e.g. via
+/// [`RingWriter::writer_pos`] / [`RingWriter::reader_pos`]) and want a
+/// safe modular comparison. Returns an error if the distance exceeds
+/// [`RING_DATA_SIZE`], which indicates either cursor corruption or
+/// caller-passed values that don't come from the same ring.
+pub fn ring_in_flight_bytes(producer_pos: u32, consumer_pos: u32) -> io::Result<u32> {
+    ring_distance(producer_pos, consumer_pos)
+}
+
 /// Returns an error if the distance exceeds `RING_DATA_SIZE`, which
 /// indicates corrupted cursors.
 fn ring_distance(producer_pos: u32, consumer_pos: u32) -> io::Result<u32> {
