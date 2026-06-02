@@ -75,6 +75,16 @@ fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     }
 }
 
+#[cfg(target_pointer_width = "64")]
+fn preadv_pwritev_offset(pos_l: usize, _pos_h: usize) -> i64 {
+    pos_l.reinterpret_as_signed() as i64
+}
+
+#[cfg(target_pointer_width = "32")]
+fn preadv_pwritev_offset(pos_l: usize, pos_h: usize) -> i64 {
+    ((pos_h as u64) << 32 | pos_l as u64).reinterpret_as_signed()
+}
+
 pub struct LinuxShimEntrypoints<FS: ShimFS> {
     task: Task<FS>,
     // The task should not be moved once it's bound to a platform thread so that
@@ -648,14 +658,16 @@ impl<FS: ShimFS> Task<FS> {
                 fd,
                 iovec,
                 iovcnt,
-                offset,
-            } => self.sys_preadv(fd, iovec, iovcnt, offset),
+                pos_l,
+                pos_h,
+            } => self.sys_preadv(fd, iovec, iovcnt, preadv_pwritev_offset(pos_l, pos_h)),
             SyscallRequest::Pwritev {
                 fd,
                 iovec,
                 iovcnt,
-                offset,
-            } => self.sys_pwritev(fd, iovec, iovcnt, offset),
+                pos_l,
+                pos_h,
+            } => self.sys_pwritev(fd, iovec, iovcnt, preadv_pwritev_offset(pos_l, pos_h)),
             SyscallRequest::Access { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EFAULT), |path| syscall!(sys_access(path, mode))),

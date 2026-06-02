@@ -5,30 +5,11 @@
 // negative iovcnt with EINVAL, matching Linux's documented behavior. The
 // boundary value IOV_MAX itself must still succeed.
 
-#define _GNU_SOURCE
-#include <errno.h>
+#include "helpers.h"
+
 #include <fcntl.h>
 #include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/syscall.h>
 #include <sys/uio.h>
-#include <unistd.h>
-
-#define FAIL(msg)                                                              \
-    do {                                                                       \
-        fprintf(stderr, "FAIL: %s (line %d): %s (errno=%d: %s)\n", __func__,   \
-                __LINE__, (msg), errno, strerror(errno));                      \
-        exit(1);                                                               \
-    } while (0)
-
-#define EXPECT(cond, msg)                                                      \
-    do {                                                                       \
-        if (!(cond)) {                                                         \
-            FAIL(msg);                                                         \
-        }                                                                      \
-    } while (0)
 
 // Linux documents IOV_MAX as 1024 in <limits.h>; the kernel's UIO_MAXIOV
 // matches. Use the constant rather than the header value so the test asserts
@@ -67,13 +48,13 @@ static void seed_iov_array(void) {
 
 static int open_seeded(const char *path) {
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    EXPECT(fd >= 0, "open test file failed");
+    TEST_ASSERT(fd >= 0, "open test file failed");
     // Seed at least IOV_MAX bytes so the boundary readv/preadv has data to read.
     char buf[LB_IOV_MAX];
     memset(buf, 'A', sizeof(buf));
-    EXPECT(write(fd, buf, sizeof(buf)) == (ssize_t)sizeof(buf),
+    TEST_ASSERT(write(fd, buf, sizeof(buf)) == (ssize_t)sizeof(buf),
            "seed write failed");
-    EXPECT(lseek(fd, 0, SEEK_SET) == 0, "seed rewind failed");
+    TEST_ASSERT(lseek(fd, 0, SEEK_SET) == 0, "seed rewind failed");
     return fd;
 }
 
@@ -82,15 +63,15 @@ static void test_readv(void) {
     int fd = open_seeded(path);
 
     errno = 0;
-    EXPECT(raw_readv(fd, iov_array, LB_IOV_MAX + 1) == -1 && errno == EINVAL,
+    TEST_ASSERT(raw_readv(fd, iov_array, LB_IOV_MAX + 1) == -1 && errno == EINVAL,
            "readv with iovcnt > IOV_MAX should fail with EINVAL");
 
     errno = 0;
-    EXPECT(raw_readv(fd, iov_array, -1) == -1 && errno == EINVAL,
+    TEST_ASSERT(raw_readv(fd, iov_array, -1) == -1 && errno == EINVAL,
            "readv with negative iovcnt should fail with EINVAL");
 
-    EXPECT(lseek(fd, 0, SEEK_SET) == 0, "rewind before boundary call failed");
-    EXPECT(raw_readv(fd, iov_array, LB_IOV_MAX) == LB_IOV_MAX,
+    TEST_ASSERT(lseek(fd, 0, SEEK_SET) == 0, "rewind before boundary call failed");
+    TEST_ASSERT(raw_readv(fd, iov_array, LB_IOV_MAX) == LB_IOV_MAX,
            "readv with iovcnt == IOV_MAX should succeed");
 
     close(fd);
@@ -100,17 +81,17 @@ static void test_readv(void) {
 static void test_writev(void) {
     const char *path = "/tmp/test_iov_max_writev.bin";
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    EXPECT(fd >= 0, "open writev test file failed");
+    TEST_ASSERT(fd >= 0, "open writev test file failed");
 
     errno = 0;
-    EXPECT(raw_writev(fd, iov_array, LB_IOV_MAX + 1) == -1 && errno == EINVAL,
+    TEST_ASSERT(raw_writev(fd, iov_array, LB_IOV_MAX + 1) == -1 && errno == EINVAL,
            "writev with iovcnt > IOV_MAX should fail with EINVAL");
 
     errno = 0;
-    EXPECT(raw_writev(fd, iov_array, -1) == -1 && errno == EINVAL,
+    TEST_ASSERT(raw_writev(fd, iov_array, -1) == -1 && errno == EINVAL,
            "writev with negative iovcnt should fail with EINVAL");
 
-    EXPECT(raw_writev(fd, iov_array, LB_IOV_MAX) == LB_IOV_MAX,
+    TEST_ASSERT(raw_writev(fd, iov_array, LB_IOV_MAX) == LB_IOV_MAX,
            "writev with iovcnt == IOV_MAX should succeed");
 
     close(fd);
@@ -122,14 +103,14 @@ static void test_preadv(void) {
     int fd = open_seeded(path);
 
     errno = 0;
-    EXPECT(raw_preadv(fd, iov_array, LB_IOV_MAX + 1, 0) == -1 && errno == EINVAL,
+    TEST_ASSERT(raw_preadv(fd, iov_array, LB_IOV_MAX + 1, 0) == -1 && errno == EINVAL,
            "preadv with iovcnt > IOV_MAX should fail with EINVAL");
 
     errno = 0;
-    EXPECT(raw_preadv(fd, iov_array, -1, 0) == -1 && errno == EINVAL,
+    TEST_ASSERT(raw_preadv(fd, iov_array, -1, 0) == -1 && errno == EINVAL,
            "preadv with negative iovcnt should fail with EINVAL");
 
-    EXPECT(raw_preadv(fd, iov_array, LB_IOV_MAX, 0) == LB_IOV_MAX,
+    TEST_ASSERT(raw_preadv(fd, iov_array, LB_IOV_MAX, 0) == LB_IOV_MAX,
            "preadv with iovcnt == IOV_MAX should succeed");
 
     close(fd);
@@ -139,22 +120,52 @@ static void test_preadv(void) {
 static void test_pwritev(void) {
     const char *path = "/tmp/test_iov_max_pwritev.bin";
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    EXPECT(fd >= 0, "open pwritev test file failed");
+    TEST_ASSERT(fd >= 0, "open pwritev test file failed");
 
     errno = 0;
-    EXPECT(raw_pwritev(fd, iov_array, LB_IOV_MAX + 1, 0) == -1 &&
+    TEST_ASSERT(raw_pwritev(fd, iov_array, LB_IOV_MAX + 1, 0) == -1 &&
                errno == EINVAL,
            "pwritev with iovcnt > IOV_MAX should fail with EINVAL");
 
     errno = 0;
-    EXPECT(raw_pwritev(fd, iov_array, -1, 0) == -1 && errno == EINVAL,
+    TEST_ASSERT(raw_pwritev(fd, iov_array, -1, 0) == -1 && errno == EINVAL,
            "pwritev with negative iovcnt should fail with EINVAL");
 
-    EXPECT(raw_pwritev(fd, iov_array, LB_IOV_MAX, 0) == LB_IOV_MAX,
+    TEST_ASSERT(raw_pwritev(fd, iov_array, LB_IOV_MAX, 0) == LB_IOV_MAX,
            "pwritev with iovcnt == IOV_MAX should succeed");
 
     close(fd);
     unlink(path);
+}
+
+static void test_error_precedence(void) {
+    errno = 0;
+    TEST_ASSERT(raw_readv(-1, iov_array, LB_IOV_MAX + 1) == -1 && errno == EBADF,
+           "readv with bad fd and oversized iovcnt should fail with EBADF");
+
+    errno = 0;
+    TEST_ASSERT(raw_writev(-1, iov_array, LB_IOV_MAX + 1) == -1 && errno == EBADF,
+           "writev with bad fd and oversized iovcnt should fail with EBADF");
+
+    errno = 0;
+    TEST_ASSERT(raw_preadv(-1, iov_array, LB_IOV_MAX + 1, -1) == -1 &&
+               errno == EINVAL,
+           "preadv with negative offset should fail before fd and iovcnt checks");
+
+    errno = 0;
+    TEST_ASSERT(raw_pwritev(-1, iov_array, LB_IOV_MAX + 1, -1) == -1 &&
+               errno == EINVAL,
+           "pwritev with negative offset should fail before fd and iovcnt checks");
+
+    errno = 0;
+    TEST_ASSERT(raw_preadv(-1, iov_array, LB_IOV_MAX + 1, 0) == -1 &&
+               errno == EBADF,
+           "preadv with bad fd and oversized iovcnt should fail with EBADF");
+
+    errno = 0;
+    TEST_ASSERT(raw_pwritev(-1, iov_array, LB_IOV_MAX + 1, 0) == -1 &&
+               errno == EBADF,
+           "pwritev with bad fd and oversized iovcnt should fail with EBADF");
 }
 
 int main(void) {
@@ -164,6 +175,7 @@ int main(void) {
     test_writev();
     test_preadv();
     test_pwritev();
+    test_error_precedence();
     printf("All iov_max tests passed.\n");
     return 0;
 }

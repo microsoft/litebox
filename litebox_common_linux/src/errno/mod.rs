@@ -187,7 +187,7 @@ impl From<litebox::fs::errors::ReadError> for Errno {
     fn from(value: litebox::fs::errors::ReadError) -> Self {
         match value {
             litebox::fs::errors::ReadError::NotAFile => Errno::EISDIR,
-            litebox::fs::errors::ReadError::NotForReading => Errno::EACCES,
+            litebox::fs::errors::ReadError::NotForReading => Errno::EBADF,
             litebox::fs::errors::ReadError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
