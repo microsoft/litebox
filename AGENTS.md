@@ -37,18 +37,9 @@ Coding agent sessions run in separate git worktrees and branches. When a
 session also brings up the Docker container, it must use a unique
 container name, ssh port, and its own target directory so parallel
 sessions do not invalidate each other's incremental builds or collide on
-host resources.
-
-**Docker image tags are auto-isolated per worktree.** The test harness
-resolves `litebox-test` / `litebox-agent-cli` through
-`tests/common/image_tag.rs`, which appends `:wt-<sha256(worktree)[..8]>`
-so two worktrees never `docker build` over each other's image. No
-per-session configuration is required. Escape hatches:
-`LITEBOX_IMAGE_TAG=<tag>` forces a single shared tag (e.g., for CI bake
-jobs); `LITEBOX_WORKTREE_PATH=<path>` overrides the path used for
-hashing. All litebox-derived images carry `LABEL litebox=1`, so
-`docker image prune --filter label=litebox=1 --filter until=72h` is the
-recommended scoped cleanup when worktrees are retired.
+host resources. Docker image tags are auto-isolated per worktree — see
+`litebox_test_harness/CLAUDE.md` "Per-session worktree" for the scheme
+and escape hatches.
 
 ## Branch and merge discipline
 
