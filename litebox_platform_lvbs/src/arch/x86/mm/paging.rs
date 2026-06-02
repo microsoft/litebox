@@ -589,6 +589,16 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                         ));
                     }
                     if rollback_on_error {
+                        if mapped_count > 0 {
+                            Self::rollback_mapped_pages(
+                                &mut inner,
+                                Page::range_inclusive(
+                                    start_page,
+                                    start_page + (mapped_count as u64 - 1),
+                                ),
+                                &mut allocator,
+                            );
+                        }
                         return Err(MapToError::PageAlreadyMapped(target_frame));
                     }
                     continue;

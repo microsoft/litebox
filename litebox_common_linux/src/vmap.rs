@@ -16,16 +16,20 @@ use thiserror::Error;
 ///
 /// Implementors must ensure that [`Self::vmap`] returns a valid mapping covering exactly the
 /// requested physical pages in order, that the returned [`Self::MapInfo`] owns the mapping and any
-/// physical-range access reservation needed for the mapping lifetime, and that [`Self::vunmap`] does not
-/// release that reservation unless the mapping has been invalidated or safely retained in the returned
+/// access reservation needed for the mapping lifetime, and that [`Self::vunmap`] does not release
+/// that reservation unless the mapping has been invalidated or safely retained in the returned
 /// [`Self::MapInfo`]. Implementors must also ensure [`Self::validate_unowned`] rejects physical
 /// pages owned by LiteBox when mapping them through this abstraction would violate Rust memory
 /// safety.
+///
+/// An access reservation is the platform's cooperative physical-range exclusion mechanism for
+/// LiteBox mappings. It does not imply Rust ownership of the foreign physical memory and does not
+/// exclude external agents such as DMA devices or another VM privilege level.
 pub unsafe trait VmapManager<const ALIGN: usize> {
     /// Mapping information returned by [`VmapManager::vmap`]. See [`PhysPageMapInfo`].
     ///
-    /// Implementors use this to carry the virtual mapping and any platform-specific physical
-    /// range access reservation policy (e.g., an RAII reservation guard) for the lifetime of the mapping.
+    /// Implementors use this to carry the virtual mapping and any platform-specific reservation
+    /// guard for the lifetime of the mapping.
     type MapInfo: PhysPageMapInfo;
 
     /// Map the given `PhysPageAddrArray` into virtually contiguous addresses with the given
@@ -39,12 +43,10 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     /// references from the returned pointer unless it can uphold Rust's aliasing and validity
     /// rules for the full lifetime of those references.
     ///
-    /// Implementations should reserve platform-specific physical range access before installing
-    /// mappings so cooperating LiteBox mappings observe the platform's reservation policy. For
-    /// copy-based physical pointer access, an exclusive reservation among LiteBox mappings is
-    /// sufficient. That policy does not exclude external agents such as DMA devices or another VM
-    /// privilege level; callers must treat the mapped memory like DMA/shared physical memory rather
-    /// than ordinary Rust-owned RAM.
+    /// Implementations should reserve access before installing mappings so cooperating LiteBox
+    /// mappings observe the platform's reservation policy. For copy-based physical pointer access,
+    /// an exclusive reservation among LiteBox mappings is sufficient. Callers must still treat the
+    /// mapped memory like DMA/shared physical memory rather than ordinary Rust-owned RAM.
     unsafe fn vmap(
         &self,
         _pages: &PhysPageAddrArray<ALIGN>,
@@ -58,13 +60,13 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     /// This function is analogous to Linux kernel's `vunmap()`.
     ///
     /// On failure, the unchanged `vmap_info` is returned alongside the error so the caller does
-    /// not lose the physical range access reservation it carries and can retry or drop it explicitly.
+    /// not lose the reservation it carries and can retry or drop it explicitly.
     ///
     /// # Safety
     ///
     /// The caller must ensure there are no outstanding raw-pointer uses or Rust references derived
     /// from `PhysPageMapInfo::base()`. After a successful call, the virtual mapping is invalid and
-    /// the physical range access reservation carried by `vmap_info` is released.
+    /// the reservation carried by `vmap_info` is released.
     unsafe fn vunmap(
         &self,
         vmap_info: Self::MapInfo,
@@ -135,8 +137,8 @@ pub type PhysPageAddrArray<const ALIGN: usize> = [PhysPageAddr<ALIGN>];
 
 /// Mapping information returned by `vmap()`.
 ///
-/// Implementors own the lifetime of the virtual mapping and any platform-specific physical range
-/// access reservation. Dropping the map info may release those resources, so callers must treat the
+/// Implementors own the lifetime of the virtual mapping and any platform-specific reservation.
+/// Dropping the map info may release those resources, so callers must treat the
 /// value as an RAII guard and pass it back to the same platform's `vunmap()` when explicitly
 /// unmapping.
 pub trait PhysPageMapInfo {

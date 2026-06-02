@@ -803,7 +803,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// Note: VTL0 physical memory is external memory not owned by LiteBox, similar to DMA/shared
     /// physical memory. Safe physical pointer APIs access it by creating a temporary mapping,
-    /// acquiring the cooperating LiteBox physical range access reservation, copying data to/from a
+    /// acquiring the cooperating LiteBox access reservation, copying data to/from a
     /// LiteBox-owned buffer with fallible raw-pointer copies, and unmapping immediately. They do not
     /// create Rust references to the mapped VTL0 memory. Direct `vmap()` remains unsafe because it
     /// exposes raw mapped memory to the caller.
@@ -1434,7 +1434,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
-        // Hold the map info in `ManuallyDrop` so its physical range access reservation is only
+        // Hold the map info in `ManuallyDrop` so its reservation is only
         // released once unmapping actually succeeds; on failure we hand it back to the caller.
         let vmap_info = ManuallyDrop::new(vmap_info);
         let base = vmap_info.base();
@@ -1454,7 +1454,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         // PTEs are already cleared at this point, so the mapping is functionally gone
         // and a retry would only re-fail against empty page-table entries. If the VA
         // allocator's bookkeeping is inconsistent, surface it via `debug_assert!` and
-        // drop `vmap_info` to release the physical range access reservation. The VA region
+        // drop `vmap_info` to release the reservation. The VA region
         // is leaked but cannot be safely recycled.
         let unregister_ok = !crate::mm::vmap::is_vmap_address(base_va)
             || crate::mm::vmap::vmap_allocator()
