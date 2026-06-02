@@ -635,7 +635,9 @@ mod test {
     #[test]
     fn test_epoll_with_eventfd() {
         let (task, epoll) = setup_epoll();
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::CLOEXEC);
+        let eventfd =
+            crate::syscalls::eventfd::EventFile::new(&task.global.litebox, 0, EfdFlags::CLOEXEC)
+                .unwrap();
         let typed = task
             .global
             .litebox
@@ -730,7 +732,9 @@ mod test {
         let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
-        let eventfd = crate::syscalls::eventfd::EventFile::new(0, EfdFlags::empty());
+        let eventfd =
+            crate::syscalls::eventfd::EventFile::new(&task.global.litebox, 0, EfdFlags::empty())
+                .unwrap();
 
         let typed = task
             .global

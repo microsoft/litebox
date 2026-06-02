@@ -806,7 +806,7 @@ minimal PolicyEngine
 broker-owned event object
 ```
 
-Early end-to-end shim tests should use a hybrid migration profile: only the migrated object family routes through the broker, while unrelated operations continue through the existing local compatibility path. UserLiteBox handle entries can therefore contain either local compatibility objects or broker reference handles with cached rights. This is explicitly a migration profile, not the final security posture for arbitrary workloads.
+Early end-to-end shim tests should use a hybrid migration profile: only the migrated object family routes through broker-backed local-core wrappers, while unrelated operations continue through the existing local compatibility path. Shims should keep calling local-core object interfaces; UserLiteBox/local-core entries can contain either local compatibility state or broker-backed wrappers with cached rights. This is explicitly a migration profile, not the final security posture for arbitrary workloads.
 
 Then proceed incrementally:
 

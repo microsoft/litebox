@@ -6,8 +6,10 @@
 use alloc::sync::Arc;
 
 use crate::{
-    broker::{BrokerControl, BrokerEvent, BrokerObjectError},
+    broker::BrokerControl,
+    event::{EventCounter, EventCounterError},
     fd::Descriptors,
+    platform::TimeProvider,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -115,15 +117,22 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         *self.x.broker_control.write() = Some(broker_control);
     }
 
-    /// Creates a broker-backed event object when broker control is installed.
-    pub fn create_broker_event(
+    /// Creates an event counter, using broker backing when available and compatible.
+    pub fn create_event_counter(
         &self,
         initial_count: u64,
-    ) -> Result<Option<BrokerEvent>, BrokerObjectError> {
+        requires_blocking: bool,
+    ) -> Result<EventCounter<Platform>, EventCounterError>
+    where
+        Platform: TimeProvider,
+    {
+        if requires_blocking {
+            return EventCounter::new_local(initial_count);
+        }
         let Some(broker) = self.x.broker_control.read().clone() else {
-            return Ok(None);
+            return EventCounter::new_local(initial_count);
         };
-        BrokerEvent::create(broker, initial_count).map(Some)
+        EventCounter::new_broker_from_control(broker, initial_count)
     }
 }
 

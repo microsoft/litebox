@@ -7,6 +7,9 @@ pub mod observer;
 pub mod polling;
 pub mod wait;
 
+mod counter;
+pub use counter::{EventCounter, EventCounterConsumeMode, EventCounterError};
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Events: u32 {
