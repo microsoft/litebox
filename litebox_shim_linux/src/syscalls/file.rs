@@ -555,19 +555,8 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(in_raw_fd) = u32::try_from(in_fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
-        let Ok(out_raw_fd) = u32::try_from(out_fd).and_then(usize::try_from) else {
-            return Err(Errno::EBADF);
-        };
         // TODO: Linux rejects `sendfile` with `EINVAL` when `out_fd` has `O_APPEND` set.
-        if !self
-            .files
-            .borrow()
-            .raw_descriptor_store
-            .read()
-            .is_alive(out_raw_fd)
-        {
-            return Err(Errno::EBADF);
-        }
+        self.check_raw_fd_exists(out_fd)?;
 
         let mut cur_off = offset_ptr
             .map(|p| {
@@ -2301,19 +2290,9 @@ impl<FS: ShimFS> Task<FS> {
         newfd: Option<i32>,
         flags: Option<OFlags>,
     ) -> Result<u32, Errno> {
-        let Ok(oldfd) = u32::try_from(oldfd) else {
-            return Err(Errno::EBADF);
-        };
+        self.check_raw_fd_exists(oldfd)?;
+        let oldfd = u32::try_from(oldfd).map_err(|_| Errno::EBADF)?;
         let oldfd_usize = usize::try_from(oldfd).or(Err(Errno::EBADF))?;
-        if !self
-            .files
-            .borrow()
-            .raw_descriptor_store
-            .read()
-            .is_alive(oldfd_usize)
-        {
-            return Err(Errno::EBADF);
-        }
         if let Some(newfd) = newfd {
             // dup2/dup3
             let Ok(newfd) = u32::try_from(newfd) else {
