@@ -153,6 +153,15 @@ mod lease;
 #[path = "common/framework.rs"]
 mod framework;
 
+// ── Per-worktree Docker image tag helper ─────────────────────────────
+// One source of truth for image tag resolution so two concurrent
+// worktrees never `docker build -t litebox-test` over each other.
+// See `tests/common/image_tag.rs` for resolution order + escape
+// hatches (`LITEBOX_IMAGE_TAG`, `LITEBOX_WORKTREE_PATH`).
+#[allow(dead_code)]
+#[path = "common/image_tag.rs"]
+mod image_tag;
+
 fn emit_timing_main(
     test: &str,
     pass: &str,
@@ -1026,7 +1035,7 @@ fn build_standard_spec(pass: &str, test_id: &str) -> framework::ContainerSpec {
         _ => panic!("unknown pass: {pass}"),
     };
     framework::ContainerSpec {
-        image: "litebox-test".to_string(),
+        image: image_tag::image_tag("litebox-test"),
         docker_args,
         command,
         detached: false,
@@ -1734,7 +1743,8 @@ fn ensure_rewritten_in_broker_cache(binary: &Path, in_container_path: &Path) {
 
 /// Build the Docker test image if needed.
 fn ensure_docker_image(ws_root: &Path) {
-    eprintln!("Building litebox-test Docker image...");
+    let tag = image_tag::image_tag("litebox-test");
+    eprintln!("Building Docker image {tag}...");
     let dockerfile = ws_root.join("litebox_tool_executor/rootfs/Dockerfile");
     assert!(
         dockerfile.exists(),
@@ -1742,19 +1752,12 @@ fn ensure_docker_image(ws_root: &Path) {
         dockerfile.display()
     );
     let status = Command::new("docker")
-        .args([
-            "build",
-            "--target",
-            "litebox-test",
-            "-t",
-            "litebox-test",
-            "-f",
-        ])
+        .args(["build", "--target", "litebox-test", "-t", &tag, "-f"])
         .arg(&dockerfile)
         .arg(ws_root)
         .status()
         .expect("docker build");
-    assert!(status.success(), "Docker build failed");
+    assert!(status.success(), "Docker build failed for {tag}");
 }
 
 /// Build all required binaries (5 legs of `BinaryType`) to the
@@ -2040,7 +2043,7 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
         .arg(format!("{}:/opt/litebox:ro", debug.display()))
         .arg("-v")
         .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
-        .arg("litebox-test")
+        .arg(image_tag::image_tag("litebox-test"))
         .args([
             "/opt/litebox/litebox_tool_executor",
             "--rootfs",
@@ -2632,7 +2635,12 @@ mod copilot {
     fn find_head_one_check(_canary: &str, response: &str) -> bool {
         let r = strip_ansi(response).to_lowercase();
         let hits = [
-            "one.txt", "two.txt", "three.txt", "four.txt", "five.txt", "six.txt",
+            "one.txt",
+            "two.txt",
+            "three.txt",
+            "four.txt",
+            "five.txt",
+            "six.txt",
         ]
         .iter()
         .filter(|n| r.contains(*n))
@@ -2647,7 +2655,12 @@ mod copilot {
     fn find_head_unpiped_check(_canary: &str, response: &str) -> bool {
         let r = strip_ansi(response).to_lowercase();
         let hits = [
-            "one.txt", "two.txt", "three.txt", "four.txt", "five.txt", "six.txt",
+            "one.txt",
+            "two.txt",
+            "three.txt",
+            "four.txt",
+            "five.txt",
+            "six.txt",
         ]
         .iter()
         .filter(|n| r.contains(*n))
@@ -2689,7 +2702,12 @@ mod copilot {
     fn find_head_ls_check(_canary: &str, response: &str) -> bool {
         let r = strip_ansi(response).to_lowercase();
         let hits = [
-            "one.txt", "two.txt", "three.txt", "four.txt", "five.txt", "six.txt",
+            "one.txt",
+            "two.txt",
+            "three.txt",
+            "four.txt",
+            "five.txt",
+            "six.txt",
         ]
         .iter()
         .filter(|n| r.contains(*n))
@@ -2817,10 +2835,7 @@ mod copilot {
             },
             Scenario {
                 id: "find_head_seq",
-                prompt: |_| {
-                    "Run `seq 1 5` and list every number it prints."
-                        .to_string()
-                },
+                prompt: |_| "Run `seq 1 5` and list every number it prints.".to_string(),
                 check: find_head_seq_check,
                 timeout_secs: 120,
                 fixtures: &[],
@@ -3153,7 +3168,7 @@ mod copilot {
             _ => panic!("unknown pass {pass}"),
         };
         super::framework::ContainerSpec {
-            image: super::copilot_image_name().to_string(),
+            image: super::copilot_image_tag(),
             docker_args,
             command,
             detached: true,
@@ -3989,7 +4004,7 @@ let o='';c.stdout.on('data',d=>o+=d);c.on('close',code=>{process.stdout.write('o
             _ => panic!("unknown pass {pass}"),
         };
         super::framework::ContainerSpec {
-            image: super::copilot_image_name().to_string(),
+            image: super::copilot_image_tag(),
             docker_args,
             command,
             detached: true,
@@ -4025,9 +4040,16 @@ let o='';c.stdout.on('data',d=>o+=d);c.on('close',code=>{process.stdout.write('o
     }
 }
 
-/// Image name for the Copilot CLI rootfs.
-fn copilot_image_name() -> &'static str {
+/// Image name (base) for the Copilot CLI rootfs. The actual tag
+/// used at build/run time goes through `image_tag::image_tag()`
+/// so concurrent worktrees don't clobber each other.
+fn copilot_image_base() -> &'static str {
     "litebox-agent-cli"
+}
+
+/// Per-worktree resolved tag.
+fn copilot_image_tag() -> String {
+    image_tag::image_tag(copilot_image_base())
 }
 
 /// Per-trial fixture directory.
@@ -4064,32 +4086,22 @@ fn write_token_env(path: &Path, tok: &str) -> Result<(), String> {
 /// Build the `litebox-agent-cli` Docker image if missing. Called
 /// only when Copilot trials are being registered.
 fn ensure_copilot_image(ws_root: &Path) {
+    let tag = copilot_image_tag();
     let check = Command::new("docker")
-        .args(["image", "inspect", copilot_image_name()])
+        .args(["image", "inspect", &tag])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     if matches!(check, Ok(s) if s.success()) {
         return;
     }
-    eprintln!("Building {} Docker image...", copilot_image_name());
+    eprintln!("Building {tag} Docker image...");
     let dockerfile = ws_root.join("litebox_tool_executor/rootfs/Dockerfile");
     let status = Command::new("docker")
-        .args([
-            "build",
-            "--target",
-            copilot_image_name(),
-            "-t",
-            copilot_image_name(),
-            "-f",
-        ])
+        .args(["build", "--target", copilot_image_base(), "-t", &tag, "-f"])
         .arg(&dockerfile)
         .arg(ws_root)
         .status()
         .expect("docker build litebox-agent-cli");
-    assert!(
-        status.success(),
-        "docker build {} failed",
-        copilot_image_name()
-    );
+    assert!(status.success(), "docker build {tag} failed",);
 }
