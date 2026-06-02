@@ -628,6 +628,12 @@ impl<FS: ShimFS> Task<FS> {
                 Some(buf) => self.sys_pwrite64(fd, &buf, offset),
                 None => Err(Errno::EFAULT),
             },
+            SyscallRequest::Sendfile {
+                out_fd,
+                in_fd,
+                offset,
+                count,
+            } => syscall!(sys_sendfile(out_fd, in_fd, offset, count)),
             SyscallRequest::Mmap {
                 addr,
                 length,

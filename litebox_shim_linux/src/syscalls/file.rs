@@ -517,6 +517,125 @@ impl<FS: ShimFS> Task<FS> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
         self.sys_write(fd, buf, Some(pos))
     }
+
+    fn rewind_sendfile_in_fd(&self, in_raw_fd: usize, unread_n: usize) -> Result<(), Errno> {
+        if unread_n == 0 {
+            return Ok(());
+        }
+
+        let rewind = isize::try_from(unread_n).map_err(|_| Errno::EOVERFLOW)?;
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                in_raw_fd,
+                |fd| {
+                    files
+                        .fs
+                        .seek(fd, -rewind, SeekWhence::RelativeToCurrentOffset)
+                        .map(|_| ())
+                        .map_err(Errno::from)
+                },
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
+            )
+            .flatten()
+    }
+
+    /// Handle syscall `sendfile`
+    pub(crate) fn sys_sendfile(
+        &self,
+        out_fd: i32,
+        in_fd: i32,
+        offset_ptr: Option<MutPtr<i64>>,
+        count: usize,
+    ) -> Result<usize, Errno> {
+        let Ok(in_raw_fd) = u32::try_from(in_fd).and_then(usize::try_from) else {
+            return Err(Errno::EBADF);
+        };
+        // TODO: Linux rejects `sendfile` with `EINVAL` when `out_fd` has `O_APPEND` set.
+        self.check_raw_fd_exists(out_fd)?;
+
+        let mut cur_off = offset_ptr
+            .map(|p| {
+                let off = p.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                if off < 0 {
+                    return Err(Errno::EINVAL);
+                }
+                usize::try_from(off).map_err(|_| Errno::EINVAL)
+            })
+            .transpose()?;
+
+        let mut kernel_buf = vec![0u8; count.min(PAGE_SIZE)];
+        let mut total: usize = 0;
+
+        while total < count {
+            let to_read = (count - total).min(kernel_buf.len());
+
+            // Non-FS sources are not seekable; Linux returns ESPIPE for any
+            // non-pread-capable source when an offset is supplied, EINVAL otherwise.
+            let non_fs_err = if cur_off.is_some() {
+                Errno::ESPIPE
+            } else {
+                Errno::EINVAL
+            };
+            let read_result = {
+                let buf_slice = &mut kernel_buf[..to_read];
+                let files = self.files.borrow();
+                files
+                    .run_on_raw_fd(
+                        in_raw_fd,
+                        |fd| files.fs.read(fd, buf_slice, cur_off).map_err(Errno::from),
+                        |_fd| Err(non_fs_err),
+                        |_fd| Err(non_fs_err),
+                        |_fd| Err(non_fs_err),
+                        |_fd| Err(non_fs_err),
+                        |_fd| Err(non_fs_err),
+                    )
+                    .flatten()
+            };
+            let read_n = match read_result {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if total == 0 => return Err(e),
+                Err(_) => break,
+            };
+
+            let write_result = self.sys_write(out_fd, &kernel_buf[..read_n], None);
+            let write_n = match write_result {
+                Ok(n) => n,
+                Err(e) => {
+                    if offset_ptr.is_none() {
+                        self.rewind_sendfile_in_fd(in_raw_fd, read_n)?;
+                    }
+                    if total == 0 {
+                        return Err(e);
+                    }
+                    break;
+                }
+            };
+
+            total += write_n;
+            if let Some(ref mut off) = cur_off {
+                *off += write_n;
+            }
+            if write_n < read_n {
+                if offset_ptr.is_none() {
+                    self.rewind_sendfile_in_fd(in_raw_fd, read_n - write_n)?;
+                }
+                break;
+            }
+        }
+
+        if let (Some(p), Some(off)) = (offset_ptr, cur_off) {
+            let off = i64::try_from(off).map_err(|_| Errno::EOVERFLOW)?;
+            p.write_at_offset(0, off).ok_or(Errno::EFAULT)?;
+        }
+
+        Ok(total)
+    }
 }
 
 fn espipe_for_non_seekable_offset(offset: Option<usize>) -> Result<(), Errno> {
@@ -2171,19 +2290,9 @@ impl<FS: ShimFS> Task<FS> {
         newfd: Option<i32>,
         flags: Option<OFlags>,
     ) -> Result<u32, Errno> {
-        let Ok(oldfd) = u32::try_from(oldfd) else {
-            return Err(Errno::EBADF);
-        };
+        self.check_raw_fd_exists(oldfd)?;
+        let oldfd = u32::try_from(oldfd).map_err(|_| Errno::EBADF)?;
         let oldfd_usize = usize::try_from(oldfd).or(Err(Errno::EBADF))?;
-        if !self
-            .files
-            .borrow()
-            .raw_descriptor_store
-            .read()
-            .is_alive(oldfd_usize)
-        {
-            return Err(Errno::EBADF);
-        }
         if let Some(newfd) = newfd {
             // dup2/dup3
             let Ok(newfd) = u32::try_from(newfd) else {
