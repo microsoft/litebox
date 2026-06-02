@@ -48,7 +48,41 @@ Coding-agent sessions run in separate git worktrees so parallel sessions
 don't invalidate each other's incremental builds or kill each other's
 containers. When investigating an integration-stack failure, build and
 run from the worktree, not the canonical checkout. See `AGENTS.md`
-"Per-session isolation" for details.
+"Per-session isolation" for the general worktree / target-dir / port
+discipline.
+
+**Docker image tags are auto-isolated per worktree.** The harness
+resolves `litebox-test` / `litebox-agent-cli` through
+`tests/common/image_tag.rs`, which appends `:wt-<sha256(worktree)[..8]>`
+so two concurrent worktrees never `docker build` over each other's
+image. The path used for hashing comes from `git rev-parse
+--show-toplevel`; the resulting tag is memoized per process. Zero
+per-session configuration required — running `cargo test` from
+`/home/me/src/litebox-foo` automatically tags
+`litebox-test:wt-abcd1234` and the dashboard supervisor in
+`/home/me/src/litebox-ci` automatically tags `litebox-test:wt-7b0ab919`
+without either knowing about the other.
+
+Escape hatches:
+
+| Env var                  | Effect |
+|--------------------------|--------|
+| `LITEBOX_IMAGE_TAG=<tag>`     | Force a single shared tag (e.g. CI bake jobs). Bypasses suffixing entirely. |
+| `LITEBOX_WORKTREE_PATH=<path>` | Override the path hashed for the suffix. Useful when running outside a worktree, or to deliberately collapse two paths to one tag. |
+
+All litebox-derived images carry `LABEL litebox=1` (set on the
+`litebox-base` stage in `litebox_tool_executor/rootfs/Dockerfile`),
+so scoped cleanup is:
+
+```sh
+docker image prune --filter label=litebox=1 --filter until=72h
+```
+
+This is the recommended periodic prune; it removes images from
+retired worktrees without touching unrelated images on the same
+Docker daemon. The `--target` argument to `docker build` always
+uses the bare stage name (`litebox-test`, `litebox-agent-cli`) —
+that's a Dockerfile-internal handle, not a tag.
 
 ## Multi-wave platform-fix workflow
 
