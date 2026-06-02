@@ -3771,6 +3771,81 @@ let o='';c.stdout.on('data',d=>o+=d);c.on('close',code=>{process.stdout.write('o
                 expected: &["INNER_DONE", "OUTER_DONE"],
                 fixtures: &[],
             },
+            // Wave 10 Track A: drive copilot's own bundled node-pty
+            // native module (pty.node) against a multi-line subprocess.
+            // Mirrors copilot's shell tool exactly: pty.fork(...) +
+            // fs.createReadStream(masterFd) drain. If THIS reproduces
+            // truncated output on litebox while PTYR_STDOUT_POST_SLEEP
+            // (blocking C reader, same shape) passes, the bug is in
+            // non-blocking master read + libuv's epoll-driven event
+            // loop interaction with litebox PTY emulation.
+            Scenario {
+                id: "nodepty_seq",
+                command: "node /workspace/nodepty_probe.mjs",
+                expected: &["END_TOTAL=", "5\\r\\n"],
+                fixtures: &[(
+                    "nodepty_probe.mjs",
+                    "import { createRequire } from \"module\";\n\
+const require = createRequire(\"/usr/local/lib/node_modules/@github/copilot/index.js\");\n\
+const pty = require(\"/usr/local/lib/node_modules/@github/copilot/prebuilds/linux-x64/pty.node\");\n\
+import * as net from \"net\";\n\
+const env = Object.entries(process.env).map(([k,v]) => `${k}=${v}`);\n\
+const r = pty.fork(\"/usr/bin/seq\", [\"1\",\"5\"], env, \"/tmp\", 80, 24, -1, -1, true, \"\", (c,sig)=>console.log(\"EXIT\",c,sig));\n\
+console.log(\"PID\",r.pid,\"FD\",r.fd);\n\
+// node-pty wraps master fd in net.Socket via Pipe binding to bypass\n\
+// node's TTY-fd check. This is the actual code path copilot's shell\n\
+// tool exercises.\n\
+const { Pipe, constants } = process.binding(\"pipe_wrap\");\n\
+const handle = new Pipe(constants.SOCKET);\n\
+handle.open(r.fd);\n\
+const s = new net.Socket({ handle, readable: true, writable: true });\n\
+let total = \"\";\n\
+s.on(\"data\", (c) => { total += c.toString(); console.log(\"CHUNK\",JSON.stringify(c.toString())); });\n\
+s.on(\"end\", () => { console.log(\"END_TOTAL=\",JSON.stringify(total)); process.exit(0); });\n\
+s.on(\"close\", () => { console.log(\"CLOSE_TOTAL=\",JSON.stringify(total)); process.exit(0); });\n\
+s.on(\"error\", (e) => { console.log(\"ERR\",e.code,\"END_TOTAL=\",JSON.stringify(total)); });\n\
+setTimeout(() => { console.log(\"TIMEOUT END_TOTAL=\",JSON.stringify(total)); process.exit(2); }, 5000);\n",
+                )],
+            },
+            // Wave 10 Track A: bare blocking read(2) on a node-pty
+            // master fd. Diagnoses whether litebox's PTY master is
+            // O_NONBLOCK by default (or is otherwise refusing to
+            // block on first read). C-level minimal probe — no node
+            // event loop, no libuv — so it isolates the kernel-shape
+            // bug from any node-side adaptation.
+            Scenario {
+                id: "nodepty_seq_blocking",
+                command: "node /workspace/nodepty_blocking.mjs",
+                expected: &["END_TOTAL=", "5\\r\\n"],
+                fixtures: &[(
+                    "nodepty_blocking.mjs",
+                    "import { createRequire } from \"module\";\n\
+const require = createRequire(\"/usr/local/lib/node_modules/@github/copilot/index.js\");\n\
+const pty = require(\"/usr/local/lib/node_modules/@github/copilot/prebuilds/linux-x64/pty.node\");\n\
+import * as fs from \"fs\";\n\
+import { execSync } from \"child_process\";\n\
+const env = Object.entries(process.env).map(([k,v]) => `${k}=${v}`);\n\
+const r = pty.fork(\"/usr/bin/seq\", [\"1\",\"5\"], env, \"/tmp\", 80, 24, -1, -1, true, \"\", (c,s)=>console.log(\"EXIT\",c,s));\n\
+console.log(\"PID\",r.pid,\"FD\",r.fd);\n\
+try { const fl = execSync(`cat /proc/self/fdinfo/${r.fd} 2>/dev/null || true`).toString(); console.log(\"FDINFO\",fl); } catch(e) {}\n\
+const buf = Buffer.alloc(4096);\n\
+let total = \"\";\n\
+for (let i = 0; i < 50; i++) {\n\
+  try {\n\
+    const n = fs.readSync(r.fd, buf, 0, 4096, null);\n\
+    if (n === 0) { console.log(\"EOF\"); break; }\n\
+    total += buf.slice(0,n).toString();\n\
+    console.log(\"READ\", n, JSON.stringify(buf.slice(0,n).toString()));\n\
+  } catch (e) {\n\
+    console.log(\"ERR\", e.code, \"i=\", i);\n\
+    if (e.code === \"EAGAIN\") { await new Promise(r=>setTimeout(r,50)); continue; }\n\
+    break;\n\
+  }\n\
+}\n\
+console.log(\"END_TOTAL=\", JSON.stringify(total));\n\
+process.exit(0);\n",
+                )],
+            },
         ]
     }
 
