@@ -29,6 +29,8 @@ use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
 use crate::syscalls::SyscallRequest;
+use crate::syscalls::file::{FileObject, FileObjectSubsystem};
+use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 
 mod loader;
 mod nt_types;
@@ -121,7 +123,11 @@ where
     let Some(handle) = syscalls::Handle::from_raw_fd(raw_fd) else {
         let typed = handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok();
         drop(handles);
-        if let Some(entry) = typed.and_then(|typed| litebox.descriptor_table_mut().remove(&typed)) {
+        let entry = typed.and_then(|typed| {
+            let mut descriptor_table = litebox.descriptor_table_mut();
+            descriptor_table.remove(&typed)
+        });
+        if let Some(entry) = entry {
             cleanup_entry(entry);
         }
         return Err(NtStatus::QUOTA_EXCEEDED);
@@ -156,13 +162,34 @@ pub(crate) fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsy
     let Some(raw_fd) = handle.raw_fd() else {
         return;
     };
+    let _ =
+        remove_raw_handle_by_raw_fd::<Platform, Subsystem>(litebox, handles, raw_fd, cleanup_entry);
+}
+
+pub(crate) fn remove_raw_handle_by_raw_fd<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore<Platform>,
+    raw_fd: usize,
+    cleanup_entry: impl FnOnce(Subsystem::Entry),
+) -> bool
+where
+    Platform: RawSyncPrimitivesProvider,
+{
     let typed = {
         let mut handles = handles.write();
         handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok()
     };
-    if let Some(entry) = typed.and_then(|typed| litebox.descriptor_table_mut().remove(&typed)) {
+    let Some(typed) = typed else {
+        return false;
+    };
+    let entry = {
+        let mut descriptor_table = litebox.descriptor_table_mut();
+        descriptor_table.remove(&typed)
+    };
+    if let Some(entry) = entry {
         cleanup_entry(entry);
     }
+    true
 }
 
 /// Builds a Windows NT shim instance.
@@ -225,7 +252,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         _envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<Platform, FS>, loader::WindowsLoadError> {
         let load_info =
-            loader::PeLoader::new(self.0.platform, fs, &self.0.page_manager).load(path)?;
+            loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager).load(path)?;
         let process = Arc::new(Process {
             ntdll_mapping: load_info.ntdll_mapping,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
@@ -236,9 +263,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
                 task: Task {
                     global: self.0.clone(),
                     process: process.clone(),
+                    fs,
                     entry_point: load_info.entry_point,
                     stack_top: load_info.stack_top,
-                    _phantom: PhantomData,
                 },
                 _not_send: PhantomData,
             },
@@ -278,9 +305,9 @@ impl<Platform: RawSyncPrimitivesProvider> Process<Platform> {
 struct Task<Platform: ShimPlatform, FS: ShimFS> {
     global: Arc<GlobalState<Platform, FS>>,
     process: Arc<Process<Platform>>,
+    fs: Arc<FS>,
     entry_point: usize,
     stack_top: usize,
-    _phantom: PhantomData<FS>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -321,6 +348,56 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "Handling Windows syscall"
         );
         let (result, op) = match req {
+            SyscallRequest::NtClose { handle } => {
+                let status = self.sys_nt_close(handle);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenFile {
+                file_handle,
+                desired_access,
+                object_attributes,
+                io_status_block,
+                share_access,
+                open_options,
+            } => {
+                let status = self.sys_nt_open_file(
+                    file_handle,
+                    desired_access,
+                    object_attributes,
+                    io_status_block,
+                    share_access,
+                    open_options,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateFile {
+                file_handle,
+                desired_access,
+                object_attributes,
+                io_status_block,
+                allocation_size,
+                file_attributes,
+                share_access,
+                create_disposition,
+                create_options,
+                ea_buffer,
+                ea_length,
+            } => {
+                let status = self.sys_nt_create_file(
+                    file_handle,
+                    desired_access,
+                    object_attributes,
+                    io_status_block,
+                    allocation_size,
+                    file_attributes,
+                    share_access,
+                    create_disposition,
+                    create_options,
+                    ea_buffer,
+                    ea_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenKey {
                 key_handle,
                 desired_access,
@@ -387,6 +464,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         op
     }
 
+    pub(crate) fn sys_nt_close(&self, handle: syscalls::Handle) -> NtStatus {
+        let Some(raw_fd) = handle.raw_fd() else {
+            return NtStatus::INVALID_HANDLE;
+        };
+        self.close_raw_fd(raw_fd, CloseRawHandleVisitor { task: self })
+    }
+
+    fn close_raw_fd(
+        &self,
+        raw_fd: usize,
+        visitor: impl RawHandleVisitor<Platform, FS>,
+    ) -> NtStatus {
+        if remove_raw_handle_by_raw_fd::<Platform, FileObjectSubsystem<FS>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |file| visitor.file(file),
+        ) {
+            return NtStatus::SUCCESS;
+        }
+        if remove_raw_handle_by_raw_fd::<Platform, RegistryKeySubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |key| visitor.registry_key(key),
+        ) {
+            return NtStatus::SUCCESS;
+        }
+        NtStatus::INVALID_HANDLE
+    }
+
     fn handle_interrupt_request(
         &self,
         _ctx: &mut litebox_common_linux::PtRegs,
@@ -396,6 +504,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "Windows guest interrupt"
         );
         ContinueOperation::Resume
+    }
+}
+
+trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
+    fn file(&self, file: FileObject<FS>);
+
+    fn registry_key(&self, key: RegistryKeyObject<Platform>);
+}
+
+struct CloseRawHandleVisitor<'task, Platform: ShimPlatform, FS: ShimFS> {
+    task: &'task Task<Platform, FS>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
+    for CloseRawHandleVisitor<'_, Platform, FS>
+{
+    fn file(&self, file: FileObject<FS>) {
+        self.task.close_file(file);
+    }
+
+    fn registry_key(&self, key: RegistryKeyObject<Platform>) {
+        self.task.close_registry_key(key);
     }
 }
 

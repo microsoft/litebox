@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+pub(crate) mod file;
 pub(crate) mod registry;
 
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
@@ -85,6 +86,30 @@ impl ProcessHandle {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
+    NtClose {
+        handle: Handle,
+    },
+    NtOpenFile {
+        file_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        share_access: u32,
+        open_options: u32,
+    },
+    NtCreateFile {
+        file_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        allocation_size: Option<Platform::RawConstPointer<i64>>,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        ea_buffer: Option<Platform::RawConstPointer<u8>>,
+        ea_length: u32,
+    },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -133,6 +158,30 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         }
 
         match NtSysno::from_raw(pt_regs.orig_rax)? {
+            NtSysno::NtClose => Some(sys_req!(NtClose {
+                handle: { Handle::from_raw },
+            })),
+            NtSysno::NtOpenFile => Some(sys_req!(NtOpenFile {
+                file_handle:*,
+                desired_access,
+                object_attributes:*,
+                io_status_block:*,
+                share_access,
+                open_options,
+            })),
+            NtSysno::NtCreateFile => Some(sys_req!(NtCreateFile {
+                file_handle:*,
+                desired_access,
+                object_attributes:*,
+                io_status_block:*,
+                allocation_size:*,
+                file_attributes,
+                share_access,
+                create_disposition,
+                create_options,
+                ea_buffer:*,
+                ea_length,
+            })),
             NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
                 key_handle:*,
                 desired_access,

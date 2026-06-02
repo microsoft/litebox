@@ -56,7 +56,7 @@ type RegistryFileSystem<Platform> = litebox::fs::layered::FileSystem<
     litebox::fs::tar_ro::FileSystem<Platform>,
 >;
 
-struct RegistryKeySubsystem<Platform>(PhantomData<fn(Platform)>);
+pub(crate) struct RegistryKeySubsystem<Platform>(PhantomData<fn(Platform)>);
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for RegistryKeySubsystem<Platform> {
     type Entry = RegistryKeyObject<Platform>;
@@ -64,7 +64,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for RegistryKeySubsystem<
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for RegistryKeyObject<Platform> {}
 
-struct RegistryKeyObject<Platform: crate::ShimPlatform> {
+pub(crate) struct RegistryKeyObject<Platform: crate::ShimPlatform> {
     path: String,
     fd: TypedFd<RegistryFileSystem<Platform>>,
     granted_access: RegistryKeyAccess,
@@ -377,7 +377,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
-    fn remove_registry_key_handle(&self, handle: Handle) {
+    pub(crate) fn close_registry_key_handle(&self, handle: Handle) {
         remove_raw_handle::<Platform, RegistryKeySubsystem<Platform>>(
             &self.global.litebox,
             &self.process.handles,
@@ -386,7 +386,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
     }
 
-    fn close_registry_key(&self, key: RegistryKeyObject<Platform>) {
+    pub(crate) fn close_registry_key(&self, key: RegistryKeyObject<Platform>) {
         let _ = self.global.registry.fs.close(&key.fd);
     }
 
@@ -406,7 +406,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match self.do_nt_open_key(desired_access, object_attributes) {
             Ok(handle) => {
                 if key_handle.write_at_offset(0, handle).is_none() {
-                    self.remove_registry_key_handle(handle);
+                    self.close_registry_key_handle(handle);
                     return NtStatus::ACCESS_VIOLATION;
                 }
 
@@ -1242,6 +1242,42 @@ mod tests {
             .do_nt_open_key(RegistryKeyAccess::SET_VALUE.bits(), write_object_attributes)
             .expect("write-only access should use write filesystem permissions");
         assert_ne!(handle, Handle::default());
+    }
+
+    #[test]
+    fn nt_close_removes_registry_key_handle() {
+        let task = crate::tests::test_task();
+        let key_handle = open_code_page_key(&task);
+        let value_name = utf16("ACP");
+        let value_name = unicode_string(&value_name);
+        let mut information = [0u8; 64];
+        let mut result_length = 0;
+
+        assert!(
+            task.do_nt_query_value_key(
+                key_handle,
+                value_name,
+                KeyValueInformationClass::Partial,
+                mut_byte_ptr(&mut information),
+                u32::try_from(information.len()).unwrap(),
+                mut_ptr(&mut result_length),
+            )
+            .is_ok()
+        );
+        assert_eq!(task.sys_nt_close(key_handle), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(key_handle), NtStatus::INVALID_HANDLE);
+        assert_eq!(
+            task.do_nt_query_value_key(
+                key_handle,
+                value_name,
+                KeyValueInformationClass::Partial,
+                mut_byte_ptr(&mut information),
+                u32::try_from(information.len()).unwrap(),
+                mut_ptr(&mut result_length),
+            )
+            .unwrap_err(),
+            NtStatus::INVALID_HANDLE
+        );
     }
 
     #[test]

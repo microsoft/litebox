@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use alloc::string::String;
+use core::mem::offset_of;
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -44,6 +45,26 @@ pub(crate) struct ObjectAttributes {
     pub(crate) attributes: u32,
     pub(crate) security_descriptor: usize,
     pub(crate) security_quality_of_service: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct IoStatusBlock {
+    pub(crate) status: i32,
+    pub(crate) padding_0: [u8; 4],
+    pub(crate) information: usize,
+}
+
+const _: () = assert!(offset_of!(IoStatusBlock, information) == 0x8);
+
+impl IoStatusBlock {
+    pub(crate) const fn new(status: NtStatus, information: usize) -> Self {
+        Self {
+            status: status.as_raw(),
+            padding_0: [0; 4],
+            information,
+        }
+    }
 }
 
 pub(crate) fn read_object_attributes<Platform: RawPointerProvider>(

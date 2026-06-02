@@ -34,6 +34,20 @@ pub(crate) fn test_task() -> Task<TestPlatform, TestFS> {
     let platform = test_platform();
     let litebox = LiteBox::new(platform);
     let page_manager = WindowsPageManager::<TestPlatform>::new(&litebox);
+    let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
+    in_mem.with_root_privileges(|fs| {
+        use litebox::fs::FileSystem as _;
+        fs.mkdir(
+            "/tmp",
+            litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+        )
+        .expect("/tmp creation cannot fail on a fresh in-memory file system");
+        fs.chown("/tmp", Some(1000), Some(1000))
+            .expect("/tmp chown cannot fail on a fresh in-memory file system");
+    });
+    let tar_ro =
+        litebox::fs::tar_ro::FileSystem::new(&litebox, litebox::fs::tar_ro::EMPTY_TAR_FILE.into());
+    let fs = Arc::new(crate::default_fs(&litebox, in_mem, tar_ro));
     Task {
         global: Arc::new(GlobalState {
             platform,
@@ -47,8 +61,8 @@ pub(crate) fn test_task() -> Task<TestPlatform, TestFS> {
             handles: WindowsHandleStore::<TestPlatform>::new(RawDescriptorStorage::new()),
             exit_code: AtomicI32::new(0),
         }),
+        fs,
         entry_point: 0,
         stack_top: 0,
-        _phantom: PhantomData,
     }
 }
