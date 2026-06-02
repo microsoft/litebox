@@ -23,6 +23,10 @@ litebox_common_windows = { version = "0.1.0", path = "../litebox_common_windows"
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
 
 [lints]
 workspace = true
