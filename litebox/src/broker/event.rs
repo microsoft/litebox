@@ -4,12 +4,11 @@
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::{
-    AddEventRequest, BrokerRequest, BrokerResponse, ConsumeEventRequest, CoreRequest, CoreResponse,
-    CreateEventRequest, ErrorCode, EventConsumeMode, EventRequest, EventResponse, ObjectHandle,
-    WaitEventRequest, WaitOutcome,
+    AddEventRequest, ConsumeEventRequest, CoreRequest, CoreResponse, CreateEventRequest, ErrorCode,
+    EventRequest, EventResponse, ObjectHandle, WaitEventRequest, WaitOutcome,
 };
 
-use super::{BrokerControl, BrokerState};
+use super::{BrokerControl, BrokerControlError, BrokerState, EventConsumeMode};
 use crate::{
     event::{
         Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
@@ -31,15 +30,6 @@ pub enum EventCounterError {
     ResourceExhausted,
     /// The backing authority or transport failed.
     Io,
-}
-
-/// How an event counter read should consume readiness credits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EventCounterConsumeMode {
-    /// Consume all currently available credits.
-    All,
-    /// Consume one credit.
-    One,
 }
 
 /// A broker-backed local-core event counter.
@@ -102,7 +92,7 @@ where
         &self,
         _cx: &WaitContext<'_, Platform>,
         _nonblock: bool,
-        mode: EventCounterConsumeMode,
+        mode: EventConsumeMode,
     ) -> Result<u64, TryOpError<EventCounterError>> {
         let value = map_broker_result(self.event.consume(mode))?;
         self.pollee.notify_observers(Events::OUT);
@@ -163,10 +153,10 @@ impl BrokerEvent {
         })
     }
 
-    fn consume(&self, mode: EventCounterConsumeMode) -> Result<u64, BrokerObjectError> {
+    fn consume(&self, mode: EventConsumeMode) -> Result<u64, BrokerObjectError> {
         let response = self.request(EventRequest::Consume(ConsumeEventRequest::new(
             self.handle,
-            to_protocol_consume_mode(mode),
+            mode,
         )))?;
         let EventResponse::Consume(response) = response else {
             return Err(BrokerObjectError::UnexpectedResponse);
@@ -200,19 +190,19 @@ fn request_event(
     request: EventRequest,
 ) -> Result<EventResponse, BrokerObjectError> {
     let response = broker
-        .request(BrokerRequest::Core(CoreRequest::Event(request)))
-        .map_err(|_| BrokerObjectError::Control)?;
+        .request(CoreRequest::Event(request))
+        .map_err(control_error_to_object_error)?;
     match response {
-        BrokerResponse::Core(CoreResponse::Event(response)) => Ok(response),
-        BrokerResponse::Error(error) => Err(error_to_object_error(error)),
+        CoreResponse::Event(response) => Ok(response),
         _ => Err(BrokerObjectError::UnexpectedResponse),
     }
 }
 
-const fn to_protocol_consume_mode(mode: EventCounterConsumeMode) -> EventConsumeMode {
-    match mode {
-        EventCounterConsumeMode::All => EventConsumeMode::All,
-        EventCounterConsumeMode::One => EventConsumeMode::One,
+const fn control_error_to_object_error(error: BrokerControlError) -> BrokerObjectError {
+    match error {
+        BrokerControlError::Transport => BrokerObjectError::Control,
+        BrokerControlError::Broker(error) => error_to_object_error(error),
+        BrokerControlError::UnexpectedResponse => BrokerObjectError::UnexpectedResponse,
     }
 }
 

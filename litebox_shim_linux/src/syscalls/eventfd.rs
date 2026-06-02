@@ -6,7 +6,7 @@
 use core::sync::atomic::AtomicU32;
 
 use litebox::{
-    EventCounter, EventCounterConsumeMode, LiteBox,
+    EventConsumeMode, EventCounter, LiteBox,
     event::{
         Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
         wait::WaitContext,
@@ -57,11 +57,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         })
     }
 
-    fn consume_mode(&self) -> EventCounterConsumeMode {
+    fn consume_mode(&self) -> EventConsumeMode {
         if self.semaphore {
-            EventCounterConsumeMode::One
+            EventConsumeMode::One
         } else {
-            EventCounterConsumeMode::All
+            EventConsumeMode::All
         }
     }
 
@@ -71,10 +71,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             return Err(TryOpError::TryAgain);
         }
 
-        let res = match self.consume_mode() {
-            EventCounterConsumeMode::All => *counter,
-            EventCounterConsumeMode::One => 1,
-        };
+        let res = if self.semaphore { 1 } else { *counter };
         *counter -= res;
 
         drop(counter);

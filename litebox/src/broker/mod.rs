@@ -3,16 +3,25 @@
 
 use alloc::sync::Arc;
 
-use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
+use litebox_broker_protocol::{CoreRequest, CoreResponse, ErrorCode};
 
 use crate::sync::{RawSyncPrimitivesProvider, RwLock};
 
-mod event_counter;
-pub use event_counter::{EventCounter, EventCounterConsumeMode, EventCounterError};
+mod event;
+pub use event::{EventCounter, EventCounterError};
+pub use litebox_broker_protocol::EventConsumeMode;
 
 /// Error returned by the deployment-provided broker control path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BrokerControlError;
+#[non_exhaustive]
+pub enum BrokerControlError {
+    /// The broker control transport failed.
+    Transport,
+    /// The broker returned an operation error.
+    Broker(ErrorCode),
+    /// The broker returned a response shape that does not match the request.
+    UnexpectedResponse,
+}
 
 /// Local-core access to the negotiated broker control channel.
 ///
@@ -20,11 +29,11 @@ pub struct BrokerControlError;
 /// requests. Deployment code owns endpoint selection and supplies the connected
 /// transport behind this protocol-level boundary.
 pub trait BrokerControl: Send + Sync {
-    /// Sends one active broker request and returns its response.
+    /// Sends one active BrokerCore request and returns its response.
     fn request(
         &self,
-        request: BrokerRequest,
-    ) -> core::result::Result<BrokerResponse, BrokerControlError>;
+        request: CoreRequest,
+    ) -> core::result::Result<CoreResponse, BrokerControlError>;
 }
 
 pub(crate) struct BrokerState<Platform: RawSyncPrimitivesProvider> {

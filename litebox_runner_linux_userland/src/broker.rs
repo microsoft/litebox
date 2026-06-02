@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 use anyhow::{Context as _, Result};
 use litebox::{BrokerControl, BrokerControlError};
 use litebox_broker_client::{BrokerClient, BrokerClientWorker};
-use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
+use litebox_broker_protocol::{BrokerRequest, BrokerResponse, CoreRequest, CoreResponse};
 use litebox_broker_unix_socket::UnixStreamClientControlChannel;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -66,11 +66,17 @@ impl BrokerControlClient {
 impl BrokerControl for BrokerControlClient {
     fn request(
         &self,
-        request: BrokerRequest,
-    ) -> core::result::Result<BrokerResponse, BrokerControlError> {
-        self.worker
-            .active_raw_request(request)
-            .map_err(|_| BrokerControlError)
+        request: CoreRequest,
+    ) -> core::result::Result<CoreResponse, BrokerControlError> {
+        match self
+            .worker
+            .active_raw_request(BrokerRequest::Core(request))
+            .map_err(|_| BrokerControlError::Transport)?
+        {
+            BrokerResponse::Core(response) => Ok(response),
+            BrokerResponse::Error(error) => Err(BrokerControlError::Broker(error)),
+            _ => Err(BrokerControlError::UnexpectedResponse),
+        }
     }
 }
 
