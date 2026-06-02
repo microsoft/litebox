@@ -35,6 +35,12 @@
 # === Stage 1: shared base ===
 FROM ubuntu:24.04 AS litebox-base
 
+# Mark all litebox-derived images with a single label so cleanup
+# scripts can scope `docker image prune` to litebox-owned images
+# (`--filter label=litebox=1`) without accidentally taking out
+# unrelated images sharing this Docker daemon.
+LABEL litebox=1
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Core packages shared by all targets.
