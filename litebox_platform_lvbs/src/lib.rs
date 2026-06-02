@@ -106,24 +106,45 @@ fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
 }
 
-/// Acquire exclusive ownership of the ALIGN-sized physical range covering each entry in
-/// `pages`.
-///
-/// Precondition: `pages` must not contain duplicate addresses. Intra-call overlap is not
-/// validated here. If two entries collide, both copies are pushed into the global lock list
-/// and the drop path only removes one of them, permanently leaking the duplicate entry. All
-/// current callers (`LinuxKernel::vmap`) pre-validate uniqueness — either by construction
-/// (contiguous pages cannot repeat) or by an explicit `HashSet` check on non-contiguous
-/// input — so this invariant is upheld today. Any new caller must do the same.
-fn acquire_phys_range_ownership<const ALIGN: usize>(
+fn build_phys_ownership_ranges<const ALIGN: usize>(
     pages: &PhysPageAddrArray<ALIGN>,
-) -> Result<LvbsPhysRangeOwnershipGuard, PhysPointerError> {
-    let mut ranges = Vec::with_capacity(pages.len());
+) -> Result<Vec<Range<usize>>, PhysPointerError> {
+    let mut page_ranges = Vec::with_capacity(pages.len());
     for page in pages {
         let start = page.as_usize();
         let end = start.checked_add(ALIGN).ok_or(PhysPointerError::Overflow)?;
+        page_ranges.push(start..end);
+    }
+    page_ranges.sort_unstable_by_key(|range| range.start);
+
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for range in page_ranges {
+        let start = range.start;
+        let end = range.end;
+        if let Some(last) = ranges.last_mut() {
+            if start == last.end {
+                last.end = end;
+                continue;
+            }
+            if start < last.end {
+                return Err(PhysPointerError::DuplicatePhysicalAddress(start));
+            }
+        }
         ranges.push(start..end);
     }
+    Ok(ranges)
+}
+
+/// Acquire exclusive ownership of the ALIGN-sized physical range covering each entry in
+/// `pages`.
+///
+/// Adjacent pages are coalesced into one range to keep the global lock list compact for the
+/// common contiguous mapping path. Duplicate pages are rejected so the drop path can release every
+/// acquired range exactly once.
+fn acquire_phys_range_ownership<const ALIGN: usize>(
+    pages: &PhysPageAddrArray<ALIGN>,
+) -> Result<LvbsPhysRangeOwnershipGuard, PhysPointerError> {
+    let ranges = build_phys_ownership_ranges(pages)?;
 
     let mut inner = PHYS_RANGE_LOCK.lock();
     for entry in &inner.entries {
@@ -148,6 +169,47 @@ impl Drop for LvbsPhysRangeOwnershipGuard {
                 inner.entries.swap_remove(index);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_ALIGN: usize = 4096;
+
+    fn page(addr: usize) -> PhysPageAddr<TEST_ALIGN> {
+        PhysPageAddr::<TEST_ALIGN>::new(addr).unwrap()
+    }
+
+    #[test]
+    fn ownership_ranges_coalesce_contiguous_pages() {
+        let pages = [page(0x1000), page(0x2000), page(0x3000)];
+
+        let ranges = build_phys_ownership_ranges(&pages).unwrap();
+
+        assert_eq!(ranges, alloc::vec![0x1000..0x4000]);
+    }
+
+    #[test]
+    fn ownership_ranges_sort_and_coalesce_out_of_order_pages() {
+        let pages = [page(0x5000), page(0x1000), page(0x2000), page(0x4000)];
+
+        let ranges = build_phys_ownership_ranges(&pages).unwrap();
+
+        assert_eq!(ranges, alloc::vec![0x1000..0x3000, 0x4000..0x6000]);
+    }
+
+    #[test]
+    fn ownership_ranges_reject_duplicate_pages() {
+        let pages = [page(0x1000), page(0x1000)];
+
+        let err = build_phys_ownership_ranges(&pages).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PhysPointerError::DuplicatePhysicalAddress(0x1000)
+        ));
     }
 }
 
@@ -1239,7 +1301,7 @@ fn is_contiguous<const ALIGN: usize>(addrs: &[PhysPageAddr<ALIGN>]) -> bool {
     true
 }
 
-impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel<Host> {
+unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel<Host> {
     type MapInfo = LvbsPhysPageMapInfo;
 
     unsafe fn vmap(

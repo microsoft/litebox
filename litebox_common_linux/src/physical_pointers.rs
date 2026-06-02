@@ -447,9 +447,17 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop
 impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop for PhysMutPtr<T, ALIGN, V> {
     fn drop(&mut self) {
         // SAFETY: The platform is expected to handle unmapping safely. Drop cannot
-        // report errors, so a failed unmap leaves map_info restored for the remainder
-        // of this destructor and is only reported by debug assertion.
+        // report errors. If unmapping fails, `unmap` restores map_info so its physical range
+        // ownership remains live. Leak it rather than releasing that ownership while the mapping
+        // may still be installed.
         let result = unsafe { self.unmap() };
+        if result.is_err() && self.map_info.is_some() {
+            let _ = self
+                .map_info
+                .take()
+                .map(alloc::boxed::Box::new)
+                .map(alloc::boxed::Box::leak);
+        }
         debug_assert!(
             result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
             "unexpected error during unmap in drop: {result:?}",
@@ -550,5 +558,69 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
             )
             .field("offset", &self.inner.offset)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vmap::PhysPageMapInfo;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    const TEST_ALIGN: usize = 4096;
+    static TEST_MANAGER: FailingUnmapManager = FailingUnmapManager;
+    static MAP_INFO_DROPPED: AtomicBool = AtomicBool::new(false);
+
+    struct TestMapInfo;
+
+    impl PhysPageMapInfo for TestMapInfo {
+        fn base(&self) -> *mut u8 {
+            core::ptr::dangling_mut::<u8>()
+        }
+
+        fn size(&self) -> usize {
+            TEST_ALIGN
+        }
+    }
+
+    impl Drop for TestMapInfo {
+        fn drop(&mut self) {
+            MAP_INFO_DROPPED.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct FailingUnmapManager;
+
+    unsafe impl VmapManager<TEST_ALIGN> for FailingUnmapManager {
+        type MapInfo = TestMapInfo;
+
+        unsafe fn vunmap(
+            &self,
+            vmap_info: Self::MapInfo,
+        ) -> Result<(), (PhysPointerError, Self::MapInfo)> {
+            Err((PhysPointerError::Unmapped(0), vmap_info))
+        }
+    }
+
+    struct TestGlobalVmapManager;
+
+    impl GlobalVmapManager<TEST_ALIGN> for TestGlobalVmapManager {
+        type Manager = FailingUnmapManager;
+
+        fn manager() -> &'static Self::Manager {
+            &TEST_MANAGER
+        }
+    }
+
+    #[test]
+    fn drop_does_not_release_map_info_when_unmap_fails() {
+        MAP_INFO_DROPPED.store(false, Ordering::SeqCst);
+        let page = PhysPageAddr::<TEST_ALIGN>::new(TEST_ALIGN).unwrap();
+        let mut ptr = PhysMutPtr::<u8, TEST_ALIGN, TestGlobalVmapManager>::new(&[page], 0).unwrap();
+        ptr.map_info = Some(TestMapInfo);
+
+        drop(ptr);
+
+        assert!(!MAP_INFO_DROPPED.load(Ordering::SeqCst));
     }
 }

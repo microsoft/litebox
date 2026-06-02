@@ -11,7 +11,17 @@ use thiserror::Error;
 /// This provider exists to service [`crate::physical_pointers::PhysMutPtr`] and
 /// [`crate::physical_pointers::PhysConstPtr`]. It can benefit other modules which need
 /// Linux kernel's `vmap()` and `vunmap()` functionalities (e.g., HVCI/HEKI, drivers).
-pub trait VmapManager<const ALIGN: usize> {
+///
+/// # Safety
+///
+/// Implementors must ensure that [`Self::vmap`] returns a valid mapping covering exactly the
+/// requested physical pages in order, that the returned [`Self::MapInfo`] owns the mapping and any
+/// physical-range ownership needed for the mapping lifetime, and that [`Self::vunmap`] does not
+/// release that ownership unless the mapping has been invalidated or safely retained in the returned
+/// [`Self::MapInfo`]. Implementors must also ensure [`Self::validate_unowned`] rejects physical
+/// pages owned by LiteBox when mapping them through this abstraction would violate Rust memory
+/// safety.
+pub unsafe trait VmapManager<const ALIGN: usize> {
     /// Mapping information returned by [`VmapManager::vmap`]. See [`PhysPageMapInfo`].
     ///
     /// Implementors use this to carry the virtual mapping and any platform-specific physical

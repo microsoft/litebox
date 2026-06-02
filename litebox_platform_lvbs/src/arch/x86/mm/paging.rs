@@ -534,7 +534,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         flags: PageTableFlags,
         exec_ranges: Option<&[Range<PhysAddr>]>,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
-        self.map_phys_frame_range_with(frame_range, flags, exec_ranges, M::pa_to_va)
+        self.map_phys_frame_range_with(frame_range, flags, exec_ranges, M::pa_to_va, false)
     }
 
     /// Map physical frame range to the page table using the direct-map offset
@@ -548,7 +548,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         flags: PageTableFlags,
         exec_ranges: Option<&[Range<PhysAddr>]>,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
-        self.map_phys_frame_range_with(frame_range, flags, exec_ranges, M::pa_to_va_direct)
+        self.map_phys_frame_range_with(frame_range, flags, exec_ranges, M::pa_to_va_direct, true)
     }
 
     /// Common implementation for [`Self::map_phys_frame_range`] and
@@ -562,8 +562,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         flags: PageTableFlags,
         exec_ranges: Option<&[Range<PhysAddr>]>,
         pa_to_va: fn(PhysAddr) -> VirtAddr,
+        rollback_on_error: bool,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let mut allocator = PageTableAllocator::<M>::new();
+        let start_page =
+            Page::<Size4KiB>::containing_address(pa_to_va(frame_range.start.start_address()));
+        let mut mapped_count: usize = 0;
 
         let mut inner = self.inner.lock();
         for target_frame in frame_range {
@@ -583,6 +587,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                         return Err(MapToError::PageAlreadyMapped(
                             PhysFrame::<Size4KiB>::containing_address(frame.start_address()),
                         ));
+                    }
+                    if rollback_on_error {
+                        return Err(MapToError::PageAlreadyMapped(target_frame));
                     }
                     continue;
                 }
@@ -623,13 +630,25 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     &mut allocator,
                 )
             } {
-                Ok(_) => {}
-                Err(e) => return Err(e),
+                Ok(_) => {
+                    mapped_count += 1;
+                }
+                Err(e) => {
+                    if rollback_on_error && mapped_count > 0 {
+                        Self::rollback_mapped_pages(
+                            &mut inner,
+                            Page::range_inclusive(
+                                start_page,
+                                start_page + (mapped_count as u64 - 1),
+                            ),
+                            &mut allocator,
+                        );
+                    }
+                    return Err(e);
+                }
             }
         }
 
-        let start_page =
-            Page::<Size4KiB>::containing_address(pa_to_va(frame_range.start.start_address()));
         let count =
             (frame_range.end.start_address() - frame_range.start.start_address()) / Size4KiB::SIZE;
         flush_tlb_range(start_page, count.trunc());
