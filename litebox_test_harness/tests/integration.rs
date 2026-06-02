@@ -2622,6 +2622,82 @@ mod copilot {
         hits >= 2 && no_timeout
     }
 
+    /// Wave 10 Track A — variants that perturb one dimension of
+    /// `find_head` at a time. Whichever variant *passes* tells us
+    /// what the bug is sensitive to. See plan.md Wave 10 section.
+
+    /// `find_head_one`: head -1 instead of -5. Single line through
+    /// the pipeline. If this passes where `find_head` fails, bug is
+    /// about multi-line drainage / SIGPIPE-killed find chain.
+    fn find_head_one_check(_canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response).to_lowercase();
+        let hits = [
+            "one.txt", "two.txt", "three.txt", "four.txt", "five.txt", "six.txt",
+        ]
+        .iter()
+        .filter(|n| r.contains(*n))
+        .count();
+        let no_timeout = !r.contains("timed out") && !r.contains("timeout");
+        hits >= 1 && no_timeout
+    }
+
+    /// `find_head_unpiped`: find without head. If this passes where
+    /// `find_head` fails, bug is in the pipe/SIGPIPE interaction.
+    /// If it fails too, bug is in multi-line readdir output reading.
+    fn find_head_unpiped_check(_canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response).to_lowercase();
+        let hits = [
+            "one.txt", "two.txt", "three.txt", "four.txt", "five.txt", "six.txt",
+        ]
+        .iter()
+        .filter(|n| r.contains(*n))
+        .count();
+        let no_timeout = !r.contains("timed out") && !r.contains("timeout");
+        hits >= 4 && no_timeout
+    }
+
+    /// `find_head_seq`: `seq 1 5` — no find, no fixtures, no pipe,
+    /// 5 lines of bytes. If this fails too, the bug is multi-line
+    /// output reading per se. If it passes, bug needs find/pipe.
+    fn find_head_seq_check(_canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response).to_lowercase();
+        let hits = ["1", "2", "3", "4", "5"]
+            .iter()
+            .filter(|n| r.contains(*n))
+            .count();
+        let no_timeout = !r.contains("timed out") && !r.contains("timeout");
+        hits >= 3 && no_timeout
+    }
+
+    /// `find_head_cat_multi`: `cat one.txt two.txt … five.txt` —
+    /// multi-file output through single process, no pipeline. Each
+    /// fixture content is a distinct word. If this passes where
+    /// `find_head` fails, bug requires the pipeline.
+    fn find_head_cat_multi_check(_canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response).to_lowercase();
+        let hits = ["alpha", "bravo", "charlie", "delta", "echo"]
+            .iter()
+            .filter(|n| r.contains(*n))
+            .count();
+        let no_timeout = !r.contains("timed out") && !r.contains("timeout");
+        hits >= 3 && no_timeout
+    }
+
+    /// `find_head_ls`: `ls /workspace/*.txt | head -5`. Same shape
+    /// as find_head but with shell globbing instead of find.
+    /// Isolates whether the bug is in find's readdir behavior.
+    fn find_head_ls_check(_canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response).to_lowercase();
+        let hits = [
+            "one.txt", "two.txt", "three.txt", "four.txt", "five.txt", "six.txt",
+        ]
+        .iter()
+        .filter(|n| r.contains(*n))
+        .count();
+        let no_timeout = !r.contains("timed out") && !r.contains("timeout");
+        hits >= 2 && no_timeout
+    }
+
     /// `build` canary check: response mentions cargo build status
     /// keywords (compiled / compiling / finished / error / warning)
     /// and isn't a hang/timeout message.
@@ -2693,6 +2769,86 @@ mod copilot {
                         .to_string()
                 },
                 check: find_head_check,
+                timeout_secs: 120,
+                fixtures: &[
+                    ("one.txt", "1\n"),
+                    ("two.txt", "2\n"),
+                    ("three.txt", "3\n"),
+                    ("four.txt", "4\n"),
+                    ("five.txt", "5\n"),
+                    ("six.txt", "6\n"),
+                ],
+            },
+            // ---- Wave 10 Track A: find_head dimension variants ----
+            Scenario {
+                id: "find_head_one",
+                prompt: |_| {
+                    "Run `find /workspace -name '*.txt' | head -1` and list the filename \
+                     you find."
+                        .to_string()
+                },
+                check: find_head_one_check,
+                timeout_secs: 120,
+                fixtures: &[
+                    ("one.txt", "1\n"),
+                    ("two.txt", "2\n"),
+                    ("three.txt", "3\n"),
+                    ("four.txt", "4\n"),
+                    ("five.txt", "5\n"),
+                    ("six.txt", "6\n"),
+                ],
+            },
+            Scenario {
+                id: "find_head_unpiped",
+                prompt: |_| {
+                    "Run `find /workspace -name '*.txt'` and list every filename it prints."
+                        .to_string()
+                },
+                check: find_head_unpiped_check,
+                timeout_secs: 120,
+                fixtures: &[
+                    ("one.txt", "1\n"),
+                    ("two.txt", "2\n"),
+                    ("three.txt", "3\n"),
+                    ("four.txt", "4\n"),
+                    ("five.txt", "5\n"),
+                    ("six.txt", "6\n"),
+                ],
+            },
+            Scenario {
+                id: "find_head_seq",
+                prompt: |_| {
+                    "Run `seq 1 5` and list every number it prints."
+                        .to_string()
+                },
+                check: find_head_seq_check,
+                timeout_secs: 120,
+                fixtures: &[],
+            },
+            Scenario {
+                id: "find_head_cat_multi",
+                prompt: |_| {
+                    "Run `cat /workspace/one.txt /workspace/two.txt /workspace/three.txt \
+                     /workspace/four.txt /workspace/five.txt` and list every word it prints."
+                        .to_string()
+                },
+                check: find_head_cat_multi_check,
+                timeout_secs: 120,
+                fixtures: &[
+                    ("one.txt", "alpha\n"),
+                    ("two.txt", "bravo\n"),
+                    ("three.txt", "charlie\n"),
+                    ("four.txt", "delta\n"),
+                    ("five.txt", "echo\n"),
+                ],
+            },
+            Scenario {
+                id: "find_head_ls",
+                prompt: |_| {
+                    "Run `ls /workspace/*.txt | head -5` and list the filenames you find."
+                        .to_string()
+                },
+                check: find_head_ls_check,
                 timeout_secs: 120,
                 fixtures: &[
                     ("one.txt", "1\n"),
