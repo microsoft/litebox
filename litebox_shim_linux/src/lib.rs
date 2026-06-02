@@ -14,10 +14,10 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
     LiteBox,
@@ -62,23 +62,6 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
     >,
 >;
 pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
-
-/// Error returned by the runner-provided broker control path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BrokerControlError;
-
-/// Local-core access to the negotiated broker control channel.
-///
-/// The shim/local core owns Linux ABI translation and constructs broker protocol
-/// requests. The runner owns endpoint selection and supplies the connected
-/// transport behind this protocol-level boundary.
-pub trait BrokerControl: Send + Sync {
-    /// Sends one active broker request and returns its response.
-    fn request(
-        &self,
-        request: litebox_broker_protocol::BrokerRequest,
-    ) -> core::result::Result<litebox_broker_protocol::BrokerResponse, BrokerControlError>;
-}
 
 /// A trait required for file systems to be used in the shim.
 pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
@@ -169,7 +152,6 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
 pub struct LinuxShimBuilder {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
-    broker_control: Option<Arc<dyn BrokerControl>>,
 }
 
 impl Default for LinuxShimBuilder {
@@ -185,7 +167,6 @@ impl LinuxShimBuilder {
         Self {
             platform,
             litebox: LiteBox::new(platform),
-            broker_control: None,
         }
     }
 
@@ -203,13 +184,6 @@ impl LinuxShimBuilder {
         default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
     }
 
-    /// Installs a runner-provided broker control channel for broker-backed local-core objects.
-    #[must_use]
-    pub fn broker_control(mut self, broker_control: Arc<dyn BrokerControl>) -> Self {
-        self.broker_control = Some(broker_control);
-        self
-    }
-
     /// Build the shim.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<FS> {
         let mut net = Network::new(&self.litebox);
@@ -225,7 +199,6 @@ impl LinuxShimBuilder {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            broker_control: self.broker_control,
         });
         LinuxShim(global)
     }
@@ -1130,8 +1103,6 @@ struct GlobalState<FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
-    /// Optional broker control path installed by the runner.
-    broker_control: Option<Arc<dyn BrokerControl>>,
 }
 
 struct Task<FS: ShimFS> {

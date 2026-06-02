@@ -95,7 +95,7 @@ Initial scope:
 
 Exit criteria:
 
-- A user-side client can connect and negotiate. In the current hosted PoC, `litebox_runner_linux_userland` consumes an externally owned Unix-socket endpoint via `--broker-socket` and uses `litebox_broker_client` directly; routing through UserLiteBox remains part of Phase 3.
+- A user-side client can connect and negotiate. In the current hosted PoC, `litebox_runner_linux_userland` consumes an externally owned Unix-socket endpoint via `--broker-socket`, uses `litebox_broker_client` to negotiate, and installs broker control on the `LiteBox` local core before starting the guest.
 - Broker binds caller identity to the authenticated channel endpoint. The first hosted executable passes the explicit unauthenticated placeholder through the same server API that later deployment-specific authentication will use.
 - Userland channel code only receives/sends decoded frames and supplies peer credentials; the generic server owns broker protocol dispatch and reports successful termination as peer-close or broker-close with a reason.
 - The Unix-socket channel adapter and hosted broker executable live in separate crates, so clients can depend on the channel without pulling in broker core/server deployment code.

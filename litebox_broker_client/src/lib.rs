@@ -9,18 +9,22 @@
 
 #![no_std]
 
-#[cfg(test)]
+#[cfg(any(feature = "std", test))]
 extern crate std;
 
 mod error;
 mod event;
 mod negotiate;
+#[cfg(feature = "std")]
+mod worker;
 
 use litebox_broker_protocol::{
     BrokerRequest, BrokerResponse, ClientControlChannel, ProtocolVersion, ReceivedBrokerResponse,
 };
 
 pub use error::{ClientError, Result};
+#[cfg(feature = "std")]
+pub use worker::{BrokerClientWorker, BrokerClientWorkerError};
 
 /// Protocol version this client implementation requests by default.
 pub const CLIENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);

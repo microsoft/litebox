@@ -120,10 +120,21 @@ fn handle_active_request<P: PolicyEngine>(
             BrokerResponse::Error(ErrorCode::ProtocolState),
             CloseReason::ProtocolViolation,
         ),
-        BrokerRequest::Core(CoreRequest::Event(request)) => {
-            BrokerDispatch::continue_after(handle_event_request(core, association, request))
+        BrokerRequest::Core(request) => {
+            BrokerDispatch::continue_after(handle_core_request(core, association, request))
         }
         _ => BrokerDispatch::continue_after(BrokerResponse::Error(ErrorCode::UnsupportedOperation)),
+    }
+}
+
+fn handle_core_request<P: PolicyEngine>(
+    core: &mut BrokerCore<P>,
+    association: &BrokerAssociation,
+    request: CoreRequest,
+) -> BrokerResponse {
+    match request {
+        CoreRequest::Event(request) => handle_event_request(core, association, request),
+        _ => BrokerResponse::Error(ErrorCode::UnsupportedOperation),
     }
 }
 

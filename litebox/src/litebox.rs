@@ -6,6 +6,7 @@
 use alloc::sync::Arc;
 
 use crate::{
+    broker::{BrokerControl, BrokerEvent, BrokerObjectError},
     fd::Descriptors,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -65,6 +66,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         crate::sync::lock_tracing::LockTracker::init(platform);
 
         let descriptors = RwLock::new(Descriptors::new_from_litebox_creation());
+        let broker_control = RwLock::new(None);
 
         litebox_util_log::trace!("LiteBox instance initialized");
 
@@ -72,6 +74,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             x: Arc::new(LiteBoxX {
                 platform,
                 descriptors,
+                broker_control,
             }),
         }
     }
@@ -106,10 +109,27 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         self.x.descriptors.write()
     }
+
+    /// Installs broker control for broker-backed local-core objects.
+    pub fn set_broker_control(&self, broker_control: Arc<dyn BrokerControl>) {
+        *self.x.broker_control.write() = Some(broker_control);
+    }
+
+    /// Creates a broker-backed event object when broker control is installed.
+    pub fn create_broker_event(
+        &self,
+        initial_count: u64,
+    ) -> Result<Option<BrokerEvent>, BrokerObjectError> {
+        let Some(broker) = self.x.broker_control.read().clone() else {
+            return Ok(None);
+        };
+        BrokerEvent::create(broker, initial_count).map(Some)
+    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
+    broker_control: RwLock<Platform, Option<Arc<dyn BrokerControl>>>,
 }

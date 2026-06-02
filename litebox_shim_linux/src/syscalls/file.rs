@@ -1898,16 +1898,16 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        let eventfd = if flags.contains(EfdFlags::NONBLOCK) {
-            if let Some(broker_control) = &self.global.broker_control {
-                super::eventfd::EventFile::new_broker(
-                    u64::from(initval),
-                    flags,
-                    broker_control.clone(),
-                )?
-            } else {
-                super::eventfd::EventFile::new(u64::from(initval), flags)
-            }
+        let broker_event = if flags.contains(EfdFlags::NONBLOCK) {
+            self.global
+                .litebox
+                .create_broker_event(u64::from(initval))
+                .map_err(super::eventfd::broker_object_error_to_errno)?
+        } else {
+            None
+        };
+        let eventfd = if let Some(event) = broker_event {
+            super::eventfd::EventFile::new_broker(event, flags)?
         } else {
             super::eventfd::EventFile::new(u64::from(initval), flags)
         };

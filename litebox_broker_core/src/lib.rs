@@ -19,7 +19,6 @@ mod event;
 mod identity;
 mod object;
 mod policy;
-mod types;
 
 use alloc::collections::BTreeMap;
 
@@ -30,11 +29,11 @@ pub use litebox_broker_protocol::{
     ObjectReferenceId, ReadinessState, WaitOutcome,
 };
 use object::{ObjectEntry, ObjectId, ObjectReference};
+pub use object::{ObjectRights, ObjectType};
 pub use policy::{
     DefaultDenyPolicy, EventOnlyPolicy, ObjectOperation, PolicyDecision, PolicyEngine,
     PolicyOperation,
 };
-pub use types::{ObjectRights, ObjectType};
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;

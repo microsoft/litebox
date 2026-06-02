@@ -85,7 +85,7 @@ Because UserLiteBox always runs in user mode, it can use Rust `std` heavily in d
 
 ### BrokerClient adapter
 
-Thin in-process adapter used by UserLiteBox and shim-specific user clients to call the broker authority interface.
+Thin in-process adapter used by UserLiteBox/local-core code to call the broker authority interface.
 
 BrokerClient is not a separate trust boundary or authority component. It is bundled with the user-mode side and serializes typed calls into the explicit broker protocol over the control channel supplied by UserLiteBox's host-support layer.
 
@@ -139,10 +139,10 @@ The broker architecture should use crate names that make the authority boundary 
 | `litebox_broker_server` | Protocol- and channel-adapter `no_std` broker server library: free receive/send loop over a caller-owned `BrokerCore` and generic server control channel. The server owns protocol negotiation, request sequencing, unknown-tag handling, protocol/core type conversion, peer-credential-to-caller-credential mapping, and typed broker-close reasons. |
 | `litebox_broker_unix_socket` | Concrete `std` Unix-domain-socket control-channel implementation for hosted userland testing. It owns only Unix stream framing and channel trait adaptation; it does not assemble a broker deployment or depend on broker core/server crates. |
 | `litebox_broker_userland` | Hosted `std` broker executable used by the userland POC. This deployment crate wires `BrokerCore`, the current policy, the generic broker server loop, and the Unix-socket channel implementation together. |
-| `litebox_broker_client` | `no_std` channel-neutral user-side adapter linked into UserLiteBox/shims/runners: negotiate broker protocol, track client negotiation state, sequence request/response pairs, map broker errors, and expose typed broker calls. |
+| `litebox_broker_client` | `no_std` channel-neutral user-side adapter linked into UserLiteBox/local-core deployments and runners: negotiate broker protocol, track client negotiation state, sequence request/response pairs, map broker errors, and expose typed broker calls. Its optional `std` worker adapter runs blocking channel I/O off guest-facing threads. |
 | `litebox_user` | Untrusted UserLiteBox facade: guest fd table view, syscall/resource routing, local-private mechanics, broker-backed object wrappers, and compatibility-profile glue. |
 
-`litebox_broker_client` should stay narrow. It is not the syscall classifier and does not implement non-delegable syscall handling. Shim dispatch and `litebox_user` decide whether an operation is local-private, broker-delegated, or host-arbitrated; the client only carries broker-delegated operations over the selected control channel.
+`litebox_broker_client` should stay narrow. It is not the syscall classifier and does not implement non-delegable syscall handling. Shim dispatch and the local core decide whether an operation is local-private, broker-delegated, or host-arbitrated; the client only carries broker-delegated operations over the selected control channel.
 
 Channel delivery must remain replaceable. `litebox_broker_protocol` and `litebox_broker_core` must not depend on Unix-domain sockets, shared-memory rings, traps, hypercalls, or any specific IPC implementation. BrokerCore may reuse shared value DTOs from `litebox_broker_protocol`, but it must not depend on protocol envelopes, channel traits, wire codecs, or concrete IPC. The broker server adapts protocol and channel concepts into direct BrokerCore domain calls. Shared control-channel traits live in `litebox_broker_protocol::channel`; concrete IPC implementations, such as `litebox_broker_unix_socket` or a later shared-memory ring crate, live outside the broker deployment crate without changing broker object semantics.
 
@@ -815,7 +815,7 @@ Then proceed incrementally:
 3. Create `litebox_broker_core` with broker-owned process/session association IDs, authority-only object type and rights metadata, caller credentials supplied by broker entry code, an event object registry plus per-association reference IDs with generation checks, a minimal object/reference registry, association cleanup, and policy hooks. BrokerCore must stay protocol-neutral and channel-neutral.
 4. Create `litebox_broker_wire` with reusable message-body encoding, `litebox_broker_unix_socket` with the concrete Unix-domain-socket implementation, `litebox_broker_server` with protocol negotiation, request sequencing, unknown-tag handling, and adaptation from channel/protocol requests to direct BrokerCore domain calls, and `litebox_broker_userland` as the hosted executable that assembles those pieces for the POC.
 5. Add startup negotiation between runner/client and broker. The current PoC starts with protocol negotiation over `--broker-socket`; later deployment profiles add required BrokerCore, BrokerService, PolicyEngine, broker capability, channel/ring, host syscall profile, UserLiteBox, and BrokerHost feature negotiation.
-6. Add a broker-owned event object with the smallest end-to-end surface first: create, wait, and signal. BrokerCore/server cleanup releases association-owned references on disconnect; protocol-level duplicate, close, explicit readiness queries, and broader stale-handle tests follow after the initial broker path is proven.
+6. Add a broker-owned event object with the smallest end-to-end surface first: create, wait, add, and consume. BrokerCore/server cleanup releases association-owned references on disconnect; protocol-level duplicate, close, explicit readiness queries, and broader stale-handle tests follow after the initial broker path is proven.
 7. Use `litebox_broker_client` for typed end-to-end broker tests, keeping the client independent of Unix sockets so future channel implementations can implement the same neutral channel traits.
 8. Introduce `litebox_user` as the untrusted UserLiteBox facade for syscall/resource routing, local-private operations, broker-backed object wrappers, and compatibility-profile glue.
 9. Define host syscall profiles for bootstrap, fast local mode, and strict mode.
