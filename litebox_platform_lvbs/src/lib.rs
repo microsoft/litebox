@@ -52,34 +52,34 @@ pub mod mshv;
 pub mod syscall_entry;
 
 static CPU_MHZ: AtomicU64 = AtomicU64::new(0);
-static PHYS_RANGE_LOCK: spin::Mutex<PhysRangeLockInner> =
-    spin::Mutex::new(PhysRangeLockInner::new());
+static PHYS_RANGE_RESERVATIONS: spin::Mutex<PhysRangeReservationInner> =
+    spin::Mutex::new(PhysRangeReservationInner::new());
 
-struct PhysRangeLockInner {
+struct PhysRangeReservationInner {
     entries: Vec<Range<usize>>,
 }
 
 /// Mapping info returned by [`LinuxKernel`]'s [`VmapManager::vmap`].
 ///
-/// Carries the virtual base/size of the mapping together with an RAII ownership guard for the
-/// physical ranges it covers. Dropping it (or passing it to `vunmap`) releases the ownership lock,
-/// which is what lets the safe physical pointer APIs copy from the mapping without `unsafe`.
+/// Carries the virtual base/size of the mapping together with an RAII access reservation for the
+/// physical ranges it covers. Dropping it (or passing it to `vunmap`) releases the reservation,
+/// which serializes cooperating LiteBox mappings for the safe physical pointer APIs.
 pub struct LvbsPhysPageMapInfo {
     base: *mut u8,
     size: usize,
-    _ownership_guard: LvbsPhysRangeOwnershipGuard,
+    _access_reservation: LvbsPhysRangeReservation,
 }
 
-struct LvbsPhysRangeOwnershipGuard {
+struct LvbsPhysRangeReservation {
     ranges: Vec<Range<usize>>,
 }
 
 impl LvbsPhysPageMapInfo {
-    fn new(base: *mut u8, size: usize, ownership_guard: LvbsPhysRangeOwnershipGuard) -> Self {
+    fn new(base: *mut u8, size: usize, access_reservation: LvbsPhysRangeReservation) -> Self {
         Self {
             base,
             size,
-            _ownership_guard: ownership_guard,
+            _access_reservation: access_reservation,
         }
     }
 }
@@ -94,7 +94,7 @@ impl PhysPageMapInfo for LvbsPhysPageMapInfo {
     }
 }
 
-impl PhysRangeLockInner {
+impl PhysRangeReservationInner {
     const fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -106,7 +106,7 @@ fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
 }
 
-fn build_phys_ownership_ranges<const ALIGN: usize>(
+fn build_phys_access_reservation_ranges<const ALIGN: usize>(
     pages: &PhysPageAddrArray<ALIGN>,
 ) -> Result<Vec<Range<usize>>, PhysPointerError> {
     let mut page_ranges = Vec::with_capacity(pages.len());
@@ -135,18 +135,20 @@ fn build_phys_ownership_ranges<const ALIGN: usize>(
     Ok(ranges)
 }
 
-/// Acquire exclusive ownership of the ALIGN-sized physical range covering each entry in
+/// Reserve exclusive LiteBox access to the ALIGN-sized physical range covering each entry in
 /// `pages`.
 ///
 /// Adjacent pages are coalesced into one range to keep the global lock list compact for the
 /// common contiguous mapping path. Duplicate pages are rejected so the drop path can release every
-/// acquired range exactly once.
-fn acquire_phys_range_ownership<const ALIGN: usize>(
+/// reserved range exactly once. This is a cooperative LiteBox reservation, not Rust ownership of
+/// the foreign physical memory; external agents may still access it unless hardware protection is
+/// applied separately.
+fn reserve_phys_range_access<const ALIGN: usize>(
     pages: &PhysPageAddrArray<ALIGN>,
-) -> Result<LvbsPhysRangeOwnershipGuard, PhysPointerError> {
-    let ranges = build_phys_ownership_ranges(pages)?;
+) -> Result<LvbsPhysRangeReservation, PhysPointerError> {
+    let ranges = build_phys_access_reservation_ranges(pages)?;
 
-    let mut inner = PHYS_RANGE_LOCK.lock();
+    let mut inner = PHYS_RANGE_RESERVATIONS.lock();
     for entry in &inner.entries {
         for range in &ranges {
             if ranges_overlap(entry, range) {
@@ -158,12 +160,12 @@ fn acquire_phys_range_ownership<const ALIGN: usize>(
     inner.entries.extend(ranges.iter().cloned());
     drop(inner);
 
-    Ok(LvbsPhysRangeOwnershipGuard { ranges })
+    Ok(LvbsPhysRangeReservation { ranges })
 }
 
-impl Drop for LvbsPhysRangeOwnershipGuard {
+impl Drop for LvbsPhysRangeReservation {
     fn drop(&mut self) {
-        let mut inner = PHYS_RANGE_LOCK.lock();
+        let mut inner = PHYS_RANGE_RESERVATIONS.lock();
         for range in &self.ranges {
             if let Some(index) = inner.entries.iter().position(|entry| entry == range) {
                 inner.entries.swap_remove(index);
@@ -183,28 +185,28 @@ mod tests {
     }
 
     #[test]
-    fn ownership_ranges_coalesce_contiguous_pages() {
+    fn access_reservation_ranges_coalesce_contiguous_pages() {
         let pages = [page(0x1000), page(0x2000), page(0x3000)];
 
-        let ranges = build_phys_ownership_ranges(&pages).unwrap();
+        let ranges = build_phys_access_reservation_ranges(&pages).unwrap();
 
         assert_eq!(ranges, alloc::vec![0x1000..0x4000]);
     }
 
     #[test]
-    fn ownership_ranges_sort_and_coalesce_out_of_order_pages() {
+    fn access_reservation_ranges_sort_and_coalesce_out_of_order_pages() {
         let pages = [page(0x5000), page(0x1000), page(0x2000), page(0x4000)];
 
-        let ranges = build_phys_ownership_ranges(&pages).unwrap();
+        let ranges = build_phys_access_reservation_ranges(&pages).unwrap();
 
         assert_eq!(ranges, alloc::vec![0x1000..0x3000, 0x4000..0x6000]);
     }
 
     #[test]
-    fn ownership_ranges_reject_duplicate_pages() {
+    fn access_reservation_ranges_reject_duplicate_pages() {
         let pages = [page(0x1000), page(0x1000)];
 
-        let err = build_phys_ownership_ranges(&pages).unwrap_err();
+        let err = build_phys_access_reservation_ranges(&pages).unwrap_err();
 
         assert!(matches!(
             err,
@@ -801,7 +803,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// Note: VTL0 physical memory is external memory not owned by LiteBox, similar to DMA/shared
     /// physical memory. Safe physical pointer APIs access it by creating a temporary mapping,
-    /// acquiring the cooperating LiteBox physical range ownership lock, copying data to/from a
+    /// acquiring the cooperating LiteBox physical range access reservation, copying data to/from a
     /// LiteBox-owned buffer with fallible raw-pointer copies, and unmapping immediately. They do not
     /// create Rust references to the mapped VTL0 memory. Direct `vmap()` remains unsafe because it
     /// exposes raw mapped memory to the caller.
@@ -1318,8 +1320,8 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         }
 
         // Reject duplicate page addresses for non-contiguous input. Contiguous input cannot
-        // repeat by construction. This upholds `acquire_phys_range_ownership`'s no-duplicate
-        // precondition so its drop path can correctly release every acquired range.
+        // repeat by construction. This upholds `reserve_phys_range_access`'s no-duplicate
+        // precondition so its drop path can correctly release every reserved range.
         if !is_contiguous(pages) {
             let mut seen = hashbrown::HashSet::with_capacity(pages.len());
             for page in pages {
@@ -1329,10 +1331,9 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             }
         }
 
-        // Acquire exclusive ownership of the physical ranges before installing the mapping.
-        // The returned guard is carried by `LvbsPhysPageMapInfo` and released on drop/`vunmap`,
-        // which is what makes the copy-based physical pointer reads/writes safe.
-        let ownership_guard = acquire_phys_range_ownership(pages)?;
+        // Reserve the physical ranges before installing the mapping. This serializes cooperating
+        // LiteBox mappings; it is not Rust ownership of the foreign physical memory.
+        let access_reservation = reserve_phys_range_access(pages)?;
 
         // VTL0 memory must never be executable from VTL1 (DEP).
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
@@ -1365,7 +1366,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(
                     page_addr,
                     pages.len() * ALIGN,
-                    ownership_guard,
+                    access_reservation,
                 )),
                 Err(MapToError::PageAlreadyMapped(_)) => {
                     Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
@@ -1405,7 +1406,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(
                     page_addr,
                     pages.len() * ALIGN,
-                    ownership_guard,
+                    access_reservation,
                 )),
                 Err(e) => {
                     let _ = vmap_allocator().unregister_allocation(base_va);
@@ -1433,7 +1434,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
-        // Hold the map info in `ManuallyDrop` so its physical range ownership guard is only
+        // Hold the map info in `ManuallyDrop` so its physical range access reservation is only
         // released once unmapping actually succeeds; on failure we hand it back to the caller.
         let vmap_info = ManuallyDrop::new(vmap_info);
         let base = vmap_info.base();
@@ -1453,7 +1454,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         // PTEs are already cleared at this point, so the mapping is functionally gone
         // and a retry would only re-fail against empty page-table entries. If the VA
         // allocator's bookkeeping is inconsistent, surface it via `debug_assert!` and
-        // drop `vmap_info` to release the physical range ownership guard. The VA region
+        // drop `vmap_info` to release the physical range access reservation. The VA region
         // is leaked but cannot be safely recycled.
         let unregister_ok = !crate::mm::vmap::is_vmap_address(base_va)
             || crate::mm::vmap::vmap_allocator()

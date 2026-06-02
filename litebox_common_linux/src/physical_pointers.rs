@@ -16,7 +16,7 @@
 //! safe because they do not create Rust references into that external
 //! memory; they only perform bounded copies between a temporary mapping
 //! and memory owned by LiteBox. Cooperating LiteBox mappings are
-//! serialized by the platform's physical range ownership policy so safe
+//! serialized by the platform's physical range access reservation policy so safe
 //! callers cannot create conflicting mappings through this abstraction.
 //!
 //! The safe APIs should validate whether a given physical address is okay
@@ -404,7 +404,7 @@ where
     /// requests for the same physical pages.
     unsafe fn unmap(&mut self) -> Result<(), PhysPointerError> {
         if let Some(map_info) = self.map_info.take() {
-            // On failure, `vunmap` hands `map_info` back so the physical range ownership it
+            // On failure, `vunmap` hands `map_info` back so the physical range access reservation it
             // carries is not lost; restore it so a later drop/retry can release it.
             if let Err((err, map_info)) = unsafe { V::manager().vunmap(map_info) } {
                 self.map_info = Some(map_info);
@@ -448,7 +448,7 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop for PhysMut
     fn drop(&mut self) {
         // SAFETY: The platform is expected to handle unmapping safely. Drop cannot
         // report errors. If unmapping fails, `unmap` restores map_info so its physical range
-        // ownership remains live. Leak it rather than releasing that ownership while the mapping
+        // access reservation remains live. Leak it rather than releasing that reservation while the mapping
         // may still be installed.
         let result = unsafe { self.unmap() };
         if result.is_err() && self.map_info.is_some() {
