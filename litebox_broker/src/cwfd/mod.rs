@@ -36,4 +36,10 @@ pub mod socketpair_state;
 pub mod state_registry;
 pub mod state_service;
 pub mod subscription_list;
+
+#[cfg(loom)]
+mod subscription_list_loom;
+
+#[cfg(test)]
+mod subscription_list_proptest;
 pub mod tcp_conn_state;

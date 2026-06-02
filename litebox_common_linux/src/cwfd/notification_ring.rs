@@ -80,6 +80,63 @@ impl NotificationSender {
         let bytes = encode_notification(frame).map_err(io_error)?;
         self.writer.write_all(&bytes)
     }
+
+    /// Sends a notification frame AND returns the post-send writer
+    /// cursor, captured atomically with respect to the send.
+    ///
+    /// This is the canonical entry point for callers that need to
+    /// implement cursor-based ACK detection (see `SubscriptionList`
+    /// invariant **A5**: post-send cursor capture). The returned
+    /// value is the `writer_pos` immediately after this frame's last
+    /// byte was written; comparing the peer's later `reader_pos`
+    /// against it tells us whether THIS frame has been consumed.
+    ///
+    /// Must be called while holding any external Mutex that
+    /// serializes access to this sender; reading `writer_pos` post-
+    /// send is only meaningful if no other thread can interleave a
+    /// send between this call's send and its position-read.
+    pub fn send_and_capture_writer_pos(&mut self, frame: &NotificationFrame) -> io::Result<u32> {
+        self.send(frame)?;
+        Ok(self.writer.writer_pos())
+    }
+
+    /// Non-blocking variant of [`send_and_capture_writer_pos`]. Sends
+    /// the frame atomically if there is space; returns `Err(WouldBlock)`
+    /// without modifying the ring if there isn't.
+    ///
+    /// This is the primary entry point for the
+    /// [`SubscriptionList`](crate::cwfd::subscription_list)'s
+    /// notification protocol, which relies on `WouldBlock` as a
+    /// flow-control signal (the bit/payload stays in pending state and
+    /// is retried on the next `try_flush`).
+    ///
+    /// On success returns the post-send `writer_pos` (see
+    /// [`send_and_capture_writer_pos`] for the A5 invariant).
+    pub fn try_send_and_capture_writer_pos(
+        &mut self,
+        frame: &NotificationFrame,
+    ) -> io::Result<u32> {
+        let bytes = encode_notification(frame).map_err(io_error)?;
+        self.writer.try_write_all(&bytes)?;
+        Ok(self.writer.writer_pos())
+    }
+
+    /// Returns the current writer cursor without sending.
+    ///
+    /// See [`RingWriter::writer_pos`].
+    pub fn writer_pos(&self) -> u32 {
+        self.writer.writer_pos()
+    }
+
+    /// Returns the current reader cursor (published by the peer
+    /// notification receiver).
+    ///
+    /// See [`RingWriter::reader_pos`]. The broker uses this together
+    /// with a previously-captured `last_send_writer_pos` to determine
+    /// whether a specific frame has been consumed.
+    pub fn reader_pos(&self) -> u32 {
+        self.writer.reader_pos()
+    }
 }
 
 /// Wraps a [`RingReader`] with framing for [`NotificationFrame`].
@@ -247,5 +304,49 @@ mod tests {
             }
             Ok(()) => panic!("expected error from sending malformed events"),
         }
+    }
+
+    #[test]
+    fn try_send_advances_writer_pos() {
+        let (mut sender, mut receiver) = make_pair();
+        let initial_writer = sender.writer_pos();
+        assert_eq!(initial_writer, 0, "fresh ring should start at writer_pos=0");
+        let frame = NotificationFrame::fixed(99, NOTIFY_EVENT_IN);
+        let post = sender
+            .try_send_and_capture_writer_pos(&frame)
+            .expect("try_send on empty ring");
+        assert!(post > initial_writer, "writer_pos must advance after send");
+        // Peer-side reader_pos is 0 until reader drains.
+        assert_eq!(sender.reader_pos(), 0);
+        let got = receiver.recv().expect("recv");
+        assert_eq!(got, frame);
+        // After reader drained, its reader_pos should equal post (or be
+        // observable as having advanced to the same value).
+        // Allow a brief settle; ring updates reader_pos with Release.
+        thread::sleep(Duration::from_millis(1));
+        assert_eq!(sender.reader_pos(), post);
+    }
+
+    #[test]
+    fn try_send_returns_would_block_when_ring_full() {
+        // Build pair WITHOUT a receiver thread; fill the ring until try_send
+        // declines.
+        let (mut sender, _receiver) = make_pair();
+        let frame = NotificationFrame::fixed(1, NOTIFY_EVENT_IN);
+        let mut sent = 0usize;
+        loop {
+            match sender.try_send_and_capture_writer_pos(&frame) {
+                Ok(_) => sent += 1,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("unexpected error after {sent} sends: {e}"),
+            }
+            if sent > 1_000_000 {
+                panic!("expected WouldBlock long before {sent} sends");
+            }
+        }
+        assert!(
+            sent > 0,
+            "should have sent at least one frame before saturating"
+        );
     }
 }

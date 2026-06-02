@@ -858,7 +858,10 @@ mod tests {
                 | SubsystemTag::Inotify
                 | SubsystemTag::Process
                 | SubsystemTag::Pipe
-                | SubsystemTag::Pty => panic!("expected Unknown({raw:#x}), got {tag:?}"),
+                | SubsystemTag::Pty
+                | SubsystemTag::InetListener
+                | SubsystemTag::InetDgram
+                | SubsystemTag::InetRaw => panic!("expected Unknown({raw:#x}), got {tag:?}"),
             }
         }
     }
