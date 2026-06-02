@@ -3523,6 +3523,28 @@ let o='';c.stdout.on('data',d=>o+=d);c.on('close',code=>{process.stdout.write('o
                 expected: &["L1", "L2", "INNER_DONE", "OUTER_DONE"],
                 fixtures: &[("cat-target2.txt", "L1\nL2\n")],
             },
+            // Mirror of `copilot::tui.find_head`: node spawns bash
+            // running `find … | head -5` over a bind-mounted /workspace
+            // with 6 .txt files. Multi-line drainage through node's
+            // child_process pipe AND SIGPIPE-killed upstream — the
+            // exact shape that copilot's shell tool deadlocks under
+            // litebox today. Pre-fix this probe FAILs on litebox with
+            // truncated output; native PASSes with all 5 filenames.
+            Scenario {
+                id: "node_spawn_bash_find_head",
+                command: "node -e \"const{spawn}=require('child_process');\
+const c=spawn('bash',['-c',\\\"find /workspace -name '*.txt' | head -5; echo INNER_DONE\\\"]);\
+let o='';c.stdout.on('data',d=>o+=d);c.on('close',code=>{process.stdout.write('out=['+o.replace(/\\n/g,'|')+'] code='+code+' OUTER_DONE\\n');});\"",
+                expected: &["nf1.txt", "nf2.txt", "INNER_DONE", "OUTER_DONE"],
+                fixtures: &[
+                    ("nf1.txt", "1\n"),
+                    ("nf2.txt", "2\n"),
+                    ("nf3.txt", "3\n"),
+                    ("nf4.txt", "4\n"),
+                    ("nf5.txt", "5\n"),
+                    ("nf6.txt", "6\n"),
+                ],
+            },
             // Nested-PTY probes — copilot's shell tool spawns bash on
             // a PTY allocated by node-pty (UnixTerminal). The dropbear
             // SSH session also runs the outer shell on a PTY, so this
@@ -3536,6 +3558,24 @@ let o='';c.stdout.on('data',d=>o+=d);c.on('close',code=>{process.stdout.write('o
                 command: "script -q -c 'find /tmp -maxdepth 1 -type d | head -1; echo INNER_DONE' /dev/null; echo OUTER_DONE",
                 expected: &["INNER_DONE", "OUTER_DONE"],
                 fixtures: &[],
+            },
+            // Nested-PTY mirror of `copilot::tui.find_head`. script(1)
+            // approximates node-pty; the inner pipeline matches copilot's
+            // shell tool prompt exactly. Native produces 5 lines; copilot
+            // under litebox reports "1 line". This probe is the headless
+            // repro for the bash-output-read-hang shim bug.
+            Scenario {
+                id: "nested_pty_find_head",
+                command: "script -q -c \"find /workspace -name '*.txt' | head -5; echo INNER_DONE\" /dev/null; echo OUTER_DONE",
+                expected: &["pf2.txt", "pf3.txt", "INNER_DONE", "OUTER_DONE"],
+                fixtures: &[
+                    ("pf1.txt", "1\n"),
+                    ("pf2.txt", "2\n"),
+                    ("pf3.txt", "3\n"),
+                    ("pf4.txt", "4\n"),
+                    ("pf5.txt", "5\n"),
+                    ("pf6.txt", "6\n"),
+                ],
             },
             Scenario {
                 id: "nested_pty_cat",

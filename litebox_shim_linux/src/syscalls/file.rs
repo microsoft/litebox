@@ -12,7 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use litebox::{
-    event::{Events, wait::WaitError},
+    event::{Events, IOPollable, wait::WaitError},
     fd::{ErrRawIntFd, FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
@@ -2137,6 +2137,25 @@ impl<FS: ShimFS> Task<FS> {
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
+                    // Delayed fork can resume the parent after the child has already
+                    // written and closed; preserve the first nonblocking read's EAGAIN.
+                    if !buf.borrow().is_empty()
+                        && self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |crate::PipeNonblockEagainOnce(enabled)| *enabled)
+                            .unwrap_or(false)
+                    {
+                        let completed_with_data = handle.with_entry(|entry| {
+                            let events = entry.check_io_events();
+                            events.contains(Events::IN) && events.contains(Events::HUP)
+                        });
+                        let _ = consume_pipe_eagain_once(self, fd);
+                        if completed_with_data {
+                            return Err(Errno::EAGAIN);
+                        }
+                    }
                     loop {
                         match handle
                             .with_entry(|entry| entry.read(&self.wait_cx(), &mut buf.borrow_mut()))
@@ -5841,14 +5860,38 @@ impl<FS: ShimFS> Task<FS> {
                             .descriptor_table()
                             .entry_handle(fd)
                             .ok_or(Errno::EBADF)?;
-                        handle.with_entry(|file| {
+                        let arm_result = handle.with_entry(|file| {
                             let diff = (file.get_status() & setfl_mask) ^ flags;
                             if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
                                 log_unsupported!("unsupported flags");
                             }
                             file.set_status(flags);
                             Ok(())
-                        })
+                        });
+                        let nonblocking = flags.intersects(OFlags::NONBLOCK);
+                        let receiver = handle.with_entry(|file| {
+                            file.direction()
+                                == litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read
+                        });
+                        let guest_created = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |crate::GuestCreatedPipe| true)
+                            .unwrap_or(false);
+                        // Mirror the local-pipe delayed-fork marker for broker pipes.
+                        if receiver
+                            && guest_created
+                            && nonblocking
+                            && self.recent_delayed_fork_resume.replace(false)
+                        {
+                            let _ = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_entry_metadata(fd, crate::PipeNonblockEagainOnce(true));
+                        }
+                        arm_result
                     }
                     crate::RawFdRef::BrokerSocketPair(fd) => {
                         let handle = self
