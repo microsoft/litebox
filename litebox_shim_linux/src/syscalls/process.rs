@@ -4187,6 +4187,29 @@ impl<FS: ShimFS> Task<FS> {
         let fc = self.fork_context.borrow_mut().take().ok_or(Errno::EINVAL)?;
         let mut fc = fc;
 
+        // --- Per-phase timing for delayed-fork latency investigation.
+        // Always-on probe; reverts on next merge cycle if not needed.
+        let phase_t_start = self.global.platform.monotonic_timestamp();
+        let mut phase_last = phase_t_start;
+        // Helper inline closure stand-in: a macro avoids borrow-of-self issues.
+        macro_rules! phase_tick {
+            ($name:literal) => {{
+                use litebox::platform::DebugLogProvider as _;
+                let now = self.global.platform.monotonic_timestamp();
+                if let (Some(now_d), Some(last_d)) = (now, phase_last) {
+                    let delta_us = now_d.saturating_sub(last_d).as_micros();
+                    let total_us = phase_t_start
+                        .map(|t0| now_d.saturating_sub(t0).as_micros())
+                        .unwrap_or(0);
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "[DELAYED-FORK-TIMING] pid={} phase={} delta_us={} total_us={}\n",
+                        self.pid, $name, delta_us, total_us
+                    ));
+                }
+                phase_last = now;
+            }};
+        }
+
         // Helper to restore fork_context on failure so prepare_for_exit
         // can signal VforkDone. Drains the Phase 2.F broker transit
         // list to release in-flight dup'd handles so the broker
@@ -4389,6 +4412,7 @@ impl<FS: ShimFS> Task<FS> {
         );
 
         // --- Pipe bridging ---
+        phase_tick!("pre_pipe_bridging");
         // For each pipe FD in the child's table, create a real OS pipe pair
         // so that parent and child can communicate across host processes.
         //
@@ -5922,7 +5946,9 @@ impl<FS: ShimFS> Task<FS> {
             is_delayed_fork: true,
         };
 
+        phase_tick!("pre_snapshot_serialize");
         let snapshot_bytes = snapshot.serialize();
+        phase_tick!("post_snapshot_serialize");
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
@@ -5996,7 +6022,10 @@ impl<FS: ShimFS> Task<FS> {
             &bidi_pt,
             &local_pipe_pairs,
         ) {
-            Ok(pid) => pid,
+            Ok(pid) => {
+                phase_tick!("post_spawn_worker_host");
+                pid
+            }
             Err(_err) => {
                 #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
@@ -6149,7 +6178,9 @@ impl<FS: ShimFS> Task<FS> {
 
         // Signal VforkDone AFTER the worker is spawned and registered.
         // The parent will then restore the CoW layer and resume.
+        phase_tick!("pre_vfork_done_signal");
         fc.vfork_done.signal();
+        phase_tick!("post_vfork_done_signal");
 
         // Mark this task as migrated so prepare_for_exit skips cleanup.
         self.delayed_fork_pending.set(false);
