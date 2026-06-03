@@ -68,6 +68,8 @@ struct ProbeOut {
 const STATX_ENOENT_STORM: HandlerToken<(), ProbeOut> = HandlerToken::new("perf.statx_enoent_storm");
 const FORK_EXEC_TRUE: HandlerToken<(), ProbeOut> = HandlerToken::new("perf.fork_exec_true");
 const FORK_ONLY_EXIT: HandlerToken<(), ProbeOut> = HandlerToken::new("perf.fork_only_exit");
+const FORK_WITH_INHERITED_PIPE: HandlerToken<(), ProbeOut> =
+    HandlerToken::new("perf.fork_with_inherited_pipe");
 
 /// `statx_enoent_storm`: issue N=1000 statx(2) calls for a path
 /// that does not exist. Mirrors Node's CommonJS module resolver,
@@ -300,6 +302,102 @@ async fn handle_fork_only_exit(
     .map_err(|e| HandlerError(format!("spawn_blocking join: {e}")))?
 }
 
+/// `fork_with_inherited_pipe`: parent creates an OS pipe via pipe2(),
+/// then forks. Child closes both pipe ends, calls getppid (forces
+/// commit_delayed_fork), then _exit(0). Parent waitpids and closes
+/// both pipe ends. N=20 iterations.
+///
+/// Difference vs `fork_only_exit`: the child inherits an open pipe
+/// pair, so the shim's commit_delayed_fork path runs the pipe-bridging
+/// phase (`pre_pipe_bridging` → `pre_snapshot_serialize`). This is
+/// the suspected location of the ~2.2s `commit_delayed_fork` latency
+/// observed by HypB probes.
+///
+/// Compared to PERF.fork_only_exit:
+///   - fork_only_exit       — no pipes; isolates spawn-worker-host cost.
+///   - fork_with_inherited_pipe — adds 1 pipe-pair; isolates the
+///     incremental cost of pipe bridging per snapshot.
+async fn handle_fork_with_inherited_pipe(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ProbeOut, HandlerError> {
+    tokio::task::spawn_blocking(|| {
+        const ITERATIONS: u64 = 20;
+        let mut per_call: Vec<u64> = Vec::with_capacity(ITERATIONS as usize);
+        let mut all_successful = true;
+        let outer_start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut fds: [libc::c_int; 2] = [-1, -1];
+            // SAFETY: pipe2 with O_CLOEXEC into a 2-element array.
+            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            if rc != 0 {
+                all_successful = false;
+                break;
+            }
+            let call_start = std::time::Instant::now();
+            // SAFETY: fork — child only invokes async-signal-safe syscalls
+            // (close, getppid, _exit). Parent waits synchronously.
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                all_successful = false;
+                // SAFETY: close fds we just created.
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                }
+                break;
+            }
+            if pid == 0 {
+                // SAFETY: async-signal-safe path.
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                    libc::getppid();
+                    libc::_exit(0);
+                }
+            }
+            let mut status: libc::c_int = 0;
+            // SAFETY: waitpid on the child pid we just forked.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            per_call.push(call_start.elapsed().as_nanos() as u64);
+            if waited != pid {
+                all_successful = false;
+            }
+            // SAFETY: close parent-side pipe fds.
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+        }
+        let elapsed_nanos = outer_start.elapsed().as_nanos() as u64;
+        per_call.sort_unstable();
+        let n = per_call.len();
+        let p50 = if n >= 16 { per_call[n / 2] } else { 0 };
+        let p95 = if n >= 16 { per_call[(n * 95) / 100] } else { 0 };
+        let min = if n >= 16 {
+            *per_call.first().unwrap()
+        } else {
+            0
+        };
+        let max = if n >= 16 {
+            *per_call.last().unwrap()
+        } else {
+            0
+        };
+        Ok(ProbeOut {
+            iterations_completed: ITERATIONS,
+            elapsed_nanos,
+            per_call_min_nanos: min,
+            per_call_p50_nanos: p50,
+            per_call_p95_nanos: p95,
+            per_call_max_nanos: max,
+            all_successful,
+        })
+    })
+    .await
+    .map_err(|e| HandlerError(format!("spawn_blocking join: {e}")))?
+}
+
 /// Verdict-check for the statx storm. Reports the throughput so it
 /// shows up in the test log on both passes; the litebox-vs-native
 /// comparison is done by the operator inspecting both test results.
@@ -372,10 +470,34 @@ fn report_fork_only_exit(out: &ProbeOut) -> Result<String, String> {
     ))
 }
 
+fn report_fork_with_inherited_pipe(out: &ProbeOut) -> Result<String, String> {
+    if !out.all_successful {
+        return Err("fork_with_inherited_pipe: at least one iteration failed".to_string());
+    }
+    let total_ms = out.elapsed_nanos / 1_000_000;
+    // Headroom: 20 iterations * 5s/iter worst-case worker-spawn = 100s.
+    if total_ms > 120_000 {
+        return Err(format!(
+            "fork_with_inherited_pipe: total elapsed {total_ms}ms exceeds 120000ms budget"
+        ));
+    }
+    let per_iter_us = out.elapsed_nanos / out.iterations_completed / 1_000;
+    Ok(format!(
+        "iterations={} total={total_ms}ms per-iter={per_iter_us}µs \
+         min={}µs p50={}µs p95={}µs max={}µs",
+        out.iterations_completed,
+        out.per_call_min_nanos / 1_000,
+        out.per_call_p50_nanos / 1_000,
+        out.per_call_p95_nanos / 1_000,
+        out.per_call_max_nanos / 1_000,
+    ))
+}
+
 pub(crate) fn register_perf_probes(reg: &mut Registry<'_>) {
     register_handler!(STATX_ENOENT_STORM, handle_statx_enoent_storm);
     register_handler!(FORK_EXEC_TRUE, handle_fork_exec_true);
     register_handler!(FORK_ONLY_EXIT, handle_fork_only_exit);
+    register_handler!(FORK_WITH_INHERITED_PIPE, handle_fork_with_inherited_pipe);
 
     // statx storm: 1000 calls. Native should complete in ~10 ms;
     // litebox observed at ~900 µs/call = ~900 ms. 30s absolute
@@ -416,5 +538,20 @@ pub(crate) fn register_perf_probes(reg: &mut Registry<'_>) {
         AgentName::Dpg1,
         &FORK_ONLY_EXIT,
         report_fork_only_exit,
+    );
+
+    // fork-with-inherited-pipe (no execve, no notification, but ONE
+    // OS pipe is open at fork time): 20 iterations. Isolates the
+    // marginal cost of the shim's pipe-bridging phase
+    // (pre_pipe_bridging → pre_snapshot_serialize) versus
+    // PERF.fork_only_exit. Suspected location of the ~2.2s
+    // commit_delayed_fork latency observed in HypB probes.
+    reg.single_agent_handler_test(
+        "vscode",
+        "perf",
+        "PERF.fork_with_inherited_pipe",
+        AgentName::Dpg1,
+        &FORK_WITH_INHERITED_PIPE,
+        report_fork_with_inherited_pipe,
     );
 }
