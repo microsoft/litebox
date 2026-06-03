@@ -20,8 +20,9 @@ use litebox_common_windows::nt_status::NtStatus;
 use litebox::LiteBox;
 use litebox::mm::PageManager;
 use litebox::platform::{
-    CrngProvider, PageManagementProvider, RawConstPointer as _, RawMutPointer as _,
-    RawPointerProvider, StdioProvider, SystemInfoProvider,
+    CrngProvider, PageManagementProvider, PunchthroughProvider, PunchthroughToken,
+    RawConstPointer as _, RawMutPointer as _, RawPointerProvider, StdioProvider,
+    SystemInfoProvider,
 };
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::RawSyncPrimitivesProvider;
@@ -107,6 +108,28 @@ where
         ptr.write_at_offset(index.try_into().ok()?, value)?;
     }
     Some(())
+}
+
+fn set_guest_teb<Platform>(platform: &Platform, teb_address: usize) -> bool
+where
+    Platform: PunchthroughProvider + RawPointerProvider,
+    <Platform as PunchthroughProvider>::PunchthroughToken<'static>: PunchthroughToken<
+        Punchthrough = litebox_common_linux::PunchthroughSyscall<'static, Platform>,
+    >,
+{
+    let punchthrough: litebox_common_linux::PunchthroughSyscall<'static, Platform> =
+        litebox_common_linux::PunchthroughSyscall::SetFsBase { addr: teb_address };
+    let Some(token) = platform.get_punchthrough_token_for(punchthrough) else {
+        litebox_util_log::warn!(teb:% = format_args!("{teb_address:#x}"); "Failed to get punchthrough token for Windows TEB base");
+        return false;
+    };
+
+    if let Err(error) = token.execute() {
+        litebox_util_log::warn!(error:? = error, teb:% = format_args!("{teb_address:#x}"); "Failed to set Windows TEB base");
+        return false;
+    }
+
+    true
 }
 
 pub(crate) fn insert_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
@@ -266,6 +289,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
                     fs,
                     entry_point: load_info.entry_point,
                     stack_top: load_info.stack_top,
+                    teb_address: load_info.environment.teb,
+                    context: load_info.environment.context,
                 },
                 _not_send: PhantomData,
             },
@@ -308,19 +333,27 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     fs: Arc<FS>,
     entry_point: usize,
     stack_top: usize,
+    context: usize,
+    teb_address: usize,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    fn init(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
+    fn init(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation
+    where
+        Platform: PunchthroughProvider,
+        <Platform as PunchthroughProvider>::PunchthroughToken<'static>: PunchthroughToken<
+            Punchthrough = litebox_common_linux::PunchthroughSyscall<'static, Platform>,
+        >,
+    {
+        if !set_guest_teb(self.global.platform, self.teb_address) {
+            return ContinueOperation::Terminate;
+        }
+
         ctx.rip = self.entry_point;
-        let stack_top_alignment = self.stack_top % 16;
-        debug_assert!(stack_top_alignment == 0 || stack_top_alignment == 8);
-        ctx.rsp = if stack_top_alignment == 0 {
-            self.stack_top - core::mem::size_of::<usize>()
-        } else {
-            self.stack_top
-        };
+        debug_assert!(self.stack_top % 16 == core::mem::size_of::<usize>());
+        ctx.rsp = self.stack_top;
         ctx.eflags = 0x202;
+        ctx.rcx = self.context;
         ctx.rdx = self
             .process
             .ntdll_mapping
@@ -535,7 +568,14 @@ pub struct WindowsShimEntrypoints<Platform: ShimPlatform, FS: ShimFS> {
     _not_send: PhantomData<*const ()>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> EnterShim for WindowsShimEntrypoints<Platform, FS> {
+impl<Platform, FS> EnterShim for WindowsShimEntrypoints<Platform, FS>
+where
+    Platform: ShimPlatform + PunchthroughProvider,
+    <Platform as PunchthroughProvider>::PunchthroughToken<'static>: PunchthroughToken<
+        Punchthrough = litebox_common_linux::PunchthroughSyscall<'static, Platform>,
+    >,
+    FS: ShimFS,
+{
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {

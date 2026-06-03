@@ -64,5 +64,7 @@ pub(crate) fn test_task() -> Task<TestPlatform, TestFS> {
         fs,
         entry_point: 0,
         stack_top: 0,
+        context: 0,
+        teb_address: 0,
     }
 }

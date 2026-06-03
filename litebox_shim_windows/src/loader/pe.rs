@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::marker::PhantomData;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
@@ -18,8 +18,13 @@ use litebox_common_windows::loader::{
     PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt, page_align_down,
 };
 use thiserror::Error;
+use zerocopy::{FromZeros, IntoBytes};
 
 use crate::ShimFS;
+use crate::nt_types::{
+    ClientId, PebBitField, ProcessEnvironmentBlock, RtlUserProcFlags, RtlUserProcessParameters,
+    ThreadEnvironmentBlock, UnicodeString, X64Context,
+};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32/ntdll.dll"];
@@ -27,11 +32,37 @@ const RUNTIME_FUNCTION_ENTRY_SIZE: usize = 12;
 const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
+const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
+const CSR_SERVER_DLL_MAX: usize = 4;
+const BASESRV_SERVERDLL_INDEX: usize = 1;
+// TODO: this is an artificial offset and should be replaced with the actual offset
+const WINDOWS_STATIC_SERVER_DATA_TABLE_OFFSET: usize = 0x750;
+const WINDOWS_BASE_STATIC_SERVER_DATA_OFFSET: usize =
+    WINDOWS_STATIC_SERVER_DATA_TABLE_OFFSET + CSR_SERVER_DLL_MAX * core::mem::size_of::<usize>();
+const WINDOWS_OS_MAJOR_VERSION: u32 = 10;
+const WINDOWS_OS_MINOR_VERSION: u32 = 0;
+const WINDOWS_OS_BUILD_NUMBER: u16 = 19041;
+const WINDOWS_OS_PLATFORM_WIN32_NT: u32 = 2;
+const WINDOWS_CRITICAL_SECTION_TIMEOUT_100NS: i64 = -150 * 10_000_000;
+const WINDOWS_HEAP_SEGMENT_RESERVE: u64 = 1024 * 1024;
+const WINDOWS_HEAP_SEGMENT_COMMIT: u64 = 2 * PAGE_SIZE as u64;
+const WINDOWS_HEAP_DECOMMIT_TOTAL_FREE_THRESHOLD: u64 = 64 * 1024;
+const WINDOWS_HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD: u64 = PAGE_SIZE as u64;
+const WINDOWS_NT_TIB_VERSION: usize = 30 << 8;
+const INITIAL_PROCESS_ID: usize = 1;
+const INITIAL_THREAD_ID: usize = 1;
+
+pub(crate) struct WindowsProcessEnvironment {
+    pub(crate) peb: usize,
+    pub(crate) teb: usize,
+    pub(crate) context: usize,
+}
 
 pub(crate) struct PeLoadInfo {
     pub(crate) entry_point: usize,
     pub(crate) stack_top: usize,
     pub(crate) ntdll_mapping: Option<MappingInfo>,
+    pub(crate) environment: WindowsProcessEnvironment,
 }
 
 pub(crate) struct PeLoader<'a, Platform: crate::ShimPlatform, FS: ShimFS> {
@@ -63,12 +94,15 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             NTDLL_PATHS,
         )?;
 
-        if let Some(ntdll) = &ntdll {
+        let entry_point = if let Some(ntdll) = &ntdll {
             if !ntdll.image.parsed.has_trampoline() {
                 return Err(WindowsLoadError::UnrewrittenNtDll);
             }
             Self::initialize_ki_user_inverted_function_table(&image, ntdll)?;
-        }
+            ntdll.exports.ldr_initialize_thunk
+        } else {
+            application_entry_point
+        };
 
         let length =
             NonZeroPageSize::new(INITIAL_STACK_SIZE).ok_or(PeImageAccessError::AddressOverflow)?;
@@ -90,10 +124,29 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             stack_top
         };
 
+        let environment = self.create_process_environment(
+            &image.parsed,
+            image.mapping.base_addr,
+            path,
+            stack_base.as_usize(),
+            stack_top,
+        )?;
+        if let Some(ntdll) = &ntdll {
+            let context = X64Context::initial_thread_context(
+                ntdll.exports.rtl_user_thread_start,
+                application_entry_point,
+                stack_top,
+                environment.peb,
+            );
+            crate::write_slice::<Platform, _>(environment.context, context.as_bytes())
+                .ok_or(PeImageAccessError::MemoryAccess)?;
+        }
+
         Ok(PeLoadInfo {
-            entry_point: application_entry_point,
+            entry_point,
             stack_top,
             ntdll_mapping: ntdll.map(|ntdll| ntdll.image.mapping),
+            environment,
         })
     }
 
@@ -133,6 +186,171 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         );
 
         Ok(())
+    }
+
+    fn create_process_environment(
+        &self,
+        image: &PeParsedFile,
+        image_base_address: usize,
+        image_path: &str,
+        stack_base: usize,
+        stack_top: usize,
+    ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
+        let create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
+            let aligned_length = size.next_multiple_of(PAGE_SIZE);
+            let length =
+                NonZeroPageSize::new(aligned_length).ok_or(PeImageAccessError::AddressOverflow)?;
+            let ptr = unsafe {
+                self.page_manager.create_writable_pages(
+                    None,
+                    length,
+                    CreatePagesFlags::empty(),
+                    |_| Ok(0),
+                )
+            }?;
+            let base = ptr.as_usize();
+            Ok(base)
+        };
+        let teb_ptr = create_pages(core::mem::size_of::<ThreadEnvironmentBlock>())?;
+        let peb_ptr = create_pages(core::mem::size_of::<ProcessEnvironmentBlock>())?;
+        let ctx_ptr = create_pages(core::mem::size_of::<X64Context>())?;
+
+        let dos_image_path = dos_image_path(image_path);
+        let current_directory_path = Utf16StringBuffer::new(r"C:\")?;
+        let dll_path = Utf16StringBuffer::new(r"C:\Windows\System32;C:\")?;
+        let image_path_name = Utf16StringBuffer::new(&dos_image_path)?;
+        let command_line = Utf16StringBuffer::new(&dos_image_path)?;
+        let window_title = Utf16StringBuffer::new(&dos_image_path)?;
+        let desktop_info = Utf16StringBuffer::new("")?;
+        let shell_info = Utf16StringBuffer::new("")?;
+        let runtime_data = Utf16StringBuffer::new("")?;
+        let redirection_dll_name = Utf16StringBuffer::new("")?;
+        let process_parameter_strings = [
+            &current_directory_path,
+            &dll_path,
+            &image_path_name,
+            &command_line,
+            &window_title,
+            &desktop_info,
+            &shell_info,
+            &runtime_data,
+            &redirection_dll_name,
+        ];
+        let process_parameters_length = process_parameter_strings.iter().try_fold(
+            core::mem::size_of::<RtlUserProcessParameters>(),
+            |length, string| {
+                length
+                    .checked_add(usize::from(string.maximum_length))
+                    .ok_or(PeImageAccessError::AddressOverflow)
+            },
+        )?;
+        let process_parameters_allocation_length =
+            process_parameters_length.next_multiple_of(PAGE_SIZE);
+        let process_parameters_ptr = create_pages(process_parameters_length)?;
+
+        let mut process_parameters = RtlUserProcessParameters::new_zeroed();
+        process_parameters.maximum_length = u32::try_from(process_parameters_allocation_length)
+            .map_err(|_| PeImageAccessError::AddressOverflow)?;
+        process_parameters.length = u32::try_from(process_parameters_length)
+            .map_err(|_| PeImageAccessError::AddressOverflow)?;
+        process_parameters.flags = RtlUserProcFlags::NORMALIZED.bits();
+        let mut process_parameter_tail = process_parameters_ptr
+            .checked_add(core::mem::size_of::<RtlUserProcessParameters>())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        process_parameters.current_directory.dos_path = write_process_parameter_string::<Platform>(
+            &mut process_parameter_tail,
+            &current_directory_path,
+        )?;
+        process_parameters.dll_path =
+            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &dll_path)?;
+        process_parameters.image_path_name = write_process_parameter_string::<Platform>(
+            &mut process_parameter_tail,
+            &image_path_name,
+        )?;
+        process_parameters.command_line =
+            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &command_line)?;
+        process_parameters.window_title =
+            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &window_title)?;
+        process_parameters.desktop_info =
+            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &desktop_info)?;
+        process_parameters.shell_info =
+            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &shell_info)?;
+        process_parameters.runtime_data =
+            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &runtime_data)?;
+        process_parameters.redirection_dll_name = write_process_parameter_string::<Platform>(
+            &mut process_parameter_tail,
+            &redirection_dll_name,
+        )?;
+        crate::write_value::<Platform, _>(process_parameters_ptr, process_parameters)
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+
+        let read_only_shared_memory_base = create_pages(WINDOWS_SHARED_SECTION_SIZE)?;
+        let read_only_static_server_data = read_only_shared_memory_base
+            .checked_add(WINDOWS_STATIC_SERVER_DATA_TABLE_OFFSET)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let base_static_server_data = read_only_shared_memory_base
+            .checked_add(WINDOWS_BASE_STATIC_SERVER_DATA_OFFSET)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let base_static_server_data_entry = read_only_static_server_data
+            .checked_add(BASESRV_SERVERDLL_INDEX * core::mem::size_of::<usize>())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        crate::write_value::<Platform, _>(base_static_server_data_entry, base_static_server_data)
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+
+        let mut peb = ProcessEnvironmentBlock::new_zeroed();
+        peb.image_base_address = image_base_address;
+        if image_base_address != image.image_base() || image.has_dynamic_base() {
+            peb.bit_field = PebBitField::IS_IMAGE_DYNAMICALLY_RELOCATED.bits();
+        }
+        let process_heaps = initial_process_heaps_array(peb_ptr)?;
+        peb.process_parameters = process_parameters_ptr;
+        peb.number_of_processors = 1;
+        peb.critical_section_timeout = WINDOWS_CRITICAL_SECTION_TIMEOUT_100NS;
+        peb.heap_segment_reserve = WINDOWS_HEAP_SEGMENT_RESERVE;
+        peb.heap_segment_commit = WINDOWS_HEAP_SEGMENT_COMMIT;
+        peb.heap_de_commit_total_free_threshold = WINDOWS_HEAP_DECOMMIT_TOTAL_FREE_THRESHOLD;
+        peb.heap_de_commit_free_block_threshold = WINDOWS_HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD;
+        peb.maximum_number_of_heaps = process_heaps.maximum_number_of_heaps;
+        peb.process_heaps = process_heaps.address;
+        peb.active_process_affinity_mask = 1;
+        peb.os_major_version = WINDOWS_OS_MAJOR_VERSION;
+        peb.os_minor_version = WINDOWS_OS_MINOR_VERSION;
+        peb.os_build_number = WINDOWS_OS_BUILD_NUMBER;
+        peb.os_platform_id = WINDOWS_OS_PLATFORM_WIN32_NT;
+        peb.image_subsystem = u32::from(image.subsystem());
+        peb.image_subsystem_major_version = u32::from(image.major_subsystem_version());
+        peb.image_subsystem_minor_version = u32::from(image.minor_subsystem_version());
+        peb.read_only_shared_memory_base = read_only_shared_memory_base;
+        peb.read_only_static_server_data = read_only_static_server_data;
+        peb.csr_server_read_only_shared_memory_base = read_only_shared_memory_base as u64;
+        crate::write_value::<Platform, _>(peb_ptr, peb).ok_or(PeImageAccessError::MemoryAccess)?;
+
+        let mut teb = ThreadEnvironmentBlock::new_zeroed();
+        teb.nt_tib.exception_list = 0;
+        teb.nt_tib.stack_base = stack_top;
+        teb.nt_tib.stack_limit = stack_base;
+        teb.nt_tib.fiber_data_or_version = WINDOWS_NT_TIB_VERSION;
+        teb.nt_tib.self_pointer = teb_ptr;
+        // TODO: set real ID
+        teb.client_id = ClientId {
+            unique_process: INITIAL_PROCESS_ID,
+            unique_thread: INITIAL_THREAD_ID,
+        };
+        teb.thread_local_storage_pointer =
+            teb_ptr + core::mem::offset_of!(ThreadEnvironmentBlock, tls_slots);
+        teb.process_environment_block = peb_ptr;
+        teb.real_client_id = teb.client_id;
+        teb.activation_context_stack_pointer =
+            teb_ptr + core::mem::offset_of!(ThreadEnvironmentBlock, activation_stack);
+        teb.static_unicode_string =
+            initial_teb_static_unicode_string(teb_ptr, &teb.static_unicode_buffer)?;
+        teb.deallocation_stack = stack_base;
+        crate::write_value::<Platform, _>(teb_ptr, teb).ok_or(PeImageAccessError::MemoryAccess)?;
+        Ok(WindowsProcessEnvironment {
+            peb: peb_ptr,
+            teb: teb_ptr,
+            context: ctx_ptr,
+        })
     }
 }
 
@@ -180,6 +398,11 @@ struct LoadedNtDll {
 
 #[derive(Clone, Copy, Debug)]
 struct NtDllExports {
+    /// `LdrInitializeThunk`
+    ldr_initialize_thunk: usize,
+    /// `RtlUserThreadStart`
+    rtl_user_thread_start: usize,
+    /// `KiUserInvertedFunctionTable`
     ki_user_inverted_function_table: usize,
 }
 
@@ -265,12 +488,16 @@ fn ntdll_exports<Platform: RawPointerProvider>(
         .try_into()
         .map_err(|_| WindowsLoadError::MissingNtDllInvertedFunctionTable)?;
 
-    ldr_initialize_thunk.ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
-    rtl_user_thread_start.ok_or(WindowsLoadError::MissingNtDllThreadEntrypoint)?;
+    let ldr_initialize_thunk =
+        ldr_initialize_thunk.ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
+    let rtl_user_thread_start =
+        rtl_user_thread_start.ok_or(WindowsLoadError::MissingNtDllThreadEntrypoint)?;
     let ki_user_inverted_function_table = ki_user_inverted_function_table
         .ok_or(WindowsLoadError::MissingNtDllInvertedFunctionTable)?;
 
     Ok(NtDllExports {
+        ldr_initialize_thunk,
+        rtl_user_thread_start,
         ki_user_inverted_function_table,
     })
 }
@@ -563,17 +790,117 @@ fn page_range(address: usize, len: usize) -> Result<(usize, usize), PeImageAcces
     Ok((start, end - start))
 }
 
+fn dos_image_path(path: &str) -> String {
+    let mut dos_path = String::from(r"\??\C:");
+    if !path.starts_with('/') && !path.starts_with('\\') {
+        dos_path.push('\\');
+    }
+    for ch in path.chars() {
+        dos_path.push(if ch == '/' { '\\' } else { ch });
+    }
+    dos_path
+}
+
+fn write_process_parameter_string<Platform: RawPointerProvider>(
+    process_parameter_tail: &mut usize,
+    string: &Utf16StringBuffer,
+) -> Result<UnicodeString, PeImageAccessError> {
+    let buffer = *process_parameter_tail;
+    crate::write_slice::<Platform, _>(buffer, &string.units)
+        .ok_or(PeImageAccessError::MemoryAccess)?;
+    *process_parameter_tail = (*process_parameter_tail)
+        .checked_add(usize::from(string.maximum_length))
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    Ok(UnicodeString {
+        length: string.length,
+        maximum_length: string.maximum_length,
+        padding_0: [0; 4],
+        buffer,
+    })
+}
+
+struct InitialProcessHeaps {
+    address: usize,
+    maximum_number_of_heaps: u32,
+}
+
+fn initial_process_heaps_array(peb_ptr: usize) -> Result<InitialProcessHeaps, PeImageAccessError> {
+    let peb_size = core::mem::size_of::<ProcessEnvironmentBlock>();
+    let address = peb_ptr
+        .checked_add(peb_size)
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    let maximum_number_of_heaps =
+        (peb_size.next_multiple_of(PAGE_SIZE) - peb_size) / core::mem::size_of::<usize>();
+    Ok(InitialProcessHeaps {
+        address,
+        maximum_number_of_heaps: maximum_number_of_heaps.trunc(),
+    })
+}
+
+fn initial_teb_static_unicode_string(
+    teb_ptr: usize,
+    static_unicode_buffer: &[u16],
+) -> Result<UnicodeString, PeImageAccessError> {
+    let buffer = teb_ptr
+        .checked_add(core::mem::offset_of!(
+            ThreadEnvironmentBlock,
+            static_unicode_buffer
+        ))
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    Ok(UnicodeString {
+        length: 0,
+        maximum_length: u16::try_from(core::mem::size_of_val(static_unicode_buffer))
+            .map_err(|_| PeImageAccessError::AddressOverflow)?,
+        padding_0: [0; 4],
+        buffer,
+    })
+}
+
+struct Utf16StringBuffer {
+    length: u16,
+    maximum_length: u16,
+    units: Vec<u16>,
+}
+
+impl Utf16StringBuffer {
+    fn new(value: &str) -> Result<Self, PeImageAccessError> {
+        let mut units: Vec<u16> = value.encode_utf16().collect();
+        let length = utf16_byte_len(units.len())?;
+        units.push(0);
+        let maximum_length = utf16_byte_len(units.len())?;
+        Ok(Self {
+            length,
+            maximum_length,
+            units,
+        })
+    }
+}
+
+fn utf16_byte_len(units: usize) -> Result<u16, PeImageAccessError> {
+    units
+        .checked_mul(core::mem::size_of::<u16>())
+        .and_then(|bytes| u16::try_from(bytes).ok())
+        .ok_or(PeImageAccessError::AddressOverflow)
+}
+
 #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
 mod tests {
     extern crate std;
 
     use alloc::{string::String, vec, vec::Vec};
+    use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 
     use super::*;
+    use crate::nt_types::{ProcessEnvironmentBlock, ThreadEnvironmentBlock, UnicodeString};
+
+    const TEST_STACK_BASE: usize = 0x7000_0000;
+    const TEST_STACK_TOP: usize = TEST_STACK_BASE + 0x100000;
 
     #[allow(non_snake_case)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        fn GetCurrentProcessId() -> u32;
+        fn GetCurrentThreadId() -> u32;
         fn GetModuleHandleW(lp_module_name: *const u16) -> *mut core::ffi::c_void;
         fn GetProcAddress(
             h_module: *mut core::ffi::c_void,
@@ -584,6 +911,337 @@ mod tests {
             lp_filename: *mut u16,
             n_size: u32,
         ) -> u32;
+    }
+
+    macro_rules! print_diff_fields {
+        ($prefix:literal, $synthetic:expr, $host:expr, [$($field:ident),+ $(,)?]) => {
+            $(
+                print_diff_field!($prefix, $synthetic, $host, $field);
+            )+
+        };
+    }
+
+    macro_rules! print_diff_field {
+        ($prefix:literal, $synthetic:expr, $host:expr, csd_version) => {
+            print_unicode_string_diff(
+                concat!($prefix, ".", stringify!(csd_version)),
+                ($synthetic).csd_version,
+                ($host).csd_version,
+            );
+        };
+        ($prefix:literal, $synthetic:expr, $host:expr, static_unicode_string) => {
+            print_unicode_string_diff(
+                concat!($prefix, ".", stringify!(static_unicode_string)),
+                ($synthetic).static_unicode_string,
+                ($host).static_unicode_string,
+            );
+        };
+        ($prefix:literal, $synthetic:expr, $host:expr, $field:ident) => {
+            print_field_diff(
+                concat!($prefix, ".", stringify!($field)),
+                ($synthetic).$field,
+                ($host).$field,
+            );
+        };
+    }
+
+    #[allow(clippy::similar_names)]
+    #[test]
+    fn prints_created_teb_host_diff() {
+        let _guard = diagnostic_output_test_lock().lock().unwrap();
+        let created = created_process_environment_snapshot();
+        let host_teb = host_teb_snapshot();
+        let host_teb_address = host_teb_address();
+        let host_peb_address = host_peb_address();
+
+        assert_eq!(created.teb.nt_tib.self_pointer, created.environment.teb);
+        assert_eq!(host_teb.nt_tib.self_pointer, host_teb_address);
+        assert_eq!(
+            created.teb.process_environment_block,
+            created.environment.peb
+        );
+        assert_eq!(host_teb.process_environment_block, host_peb_address);
+        assert_eq!(host_teb.client_id, host_client_id());
+
+        print_diff_header("synthetic TEB vs host TEB");
+        print_diff_fields!(
+            "TEB.NtTib",
+            created.teb.nt_tib,
+            host_teb.nt_tib,
+            [
+                exception_list,
+                stack_base,
+                stack_limit,
+                sub_system_tib,
+                fiber_data_or_version,
+                arbitrary_user_pointer,
+                self_pointer,
+            ]
+        );
+        print_diff_fields!(
+            "TEB",
+            created.teb,
+            host_teb,
+            [
+                environment_pointer,
+                client_id,
+                active_rpc_handle,
+                thread_local_storage_pointer,
+                process_environment_block,
+                last_error_value,
+                count_of_owned_critical_sections,
+                csr_client_thread,
+                win_32_thread_info,
+                user_32_reserved,
+                user_reserved,
+                padding_user_reserved,
+                wow_32_reserved,
+                current_locale,
+                fp_software_status_register,
+                reserved_for_debugger_instrumentation,
+                system_reserved_1,
+                heap_fls_data,
+                rng_state,
+                placeholder_compatibility_mode,
+                placeholder_hydration_always_explicit,
+                placeholder_reserved,
+                proxied_process_id,
+                activation_stack,
+                working_on_behalf_ticket,
+                exception_code,
+                padding_0,
+                activation_context_stack_pointer,
+                instrumentation_callback_sp,
+                instrumentation_callback_previous_pc,
+                instrumentation_callback_previous_sp,
+                tx_fs_context,
+                instrumentation_callback_disabled,
+                unaligned_load_store_exceptions,
+                padding_1,
+                gdi_teb_batch,
+                real_client_id,
+                gdi_cached_process_handle,
+                gdi_client_pid,
+                gdi_client_tid,
+                gdi_thread_local_info,
+                win_32_client_info,
+                gl_dispatch_table,
+                gl_reserved_1,
+                gl_reserved_2,
+                gl_section_info,
+                gl_section,
+                gl_table,
+                gl_current_rc,
+                gl_context,
+                last_status_value,
+                padding_2,
+                static_unicode_string,
+                static_unicode_buffer,
+                padding_3,
+                deallocation_stack,
+                tls_slots,
+                tls_links,
+                vdm,
+                reserved_for_nt_rpc,
+                dbg_ss_reserved,
+                hard_error_mode,
+                padding_4,
+                instrumentation,
+                activity_id,
+                sub_process_tag,
+                perflib_data,
+                etw_trace_data,
+                win_sock_data,
+                gdi_batch_count,
+                ideal_processor_value,
+                guaranteed_stack_bytes,
+                padding_5,
+                reserved_for_perf,
+                reserved_for_ole,
+                waiting_on_loader_lock,
+                padding_6,
+                saved_priority_state,
+                reserved_for_code_coverage,
+                thread_pool_data,
+                tls_expansion_slots,
+                chpe_v_2_cpu_area_info,
+                unused,
+                mui_generation,
+                is_impersonating,
+                nls_cache,
+                p_shim_data,
+                heap_data,
+                padding_7,
+                current_transaction_handle,
+                active_frame,
+                fls_data,
+                preferred_languages,
+                user_pref_languages,
+                merged_pref_languages,
+                mui_impersonation,
+                cross_teb_flags,
+                same_teb_flags,
+                txn_scope_enter_callback,
+                txn_scope_exit_callback,
+                txn_scope_context,
+                lock_count,
+                wow_teb_offset,
+                resource_ret_value,
+                reserved_for_wdf,
+                reserved_for_crt,
+                effective_container_id,
+                last_sleep_counter,
+                spin_call_count,
+                padding_8,
+                extended_feature_disable_mask,
+                scheduler_shared_data_slot,
+                heap_walk_context,
+                primary_group_affinity,
+                rcu,
+            ]
+        );
+    }
+
+    #[test]
+    fn prints_created_peb_host_diff() {
+        let _guard = diagnostic_output_test_lock().lock().unwrap();
+        let created = created_process_environment_snapshot();
+        let host_peb = host_peb_snapshot();
+        let base_static_server_data: usize = read_guest_value(
+            created.peb.read_only_static_server_data
+                + BASESRV_SERVERDLL_INDEX * core::mem::size_of::<usize>(),
+        );
+
+        assert_eq!(created.peb.image_base_address, created.image_base_address);
+        assert_eq!(
+            created.peb.read_only_static_server_data,
+            created.peb.read_only_shared_memory_base + WINDOWS_STATIC_SERVER_DATA_TABLE_OFFSET
+        );
+        assert_eq!(
+            base_static_server_data,
+            created.peb.read_only_shared_memory_base + WINDOWS_BASE_STATIC_SERVER_DATA_OFFSET
+        );
+        assert_ne!(host_peb.image_base_address, 0);
+
+        print_diff_header("synthetic PEB vs host PEB");
+        print_diff_fields!(
+            "PEB",
+            created.peb,
+            host_peb,
+            [
+                inherited_address_space,
+                read_image_file_exec_options,
+                being_debugged,
+            ]
+        );
+        print_peb_bit_field_diff(
+            "PEB.bit_field",
+            crate::nt_types::PebBitField::from_bits_retain(created.peb.bit_field),
+            crate::nt_types::PebBitField::from_bits_retain(host_peb.bit_field),
+        );
+        print_diff_fields!(
+            "PEB",
+            created.peb,
+            host_peb,
+            [
+                padding_0,
+                mutant,
+                image_base_address,
+                ldr,
+                process_parameters,
+                sub_system_data,
+                process_heap,
+                fast_peb_lock,
+                atl_thunk_s_list_ptr,
+                ifeo_key,
+                cross_process_flags,
+                padding_1,
+                kernel_callback_table,
+                system_reserved,
+                atl_thunk_s_list_ptr_32,
+                api_set_map,
+                tls_expansion_counter,
+                padding_2,
+                tls_bitmap,
+                tls_bitmap_bits,
+                read_only_shared_memory_base,
+                shared_data,
+                read_only_static_server_data,
+                ansi_code_page_data,
+                oem_code_page_data,
+                unicode_case_table_data,
+                number_of_processors,
+                nt_global_flag,
+                critical_section_timeout,
+                heap_segment_reserve,
+                heap_segment_commit,
+                heap_de_commit_total_free_threshold,
+                heap_de_commit_free_block_threshold,
+                number_of_heaps,
+                maximum_number_of_heaps,
+                process_heaps,
+                gdi_shared_handle_table,
+                process_starter_helper,
+                gdi_dc_attribute_list,
+                padding_3,
+                loader_lock,
+                os_major_version,
+                os_minor_version,
+                os_build_number,
+                os_csd_version,
+                os_platform_id,
+                image_subsystem,
+                image_subsystem_major_version,
+                image_subsystem_minor_version,
+                padding_4,
+                active_process_affinity_mask,
+                gdi_handle_buffer,
+                post_process_init_routine,
+                tls_expansion_bitmap,
+                tls_expansion_bitmap_bits,
+                session_id,
+                padding_5,
+                app_compat_flags,
+                app_compat_flags_user,
+                p_shim_data,
+                app_compat_info,
+                csd_version,
+                activation_context_data,
+                process_assembly_storage_map,
+                system_default_activation_context_data,
+                system_assembly_storage_map,
+                minimum_stack_commit,
+                spare_pointers,
+                patch_loader_data,
+                chpe_v2_process_info,
+                app_model_feature_state,
+                spare_ulongs,
+                active_code_page,
+                oem_code_page,
+                use_case_mapping,
+                unused_nls_field,
+                padding_6a,
+                wer_registration_data,
+                wer_ship_assert_ptr,
+                ec_code_bit_map,
+                p_image_header_hash,
+                tracing_flags,
+                padding_6,
+                csr_server_read_only_shared_memory_base,
+                tpp_workerp_list_lock,
+                tpp_workerp_list,
+                wait_on_address_hash_table,
+                telemetry_coverage_header,
+                cloud_file_flags,
+                cloud_file_diag_flags,
+                placeholder_compatibility_mode,
+                placeholder_compatibility_mode_reserved,
+                leap_second_data,
+                leap_second_flags,
+                nt_global_flag_2,
+                extended_feature_disable_mask,
+            ]
+        );
     }
 
     #[test]
@@ -651,6 +1309,222 @@ mod tests {
             "the test executable",
             module_inverted_function_table_entry(application_module_base()),
         );
+    }
+
+    struct CreatedProcessEnvironmentSnapshot {
+        environment: WindowsProcessEnvironment,
+        peb: ProcessEnvironmentBlock,
+        teb: ThreadEnvironmentBlock,
+        image_base_address: usize,
+    }
+
+    fn created_process_environment_snapshot() -> CreatedProcessEnvironmentSnapshot {
+        let _guard = process_environment_test_lock().lock().unwrap();
+        let platform = crate::tests::test_platform();
+        let litebox = litebox::LiteBox::new(platform);
+        let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
+        let fs = Arc::new(litebox::fs::in_mem::FileSystem::new(&litebox));
+        let loader = PeLoader::new(platform, fs, &page_manager);
+        let image = loaded_module_image(application_module_base());
+
+        let image_base_address = image.mapping.base_addr;
+        let environment = loader
+            .create_process_environment(
+                &image.parsed,
+                image_base_address,
+                "test.exe",
+                TEST_STACK_BASE,
+                TEST_STACK_TOP,
+            )
+            .expect("failed to create synthetic Windows process environment");
+
+        CreatedProcessEnvironmentSnapshot {
+            peb: read_guest_value(environment.peb),
+            teb: read_guest_value(environment.teb),
+            environment,
+            image_base_address,
+        }
+    }
+
+    fn process_environment_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn diagnostic_output_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn print_field_diff<T>(field: &str, synthetic: T, host: T)
+    where
+        T: core::fmt::Debug + IntoBytes + zerocopy::Immutable,
+    {
+        let status = if synthetic.as_bytes() == host.as_bytes() {
+            "✓"
+        } else {
+            "X"
+        };
+        let synthetic = format_field_value(&synthetic);
+        let host = format_field_value(&host);
+        std::println!("{status:<2} {field:<48} {synthetic} | {host}");
+    }
+
+    fn print_peb_bit_field_diff(
+        field: &str,
+        synthetic: crate::nt_types::PebBitField,
+        host: crate::nt_types::PebBitField,
+    ) {
+        let status = if synthetic.bits() == host.bits() {
+            "✓"
+        } else {
+            "X"
+        };
+        let synthetic = format_field_value(&synthetic);
+        let host = format_field_value(&host);
+        std::println!("{status:<2} {field:<48} {synthetic} | {host}");
+    }
+
+    fn print_unicode_string_diff(field: &str, synthetic: UnicodeString, host: UnicodeString) {
+        let synthetic = decode_guest_unicode_string(synthetic);
+        let host = decode_host_unicode_string(host);
+        let status = if synthetic == host { "✓" } else { "X" };
+        let synthetic = format_field_value(&synthetic);
+        let host = format_field_value(&host);
+        std::println!("{status:<2} {field:<48} {synthetic} | {host}");
+    }
+
+    fn decode_guest_unicode_string(value: UnicodeString) -> String {
+        let Some(chars) = unicode_string_chars(value) else {
+            return std::format!("<invalid length {:#x}>", value.length);
+        };
+        if chars == 0 {
+            return String::new();
+        }
+        if value.buffer == 0 {
+            return String::from("<null buffer>");
+        }
+
+        let ptr =
+            <crate::tests::TestPlatform as RawPointerProvider>::RawConstPointer::<u16>::from_usize(
+                value.buffer,
+            );
+        let Some(units) = ptr.to_owned_slice(chars) else {
+            return String::from("<unreadable buffer>");
+        };
+        String::from_utf16_lossy(&units)
+    }
+
+    fn decode_host_unicode_string(value: UnicodeString) -> String {
+        let Some(chars) = unicode_string_chars(value) else {
+            return std::format!("<invalid length {:#x}>", value.length);
+        };
+        if chars == 0 {
+            return String::new();
+        }
+        if value.buffer == 0 {
+            return String::from("<null buffer>");
+        }
+
+        // SAFETY: Host PEB/TEB snapshots contain pointers owned by the current
+        // process; the `UNICODE_STRING.Length` field bounds the UTF-16 slice.
+        let units = unsafe { core::slice::from_raw_parts(value.buffer as *const u16, chars) };
+        String::from_utf16_lossy(units)
+    }
+
+    fn unicode_string_chars(value: UnicodeString) -> Option<usize> {
+        if value.length.is_multiple_of(2) {
+            Some(usize::from(value.length / 2))
+        } else {
+            None
+        }
+    }
+
+    fn format_field_value<T: core::fmt::Debug>(value: &T) -> String {
+        const MAX_VALUE_LEN: usize = 96;
+
+        let mut value = std::format!("{value:x?}");
+        if value.len() <= MAX_VALUE_LEN {
+            return value;
+        }
+
+        let mut end = MAX_VALUE_LEN;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+        value.push_str("...");
+        value
+    }
+
+    fn print_diff_header(title: &str) {
+        std::println!("{title}");
+        std::println!("   {:<48} synthetic | host", "field");
+        std::println!("   {:<48} ----------------", "-----");
+    }
+
+    fn read_guest_value<T>(address: usize) -> T
+    where
+        T: Copy + zerocopy::FromBytes,
+    {
+        let ptr =
+            <crate::tests::TestPlatform as RawPointerProvider>::RawConstPointer::<T>::from_usize(
+                address,
+            );
+        ptr.read_at_offset(0)
+            .expect("failed to read synthetic guest process environment value")
+    }
+
+    fn host_teb_snapshot() -> ThreadEnvironmentBlock {
+        // SAFETY: `host_teb_address` returns the current thread's live host TEB pointer.
+        unsafe { read_host_value(host_teb_address() as *const ThreadEnvironmentBlock) }
+    }
+
+    fn host_peb_snapshot() -> ProcessEnvironmentBlock {
+        // SAFETY: `host_peb_address` returns the current process's live host PEB pointer.
+        unsafe { read_host_value(host_peb_address() as *const ProcessEnvironmentBlock) }
+    }
+
+    fn host_teb_address() -> usize {
+        let teb: usize;
+        // SAFETY: On x86_64 Windows, GS:[0x30] is the current thread's TEB pointer.
+        unsafe {
+            core::arch::asm!(
+                "mov {}, gs:[0x30]",
+                out(reg) teb,
+                options(nostack, preserves_flags, readonly),
+            );
+        }
+        teb
+    }
+
+    fn host_peb_address() -> usize {
+        let peb: usize;
+        // SAFETY: On x86_64 Windows, GS:[0x60] is the current process's PEB pointer.
+        unsafe {
+            core::arch::asm!(
+                "mov {}, gs:[0x60]",
+                out(reg) peb,
+                options(nostack, preserves_flags, readonly),
+            );
+        }
+        peb
+    }
+
+    fn host_client_id() -> ClientId {
+        // SAFETY: These kernel32 calls take no pointers and return IDs for the current process/thread.
+        let unique_process = unsafe { GetCurrentProcessId() };
+        // SAFETY: These kernel32 calls take no pointers and return IDs for the current process/thread.
+        let unique_thread = unsafe { GetCurrentThreadId() };
+        ClientId {
+            unique_process: usize::try_from(unique_process).unwrap(),
+            unique_thread: usize::try_from(unique_thread).unwrap(),
+        }
+    }
+
+    unsafe fn read_host_value<T: Copy>(address: *const T) -> T {
+        // SAFETY: The caller guarantees `address` points into a live host PEB/TEB object.
+        unsafe { core::ptr::read_volatile(address) }
     }
 
     fn own_inverted_function_table() -> *const u8 {

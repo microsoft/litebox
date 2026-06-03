@@ -7,6 +7,7 @@
 use alloc::{string::String, vec::Vec};
 use core::cmp;
 use core::mem::size_of;
+use object::read::pe::ImageOptionalHeader as _;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use object::endian::LittleEndian as LE;
@@ -19,6 +20,7 @@ pub const PAGE_SIZE: usize = 4096;
 
 /// Maximum supported section count. PE limit per spec is 96.
 const MAX_SECTIONS: usize = 96;
+const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
 
 /// The result of parsing a PE32+ file.
 #[derive(Debug)]
@@ -30,7 +32,7 @@ pub struct PeParsedFile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PeImageInfo {
+pub struct PeImageInfo {
     machine: u16,
     characteristics: u16,
     image_base: usize,
@@ -40,9 +42,11 @@ struct PeImageInfo {
     section_alignment: usize,
     file_alignment: usize,
     subsystem: u16,
+    /// Major subsystem version from the PE optional header.
+    major_subsystem_version: u16,
+    /// Minor subsystem version from the PE optional header.
+    minor_subsystem_version: u16,
     dll_characteristics: u16,
-    size_of_heap_reserve: usize,
-    size_of_heap_commit: usize,
 }
 
 /// Information about the mapped PE image.
@@ -212,6 +216,35 @@ impl PeParsedFile {
     #[must_use]
     pub fn image_size(&self) -> usize {
         self.image.size_of_image
+    }
+
+    /// Returns the preferred image base from the optional header.
+    #[must_use]
+    pub fn image_base(&self) -> usize {
+        self.image.image_base
+    }
+
+    /// Returns whether the image opts into dynamic-base loading.
+    #[must_use]
+    pub fn has_dynamic_base(&self) -> bool {
+        self.image.dll_characteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE != 0
+    }
+
+    #[must_use]
+    pub fn subsystem(&self) -> u16 {
+        self.image.subsystem
+    }
+
+    /// Returns the major subsystem version.
+    #[must_use]
+    pub fn major_subsystem_version(&self) -> u16 {
+        self.image.major_subsystem_version
+    }
+
+    /// Returns the minor subsystem version.
+    #[must_use]
+    pub fn minor_subsystem_version(&self) -> u16 {
+        self.image.minor_subsystem_version
     }
 
     /// Returns the exception directory, if present.
@@ -838,9 +871,9 @@ fn parse_headers<F: ReadAt>(
         section_alignment: opt.section_alignment.get(LE) as usize,
         file_alignment: opt.file_alignment.get(LE) as usize,
         subsystem: opt.subsystem.get(LE),
+        major_subsystem_version: opt.major_subsystem_version(),
+        minor_subsystem_version: opt.minor_subsystem_version(),
         dll_characteristics: opt.dll_characteristics.get(LE),
-        size_of_heap_reserve: usize_from_u64(opt.size_of_heap_reserve.get(LE))?,
-        size_of_heap_commit: usize_from_u64(opt.size_of_heap_commit.get(LE))?,
     };
     if image.size_of_headers > file_size {
         return Err(PeParseError::UnsupportedImage);
