@@ -199,6 +199,20 @@ impl BrokerPipeFd<Platform> {
         if buf.is_empty() {
             return Ok(0);
         }
+        // HypB timing diag: log entry to read to detect when the
+        // parent's read(ready[0]) actually fires.
+        {
+            use litebox::platform::DebugLogProvider as _;
+            use litebox::platform::TimeProvider as _;
+            let t = litebox_platform_multiplex::platform().monotonic_timestamp();
+            let host_pid = unsafe { ::syscalls::raw::syscall0(::syscalls::Sysno::getpid) };
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "[HypB-read-entry] host_pid={} handle={} t_ns={}\n",
+                host_pid,
+                self.handle(),
+                t.map(|d| d.as_nanos()).unwrap_or(0),
+            ));
+        }
         self.common.ensure_subscribed(&self.pollee);
         // Phase C.5c: cap the requested read length to fit within
         // the wire codec's BODY_MAX. The response body is
@@ -321,6 +335,22 @@ impl FdEnabledSubsystemEntry for BrokerPipeFd<Platform> {
     }
 
     fn on_close(&self) {
+        // HypB timing diag: log close on the parent-side ready pipe
+        // write end (and similar) so we can detect 2-second close
+        // latencies.
+        {
+            use litebox::platform::DebugLogProvider as _;
+            use litebox::platform::TimeProvider as _;
+            let t = litebox_platform_multiplex::platform().monotonic_timestamp();
+            let host_pid = unsafe { ::syscalls::raw::syscall0(::syscalls::Sysno::getpid) };
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "[HypB-close-timing] host_pid={} handle={} dir={:?} t_ns={}\n",
+                host_pid,
+                self.handle(),
+                self.direction,
+                t.map(|d| d.as_nanos()).unwrap_or(0),
+            ));
+        }
         // Per-slot release: every removal of an fd-table slot
         // referencing this BrokerPipeFd decrements the broker
         // registry refcount. When the last slot is removed, the
