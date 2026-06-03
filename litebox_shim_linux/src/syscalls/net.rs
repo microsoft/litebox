@@ -3179,8 +3179,8 @@ impl<FS: ShimFS> Task<FS> {
     /// cmsg level/type is rejected with `EOPNOTSUPP`.
     ///
     /// Returns `(passed_fds, passed_tokens)`. `passed_tokens` is
-    /// populated for broker-backed subsystem entries (currently only
-    /// eventfd; future subsystems extend the match arm). The caller
+    /// populated for broker-backed subsystem entries (eventfd, pipes,
+    /// and other cross-worker-transferable handles). The caller
     /// hands both to `sendto`, which routes them through the in-worker
     /// `Channel` arm (uses `passed_fds`) or the cross-worker `Tcp` arm
     /// (uses `passed_tokens` to LBFD-frame the broker handle ids).
@@ -3333,9 +3333,36 @@ impl<FS: ShimFS> Task<FS> {
                             // External fds are sealed host fds and transfer as PassedFd.
                             Ok(false)
                         }
-                        crate::RawFdRef::BrokerPipe(_) => {
-                            // Broker pipes are not broker-token-transferable over SCM yet.
-                            Ok(false)
+                        crate::RawFdRef::BrokerPipe(typed) => {
+                            let Some(provider) = super::broker_pipe::broker_pipe_provider() else {
+                                return Ok(false);
+                            };
+                            let entry_handle = dt
+                                .entry_handle::<super::broker_pipe::BrokerPipeSubsystem>(typed)
+                                .ok_or(Errno::EBADF)?;
+                            let (handle_id, direction) = entry_handle.with_entry(|e| {
+                                (
+                                    e.handle(),
+                                    e.direction(),
+                                )
+                            });
+                            provider.dup_handle(handle_id).map_err(|_| Errno::EIO)?;
+                            let tag = match direction {
+                                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => {
+                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::PipeRead
+                                }
+                                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => {
+                                    litebox_common_linux::fd_transfer_frame::SubsystemTag::PipeWrite
+                                }
+                            };
+                            passed_tokens.push(
+                                litebox_common_linux::fd_transfer_frame::PassedToken::new(
+                                    tag,
+                                    handle_id,
+                                )
+                                .map_err(|_| Errno::EINVAL)?,
+                            );
+                            Ok(true)
                         }
                         crate::RawFdRef::BrokerSocketPair(_) => {
                             // Broker socketpairs are not broker-token-transferable over SCM yet.
@@ -4130,6 +4157,66 @@ impl<FS: ShimFS> Task<FS> {
                         let mut dt = self.global.litebox.descriptor_table_mut();
                         let typed =
                             dt.insert::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(conn);
+                        if cloexec {
+                            let _ = dt.set_fd_metadata(
+                                &typed,
+                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                            );
+                        }
+                        drop(dt);
+                        let files = self.files.borrow();
+                        match files.insert_raw_fd(typed) {
+                            Ok(raw_fd) => {
+                                installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                            }
+                            Err(typed) => {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .remove(&typed)
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    SubsystemTag::PipeRead | SubsystemTag::PipeWrite => {
+                        let Some(provider) = super::broker_pipe::broker_pipe_provider() else {
+                            continue;
+                        };
+                        let handle_id = token.id();
+                        if provider.dup_handle(handle_id).is_err() {
+                            continue;
+                        }
+                        let direction = match token.tag() {
+                            SubsystemTag::PipeRead => {
+                                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read
+                            }
+                            SubsystemTag::PipeWrite => {
+                                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write
+                            }
+                            SubsystemTag::Eventfd
+                            | SubsystemTag::TcpSocket
+                            | SubsystemTag::Pidfd
+                            | SubsystemTag::UnixSocket
+                            | SubsystemTag::Signalfd
+                            | SubsystemTag::Timerfd
+                            | SubsystemTag::Inotify
+                            | SubsystemTag::Process
+                            | SubsystemTag::Pipe
+                            | SubsystemTag::Pty
+                            | SubsystemTag::InetListener
+                            | SubsystemTag::InetDgram
+                            | SubsystemTag::InetRaw
+                            | SubsystemTag::Unknown(_) => unreachable!(),
+                        };
+                        let pipe = super::broker_pipe::BrokerPipeFd::<Platform>::new(
+                            provider,
+                            handle_id,
+                            direction,
+                            litebox::fs::OFlags::empty(),
+                            3,
+                        );
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(pipe);
                         if cloexec {
                             let _ = dt.set_fd_metadata(
                                 &typed,
