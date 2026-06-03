@@ -1057,6 +1057,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     special_cases::register_unix_socket(&mut registry::Registry::new(&mut tests));
     special_cases::register_cross_worker(&mut registry::Registry::new(&mut tests));
     special_cases::register_pipe_eof(&mut registry::Registry::new(&mut tests));
+    special_cases::register_pipe_nonblock_fork(&mut registry::Registry::new(&mut tests));
     pipe_bridge::register_pipe_bridge(&mut registry::Registry::new(&mut tests));
     tcp_stress::register_tcp_stress(&mut registry::Registry::new(&mut tests));
     file_tcp::register_file_tcp(&mut registry::Registry::new(&mut tests));

@@ -1096,6 +1096,7 @@ fn subcmd_pipe_test(args: &[String]) -> i32 {
         "read-on-fd" => subcmd_read_on_fd(args),
         "echo-on-fd" => subcmd_echo_on_fd(args),
         "delayed-write-on-fd" => subcmd_delayed_write_on_fd(args),
+        "nonblock-fork" => subcmd_nonblock_fork(args),
         other => {
             eprintln!("unknown pipe-test: {other}");
             1
@@ -1152,6 +1153,164 @@ fn subcmd_eof_fork() -> i32 {
     } else {
         println!("P1_EOF_FAIL:data={data}");
         1
+    }
+}
+
+/// `nonblock-fork <r_nb:0|1> <w_nb:0|1>` — verify that O_NONBLOCK is
+/// preserved per-end across a `fork()`.
+///
+/// Parent: creates a pipe, applies the requested NONBLOCK setting via
+/// `fcntl(F_SETFL)` on each end independently, forks, then closes both
+/// of its own ends so that the child inherits the *only* references to
+/// the pipe. Under litebox's delayed-fork model this drives the
+/// runner's child-only-local-pipe code path (the Phase 2 BrokerPipe
+/// migration target).
+///
+/// Child: re-reads `F_GETFL` on both inherited fds and compares the
+/// `O_NONBLOCK` bit against what the parent set. Also performs a
+/// functional check: with NONBLOCK on the read end, an empty read must
+/// return `EAGAIN` (not block); without NONBLOCK and a closed write
+/// end, the read must return 0 (EOF). Reports the verdict by exit
+/// code (0 = OK).
+///
+/// Naming convention for the parent harness output: `PFLG_NB_OK` on
+/// success, `PFLG_NB_FAIL:<detail>` on failure.
+fn subcmd_nonblock_fork(args: &[String]) -> i32 {
+    let r_nb = matches!(args.get(3).map(String::as_str), Some("1"));
+    let w_nb = matches!(args.get(4).map(String::as_str), Some("1"));
+
+    let mut pipe_fds = [0i32; 2];
+    // Safety: pipe_fds points to two valid i32 slots for pipe to fill.
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        println!("PFLG_NB_FAIL:pipe:{}", errno());
+        return 1;
+    }
+    let rfd = pipe_fds[0];
+    let wfd = pipe_fds[1];
+
+    // Apply per-end NONBLOCK before fork so that the snapshot the
+    // delayed-fork machinery captures contains the desired flags.
+    if let Err(e) = set_nonblock(rfd, r_nb) {
+        println!("PFLG_NB_FAIL:setfl_r:{e}");
+        return 1;
+    }
+    if let Err(e) = set_nonblock(wfd, w_nb) {
+        println!("PFLG_NB_FAIL:setfl_w:{e}");
+        return 1;
+    }
+
+    // Safety: single-threaded argv leaf.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("PFLG_NB_FAIL:fork:{}", errno());
+        return 1;
+    }
+
+    if pid == 0 {
+        // Child: verify inherited flags and pipe functionality, then
+        // exit with status code 0 on success, 1..=4 on specific
+        // failure modes. Stdout is captured separately so the child's
+        // diagnostic line is visible to the parent harness.
+        let got_r = match fcntl_getfl(rfd) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("PFLG_NB_FAIL:child_getfl_r:{e}");
+                std::process::exit(1);
+            }
+        };
+        let got_w = match fcntl_getfl(wfd) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("PFLG_NB_FAIL:child_getfl_w:{e}");
+                std::process::exit(1);
+            }
+        };
+        let r_actual_nb = (got_r & libc::O_NONBLOCK) != 0;
+        let w_actual_nb = (got_w & libc::O_NONBLOCK) != 0;
+        if r_actual_nb != r_nb || w_actual_nb != w_nb {
+            println!(
+                "PFLG_NB_FAIL:flags_mismatch:r_want={r_nb},r_got={r_actual_nb},\
+                 w_want={w_nb},w_got={w_actual_nb}"
+            );
+            std::process::exit(2);
+        }
+
+        // Functional check on the read end. With NONBLOCK and an empty
+        // pipe whose write end is still open, read must return EAGAIN.
+        let mut buf = [0u8; 16];
+        if r_nb {
+            // Safety: rfd is a valid fd, buf is a valid mutable slice.
+            let n = unsafe {
+                libc::read(rfd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
+            };
+            if n != -1 || (errno() != libc::EAGAIN && errno() != libc::EWOULDBLOCK) {
+                println!("PFLG_NB_FAIL:read_should_eagain:n={n},errno={}", errno());
+                std::process::exit(3);
+            }
+        }
+
+        // Round-trip a byte to confirm the pipe is wired up correctly.
+        let msg = b"X";
+        // Safety: wfd is valid, msg is valid initialised memory.
+        let wn =
+            unsafe { libc::write(wfd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
+        if wn != 1 {
+            println!("PFLG_NB_FAIL:roundtrip_write:n={wn},errno={}", errno());
+            std::process::exit(4);
+        }
+        // Safety: rfd is valid, buf has room for one byte.
+        let rn =
+            unsafe { libc::read(rfd, buf.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        if rn != 1 || buf[0] != b'X' {
+            println!("PFLG_NB_FAIL:roundtrip_read:n={rn},b0={}", buf[0]);
+            std::process::exit(4);
+        }
+
+        println!("PFLG_NB_CHILD_OK:r_nb={r_nb},w_nb={w_nb}");
+        std::process::exit(0);
+    }
+
+    // Parent: close both ends so the child holds the only references
+    // (this matches the litebox local-pipes fork-restore shape).
+    // Safety: rfd and wfd are valid fds returned by pipe.
+    unsafe {
+        libc::close(rfd);
+        libc::close(wfd);
+    }
+    let exit_code = wait_child(pid);
+    if exit_code == 0 {
+        println!("PFLG_NB_OK:r_nb={r_nb},w_nb={w_nb}");
+        0
+    } else {
+        println!("PFLG_NB_FAIL:child_exit={exit_code}");
+        1
+    }
+}
+
+/// Apply or clear `O_NONBLOCK` on `fd` via `fcntl(F_GETFL)` +
+/// `fcntl(F_SETFL)`. Returns the errno string on failure.
+fn set_nonblock(fd: i32, nb: bool) -> Result<(), String> {
+    let cur = fcntl_getfl(fd)?;
+    let new = if nb {
+        cur | libc::O_NONBLOCK
+    } else {
+        cur & !libc::O_NONBLOCK
+    };
+    // Safety: fd is a valid fd and F_SETFL takes a plain int argument.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, new) };
+    if rc < 0 {
+        return Err(format!("setfl:{}", errno()));
+    }
+    Ok(())
+}
+
+fn fcntl_getfl(fd: i32) -> Result<i32, String> {
+    // Safety: fd is a valid fd and F_GETFL takes no argument.
+    let f = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if f < 0 {
+        Err(format!("getfl:{}", errno()))
+    } else {
+        Ok(f)
     }
 }
 
