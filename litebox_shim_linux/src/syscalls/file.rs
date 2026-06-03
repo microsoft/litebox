@@ -2907,7 +2907,7 @@ mod tests {
         )
         .unwrap();
 
-        // ── sys_mkdir: create a subdirectory via relative path ──
+        // ── create a subdirectory via relative path ──
         task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "subdir", 0o777)
             .unwrap();
         task.sys_stat("/cwd_test/subdir").unwrap(); // verify via absolute
