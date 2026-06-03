@@ -112,20 +112,40 @@ enum ScmKind {
     PassTcpSocket,
     PassThenCloseSender,
     PassTwoFdsOneMsg,
-    /// Targeted probe for the broker `SubscriptionList`'s
-    /// "deferred-edge-bit orphaned after producer quiesce" failure
-    /// mode (HypB). Sender creates a pipe, passes the read end via
-    /// SCM_RIGHTS, then writes two bytes back-to-back so the
-    /// broker's second `notify(IN)` lands while the first
-    /// edge-frame is still in flight (forcing the deferred-bit
-    /// code path). Receiver does two `epoll_wait + read(1)` cycles
-    /// — a level-triggered usage where the second wake must arrive
-    /// even with no further producer activity. On native Linux,
-    /// pipe epoll is level-triggered and trivially succeeds. On
-    /// litebox, if the deferred edge bit is not re-flushed (no
-    /// production `try_flush_subscriptions` call site), the
-    /// receiver's second `epoll_wait` blocks until timeout. Tests
-    /// the protocol's liveness gap, not its no-loss invariant.
+    /// Originally designed as a HypB probe for the broker
+    /// `SubscriptionList`'s "deferred-edge-bit orphaned after
+    /// producer quiesce" failure mode. Sender creates a pipe,
+    /// passes the read end via SCM_RIGHTS, writes two bytes
+    /// back-to-back so the broker's second `notify(IN)` lands
+    /// while the first edge-frame is still in flight (forcing
+    /// the deferred-bit code path). Receiver does two
+    /// `epoll_wait + read(1)` cycles — level-triggered usage
+    /// where the second wake must arrive even with no further
+    /// producer activity. Native Linux: trivially PASS.
+    ///
+    /// **In practice this probe currently exercises PE.5, not
+    /// HypB.** Investigation 2026-06-03 (post merge `8c8bf696`):
+    /// the agent dies during SCM teardown with a tokio I/O driver
+    /// EIO panic *before* reaching the wake-2 path. Captured
+    /// `/tmp/rst-diag.log` shows:
+    ///   [PE.5-diag] BROKER PROTOCOL VIOLATION
+    ///     Release handle_id=N caller_pid=P
+    ///     state_exists=true process_exists=false
+    ///   [PE.13-diag] BrokerPipeProvider::release(N) failed:
+    ///     io error talking to broker control socket
+    ///   [PE.5-diag] broker eventfd Io fallthrough: BrokenPipe
+    /// Tokio's wake `eventfd_write` fails because the broker
+    /// control socket got torn down after the Release-with-
+    /// process_exists=false protocol violation; tokio panics
+    /// in `runtime/io/driver.rs:260` and the coordinator times
+    /// out reading the agent's result line.
+    ///
+    /// Until PE.5 (the release-after-deregister bug) is fixed,
+    /// this probe is effectively a deterministic PE.5 repro
+    /// across all 10 SCM_PAIRS combos. Once PE.5 is fixed, it
+    /// reverts to validating HypB (PASS if the flush wiring
+    /// in `8c8bf696` is correct, FAIL at wake-2 otherwise).
+    /// A separate non-tokio probe will isolate HypB cleanly.
     PassPipeDoubleWake,
 }
 
