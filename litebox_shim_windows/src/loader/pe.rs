@@ -948,7 +948,6 @@ mod tests {
     #[allow(clippy::similar_names)]
     #[test]
     fn prints_created_teb_host_diff() {
-        let _guard = diagnostic_output_test_lock().lock().unwrap();
         let created = created_process_environment_snapshot();
         let host_teb = host_teb_snapshot();
         let host_teb_address = host_teb_address();
@@ -1104,7 +1103,6 @@ mod tests {
 
     #[test]
     fn prints_created_peb_host_diff() {
-        let _guard = diagnostic_output_test_lock().lock().unwrap();
         let created = created_process_environment_snapshot();
         let host_peb = host_peb_snapshot();
         let base_static_server_data: usize = read_guest_value(
@@ -1319,7 +1317,6 @@ mod tests {
     }
 
     fn created_process_environment_snapshot() -> CreatedProcessEnvironmentSnapshot {
-        let _guard = process_environment_test_lock().lock().unwrap();
         let platform = crate::tests::test_platform();
         let litebox = litebox::LiteBox::new(platform);
         let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
@@ -1344,16 +1341,6 @@ mod tests {
             environment,
             image_base_address,
         }
-    }
-
-    fn process_environment_test_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    fn diagnostic_output_test_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     fn print_field_diff<T>(field: &str, synthetic: T, host: T)
