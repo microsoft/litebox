@@ -147,9 +147,10 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
     register_handler!(FORK_INHERIT, handle_fork_inherit);
     register_handler!(FORK_INHERIT_POLL, handle_fork_inherit_poll);
 
-    // eventfd-test argv subcommand: the EV.fork_inherit.<bt> tests invoke
-    // the child binary directly to exercise the fresh-process loader/libc
-    // path. Body lives in `mod leaf_subcmd` at the bottom of this file.
+    // eventfd-test argv subcommand: the EV.fork_inherit.<bt> and
+    // EV.tokio_runtime_drop.<bt> tests invoke the child binary directly to
+    // exercise fresh-process loader/libc/runtime paths. Body lives in
+    // `mod leaf_subcmd` at the bottom of this file.
     crate::register_leaf_subcommand!("eventfd-test", |args: &[String]| -> i32 {
         let sub = args.get(2).map_or("help", String::as_str);
         leaf_subcmd::run(sub, args)
@@ -208,6 +209,7 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
             });
     }
 
+    register_tokio_runtime_drop_tests(reg);
     register_fork_inherit_tests(reg);
 }
 
@@ -375,6 +377,46 @@ async fn handle_fork_inherit_poll(
     })
 }
 
+fn register_tokio_runtime_drop_tests(reg: &mut Registry<'_>) {
+    let bt = crate::BinaryType::StaticPieMusl;
+    let bt_label = bt.label();
+    reg.test(
+        "vscode",
+        "eventfd",
+        format!("EV.tokio_runtime_drop.{bt_label}"),
+    )
+    .timeout(30)
+    .build(move |_cx| {
+        Box::new(move |run| {
+            let self_exe = run.self_exe().to_string();
+            let child_binary = crate::binary_path(bt, &self_exe);
+            Box::pin(async move {
+                let output = std::process::Command::new(&child_binary)
+                    .args(["eventfd-test", "tokio-release-after-deregister"])
+                    .output();
+                match output {
+                    Ok(out) => {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        TestOutcome::new(
+                            bt_label,
+                            out.status.success() && stdout.starts_with("PASS"),
+                            format!(
+                                "{} exit={:?} stdout={stdout:?} stderr={stderr:?}",
+                                child_binary,
+                                out.status.code()
+                            ),
+                        )
+                    }
+                    Err(e) => {
+                        TestOutcome::new(bt_label, false, format!("spawn {child_binary}: {e}"))
+                    }
+                }
+            })
+        })
+    });
+}
+
 fn register_fork_inherit_tests(reg: &mut Registry<'_>) {
     // EV.fork_inherit.<bt> — basic cross-binary-type fork inheritance.
     for &bt in crate::BinaryType::ALL {
@@ -468,11 +510,114 @@ mod leaf_subcmd {
         match sub {
             "read-inherited" => read_inherited(args),
             "read-inherited-poll" => read_inherited_poll(args),
+            "tokio-release-after-deregister" => tokio_release_after_deregister(),
             other => {
                 eprintln!("eventfd-test: unknown subcommand: {other}");
                 2
             }
         }
+    }
+
+    /// `eventfd-test tokio-release-after-deregister`
+    ///
+    /// Fresh-process probe for the PE.5 release-after-deregister shape: fork a
+    /// child that keeps broker-backed pipe refs alive, issue the same per-pid
+    /// release sweep used by process teardown, close the parent's pipe fds, then
+    /// force a tokio current-thread runtime wake. Pre-fix, the late fd close
+    /// killed the broker control socket and the wake panicked with EIO.
+    fn tokio_release_after_deregister() -> i32 {
+        let mut pipefd = [0; 2];
+        // SAFETY: pipefd points to two valid i32 slots for libc::pipe to fill.
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            eprintln!("pipe: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+
+        // SAFETY: fork has no Rust-level shared locks in this leaf before the
+        // child immediately blocks in libc::read and exits via _exit.
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            eprintln!("fork: {}", std::io::Error::last_os_error());
+            close_fd(pipefd[0]);
+            close_fd(pipefd[1]);
+            return 1;
+        }
+        if child == 0 {
+            close_fd(pipefd[1]);
+            // SAFETY: pause blocks the child so it keeps its inherited broker
+            // pipe refs alive until the parent has exercised the late release.
+            let _ = unsafe { libc::pause() };
+            close_fd(pipefd[0]);
+            // SAFETY: child must not run Rust destructors after fork.
+            unsafe { libc::_exit(0) };
+        }
+
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("tokio runtime build: {e}");
+                close_fd(pipefd[0]);
+                close_fd(pipefd[1]);
+                terminate_child(child);
+                return 1;
+            }
+        };
+
+        if let Some(client) = litebox_common_linux::fd_token_client::global_client() {
+            let pid = std::process::id();
+            let _guard = litebox_common_linux::fd_token_client::set_caller_pid_scope(pid);
+            if let Err(e) = client.release_all_for_pid(pid) {
+                eprintln!("release_all_for_pid({pid}): {e:?}");
+                close_fd(pipefd[0]);
+                close_fd(pipefd[1]);
+                terminate_child(child);
+                return 1;
+            }
+        }
+
+        close_fd(pipefd[0]);
+        close_fd(pipefd[1]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = rt.handle().clone();
+        let waker = std::thread::spawn(move || {
+            let _ = rx.recv();
+            handle.spawn(async {});
+        });
+        if tx.send(()).is_err() {
+            eprintln!("failed to signal wake thread");
+            terminate_child(child);
+            return 1;
+        }
+        rt.block_on(async {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        });
+        if let Err(e) = waker.join() {
+            eprintln!("wake thread panicked: {e:?}");
+            terminate_child(child);
+            return 1;
+        }
+        terminate_child(child);
+        println!("PASS tokio runtime wake survived late fd releases");
+        0
+    }
+
+    fn close_fd(fd: i32) {
+        // SAFETY: closing an fd is safe; errors are intentionally ignored in cleanup.
+        let _ = unsafe { libc::close(fd) };
+    }
+
+    fn terminate_child(pid: libc::pid_t) {
+        // SAFETY: pid is the specific child returned by fork; SIGTERM asks only
+        // that child to exit after the parent has finished the probe.
+        let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+        let mut status = 0;
+        // SAFETY: status points to a valid i32 and pid is the child returned by fork.
+        let _ = unsafe { libc::waitpid(pid, std::ptr::from_mut(&mut status), 0) };
     }
 
     /// `eventfd-test read-inherited <fd> <expected>`
