@@ -130,6 +130,10 @@ pub enum SubsystemTag {
     Process,
     /// Broker-hosted anonymous pipe. Wire value `9`. Phase C.
     Pipe,
+    /// Broker-hosted pipe read end for SCM_RIGHTS token transfer. Wire value `14`.
+    PipeRead,
+    /// Broker-hosted pipe write end for SCM_RIGHTS token transfer. Wire value `15`.
+    PipeWrite,
     /// Broker-hosted pseudo-terminal endpoint. Wire value `10`.
     /// Phase E reserves this tag for PTY master/slave identity that
     /// must survive cross-worker `exec_on_remote_host`.
@@ -164,6 +168,8 @@ impl SubsystemTag {
             SubsystemTag::InetListener => 11,
             SubsystemTag::InetDgram => 12,
             SubsystemTag::InetRaw => 13,
+            SubsystemTag::PipeRead => 14,
+            SubsystemTag::PipeWrite => 15,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -186,6 +192,8 @@ impl SubsystemTag {
             11 => SubsystemTag::InetListener,
             12 => SubsystemTag::InetDgram,
             13 => SubsystemTag::InetRaw,
+            14 => SubsystemTag::PipeRead,
+            15 => SubsystemTag::PipeWrite,
             other => SubsystemTag::Unknown(other),
         }
     }
@@ -858,6 +866,8 @@ mod tests {
                 | SubsystemTag::Inotify
                 | SubsystemTag::Process
                 | SubsystemTag::Pipe
+                | SubsystemTag::PipeRead
+                | SubsystemTag::PipeWrite
                 | SubsystemTag::Pty
                 | SubsystemTag::InetListener
                 | SubsystemTag::InetDgram
@@ -875,6 +885,9 @@ mod tests {
         assert_eq!(SubsystemTag::Signalfd.as_u8(), 5);
         assert_eq!(SubsystemTag::Timerfd.as_u8(), 6);
         assert_eq!(SubsystemTag::Inotify.as_u8(), 7);
+        assert_eq!(SubsystemTag::Pipe.as_u8(), 9);
+        assert_eq!(SubsystemTag::PipeRead.as_u8(), 14);
+        assert_eq!(SubsystemTag::PipeWrite.as_u8(), 15);
         for tag in [
             SubsystemTag::Eventfd,
             SubsystemTag::TcpSocket,
@@ -883,6 +896,14 @@ mod tests {
             SubsystemTag::Signalfd,
             SubsystemTag::Timerfd,
             SubsystemTag::Inotify,
+            SubsystemTag::Process,
+            SubsystemTag::Pipe,
+            SubsystemTag::Pty,
+            SubsystemTag::InetListener,
+            SubsystemTag::InetDgram,
+            SubsystemTag::InetRaw,
+            SubsystemTag::PipeRead,
+            SubsystemTag::PipeWrite,
         ] {
             assert!(tag.is_known(), "{tag:?} should be known");
             assert_eq!(SubsystemTag::from_u8(tag.as_u8()), tag);
