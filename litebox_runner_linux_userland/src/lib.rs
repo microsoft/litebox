@@ -248,7 +248,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     in_mem.with_root_privileges(|fs| {
                         fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
                         if mode_and_user.1 != 0 {
-                            chown_to_initial_user(fs, &prog);
+                            chown_to_initial_user(fs, path);
                         }
                     });
                 } else {
