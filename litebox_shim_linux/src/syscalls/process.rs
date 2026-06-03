@@ -4203,7 +4203,10 @@ impl<FS: ShimFS> Task<FS> {
                         .unwrap_or(0);
                     litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
                         "[DELAYED-FORK-TIMING] pid={} phase={} delta_us={} total_us={}\n",
-                        self.pid, $name, delta_us, total_us
+                        self.pid,
+                        $name,
+                        delta_us,
+                        total_us
                     ));
                 }
                 phase_last = now;

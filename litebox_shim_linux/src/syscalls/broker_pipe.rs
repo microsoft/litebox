@@ -216,8 +216,7 @@ impl BrokerPipeFd<Platform> {
                     Ok(bytes) => {
                         let n = bytes.len().min(buf.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
-                        if n == 0 {
-                        }
+                        if n == 0 {}
                         Ok(n)
                     }
                     Err(BrokerOpError::WouldBlock) => {
