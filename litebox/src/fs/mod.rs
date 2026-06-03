@@ -222,22 +222,34 @@ bitflags! {
         /// `O_CREAT`: if path does not exist, create it as a regular file
         const CREAT = 0x40;
         /// `O_DIRECT`: try to minimize cache effects of I/O for this file
+        #[cfg(target_arch = "x86_64")]
         const DIRECT = 0x4000;
+        #[cfg(target_arch = "aarch64")]
+        const DIRECT = 0x10000;
         /// `O_DIRECTORY`: fail if not a directory
+        #[cfg(target_arch = "x86_64")]
         const DIRECTORY = 0x10000;
+        #[cfg(target_arch = "aarch64")]
+        const DIRECTORY = 0x4000;
         /// `O_DSYNC`: write operations on the file will complete according to the requirements of
         /// synchronized I/O *data* integrity completion.
         const DSYNC = 0x1000;
         /// `O_EXCL`: exclusive use
         const EXCL = 0x80;
         /// `O_LARGEFILE`: allow large file support
+        #[cfg(target_arch = "x86_64")]
         const LARGEFILE = 0x8000;
+        #[cfg(target_arch = "aarch64")]
+        const LARGEFILE = 0x20000;
         /// `O_NOATIME`: do not update access time
         const NOATIME = 0x40000;
         /// `O_NOCTTY`: do not assign controlling terminal
         const NOCTTY = 0x100;
         /// `O_NOFOLLOW`: fail if the path does not point to a regular file
+        #[cfg(target_arch = "x86_64")]
         const NOFOLLOW = 0x20000;
+        #[cfg(target_arch = "aarch64")]
+        const NOFOLLOW = 0x8000;
         /// `O_NDELAY`: non-blocking mode (same as NONBLOCK)
         const NDELAY = 0x800;
         /// `O_NONBLOCK`: non-blocking mode (same as NDELAY)
@@ -249,7 +261,10 @@ bitflags! {
         /// integrity completion provided by `O_DSYNC`.)
         const SYNC = 0x101000;
         /// `O_TMPFILE`: create an unnamed temporary file
+        #[cfg(target_arch = "x86_64")]
         const TMPFILE = 0x410000;
+        #[cfg(target_arch = "aarch64")]
+        const TMPFILE = 0x404000;
         /// `O_TRUNC`: truncate the file to zero length
         const TRUNC = 0x200;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>

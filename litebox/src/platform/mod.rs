@@ -376,6 +376,9 @@ where
         // safe (it probably is fine, but the following sequence of steps ensures we are
         // staying in a very safe subset).
         let bytes: *mut [c_char] = Box::into_raw(bytes);
+        // SAFETY: c_char and u8 have the same size and alignment. The cast is a no-op on
+        // targets where c_char is u8 (e.g. aarch64), hence the `unnecessary_cast` allow.
+        #[allow(clippy::unnecessary_cast)]
         let bytes: *mut [u8] = bytes as *mut [u8];
         let bytes: Box<[u8]> = unsafe { Box::from_raw(bytes) };
         let bytes: Vec<u8> = Vec::from(bytes);

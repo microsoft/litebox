@@ -101,6 +101,8 @@ const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
 
 const MACHINE: u16 = if cfg!(target_arch = "x86_64") {
     elf::abi::EM_X86_64
+} else if cfg!(target_arch = "aarch64") {
+    elf::abi::EM_AARCH64
 } else {
     panic!("unsupported arch")
 };

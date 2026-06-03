@@ -114,6 +114,20 @@ pub struct ExceptionInfo {
     pub kernel_mode: bool,
 }
 
+/// Information about a hardware exception on aarch64.
+#[cfg(target_arch = "aarch64")]
+#[derive(Copy, Clone, Debug)]
+pub struct ExceptionInfo {
+    /// The aarch64 exception class from ESR_EL1[31:26].
+    pub exception: Exception,
+    /// The fault address (FAR_EL1).
+    pub fault_address: usize,
+    /// The exception syndrome register value (ESR_EL1).
+    pub esr: u64,
+    /// Whether the exception occurred in kernel mode.
+    pub kernel_mode: bool,
+}
+
 /// An x86 exception type.
 #[cfg(target_arch = "x86_64")]
 #[repr(transparent)]
@@ -132,4 +146,28 @@ impl Exception {
     pub const GENERAL_PROTECTION_FAULT: Self = Self(13);
     /// #PF
     pub const PAGE_FAULT: Self = Self(14);
+}
+
+/// An aarch64 exception class from ESR_EL1[31:26].
+#[cfg(target_arch = "aarch64")]
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Exception(pub u8);
+
+#[cfg(target_arch = "aarch64")]
+impl Exception {
+    /// Breakpoint exception from a lower exception level.
+    pub const BREAKPOINT_LOWER_EL: Self = Self(0x30);
+    /// Breakpoint exception taken without a change in exception level.
+    pub const BREAKPOINT_CURRENT_EL: Self = Self(0x31);
+    /// BRK instruction trap from AArch64 state.
+    pub const BRK64: Self = Self(0x3c);
+    /// Instruction abort taken without a change in exception level.
+    pub const INSTRUCTION_ABORT_CURRENT_EL: Self = Self(0x21);
+    /// Instruction abort taken from a lower exception level.
+    pub const INSTRUCTION_ABORT_LOWER_EL: Self = Self(0x20);
+    /// Data abort taken without a change in exception level.
+    pub const DATA_ABORT_CURRENT_EL: Self = Self(0x25);
+    /// Data abort taken from a lower exception level.
+    pub const DATA_ABORT_LOWER_EL: Self = Self(0x24);
 }
