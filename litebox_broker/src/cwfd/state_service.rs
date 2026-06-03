@@ -959,6 +959,25 @@ fn handle_write_pipe(
             return status_err(Opcode::WritePipeResponse, status);
         }
     };
+    // HypB diag: log producer's handle_id before write fires (matches PIPE WRITE inner_addr).
+    {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = writeln!(
+                f,
+                "[HypB-diag] ts={ts} WRITE-PIPE-RPC handle={handle_id} bytes={}",
+                bytes.len()
+            );
+        }
+    }
     match state.write(&bytes) {
         Ok(n) => HandlerResult {
             frame: build_write_pipe_response_ok(n as u64),
