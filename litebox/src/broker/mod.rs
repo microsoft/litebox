@@ -7,8 +7,7 @@ use litebox_broker_protocol::{CoreRequest, CoreResponse};
 
 use crate::sync::RawSyncPrimitivesProvider;
 
-mod error;
-pub(crate) mod event;
+pub(crate) mod error;
 pub use error::BrokerControlError;
 
 /// Local-core access to the negotiated broker control channel.
@@ -35,5 +34,9 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerState<Platform> {
             control,
             _marker: core::marker::PhantomData,
         }
+    }
+
+    pub(crate) fn control(&self) -> Option<Arc<dyn BrokerControl>> {
+        self.control.clone()
     }
 }

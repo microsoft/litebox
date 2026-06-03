@@ -47,12 +47,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
         let local_core_event = if flags.contains(EfdFlags::NONBLOCK) {
-            Some(
-                litebox
-                    .events()
-                    .create_counter(count)
-                    .map_err(Errno::from)?,
-            )
+            Some(EventCounter::new(litebox, count).map_err(Errno::from)?)
         } else {
             None
         };

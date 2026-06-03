@@ -22,7 +22,7 @@ pub enum BrokerControlError {
 /// This keeps protocol/control-channel failures separate from the public
 /// object-specific API error exposed by each local-core facade.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BrokerObjectError {
+pub(crate) enum BrokerObjectError {
     /// The deployment-provided broker control path failed.
     Control,
     /// The broker rejected the cached object handle, type, or rights.
@@ -61,7 +61,7 @@ impl From<ErrorCode> for BrokerObjectError {
     }
 }
 
-pub(super) fn map_broker_object_result<T>(
+pub(crate) fn map_broker_object_result<T>(
     result: Result<T, BrokerObjectError>,
 ) -> Result<T, TryOpError<EventCounterError>> {
     match result {

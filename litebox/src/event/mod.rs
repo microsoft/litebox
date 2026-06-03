@@ -3,41 +3,10 @@
 
 //! Events related functionality
 
-use crate::{
-    broker::BrokerState,
-    event::counter::{EventCounter, EventCounterError},
-    platform::TimeProvider,
-    sync::RawSyncPrimitivesProvider,
-};
-
 pub mod counter;
 pub mod observer;
 pub mod polling;
 pub mod wait;
-
-/// Factories for local-core event objects.
-pub struct EventObjects<'a, Platform: RawSyncPrimitivesProvider> {
-    broker: &'a BrokerState<Platform>,
-}
-
-impl<'a, Platform: RawSyncPrimitivesProvider> EventObjects<'a, Platform> {
-    pub(crate) fn new(broker: &'a BrokerState<Platform>) -> Self {
-        Self { broker }
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider> EventObjects<'_, Platform> {
-    /// Creates a local-core event counter.
-    pub fn create_counter(
-        &self,
-        initial_count: u64,
-    ) -> Result<EventCounter<Platform>, EventCounterError>
-    where
-        Platform: TimeProvider,
-    {
-        self.broker.create_event_counter(initial_count)
-    }
-}
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
