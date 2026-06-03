@@ -71,7 +71,8 @@ pub(crate) struct BrokerPipeFd<P: RawSyncPrimitivesProvider + litebox::platform:
     // we have a "reader closed without reading" data-loss bug.
     read_count: AtomicU32,
     // PE.14 diag: creation-site tag for orphan-slot identification.
-    // 0=sys_pipe2, 1=install_broker_bridge_fd, 2=fork_snapshot_restore.
+    // 0=sys_pipe2, 1=install_broker_bridge_fd,
+    // 2=fork_snapshot_restore, 3=SCM_RIGHTS.
     creation_site: u8,
 }
 
@@ -107,10 +108,10 @@ where
     /// If you add a fourth construction site, AUDIT the caller for
     /// a matching dup_handle.
     /// Per PE.14 instrumentation: `creation_site` is a small tag
-    /// (0=sys_pipe2, 1=install_broker_bridge_fd, 2=fork_snapshot_restore)
-    /// recorded on this slot. When `on_close` fires with read_count==0
-    /// (orphan read-end), the tag is logged so we can identify which
-    /// construction path produced the orphan slot.
+    /// (0=sys_pipe2, 1=install_broker_bridge_fd, 2=fork_snapshot_restore,
+    /// 3=SCM_RIGHTS) recorded on this slot. When `on_close` fires with
+    /// read_count==0 (orphan read-end), the tag is logged so we can
+    /// identify which construction path produced the orphan slot.
     pub(crate) fn new(
         provider: Arc<dyn BrokerPipeProvider>,
         handle: u64,
