@@ -346,6 +346,11 @@ impl SubscriptionList {
         Ok(())
     }
 
+    /// HypB diag accessor: number of registered subscriptions on this list.
+    pub fn entry_count_for_diag(&self) -> usize {
+        self.entries.lock().map(|e| e.len()).unwrap_or(0)
+    }
+
     /// Records an edge-channel state-change. Bits in `events` that
     /// intersect a subscription's `events_mask` are OR'd into the
     /// subscription's `pending_mask` and we then attempt to flush
@@ -464,10 +469,47 @@ impl SubscriptionList {
                 sub.last_send_writer_pos = post_writer_pos;
                 sub.edge_frame_in_flight = true;
                 sub.pending_mask = 0;
+                {
+                    use std::io::Write;
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rst-diag.log")
+                    {
+                        let _ = writeln!(
+                            f,
+                            "[HypB-diag] ts={ts} EDGE SEND OK sub_id={} mask={:#x} wpos={post_writer_pos}",
+                            sub.id,
+                            frame.events()
+                        );
+                    }
+                }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 // I4: ring full. Leave pending_mask intact; next
                 // try_flush will retry.
+                {
+                    use std::io::Write;
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rst-diag.log")
+                    {
+                        let _ = writeln!(
+                            f,
+                            "[HypB-diag] ts={ts} EDGE SEND WouldBlock sub_id={} pending={:#x}",
+                            sub.id, sub.pending_mask
+                        );
+                    }
+                }
             }
             Err(err) if is_peer_gone(&err) => {
                 tracing::warn!(
@@ -475,6 +517,24 @@ impl SubscriptionList {
                     error = %err,
                     "edge notification send failed (peer gone); removing subscription",
                 );
+                {
+                    use std::io::Write;
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/rst-diag.log")
+                    {
+                        let _ = writeln!(
+                            f,
+                            "[HypB-diag] ts={ts} EDGE SEND PEER-GONE sub_id={} err={err}",
+                            sub.id
+                        );
+                    }
+                }
                 to_remove.push(sub.id);
             }
             Err(err) => {

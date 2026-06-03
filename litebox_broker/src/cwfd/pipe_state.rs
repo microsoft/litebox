@@ -154,6 +154,26 @@ impl PipeInner {
         buf.buf.extend(bytes[..n].iter().copied());
         let has_data = !buf.buf.is_empty();
         drop(buf);
+        // HypB diag: log write + whether notify will fire.
+        {
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[HypB-diag] ts={ts} PIPE WRITE inner_addr={:p} n={n} has_data={has_data} subs={}",
+                    self as *const Self,
+                    self.read_subject.entry_count_for_diag()
+                );
+            }
+        }
         if has_data {
             self.read_subject.notify(NOTIFY_EVENT_IN);
         }
@@ -356,6 +376,26 @@ impl StateObject for PipeReadEnd {
         sender: Arc<Mutex<NotificationSender>>,
     ) -> Result<(), SubscribeError> {
         let now = self.inner.current_read_end_events();
+        // HypB diag: log subscribe to pipe read end.
+        {
+            use std::io::Write;
+            let handle_id = self.handle_id.load(Ordering::Relaxed);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[HypB-diag] ts={ts} PIPE READ-END SUBSCRIBE handle={handle_id} inner_addr={:p} sub_id={subscription_id} mask={events_mask:#x} now={now:#x}",
+                    Arc::as_ptr(&self.inner)
+                );
+            }
+        }
         self.inner
             .read_subject
             .add(subscription_id, events_mask, sender)?;

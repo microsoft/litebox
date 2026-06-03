@@ -1824,22 +1824,36 @@ impl<FS: ShimFS> Task<FS> {
                 }?
             }
             AddressFamily::NETLINK => {
-                // Create a pipe pair to reserve an fd number. The writer is
+                // Reserve an fd number with a BrokerPipe whose write end is
                 // closed immediately — all I/O is intercepted via
-                // netlink_sockets before reaching the underlying pipe.
-                let (writer, reader) = self.global.pipes.create_pipe(
-                    4096,
-                    litebox::pipes::Flags::empty(),
-                    core::num::NonZero::new(4096),
+                // `netlink_sockets` before reaching the underlying pipe.
+                // Using BrokerPipe rather than the legacy local
+                // `litebox::pipes::Pipes` removes one of the few remaining
+                // legacy-pipe producers; see session-state
+                // `files/legacy-pipes-migration.md` (Phase 1).
+                let provider = super::broker_pipe::broker_pipe_provider().ok_or(Errno::ENODEV)?;
+                let (read_handle, write_handle) = provider
+                    .create_pipe(4096, 4096)
+                    .map_err(|_| Errno::ENODEV)?;
+                provider.release(write_handle);
+                let reader_entry = super::broker_pipe::BrokerPipeFd::<crate::Platform>::new(
+                    alloc::sync::Arc::clone(&provider),
+                    read_handle,
+                    litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
+                    OFlags::empty(),
+                    0, // creation_site: sys_pipe2-equivalent (netlink sentinel)
                 );
-                self.global.pipes.close(&writer).unwrap();
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                let reader = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(reader_entry);
                 if flags.contains(SockFlags::CLOEXEC) {
-                    let mut dt = self.global.litebox.descriptor_table_mut();
                     let old = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC);
                     assert!(old.is_none());
                 }
+                drop(dt);
                 let raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
-                    self.global.pipes.close(&reader).unwrap();
+                    // Best-effort close — Broker tracks refcount; on Drop
+                    // BrokerPipeFd::on_close fires `release(handle)`.
+                    let _ = self.global.litebox.descriptor_table_mut().remove(&reader);
                     Errno::EMFILE
                 })?;
                 let fd_u32 = u32::try_from(raw_fd).unwrap();

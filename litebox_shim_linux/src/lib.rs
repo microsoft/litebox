@@ -449,6 +449,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         >,
         pty_role: Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
         pty_id: Option<u32>,
+        pipe_flags: litebox::fs::OFlags,
     ) -> Result<(), ()> {
         use syscalls::fork_snapshot::BrokerHandleKind;
         let files = self.task.files.borrow();
@@ -488,7 +489,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     provider,
                     handle_id,
                     direction,
-                    litebox::fs::OFlags::empty(),
+                    pipe_flags,
                     1, // creation_site: install_broker_bridge_fd
                 );
                 let typed: litebox::fd::TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem> = self
@@ -829,7 +830,16 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         kind: syscalls::fork_snapshot::BrokerHandleKind,
         handle_id: u64,
     ) -> Result<(), ()> {
-        self.install_broker_bridge_fd(guest_fd, kind, handle_id, None, None, None, None)
+        self.install_broker_bridge_fd(
+            guest_fd,
+            kind,
+            handle_id,
+            None,
+            None,
+            None,
+            None,
+            litebox::fs::OFlags::empty(),
+        )
     }
 
     fn install_broker_pty_at_slot(
