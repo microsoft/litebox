@@ -297,6 +297,18 @@ type BrokerFdBridgeParsed = (
 /// `fd:kind:handle_id[:subkind]` and returns the components.
 ///
 /// `subkind` is required for pipe direction, unix socketpair endpoint, and PTY role.
+/// Map `litebox::pipes::Flags` bits (as serialised by the parent in
+/// the fork snapshot) to a `litebox::fs::OFlags` value carrying just
+/// the per-fd status flags relevant for broker pipes (NONBLOCK).
+fn pipe_nonblock_oflags(flags_bits: u32) -> litebox::fs::OFlags {
+    let f = litebox::pipes::Flags::from_bits_truncate(flags_bits);
+    let mut o = litebox::fs::OFlags::empty();
+    if f.contains(litebox::pipes::Flags::NON_BLOCKING) {
+        o |= litebox::fs::OFlags::NONBLOCK;
+    }
+    o
+}
+
 #[deny(clippy::wildcard_enum_match_arm)]
 fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
     use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
@@ -577,6 +589,7 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             socketpair_endpoint,
             pty_role,
             pty_id,
+            litebox::fs::OFlags::empty(),
         )
         .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))
 }
@@ -1991,36 +2004,43 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
 
             // Install connected pipe pairs for child-only pipes (both
             // ends in the child, not in the parent).  These bypass the
-            // mux entirely — write(write_fd) → read(read_fd) locally.
+            // mux entirely — write(write_fd) → read(read_fd) locally,
+            // but via the broker so all pipe state is broker-held.
             //
             // Entries arrive in order: primary pair first, then alias
             // entries where one fd matches the primary.  For aliases,
-            // dup the already-installed pipe end to the new fd.
+            // we install a new BrokerPipeFd referring to the same
+            // broker handle — install_broker_bridge_fd internally
+            // dup_handles, so each install adds an independent
+            // refcount.
             if !local_pipes.is_empty() {
-                let litebox_ref = shim.litebox();
-                let pipes_sub = litebox::pipes::Pipes::new(litebox_ref);
-                // Keep dup'd TypedFds so we can dup again for aliases.
-                let mut sender_dups: std::collections::HashMap<
-                    usize,
-                    litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
-                > = std::collections::HashMap::new();
-                let mut receiver_dups: std::collections::HashMap<
-                    usize,
-                    litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
-                > = std::collections::HashMap::new();
-                // Map: write_fd → read_fd for primary pairs.
+                let provider = litebox_shim_linux::syscalls::broker_pipe_provider()
+                    .expect("broker pipe provider for child-only local pipes");
+                // Map write_fd → broker write handle (for aliases).
+                let mut write_handle_for_fd: std::collections::HashMap<usize, u64> =
+                    std::collections::HashMap::new();
+                // Map read_fd → broker read handle (for aliases).
+                let mut read_handle_for_fd: std::collections::HashMap<usize, u64> =
+                    std::collections::HashMap::new();
+                // Track primary read_fd ↔ write_fd pairing so alias
+                // entries can locate the partner handle.
                 let mut read_for_write: std::collections::HashMap<usize, usize> =
                     std::collections::HashMap::new();
+                // Handles we created and own a +1 refcount on; release
+                // them at end of block. (install_broker_bridge_fd
+                // internally dup_handles, so each install adds its own
+                // refcount independent of our baseline.)
+                let mut owned_handles: Vec<u64> = Vec::new();
 
                 for &(write_fd, read_fd, ref drained, w_flags_bits, r_flags_bits) in local_pipes {
-                    // Sentinel: write_fd == usize::MAX means this is an orphan
-                    // pipe where the write end was closed before migration.
-                    // Create a pipe, fill with drained data, close the sender,
-                    // and install only the receiver at read_fd.  The guest
-                    // reads the data and then gets EOF.
+                    // Sentinel: write_fd == usize::MAX means this is an
+                    // orphan pipe where the write end was closed before
+                    // migration.  Handled by the orphan path above
+                    // before this block runs — but local_pipes contains
+                    // both orphan and primary/alias entries.
                     if write_fd == usize::MAX {
-                        let provider = litebox_shim_linux::syscalls::broker_pipe_provider()
-                            .expect("broker pipe provider for orphan local pipe");
+                        // Orphan path: create pipe, fill drained,
+                        // release write, install read end.
                         let (read_handle, write_handle) = provider
                             .create_pipe(1024 * 1024, 4096)
                             .expect("create broker pipe for orphan");
@@ -2034,6 +2054,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             }
                         }
                         provider.release(write_handle);
+                        let r_flags = pipe_nonblock_oflags(r_flags_bits);
                         program
                             .entrypoints
                             .install_broker_bridge_fd(
@@ -2046,97 +2067,121 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                                 None,
                                 None,
                                 None,
+                                r_flags,
                             )
                             .expect("install broker orphan read end");
                         provider.release(read_handle);
                         continue;
                     }
 
-                    let w_installed = sender_dups.contains_key(&write_fd);
-                    let r_installed = receiver_dups.contains_key(&read_fd);
+                    let w_installed = write_handle_for_fd.contains_key(&write_fd);
+                    let r_installed = read_handle_for_fd.contains_key(&read_fd);
 
                     if !w_installed && !r_installed {
-                        // Primary pair: create new connected pipe.
-                        // Apply the read-end flags at creation (they
-                        // affect the shared pipe state like O_NONBLOCK).
-                        let r_flags = litebox::pipes::Flags::from_bits_truncate(r_flags_bits);
-                        // TODO(legacy-pipes-migration): Phase 2 — migrate this
-                        // child-only local pipe primary/alias path to
-                        // BrokerPipe. See files/legacy-pipes-migration.md.
-                        #[allow(deprecated)]
-                        let (sender, receiver) = pipes_sub.create_pipe(
-                            1024 * 1024,
-                            r_flags,
-                            core::num::NonZero::new(4096),
-                        );
-                        // Apply write-end flags separately if different.
-                        // clear creation-time flags first, then set desired.
-                        let w_flags = litebox::pipes::Flags::from_bits_truncate(w_flags_bits);
-                        if w_flags != r_flags {
-                            let _ = pipes_sub.update_flags(&sender, r_flags, false);
-                            if !w_flags.is_empty() {
-                                let _ = pipes_sub.update_flags(&sender, w_flags, true);
-                            }
-                        }
-                        // Pre-fill drained data into the pipe so the
-                        // child sees any bytes that were buffered before
-                        // migration.
+                        // Primary pair: create new connected broker
+                        // pipe and install both ends.
+                        let (read_handle, write_handle) = provider
+                            .create_pipe(1024 * 1024, 4096)
+                            .expect("create broker pipe for child-only primary pair");
+                        // Pre-fill drained bytes so the child sees any
+                        // data buffered before migration.
                         if !drained.is_empty() {
-                            let wait_state = litebox::event::wait::WaitState::new(
-                                litebox_platform_multiplex::platform(),
-                            );
-                            let cx = wait_state.context();
                             let mut offset = 0;
                             while offset < drained.len() {
-                                match pipes_sub.write(&cx, &sender, &drained[offset..]) {
+                                match provider.write_pipe(write_handle, &drained[offset..]) {
+                                    Ok(0) | Err(_) => break,
                                     Ok(n) => offset += n,
-                                    Err(_) => break,
                                 }
                             }
                         }
-                        // Dup before install (install consumes TypedFd).
-                        let s_dup = litebox_ref.descriptor_table_mut().duplicate(&sender);
-                        let r_dup = litebox_ref.descriptor_table_mut().duplicate(&receiver);
-                        program.entrypoints.install_mux_pipe_fd(write_fd, sender);
-                        program.entrypoints.install_mux_pipe_fd(read_fd, receiver);
-                        if let Some(s) = s_dup {
-                            sender_dups.insert(write_fd, s);
-                        }
-                        if let Some(r) = r_dup {
-                            receiver_dups.insert(read_fd, r);
-                        }
+                        let w_flags = pipe_nonblock_oflags(w_flags_bits);
+                        let r_flags = pipe_nonblock_oflags(r_flags_bits);
+                        program
+                            .entrypoints
+                            .install_broker_bridge_fd(
+                                read_fd,
+                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Pipe,
+                                read_handle,
+                                Some(
+                                    litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
+                                ),
+                                None,
+                                None,
+                                None,
+                                r_flags,
+                            )
+                            .expect("install broker child-only read end");
+                        program
+                            .entrypoints
+                            .install_broker_bridge_fd(
+                                write_fd,
+                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Pipe,
+                                write_handle,
+                                Some(
+                                    litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
+                                ),
+                                None,
+                                None,
+                                None,
+                                w_flags,
+                            )
+                            .expect("install broker child-only write end");
+                        owned_handles.push(read_handle);
+                        owned_handles.push(write_handle);
+                        read_handle_for_fd.insert(read_fd, read_handle);
+                        write_handle_for_fd.insert(write_fd, write_handle);
                         read_for_write.insert(write_fd, read_fd);
                     } else if w_installed && !r_installed {
-                        // write_fd already installed. read_fd is a new
-                        // alias — dup the receiver from primary pair.
+                        // read_fd is a new alias for an existing
+                        // primary's read end.
                         if let Some(&primary_r) = read_for_write.get(&write_fd)
-                            && let Some(src) = receiver_dups.get(&primary_r)
-                            && let Some(duped) = litebox_ref.descriptor_table_mut().duplicate(src)
+                            && let Some(&handle) = read_handle_for_fd.get(&primary_r)
                         {
-                            program.entrypoints.install_mux_pipe_fd(read_fd, duped);
+                            let r_flags = pipe_nonblock_oflags(r_flags_bits);
+                            let _ = program.entrypoints.install_broker_bridge_fd(
+                                read_fd,
+                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Pipe,
+                                handle,
+                                Some(
+                                    litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read,
+                                ),
+                                None,
+                                None,
+                                None,
+                                r_flags,
+                            );
                         }
                     } else if r_installed && !w_installed {
-                        // read_fd already installed. write_fd is a new
-                        // alias — dup the sender from primary pair.
-                        // Find which primary write_fd maps to this read_fd.
+                        // write_fd is a new alias for an existing
+                        // primary's write end.
                         let primary_w = read_for_write
                             .iter()
                             .find(|(_, v)| **v == read_fd)
                             .map(|(k, _)| *k);
                         if let Some(pw) = primary_w
-                            && let Some(src) = sender_dups.get(&pw)
-                            && let Some(duped) = litebox_ref.descriptor_table_mut().duplicate(src)
+                            && let Some(&handle) = write_handle_for_fd.get(&pw)
                         {
-                            program.entrypoints.install_mux_pipe_fd(write_fd, duped);
+                            let w_flags = pipe_nonblock_oflags(w_flags_bits);
+                            let _ = program.entrypoints.install_broker_bridge_fd(
+                                write_fd,
+                                litebox_shim_linux::syscalls::fork_snapshot::BrokerHandleKind::Pipe,
+                                handle,
+                                Some(
+                                    litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write,
+                                ),
+                                None,
+                                None,
+                                None,
+                                w_flags,
+                            );
                         }
                     }
                 }
-                // Clean up dup'd references kept for aliasing.
-                for (_, fd) in sender_dups {
-                    let _ = pipes_sub.close(&fd);
-                }
-                for (_, fd) in receiver_dups {
-                    let _ = pipes_sub.close(&fd);
+                // Release the baseline +1 refcount we hold on each
+                // primary handle. install_broker_bridge_fd already
+                // dup_handle'd to record the new fd-table reference.
+                for h in owned_handles {
+                    provider.release(h);
                 }
             }
 
