@@ -2044,6 +2044,7 @@ dependencies = [
  "alacritty_terminal",
  "libc",
  "libtest-mimic",
+ "litebox_common_linux",
  "litebox_timing",
  "rusqlite",
  "serde",

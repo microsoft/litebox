@@ -13,7 +13,9 @@ use crate::fd_tokens::BrokerFdTokenRegistry;
 use crate::inotify_dispatcher::InotifyDispatcher;
 use crate::pgrp_signal_inbox::PgrpSignalInbox;
 use crate::process_state::ProcessState;
-use crate::state_registry::{BrokerStateRegistry, StateHandle, StateRegistryError};
+use crate::state_registry::{
+    BrokerStateRegistry, StateHandle, StateObjectEnum, StateRegistryError,
+};
 use crate::state_service::{
     ConnState, SubscriptionRegistry, handle_deliver_signal_inbox, handle_pty_ioctl,
     handle_pty_write, handle_request as state_handle_request, handle_set_pgid, handle_set_sid,
@@ -21,8 +23,9 @@ use crate::state_service::{
 };
 use litebox_common_linux::fd_token_protocol::{
     BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, StatusCode, build_error_response,
-    decode, parse_create_pidfd_response_ok, parse_create_pty_response_ok, parse_handle_body,
-    parse_inet_listener_accept_response_ok, parse_open_pty_slave_response_ok,
+    build_release_response_ok, decode, parse_create_pidfd_response_ok,
+    parse_create_pty_response_ok, parse_handle_body, parse_inet_listener_accept_response_ok,
+    parse_open_pty_slave_response_ok,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use std::collections::HashMap;
@@ -451,6 +454,27 @@ fn peer_cred_fields(peer_cred: Option<PeerCred>) -> String {
             cred.pid, cred.uid, cred.gid
         ),
         None => "peer_pid=? peer_uid=? peer_gid=?".to_string(),
+    }
+}
+
+fn caller_process_exited_or_gone(
+    process_registry: &BrokerStateRegistry,
+    caller_scope: CallerScope,
+) -> bool {
+    let CallerScope::Owned(pid) = caller_scope else {
+        return false;
+    };
+    let handle = StateHandle::from_id(u64::from(pid.get()));
+    match process_registry.resolve(handle, SubsystemTag::Process) {
+        Ok(state) => {
+            let StateObjectEnum::Process(process) = state.as_ref() else {
+                return false;
+            };
+            process.exit_state().is_some()
+        }
+        Err(StateRegistryError::UnknownHandle(_)) => true,
+        Err(StateRegistryError::TagMismatch { .. })
+        | Err(StateRegistryError::RefcountOverflow(_)) => false,
     }
 }
 
@@ -1142,65 +1166,89 @@ fn handle_control_connection_inner(
                                 .resolve_untyped(StateHandle::from_id(release_id))
                                 .is_ok();
                             if state_exists || process_exists {
-                                // Handle exists but THIS conn isn't an owner. Loud bug.
-                                warn!(
-                                    handle_id = release_id,
-                                    state_exists,
-                                    process_exists,
-                                    caller_pid,
-                                    "fd-token control: PROTOCOL VIOLATION: Release of \
-                                     broker-held resource not owned by this connection; \
-                                     closing. Likely a shim-side bug — a fork-inherited \
-                                     fd-table entry's on_close firing release without a \
-                                     matching DupHandle."
-                                );
-                                // PE.5 diag: also write to the runner-side
-                                // diagnostic file so it's visible in
-                                // LITEBOX_KEEP_CONTAINER inspections.
-                                // Includes tracker state dump for the
-                                // current conn so we can see which
-                                // (pid, id) buckets exist when the
-                                // violation fires.
-                                use std::io::Write;
-                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open("/tmp/rst-diag.log")
+                                // Per-pid ReleaseAllForPid is a teardown sweep, not a
+                                // replacement for every later fd Drop. If a state object
+                                // is still live but this conn's per-pid bucket was already
+                                // drained, treat the late fd close as an idempotent no-op
+                                // rather than killing the shared control socket.
+                                if state_exists
+                                    && (!process_exists
+                                        || caller_process_exited_or_gone(
+                                            process_registry,
+                                            caller_scope,
+                                        ))
                                 {
-                                    let state_entries: Vec<((u32, u64), u32)> = tracker
-                                        .state_refs
-                                        .iter()
-                                        .map(|((scope, id), count)| {
-                                            (((*scope).to_wire(), *id), *count)
-                                        })
-                                        .collect();
-                                    let proc_entries: Vec<((u32, u64), u32)> = tracker
-                                        .process_refs
-                                        .iter()
-                                        .map(|((scope, id), count)| {
-                                            (((*scope).to_wire(), *id), *count)
-                                        })
-                                        .collect();
-                                    let _ = writeln!(
-                                        f,
-                                        "[PE.5-diag] BROKER PROTOCOL VIOLATION conn_id={}: Release \
+                                    debug!(
+                                        handle_id = release_id,
+                                        caller_pid,
+                                        "fd-token control: tolerating late Release after per-pid deregistration"
+                                    );
+                                    SocketHandlerResult {
+                                        frame: build_release_response_ok(),
+                                        out_fd: None,
+                                    }
+                                } else {
+                                    // Handle exists but THIS conn isn't an owner. Loud bug.
+                                    warn!(
+                                        handle_id = release_id,
+                                        state_exists,
+                                        process_exists,
+                                        caller_pid,
+                                        "fd-token control: PROTOCOL VIOLATION: Release of \
+                                         broker-held resource not owned by this connection; \
+                                         closing. Likely a shim-side bug — a fork-inherited \
+                                         fd-table entry's on_close firing release without a \
+                                         matching DupHandle."
+                                    );
+                                    // PE.5 diag: also write to the runner-side
+                                    // diagnostic file so it's visible in
+                                    // LITEBOX_KEEP_CONTAINER inspections.
+                                    // Includes tracker state dump for the
+                                    // current conn so we can see which
+                                    // (pid, id) buckets exist when the
+                                    // violation fires.
+                                    use std::io::Write;
+                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("/tmp/rst-diag.log")
+                                    {
+                                        let state_entries: Vec<((u32, u64), u32)> = tracker
+                                            .state_refs
+                                            .iter()
+                                            .map(|((scope, id), count)| {
+                                                (((*scope).to_wire(), *id), *count)
+                                            })
+                                            .collect();
+                                        let proc_entries: Vec<((u32, u64), u32)> = tracker
+                                            .process_refs
+                                            .iter()
+                                            .map(|((scope, id), count)| {
+                                                (((*scope).to_wire(), *id), *count)
+                                            })
+                                            .collect();
+                                        let _ = writeln!(
+                                            f,
+                                            "[PE.5-diag] BROKER PROTOCOL VIOLATION conn_id={}: Release \
                                          handle_id={release_id} caller_pid={caller_pid} \
                                          state_exists={state_exists} process_exists={process_exists}\n  \
                                          conn state_refs: {state_entries:?}\n  \
                                          conn process_refs: {proc_entries:?}",
-                                        tracker.conn_id
-                                    );
+                                            tracker.conn_id
+                                        );
+                                    }
+                                    return;
                                 }
-                                return;
-                            }
-                            // Handle is truly unknown to the broker — preserve existing
-                            // semantics by returning UnknownHandle to the client.
-                            SocketHandlerResult {
-                                frame: build_error_response(
-                                    Opcode::ReleaseResponse,
-                                    litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle,
-                                ),
-                                out_fd: None,
+                            } else {
+                                // Handle is truly unknown to the broker — preserve existing
+                                // semantics by returning UnknownHandle to the client.
+                                SocketHandlerResult {
+                                    frame: build_error_response(
+                                        Opcode::ReleaseResponse,
+                                        litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle,
+                                    ),
+                                    out_fd: None,
+                                }
                             }
                         }
                     }
@@ -1964,6 +2012,41 @@ mod tests {
             client.release(handle).expect("release ambient under pid");
         }
 
+        assert_eq!(state_registry.live_handle_count(), 0);
+    }
+
+    #[test]
+    fn release_after_process_exit_is_tolerated_when_state_still_exists() {
+        use litebox_common_linux::fd_token_client::set_caller_pid_scope;
+
+        let (_dir, path, _fdr, state_registry, _proc) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        let (read_handle, _write_handle) = {
+            let _guard = set_caller_pid_scope(7);
+            client.create_pipe(65_536, 4_096).expect("create pipe")
+        };
+        {
+            let _guard = set_caller_pid_scope(8);
+            client.dup_handle(read_handle).expect("pid 8 dup read end");
+        }
+        assert_eq!(state_registry.live_handle_count(), 2);
+
+        {
+            let _guard = set_caller_pid_scope(7);
+            client.mark_process_exited(7, 0).expect("mark pid 7 exited");
+            assert_eq!(client.release_all_for_pid(7).expect("release all pid 7"), 3);
+            assert_eq!(state_registry.live_handle_count(), 1);
+            client
+                .release(read_handle)
+                .expect("late fd close after process release-all");
+        }
+
+        assert_eq!(state_registry.live_handle_count(), 1);
+        {
+            let _guard = set_caller_pid_scope(8);
+            client.release(read_handle).expect("pid 8 release read end");
+        }
         assert_eq!(state_registry.live_handle_count(), 0);
     }
 
