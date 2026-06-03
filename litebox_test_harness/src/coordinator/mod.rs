@@ -16,7 +16,9 @@ pub(crate) mod epoll_pidfd;
 pub(crate) mod eventfd;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
+pub(crate) mod fork_pipe_inheritance;
 pub(crate) mod getrandom_tests;
+pub(crate) mod hypb;
 pub(crate) mod inherit_matrix;
 pub(crate) mod inotify;
 pub(crate) mod invariants;
@@ -1009,6 +1011,10 @@ pub fn collect_all_tests() -> Vec<Test> {
     tcp_state::register_tcp_listen_busy_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_bash_fork_exec_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_fork_from_worker_exec_tests(&mut registry::Registry::new(&mut tests));
+    fork_pipe_inheritance::register_fork_pipe_inheritance_tests(&mut registry::Registry::new(
+        &mut tests,
+    ));
+    hypb::register_hypb_tests(&mut registry::Registry::new(&mut tests));
     common::register_minimal_canary_tests(&mut registry::Registry::new(&mut tests));
     shell::register_stdin_pipe_subst_tests(&mut registry::Registry::new(&mut tests));
     special_cases::register_cross_worker_file_tests(&mut registry::Registry::new(&mut tests));

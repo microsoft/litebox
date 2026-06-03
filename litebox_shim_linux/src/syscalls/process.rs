@@ -4334,12 +4334,15 @@ impl<FS: ShimFS> Task<FS> {
             "[DELAYED-FORK] pid={}: snapshot_fs",
             self.pid
         );
+        // This is still the pre-exec fork child. Preserve FD_CLOEXEC fds in
+        // the restored worker so they remain usable until a later exec closes
+        // them.
         let fd_table = self.snapshot_fd_table(
             &mut reject,
             &mut fc.fork_snapshot_broker_transit,
             &mut fc.fork_snapshot_pidfd_process_transit,
             &mut fc.fork_snapshot_fd_token_transit,
-            true,
+            false,
             Self::delayed_fork_trigger_fd(ctx),
         );
         let memory = self.snapshot_memory(&mut reject);
