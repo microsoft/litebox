@@ -1305,6 +1305,10 @@ pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
     pipe_lifecycle::register_pipe_eof(reg);
 }
 
+pub(crate) fn register_pipe_nonblock_fork(reg: &mut Registry<'_>) {
+    pipe_lifecycle::register_pipe_nonblock_fork(reg);
+}
+
 // Register contamination sequence tests (X49-X59).
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
