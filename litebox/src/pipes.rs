@@ -73,6 +73,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// written atomically (i.e., not interleaved with other writes) if a slice of those many (or fewer)
     /// elements are passed at once. Slices longer than this length have no guarantees on atomicity of
     /// writes and might be interleaved with other writes.
+    #[deprecated(
+        note = "Legacy in-process pipes are being removed; migrate to BrokerPipe \
+                (see files/legacy-pipes-migration.md). Compiler warnings here enumerate \
+                the remaining producers (Phases 2+3)."
+    )]
     pub fn create_pipe(
         &self,
         capacity: usize,
@@ -975,6 +980,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> From<PipeEnd<Platform>>
 pub type PipeFd<Platform> = crate::fd::TypedFd<Pipes<Platform>>;
 
 #[cfg(test)]
+#[allow(deprecated)] // tests exercise the legacy API being phased out
 mod tests {
     use crate::{
         event::wait::WaitState,

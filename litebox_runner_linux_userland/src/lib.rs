@@ -2060,6 +2060,10 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                         // Apply the read-end flags at creation (they
                         // affect the shared pipe state like O_NONBLOCK).
                         let r_flags = litebox::pipes::Flags::from_bits_truncate(r_flags_bits);
+                        // TODO(legacy-pipes-migration): Phase 2 — migrate this
+                        // child-only local pipe primary/alias path to
+                        // BrokerPipe. See files/legacy-pipes-migration.md.
+                        #[allow(deprecated)]
                         let (sender, receiver) = pipes_sub.create_pipe(
                             1024 * 1024,
                             r_flags,
@@ -2179,6 +2183,10 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                         continue;
                     }
 
+                    // TODO(legacy-pipes-migration): Phase 3 — migrate this
+                    // mux-stream endpoint pair to BrokerPipe. Paired with
+                    // process.rs:3464 (parent mux dispatcher).
+                    #[allow(deprecated)]
                     let (sender, receiver) = pipes.create_pipe(
                         1024 * 1024,
                         litebox::pipes::Flags::NON_BLOCKING,

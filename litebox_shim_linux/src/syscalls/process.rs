@@ -3461,6 +3461,11 @@ impl<FS: ShimFS> Task<FS> {
                         // non-blocking for the mux background thread (which
                         // can't use pollee.wait due to GS-based TLS).
                         // The guest end is cleared to blocking below.
+                        // TODO(legacy-pipes-migration): Phase 3 — migrate this
+                        // mux-dispatcher pipe pair to BrokerPipe so that
+                        // `litebox::pipes::Pipes` can be deleted entirely.
+                        // See files/legacy-pipes-migration.md.
+                        #[allow(deprecated)]
                         let (sender, receiver) = self.global.pipes.create_pipe(
                             1024 * 1024,
                             litebox::pipes::Flags::NON_BLOCKING,
