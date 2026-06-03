@@ -96,4 +96,8 @@ impl StateObject for InetRawState {
     fn current_events(&self) -> u32 {
         InetRawState::current_events(self)
     }
+
+    fn try_flush_subscriptions(&self) {
+        self.subject.try_flush();
+    }
 }

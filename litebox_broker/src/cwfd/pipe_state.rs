@@ -372,6 +372,10 @@ impl StateObject for PipeReadEnd {
     fn current_events(&self) -> u32 {
         self.inner.current_read_end_events()
     }
+
+    fn try_flush_subscriptions(&self) {
+        self.inner.read_subject.try_flush();
+    }
 }
 
 impl StateObject for PipeWriteEnd {
@@ -405,5 +409,9 @@ impl StateObject for PipeWriteEnd {
 
     fn current_events(&self) -> u32 {
         self.inner.current_write_end_events()
+    }
+
+    fn try_flush_subscriptions(&self) {
+        self.inner.write_subject.try_flush();
     }
 }

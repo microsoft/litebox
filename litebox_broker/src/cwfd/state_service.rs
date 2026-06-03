@@ -201,6 +201,23 @@ pub fn handle_request(
     request: &Frame<'_>,
     in_fds: Vec<OwnedFd>,
 ) -> HandlerResult {
+    let result = dispatch_request(registry, inotify_dispatcher, conn, request, in_fds);
+    // A4 liveness chokepoint: every RPC implies the worker drained
+    // its prior notification frame, so re-attempt any deferred edge
+    // bits across the whole registry. See
+    // `BrokerStateRegistry::try_flush_all_subscriptions` and the
+    // `SubscriptionList` module-level invariants (I3, A4, A6).
+    registry.try_flush_all_subscriptions();
+    result
+}
+
+fn dispatch_request(
+    registry: &BrokerStateRegistry,
+    inotify_dispatcher: &Arc<InotifyDispatcher>,
+    conn: &mut ConnState,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
     // reason: unsupported variants intentionally share this fallback path.
     #[allow(clippy::wildcard_enum_match_arm)]
     match request.opcode {
@@ -2966,8 +2983,7 @@ fn handle_release_state(
             {
                 let master_handle_id = pty.master_handle_id();
                 if master_handle_id != 0 {
-                    let rc_master =
-                        registry.refcount(StateHandle::from_id(master_handle_id));
+                    let rc_master = registry.refcount(StateHandle::from_id(master_handle_id));
                     let user_slave_count = new_rc.saturating_sub(rc_master);
                     if user_slave_count == 0 {
                         // Last user-space slave fd-holder released;

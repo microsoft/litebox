@@ -13,8 +13,8 @@
 use core::any::Any;
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
 };
 
 use litebox_common_linux::fd_token_protocol::{PtyEndpoint, PtyIoctlOp};
@@ -523,6 +523,11 @@ impl StateObject for PtyState {
 
     fn current_events(&self) -> u32 {
         PtyState::current_events(self)
+    }
+
+    fn try_flush_subscriptions(&self) {
+        self.pair.master_subject.try_flush();
+        self.pair.slave_subject.try_flush();
     }
 }
 

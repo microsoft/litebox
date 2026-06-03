@@ -517,6 +517,14 @@ impl StateObject for SocketPairEnd {
     fn current_events(&self) -> u32 {
         self.inner.current_events(self.endpoint)
     }
+
+    fn try_flush_subscriptions(&self) {
+        let subject = match self.endpoint {
+            SocketPairEndpoint::A => &self.inner.subject_a,
+            SocketPairEndpoint::B => &self.inner.subject_b,
+        };
+        subject.try_flush();
+    }
 }
 
 #[cfg(test)]

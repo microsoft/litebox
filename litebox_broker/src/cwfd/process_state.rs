@@ -169,6 +169,10 @@ impl StateObject for ProcessState {
             0
         }
     }
+
+    fn try_flush_subscriptions(&self) {
+        self.subscription_list.try_flush();
+    }
 }
 
 #[cfg(test)]

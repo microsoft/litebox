@@ -115,8 +115,7 @@ fn try_flush_edge(entries: &mut Inner, sender: &Mutex<RingModel>) -> bool {
     let ring = sender.lock().unwrap();
     // A6: defer if a prior frame is still un-consumed.
     let reader_pos = ring.reader_pos.load(Ordering::Acquire);
-    if entries.edge_frame_in_flight && !frame_consumed(entries.last_send_writer_pos, reader_pos)
-    {
+    if entries.edge_frame_in_flight && !frame_consumed(entries.last_send_writer_pos, reader_pos) {
         return false;
     }
     // "Send" a frame: advance writer_pos by 1 unit. The Release here

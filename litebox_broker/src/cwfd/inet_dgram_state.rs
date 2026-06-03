@@ -456,6 +456,10 @@ impl StateObject for InetDgramState {
     fn current_events(&self) -> u32 {
         InetDgramState::current_events(self)
     }
+
+    fn try_flush_subscriptions(&self) {
+        self.subject.try_flush();
+    }
 }
 
 fn is_broker_dns_service(peer: SocketAddr) -> bool {

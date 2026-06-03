@@ -157,6 +157,27 @@ pub trait StateObject: Any + Send + Sync + core::fmt::Debug {
     /// truth for broker-held resources.
     fn current_events(&self) -> u32;
 
+    /// Opportunistically re-attempts delivery of any edge/payload
+    /// notifications previously deferred (per
+    /// [`crate::cwfd::subscription_list::SubscriptionList`]'s A6
+    /// in-flight bound or I4 ring-full retry path). Called by
+    /// [`crate::cwfd::state_service::handle_request`] after every
+    /// RPC dispatch; the worker's act of issuing a syscall RPC
+    /// implies it has drained the prior frame, so the broker may
+    /// now observe `reader_pos` advanced past the in-flight cursor
+    /// and successfully emit pending bits.
+    ///
+    /// **Why this method has no default:** producer-exit
+    /// "orphaned deferred bit" is a real failure mode. If a state
+    /// type implements `SubscriptionList`-backed notification but
+    /// does not flush on RPC boundaries, level-triggered consumer
+    /// patterns time out (see
+    /// `litebox_test_harness` `SCM.pass_pipe_double_wake` for the
+    /// minimal repro). Requiring every impl to choose ensures no
+    /// subsystem accidentally inherits the orphaned-bit bug by
+    /// forgetting to flush.
+    fn try_flush_subscriptions(&self);
+
     #[cfg(debug_assertions)]
     fn debug_repr(&self) -> String {
         core::any::type_name::<Self>().to_string()
@@ -317,6 +338,24 @@ impl StateObjectEnum {
         }
     }
 
+    pub fn try_flush_subscriptions(&self) {
+        match self {
+            StateObjectEnum::Eventfd(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::PipeReadEnd(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::PipeWriteEnd(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::SocketPairEnd(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::TcpConn(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::InetListener(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::InetDgram(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::InetRaw(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::Signalfd(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::Inotify(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::Pty(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::Pidfd(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::Process(state) => state.try_flush_subscriptions(),
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub fn debug_repr(&self) -> String {
         match self {
@@ -361,6 +400,10 @@ impl StateObject for StateObjectEnum {
 
     fn current_events(&self) -> u32 {
         StateObjectEnum::current_events(self)
+    }
+
+    fn try_flush_subscriptions(&self) {
+        StateObjectEnum::try_flush_subscriptions(self)
     }
 
     #[cfg(debug_assertions)]
@@ -563,6 +606,46 @@ impl BrokerStateRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Calls [`StateObjectEnum::try_flush_subscriptions`] on every
+    /// currently-registered state object. Invoked by
+    /// [`crate::cwfd::state_service::handle_request`] after every
+    /// RPC dispatch as the **A4 liveness chokepoint** for the
+    /// notification protocol: the worker's act of issuing a syscall
+    /// RPC implies it has drained its prior notification frame, so
+    /// the broker should retry any bits that were deferred (per
+    /// `SubscriptionList` invariant A6) while the previous frame
+    /// was in flight. Without this hook, a producer that quiesces
+    /// after issuing back-to-back notifies (e.g., `find | head -5
+    /// > pty_slave` then both exit) leaves the second notify
+    /// "orphaned" in `pending_mask` — receivers block on
+    /// `epoll_wait` forever despite data sitting in the broker.
+    ///
+    /// Cost: `O(N)` per RPC where `N` is the count of registered
+    /// state objects. Each `try_flush_subscriptions` early-exits
+    /// when there are no pending bits, so the steady-state cost is
+    /// `N` mutex acquire/release pairs with no I/O. Targeted-flush
+    /// optimisation (only the touched state) is left as future
+    /// work; correctness first.
+    ///
+    /// Snapshots `Arc<StateObjectEnum>` references under the
+    /// registry lock and drops the lock before calling each
+    /// `try_flush_subscriptions`. This avoids holding the registry
+    /// lock across notification-ring sends (which take the
+    /// per-subscription `Mutex<NotificationSender>`), preserving
+    /// the existing lock-order discipline used by `notify`.
+    pub fn try_flush_all_subscriptions(&self) {
+        let states: Vec<Arc<StateObjectEnum>> = {
+            let s = self.state.lock().expect("BrokerStateRegistry poisoned");
+            s.table
+                .values()
+                .map(|entry| Arc::clone(&entry.state))
+                .collect()
+        };
+        for state in &states {
+            state.try_flush_subscriptions();
+        }
     }
 
     #[cfg(debug_assertions)]

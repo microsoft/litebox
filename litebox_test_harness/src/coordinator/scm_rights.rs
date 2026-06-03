@@ -112,6 +112,21 @@ enum ScmKind {
     PassTcpSocket,
     PassThenCloseSender,
     PassTwoFdsOneMsg,
+    /// Targeted probe for the broker `SubscriptionList`'s
+    /// "deferred-edge-bit orphaned after producer quiesce" failure
+    /// mode (HypB). Sender creates a pipe, passes the read end via
+    /// SCM_RIGHTS, then writes two bytes back-to-back so the
+    /// broker's second `notify(IN)` lands while the first
+    /// edge-frame is still in flight (forcing the deferred-bit
+    /// code path). Receiver does two `epoll_wait + read(1)` cycles
+    /// — a level-triggered usage where the second wake must arrive
+    /// even with no further producer activity. On native Linux,
+    /// pipe epoll is level-triggered and trivially succeeds. On
+    /// litebox, if the deferred edge bit is not re-flushed (no
+    /// production `try_flush_subscriptions` call site), the
+    /// receiver's second `epoll_wait` blocks until timeout. Tests
+    /// the protocol's liveness gap, not its no-loss invariant.
+    PassPipeDoubleWake,
 }
 
 const SCM_SCENARIOS: &[ScmScenario] = &[
@@ -134,6 +149,10 @@ const SCM_SCENARIOS: &[ScmScenario] = &[
     ScmScenario {
         name: "pass_two_fds_one_msg",
         kind: ScmKind::PassTwoFdsOneMsg,
+    },
+    ScmScenario {
+        name: "pass_pipe_double_wake",
+        kind: ScmKind::PassPipeDoubleWake,
     },
 ];
 
@@ -349,6 +368,7 @@ fn accept_and_validate(kind: ScmKind, listener: UnixListener) -> Result<ScmOut, 
         ScmKind::PassTcpSocket => receive_tcp(stream),
         ScmKind::PassThenCloseSender => receive_eventfd(stream, 5, true, "close_sender"),
         ScmKind::PassTwoFdsOneMsg => receive_two_eventfds(stream),
+        ScmKind::PassPipeDoubleWake => receive_pipe_double_wake(stream),
     }
 }
 
@@ -401,6 +421,7 @@ fn send_for_scenario(kind: ScmKind, socket_path: &str) -> Result<(), String> {
             second.write(13).map_err(|e| e.to_string())?;
             Ok(())
         }
+        ScmKind::PassPipeDoubleWake => send_pipe_double_wake(socket_path),
     }
 }
 
@@ -488,6 +509,161 @@ fn receive_two_eventfds(stream: UnixStream) -> Result<ScmOut, String> {
             "received_eventfds=[{},{}] values=11,13",
             first.as_raw_fd(),
             second.as_raw_fd()
+        ),
+    })
+}
+
+// ---------- pass_pipe_double_wake ----------
+//
+// HypB probe. Documented in detail on `ScmKind::PassPipeDoubleWake`.
+//
+// Wire protocol on the unix stream (over the SCM_RIGHTS path):
+//   sender -> receiver: SCM_RIGHTS msg with pipe-read fd + b"pipe_dwake"
+//   receiver -> sender: b"R"     ("receiver ready, both ends armed")
+//   sender  -> receiver: b"B"    ("both bytes written, do not close")
+//   receiver -> sender: b"D"     ("done validating, you can exit")
+// The sender holds the write end open across the two `write(1)` calls
+// AND across the receiver's two `epoll_wait` cycles, so the only
+// notification activity is the back-to-back `notify(IN)` pair. There
+// is no follow-up HUP that would otherwise re-flush a deferred bit.
+
+fn send_pipe_double_wake(socket_path: &str) -> Result<(), String> {
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: pipe2 writes two valid fds on success; size is 2.
+    let rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc != 0 {
+        return Err(format!("pipe2: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: each fd was just produced by pipe2 and is uniquely owned here.
+    let read_end = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+    // SAFETY: write end fd ownership transferred.
+    let write_end = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+
+    let stream = UnixStream::connect(socket_path)?;
+    stream.send_fd(read_end.as_fd(), b"pipe_dwake")?;
+    drop(read_end);
+
+    // Wait for receiver to confirm it has subscribed.
+    let mut ready = [0u8; 1];
+    stream.read_exact(&mut ready)?;
+    if ready[0] != b'R' {
+        return Err(format!(
+            "expected READY sentinel 'R', got {:?}",
+            ready[0] as char
+        ));
+    }
+
+    // Back-to-back writes. The broker's `notify(IN)` for the second
+    // write should land while the first edge frame is still
+    // in-flight, exercising the defer path. We do NOT delay between
+    // them and we do NOT close the write end after — both deliberate.
+    write_all(write_end.as_raw_fd(), b"x")?;
+    write_all(write_end.as_raw_fd(), b"y")?;
+    stream.write_all(b"B")?;
+
+    // Wait for receiver to finish before dropping the write end (so
+    // the receiver's epoll loop never observes HUP, which would
+    // separately re-flush the deferred bit and mask the bug).
+    let mut done = [0u8; 1];
+    stream.read_exact(&mut done)?;
+    if done[0] != b'D' {
+        return Err(format!(
+            "expected DONE sentinel 'D', got {:?}",
+            done[0] as char
+        ));
+    }
+    drop(write_end);
+    Ok(())
+}
+
+fn receive_pipe_double_wake(stream: UnixStream) -> Result<ScmOut, String> {
+    let (fd, payload) = stream.recv_fd(64)?;
+    expect_payload(&payload, "pipe_dwake")?;
+    let read_fd = fd.as_raw_fd();
+
+    let mut epoll = crate::os::epoll::Epoll::new().map_err(|e| format!("epoll_create1: {e}"))?;
+    epoll
+        .add_fd(
+            read_fd,
+            "in",
+            crate::os::epoll::EpollTarget {
+                kind: "pipe_read",
+                id: read_fd as u64,
+            },
+        )
+        .map_err(|e| format!("epoll_ctl add pipe read end: {e}"))?;
+
+    // Pre-check: with nothing written, fast poll should be empty.
+    let pre = epoll
+        .wait(0, 4)
+        .map_err(|e| format!("pre epoll_wait: {e}"))?;
+    if !pre.is_empty() {
+        return Err(format!("pre epoll_wait(0) expected no events, got {pre:?}"));
+    }
+    stream.write_all(b"R")?;
+
+    // Wait for the sender's "both bytes written" sentinel so we know
+    // both `notify(IN)` calls have landed at the broker before we
+    // start consuming.
+    let mut both = [0u8; 1];
+    stream.read_exact(&mut both)?;
+    if both[0] != b'B' {
+        return Err(format!(
+            "expected BOTH sentinel 'B', got {:?}",
+            both[0] as char
+        ));
+    }
+
+    // Wake 1: should arrive promptly carrying the first byte.
+    let started_1 = Instant::now();
+    let evs_1 = epoll
+        .wait(2000, 4)
+        .map_err(|e| format!("wake1 epoll_wait: {e}"))?;
+    let elapsed_1_ms = started_1.elapsed().as_millis();
+    if evs_1.is_empty() {
+        return Err(format!(
+            "wake1 epoll_wait(2000) timed out without IN ({elapsed_1_ms}ms elapsed) — \
+             notification path did not deliver the first write"
+        ));
+    }
+    let byte_1 = read_exact(read_fd, 1)?;
+    if byte_1 != b"x" {
+        return Err(format!("wake1 read: expected 'x', got {:?}", byte_1));
+    }
+
+    // Wake 2: requires the broker's deferred IN bit (queued during
+    // the back-to-back write pair) to be re-emitted. On native Linux
+    // pipe epoll is level-triggered and trivially re-fires while data
+    // remains. On litebox, the broker `SubscriptionList`'s
+    // `try_flush_subscriptions` has no production call site, so the
+    // deferred bit is orphaned — this `epoll_wait` blocks until
+    // timeout.
+    let started_2 = Instant::now();
+    let evs_2 = epoll
+        .wait(2000, 4)
+        .map_err(|e| format!("wake2 epoll_wait: {e}"))?;
+    let elapsed_2_ms = started_2.elapsed().as_millis();
+    if evs_2.is_empty() {
+        // Send DONE so the sender does not block forever before we
+        // surface the error.
+        let _ = stream.write_all(b"D");
+        return Err(format!(
+            "wake2 epoll_wait(2000) timed out without IN \
+             ({elapsed_1_ms}ms wake1, {elapsed_2_ms}ms wake2) — \
+             deferred-edge bit orphaned (HypB)"
+        ));
+    }
+    let byte_2 = read_exact(read_fd, 1)?;
+    if byte_2 != b"y" {
+        let _ = stream.write_all(b"D");
+        return Err(format!("wake2 read: expected 'y', got {:?}", byte_2));
+    }
+
+    stream.write_all(b"D")?;
+    Ok(ScmOut {
+        detail: format!(
+            "pipe_dwake ok wake1={elapsed_1_ms}ms wake2={elapsed_2_ms}ms \
+             evs1={evs_1:?} evs2={evs_2:?}"
         ),
     })
 }

@@ -432,6 +432,10 @@ impl StateObject for InetListenerState {
     fn current_events(&self) -> u32 {
         InetListenerState::current_events(self)
     }
+
+    fn try_flush_subscriptions(&self) {
+        self.subject.try_flush();
+    }
 }
 
 fn accept_loop(
