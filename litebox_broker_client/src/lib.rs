@@ -27,7 +27,7 @@ pub use error::{ClientError, Result};
 pub use worker::{BrokerClientWorker, BrokerClientWorkerError};
 
 /// Protocol version this client implementation requests by default.
-pub const CLIENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);
+pub const CLIENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 2);
 
 /// Typed client for broker operations.
 pub struct BrokerClient<T> {

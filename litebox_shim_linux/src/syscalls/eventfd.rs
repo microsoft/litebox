@@ -6,10 +6,10 @@
 use core::sync::atomic::AtomicU32;
 
 use litebox::{
-    EventConsumeMode, EventCounter, LiteBox,
+    LiteBox,
     event::{
-        Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
-        wait::WaitContext,
+        EventCounter, EventCounterReadMode, Events, IOPollable, observer::Observer,
+        polling::Pollee, polling::TryOpError, wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::OFlags,
@@ -43,7 +43,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
         let local_core_event = if flags.contains(EfdFlags::NONBLOCK) {
-            litebox.create_event_counter(count).map_err(Errno::from)?
+            Some(
+                litebox
+                    .objects()
+                    .events()
+                    .create_counter(count)
+                    .map_err(Errno::from)?,
+            )
         } else {
             None
         };
@@ -57,11 +63,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         })
     }
 
-    fn consume_mode(&self) -> EventConsumeMode {
+    fn consume_mode(&self) -> EventCounterReadMode {
         if self.semaphore {
-            EventConsumeMode::One
+            EventCounterReadMode::One
         } else {
-            EventConsumeMode::All
+            EventCounterReadMode::All
         }
     }
 
@@ -258,48 +264,12 @@ mod tests {
     }
 
     #[test]
-    fn test_nonblocking_eventfd() {
+    fn test_nonblocking_eventfd_requires_broker_control() {
         let task = crate::syscalls::tests::init_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(
-            super::EventFile::new(&task.global.litebox, 0, EfdFlags::NONBLOCK).unwrap(),
+        assert_eq!(
+            super::EventFile::new(&task.global.litebox, 0, EfdFlags::NONBLOCK).map(|_| ()),
+            Err(Errno::EIO)
         );
-        let copied_eventfd = eventfd.clone();
-        std::thread::spawn(move || {
-            // first write should succeed immediately
-            copied_eventfd
-                .write(&WaitState::new(platform()).context(), 1)
-                .unwrap();
-            // block until the first read finishes
-            while let Err(e) =
-                copied_eventfd.write(&WaitState::new(platform()).context(), u64::MAX - 1)
-            {
-                assert_eq!(e, Errno::EAGAIN, "Unexpected error: {e:?}");
-                core::hint::spin_loop();
-            }
-        });
-
-        let read = |eventfd: &super::EventFile<litebox_platform_multiplex::Platform>,
-                    expected_value: u64| {
-            loop {
-                match eventfd.read(&WaitState::new(platform()).context()) {
-                    Ok(ret) => {
-                        assert_eq!(ret, expected_value);
-                        break;
-                    }
-                    Err(Errno::EAGAIN) => {
-                        // busy wait
-                        // TODO: use poll rather than busy wait
-                    }
-                    Err(e) => panic!("Unexpected error: {e:?}"),
-                }
-                core::hint::spin_loop();
-            }
-        };
-
-        // block until the first write
-        read(&eventfd, 1);
-        // block until the second write
-        read(&eventfd, u64::MAX - 1);
     }
 }

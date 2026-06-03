@@ -164,10 +164,13 @@ impl LinuxShimBuilder {
     /// Returns a new shim builder.
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
-        Self {
-            platform,
-            litebox: LiteBox::new(platform),
-        }
+        Self::from_litebox(LiteBox::new(platform))
+    }
+
+    /// Returns a new shim builder using an already-created LiteBox instance.
+    pub fn from_litebox(litebox: LiteBox<Platform>) -> Self {
+        let platform = litebox_platform_multiplex::platform();
+        Self { platform, litebox }
     }
 
     /// Returns the litebox object for the shim.

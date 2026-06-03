@@ -3,7 +3,10 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use litebox::fs::{FileSystem as _, Mode};
+use litebox::{
+    LiteBox,
+    fs::{FileSystem as _, Mode},
+};
 use litebox_platform_multiplex::Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
@@ -214,12 +217,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_platform_multiplex::set_platform(platform);
     let broker_connection = broker::connect(cli_args.broker_socket.as_deref())?;
 
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
-    if let Some(broker_connection) = &broker_connection {
-        shim_builder
-            .litebox()
-            .set_broker_control(broker_connection.control());
-    }
+    let shim_builder = if let Some(broker_connection) = &broker_connection {
+        litebox_shim_linux::LinuxShimBuilder::from_litebox(LiteBox::new_with_broker_control(
+            litebox_platform_multiplex::platform(),
+            broker_connection.control(),
+        ))
+    } else {
+        litebox_shim_linux::LinuxShimBuilder::new()
+    };
     let litebox = shim_builder.litebox();
     // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) }

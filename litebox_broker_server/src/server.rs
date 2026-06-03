@@ -13,7 +13,7 @@ use litebox_broker_protocol::{
 };
 
 /// Protocol version this broker server implementation supports.
-pub const SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);
+pub const SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 2);
 
 /// Serves one broker connection over the provided connected control channel.
 pub fn serve_connection<P, T>(
@@ -420,7 +420,7 @@ mod tests {
         assert_eq!(
             dispatch.response,
             event_response(EventResponse::Wait(WaitEventResponse::new(
-                WaitOutcome::WouldBlock(ReadinessState::new(false, 0))
+                WaitOutcome::WouldBlock(ReadinessState::new(false, true, 0))
             )))
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(
             dispatch.response,
             event_response(EventResponse::Add(AddEventResponse::new(
-                ReadinessState::new(true, 1)
+                ReadinessState::new(true, true, 1)
             )))
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(
             dispatch.response,
             event_response(EventResponse::Wait(WaitEventResponse::new(
-                WaitOutcome::Ready(ReadinessState::new(true, 1))
+                WaitOutcome::Ready(ReadinessState::new(true, true, 1))
             )))
         );
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);

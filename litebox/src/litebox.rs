@@ -6,9 +6,9 @@
 use alloc::sync::Arc;
 
 use crate::{
-    broker::{BrokerControl, BrokerState, EventCounter, EventCounterError},
+    broker::{BrokerControl, BrokerState},
     fd::Descriptors,
-    platform::TimeProvider,
+    objects::Objects,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -32,6 +32,21 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// If the `enforce_singleton_litebox_instance` compilation feature has been enabled, and more
     /// than one instance is made, will panic.
     pub fn new(platform: &'static Platform) -> Self {
+        Self::new_inner(platform, None)
+    }
+
+    /// Create a new [`LiteBox`] instance with broker control installed.
+    pub fn new_with_broker_control(
+        platform: &'static Platform,
+        broker_control: Arc<dyn BrokerControl>,
+    ) -> Self {
+        Self::new_inner(platform, Some(broker_control))
+    }
+
+    fn new_inner(
+        platform: &'static Platform,
+        broker_control: Option<Arc<dyn BrokerControl>>,
+    ) -> Self {
         // This check ensures that there is exactly one `LiteBox` instance in the process.
         //
         // LiteBox itself supports having multiple instances (and subsystems correctly make any
@@ -67,7 +82,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         crate::sync::lock_tracing::LockTracker::init(platform);
 
         let descriptors = RwLock::new(Descriptors::new_from_litebox_creation());
-        let broker = BrokerState::new();
+        let broker = BrokerState::new(broker_control);
 
         litebox_util_log::trace!("LiteBox instance initialized");
 
@@ -111,20 +126,9 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         self.x.descriptors.write()
     }
 
-    /// Installs broker control for broker-backed local-core objects.
-    pub fn set_broker_control(&self, broker_control: Arc<dyn BrokerControl>) {
-        self.x.broker.set_control(broker_control);
-    }
-
-    /// Creates a broker-backed event counter when broker control is installed.
-    pub fn create_event_counter(
-        &self,
-        initial_count: u64,
-    ) -> Result<Option<EventCounter<Platform>>, EventCounterError>
-    where
-        Platform: TimeProvider,
-    {
-        self.x.broker.create_event_counter(initial_count)
+    /// Returns local-core object factories.
+    pub fn objects(&self) -> Objects<'_, Platform> {
+        Objects::new(&self.x.broker)
     }
 }
 

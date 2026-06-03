@@ -50,7 +50,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
         let object_id =
             self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
         let state = self.event_state(object_id)?;
-        Ok(if state.ready {
+        Ok(if state.read_ready {
             WaitOutcome::Ready(state)
         } else {
             WaitOutcome::WouldBlock(state)
@@ -107,7 +107,11 @@ impl EventObject {
     }
 
     pub(crate) const fn readiness_state(self) -> ReadinessState {
-        ReadinessState::new(self.count > 0, self.readiness_generation)
+        ReadinessState::new(
+            self.count > 0,
+            self.count < MAX_EVENT_COUNT,
+            self.readiness_generation,
+        )
     }
 
     fn add(&mut self, value: u64) -> Result<ReadinessState> {

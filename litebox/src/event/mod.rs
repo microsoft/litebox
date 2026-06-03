@@ -3,9 +3,12 @@
 
 //! Events related functionality
 
+pub mod counter;
 pub mod observer;
 pub mod polling;
 pub mod wait;
+
+pub use counter::{EventCounter, EventCounterError, EventCounterReadMode};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]

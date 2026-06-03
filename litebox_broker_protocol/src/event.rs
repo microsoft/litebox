@@ -6,26 +6,32 @@ use crate::ObjectHandle;
 /// Broker-authoritative readiness state for one object.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadinessState {
-    /// Whether the object is currently ready.
-    pub ready: bool,
+    /// Whether an event read/consume operation can complete without blocking.
+    pub read_ready: bool,
+    /// Whether an event write/add operation can complete without blocking.
+    pub write_ready: bool,
     /// Monotonic readiness generation used to invalidate user-side readiness caches.
     pub generation: u64,
 }
 
 impl ReadinessState {
     /// Creates a readiness state.
-    pub const fn new(ready: bool, generation: u64) -> Self {
-        Self { ready, generation }
+    pub const fn new(read_ready: bool, write_ready: bool, generation: u64) -> Self {
+        Self {
+            read_ready,
+            write_ready,
+            generation,
+        }
     }
 }
 
-/// Result of checking whether a broker event wait would complete now.
+/// Result of checking whether a broker event read wait would complete now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WaitOutcome {
-    /// The object is ready now.
+    /// The object is read-ready now.
     Ready(ReadinessState),
-    /// The object is not ready; deployment-specific wait plumbing may block.
+    /// The object is not read-ready; deployment-specific wait plumbing may block.
     WouldBlock(ReadinessState),
 }
 

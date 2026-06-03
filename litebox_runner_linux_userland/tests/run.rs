@@ -311,10 +311,10 @@ fn test_broker_event_path_over_unix_socket() {
     let handle = client.create_event().expect("event create failed");
     assert_eq!(
         client.wait_event(handle).expect("event wait failed"),
-        WaitOutcome::WouldBlock(ReadinessState::new(false, 0))
+        WaitOutcome::WouldBlock(ReadinessState::new(false, true, 0))
     );
     let readiness = client.add_event(handle, 1).expect("event add failed");
-    assert_eq!(readiness, ReadinessState::new(true, 1));
+    assert_eq!(readiness, ReadinessState::new(true, true, 1));
     assert_eq!(
         client.wait_event(handle).expect("event ready-wait failed"),
         WaitOutcome::Ready(readiness)

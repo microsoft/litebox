@@ -5,13 +5,11 @@ use alloc::sync::Arc;
 
 use litebox_broker_protocol::{CoreRequest, CoreResponse};
 
-use crate::sync::{RawSyncPrimitivesProvider, RwLock};
+use crate::sync::RawSyncPrimitivesProvider;
 
 mod error;
-mod event;
-pub use error::{BrokerControlError, EventCounterError};
-pub use event::EventCounter;
-pub use litebox_broker_protocol::EventConsumeMode;
+pub(crate) mod event;
+pub use error::BrokerControlError;
 
 /// Local-core access to the negotiated broker control channel.
 ///
@@ -27,17 +25,15 @@ pub trait BrokerControl: Send + Sync {
 }
 
 pub(crate) struct BrokerState<Platform: RawSyncPrimitivesProvider> {
-    control: RwLock<Platform, Option<Arc<dyn BrokerControl>>>,
+    control: Option<Arc<dyn BrokerControl>>,
+    _marker: core::marker::PhantomData<Platform>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> BrokerState<Platform> {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(control: Option<Arc<dyn BrokerControl>>) -> Self {
         Self {
-            control: RwLock::new(None),
+            control,
+            _marker: core::marker::PhantomData,
         }
-    }
-
-    pub(crate) fn set_control(&self, broker_control: Arc<dyn BrokerControl>) {
-        *self.control.write() = Some(broker_control);
     }
 }

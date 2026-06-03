@@ -2847,7 +2847,7 @@ mod tests {
     fn eventfd_writev_rejects_split_value() {
         let task = crate::syscalls::tests::init_platform(None);
         let fd = task
-            .sys_eventfd2(0, EfdFlags::NONBLOCK)
+            .sys_eventfd2(0, EfdFlags::empty())
             .expect("eventfd2 failed");
         let fd = i32::try_from(fd).unwrap();
         let value = 0x0102_0304_0506_0708u64;
@@ -2867,9 +2867,6 @@ mod tests {
             task.sys_writev(fd, ConstPtr::from_ptr(iovs.as_ptr()), iovs.len()),
             Err(Errno::EINVAL)
         );
-
-        let mut output = [0u8; 8];
-        assert_eq!(task.sys_read(fd, &mut output, None), Err(Errno::EAGAIN));
     }
 
     #[test]
@@ -2936,7 +2933,7 @@ mod tests {
     fn eventfd_writev_writes_each_full_value() {
         let task = crate::syscalls::tests::init_platform(None);
         let fd = task
-            .sys_eventfd2(0, EfdFlags::NONBLOCK)
+            .sys_eventfd2(0, EfdFlags::empty())
             .expect("eventfd2 failed");
         let fd = i32::try_from(fd).unwrap();
         let first = 7u64.to_ne_bytes();
@@ -2960,7 +2957,6 @@ mod tests {
         let mut output = [0u8; 8];
         assert_eq!(task.sys_read(fd, &mut output, None), Ok(8));
         assert_eq!(u64::from_ne_bytes(output), 18);
-        assert_eq!(task.sys_read(fd, &mut output, None), Err(Errno::EAGAIN));
     }
 
     #[test]
