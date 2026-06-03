@@ -3,25 +3,15 @@
 
 use alloc::sync::Arc;
 
-use litebox_broker_protocol::{CoreRequest, CoreResponse, ErrorCode};
+use litebox_broker_protocol::{CoreRequest, CoreResponse};
 
 use crate::sync::{RawSyncPrimitivesProvider, RwLock};
 
+mod error;
 mod event;
-pub use event::{EventCounter, EventCounterError};
+pub use error::{BrokerControlError, EventCounterError};
+pub use event::EventCounter;
 pub use litebox_broker_protocol::EventConsumeMode;
-
-/// Error returned by the deployment-provided broker control path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum BrokerControlError {
-    /// The broker control transport failed.
-    Transport,
-    /// The broker returned an operation error.
-    Broker(ErrorCode),
-    /// The broker returned a response shape that does not match the request.
-    UnexpectedResponse,
-}
 
 /// Local-core access to the negotiated broker control channel.
 ///

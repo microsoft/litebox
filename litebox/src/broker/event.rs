@@ -4,11 +4,18 @@
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::{
-    AddEventRequest, ConsumeEventRequest, CoreRequest, CoreResponse, CreateEventRequest, ErrorCode,
-    EventRequest, EventResponse, ObjectHandle, WaitEventRequest, WaitOutcome,
+    AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CoreRequest, CoreResponse,
+    CreateEventRequest, EventRequest, EventResponse, ObjectHandle, ReadinessState,
+    WaitEventRequest, WaitOutcome,
 };
 
-use super::{BrokerControl, BrokerControlError, BrokerState, EventConsumeMode};
+use super::{
+    BrokerControl, BrokerState, EventConsumeMode,
+    error::{
+        BrokerObjectError, EventCounterError, control_error_to_object_error,
+        map_broker_object_result, object_error_to_event_counter_error,
+    },
+};
 use crate::{
     event::{
         Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
@@ -18,23 +25,10 @@ use crate::{
     sync::RawSyncPrimitivesProvider,
 };
 
-/// Errors returned by broker-backed local-core event counters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum EventCounterError {
-    /// The requested operation is invalid for this event counter.
-    InvalidInput,
-    /// The operation would block.
-    WouldBlock,
-    /// The event counter cannot accept more state.
-    ResourceExhausted,
-    /// The backing authority or transport failed.
-    Io,
-}
-
 /// A broker-backed local-core event counter.
 pub struct EventCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    event: BrokerEvent,
+    broker: Arc<dyn BrokerControl>,
+    handle: ObjectHandle,
     pollee: Pollee<Platform>,
 }
 
@@ -53,31 +47,22 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerState<Platform> {
     }
 }
 
-#[derive(Clone)]
-struct BrokerEvent {
-    broker: Arc<dyn BrokerControl>,
-    handle: ObjectHandle,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BrokerObjectError {
-    Control,
-    InvalidObject,
-    WouldBlock,
-    ResourceExhausted,
-    UnexpectedResponse,
-    Internal,
-}
-
 impl<Platform> EventCounter<Platform>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
     fn new(broker: Arc<dyn BrokerControl>, initial_count: u64) -> Result<Self, EventCounterError> {
-        let event = BrokerEvent::create(broker, initial_count)
-            .map_err(broker_error_to_event_counter_error)?;
+        let response = request_event(
+            &broker,
+            EventRequest::Create(CreateEventRequest::new(initial_count)),
+        )
+        .map_err(object_error_to_event_counter_error)?;
+        let EventResponse::Create(response) = response else {
+            return Err(EventCounterError::Io);
+        };
         Ok(Self {
-            event,
+            broker,
+            handle: response.handle,
             pollee: Pollee::new(),
         })
     }
@@ -94,9 +79,8 @@ where
         _nonblock: bool,
         mode: EventConsumeMode,
     ) -> Result<u64, TryOpError<EventCounterError>> {
-        let value = map_broker_result(self.event.consume(mode))?;
-        self.pollee.notify_observers(Events::OUT);
-        Ok(value)
+        let response = map_broker_object_result(self.consume(mode))?;
+        Ok(response.value)
     }
 
     /// Writes readiness credits to the event counter.
@@ -109,9 +93,42 @@ where
         if value == u64::MAX {
             return Err(TryOpError::Other(EventCounterError::InvalidInput));
         }
-        map_broker_result(self.event.add(value))?;
-        self.pollee.notify_observers(Events::IN);
+        let readiness = map_broker_object_result(self.add(value))?;
+        if value != 0 && readiness.ready {
+            self.pollee.notify_observers(Events::IN);
+        }
         Ok(core::mem::size_of::<u64>())
+    }
+
+    fn consume(&self, mode: EventConsumeMode) -> Result<ConsumeEventResponse, BrokerObjectError> {
+        let response = self.request(EventRequest::Consume(ConsumeEventRequest::new(
+            self.handle,
+            mode,
+        )))?;
+        let EventResponse::Consume(response) = response else {
+            return Err(BrokerObjectError::UnexpectedResponse);
+        };
+        Ok(response)
+    }
+
+    fn add(&self, value: u64) -> Result<ReadinessState, BrokerObjectError> {
+        let response = self.request(EventRequest::Add(AddEventRequest::new(self.handle, value)))?;
+        let EventResponse::Add(response) = response else {
+            return Err(BrokerObjectError::UnexpectedResponse);
+        };
+        Ok(response.readiness)
+    }
+
+    fn is_read_ready(&self) -> Result<bool, BrokerObjectError> {
+        let response = self.request(EventRequest::Wait(WaitEventRequest::new(self.handle)))?;
+        let EventResponse::Wait(response) = response else {
+            return Err(BrokerObjectError::UnexpectedResponse);
+        };
+        Ok(matches!(response.outcome, WaitOutcome::Ready(_)))
+    }
+
+    fn request(&self, request: EventRequest) -> Result<EventResponse, BrokerObjectError> {
+        request_event(&self.broker, request)
     }
 }
 
@@ -128,60 +145,10 @@ where
         // readiness optimistic and surface counter-limit failures from write
         // until broker write-readiness plumbing exists.
         let mut events = Events::OUT;
-        if self.event.is_read_ready().unwrap_or(false) {
+        if self.is_read_ready().unwrap_or(false) {
             events |= Events::IN;
         }
         events
-    }
-}
-
-impl BrokerEvent {
-    fn create(
-        broker: Arc<dyn BrokerControl>,
-        initial_count: u64,
-    ) -> Result<Self, BrokerObjectError> {
-        let response = request_event(
-            &broker,
-            EventRequest::Create(CreateEventRequest::new(initial_count)),
-        )?;
-        let EventResponse::Create(response) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse);
-        };
-        Ok(Self {
-            broker,
-            handle: response.handle,
-        })
-    }
-
-    fn consume(&self, mode: EventConsumeMode) -> Result<u64, BrokerObjectError> {
-        let response = self.request(EventRequest::Consume(ConsumeEventRequest::new(
-            self.handle,
-            mode,
-        )))?;
-        let EventResponse::Consume(response) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse);
-        };
-        Ok(response.value)
-    }
-
-    fn add(&self, value: u64) -> Result<(), BrokerObjectError> {
-        let response = self.request(EventRequest::Add(AddEventRequest::new(self.handle, value)))?;
-        let EventResponse::Add(_) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse);
-        };
-        Ok(())
-    }
-
-    fn is_read_ready(&self) -> Result<bool, BrokerObjectError> {
-        let response = self.request(EventRequest::Wait(WaitEventRequest::new(self.handle)))?;
-        let EventResponse::Wait(response) = response else {
-            return Err(BrokerObjectError::UnexpectedResponse);
-        };
-        Ok(matches!(response.outcome, WaitOutcome::Ready(_)))
-    }
-
-    fn request(&self, request: EventRequest) -> Result<EventResponse, BrokerObjectError> {
-        request_event(&self.broker, request)
     }
 }
 
@@ -198,42 +165,146 @@ fn request_event(
     }
 }
 
-const fn control_error_to_object_error(error: BrokerControlError) -> BrokerObjectError {
-    match error {
-        BrokerControlError::Transport => BrokerObjectError::Control,
-        BrokerControlError::Broker(error) => error_to_object_error(error),
-        BrokerControlError::UnexpectedResponse => BrokerObjectError::UnexpectedResponse,
-    }
-}
+#[cfg(test)]
+mod tests {
+    extern crate std;
 
-const fn error_to_object_error(error: ErrorCode) -> BrokerObjectError {
-    match error {
-        ErrorCode::InvalidRights | ErrorCode::WrongObjectType | ErrorCode::StaleHandle => {
-            BrokerObjectError::InvalidObject
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::{collections::VecDeque, sync::Mutex};
+
+    use litebox_broker_protocol::{
+        AddEventResponse, ConsumeEventResponse, CoreRequest, CoreResponse, CreateEventResponse,
+        EventResponse, ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId, ReadinessState,
+    };
+
+    use super::*;
+    use crate::{
+        BrokerControlError,
+        event::{Events, IOPollable, observer::Observer, wait::WaitState},
+        platform::mock::MockPlatform,
+    };
+
+    struct MockBrokerControl {
+        responses: Mutex<VecDeque<CoreResponse>>,
+    }
+
+    impl MockBrokerControl {
+        fn new(responses: impl IntoIterator<Item = CoreResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+            }
         }
-        ErrorCode::WouldBlock => BrokerObjectError::WouldBlock,
-        ErrorCode::ResourceExhausted => BrokerObjectError::ResourceExhausted,
-        _ => BrokerObjectError::Internal,
     }
-}
 
-fn map_broker_result<T>(
-    result: Result<T, BrokerObjectError>,
-) -> Result<T, TryOpError<EventCounterError>> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(BrokerObjectError::WouldBlock) => Err(TryOpError::TryAgain),
-        Err(error) => Err(TryOpError::Other(broker_error_to_event_counter_error(
-            error,
-        ))),
+    impl BrokerControl for MockBrokerControl {
+        fn request(
+            &self,
+            _request: CoreRequest,
+        ) -> core::result::Result<CoreResponse, BrokerControlError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(BrokerControlError::UnexpectedResponse)
+        }
     }
-}
 
-const fn broker_error_to_event_counter_error(error: BrokerObjectError) -> EventCounterError {
-    match error {
-        BrokerObjectError::InvalidObject => EventCounterError::InvalidInput,
-        BrokerObjectError::WouldBlock => EventCounterError::WouldBlock,
-        BrokerObjectError::ResourceExhausted => EventCounterError::ResourceExhausted,
-        _ => EventCounterError::Io,
+    struct CountingObserver {
+        notifications: AtomicUsize,
+    }
+
+    impl CountingObserver {
+        fn new() -> Self {
+            Self {
+                notifications: AtomicUsize::new(0),
+            }
+        }
+
+        fn notifications(&self) -> usize {
+            self.notifications.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Observer<Events> for CountingObserver {
+        fn on_events(&self, _events: &Events) {
+            self.notifications.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn sample_handle() -> ObjectHandle {
+        ObjectHandle::new(ObjectReferenceId::new(1), ObjectReferenceGeneration::new(1))
+    }
+
+    fn create_response() -> CoreResponse {
+        CoreResponse::Event(EventResponse::Create(CreateEventResponse::new(
+            sample_handle(),
+        )))
+    }
+
+    fn add_response(ready: bool) -> CoreResponse {
+        CoreResponse::Event(EventResponse::Add(AddEventResponse::new(
+            ReadinessState::new(ready, 1),
+        )))
+    }
+
+    fn consume_response(value: u64, ready: bool) -> CoreResponse {
+        CoreResponse::Event(EventResponse::Consume(ConsumeEventResponse::new(
+            value,
+            ReadinessState::new(ready, 1),
+        )))
+    }
+
+    fn event_counter(
+        responses: impl IntoIterator<Item = CoreResponse>,
+    ) -> EventCounter<MockPlatform> {
+        EventCounter::new(Arc::new(MockBrokerControl::new(responses)), 0).unwrap()
+    }
+
+    fn observer() -> (Arc<CountingObserver>, Arc<dyn Observer<Events>>) {
+        let observer = Arc::new(CountingObserver::new());
+        let observer_dyn: Arc<dyn Observer<Events>> = observer.clone();
+        (observer, observer_dyn)
+    }
+
+    #[test]
+    fn zero_write_does_not_notify_read_observers() {
+        let event = event_counter([create_response(), add_response(false)]);
+        let (observer, observer_dyn) = observer();
+        event.register_observer(Arc::downgrade(&observer_dyn), Events::IN);
+
+        let wait = WaitState::new(MockPlatform::new());
+        assert_eq!(event.write(&wait.context(), true, 0).unwrap(), 8);
+
+        assert_eq!(observer.notifications(), 0);
+    }
+
+    #[test]
+    fn nonzero_write_notifies_read_observers_when_broker_reports_ready() {
+        let event = event_counter([create_response(), add_response(true)]);
+        let (observer, observer_dyn) = observer();
+        event.register_observer(Arc::downgrade(&observer_dyn), Events::IN);
+
+        let wait = WaitState::new(MockPlatform::new());
+        assert_eq!(event.write(&wait.context(), true, 1).unwrap(), 8);
+
+        assert_eq!(observer.notifications(), 1);
+    }
+
+    #[test]
+    fn read_does_not_notify_write_observers_without_broker_write_readiness() {
+        let event = event_counter([create_response(), consume_response(1, false)]);
+        let (observer, observer_dyn) = observer();
+        event.register_observer(Arc::downgrade(&observer_dyn), Events::OUT);
+
+        let wait = WaitState::new(MockPlatform::new());
+        assert_eq!(
+            event
+                .read(&wait.context(), true, EventConsumeMode::All)
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(observer.notifications(), 0);
     }
 }
