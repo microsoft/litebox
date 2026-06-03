@@ -67,6 +67,7 @@ struct ProbeOut {
 
 const STATX_ENOENT_STORM: HandlerToken<(), ProbeOut> = HandlerToken::new("perf.statx_enoent_storm");
 const FORK_EXEC_TRUE: HandlerToken<(), ProbeOut> = HandlerToken::new("perf.fork_exec_true");
+const FORK_ONLY_EXIT: HandlerToken<(), ProbeOut> = HandlerToken::new("perf.fork_only_exit");
 
 /// `statx_enoent_storm`: issue N=1000 statx(2) calls for a path
 /// that does not exist. Mirrors Node's CommonJS module resolver,
@@ -214,6 +215,91 @@ async fn handle_fork_exec_true(
     .map_err(|e| HandlerError(format!("spawn_blocking join: {e}")))?
 }
 
+/// `fork_only_exit`: fork + child immediately calls a non-pre-exec
+/// syscall (getppid) and `_exit(0)`; parent waitpid. N=50 iterations.
+/// This isolates the cost of the delayed-fork commit path
+/// (`spawn_worker_host_for_fork_restore` in
+/// `litebox_shim_linux/src/syscalls/process.rs`) from execve overhead
+/// and from any broker pipe / notification dependency that the
+/// existing harness fork probes (HypB, FORK.*) introduce.
+///
+/// The `getppid` syscall is the trigger: it is not on the pre-exec
+/// allowlist, so it forces the shim to commit the delayed fork and
+/// migrate the child to a worker host. The subsequent `_exit(0)` is
+/// the only other syscall the child runs, so essentially all
+/// per-iter time is spent in clone + commit_delayed_fork + waitpid.
+/// Pair with the `[DELAYED-FORK-TIMING]` per-phase log lines emitted
+/// by `commit_delayed_fork` to attribute the cost to a phase.
+///
+/// Native baseline per-iter is ~100µs (just clone + exit + wait); a
+/// litebox per-iter measurement plus the per-phase log lines tell
+/// you both *whether* spawn_worker_host_for_fork_restore is the
+/// dominant cost and *which sub-phase* dominates within it.
+async fn handle_fork_only_exit(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ProbeOut, HandlerError> {
+    tokio::task::spawn_blocking(|| {
+        const ITERATIONS: u64 = 50;
+        let mut per_call: Vec<u64> = Vec::with_capacity(ITERATIONS as usize);
+        let mut all_successful = true;
+        let outer_start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let call_start = std::time::Instant::now();
+            // SAFETY: fork() — child only invokes async-signal-safe
+            // syscalls (getppid, _exit). Parent waits synchronously
+            // on the child pid.
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                all_successful = false;
+                break;
+            }
+            if pid == 0 {
+                // SAFETY: getppid is async-signal-safe and forces a
+                // non-pre-exec syscall, triggering commit_delayed_fork
+                // in the shim. _exit is async-signal-safe.
+                unsafe {
+                    libc::getppid();
+                    libc::_exit(0);
+                }
+            }
+            let mut status: libc::c_int = 0;
+            // SAFETY: waitpid on the child pid we just forked.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            per_call.push(call_start.elapsed().as_nanos() as u64);
+            if waited != pid {
+                all_successful = false;
+            }
+        }
+        let elapsed_nanos = outer_start.elapsed().as_nanos() as u64;
+        per_call.sort_unstable();
+        let n = per_call.len();
+        let p50 = if n >= 16 { per_call[n / 2] } else { 0 };
+        let p95 = if n >= 16 { per_call[(n * 95) / 100] } else { 0 };
+        let min = if n >= 16 {
+            *per_call.first().unwrap()
+        } else {
+            0
+        };
+        let max = if n >= 16 {
+            *per_call.last().unwrap()
+        } else {
+            0
+        };
+        Ok(ProbeOut {
+            iterations_completed: ITERATIONS,
+            elapsed_nanos,
+            per_call_min_nanos: min,
+            per_call_p50_nanos: p50,
+            per_call_p95_nanos: p95,
+            per_call_max_nanos: max,
+            all_successful,
+        })
+    })
+    .await
+    .map_err(|e| HandlerError(format!("spawn_blocking join: {e}")))?
+}
+
 /// Verdict-check for the statx storm. Reports the throughput so it
 /// shows up in the test log on both passes; the litebox-vs-native
 /// comparison is done by the operator inspecting both test results.
@@ -264,9 +350,32 @@ fn report_fork_exec(out: &ProbeOut) -> Result<String, String> {
     ))
 }
 
+fn report_fork_only_exit(out: &ProbeOut) -> Result<String, String> {
+    if !out.all_successful {
+        return Err("fork_only_exit: at least one iteration failed".to_string());
+    }
+    let total_ms = out.elapsed_nanos / 1_000_000;
+    if total_ms > 30_000 {
+        return Err(format!(
+            "fork_only_exit: total elapsed {total_ms}ms exceeds 30000ms budget"
+        ));
+    }
+    let per_iter_us = out.elapsed_nanos / out.iterations_completed / 1_000;
+    Ok(format!(
+        "iterations={} total={total_ms}ms per-iter={per_iter_us}µs \
+         min={}µs p50={}µs p95={}µs max={}µs",
+        out.iterations_completed,
+        out.per_call_min_nanos / 1_000,
+        out.per_call_p50_nanos / 1_000,
+        out.per_call_p95_nanos / 1_000,
+        out.per_call_max_nanos / 1_000,
+    ))
+}
+
 pub(crate) fn register_perf_probes(reg: &mut Registry<'_>) {
     register_handler!(STATX_ENOENT_STORM, handle_statx_enoent_storm);
     register_handler!(FORK_EXEC_TRUE, handle_fork_exec_true);
+    register_handler!(FORK_ONLY_EXIT, handle_fork_only_exit);
 
     // statx storm: 1000 calls. Native should complete in ~10 ms;
     // litebox observed at ~900 µs/call = ~900 ms. 30s absolute
@@ -290,5 +399,22 @@ pub(crate) fn register_perf_probes(reg: &mut Registry<'_>) {
         AgentName::Dpg1,
         &FORK_EXEC_TRUE,
         report_fork_exec,
+    );
+
+    // fork-only (no execve, no pipe, no notification): 50 iterations
+    // of fork → getppid → _exit → waitpid. Isolates the cost of
+    // spawn_worker_host_for_fork_restore (commit_delayed_fork path)
+    // from execve and from any broker pipe / notification dependency.
+    // Pair with `[DELAYED-FORK-TIMING]` per-phase log lines in the
+    // shim to attribute per-iter cost to a sub-phase. Native ~5 ms
+    // (clone + exit + wait only); litebox per-iter measurement
+    // surfaces the fork-restore handshake overhead in isolation.
+    reg.single_agent_handler_test(
+        "vscode",
+        "perf",
+        "PERF.fork_only_exit",
+        AgentName::Dpg1,
+        &FORK_ONLY_EXIT,
+        report_fork_only_exit,
     );
 }
