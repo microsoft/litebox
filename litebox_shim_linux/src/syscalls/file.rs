@@ -18,14 +18,30 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, InodeType,
-    IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno, signal::Signal,
+    AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
+    InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,
+    signal::Signal,
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task, syscalls::signal};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Clone, Copy)]
+struct AccessUserInfo {
+    user: u32,
+    group: u32,
+}
+
+impl From<litebox::fs::UserInfo> for AccessUserInfo {
+    fn from(value: litebox::fs::UserInfo) -> Self {
+        Self {
+            user: u32::from(value.user),
+            group: u32::from(value.group),
+        }
+    }
+}
 
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
@@ -1042,35 +1058,122 @@ impl<FS: ShimFS> Task<FS> {
         write_to_iovec(iovs, |buf, _total| self.sys_write(fd, buf, None))
     }
 
-    /// Handle syscall `access`
-    pub fn sys_access(
-        &self,
-        pathname: impl path::Arg,
-        mode: litebox_common_linux::AccessFlags,
+    fn validate_access_mode(mode: &AccessFlags) -> Result<(), Errno> {
+        let valid_mode = AccessFlags::R_OK | AccessFlags::W_OK | AccessFlags::X_OK;
+        if mode.intersects(valid_mode.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    fn do_access_mode(
+        mode: Mode,
+        owner: AccessUserInfo,
+        caller: AccessUserInfo,
+        access_mode: &AccessFlags,
     ) -> Result<(), Errno> {
-        let pathname = self.resolve_path(pathname)?;
-        let status = self.files.borrow().fs.file_status(pathname)?;
-        if mode == litebox_common_linux::AccessFlags::F_OK {
+        if access_mode.is_empty() {
             return Ok(());
         }
-        // TODO: the check is done using the calling process's real UID and GID.
-        // Here we assume the caller owns the file.
-        if mode.contains(litebox_common_linux::AccessFlags::R_OK)
-            && !status.mode.contains(litebox::fs::Mode::RUSR)
-        {
+        if caller.user == 0 {
+            if access_mode.contains(AccessFlags::X_OK)
+                && !mode.intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH)
+            {
+                return Err(Errno::EACCES);
+            }
+            return Ok(());
+        }
+        // TODO: Linux also uses group bits when `owner.group` is in the caller's supplementary
+        // group list. `AccessUserInfo` only carries the real/effective primary group today.
+        let (read, write, execute) = if caller.user == owner.user {
+            (Mode::RUSR, Mode::WUSR, Mode::XUSR)
+        } else if caller.group == owner.group {
+            (Mode::RGRP, Mode::WGRP, Mode::XGRP)
+        } else {
+            (Mode::ROTH, Mode::WOTH, Mode::XOTH)
+        };
+        if access_mode.contains(AccessFlags::R_OK) && !mode.contains(read) {
             return Err(Errno::EACCES);
         }
-        if mode.contains(litebox_common_linux::AccessFlags::W_OK)
-            && !status.mode.contains(litebox::fs::Mode::WUSR)
-        {
+        if access_mode.contains(AccessFlags::W_OK) && !mode.contains(write) {
             return Err(Errno::EACCES);
         }
-        if mode.contains(litebox_common_linux::AccessFlags::X_OK)
-            && !status.mode.contains(litebox::fs::Mode::XUSR)
-        {
+        if access_mode.contains(AccessFlags::X_OK) && !mode.contains(execute) {
             return Err(Errno::EACCES);
         }
         Ok(())
+    }
+
+    fn access_user(&self, flags: &AtFlags) -> AccessUserInfo {
+        if flags.contains(AtFlags::AT_EACCESS) {
+            AccessUserInfo {
+                user: self.credentials.euid,
+                group: self.credentials.egid,
+            }
+        } else {
+            AccessUserInfo {
+                user: self.credentials.uid,
+                group: self.credentials.gid,
+            }
+        }
+    }
+
+    fn do_access(
+        &self,
+        pathname: impl path::Arg,
+        mode: AccessFlags,
+        caller: AccessUserInfo,
+    ) -> Result<(), Errno> {
+        let status = self.files.borrow().fs.file_status(pathname)?;
+        let owner = status.owner.into();
+        Self::do_access_mode(status.mode, owner, caller, &mode)
+    }
+
+    /// Handle syscall `faccessat`
+    pub(crate) fn sys_faccessat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: AccessFlags,
+        flags: AtFlags,
+    ) -> Result<(), Errno> {
+        let supported_flags =
+            AtFlags::AT_EACCESS | AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        // TODO: `AT_SYMLINK_NOFOLLOW` is accepted for Linux compatibility, but LiteBox file
+        // status lookups do not currently follow symlinks in any backend.
+        if flags.intersects(supported_flags.complement()) {
+            return Err(Errno::EINVAL);
+        }
+
+        Self::validate_access_mode(&mode)?;
+        let caller = self.access_user(&flags);
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        match fs_path {
+            FsPath::Absolute { path } => self.do_access(path, mode, caller),
+            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                let cwd = get_cwd();
+                self.do_access(cwd, mode, caller)
+            }
+            FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                let stat: FileStat = descriptor_stat(fd as usize, self)?;
+                let owner = AccessUserInfo {
+                    user: stat.st_uid,
+                    group: stat.st_gid,
+                };
+                Self::do_access_mode(
+                    Mode::from_bits_truncate(stat.st_mode & 0o7777),
+                    owner,
+                    caller,
+                    &mode,
+                )
+            }
+            FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
+            FsPath::FdRelative { .. } => {
+                log_unsupported!("fd-relative faccessat is not supported yet");
+                Err(Errno::EINVAL)
+            }
+        }
     }
 
     /// Read the target of a symbolic link
@@ -2774,8 +2877,14 @@ mod tests {
         // ── sys_lstat: lstat the relative file ──
         task.sys_lstat("file.txt").unwrap();
 
-        // ── sys_access: check relative file is accessible ──
-        task.sys_access("file.txt", AccessFlags::F_OK).unwrap();
+        // ── sys_faccessat: check relative file is accessible ──
+        task.sys_faccessat(
+            litebox_common_linux::AT_FDCWD,
+            "file.txt",
+            AccessFlags::F_OK,
+            AtFlags::empty(),
+        )
+        .unwrap();
 
         // ── sys_mkdir: create a subdirectory via relative path ──
         task.sys_mkdir("subdir", 0o777).unwrap();

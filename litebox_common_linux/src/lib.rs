@@ -2097,9 +2097,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pos_l: usize,
         pos_h: usize,
     },
-    Access {
+    Faccessat {
+        dirfd: i32,
         pathname: Platform::RawConstPointer<i8>,
         mode: AccessFlags,
+        flags: AtFlags,
     },
     Madvise {
         addr: Platform::RawMutPointer<u8>,
@@ -2596,7 +2598,19 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
             Sysno::preadv => sys_req!(Preadv { fd, iovec:*, iovcnt, pos_l, pos_h }),
             Sysno::pwritev => sys_req!(Pwritev { fd, iovec:*, iovcnt, pos_l, pos_h }),
-            Sysno::access => sys_req!(Access { pathname:*, mode }),
+            Sysno::access => SyscallRequest::Faccessat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                mode: ctx.sys_req_arg(1),
+                flags: AtFlags::empty(),
+            },
+            Sysno::faccessat => SyscallRequest::Faccessat {
+                dirfd: ctx.sys_req_arg(0),
+                pathname: ctx.sys_req_ptr(1),
+                mode: ctx.sys_req_arg(2),
+                flags: AtFlags::empty(),
+            },
+            Sysno::faccessat2 => sys_req!(Faccessat { dirfd, pathname:*, mode, flags }),
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),

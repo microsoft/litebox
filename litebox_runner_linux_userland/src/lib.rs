@@ -11,6 +11,11 @@ use std::path::{Path, PathBuf};
 
 extern crate alloc;
 
+// Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
+// credentials aligned with the in-memory filesystem default user and avoids truncating high host IDs.
+const DEFAULT_GUEST_UID: u16 = 1000;
+const DEFAULT_GUEST_GID: u16 = 1000;
+
 /// Run Linux programs with LiteBox on unmodified Linux
 ///
 /// Detailed logging can be controlled via the `LITEBOX_LOG` environment variable. For example:
@@ -198,6 +203,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_platform_multiplex::set_platform(platform);
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
+    // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) }
+        .try_into()
+        .context("failed to convert gettid result to i32")?;
+    // SAFETY: `getppid` takes no arguments and has no Rust-side aliasing requirements.
+    let ppid = unsafe { libc::getppid() };
+    let task_params = litebox_common_linux::TaskParams {
+        pid: tid,
+        ppid,
+        uid: u32::from(DEFAULT_GUEST_UID),
+        euid: u32::from(DEFAULT_GUEST_UID),
+        gid: u32::from(DEFAULT_GUEST_GID),
+        egid: u32::from(DEFAULT_GUEST_GID),
+    };
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
 
@@ -207,6 +226,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         if let Some(prog_data) = prog_data {
             let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
             let ancestors: Vec<_> = prog.ancestors().collect();
+            let chown_to_initial_user = |fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
+                                         path: &Path| {
+                fs.chown(
+                    path.to_str().unwrap(),
+                    Some(DEFAULT_GUEST_UID),
+                    Some(DEFAULT_GUEST_GID),
+                )
+                .unwrap();
+            };
             let mut prev_user = 0;
             for (path, &mode_and_user) in ancestors
                 .into_iter()
@@ -220,9 +248,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     in_mem.with_root_privileges(|fs| {
                         fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
                         if mode_and_user.1 != 0 {
-                            // This file is owned by a non-root user, so we need to set the ownership to our default user
-                            fs.chown(path.to_str().unwrap(), Some(1000), Some(1000))
-                                .unwrap();
+                            chown_to_initial_user(fs, path);
                         }
                     });
                 } else {
@@ -254,9 +280,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 in_mem.with_root_privileges(|fs| {
                     open_file(fs, prog.to_str().unwrap(), last.0);
                     if last.1 != 0 {
-                        // This file is owned by a non-root user, so we need to set the ownership to our default user
-                        fs.chown(prog.to_str().unwrap(), Some(1000), Some(1000))
-                            .unwrap();
+                        chown_to_initial_user(fs, &prog);
                     }
                 });
             } else {
@@ -356,8 +380,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     } else {
         envp
     };
-
-    let task_params = platform.init_task();
 
     #[cfg(target_arch = "x86_64")]
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter();

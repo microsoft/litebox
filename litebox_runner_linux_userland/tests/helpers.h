@@ -10,12 +10,14 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -35,6 +37,12 @@ static inline long itimer_value_us(const struct itimerval *iv) {
 static inline void die(const char *msg) {
     perror(msg);
     exit(1);
+}
+
+static inline void create_test_file(const char *path, mode_t mode) {
+    int fd = open(path, O_RDONLY | O_CREAT, mode);
+    TEST_ASSERT(fd >= 0, "create test file failed");
+    TEST_ASSERT(close(fd) == 0, "close test file failed");
 }
 
 static inline void expect_sys_shutdown(int fd, int how, const char *op) {
