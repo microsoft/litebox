@@ -52,24 +52,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     /// system.
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        Self::new_with_user(
-            litebox,
-            UserInfo {
-                user: 1000,
-                group: 1000,
-            },
-        )
-    }
-
-    /// Construct a new `FileSystem` instance with the given initial user.
-    #[must_use]
-    pub fn new_with_user(litebox: &LiteBox<Platform>, current_user: UserInfo) -> Self {
         let litebox = litebox.clone();
         let root = sync::RwLock::new(RootDir::new());
         Self {
             litebox,
             root,
-            current_user,
+            current_user: UserInfo {
+                user: 1000,
+                group: 1000,
+            },
             current_working_dir: "/".into(),
             unique_id_freshness: 1.into(), // the root dir gets unique ID of 0
         }

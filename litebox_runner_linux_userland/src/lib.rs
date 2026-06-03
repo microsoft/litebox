@@ -11,6 +11,11 @@ use std::path::{Path, PathBuf};
 
 extern crate alloc;
 
+// Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
+// credentials aligned with the in-memory filesystem default user and avoids truncating high host IDs.
+const DEFAULT_GUEST_UID: u16 = 1000;
+const DEFAULT_GUEST_GID: u16 = 1000;
+
 /// Run Linux programs with LiteBox on unmodified Linux
 ///
 /// Detailed logging can be controlled via the `LITEBOX_LOG` environment variable. For example:
@@ -198,13 +203,22 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_platform_multiplex::set_platform(platform);
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
-    let task_params = platform.init_task();
-    let fs_user = litebox::fs::UserInfo {
-        user: task_params.euid.try_into()?,
-        group: task_params.egid.try_into()?,
+    // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) }
+        .try_into()
+        .context("failed to convert gettid result to i32")?;
+    // SAFETY: `getppid` takes no arguments and has no Rust-side aliasing requirements.
+    let ppid = unsafe { libc::getppid() };
+    let task_params = litebox_common_linux::TaskParams {
+        pid: tid,
+        ppid,
+        uid: u32::from(DEFAULT_GUEST_UID),
+        euid: u32::from(DEFAULT_GUEST_UID),
+        gid: u32::from(DEFAULT_GUEST_GID),
+        egid: u32::from(DEFAULT_GUEST_GID),
     };
     let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new_with_user(litebox, fs_user);
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
 
         // When loading the program from the tar, we don't need to create ancestor
         // directories or write the program binary into the in-memory FS -- the program
@@ -216,8 +230,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                                          path: &Path| {
                 fs.chown(
                     path.to_str().unwrap(),
-                    Some(fs_user.user),
-                    Some(fs_user.group),
+                    Some(DEFAULT_GUEST_UID),
+                    Some(DEFAULT_GUEST_GID),
                 )
                 .unwrap();
             };
@@ -234,7 +248,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     in_mem.with_root_privileges(|fs| {
                         fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
                         if mode_and_user.1 != 0 {
-                            chown_to_initial_user(fs, path);
+                            chown_to_initial_user(fs, &prog);
                         }
                     });
                 } else {

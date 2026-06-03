@@ -19,7 +19,8 @@ use litebox::{
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno, signal::Signal,
+    InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,
+    signal::Signal,
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
@@ -1074,6 +1075,16 @@ impl<FS: ShimFS> Task<FS> {
         if access_mode.is_empty() {
             return Ok(());
         }
+        if caller.user == 0 {
+            if access_mode.contains(AccessFlags::X_OK)
+                && !mode.intersects(Mode::XUSR | Mode::XGRP | Mode::XOTH)
+            {
+                return Err(Errno::EACCES);
+            }
+            return Ok(());
+        }
+        // TODO: Linux also uses group bits when `owner.group` is in the caller's supplementary
+        // group list. `AccessUserInfo` only carries the real/effective primary group today.
         let (read, write, execute) = if caller.user == owner.user {
             (Mode::RUSR, Mode::WUSR, Mode::XUSR)
         } else if caller.group == owner.group {
@@ -1128,26 +1139,34 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<(), Errno> {
         let supported_flags =
             AtFlags::AT_EACCESS | AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
+        // TODO: `AT_SYMLINK_NOFOLLOW` is accepted for Linux compatibility, but LiteBox file
+        // status lookups do not currently follow symlinks in any backend.
         if flags.intersects(supported_flags.complement()) {
             return Err(Errno::EINVAL);
         }
 
         Self::validate_access_mode(&mode)?;
         let caller = self.access_user(&flags);
-        let cwd = self.fs.borrow().cwd.read().clone();
-        let fs_path = FsPath::new(dirfd, pathname, || cwd.clone())?;
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
             FsPath::Absolute { path } => self.do_access(path, mode, caller),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                let cwd = get_cwd();
                 self.do_access(cwd, mode, caller)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let stat = descriptor_stat(fd as usize, self)?;
+                let stat: FileStat = descriptor_stat(fd as usize, self)?;
                 let owner = AccessUserInfo {
                     user: stat.st_uid,
                     group: stat.st_gid,
                 };
-                Self::do_access_mode(Mode::from_bits_retain(stat.st_mode), owner, caller, &mode)
+                Self::do_access_mode(
+                    Mode::from_bits_truncate(stat.st_mode & 0o7777),
+                    owner,
+                    caller,
+                    &mode,
+                )
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::ENOENT),
             FsPath::FdRelative { .. } => {
