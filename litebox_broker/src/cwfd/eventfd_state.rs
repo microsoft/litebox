@@ -275,6 +275,10 @@ impl StateObject for EventfdState {
     fn current_events(&self) -> u32 {
         EventfdState::current_events(self)
     }
+
+    fn try_flush_subscriptions(&self) {
+        self.subscriptions.try_flush();
+    }
 }
 
 #[cfg(test)]

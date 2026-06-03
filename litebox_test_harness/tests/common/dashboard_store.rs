@@ -376,10 +376,7 @@ fn insert_run_row(conn: &Connection) -> i64 {
     let branch = std::env::var("LITEBOX_DASHBOARD_REF")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            git_capture(&["rev-parse", "--abbrev-ref", "HEAD"])
-                .filter(|s| s != "HEAD")
-        });
+        .or_else(|| git_capture(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|s| s != "HEAD"));
     let worktree_path =
         git_capture(&["rev-parse", "--show-toplevel"]).unwrap_or_else(|| "unknown".to_string());
     let dirty_status = git_capture(&["status", "--porcelain"]).unwrap_or_default();

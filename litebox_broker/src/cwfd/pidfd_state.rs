@@ -179,6 +179,10 @@ impl StateObject for PidfdState {
             0
         }
     }
+
+    fn try_flush_subscriptions(&self) {
+        self.subscriptions.try_flush();
+    }
 }
 
 /// Opens a pidfd watching `target_host_pid` via the `pidfd_open(2)`

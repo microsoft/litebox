@@ -725,6 +725,10 @@ impl StateObject for TcpConnState {
     fn current_events(&self) -> u32 {
         notification_events(TcpConnState::current_events(self))
     }
+
+    fn try_flush_subscriptions(&self) {
+        self.subject.try_flush();
+    }
 }
 
 fn notification_events(events: u32) -> u32 {

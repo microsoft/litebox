@@ -1296,105 +1296,97 @@ fn register_slave_write_after_master_close(reg: &mut Registry<'_>) {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    reg.test(
-        "vscode",
-        "pty",
-        "PTYR.slave_write_after_master_close.dpg1",
-    )
-    .timeout(15)
-    .build(|_cx| {
-        Box::new(move |_run| {
-            Box::pin(async move {
-                let outcome = (|| -> Result<String, String> {
-                    let pty = Pty::open()?;
-                    ensure_slave_path(&pty)?;
-                    let slave_path = CString::new(pty.slave_path())
-                        .map_err(|e| format!("slave_path nul: {e}"))?;
-                    // SAFETY: opening /dev/pts/N read/write; we own the
-                    // returned fd via OwnedFd.
-                    let slave_fd = unsafe {
-                        libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY)
-                    };
-                    if slave_fd < 0 {
-                        return Err(format!(
-                            "open(slave_path={:?}): {}",
-                            pty.slave_path(),
-                            std::io::Error::last_os_error()
-                        ));
-                    }
-                    // SAFETY: slave_fd was just returned by open and
-                    // ownership is transferred to OwnedFd.
-                    let slave: OwnedFd = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+    reg.test("vscode", "pty", "PTYR.slave_write_after_master_close.dpg1")
+        .timeout(15)
+        .build(|_cx| {
+            Box::new(move |_run| {
+                Box::pin(async move {
+                    let outcome = (|| -> Result<String, String> {
+                        let pty = Pty::open()?;
+                        ensure_slave_path(&pty)?;
+                        let slave_path = CString::new(pty.slave_path())
+                            .map_err(|e| format!("slave_path nul: {e}"))?;
+                        // SAFETY: opening /dev/pts/N read/write; we own the
+                        // returned fd via OwnedFd.
+                        let slave_fd = unsafe {
+                            libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY)
+                        };
+                        if slave_fd < 0 {
+                            return Err(format!(
+                                "open(slave_path={:?}): {}",
+                                pty.slave_path(),
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        // SAFETY: slave_fd was just returned by open and
+                        // ownership is transferred to OwnedFd.
+                        let slave: OwnedFd = unsafe { OwnedFd::from_raw_fd(slave_fd) };
 
-                    // Sanity check: a write before master close MUST
-                    // succeed. This rules out "slave was never writable
-                    // in this environment" as a confound.
-                    let pre = unsafe {
-                        libc::write(slave.as_raw_fd(), b"x".as_ptr().cast(), 1)
-                    };
-                    if pre != 1 {
-                        let e = std::io::Error::last_os_error();
-                        return Err(format!(
-                            "pre-close write(slave) rc={pre} errno={e}"
-                        ));
-                    }
+                        // Sanity check: a write before master close MUST
+                        // succeed. This rules out "slave was never writable
+                        // in this environment" as a confound.
+                        let pre =
+                            unsafe { libc::write(slave.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+                        if pre != 1 {
+                            let e = std::io::Error::last_os_error();
+                            return Err(format!("pre-close write(slave) rc={pre} errno={e}"));
+                        }
 
-                    // Drop master — triggers broker-side PtyState::drop
-                    // for the master endpoint and flips
-                    // `master_open_count` to 0.
-                    drop(pty);
+                        // Drop master — triggers broker-side PtyState::drop
+                        // for the master endpoint and flips
+                        // `master_open_count` to 0.
+                        drop(pty);
 
-                    // The shim-side release is synchronous from the
-                    // worker's POV (release_state RPC), but we still
-                    // give a small grace to absorb any
-                    // notification-ring lag before the slave's next
-                    // syscall observes the state change.
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                        // The shim-side release is synchronous from the
+                        // worker's POV (release_state RPC), but we still
+                        // give a small grace to absorb any
+                        // notification-ring lag before the slave's next
+                        // syscall observes the state change.
+                        std::thread::sleep(std::time::Duration::from_millis(50));
 
-                    // Post-close write: MUST be EIO.
-                    let rc = unsafe {
-                        libc::write(slave.as_raw_fd(), b"y".as_ptr().cast(), 1)
-                    };
-                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                    if rc >= 0 {
-                        return Err(format!(
-                            "write(slave) after master close returned rc={rc}; \
+                        // Post-close write: MUST be EIO.
+                        let rc = unsafe { libc::write(slave.as_raw_fd(), b"y".as_ptr().cast(), 1) };
+                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        if rc >= 0 {
+                            return Err(format!(
+                                "write(slave) after master close returned rc={rc}; \
                              expected -1/EIO"
-                        ));
-                    }
-                    if errno != libc::EIO {
-                        return Err(format!(
-                            "write(slave) after master close: errno={errno} \
+                            ));
+                        }
+                        if errno != libc::EIO {
+                            return Err(format!(
+                                "write(slave) after master close: errno={errno} \
                              ({}), expected EIO ({})",
-                            errno_name(errno),
-                            libc::EIO,
-                        ));
-                    }
+                                errno_name(errno),
+                                libc::EIO,
+                            ));
+                        }
 
-                    // Read of slave with master closed must return 0
-                    // (EOF), matching Linux PTY semantics. This is a
-                    // cheap second invariant that protects the
-                    // already-correct read path.
-                    let mut buf = [0u8; 16];
-                    let r =
-                        unsafe { libc::read(slave.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-                    if r != 0 {
-                        let e = std::io::Error::last_os_error();
-                        return Err(format!(
-                            "read(slave) after master close rc={r} errno={e}; \
+                        // Read of slave with master closed must return 0
+                        // (EOF), matching Linux PTY semantics. This is a
+                        // cheap second invariant that protects the
+                        // already-correct read path.
+                        let mut buf = [0u8; 16];
+                        let r = unsafe {
+                            libc::read(slave.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                        };
+                        if r != 0 {
+                            let e = std::io::Error::last_os_error();
+                            return Err(format!(
+                                "read(slave) after master close rc={r} errno={e}; \
                              expected 0 (EOF)"
-                        ));
-                    }
+                            ));
+                        }
 
-                    Ok("write→EIO; read→0 (EOF)".to_string())
-                })();
-                match outcome {
-                    Ok(detail) => TestOutcome::new("dpg1", true, detail),
-                    Err(detail) => TestOutcome::new("dpg1", false, detail),
-                }
+                        Ok("write→EIO; read→0 (EOF)".to_string())
+                    })();
+                    match outcome {
+                        Ok(detail) => TestOutcome::new("dpg1", true, detail),
+                        Err(detail) => TestOutcome::new("dpg1", false, detail),
+                    }
+                })
             })
-        })
-    });
+        });
 }
 
 fn errno_name(e: i32) -> &'static str {

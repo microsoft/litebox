@@ -542,9 +542,8 @@ async fn handle_poll_ready_after_exit(
             // path drives waitpid through MarkProcessExited).
             let mut status: libc::c_int = 0;
             // SAFETY: child is a valid pid; status is one i32.
-            let waited = unsafe {
-                libc::waitpid(child, std::ptr::from_mut(&mut status), libc::WNOHANG)
-            };
+            let waited =
+                unsafe { libc::waitpid(child, std::ptr::from_mut(&mut status), libc::WNOHANG) };
             if waited == child {
                 reaped = true;
                 // One last poll — observers fire immediately when the

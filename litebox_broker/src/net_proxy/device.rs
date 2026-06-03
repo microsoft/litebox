@@ -3,7 +3,7 @@
 
 //! LBNP IPC framing helpers.
 
-use crate::sock_compat::{self, RawSock, MSG_PEEK};
+use crate::sock_compat::{self, MSG_PEEK, RawSock};
 
 use tracing::error;
 

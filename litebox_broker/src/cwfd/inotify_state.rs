@@ -189,4 +189,8 @@ impl StateObject for InotifyState {
     fn current_events(&self) -> u32 {
         InotifyState::current_events(self)
     }
+
+    fn try_flush_subscriptions(&self) {
+        self.subscriptions.try_flush();
+    }
 }

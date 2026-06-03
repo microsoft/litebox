@@ -65,8 +65,7 @@ struct ProbeOut {
     all_successful: bool,
 }
 
-const STATX_ENOENT_STORM: HandlerToken<(), ProbeOut> =
-    HandlerToken::new("perf.statx_enoent_storm");
+const STATX_ENOENT_STORM: HandlerToken<(), ProbeOut> = HandlerToken::new("perf.statx_enoent_storm");
 const FORK_EXEC_TRUE: HandlerToken<(), ProbeOut> = HandlerToken::new("perf.fork_exec_true");
 
 /// `statx_enoent_storm`: issue N=1000 statx(2) calls for a path
@@ -120,8 +119,16 @@ async fn handle_statx_enoent_storm(
         let n = per_call.len();
         let p50 = if n >= 16 { per_call[n / 2] } else { 0 };
         let p95 = if n >= 16 { per_call[(n * 95) / 100] } else { 0 };
-        let min = if n >= 16 { *per_call.first().unwrap() } else { 0 };
-        let max = if n >= 16 { *per_call.last().unwrap() } else { 0 };
+        let min = if n >= 16 {
+            *per_call.first().unwrap()
+        } else {
+            0
+        };
+        let max = if n >= 16 {
+            *per_call.last().unwrap()
+        } else {
+            0
+        };
         Ok(ProbeOut {
             iterations_completed: ITERATIONS,
             elapsed_nanos,
@@ -183,8 +190,16 @@ async fn handle_fork_exec_true(
         let n = per_call.len();
         let p50 = if n >= 16 { per_call[n / 2] } else { 0 };
         let p95 = if n >= 16 { per_call[(n * 95) / 100] } else { 0 };
-        let min = if n >= 16 { *per_call.first().unwrap() } else { 0 };
-        let max = if n >= 16 { *per_call.last().unwrap() } else { 0 };
+        let min = if n >= 16 {
+            *per_call.first().unwrap()
+        } else {
+            0
+        };
+        let max = if n >= 16 {
+            *per_call.last().unwrap()
+        } else {
+            0
+        };
         Ok(ProbeOut {
             iterations_completed: ITERATIONS,
             elapsed_nanos,

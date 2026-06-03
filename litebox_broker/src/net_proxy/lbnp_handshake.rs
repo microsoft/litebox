@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use tracing::info;
 
-use crate::sock_compat::{self, IpcStream, PollFd, POLLIN, POLLOUT};
+use crate::sock_compat::{self, IpcStream, POLLIN, POLLOUT, PollFd};
 
 use super::device::DEVICE_MTU;
 

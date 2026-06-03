@@ -95,6 +95,10 @@ impl StateObject for SignalfdState {
     fn current_events(&self) -> u32 {
         SignalfdState::current_events(self)
     }
+
+    fn try_flush_subscriptions(&self) {
+        self.subscriptions.try_flush();
+    }
 }
 
 fn empty_sigset() -> std::io::Result<libc::sigset_t> {

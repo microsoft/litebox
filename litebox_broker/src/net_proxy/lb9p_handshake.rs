@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
-use crate::sock_compat::{self, IpcStream, PollFd, RawSock, POLLIN};
+use crate::sock_compat::{self, IpcStream, POLLIN, PollFd, RawSock};
 
 use super::LocalServiceRegistry;
 
