@@ -95,7 +95,7 @@ Initial scope:
 
 Exit criteria:
 
-- A user-side client can connect and negotiate. In the current hosted PoC, `litebox_runner_linux_userland` consumes an externally owned Unix-socket endpoint via `--broker-socket`, uses `litebox_broker_client` to negotiate, constructs the `LiteBox` local core with broker control already present, and the Linux shim reaches migrated objects through the local-core object factory namespace rather than through broker-specific APIs.
+- A user-side client can connect and negotiate. In the current hosted PoC, `litebox_runner_linux_userland` consumes an externally owned Unix-socket endpoint via `--broker-socket`, uses `litebox_broker_client` to negotiate, constructs the `LiteBox` local core with broker control already present, and the Linux shim reaches migrated event objects through the local-core event domain rather than through broker-specific APIs.
 - Broker binds caller identity to the authenticated channel endpoint. The first hosted executable passes the explicit unauthenticated placeholder through the same server API that later deployment-specific authentication will use.
 - Userland channel code only receives/sends decoded frames and supplies peer credentials; the generic server owns broker protocol dispatch and reports successful termination as peer-close or broker-close with a reason.
 - The Unix-socket channel adapter and hosted broker executable live in separate crates, so clients can depend on the channel without pulling in broker core/server deployment code.

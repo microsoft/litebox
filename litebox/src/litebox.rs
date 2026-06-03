@@ -7,8 +7,8 @@ use alloc::sync::Arc;
 
 use crate::{
     broker::{BrokerControl, BrokerState},
+    event::EventObjects,
     fd::Descriptors,
-    objects::Objects,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -126,9 +126,9 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         self.x.descriptors.write()
     }
 
-    /// Returns local-core object factories.
-    pub fn objects(&self) -> Objects<'_, Platform> {
-        Objects::new(&self.x.broker)
+    /// Returns local-core event object factories.
+    pub fn events(&self) -> EventObjects<'_, Platform> {
+        EventObjects::new(&self.x.broker)
     }
 }
 

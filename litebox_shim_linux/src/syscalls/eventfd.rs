@@ -8,8 +8,12 @@ use core::sync::atomic::AtomicU32;
 use litebox::{
     LiteBox,
     event::{
-        EventCounter, EventCounterReadMode, Events, IOPollable, observer::Observer,
-        polling::Pollee, polling::TryOpError, wait::WaitContext,
+        Events, IOPollable,
+        counter::{EventCounter, EventCounterReadMode},
+        observer::Observer,
+        polling::Pollee,
+        polling::TryOpError,
+        wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::OFlags,
@@ -45,7 +49,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         let local_core_event = if flags.contains(EfdFlags::NONBLOCK) {
             Some(
                 litebox
-                    .objects()
                     .events()
                     .create_counter(count)
                     .map_err(Errno::from)?,

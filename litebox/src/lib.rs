@@ -21,7 +21,6 @@ pub mod fd;
 pub mod fs;
 pub mod mm;
 pub mod net;
-pub mod objects;
 pub mod path;
 pub mod pipes;
 pub mod platform;
