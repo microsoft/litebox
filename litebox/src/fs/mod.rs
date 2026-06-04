@@ -130,6 +130,24 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         Err(errors::OpenError::Io)
     }
 
+    /// Extract the externally-routable backend identifier for an
+    /// existing open descriptor.
+    ///
+    /// For 9P-backed filesystems this returns the open Tlopen'd
+    /// `fid` number, suitable for handing to the broker via
+    /// `RegisterOfd` so that other processes can later
+    /// `CloneOfd`/[`Self::wrap_existing_fid`] it into their own
+    /// descriptor table while sharing the same open file
+    /// description (POSIX shared offset semantics).
+    ///
+    /// Default implementation returns `None` — backends that don't
+    /// expose externally-routable fid numbers (e.g. the in-memory
+    /// test FS) opt out by inheriting the default.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn descriptor_backend_fid(&self, fd: &TypedFd<Self>) -> Option<u32> {
+        None
+    }
+
     /// Close the file at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.

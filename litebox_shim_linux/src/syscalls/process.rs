@@ -5704,6 +5704,79 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     }
 
+                    // Phase 3 D5-fs: when LITEBOX_NEW_MUX is on and a
+                    // BrokerFsProvider is registered, migrate the
+                    // child's inherited FS fd directly onto a broker
+                    // OFD registry handle. The worker then runs a
+                    // CloneOfd against this `open_file_id` and wraps
+                    // the resulting 9P fid in a guest descriptor, so
+                    // the child's reads/writes go straight to the
+                    // broker (and through to the same kernel OFD as
+                    // the parent), preserving POSIX inherited-fd
+                    // shared-position semantics. The parent's
+                    // original 9P fid is left in place; `RegisterOfd`
+                    // is idempotent and only mints a broker-side
+                    // `Arc<File>` clone — the parent keeps using its
+                    // fid normally.
+                    if super::new_mux_enabled() {
+                        let parent_info: Option<(u32, alloc::string::String)> = {
+                            let files = self.files.borrow();
+                            files
+                                .run_on_raw_fd(entry.fd, |raw_fd_ref| match raw_fd_ref {
+                                    crate::RawFdRef::Fs(fd) => files
+                                        .fs
+                                        .descriptor_backend_fid(fd)
+                                        .zip(files.fs.fd_path(fd)),
+                                    #[allow(
+                                        clippy::wildcard_enum_match_arm,
+                                        reason = "only Fs-backed entries have 9P fids; \
+                                                  all other RawFdRef kinds opt out of D5-fs"
+                                    )]
+                                    _ => None,
+                                })
+                                .ok()
+                                .flatten()
+                        };
+                        if let (Some((parent_fid, path)), Some(provider)) =
+                            (parent_info, super::broker_fs_provider())
+                        {
+                            match provider.register_ofd(parent_fid) {
+                                Ok(open_file_id) => {
+                                    let status_flags_bits = entry.status_flags;
+                                    let path_hex = brokerfile_bridge_encode_path(&path);
+                                    broker_fd_bridge_specs.push(alloc::format!(
+                                        "{}:fs_fid:{}:{}:{}",
+                                        entry.fd,
+                                        open_file_id,
+                                        status_flags_bits,
+                                        path_hex,
+                                    ));
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: fs fd={} parent_fid={} migrated to broker OFD id={}",
+                                        self.pid,
+                                        entry.fd,
+                                        parent_fid,
+                                        open_file_id,
+                                    );
+                                    continue;
+                                }
+                                Err(_e) => {
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: fs fd={} parent_fid={} register_ofd failed: {:?}; falling back to mux relay",
+                                        self.pid,
+                                        entry.fd,
+                                        parent_fid,
+                                        _e,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     let (read_fd, write_fd) = match self.global.platform.create_external_fd() {
                         Ok(pair) => pair,
                         Err(_) => continue,

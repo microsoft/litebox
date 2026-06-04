@@ -1210,6 +1210,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         Ok(fd)
     }
 
+    fn descriptor_backend_fid(&self, fd: &FileFd<Platform, W>) -> Option<u32> {
+        self.litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| desc.entry.fid)
+    }
+
     #[allow(clippy::similar_names)]
     fn open(
         &self,
