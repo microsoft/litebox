@@ -238,17 +238,6 @@ impl Server {
     ) -> Result<crate::ofd_registry::OpenFileId, u32> {
         let registry = self.ofd_registry.as_ref().ok_or(libc::ENOTSUP as u32)?;
         let fid_arc = self.get_fid(fid)?;
-        let path = {
-            let state = read_lock(&fid_arc, "fid");
-            if !state.is_open || state.file.is_none() {
-                return Err(libc::EBADF as u32);
-            }
-            // Idempotent: if the fid already has an id, return it.
-            if let Some(existing) = state.open_file_id {
-                return Ok(existing);
-            }
-            state.path.clone()
-        };
         #[cfg(test)]
         if let Some(barrier) = {
             mutex_lock(&REGISTER_FID_BEFORE_WRITE_LOCK_HOOK, "register_hook")
@@ -257,14 +246,23 @@ impl Server {
         } {
             barrier.wait();
         }
-        // Acquire write lock to set the id atomically with the
-        // registry insertion. The file reference is read again
-        // under the write lock to avoid races with a concurrent
-        // Tclunk.
+
         let mut state = write_lock(&fid_arc, "fid");
+        if !state.is_open || state.file.is_none() {
+            return Err(libc::EBADF as u32);
+        }
+        // Idempotent: if the fid already has an id, return it.
         if let Some(existing) = state.open_file_id {
             return Ok(existing);
         }
+        {
+            let fids = read_lock(&self.fids, "fids");
+            match fids.get(&fid) {
+                Some(current) if Arc::ptr_eq(current, &fid_arc) => {}
+                _ => return Err(libc::EBADF as u32),
+            }
+        }
+        let path = state.path.clone();
         let file = state.file.as_ref().ok_or(libc::EBADF as u32)?;
         let id = registry
             .register(file, path)
