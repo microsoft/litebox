@@ -1147,7 +1147,7 @@ async fn handle_sigwinch_delivered_on_resize(
     Ok(PtyOut { detail })
 }
 
-// FOLLOWUP(#902)-broker-pty-background-read-sigttin: native passes this
+// FOLLOWUP-broker-pty-background-read-sigttin: native passes this
 // reproducer across EXEC_AGENTS; Litebox currently times out because a
 // background pgrp read on the controlling tty does not complete with
 // SIGTTIN semantics under broker-direct PTY.
@@ -2396,7 +2396,7 @@ mod leaf_subcmd {
             eprintln!("fork failed: {}", std::io::Error::last_os_error());
             return 1;
         }
-        // FOLLOWUP(#902)-broker-pty-background-read-sigttin: native delivers
+        // FOLLOWUP-broker-pty-background-read-sigttin: native delivers
         // SIGTTIN to the background pgrp immediately. Litebox currently
         // leaves the child blocked in read(), so this poll times out and
         // reports a minimal reproducer without marking the test xfail.
