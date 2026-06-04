@@ -4220,6 +4220,7 @@ impl<FS: ShimFS> Task<FS> {
                             | SubsystemTag::InetListener
                             | SubsystemTag::InetDgram
                             | SubsystemTag::InetRaw
+                            | SubsystemTag::HostFd
                             | SubsystemTag::Unknown(_) => unreachable!(),
                         };
                         let pipe = super::broker_pipe::BrokerPipeFd::<Platform>::new(
@@ -4262,7 +4263,8 @@ impl<FS: ShimFS> Task<FS> {
                     | SubsystemTag::Inotify
                     | SubsystemTag::Pipe
                     | SubsystemTag::Pty
-                    | SubsystemTag::InetRaw => {
+                    | SubsystemTag::InetRaw
+                    | SubsystemTag::HostFd => {
                         // Reserved for P2.A/B/C and later phases.
                         // Until those subphases land, the receive
                         // path drops the fd cleanly rather than
