@@ -8,7 +8,7 @@ use core::sync::atomic::AtomicU32;
 use litebox::{
     event::{
         Events, IOPollable,
-        counter::{EventCounter, EventCounterReadMode},
+        counter::{EventCounter, EventCounterError, EventCounterReadMode},
         observer::Observer,
         polling::{Pollee, TryOpError},
         wait::WaitContext,
@@ -65,10 +65,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
             Self::ShimLocal { .. } => true,
             Self::LocalCore(counter) => counter.supports_blocking_operations(),
         }
-    }
-
-    fn is_local_core(&self) -> bool {
-        matches!(self, Self::LocalCore(_))
     }
 
     fn read(
@@ -192,14 +188,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     super::common_functions_for_file_status!();
 
     pub(crate) fn set_status_flags(&self, requested: OFlags, mask: OFlags) -> Result<(), Errno> {
-        let current_status = self.get_status();
         let new_status = (self.get_status() & mask.complement()) | (requested & mask);
-        if !current_status.contains(OFlags::NONBLOCK)
-            && new_status.contains(OFlags::NONBLOCK)
-            && !self.counter.is_local_core()
-        {
-            return Err(Errno::EINVAL);
-        }
         if !new_status.contains(OFlags::NONBLOCK) && !self.counter.supports_blocking_operations() {
             return Err(Errno::EINVAL);
         }
@@ -237,9 +226,11 @@ impl<FS: ShimFS> GlobalState<FS> {
 
         let count = u64::from(initval);
         let counter = if flags.contains(EfdFlags::NONBLOCK) {
-            EventFileCounter::local_core(
-                EventCounter::new(&self.litebox, count).map_err(Errno::from)?,
-            )
+            match EventCounter::new(&self.litebox, count) {
+                Ok(counter) => EventFileCounter::local_core(counter),
+                Err(EventCounterError::Unavailable) => EventFileCounter::shim_local(count),
+                Err(error) => return Err(error.into()),
+            }
         } else {
             EventFileCounter::shim_local(count)
         };
@@ -257,7 +248,7 @@ fn consume_mode(semaphore: bool) -> EventCounterReadMode {
 
 #[cfg(test)]
 mod tests {
-    use litebox::event::wait::WaitState;
+    use litebox::{event::wait::WaitState, fs::OFlags};
     use litebox_common_linux::{EfdFlags, errno::Errno};
     use litebox_platform_multiplex::platform;
 
@@ -347,14 +338,39 @@ mod tests {
     }
 
     #[test]
-    fn test_nonblocking_eventfd_requires_broker_control() {
+    fn test_nonblocking_eventfd_uses_shim_local_without_broker_control() {
         let task = crate::syscalls::tests::init_platform(None);
 
+        let eventfd = task
+            .global
+            .create_linux_eventfd(0, EfdFlags::NONBLOCK)
+            .unwrap();
         assert_eq!(
-            task.global
-                .create_linux_eventfd(0, EfdFlags::NONBLOCK)
-                .map(|_| ()),
-            Err(Errno::EIO)
+            eventfd.read(&WaitState::new(platform()).context()),
+            Err(Errno::EAGAIN)
+        );
+        assert_eq!(
+            eventfd.write(&WaitState::new(platform()).context(), 1),
+            Ok(8)
+        );
+        assert_eq!(eventfd.read(&WaitState::new(platform()).context()), Ok(1));
+    }
+
+    #[test]
+    fn test_shim_local_eventfd_can_be_made_nonblocking() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let eventfd = task
+            .global
+            .create_linux_eventfd(0, EfdFlags::empty())
+            .unwrap();
+
+        eventfd
+            .set_status_flags(OFlags::NONBLOCK, OFlags::NONBLOCK)
+            .unwrap();
+        assert_eq!(
+            eventfd.read(&WaitState::new(platform()).context()),
+            Err(Errno::EAGAIN)
         );
     }
 }
