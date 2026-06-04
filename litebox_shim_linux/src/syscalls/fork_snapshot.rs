@@ -2208,6 +2208,7 @@ mod tests {
                 BrokerHandleKind::UnixSocket,
                 BrokerHandleKind::TcpConn,
                 BrokerHandleKind::InetListener,
+                BrokerHandleKind::InetDgram,
             ];
             for k in &kinds {
                 match k {
@@ -2218,7 +2219,8 @@ mod tests {
                     | BrokerHandleKind::Pipe
                     | BrokerHandleKind::UnixSocket
                     | BrokerHandleKind::TcpConn
-                    | BrokerHandleKind::InetListener => {}
+                    | BrokerHandleKind::InetListener
+                    | BrokerHandleKind::InetDgram => {}
                 }
             }
             kinds
