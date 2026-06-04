@@ -484,8 +484,8 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
                 Ok(())
             }
             ArchSpecificRegister::GsBase => {
-                unsafe { litebox_common_linux::wrgsbase(val) };
-                Ok(())
+                // See https://github.com/microsoft/litebox/pull/806#discussion_r3210873538
+                unimplemented!()
             }
             _ => Err(ArchSpecificError::RegisterUnsupported),
         }
@@ -497,7 +497,10 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     ) -> Result<usize, ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
-            ArchSpecificRegister::GsBase => Ok(unsafe { litebox_common_linux::rdgsbase() }),
+            ArchSpecificRegister::GsBase => {
+                // See https://github.com/microsoft/litebox/pull/806#discussion_r3210873538
+                unimplemented!()
+            }
             _ => Err(ArchSpecificError::RegisterUnsupported),
         }
     }
