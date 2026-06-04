@@ -1169,46 +1169,36 @@ impl<FS: ShimFS> Task<FS> {
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
-        let files = self.files.borrow();
-        let res = files
-            .run_on_raw_fd(
-                raw_fd,
-                |fd| {
-                    write_to_iovec(iovs, |buf, _total| {
-                        files.fs.write(fd, buf, None).map_err(Errno::from)
-                    })
-                },
-                |fd| {
-                    write_to_iovec(iovs, |buf, _total| {
-                        self.global.sendto(
-                            &self.wait_cx(),
-                            fd,
-                            buf,
-                            litebox_common_linux::SendFlags::empty(),
-                            None,
-                        )
-                    })
-                },
-                |_fd| todo!("pipes"),
-                |fd| {
-                    let handle = self
-                        .global
-                        .litebox
-                        .descriptor_table()
-                        .entry_handle(fd)
-                        .ok_or(Errno::EBADF)?;
-                    write_eventfd_iovec(iovs, |value| {
-                        handle.with_entry(|file| file.write(&self.wait_cx(), value))
-                    })
-                },
-                |_fd| Err(Errno::EINVAL),
-                |_fd| todo!("unix"),
-            )
-            .flatten();
-        if let Err(Errno::EPIPE) = res {
-            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
+        {
+            let files = self.files.borrow();
+            if let Some(size) = files
+                .run_on_raw_fd(
+                    raw_fd,
+                    |_fd| Ok(None),
+                    |_fd| Ok(None),
+                    |_fd| Ok(None),
+                    |fd| {
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        write_eventfd_iovec(iovs, |value| {
+                            handle.with_entry(|file| file.write(&self.wait_cx(), value))
+                        })
+                        .map(Some)
+                    },
+                    |_fd| Ok(None),
+                    |_fd| Ok(None),
+                )
+                .flatten()?
+            {
+                return Ok(size);
+            }
         }
-        res
+
+        write_to_iovec(iovs, |buf, _total| self.sys_write(fd, buf, None))
     }
 
     fn validate_access_mode(mode: &AccessFlags) -> Result<(), Errno> {
@@ -2738,6 +2728,40 @@ mod tests {
 
         assert_eq!(result, Ok(first.len()));
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn writev_uses_generic_write_path_for_pipes() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let first = b"hello ";
+        let second = b"pipe";
+        let iovs = [
+            IoWriteVec {
+                iov_base: ConstPtr::from_ptr(first.as_ptr()),
+                iov_len: first.len(),
+            },
+            IoWriteVec {
+                iov_base: ConstPtr::from_ptr(second.as_ptr()),
+                iov_len: second.len(),
+            },
+        ];
+
+        assert_eq!(
+            task.sys_writev(
+                i32::try_from(write_fd).unwrap(),
+                ConstPtr::from_ptr(iovs.as_ptr()),
+                iovs.len()
+            ),
+            Ok(first.len() + second.len())
+        );
+
+        let mut output = [0u8; 10];
+        assert_eq!(
+            task.sys_read(i32::try_from(read_fd).unwrap(), &mut output, None),
+            Ok(output.len())
+        );
+        assert_eq!(&output, b"hello pipe");
     }
 
     #[test]
