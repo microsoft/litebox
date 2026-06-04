@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
+pub mod broker_fs_provider;
 pub mod broker_inet_dgram_provider;
 pub mod broker_inet_listener_provider;
 pub mod broker_inet_raw_provider;
@@ -3531,6 +3532,12 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     ));
     litebox_shim_linux::syscalls::set_broker_pipe_provider(pipe_provider)
         .map_err(|_| anyhow!("pipe provider already set"))?;
+
+    let fs_provider = Arc::new(crate::broker_fs_provider::RunnerBrokerFsProvider::new(
+        Arc::clone(&client),
+    ));
+    litebox_shim_linux::syscalls::set_broker_fs_provider(fs_provider)
+        .map_err(|_| anyhow!("fs provider already set"))?;
 
     let socketpair_provider = Arc::new(
         crate::broker_socketpair_provider::RunnerBrokerSocketPairProvider::new(

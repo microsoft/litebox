@@ -4,6 +4,7 @@
 //! Syscalls Handlers
 
 pub(crate) mod broker_backed;
+pub(crate) mod broker_fs;
 pub(crate) mod broker_inet_dgram;
 pub(crate) mod broker_inet_listener;
 pub(crate) mod broker_inet_raw;
@@ -20,6 +21,7 @@ pub(crate) mod inotify;
 /// calls this at bootstrap if a broker fd-token control socket is
 /// available; the shim consults the registered provider from
 /// `sys_eventfd2`.
+pub use broker_fs::{broker_fs_provider, set_broker_fs_provider};
 pub use broker_inet_dgram::{
     broker_inet_dgram_enabled, broker_inet_dgram_provider, set_broker_inet_dgram_enabled,
     set_broker_inet_dgram_provider,
