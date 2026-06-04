@@ -51,6 +51,8 @@ const TCP_CONN_MATRIX: HandlerToken<TcpConnTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.tcp_conn");
 const TCP_CONN_PEER: HandlerToken<TcpConnPeerArgs, TcpConnPeerOutput> =
     HandlerToken::new("inherit_matrix.tcp_conn_peer");
+const FS_FID: HandlerToken<FsFidTrialArgs, ChildOutput> =
+    HandlerToken::new("inherit_matrix.fs_fid");
 
 const TCP_CONN_READY: &str = "tcp_conn_listening";
 
@@ -306,6 +308,32 @@ struct TcpConnPeerOutput {
     detail: String,
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum FsFidScenario {
+    SharedPosition,
+    UnlinkedAfterInherit,
+    ParentCloseFirst,
+}
+
+impl FsFidScenario {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::SharedPosition => "shared_position",
+            Self::UnlinkedAfterInherit => "unlinked_after_inherit",
+            Self::ParentCloseFirst => "parent_close_first",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct FsFidTrialArgs {
+    child_binary: String,
+    scenario: FsFidScenario,
+    test_id: String,
+    timeout_ms: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct ChildOutput {
     exit_code: i32,
@@ -324,7 +352,53 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(SOCKETPAIR_MATRIX, handle_socketpair_trial);
     register_handler!(TCP_CONN_MATRIX, handle_tcp_conn_trial);
     register_handler!(TCP_CONN_PEER, handle_tcp_conn_peer);
+    register_handler!(FS_FID, handle_fs_fid_trial);
     register_leaf_subcommand!("inherit-matrix", leaf_subcmd::subcmd_inherit_matrix);
+
+    for scenario in [
+        FsFidScenario::SharedPosition,
+        FsFidScenario::UnlinkedAfterInherit,
+        FsFidScenario::ParentCloseFirst,
+    ] {
+        let id = format!("inherit_matrix.fs_fid.{}", scenario.id());
+        reg.test("vscode", "inherit_matrix", id.clone())
+            .timeout(30)
+            .build(move |cx| {
+                let parent = cx.require(AgentName::Dpg1);
+                let id = id.clone();
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let child_binary = run.self_exe().to_string();
+                        let result = run
+                            .send_named_typed(
+                                &parent,
+                                &FS_FID,
+                                FsFidTrialArgs {
+                                    child_binary,
+                                    scenario,
+                                    test_id: id,
+                                    timeout_ms: 2000,
+                                },
+                            )
+                            .await;
+                        match result {
+                            Ok(out) if out.exit_code == 0 => {
+                                TestOutcome::new("Dpg1", true, out.stdout)
+                            }
+                            Ok(out) => TestOutcome::new(
+                                "Dpg1",
+                                false,
+                                format!(
+                                    "exit_code={} stdout={:?} stderr={:?}",
+                                    out.exit_code, out.stdout, out.stderr
+                                ),
+                            ),
+                            Err(error) => TestOutcome::new("Dpg1", false, error),
+                        }
+                    })
+                })
+            });
+    }
 
     for &subsystem in &[
         InheritSubsystem::TcpListen,
@@ -1528,6 +1602,126 @@ async fn handle_pty_trial(
     })
 }
 
+const FS_FID_PAYLOAD: &[u8] = b"fs-fid-payload";
+
+async fn handle_fs_fid_trial(
+    args: FsFidTrialArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    let path = fs_fid_path(&args.test_id);
+    let result = run_fs_fid_trial(&args, &path);
+    let cleanup = std::fs::remove_file(&path);
+    match result {
+        Ok(mut out) => {
+            if out.exit_code == 0
+                && let Err(e) = cleanup
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                out.exit_code = 1;
+                out.stderr = format!("fs_fid cleanup {}: {e}; {}", path.display(), out.stderr);
+            }
+            Ok(out)
+        }
+        Err(e) => {
+            let _ = cleanup;
+            Err(e)
+        }
+    }
+}
+
+fn run_fs_fid_trial(
+    args: &FsFidTrialArgs,
+    path: &std::path::Path,
+) -> Result<ChildOutput, HandlerError> {
+    let _ = std::fs::remove_file(path);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| HandlerError(format!("fs_fid open {}: {e}", path.display())))?;
+    file.write_all(FS_FID_PAYLOAD)
+        .map_err(|e| HandlerError(format!("fs_fid seed write: {e}")))?;
+    file.flush()
+        .map_err(|e| HandlerError(format!("fs_fid seed flush: {e}")))?;
+
+    match args.scenario {
+        FsFidScenario::SharedPosition => {}
+        FsFidScenario::UnlinkedAfterInherit | FsFidScenario::ParentCloseFirst => {
+            file.seek(SeekFrom::Start(0))
+                .map_err(|e| HandlerError(format!("fs_fid seek start: {e}")))?;
+        }
+    }
+    std::fs::remove_file(path)
+        .map_err(|e| HandlerError(format!("fs_fid unlink {}: {e}", path.display())))?;
+
+    let fd = file.as_raw_fd();
+    clear_cloexec(fd)?;
+
+    let mut control = [-1i32; 2];
+    if matches!(args.scenario, FsFidScenario::ParentCloseFirst) {
+        // SAFETY: control points to two writable fd slots.
+        if unsafe { libc::pipe(control.as_mut_ptr()) } != 0 {
+            return Err(HandlerError(format!(
+                "fs_fid control pipe: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        clear_cloexec(control[0])?;
+    }
+
+    let mut child = Command::new(&args.child_binary);
+    child
+        .args(["inherit-matrix", "fs-fid-child", args.scenario.id()])
+        .env("LITEBOX_INHERIT_FD", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if matches!(args.scenario, FsFidScenario::ParentCloseFirst) {
+        child.env("LITEBOX_FS_FID_CONTROL_FD", control[0].to_string());
+    }
+    let child = child
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+
+    if matches!(args.scenario, FsFidScenario::ParentCloseFirst) {
+        drop(file);
+        // SAFETY: parent writes one byte to release the child, then closes both
+        // control endpoints it owns.
+        unsafe {
+            libc::close(control[0]);
+            let byte = [b'!'];
+            let _ = libc::write(control[1], byte.as_ptr().cast::<libc::c_void>(), byte.len());
+            libc::close(control[1]);
+        }
+    } else if control[0] >= 0 {
+        // SAFETY: defensive cleanup for unused control fds.
+        unsafe {
+            libc::close(control[0]);
+            libc::close(control[1]);
+        }
+    }
+
+    let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 1000))?;
+    Ok(ChildOutput {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
+}
+
+fn fs_fid_path(test_id: &str) -> std::path::PathBuf {
+    let sanitized: String = test_id
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' => c,
+            _ => '_',
+        })
+        .collect();
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(format!("canary-{sanitized}-{}.txt", std::process::id()))
+}
+
 const BROKERFILE_READ_PAYLOAD: &[u8] = b"brokerfile inherited read\n";
 const BROKERFILE_WRITE_PAYLOAD: &[u8] = b"hello\n";
 const BROKERFILE_LSEEK_PAYLOAD: &[u8] = b"ABCDEFGH";
@@ -2395,6 +2589,7 @@ mod leaf_subcmd {
             Some("pty-child") => pty_child(args),
             Some("signalfd-child") => signalfd_child(args),
             Some("brokerfile-child") => brokerfile_child(args),
+            Some("fs-fid-child") => fs_fid_child(args),
             Some("timerfd-child") => timerfd_child(args),
             Some(other) => {
                 eprintln!("inherit-matrix: unknown subcommand: {other}");
@@ -2645,6 +2840,62 @@ mod leaf_subcmd {
             return 1;
         }
         0
+    }
+
+    fn fs_fid_child(args: &[String]) -> i32 {
+        let Some(scenario) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix fs-fid-child: missing scenario");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix fs-fid-child: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+
+        match scenario {
+            "shared_position" => fs_fid_expect_eof(fd),
+            "unlinked_after_inherit" => read_brokerfile(fd, b"fs-fid-payload"),
+            "parent_close_first" => fs_fid_parent_close_first(fd),
+            other => {
+                eprintln!("inherit-matrix fs-fid-child: unknown scenario {other}");
+                2
+            }
+        }
+    }
+
+    fn fs_fid_expect_eof(fd: RawFd) -> i32 {
+        let mut byte = [0u8; 1];
+        // SAFETY: fd is inherited from the parent and byte is writable.
+        let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        if n == 0 {
+            println!("shared-position-eof");
+            0
+        } else {
+            eprintln!(
+                "inherit-matrix fs-fid shared_position: read n={n} byte={} err={}",
+                byte[0],
+                std::io::Error::last_os_error()
+            );
+            1
+        }
+    }
+
+    fn fs_fid_parent_close_first(fd: RawFd) -> i32 {
+        let Some(control_fd) = std::env::var("LITEBOX_FS_FID_CONTROL_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix fs-fid-child: bad LITEBOX_FS_FID_CONTROL_FD");
+            return 2;
+        };
+        let mut byte = [0u8; 1];
+        if read_exact_raw_fd(control_fd, &mut byte, "fs_fid control") != 0 {
+            return 1;
+        }
+        read_brokerfile(fd, b"fs-fid-payload")
     }
 
     fn brokerfile_child(args: &[String]) -> i32 {
