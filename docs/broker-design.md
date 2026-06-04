@@ -313,7 +313,7 @@ The durable-unicorn Linux experiment provides a future hosted-userland profile w
 - the broker binds the mapped ring set to the host-authenticated spawned runner identity;
 - the runner maps the `memfd`, initializes UserLiteBox/shim state, installs sandbox restrictions, then enters guest code.
 
-This is intentionally different from the current Unix-socket PoC. Today, `litebox_runner_linux_userland` does not spawn or supervise the broker. It consumes an already-running broker endpoint via unstable `--broker-socket`, negotiates the broker protocol through `litebox_broker_client`, and then starts the guest without issuing broker object operations as a startup smoke test. Broker lifecycle ownership stays outside the runner until a later deployment profile explicitly defines broker-owned launch.
+This is intentionally different from the current Unix-socket PoC. Today, `litebox_runner_linux_userland` does not spawn or supervise the broker. It consumes an already-running broker endpoint via unstable `--broker-socket`, negotiates the broker protocol through `litebox_broker_client`, and then starts the guest. A startup smoke test exercises only that connection/negotiation path, while broker-backed nonblocking Linux `eventfd` exercises the implemented guest-visible broker object path through the local-core event counter. Broker lifecycle ownership stays outside the runner until a later deployment profile explicitly defines broker-owned launch.
 
 The initial Linux ring set can use five unidirectional rings:
 
@@ -366,7 +366,7 @@ The eventual deployment contract should fail closed:
 6. The broker replies with supported services and capabilities.
 7. The user side starts only if the required versions and features match.
 
-The current hosted PoC implements only the first control-channel subset of that contract: an externally supplied Unix socket, protocol negotiation, unauthenticated placeholder peer credentials, and a broker setup deadline that bounds connection and negotiation. Full deployment-profile negotiation, host syscall profile matching, channel/ring negotiation, authenticated identity binding, and guest-visible broker object routing remain future work.
+The current hosted PoC implements the first control-channel subset of that contract: an externally supplied Unix socket, protocol negotiation, unauthenticated placeholder peer credentials, and a broker setup deadline that bounds connection and negotiation. It also routes the migrated nonblocking `eventfd` object family through broker-backed local-core event counters. Full deployment-profile negotiation, host syscall profile matching, channel/ring negotiation, authenticated identity binding, and broader guest-visible broker object routing remain future work.
 
 UserLiteBox should not depend on BrokerPlatform internals. It should depend on the host ABI selected by the deployment profile and the negotiated broker contract: memory-grant format, trap/upcall mechanism, shared-page support, direct fast-path permissions, broker-mediated network/storage requirements, timer behavior, and similar features. Enforcement happens broker-side through PolicyEngine; user-mode code only adapts to supported capabilities.
 
