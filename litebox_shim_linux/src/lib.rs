@@ -61,6 +61,7 @@ pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
         litebox::fs::tar_ro::FileSystem<Platform>,
     >,
 >;
+
 pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
 
 /// A trait required for file systems to be used in the shim.
@@ -164,11 +165,11 @@ impl LinuxShimBuilder {
     /// Returns a new shim builder.
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
-        Self::from_litebox(LiteBox::new(platform))
+        Self::new_with_litebox(LiteBox::new(platform))
     }
 
     /// Returns a new shim builder using an already-created LiteBox instance.
-    pub fn from_litebox(litebox: LiteBox<Platform>) -> Self {
+    pub fn new_with_litebox(litebox: LiteBox<Platform>) -> Self {
         let platform = litebox_platform_multiplex::platform();
         Self { platform, litebox }
     }
@@ -353,6 +354,10 @@ fn default_fs(
 // Special override so that `GETFL` can return stdio-specific flags
 #[derive(Clone)]
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
+
+/// Status flags for pipes
+#[derive(Clone)]
+pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {

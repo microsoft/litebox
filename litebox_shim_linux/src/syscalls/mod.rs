@@ -9,7 +9,6 @@ pub mod file;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
-pub(crate) mod pipe;
 pub mod process;
 pub(crate) mod unix;
 

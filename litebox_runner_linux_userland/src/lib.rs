@@ -3,10 +3,7 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use litebox::{
-    LiteBox,
-    fs::{FileSystem as _, Mode},
-};
+use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
@@ -218,10 +215,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let broker_connection = broker::connect(cli_args.broker_socket.as_deref())?;
 
     let shim_builder = if let Some(broker_connection) = &broker_connection {
-        litebox_shim_linux::LinuxShimBuilder::from_litebox(LiteBox::new_with_broker_control(
-            litebox_platform_multiplex::platform(),
-            broker_connection.control(),
-        ))
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(
+            litebox::LiteBox::new_with_broker_control(
+                litebox_platform_multiplex::platform(),
+                broker_connection.control(),
+            ),
+        )
     } else {
         litebox_shim_linux::LinuxShimBuilder::new()
     };

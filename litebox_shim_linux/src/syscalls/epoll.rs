@@ -143,7 +143,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 };
                 Some(poll(&proxy))
             }
-            EpollDescriptor::Pipe(fd) => global.with_linux_pipe_iopollable(fd, poll).ok(),
+            EpollDescriptor::Pipe(fd) => global.pipes.with_iopollable(fd, poll).ok(),
             EpollDescriptor::Unix(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
@@ -635,9 +635,10 @@ mod test {
     #[test]
     fn test_epoll_with_eventfd() {
         let (task, epoll) = setup_epoll();
-        let eventfd =
-            crate::syscalls::eventfd::EventFile::new(&task.global.litebox, 0, EfdFlags::CLOEXEC)
-                .unwrap();
+        let eventfd = task
+            .global
+            .create_linux_eventfd(0, EfdFlags::CLOEXEC)
+            .unwrap();
         let typed = task
             .global
             .litebox
@@ -732,9 +733,10 @@ mod test {
         let task = crate::syscalls::tests::init_platform(None);
 
         let mut set = super::PollSet::with_capacity(0);
-        let eventfd =
-            crate::syscalls::eventfd::EventFile::new(&task.global.litebox, 0, EfdFlags::empty())
-                .unwrap();
+        let eventfd = task
+            .global
+            .create_linux_eventfd(0, EfdFlags::empty())
+            .unwrap();
 
         let typed = task
             .global
