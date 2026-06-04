@@ -3228,6 +3228,101 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            // --- Parent broker socketpair installs ---
+            // D5-vsocket: replace parent-side UnixSocket peers with the broker
+            // endpoint paired with the worker endpoint shipped via
+            // --broker-fd-bridge. The first install consumes create_socketpair's
+            // creation ref; alias installs dup_handle before constructing their
+            // BrokerSocketPairFd so on_close has a matching release.
+            let parent_socketpair_installs: Vec<crate::BrokerSocketPairParentInstall> = vd
+                .broker_socketpair_parent_installs
+                .lock()
+                .drain(..)
+                .collect();
+            if !parent_socketpair_installs.is_empty() {
+                if let Some(provider) = super::broker_socketpair::broker_socketpair_provider() {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    let files = self.files.borrow();
+                    for install in parent_socketpair_installs {
+                        if install.dup_before_install
+                            && releaser.dup_handle(install.handle_id).is_err()
+                        {
+                            continue;
+                        }
+
+                        let flags = {
+                            let rds = files.raw_descriptor_store.read();
+                            let typed = rds
+                                .fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
+                                    install.guest_fd,
+                                )
+                                .ok();
+                            drop(rds);
+                            typed
+                                .and_then(|typed| {
+                                    let dt = self.global.litebox.descriptor_table();
+                                    let flags = dt.with_entry(
+                                        &typed,
+                                        |sock: &super::unix::UnixSocket<FS>| sock.get_status(),
+                                    );
+                                    drop(dt);
+                                    flags
+                                })
+                                .unwrap_or_else(litebox::fs::OFlags::empty)
+                                & litebox::fs::OFlags::STATUS_FLAGS_MASK
+                        };
+
+                        let sp_fd =
+                            super::broker_socketpair::BrokerSocketPairFd::<crate::Platform>::new(
+                                alloc::sync::Arc::clone(&provider),
+                                install.handle_id,
+                                install.endpoint,
+                                flags,
+                            );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<super::broker_socketpair::BrokerSocketPairSubsystem>(
+                            sp_fd,
+                        );
+
+                        let mut rds = files.raw_descriptor_store.write();
+                        if let Ok(old_sock) = rds
+                            .fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
+                                install.guest_fd,
+                            )
+                        {
+                            drop(rds);
+                            let _ = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .remove(&old_sock);
+                            rds = files.raw_descriptor_store.write();
+                        } else if let Ok(old_broker_sock) = rds.fd_consume_raw_integer::<
+                            super::broker_socketpair::BrokerSocketPairSubsystem,
+                        >(install.guest_fd) {
+                            drop(rds);
+                            let _ = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .remove(&old_broker_sock);
+                            rds = files.raw_descriptor_store.write();
+                        }
+                        let ok = rds.fd_into_specific_raw_integer(typed, install.guest_fd);
+                        debug_assert!(
+                            ok,
+                            "broker socketpair parent install: slot {} still occupied",
+                            install.guest_fd
+                        );
+                    }
+                }
+            }
+
             // --- Parent mux dispatcher ---
             // If commit_delayed_fork set up a multiplexer, start the parent
             // dispatcher that relays data between the mux socketpair and
@@ -4466,6 +4561,16 @@ impl<FS: ShimFS> Task<FS> {
             u64,
         );
         let mut broker_fd_bridge_transit_release: alloc::vec::Vec<TransitRelease> =
+            alloc::vec::Vec::new();
+        let mut broker_socketpair_parent_installs: alloc::vec::Vec<
+            crate::BrokerSocketPairParentInstall,
+        > = alloc::vec::Vec::new();
+        let mut broker_socketpair_parent_release_on_failure: alloc::vec::Vec<TransitRelease> =
+            alloc::vec::Vec::new();
+        // (bridge_index, worker_handle_id, endpoint_char, child_nonblock) for
+        // migrated virtual-socket streams whose dup'd child aliases need their
+        // own --broker-fd-bridge specs.
+        let mut broker_socketpair_migrated_streams: alloc::vec::Vec<(usize, u64, char, bool)> =
             alloc::vec::Vec::new();
         // (write_fd, read_fd, drained_data, write_flags, read_flags)
         let mut local_pipe_pairs: Vec<(usize, usize, Vec<u8>, u32, u32)> = Vec::new();
@@ -5904,6 +6009,118 @@ impl<FS: ShimFS> Task<FS> {
                         // Build a MuxParentStream for each parent counterpart.
                         let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
 
+                        if type_byte == b's' && super::new_mux_enabled() {
+                            let child_nonblock = {
+                                let files = self.files.borrow();
+                                let rds = files.raw_descriptor_store.read();
+                                let typed = rds
+                                    .fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
+                                        guest_fd,
+                                    )
+                                    .ok();
+                                drop(rds);
+                                typed
+                                    .and_then(|typed| {
+                                        let dt = self.global.litebox.descriptor_table();
+                                        let flags = dt.with_entry(
+                                            &typed,
+                                            |sock: &super::unix::UnixSocket<FS>| sock.get_status(),
+                                        );
+                                        drop(dt);
+                                        flags
+                                    })
+                                    .is_some_and(|flags| {
+                                        flags.contains(litebox::fs::OFlags::NONBLOCK)
+                                    })
+                            };
+
+                            if let Some(provider) =
+                                super::broker_socketpair::broker_socketpair_provider()
+                            {
+                                const SP_CAPACITY: u64 = 64 * 1024;
+                                const SP_ATOMIC: u64 = 4096;
+                                if let Ok((parent_handle, worker_handle)) =
+                                    provider.create_socketpair(SP_CAPACITY, SP_ATOMIC)
+                                {
+                                    let mut drained_ok = true;
+                                    if direction == ExternalFdDirection::Read && !drained.is_empty()
+                                    {
+                                        let mut off = 0;
+                                        while off < drained.len() {
+                                            match provider
+                                                .write_socketpair(parent_handle, &drained[off..])
+                                            {
+                                                Ok(0) | Err(_) => {
+                                                    drained_ok = false;
+                                                    break;
+                                                }
+                                                Ok(n) => off += n,
+                                            }
+                                        }
+                                    }
+
+                                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                                        alloc::sync::Arc::clone(&provider) as _;
+
+                                    if drained_ok {
+                                        let child_nonblock_flag =
+                                            if child_nonblock { 1 } else { 0 };
+                                        broker_fd_bridge_specs.push(alloc::format!(
+                                            "{guest_fd}:unix_socket:{worker_handle}:b:{child_nonblock_flag}"
+                                        ));
+                                        broker_fd_bridge_transit_release.push((
+                                            alloc::sync::Arc::clone(&releaser),
+                                            worker_handle,
+                                        ));
+                                        broker_socketpair_migrated_streams.push((
+                                            i,
+                                            worker_handle,
+                                            'b',
+                                            child_nonblock,
+                                        ));
+
+                                        if parents.is_empty() {
+                                            // No parent peer remains. Drop endpoint A so endpoint B
+                                            // observes peer shutdown after any prefilled bytes drain.
+                                            releaser.release(parent_handle);
+                                        } else {
+                                            for (parent_index, &(parent_fd, _, _)) in
+                                                parents.iter().enumerate()
+                                            {
+                                                broker_socketpair_parent_installs.push(
+                                                    crate::BrokerSocketPairParentInstall {
+                                                        guest_fd: parent_fd,
+                                                        handle_id: parent_handle,
+                                                        endpoint: litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::A,
+                                                        dup_before_install: parent_index > 0,
+                                                    },
+                                                );
+                                            }
+                                            broker_socketpair_parent_release_on_failure
+                                                .push((releaser, parent_handle));
+                                        }
+
+                                        handled_as_broker_bridge = true;
+                                        #[cfg(feature = "trace_syscalls")]
+                                        litebox::log_println!(
+                                            self.global.platform,
+                                            "[DELAYED-FORK] pid={}: stream={} unix socket migrated to broker handles parent={} worker={} child_nonblock={} parents={}",
+                                            self.pid,
+                                            stream_id,
+                                            parent_handle,
+                                            worker_handle,
+                                            child_nonblock,
+                                            parents.len(),
+                                        );
+                                    } else {
+                                        releaser.release(parent_handle);
+                                        releaser.release(worker_handle);
+                                    }
+                                }
+                            }
+                        }
+
                         // Check if the pipe's writer is already closed.
                         // When a Read-direction child pipe has a closed writer
                         // and there's drained data, no more data can arrive.
@@ -5929,7 +6146,11 @@ impl<FS: ShimFS> Task<FS> {
                             false
                         };
 
-                        if parents.is_empty()
+                        if handled_as_broker_bridge {
+                            // The virtual socket stream was replaced by direct broker
+                            // socketpair handles above. Keep the legacy mux parent
+                            // structures untouched for this stream.
+                        } else if parents.is_empty()
                             || (writer_closed && direction == ExternalFdDirection::Read)
                         {
                             #[cfg(feature = "trace_syscalls")]
@@ -6015,6 +6236,39 @@ impl<FS: ShimFS> Task<FS> {
                 // fd.  The parent `seen_streams` dedup installs a
                 // dup'd dispatch pipe for the alias.
                 for &(alias_fd, primary_idx) in &mux_aliases {
+                    if let Some(&(_, handle_id, endpoint_char, primary_nonblock)) =
+                        broker_socketpair_migrated_streams
+                            .iter()
+                            .find(|&&(idx, _, _, _)| idx == primary_idx)
+                    {
+                        let alias_nonblock = {
+                            let files = self.files.borrow();
+                            let rds = files.raw_descriptor_store.read();
+                            let typed = rds
+                                .fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
+                                    alias_fd,
+                                )
+                                .ok();
+                            drop(rds);
+                            typed
+                                .and_then(|typed| {
+                                    let dt = self.global.litebox.descriptor_table();
+                                    let flags = dt.with_entry(
+                                        &typed,
+                                        |sock: &super::unix::UnixSocket<FS>| sock.get_status(),
+                                    );
+                                    drop(dt);
+                                    flags
+                                })
+                                .is_some_and(|flags| flags.contains(litebox::fs::OFlags::NONBLOCK))
+                        } || primary_nonblock;
+                        let alias_nonblock_flag = if alias_nonblock { 1 } else { 0 };
+                        broker_fd_bridge_specs.push(alloc::format!(
+                            "{alias_fd}:unix_socket:{handle_id}:{endpoint_char}:{alias_nonblock_flag}"
+                        ));
+                        continue;
+                    }
+
                     let stream_id = u32::try_from(primary_idx).unwrap_or(0);
                     let &(_, _, direction) = &child_pipe_bridges[primary_idx];
                     let dir_byte = match direction {
@@ -6022,7 +6276,16 @@ impl<FS: ShimFS> Task<FS> {
                         ExternalFdDirection::Write => b'w',
                         ExternalFdDirection::ReadWrite => b'b',
                     };
-                    mux_stream_specs.push((stream_id, alias_fd, dir_byte, b'p', false));
+                    let type_byte = bridge_parent_info
+                        .get(primary_idx)
+                        .and_then(|v| v.first())
+                        .map_or(b'p', |&(_, _, sub)| match sub {
+                            crate::ReplacedSubsystem::Pipe => b'p',
+                            crate::ReplacedSubsystem::UnixSocket => b's',
+                            crate::ReplacedSubsystem::Pty => b't',
+                            crate::ReplacedSubsystem::Filesystem => b'f',
+                        });
+                    mux_stream_specs.push((stream_id, alias_fd, dir_byte, type_byte, false));
                 }
 
                 // Store mux info in VforkDone for the parent to consume.
@@ -6031,6 +6294,8 @@ impl<FS: ShimFS> Task<FS> {
                     .store(mux_parent_raw, core::sync::atomic::Ordering::Release);
                 *fc.vfork_done.mux_parent_streams.lock() = mux_parent_streams;
                 *fc.vfork_done.mux_orphan_streams.lock() = orphan_stream_ids;
+                *fc.vfork_done.broker_socketpair_parent_installs.lock() =
+                    broker_socketpair_parent_installs;
                 // Don't store fd_replacements — the mux replaces per-fd relay.
 
                 // Clear child_pipe_bridges — child OS fds for non-host-backed
@@ -6097,6 +6362,16 @@ impl<FS: ShimFS> Task<FS> {
                 for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
                     self.global.platform.close_host_fd(pr.host_fd);
                 }
+                for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
+                    releaser.release(handle_id);
+                }
+                for (releaser, handle_id) in broker_socketpair_parent_release_on_failure.drain(..) {
+                    releaser.release(handle_id);
+                }
+                fc.vfork_done
+                    .broker_socketpair_parent_installs
+                    .lock()
+                    .clear();
                 // Clean up mux socketpair on failure.
                 let mux_pfd = fc
                     .vfork_done
@@ -6189,6 +6464,13 @@ impl<FS: ShimFS> Task<FS> {
                 for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
                     releaser.release(handle_id);
                 }
+                for (releaser, handle_id) in broker_socketpair_parent_release_on_failure.drain(..) {
+                    releaser.release(handle_id);
+                }
+                fc.vfork_done
+                    .broker_socketpair_parent_installs
+                    .lock()
+                    .clear();
                 put_fc_back(self, fc);
                 return Err(Errno::ENOMEM);
             }
