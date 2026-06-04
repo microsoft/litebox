@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::vec::Vec;
 use core::ops::BitOr;
 
 use crate::event::EventObject;
@@ -112,6 +111,12 @@ impl<P: PolicyEngine> BrokerCore<P> {
         object_type: ObjectType,
         rights: ObjectRights,
     ) -> Result<ObjectHandle> {
+        if self.objects.len() >= self.limits.max_objects
+            || self.references.len() >= self.limits.max_references
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+
         let object_id = self.allocate_object_id()?;
         let reference_id = self.allocate_reference_id()?;
         let reference_generation = FIRST_REFERENCE_GENERATION;
@@ -151,14 +156,19 @@ impl<P: PolicyEngine> BrokerCore<P> {
         handle: ObjectHandle,
         object_type: ObjectType,
         rights: ObjectRights,
-    ) -> Result<ObjectId> {
-        let object_id = self.validate_handle(association, handle, object_type, rights)?;
+    ) -> Result<AuthorizedObject> {
+        let reference = self.validate_handle(association, handle, object_type, rights)?;
+        let object_id = reference.object_id;
+        let reference_rights = reference.rights;
         match self.policy.authorize(PolicyOperation::use_object(
             association.caller_credential(),
             object_type,
             rights,
         ))? {
-            PolicyDecision::Authorized => Ok(object_id),
+            PolicyDecision::Authorized => Ok(AuthorizedObject {
+                object_id,
+                rights: reference_rights,
+            }),
             _ => Err(BrokerError::InvalidPolicyDecision),
         }
     }
@@ -181,7 +191,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
         handle: ObjectHandle,
         expected_type: ObjectType,
         required_rights: ObjectRights,
-    ) -> Result<ObjectId> {
+    ) -> Result<ObjectReference> {
         let reference = self.reference_for_handle(association, handle)?;
         if reference.object_type != expected_type {
             return Err(BrokerError::WrongObjectType);
@@ -198,7 +208,7 @@ impl<P: PolicyEngine> BrokerCore<P> {
             return Err(BrokerError::WrongObjectType);
         }
 
-        Ok(reference.object_id)
+        Ok(*reference)
     }
 
     fn allocate_object_id(&mut self) -> Result<ObjectId> {
@@ -232,24 +242,14 @@ impl<P> BrokerCore<P> {
     /// Closes a broker association and releases references owned by it.
     pub fn close_association(&mut self, association: BrokerAssociation) {
         let identity = association.identity();
-        let reference_ids = self
-            .references
-            .iter()
-            .filter_map(|(reference_id, reference)| {
-                (reference.owner == identity).then_some(*reference_id)
-            })
-            .collect::<Vec<_>>();
-
-        let mut object_ids = Vec::new();
-        for reference_id in reference_ids {
-            if let Some(reference) = self.references.remove(&reference_id) {
-                object_ids.push(reference.object_id);
-            }
-        }
-
-        for object_id in object_ids {
-            self.drop_object_if_unreferenced(object_id);
-        }
+        self.references
+            .retain(|_, reference| reference.owner != identity);
+        let references = &self.references;
+        self.objects.retain(|object_id, _| {
+            references
+                .values()
+                .any(|reference| reference.object_id == *object_id)
+        });
     }
 
     fn reference_for_handle(
@@ -281,10 +281,18 @@ impl<P> BrokerCore<P> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AuthorizedObject {
+    pub(crate) object_id: ObjectId,
+    pub(crate) rights: ObjectRights,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BrokerError, CallerCredential, DefaultDenyPolicy, EventOnlyPolicy};
+    use crate::{
+        BrokerCoreLimits, BrokerError, CallerCredential, DefaultDenyPolicy, EventOnlyPolicy,
+    };
 
     #[test]
     fn object_and_reference_allocators_issue_max_id_then_exhaust() {
@@ -319,6 +327,31 @@ mod tests {
     }
 
     #[test]
+    fn insert_object_with_reference_enforces_object_and_reference_limits() {
+        let mut object_limited =
+            BrokerCore::new_with_limits(EventOnlyPolicy, BrokerCoreLimits::new(0, 1));
+        let association = object_limited
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        assert_eq!(
+            object_limited.create_event(&association),
+            Err(BrokerError::ResourceExhausted)
+        );
+
+        let mut reference_limited =
+            BrokerCore::new_with_limits(EventOnlyPolicy, BrokerCoreLimits::new(1, 0));
+        let association = reference_limited
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        assert_eq!(
+            reference_limited.create_event(&association),
+            Err(BrokerError::ResourceExhausted)
+        );
+    }
+
+    #[test]
     fn close_association_releases_owned_references_and_orphaned_objects() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
         let association = core
@@ -333,6 +366,27 @@ mod tests {
 
         assert!(core.references.is_empty());
         assert!(core.objects.is_empty());
+    }
+
+    #[test]
+    fn foreign_core_association_cannot_authorize_matching_handle_values() {
+        let mut owner_core = BrokerCore::new(EventOnlyPolicy);
+        let owner = owner_core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = owner_core.create_event(&owner).unwrap();
+
+        let mut other_core = BrokerCore::new(EventOnlyPolicy);
+        let other = other_core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+        let other_handle = other_core.create_event(&other).unwrap();
+        assert_eq!(handle, other_handle);
+
+        assert_eq!(
+            other_core.wait_event(&owner, handle),
+            Err(BrokerError::UnknownObject)
+        );
     }
 
     #[test]
@@ -378,7 +432,7 @@ mod tests {
         );
         assert!(matches!(
             core.wait_event(&owner, handle),
-            Ok(crate::WaitOutcome::WouldBlock(_))
+            Ok(litebox_broker_protocol::WaitOutcome::WouldBlock(_))
         ));
     }
 }

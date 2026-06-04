@@ -27,6 +27,12 @@ impl<T: ClientControlChannel> BrokerClient<T> {
         if self.state != crate::ConnectionState::AwaitingNegotiation {
             return Err(ClientError::AlreadyNegotiated);
         }
+        if !protocol_version.is_supported_by(CLIENT_PROTOCOL_VERSION) {
+            return Err(ClientError::UnsupportedVersion {
+                requested: protocol_version,
+                broker_protocol_version: CLIENT_PROTOCOL_VERSION,
+            });
+        }
 
         let response = self.request(BrokerRequest::Negotiate { protocol_version })?;
         match response {

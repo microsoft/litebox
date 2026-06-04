@@ -24,7 +24,9 @@ const MAX_FRAME_LEN: usize = 64 * 1024;
 /// Client-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamClientControlChannel {
     stream: UnixStream,
+    io_timeout: Option<Duration>,
     io_deadline: Option<Instant>,
+    active_request_deadline: Option<Instant>,
 }
 
 impl UnixStreamClientControlChannel {
@@ -32,7 +34,9 @@ impl UnixStreamClientControlChannel {
     pub const fn from_connected(stream: UnixStream) -> Self {
         Self {
             stream,
+            io_timeout: None,
             io_deadline: None,
+            active_request_deadline: None,
         }
     }
 
@@ -43,34 +47,82 @@ impl UnixStreamClientControlChannel {
 
     /// Sets the read and write timeout for broker control-channel operations.
     pub fn set_io_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.io_timeout = timeout;
         self.io_deadline = None;
+        self.active_request_deadline = None;
         self.set_stream_io_timeout(timeout)
     }
 
     /// Sets a wall-clock deadline for broker control-channel operations.
     pub fn set_io_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         self.io_deadline = deadline;
+        self.active_request_deadline = None;
         match deadline {
             Some(deadline) => self.set_stream_io_timeout(Some(io_timeout_for_deadline(deadline)?)),
-            None => self.set_stream_io_timeout(None),
+            None => self.set_stream_io_timeout(self.io_timeout),
         }
+    }
+
+    /// Clones the underlying stream so another owner can interrupt blocking I/O.
+    pub fn try_clone_stream(&self) -> io::Result<UnixStream> {
+        self.stream.try_clone()
     }
 
     fn set_stream_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(timeout)?;
         self.stream.set_write_timeout(timeout)
     }
+
+    fn current_deadline(&mut self) -> io::Result<Option<Instant>> {
+        if let Some(deadline) = self.io_deadline {
+            return Ok(Some(deadline));
+        }
+        if let Some(deadline) = self.active_request_deadline {
+            return Ok(Some(deadline));
+        }
+        let Some(timeout) = self.io_timeout else {
+            return Ok(None);
+        };
+        let deadline = deadline_after(timeout)?;
+        self.active_request_deadline = Some(deadline);
+        Ok(Some(deadline))
+    }
+
+    fn clear_active_request_deadline(&mut self) -> io::Result<()> {
+        if self.io_deadline.is_none() {
+            self.active_request_deadline = None;
+            self.set_stream_io_timeout(self.io_timeout)?;
+        }
+        Ok(())
+    }
 }
 
 /// Server-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamServerControlChannel {
     stream: UnixStream,
+    io_deadline: Option<Instant>,
 }
 
 impl UnixStreamServerControlChannel {
     /// Creates a server control channel from an accepted Unix stream.
     pub const fn from_accepted(stream: UnixStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            io_deadline: None,
+        }
+    }
+
+    /// Sets a wall-clock deadline for all broker control-channel operations.
+    pub fn set_io_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        self.io_deadline = deadline;
+        if let Some(deadline) = deadline {
+            let timeout = io_timeout_for_deadline(deadline)?;
+            self.stream.set_read_timeout(Some(timeout))?;
+            self.stream.set_write_timeout(Some(timeout))
+        } else {
+            self.stream.set_read_timeout(None)?;
+            self.stream.set_write_timeout(None)
+        }
     }
 }
 
@@ -78,18 +130,23 @@ impl ClientControlChannel for UnixStreamClientControlChannel {
     type Error = io::Error;
 
     fn send_request(&mut self, request: &BrokerRequest) -> io::Result<()> {
-        write_frame_with_deadline(
-            &mut self.stream,
-            &encode_request(*request).map_err(wire_error)?,
-            self.io_deadline,
-        )
+        let frame = encode_request(request.clone()).map_err(wire_error)?;
+        let deadline = self.current_deadline()?;
+        let result = write_frame_with_deadline(&mut self.stream, &frame, deadline);
+        if result.is_err() {
+            self.active_request_deadline = None;
+        }
+        result
     }
 
     fn recv_response(&mut self) -> io::Result<Option<ReceivedBrokerResponse>> {
-        let Some(frame) = read_frame_with_deadline(&mut self.stream, self.io_deadline)? else {
-            return Ok(None);
+        let deadline = self.current_deadline()?;
+        let result = match read_frame_with_deadline(&mut self.stream, deadline)? {
+            Some(frame) => decode_response(&frame).map(Some).map_err(wire_error),
+            None => Ok(None),
         };
-        decode_response(&frame).map(Some).map_err(wire_error)
+        self.clear_active_request_deadline()?;
+        result
     }
 }
 
@@ -103,22 +160,19 @@ impl ServerControlChannel for UnixStreamServerControlChannel {
     }
 
     fn recv_request(&mut self) -> io::Result<Option<ReceivedBrokerRequest>> {
-        let Some(frame) = read_frame(&mut self.stream)? else {
+        let Some(frame) = read_frame_with_deadline(&mut self.stream, self.io_deadline)? else {
             return Ok(None);
         };
         decode_request(&frame).map(Some).map_err(wire_error)
     }
 
     fn send_response(&mut self, response: &BrokerResponse) -> io::Result<()> {
-        write_frame(
+        write_frame_with_deadline(
             &mut self.stream,
-            &encode_response(*response).map_err(wire_error)?,
+            &encode_response(response.clone()).map_err(wire_error)?,
+            self.io_deadline,
         )
     }
-}
-
-fn read_frame(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
-    read_frame_with_deadline(stream, None)
 }
 
 fn read_frame_with_deadline(
@@ -155,10 +209,6 @@ fn read_frame_with_deadline(
         }
     }
     Ok(Some(frame))
-}
-
-fn write_frame(stream: &mut UnixStream, frame: &[u8]) -> io::Result<()> {
-    write_frame_with_deadline(stream, frame, None)
 }
 
 fn write_frame_with_deadline(
@@ -213,6 +263,12 @@ fn io_timeout_for_deadline(deadline: Instant) -> io::Result<Duration> {
     Ok(timeout)
 }
 
+fn deadline_after(timeout: Duration) -> io::Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "broker I/O timeout overflow"))
+}
+
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -231,9 +287,14 @@ mod tests {
     #[test]
     fn frame_round_trip() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
-        write_frame(&mut writer, &[1, 2, 3]).unwrap();
+        write_frame_with_deadline(&mut writer, &[1, 2, 3], None).unwrap();
 
-        assert_eq!(read_frame(&mut reader).unwrap().unwrap(), [1, 2, 3]);
+        assert_eq!(
+            read_frame_with_deadline(&mut reader, None)
+                .unwrap()
+                .unwrap(),
+            [1, 2, 3]
+        );
     }
 
     #[test]
@@ -241,7 +302,11 @@ mod tests {
         let (writer, mut reader) = UnixStream::pair().unwrap();
         drop(writer);
 
-        assert!(read_frame(&mut reader).unwrap().is_none());
+        assert!(
+            read_frame_with_deadline(&mut reader, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -250,14 +315,18 @@ mod tests {
         writer.write_all(&[1, 0]).unwrap();
         drop(writer);
         assert_eq!(
-            read_frame(&mut reader).unwrap_err().kind(),
+            read_frame_with_deadline(&mut reader, None)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
 
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer.write_all(&0u32.to_le_bytes()).unwrap();
         assert_eq!(
-            read_frame(&mut reader).unwrap_err().kind(),
+            read_frame_with_deadline(&mut reader, None)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
 
@@ -266,7 +335,9 @@ mod tests {
             .write_all(&u32::try_from(MAX_FRAME_LEN + 1).unwrap().to_le_bytes())
             .unwrap();
         assert_eq!(
-            read_frame(&mut reader).unwrap_err().kind(),
+            read_frame_with_deadline(&mut reader, None)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
 
@@ -275,7 +346,9 @@ mod tests {
         writer.write_all(&[1, 2]).unwrap();
         drop(writer);
         assert_eq!(
-            read_frame(&mut reader).unwrap_err().kind(),
+            read_frame_with_deadline(&mut reader, None)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
     }
@@ -299,6 +372,33 @@ mod tests {
     }
 
     #[test]
+    fn client_response_read_io_timeout_is_wall_clock() {
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamClientControlChannel::from_connected(client);
+        channel
+            .set_io_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        let reader = std::thread::spawn(move || channel.recv_response().unwrap_err());
+        server.write_all(&8u32.to_le_bytes()).unwrap();
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(20));
+            if server.write_all(&[0]).is_err() {
+                break;
+            }
+        }
+
+        let error = reader.join().expect("timeout reader panicked");
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "unexpected timeout error kind: {error:?}"
+        );
+    }
+
+    #[test]
     fn client_response_read_honors_io_deadline() {
         let (mut server, client) = UnixStream::pair().unwrap();
         let mut channel = UnixStreamClientControlChannel::from_connected(client);
@@ -308,6 +408,33 @@ mod tests {
 
         let reader = std::thread::spawn(move || channel.recv_response().unwrap_err());
         server.write_all(&8u32.to_le_bytes()).unwrap();
+
+        let error = reader.join().expect("deadline reader panicked");
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "unexpected deadline error kind: {error:?}"
+        );
+    }
+
+    #[test]
+    fn server_request_read_io_deadline_is_wall_clock() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamServerControlChannel::from_accepted(server);
+        channel
+            .set_io_deadline(Some(Instant::now() + Duration::from_millis(50)))
+            .unwrap();
+
+        let reader = std::thread::spawn(move || channel.recv_request().unwrap_err());
+        client.write_all(&8u32.to_le_bytes()).unwrap();
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(20));
+            if client.write_all(&[0]).is_err() {
+                break;
+            }
+        }
 
         let error = reader.join().expect("deadline reader panicked");
         assert!(

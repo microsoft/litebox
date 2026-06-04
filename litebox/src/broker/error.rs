@@ -74,11 +74,12 @@ pub(crate) fn map_broker_object_result<T>(
 impl From<BrokerObjectError> for EventCounterError {
     fn from(error: BrokerObjectError) -> Self {
         match error {
-            BrokerObjectError::InvalidObject => Self::InvalidInput,
             BrokerObjectError::WouldBlock => Self::WouldBlock,
             BrokerObjectError::ResourceExhausted => Self::ResourceExhausted,
             BrokerObjectError::UnexpectedResponse => Self::UnexpectedResponse,
-            _ => Self::Io,
+            BrokerObjectError::Control
+            | BrokerObjectError::InvalidObject
+            | BrokerObjectError::Internal => Self::Io,
         }
     }
 }

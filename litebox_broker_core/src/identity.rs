@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{BrokerCore, Result, allocate_id};
 
 /// Caller identity information supplied by the broker entry layer.
@@ -31,6 +33,17 @@ macro_rules! id_type {
 }
 
 id_type! {
+    /// Process-local broker core identity.
+    BrokerCoreId
+}
+
+static NEXT_CORE_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn allocate_core_id() -> BrokerCoreId {
+    BrokerCoreId::new(NEXT_CORE_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+id_type! {
     /// Broker-assigned sandbox session identity.
     SessionId
 }
@@ -47,15 +60,17 @@ id_type! {
 /// Broker-assigned identity for one caller association.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct AssociationIdentity {
-    session_id: SessionId,
-    process_id: ProcessId,
+    core: BrokerCoreId,
+    session: SessionId,
+    process: ProcessId,
 }
 
 impl AssociationIdentity {
-    const fn new(session_id: SessionId, process_id: ProcessId) -> Self {
+    const fn new(core_id: BrokerCoreId, session_id: SessionId, process_id: ProcessId) -> Self {
         Self {
-            session_id,
-            process_id,
+            core: core_id,
+            session: session_id,
+            process: process_id,
         }
     }
 }
@@ -64,9 +79,8 @@ impl AssociationIdentity {
 ///
 /// User mode does not choose this value. The broker entry layer authenticates
 /// the caller, then BrokerCore assigns this identity for all operations received
-/// on that association. The current architecture expects one BrokerCore per
-/// broker, so this token is scoped by broker-assigned session and process
-/// identity rather than by a separate core identifier.
+/// on that association. The token is scoped by a process-local BrokerCore
+/// identity so handles cannot be replayed across distinct core instances.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BrokerAssociation {
     /// Broker-assigned sandbox session and guest process identity.
@@ -78,12 +92,13 @@ pub struct BrokerAssociation {
 impl BrokerAssociation {
     /// Creates an authenticated association identity.
     pub(crate) const fn new(
+        core_id: BrokerCoreId,
         session_id: SessionId,
         process_id: ProcessId,
         caller_credential: CallerCredential,
     ) -> Self {
         Self {
-            identity: AssociationIdentity::new(session_id, process_id),
+            identity: AssociationIdentity::new(core_id, session_id, process_id),
             caller_credential,
         }
     }
@@ -108,6 +123,7 @@ impl<P> BrokerCore<P> {
         // The POC models one sandbox session per BrokerCore; multi-session
         // allocation belongs with the future deployment/session manager.
         let association = BrokerAssociation::new(
+            self.core_id,
             SessionId::FIRST,
             ProcessId::new(process_id),
             caller_credential,
@@ -138,5 +154,20 @@ mod tests {
             second.caller_credential(),
             CallerCredential::Unauthenticated
         );
+    }
+
+    #[test]
+    fn create_association_scopes_identity_to_core_instance() {
+        let mut first_core = BrokerCore::new(DefaultDenyPolicy);
+        let mut second_core = BrokerCore::new(DefaultDenyPolicy);
+
+        let first = first_core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second = second_core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        assert_ne!(first.identity(), second.identity());
     }
 }

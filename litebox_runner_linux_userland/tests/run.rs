@@ -9,6 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c"];
+
 #[must_use]
 struct Runner {
     command: std::process::Command,
@@ -192,9 +195,18 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
     files
 }
 
+fn is_broker_only_c_test(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| BROKER_ONLY_C_TESTS.contains(&name))
+}
+
 #[test]
 fn test_dynamic_lib_with_rewriter() {
     for path in find_c_test_files("./tests") {
+        if is_broker_only_c_test(&path) {
+            continue;
+        }
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -208,6 +220,9 @@ fn test_dynamic_lib_with_rewriter() {
 #[test]
 fn test_static_exec_with_rewriter() {
     for path in find_c_test_files("./tests") {
+        if is_broker_only_c_test(&path) {
+            continue;
+        }
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -245,36 +260,83 @@ fn unique_test_socket_path(name: &str) -> PathBuf {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn spawn_test_broker<P>(socket_path: &Path, policy: P) -> std::thread::JoinHandle<()>
+struct TestBroker {
+    thread: Option<std::thread::JoinHandle<()>>,
+    done_rx: std::sync::mpsc::Receiver<()>,
+    socket_path: PathBuf,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl TestBroker {
+    fn join(mut self) {
+        self.done_rx
+            .recv_timeout(BROKER_HELPER_TIMEOUT)
+            .expect("broker test server did not finish");
+        self.thread
+            .take()
+            .expect("broker test server thread missing")
+            .join()
+            .expect("broker test server panicked");
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl Drop for TestBroker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn spawn_test_broker<P>(socket_path: &Path, policy: P) -> TestBroker
 where
     P: litebox_broker_core::PolicyEngine + Send + 'static,
 {
     let _ = std::fs::remove_file(socket_path);
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let server_socket_path = socket_path.to_path_buf();
+    let cleanup_socket_path = socket_path.to_path_buf();
     let broker_thread = std::thread::spawn(move || {
-        let listener = std::os::unix::net::UnixListener::bind(&server_socket_path)
-            .expect("failed to bind broker test socket");
-        ready_tx.send(()).expect("failed to report broker ready");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let listener = std::os::unix::net::UnixListener::bind(&server_socket_path)
+                .expect("failed to bind broker test socket");
+            ready_tx.send(()).expect("failed to report broker ready");
 
-        let (stream, _) = listener.accept().expect("failed to accept broker client");
-        let mut channel =
-            litebox_broker_unix_socket::UnixStreamServerControlChannel::from_accepted(stream);
-        let mut core = litebox_broker_core::BrokerCore::new(policy);
-        let termination = litebox_broker_server::serve_connection(&mut core, &mut channel)
-            .expect("broker server failed");
-        assert_eq!(
-            termination,
-            litebox_broker_server::ConnectionTermination::PeerClosed
-        );
-        let _ = std::fs::remove_file(server_socket_path);
+            let (stream, _) = listener.accept().expect("failed to accept broker client");
+            stream
+                .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
+                .expect("failed to configure broker test read timeout");
+            stream
+                .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
+                .expect("failed to configure broker test write timeout");
+            let mut channel =
+                litebox_broker_unix_socket::UnixStreamServerControlChannel::from_accepted(stream);
+            let mut core = litebox_broker_core::BrokerCore::new(policy);
+            let termination = litebox_broker_server::serve_connection(&mut core, &mut channel)
+                .expect("broker server failed");
+            assert_eq!(
+                termination,
+                litebox_broker_server::ConnectionTermination::PeerClosed
+            );
+        }));
+        let _ = std::fs::remove_file(&server_socket_path);
+        let _ = done_tx.send(());
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     });
 
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("broker test server did not start");
-    broker_thread
+    TestBroker {
+        thread: Some(broker_thread),
+        done_rx,
+        socket_path: cleanup_socket_path,
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -287,8 +349,7 @@ fn test_runner_connects_to_broker() {
     Runner::new(&true_path, "broker_true_rewriter")
         .broker_socket(&socket_path)
         .run();
-    broker_thread.join().expect("broker test server panicked");
-    let _ = std::fs::remove_file(socket_path);
+    broker_thread.join();
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -302,8 +363,7 @@ fn test_broker_backed_eventfd_with_rewriter() {
         .broker_socket(&socket_path)
         .run();
 
-    broker_thread.join().expect("broker test server panicked");
-    let _ = std::fs::remove_file(socket_path);
+    broker_thread.join();
 }
 
 #[cfg(target_arch = "x86_64")]

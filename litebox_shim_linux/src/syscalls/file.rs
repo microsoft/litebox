@@ -904,7 +904,12 @@ impl<FS: ShimFS> Task<FS> {
                     |_fd| Ok(None),
                     |_fd| Ok(None),
                     |fd| {
-                        validate_eventfd_iovec_len(iovs.iter().map(|iov| iov.iov_len))?;
+                        let total_len =
+                            eventfd_iovec_total_len(iovs.iter().map(|iov| iov.iov_len))?;
+                        if total_len == 0 {
+                            return Ok(Some(0));
+                        }
+                        validate_eventfd_iovec_len(total_len)?;
                         let handle = self
                             .global
                             .litebox
@@ -977,7 +982,7 @@ fn check_iov_lens(iov_lens: impl IntoIterator<Item = usize>) -> Result<(), Errno
     Ok(())
 }
 
-fn validate_eventfd_iovec_len(iov_lens: impl IntoIterator<Item = usize>) -> Result<(), Errno> {
+fn eventfd_iovec_total_len(iov_lens: impl IntoIterator<Item = usize>) -> Result<usize, Errno> {
     let mut total_len = 0usize;
     for iov_len in iov_lens {
         total_len = total_len.checked_add(iov_len).ok_or(Errno::EINVAL)?;
@@ -985,6 +990,10 @@ fn validate_eventfd_iovec_len(iov_lens: impl IntoIterator<Item = usize>) -> Resu
             return Err(Errno::EINVAL);
         }
     }
+    Ok(total_len)
+}
+
+fn validate_eventfd_iovec_len(total_len: usize) -> Result<(), Errno> {
     if total_len < size_of::<u64>() {
         return Err(Errno::EINVAL);
     }
@@ -992,7 +1001,7 @@ fn validate_eventfd_iovec_len(iov_lens: impl IntoIterator<Item = usize>) -> Resu
 }
 
 fn copy_eventfd_value_to_iovec(iovs: &[IoReadVec<MutPtr<u8>>], value: u64) -> Result<(), Errno> {
-    validate_eventfd_iovec_len(iovs.iter().map(|iov| iov.iov_len))?;
+    validate_eventfd_iovec_len(eventfd_iovec_total_len(iovs.iter().map(|iov| iov.iov_len))?)?;
 
     let bytes = value.to_ne_bytes();
     let mut copied = 0;
@@ -2884,6 +2893,34 @@ mod tests {
             task.sys_writev(fd, ConstPtr::from_ptr(iovs.as_ptr()), iovs.len()),
             Err(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn eventfd_readv_all_zero_iovecs_is_noop() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let fd = task
+            .sys_eventfd2(5, EfdFlags::empty())
+            .expect("eventfd2 failed");
+        let fd = i32::try_from(fd).unwrap();
+        let mut output = [0u8; 8];
+        let iovs = [
+            IoReadVec {
+                iov_base: MutPtr::from_usize(output.as_mut_ptr().expose_provenance()),
+                iov_len: 0,
+            },
+            IoReadVec {
+                iov_base: MutPtr::from_usize(output.as_mut_ptr().expose_provenance()),
+                iov_len: 0,
+            },
+        ];
+
+        assert_eq!(
+            task.sys_readv(fd, ConstPtr::from_ptr(iovs.as_ptr()), iovs.len()),
+            Ok(0)
+        );
+
+        assert_eq!(task.sys_read(fd, &mut output, None), Ok(8));
+        assert_eq!(u64::from_ne_bytes(output), 5);
     }
 
     #[test]

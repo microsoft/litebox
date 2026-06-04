@@ -21,7 +21,7 @@ pub enum PeerCredential {
 }
 
 /// Broker authority request received from a control channel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReceivedBrokerRequest {
     /// A request understood by the current protocol crate.
@@ -37,7 +37,7 @@ impl From<BrokerRequest> for ReceivedBrokerRequest {
 }
 
 /// Broker authority response received from a control channel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReceivedBrokerResponse {
     /// A response understood by the current protocol crate.

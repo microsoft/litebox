@@ -23,11 +23,9 @@ mod policy;
 use alloc::collections::BTreeMap;
 
 pub use error::BrokerError;
+use identity::BrokerCoreId;
 pub use identity::{BrokerAssociation, CallerCredential};
-pub use litebox_broker_protocol::{
-    ConsumeEventResponse, EventConsumeMode, ObjectHandle, ObjectReferenceGeneration,
-    ObjectReferenceId, ReadinessState, WaitOutcome,
-};
+use litebox_broker_protocol::ObjectReferenceId;
 use object::{ObjectEntry, ObjectId, ObjectReference};
 pub use object::{ObjectRights, ObjectType};
 pub use policy::{
@@ -38,9 +36,43 @@ pub use policy::{
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
 
+/// Resource limits for broker-owned authority state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BrokerCoreLimits {
+    /// Maximum live broker objects.
+    pub max_objects: usize,
+    /// Maximum live object references.
+    pub max_references: usize,
+}
+
+impl BrokerCoreLimits {
+    /// Conservative default limits for the first broker proof of concept.
+    pub const DEFAULT: Self = Self {
+        max_objects: 4096,
+        max_references: 4096,
+    };
+
+    /// Creates a broker core limit set.
+    pub const fn new(max_objects: usize, max_references: usize) -> Self {
+        Self {
+            max_objects,
+            max_references,
+        }
+    }
+}
+
+impl Default for BrokerCoreLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Channel-independent broker authority state.
 pub struct BrokerCore<P> {
+    core_id: BrokerCoreId,
     policy: P,
+    limits: BrokerCoreLimits,
     next_process_id: u64,
     next_object_id: u64,
     next_reference_id: u64,
@@ -51,8 +83,15 @@ pub struct BrokerCore<P> {
 impl<P> BrokerCore<P> {
     /// Creates a broker core with the provided policy engine.
     pub fn new(policy: P) -> Self {
+        Self::new_with_limits(policy, BrokerCoreLimits::DEFAULT)
+    }
+
+    /// Creates a broker core with explicit authority-state limits.
+    pub fn new_with_limits(policy: P, limits: BrokerCoreLimits) -> Self {
         Self {
+            core_id: identity::allocate_core_id(),
             policy,
+            limits,
             next_process_id: 1,
             next_object_id: 1,
             next_reference_id: 1,

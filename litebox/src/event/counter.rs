@@ -299,6 +299,14 @@ mod tests {
     }
 
     #[test]
+    fn cached_broker_object_errors_map_to_io() {
+        assert_eq!(
+            EventCounterError::from(BrokerObjectError::InvalidObject),
+            EventCounterError::Io
+        );
+    }
+
+    #[test]
     fn zero_write_does_not_notify_read_observers_even_when_broker_reports_ready() {
         let litebox = litebox([create_response(), add_response(true, true)]);
         let event = EventCounter::new(&litebox, 0).unwrap();

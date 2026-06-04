@@ -230,7 +230,7 @@ enum ConnectionState {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct BrokerDispatch {
     response: BrokerResponse,
     outcome: DispatchOutcome,
@@ -433,7 +433,7 @@ mod tests {
                 broker_protocol_version: SUPPORTED_PROTOCOL_VERSION
             }
         );
-        let handle = match channel.responses[1] {
+        let handle = match &channel.responses[1] {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(response))) => {
                 response.handle
             }
@@ -602,7 +602,7 @@ mod tests {
             if let Some(error) = self.send_error {
                 return Err(error);
             }
-            self.responses.push(*response);
+            self.responses.push(response.clone());
             Ok(())
         }
     }

@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use std::{
+    net::Shutdown,
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -15,6 +16,7 @@ use litebox_broker_protocol::{BrokerRequest, BrokerResponse, CoreRequest, CoreRe
 use litebox_broker_unix_socket::UnixStreamClientControlChannel;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+const ACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
 type Client = BrokerClient<UnixStreamClientControlChannel>;
@@ -52,9 +54,11 @@ impl Drop for BrokerConnection {
 }
 
 impl BrokerControlClient {
-    fn new(client: Client) -> Self {
+    fn new(client: Client, shutdown_stream: std::os::unix::net::UnixStream) -> Self {
         Self {
-            worker: BrokerClientWorker::new(client),
+            worker: BrokerClientWorker::new_with_shutdown_hook(client, move || {
+                let _ = shutdown_stream.shutdown(Shutdown::Both);
+            }),
         }
     }
 
@@ -84,12 +88,16 @@ fn connect_to_endpoint(socket_path: &Path) -> Result<BrokerConnection> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let mut client = connect_with_retry(socket_path, setup_deadline)
         .with_context(|| format!("failed to connect to broker at {}", socket_path.display()))?;
+    let shutdown_stream = client
+        .control_channel_mut()
+        .try_clone_stream()
+        .context("failed to clone broker control channel for shutdown")?;
     client
         .control_channel_mut()
-        .set_io_deadline(None)
-        .context("failed to clear broker setup deadline")?;
+        .set_io_timeout(Some(ACTIVE_REQUEST_TIMEOUT))
+        .context("failed to configure broker active request timeout")?;
     Ok(BrokerConnection {
-        control: Arc::new(BrokerControlClient::new(client)),
+        control: Arc::new(BrokerControlClient::new(client, shutdown_stream)),
     })
 }
 

@@ -92,6 +92,10 @@ fn test_fcntl() {
         .expect("Failed to create eventfd");
     let eventfd = i32::try_from(eventfd).unwrap();
     check(eventfd, OFlags::RDWR, OFlags::RDWR);
+    assert_eq!(
+        task.sys_fcntl(eventfd, FcntlArg::SETFL(OFlags::RDWR | OFlags::NONBLOCK)),
+        Err(Errno::EINVAL)
+    );
 
     // Test fcntl with DUPFD
     let fd = task

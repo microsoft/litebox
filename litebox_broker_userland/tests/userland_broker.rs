@@ -5,7 +5,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,9 +16,12 @@ use litebox_broker_unix_socket::UnixStreamClientControlChannel;
 
 #[test]
 fn separate_process_broker_serves_event_object_requests() {
-    let socket_path = unique_socket_path();
-    let mut child = spawn_broker(&socket_path);
-    let channel = connect_with_retry(&socket_path).unwrap();
+    let socket_path = SocketPathGuard::new(unique_socket_path());
+    let mut child = ChildGuard::new(spawn_broker(socket_path.path()));
+    let mut channel = connect_with_retry(socket_path.path()).unwrap();
+    channel
+        .set_io_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let mut client = BrokerClient::new(channel);
 
     assert_eq!(client.negotiate().unwrap(), SUPPORTED_PROTOCOL_VERSION);
@@ -38,10 +41,8 @@ fn separate_process_broker_serves_event_object_requests() {
         client.wait_event(handle).unwrap(),
         WaitOutcome::Ready(ReadinessState::new(true, true, 1))
     );
-
     drop(client);
     assert!(child.wait().unwrap().success());
-    let _ = fs::remove_file(socket_path);
 }
 
 fn spawn_broker(socket_path: &Path) -> Child {
@@ -50,6 +51,62 @@ fn spawn_broker(socket_path: &Path) -> Child {
         .arg(socket_path)
         .spawn()
         .unwrap()
+}
+
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child.as_mut().expect("child process missing").wait();
+        if status.is_ok() {
+            self.child = None;
+        }
+        status
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            match child.try_wait() {
+                Ok(Some(_status)) => {}
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(_error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+}
+
+struct SocketPathGuard {
+    path: PathBuf,
+}
+
+impl SocketPathGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SocketPathGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamClientControlChannel> {

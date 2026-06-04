@@ -67,6 +67,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFileCounter<Platfo
         }
     }
 
+    fn is_local_core(&self) -> bool {
+        matches!(self, Self::LocalCore(_))
+    }
+
     fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -188,7 +192,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     super::common_functions_for_file_status!();
 
     pub(crate) fn set_status_flags(&self, requested: OFlags, mask: OFlags) -> Result<(), Errno> {
+        let current_status = self.get_status();
         let new_status = (self.get_status() & mask.complement()) | (requested & mask);
+        if !current_status.contains(OFlags::NONBLOCK)
+            && new_status.contains(OFlags::NONBLOCK)
+            && !self.counter.is_local_core()
+        {
+            return Err(Errno::EINVAL);
+        }
         if !new_status.contains(OFlags::NONBLOCK) && !self.counter.supports_blocking_operations() {
             return Err(Errno::EINVAL);
         }
@@ -262,19 +273,24 @@ mod tests {
                 .unwrap(),
         );
         let total = 8;
-        for _ in 0..total {
-            let copied_eventfd = eventfd.clone();
-            std::thread::spawn(move || {
-                copied_eventfd
-                    .read(&WaitState::new(platform()).context())
-                    .unwrap();
-            });
-        }
+        let handles: std::vec::Vec<_> = (0..total)
+            .map(|_| {
+                let copied_eventfd = eventfd.clone();
+                std::thread::spawn(move || {
+                    copied_eventfd
+                        .read(&WaitState::new(platform()).context())
+                        .unwrap();
+                })
+            })
+            .collect();
 
         std::thread::sleep(core::time::Duration::from_millis(500));
         eventfd
             .write(&WaitState::new(platform()).context(), total)
             .unwrap();
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 
     #[test]

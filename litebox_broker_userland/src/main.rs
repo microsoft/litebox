@@ -2,23 +2,79 @@
 // Licensed under the MIT license.
 
 use std::env;
+use std::fs;
 use std::io;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, EventOnlyPolicy};
 use litebox_broker_server::{BrokerServeError, serve_connection};
 use litebox_broker_unix_socket::UnixStreamServerControlChannel;
 
+const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn main() -> io::Result<()> {
     let args = Args::parse(env::args().skip(1))?;
-    let listener = UnixListener::bind(&args.socket_path)?;
+    let listener = bind_listener(&args.socket_path)?;
+    let _socket_cleanup = SocketPathCleanup::new(args.socket_path.clone());
     let (stream, _) = listener.accept()?;
     let mut channel = UnixStreamServerControlChannel::from_accepted(stream);
+    channel.set_io_deadline(Some(Instant::now() + SESSION_TIMEOUT))?;
     let mut broker = BrokerCore::new(EventOnlyPolicy);
     serve_connection(&mut broker, &mut channel)
         .map(|_| ())
         .map_err(broker_error)
+}
+
+fn bind_listener(socket_path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(socket_path) {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            remove_stale_socket(socket_path)?;
+            UnixListener::bind(socket_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_stale_socket(socket_path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(socket_path)?;
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "broker socket path exists and is not a socket",
+        ));
+    }
+
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_stream) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "broker socket path is already accepting connections",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            fs::remove_file(socket_path)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+struct SocketPathCleanup {
+    socket_path: PathBuf,
+}
+
+impl SocketPathCleanup {
+    fn new(socket_path: PathBuf) -> Self {
+        Self { socket_path }
+    }
+}
+
+impl Drop for SocketPathCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket_path);
+    }
 }
 
 fn broker_error(error: BrokerServeError<io::Error>) -> io::Error {

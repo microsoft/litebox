@@ -4,10 +4,13 @@
 use litebox_broker_protocol::{
     AddEventRequest, BrokerRequest, BrokerResponse, ClientControlChannel, ConsumeEventRequest,
     ConsumeEventResponse, CoreRequest, CoreResponse, CreateEventRequest, EventConsumeMode,
-    EventRequest, EventResponse, ObjectHandle, ReadinessState, WaitEventRequest, WaitOutcome,
+    EventRequest, EventResponse, ObjectHandle, ProtocolVersion, ReadinessState, WaitEventRequest,
+    WaitOutcome,
 };
 
 use crate::{BrokerClient, ClientError, Result};
+
+const EVENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 2);
 
 impl<T: ClientControlChannel> BrokerClient<T> {
     /// Creates a broker-owned event object.
@@ -20,7 +23,7 @@ impl<T: ClientControlChannel> BrokerClient<T> {
         &mut self,
         initial_count: u64,
     ) -> Result<ObjectHandle, T::Error> {
-        self.ensure_negotiated()?;
+        self.ensure_event_protocol()?;
         match self.request(event_request(EventRequest::Create(
             CreateEventRequest::new(initial_count),
         )))? {
@@ -33,7 +36,7 @@ impl<T: ClientControlChannel> BrokerClient<T> {
 
     /// Checks whether an event wait would complete now.
     pub fn wait_event(&mut self, handle: ObjectHandle) -> Result<WaitOutcome, T::Error> {
-        self.ensure_negotiated()?;
+        self.ensure_event_protocol()?;
         match self.request(event_request(EventRequest::Wait(WaitEventRequest::new(
             handle,
         ))))? {
@@ -50,7 +53,7 @@ impl<T: ClientControlChannel> BrokerClient<T> {
         handle: ObjectHandle,
         value: u64,
     ) -> Result<ReadinessState, T::Error> {
-        self.ensure_negotiated()?;
+        self.ensure_event_protocol()?;
         match self.request(event_request(EventRequest::Add(AddEventRequest::new(
             handle, value,
         ))))? {
@@ -67,7 +70,7 @@ impl<T: ClientControlChannel> BrokerClient<T> {
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> Result<ConsumeEventResponse, T::Error> {
-        self.ensure_negotiated()?;
+        self.ensure_event_protocol()?;
         match self.request(event_request(EventRequest::Consume(
             ConsumeEventRequest::new(handle, mode),
         )))? {
@@ -81,4 +84,18 @@ impl<T: ClientControlChannel> BrokerClient<T> {
 
 const fn event_request(request: EventRequest) -> BrokerRequest {
     BrokerRequest::Core(CoreRequest::Event(request))
+}
+
+impl<T: ClientControlChannel> BrokerClient<T> {
+    fn ensure_event_protocol(&self) -> Result<(), T::Error> {
+        let negotiated = self.ensure_negotiated()?;
+        if EVENT_PROTOCOL_VERSION.is_supported_by(negotiated) {
+            Ok(())
+        } else {
+            Err(ClientError::UnsupportedVersion {
+                requested: EVENT_PROTOCOL_VERSION,
+                broker_protocol_version: negotiated,
+            })
+        }
+    }
 }

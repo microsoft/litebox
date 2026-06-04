@@ -190,7 +190,10 @@ fn decode_event_request(decoder: &mut Decoder<'_>) -> Result<Option<EventRequest
         }
         EVENT_REQUEST_TAG_CONSUME => EventRequest::Consume(ConsumeEventRequest::new(
             decoder.handle()?,
-            decode_event_consume_mode(decoder)?,
+            match decode_event_consume_mode(decoder)? {
+                Some(mode) => mode,
+                None => return Ok(None),
+            },
         )),
         _ => return Ok(None),
     };
@@ -324,9 +327,12 @@ fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<Option<EventRespon
         EVENT_RESPONSE_TAG_CREATED => {
             EventResponse::Create(CreateEventResponse::new(decoder.handle()?))
         }
-        EVENT_RESPONSE_TAG_WAITED => {
-            EventResponse::Wait(WaitEventResponse::new(decode_wait_outcome(decoder)?))
-        }
+        EVENT_RESPONSE_TAG_WAITED => EventResponse::Wait(WaitEventResponse::new(
+            match decode_wait_outcome(decoder)? {
+                Some(outcome) => outcome,
+                None => return Ok(None),
+            },
+        )),
         EVENT_RESPONSE_TAG_ADDED => EventResponse::Add(AddEventResponse::new(decoder.readiness()?)),
         EVENT_RESPONSE_TAG_CONSUMED => EventResponse::Consume(ConsumeEventResponse::new(
             decoder.u64()?,
@@ -338,11 +344,11 @@ fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<Option<EventRespon
     Ok(Some(response))
 }
 
-fn decode_wait_outcome(decoder: &mut Decoder<'_>) -> Result<WaitOutcome, WireError> {
+fn decode_wait_outcome(decoder: &mut Decoder<'_>) -> Result<Option<WaitOutcome>, WireError> {
     match decoder.u8()? {
-        WAIT_OUTCOME_TAG_READY => Ok(WaitOutcome::Ready(decoder.readiness()?)),
-        WAIT_OUTCOME_TAG_WOULD_BLOCK => Ok(WaitOutcome::WouldBlock(decoder.readiness()?)),
-        _ => Err(WireError::UnknownWaitOutcome),
+        WAIT_OUTCOME_TAG_READY => Ok(Some(WaitOutcome::Ready(decoder.readiness()?))),
+        WAIT_OUTCOME_TAG_WOULD_BLOCK => Ok(Some(WaitOutcome::WouldBlock(decoder.readiness()?))),
+        _ => Ok(None),
     }
 }
 
@@ -363,11 +369,13 @@ fn encode_event_consume_mode(
     }
 }
 
-fn decode_event_consume_mode(decoder: &mut Decoder<'_>) -> Result<EventConsumeMode, WireError> {
+fn decode_event_consume_mode(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<EventConsumeMode>, WireError> {
     match decoder.u8()? {
-        EVENT_CONSUME_MODE_TAG_ALL => Ok(EventConsumeMode::All),
-        EVENT_CONSUME_MODE_TAG_ONE => Ok(EventConsumeMode::One),
-        _ => Err(WireError::UnknownEventConsumeMode),
+        EVENT_CONSUME_MODE_TAG_ALL => Ok(Some(EventConsumeMode::All)),
+        EVENT_CONSUME_MODE_TAG_ONE => Ok(Some(EventConsumeMode::One)),
+        _ => Ok(None),
     }
 }
 
@@ -504,7 +512,7 @@ mod tests {
 
         for request in requests {
             assert_eq!(
-                decode_request(&encode_request(request).unwrap()).unwrap(),
+                decode_request(&encode_request(request.clone()).unwrap()).unwrap(),
                 ReceivedBrokerRequest::Request(request)
             );
         }
@@ -541,7 +549,7 @@ mod tests {
 
         for response in responses {
             assert_eq!(
-                decode_response(&encode_response(response).unwrap()).unwrap(),
+                decode_response(&encode_response(response.clone()).unwrap()).unwrap(),
                 ReceivedBrokerResponse::Response(response)
             );
         }
@@ -551,6 +559,15 @@ mod tests {
     fn decode_rejects_malformed_request_frames() {
         assert_eq!(
             decode_request(&[0xff, 1, 2, 3]),
+            Ok(ReceivedBrokerRequest::Unknown)
+        );
+        let mut unknown_consume_mode = encode_request(event_request(EventRequest::Consume(
+            ConsumeEventRequest::new(sample_handle(), EventConsumeMode::All),
+        )))
+        .unwrap();
+        *unknown_consume_mode.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_request(&unknown_consume_mode),
             Ok(ReceivedBrokerRequest::Unknown)
         );
         assert_eq!(decode_request(&[0, 1]), Err(WireError::TruncatedFrame));
@@ -570,7 +587,7 @@ mod tests {
         );
         assert_eq!(
             decode_response(&[1, 0, 1, 0xff]),
-            Err(WireError::UnknownWaitOutcome)
+            Ok(ReceivedBrokerResponse::Unknown)
         );
         assert_eq!(
             decode_response(&[2, 0xff, 0xff]),

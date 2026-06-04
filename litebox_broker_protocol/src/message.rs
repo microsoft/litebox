@@ -12,7 +12,7 @@ use crate::{
 /// The outer broker request is intentionally small. Object-family and
 /// domain-specific operations are grouped below it so new object families do not
 /// accumulate as unrelated top-level broker variants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BrokerRequest {
     /// Protocol negotiation request.
@@ -25,7 +25,7 @@ pub enum BrokerRequest {
 }
 
 /// Request adapted by the broker server into a BrokerCore domain call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CoreRequest {
     /// Event object request family.
@@ -33,7 +33,7 @@ pub enum CoreRequest {
 }
 
 /// Broker-owned event object request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EventRequest {
     /// Create a broker-owned event object.
@@ -51,7 +51,7 @@ pub enum EventRequest {
 /// Common connection/protocol outcomes stay at this layer. Domain payloads are
 /// grouped under [`CoreResponse`] so future object families can evolve without
 /// turning the broker envelope into a flat operation/result list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BrokerResponse {
     /// Negotiation result.
@@ -79,7 +79,7 @@ pub enum BrokerResponse {
 }
 
 /// Response returned by a BrokerCore domain request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CoreResponse {
     /// Event object response family.
@@ -87,7 +87,7 @@ pub enum CoreResponse {
 }
 
 /// Broker-owned event object response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EventResponse {
     /// Create operation response.

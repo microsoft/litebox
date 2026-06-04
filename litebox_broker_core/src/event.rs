@@ -3,11 +3,10 @@
 
 use crate::object::{ObjectId, ObjectKind};
 use crate::{
-    BrokerAssociation, BrokerCore, BrokerError, ObjectHandle, ObjectRights, ObjectType,
-    PolicyEngine, Result,
+    BrokerAssociation, BrokerCore, BrokerError, ObjectRights, ObjectType, PolicyEngine, Result,
 };
 use litebox_broker_protocol::{
-    ConsumeEventResponse, EventConsumeMode, ReadinessState, WaitOutcome,
+    ConsumeEventResponse, EventConsumeMode, ObjectHandle, ReadinessState, WaitOutcome,
 };
 
 const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
@@ -47,9 +46,12 @@ impl<P: PolicyEngine> BrokerCore<P> {
         association: &BrokerAssociation,
         handle: ObjectHandle,
     ) -> Result<WaitOutcome> {
-        let object_id =
+        let authorized =
             self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
-        let state = self.event_state(object_id)?;
+        let state = Self::filter_readiness_for_rights(
+            self.event_state(authorized.object_id)?,
+            authorized.rights,
+        );
         Ok(if state.read_ready {
             WaitOutcome::Ready(state)
         } else {
@@ -64,10 +66,12 @@ impl<P: PolicyEngine> BrokerCore<P> {
         handle: ObjectHandle,
         value: u64,
     ) -> Result<ReadinessState> {
-        let object_id =
+        let authorized =
             self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WRITE)?;
-        match &mut self.object_mut(object_id)?.kind {
-            ObjectKind::Event(event) => event.add(value),
+        match &mut self.object_mut(authorized.object_id)?.kind {
+            ObjectKind::Event(event) => event
+                .add(value)
+                .map(|state| Self::filter_readiness_for_rights(state, authorized.rights)),
         }
     }
 
@@ -78,11 +82,24 @@ impl<P: PolicyEngine> BrokerCore<P> {
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> Result<ConsumeEventResponse> {
-        let object_id =
+        let authorized =
             self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
-        match &mut self.object_mut(object_id)?.kind {
-            ObjectKind::Event(event) => event.consume(mode),
+        match &mut self.object_mut(authorized.object_id)?.kind {
+            ObjectKind::Event(event) => event.consume(mode).map(|response| {
+                ConsumeEventResponse::new(
+                    response.value,
+                    Self::filter_readiness_for_rights(response.readiness, authorized.rights),
+                )
+            }),
         }
+    }
+
+    fn filter_readiness_for_rights(state: ReadinessState, rights: ObjectRights) -> ReadinessState {
+        ReadinessState::new(
+            rights.contains(ObjectRights::WAIT) && state.read_ready,
+            rights.contains(ObjectRights::WRITE) && state.write_ready,
+            state.generation,
+        )
     }
 
     fn event_state(&self, object_id: ObjectId) -> Result<ReadinessState> {
@@ -120,8 +137,9 @@ impl EventObject {
             .checked_add(value)
             .filter(|count| *count <= MAX_EVENT_COUNT)
             .ok_or(BrokerError::WouldBlock)?;
+        let next_generation = self.next_generation()?;
         self.count = new_count;
-        self.bump_generation()?;
+        self.readiness_generation = next_generation;
         Ok(self.readiness_state())
     }
 
@@ -135,17 +153,16 @@ impl EventObject {
             EventConsumeMode::One => 1,
             _ => return Err(BrokerError::UnsupportedOperation),
         };
+        let next_generation = self.next_generation()?;
         self.count -= value;
-        self.bump_generation()?;
+        self.readiness_generation = next_generation;
         Ok(ConsumeEventResponse::new(value, self.readiness_state()))
     }
 
-    fn bump_generation(&mut self) -> Result<()> {
-        self.readiness_generation = self
-            .readiness_generation
+    fn next_generation(&self) -> Result<u64> {
+        self.readiness_generation
             .checked_add(1)
-            .ok_or(BrokerError::ResourceExhausted)?;
-        Ok(())
+            .ok_or(BrokerError::ResourceExhausted)
     }
 }
 
@@ -153,9 +170,10 @@ impl EventObject {
 mod tests {
     use super::*;
     use crate::{
-        BrokerCore, CallerCredential, EventOnlyPolicy, ObjectOperation, ObjectReferenceGeneration,
-        PolicyDecision, PolicyEngine, PolicyOperation,
+        BrokerCore, CallerCredential, EventOnlyPolicy, ObjectOperation, PolicyDecision,
+        PolicyEngine, PolicyOperation,
     };
+    use litebox_broker_protocol::ObjectReferenceGeneration;
 
     #[test]
     fn wait_rejects_invalid_references_with_expected_errors() {
@@ -214,6 +232,51 @@ mod tests {
             core.add_event(&association, handle, 1),
             Err(BrokerError::InvalidRights)
         );
+    }
+
+    #[test]
+    fn event_readiness_state_only_reports_authorized_directions() {
+        let mut core = BrokerCore::new(WaitOnlyCreatePolicy);
+        let association = core
+            .create_association(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = core.create_event_with_count(&association, 1).unwrap();
+
+        assert!(matches!(
+            core.wait_event(&association, handle),
+            Ok(WaitOutcome::Ready(ReadinessState {
+                read_ready: true,
+                write_ready: false,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn add_event_does_not_mutate_count_when_generation_is_exhausted() {
+        let mut event = EventObject {
+            count: 1,
+            readiness_generation: u64::MAX,
+        };
+
+        assert_eq!(event.add(1), Err(BrokerError::ResourceExhausted));
+        assert_eq!(event.count, 1);
+        assert_eq!(event.readiness_generation, u64::MAX);
+    }
+
+    #[test]
+    fn consume_event_does_not_mutate_count_when_generation_is_exhausted() {
+        let mut event = EventObject {
+            count: 1,
+            readiness_generation: u64::MAX,
+        };
+
+        assert_eq!(
+            event.consume(EventConsumeMode::One),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(event.count, 1);
+        assert_eq!(event.readiness_generation, u64::MAX);
     }
 
     struct WaitOnlyCreatePolicy;

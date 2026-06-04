@@ -10,11 +10,11 @@
 
 #![no_std]
 
-mod channel;
-mod error;
-mod event;
-mod message;
-mod object;
+pub mod channel;
+pub mod error;
+pub mod event;
+pub mod message;
+pub mod object;
 
 pub use channel::{
     ClientControlChannel, PeerCredential, ReceivedBrokerRequest, ReceivedBrokerResponse,
