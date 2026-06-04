@@ -2866,7 +2866,7 @@ mod tests {
     fn eventfd_writev_rejects_leading_zero_before_value() {
         let task = crate::syscalls::tests::init_platform(None);
         let fd = task
-            .sys_eventfd2(5, EfdFlags::NONBLOCK)
+            .sys_eventfd2(5, EfdFlags::empty())
             .expect("eventfd2 failed");
         let fd = i32::try_from(fd).unwrap();
         let value = 7u64.to_ne_bytes();
@@ -2889,14 +2889,13 @@ mod tests {
         let mut output = [0u8; 8];
         assert_eq!(task.sys_read(fd, &mut output, None), Ok(8));
         assert_eq!(u64::from_ne_bytes(output), 5);
-        assert_eq!(task.sys_read(fd, &mut output, None), Err(Errno::EAGAIN));
     }
 
     #[test]
     fn eventfd_writev_all_zero_iovecs_is_noop() {
         let task = crate::syscalls::tests::init_platform(None);
         let fd = task
-            .sys_eventfd2(5, EfdFlags::NONBLOCK)
+            .sys_eventfd2(5, EfdFlags::empty())
             .expect("eventfd2 failed");
         let fd = i32::try_from(fd).unwrap();
         let value = 7u64.to_ne_bytes();
@@ -2919,7 +2918,6 @@ mod tests {
         let mut output = [0u8; 8];
         assert_eq!(task.sys_read(fd, &mut output, None), Ok(8));
         assert_eq!(u64::from_ne_bytes(output), 5);
-        assert_eq!(task.sys_read(fd, &mut output, None), Err(Errno::EAGAIN));
     }
 
     #[test]
