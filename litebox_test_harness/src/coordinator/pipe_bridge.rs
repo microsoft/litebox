@@ -97,6 +97,43 @@ const EPOLL_SOCKETPAIR_BRIDGE: HandlerToken<EpollSocketpairBridgeArgs, PipeBridg
 pub(crate) const BIDIRECTIONAL: HandlerToken<(), PipeBridgeOut> =
     HandlerToken::new("pipe_bridge.bidirectional");
 
+#[derive(Serialize, Deserialize)]
+struct HostFdAttachArgs {
+    scenario: HostFdAttachScenario,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HostFdAttachScenario {
+    Read,
+    Write,
+    StdioNoClose,
+    ScmRightsFailure,
+}
+
+impl HostFdAttachScenario {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::StdioNoClose => "stdio_no_close",
+            Self::ScmRightsFailure => "scm_rights_failure",
+        }
+    }
+
+    const fn expected(self) -> &'static str {
+        match self {
+            Self::Read => "HOST_FD_ATTACH_READ_OK",
+            Self::Write => "HOST_FD_ATTACH_WRITE_OK",
+            Self::StdioNoClose => "HOST_FD_ATTACH_STDIO_OK",
+            Self::ScmRightsFailure => "HOST_FD_ATTACH_SCM_RIGHTS_FAILURE_OK",
+        }
+    }
+}
+
+const HOST_FD_ATTACH: HandlerToken<HostFdAttachArgs, PipeBridgeOut> =
+    HandlerToken::new("pipe_bridge.host_fd_attach");
+
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
@@ -252,6 +289,206 @@ async fn handle_bidirectional(
     Ok(PipeBridgeOut {
         detail: test_bidirectional(),
     })
+}
+
+async fn handle_host_fd_attach(
+    args: HostFdAttachArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    let detail = tokio::task::spawn_blocking(move || test_host_fd_attach(args.scenario))
+        .await
+        .map_err(|e| HandlerError(format!("host_fd_attach task join: {e}")))?;
+    Ok(PipeBridgeOut { detail })
+}
+
+fn test_host_fd_attach(scenario: HostFdAttachScenario) -> String {
+    match scenario {
+        HostFdAttachScenario::Read => test_host_fd_attach_read(),
+        HostFdAttachScenario::Write => test_host_fd_attach_write(),
+        HostFdAttachScenario::StdioNoClose => test_host_fd_attach_stdio_no_close(),
+        HostFdAttachScenario::ScmRightsFailure => test_host_fd_attach_scm_rights_failure(),
+    }
+}
+
+fn test_host_fd_attach_read() -> String {
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: pipe_fds points to two writable fd slots.
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        return format!("HOST_FD_ATTACH_READ_PIPE_FAIL:{}", errno());
+    }
+    let [rd, wr] = pipe_fds;
+    let msg = b"host-fd-attach-read";
+    // SAFETY: wr is a live pipe fd and msg is initialized.
+    let n = unsafe { libc::write(wr, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
+    // SAFETY: parent no longer needs wr.
+    unsafe { libc::close(wr) };
+    if n != msg.len() as isize {
+        // SAFETY: rd is still live and owned here.
+        unsafe { libc::close(rd) };
+        return format!("HOST_FD_ATTACH_READ_WRITE_FAIL:n={n},errno={}", errno());
+    }
+
+    // SAFETY: fork duplicates the single-threaded blocking probe.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        // SAFETY: rd is still live and owned here.
+        unsafe { libc::close(rd) };
+        return format!("HOST_FD_ATTACH_READ_FORK_FAIL:{}", errno());
+    }
+    if pid == 0 {
+        let mut buf = [0u8; 64];
+        // SAFETY: rd is inherited into the child and buf is writable.
+        let got = unsafe { libc::read(rd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        let ok = got == msg.len() as isize && &buf[..got as usize] == msg;
+        // SAFETY: child exits without running inherited async runtime destructors.
+        unsafe { libc::_exit(i32::from(!ok)) };
+    }
+    // SAFETY: parent releases its read fd after the child inherited it.
+    unsafe { libc::close(rd) };
+    let exit = wait_child(pid);
+    if exit == 0 {
+        "HOST_FD_ATTACH_READ_OK".to_string()
+    } else {
+        format!("HOST_FD_ATTACH_READ_FAIL:exit={exit}")
+    }
+}
+
+fn test_host_fd_attach_write() -> String {
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: pipe_fds points to two writable fd slots.
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        return format!("HOST_FD_ATTACH_WRITE_PIPE_FAIL:{}", errno());
+    }
+    let [rd, wr] = pipe_fds;
+    let msg = b"host-fd-attach-write";
+    // SAFETY: fork duplicates the single-threaded blocking probe.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        // SAFETY: cleanup fds owned here.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return format!("HOST_FD_ATTACH_WRITE_FORK_FAIL:{}", errno());
+    }
+    if pid == 0 {
+        // SAFETY: child does not read from rd.
+        unsafe { libc::close(rd) };
+        // SAFETY: wr is inherited into the child and msg is initialized.
+        let n = unsafe { libc::write(wr, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
+        // SAFETY: child is done with wr.
+        unsafe { libc::close(wr) };
+        let ok = n == msg.len() as isize;
+        // SAFETY: child exits without running inherited async runtime destructors.
+        unsafe { libc::_exit(i32::from(!ok)) };
+    }
+    // SAFETY: parent reads only from rd.
+    unsafe { libc::close(wr) };
+    let mut buf = [0u8; 64];
+    // SAFETY: rd is live and buf is writable.
+    let got = unsafe { libc::read(rd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    // SAFETY: parent is done with rd.
+    unsafe { libc::close(rd) };
+    let exit = wait_child(pid);
+    if got == msg.len() as isize && &buf[..got as usize] == msg && exit == 0 {
+        "HOST_FD_ATTACH_WRITE_OK".to_string()
+    } else {
+        format!(
+            "HOST_FD_ATTACH_WRITE_FAIL:n={got},exit={exit},errno={}",
+            errno()
+        )
+    }
+}
+
+fn test_host_fd_attach_stdio_no_close() -> String {
+    let before = [0, 1, 2].map(fd_is_open);
+    if before.iter().any(|open| !open) {
+        return format!("HOST_FD_ATTACH_STDIO_PRE_CLOSED:{before:?}");
+    }
+    // SAFETY: fork duplicates the single-threaded blocking probe.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return format!("HOST_FD_ATTACH_STDIO_FORK_FAIL:{}", errno());
+    }
+    if pid == 0 {
+        let ok = [0, 1, 2].into_iter().all(fd_is_open);
+        // SAFETY: child exits without running inherited async runtime destructors.
+        unsafe { libc::_exit(i32::from(!ok)) };
+    }
+    let exit = wait_child(pid);
+    let after = [0, 1, 2].map(fd_is_open);
+    if exit == 0 && after.iter().all(|open| *open) {
+        "HOST_FD_ATTACH_STDIO_OK".to_string()
+    } else {
+        format!("HOST_FD_ATTACH_STDIO_FAIL:exit={exit},before={before:?},after={after:?}")
+    }
+}
+
+fn fd_is_open(fd: i32) -> bool {
+    // SAFETY: fcntl(F_GETFD) has no pointer arguments and does not consume fd.
+    (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
+}
+
+fn test_host_fd_attach_scm_rights_failure() -> String {
+    let mut sp = [0i32; 2];
+    // SAFETY: sp points to two writable fd slots.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sp.as_mut_ptr()) } != 0 {
+        return format!("HOST_FD_ATTACH_SCM_SOCKETPAIR_FAIL:{}", errno());
+    }
+    let result = send_bogus_scm_rights(sp[0], -1);
+    let ok = result.is_err();
+    let probe = b"still-alive";
+    // SAFETY: sp[0] is a live socket and probe is initialized.
+    let wrote = unsafe { libc::write(sp[0], probe.as_ptr().cast::<libc::c_void>(), probe.len()) };
+    let mut buf = [0u8; 32];
+    // SAFETY: sp[1] is a live socket and buf is writable.
+    let read = unsafe { libc::read(sp[1], buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    // SAFETY: cleanup owned socketpair fds.
+    unsafe {
+        libc::close(sp[0]);
+        libc::close(sp[1]);
+    }
+    if ok
+        && wrote == probe.len() as isize
+        && read == probe.len() as isize
+        && &buf[..read as usize] == probe
+    {
+        "HOST_FD_ATTACH_SCM_RIGHTS_FAILURE_OK".to_string()
+    } else {
+        format!(
+            "HOST_FD_ATTACH_SCM_RIGHTS_FAILURE_FAIL:send={result:?},wrote={wrote},read={read},errno={}",
+            errno()
+        )
+    }
+}
+
+fn send_bogus_scm_rights(sock: i32, bogus_fd: i32) -> Result<(), i32> {
+    let byte = [b'X'];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_ptr().cast::<libc::c_void>().cast_mut(),
+        iov_len: byte.len(),
+    };
+    let mut control = [0u8; 64];
+    // SAFETY: zeroed msghdr is filled before sendmsg.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+    msg.msg_controllen = control.len().try_into().unwrap();
+    // SAFETY: msg/control form a valid SCM_RIGHTS control buffer.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err(libc::EINVAL);
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as _;
+        libc::CMSG_DATA(cmsg).cast::<i32>().write(bogus_fd);
+        msg.msg_controllen = (*cmsg).cmsg_len;
+        let rc = libc::sendmsg(sock, &raw const msg, 0);
+        if rc == -1 { Err(errno()) } else { Ok(()) }
+    }
 }
 
 fn test_extra_pipe_multi(exe: &str, count: usize) -> String {
@@ -748,6 +985,7 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
     register_handler!(EPOLL_PIPE_BRIDGE, handle_epoll_pipe_bridge);
     register_handler!(EPOLL_SOCKETPAIR_BRIDGE, handle_epoll_socketpair_bridge);
     register_handler!(BIDIRECTIONAL, handle_bidirectional);
+    register_handler!(HOST_FD_ATTACH, handle_host_fd_attach);
     register_leaf_subcommand!("pipe-test", subcmd_pipe_test);
     // Also expose `bidirectional` as an argv subcommand for the
     // US3 test family. The leaf-agent form (via run_leaf on
@@ -761,6 +999,38 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
         println!("{out}");
         if out == "US3_BIDI_OK" { 0 } else { 1 }
     });
+
+    for scenario in [
+        HostFdAttachScenario::Read,
+        HostFdAttachScenario::Write,
+        HostFdAttachScenario::StdioNoClose,
+        HostFdAttachScenario::ScmRightsFailure,
+    ] {
+        for &agent in NPIPE_AGENTS {
+            let agent_s = agent.to_string();
+            let id = format!("PB.host_fd_attach.{}.{agent}", scenario.id());
+            reg.test("xworker", "pipe_bridge", id)
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let a = agent_s.clone();
+                        Box::pin(async move {
+                            let result = run
+                                .send_named_typed(
+                                    &handle,
+                                    &HOST_FD_ATTACH,
+                                    HostFdAttachArgs { scenario },
+                                )
+                                .await;
+                            let pass =
+                                matches!(&result, Ok(out) if out.detail == scenario.expected());
+                            super::TestOutcome::new(&a, pass, format!("{result:?}"))
+                        })
+                    })
+                });
+        }
+    }
 
     struct PbCase {
         mode: &'static str,
