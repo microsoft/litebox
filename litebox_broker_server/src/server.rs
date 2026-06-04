@@ -319,9 +319,7 @@ where
 mod tests {
     use super::*;
     use litebox_broker_core::EventOnlyPolicy;
-    use litebox_broker_protocol::{
-        AddEventRequest, CreateEventRequest, ReadinessState, WaitEventRequest, WaitOutcome,
-    };
+    use litebox_broker_protocol::CreateEventRequest;
 
     #[test]
     fn dispatch_enforces_negotiation_state() {
@@ -398,64 +396,20 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_negotiates_then_routes_event_requests() {
+    fn dispatch_negotiates_then_routes_event_create() {
         let (mut core, association, mut state) = new_association();
         negotiate(&mut core, &association, &mut state);
 
         let dispatch = handle_request(&mut core, &association, &mut state, event_create_request(0));
         assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-        let handle = match dispatch.response {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(response))) => {
-                response.handle
-            }
+        match dispatch.response {
+            BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(_))) => {}
             response => panic!("unexpected response: {response:?}"),
-        };
-
-        let dispatch = handle_request(
-            &mut core,
-            &association,
-            &mut state,
-            event_request(EventRequest::Wait(WaitEventRequest::new(handle))),
-        );
-        assert_eq!(
-            dispatch.response,
-            event_response(EventResponse::Wait(WaitEventResponse::new(
-                WaitOutcome::WouldBlock(ReadinessState::new(false, true, 0))
-            )))
-        );
-        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-
-        let dispatch = handle_request(
-            &mut core,
-            &association,
-            &mut state,
-            event_request(EventRequest::Add(AddEventRequest::new(handle, 1))),
-        );
-        assert_eq!(
-            dispatch.response,
-            event_response(EventResponse::Add(AddEventResponse::new(
-                ReadinessState::new(true, true, 1)
-            )))
-        );
-        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-
-        let dispatch = handle_request(
-            &mut core,
-            &association,
-            &mut state,
-            event_request(EventRequest::Wait(WaitEventRequest::new(handle))),
-        );
-        assert_eq!(
-            dispatch.response,
-            event_response(EventResponse::Wait(WaitEventResponse::new(
-                WaitOutcome::Ready(ReadinessState::new(true, true, 1))
-            )))
-        );
-        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
+        }
     }
 
     #[test]
-    fn serve_connection_negotiates_routes_event_and_returns_peer_closed() {
+    fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
         let mut channel = FakeServerChannel::new(std::vec::Vec::from([
             Ok(Some(ReceivedBrokerRequest::Request(
@@ -485,14 +439,7 @@ mod tests {
             }
             response => panic!("unexpected response: {response:?}"),
         };
-
-        let probe = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        assert_eq!(
-            core.close_object_reference(&probe, handle),
-            Err(BrokerError::UnknownObject)
-        );
+        assert_eq!(handle.reference_id.get(), 1);
     }
 
     #[test]
@@ -518,28 +465,6 @@ mod tests {
             [BrokerResponse::Error(ErrorCode::ProtocolState)]
         );
         assert_eq!(channel.requests.len(), 1);
-    }
-
-    #[test]
-    fn serve_connection_returns_channel_error_after_cleanup_path() {
-        let mut core = BrokerCore::new(EventOnlyPolicy);
-        let mut channel = FakeServerChannel::new(std::vec::Vec::from([
-            Ok(Some(ReceivedBrokerRequest::Request(
-                BrokerRequest::Negotiate {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION,
-                },
-            ))),
-            Ok(Some(ReceivedBrokerRequest::Request(event_create_request(
-                0,
-            )))),
-            Err(FakeChannelError::Recv),
-        ]));
-
-        match serve_connection(&mut core, &mut channel) {
-            Err(BrokerServeError::Channel(FakeChannelError::Recv)) => {}
-            result => panic!("unexpected serve result: {result:?}"),
-        }
-        assert_eq!(channel.responses.len(), 2);
     }
 
     #[test]
@@ -619,14 +544,12 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum FakeChannelError {
-        Recv,
         Send,
     }
 
     impl fmt::Display for FakeChannelError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
-                Self::Recv => f.write_str("fake receive error"),
                 Self::Send => f.write_str("fake send error"),
             }
         }

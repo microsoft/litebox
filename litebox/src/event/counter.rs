@@ -299,8 +299,8 @@ mod tests {
     }
 
     #[test]
-    fn zero_write_does_not_notify_read_observers() {
-        let litebox = litebox([create_response(), add_response(false, true)]);
+    fn zero_write_does_not_notify_read_observers_even_when_broker_reports_ready() {
+        let litebox = litebox([create_response(), add_response(true, true)]);
         let event = EventCounter::new(&litebox, 0).unwrap();
         let (observer, observer_dyn) = observer();
         event.register_observer(Arc::downgrade(&observer_dyn), Events::IN);
@@ -325,8 +325,12 @@ mod tests {
     }
 
     #[test]
-    fn read_does_not_notify_write_observers_without_broker_write_readiness() {
-        let litebox = litebox([create_response(), consume_response(1, false, false)]);
+    fn read_notifies_write_observers_only_when_broker_reports_write_ready() {
+        let litebox = litebox([
+            create_response(),
+            consume_response(1, false, false),
+            consume_response(1, false, true),
+        ]);
         let event = EventCounter::new(&litebox, 0).unwrap();
         let (observer, observer_dyn) = observer();
         event.register_observer(Arc::downgrade(&observer_dyn), Events::OUT);
@@ -340,16 +344,7 @@ mod tests {
         );
 
         assert_eq!(observer.notifications(), 0);
-    }
 
-    #[test]
-    fn read_notifies_write_observers_when_broker_reports_write_ready() {
-        let litebox = litebox([create_response(), consume_response(1, false, true)]);
-        let event = EventCounter::new(&litebox, 0).unwrap();
-        let (observer, observer_dyn) = observer();
-        event.register_observer(Arc::downgrade(&observer_dyn), Events::OUT);
-
-        let wait = WaitState::new(MockPlatform::new());
         assert_eq!(
             event
                 .read(&wait.context(), true, EventCounterReadMode::All)

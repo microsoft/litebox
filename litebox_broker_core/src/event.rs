@@ -158,7 +158,7 @@ mod tests {
     };
 
     #[test]
-    fn wait_rejects_reference_without_wait_right() {
+    fn wait_rejects_invalid_references_with_expected_errors() {
         let mut core = BrokerCore::new(EventOnlyPolicy);
         let association = core
             .create_association(CallerCredential::Unauthenticated)
@@ -176,14 +176,7 @@ mod tests {
             core.wait_event(&association, handle),
             Err(BrokerError::InvalidRights)
         );
-    }
 
-    #[test]
-    fn wait_rejects_stale_reference_generation() {
-        let mut core = BrokerCore::new(EventOnlyPolicy);
-        let association = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
         let mut handle = core.create_event(&association).unwrap();
         handle.reference_generation =
             ObjectReferenceGeneration::new(handle.reference_generation.get() + 1);
@@ -192,18 +185,11 @@ mod tests {
             core.wait_event(&association, handle),
             Err(BrokerError::StaleHandle)
         );
-    }
 
-    #[test]
-    fn wait_hides_handle_owned_by_another_association() {
-        let mut core = BrokerCore::new(EventOnlyPolicy);
-        let owner = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
         let other = core
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
-        let handle = core.create_event(&owner).unwrap();
+        let handle = core.create_event(&association).unwrap();
 
         assert_eq!(
             core.wait_event(&other, handle),

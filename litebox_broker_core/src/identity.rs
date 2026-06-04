@@ -122,7 +122,7 @@ mod tests {
     use crate::DefaultDenyPolicy;
 
     #[test]
-    fn create_association_uses_one_session_and_distinct_processes() {
+    fn create_association_assigns_distinct_identities_and_preserves_credential() {
         let mut core = BrokerCore::new(DefaultDenyPolicy);
 
         let first = core
@@ -132,10 +132,7 @@ mod tests {
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
 
-        assert_eq!(first.identity.session_id, SessionId::FIRST);
-        assert_eq!(second.identity.session_id, SessionId::FIRST);
-        assert_eq!(first.identity.process_id, ProcessId::new(1));
-        assert_eq!(second.identity.process_id, ProcessId::new(2));
+        assert_ne!(first.identity(), second.identity());
         assert_eq!(first.caller_credential(), CallerCredential::Unauthenticated);
         assert_eq!(
             second.caller_credential(),

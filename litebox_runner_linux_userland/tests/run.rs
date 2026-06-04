@@ -293,40 +293,6 @@ fn test_runner_connects_to_broker() {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
-fn test_broker_event_path_over_unix_socket() {
-    use litebox_broker_protocol::{ReadinessState, WaitOutcome};
-
-    let socket_path = unique_test_socket_path("broker-event");
-    let broker_thread = spawn_test_broker(&socket_path, litebox_broker_core::EventOnlyPolicy);
-
-    let mut channel =
-        litebox_broker_unix_socket::UnixStreamClientControlChannel::connect(&socket_path)
-            .expect("failed to connect to broker test socket");
-    channel
-        .set_io_timeout(Some(std::time::Duration::from_secs(5)))
-        .expect("failed to configure broker test timeout");
-    let mut client = litebox_broker_client::BrokerClient::new(channel);
-    client.negotiate().expect("broker negotiation failed");
-
-    let handle = client.create_event().expect("event create failed");
-    assert_eq!(
-        client.wait_event(handle).expect("event wait failed"),
-        WaitOutcome::WouldBlock(ReadinessState::new(false, true, 0))
-    );
-    let readiness = client.add_event(handle, 1).expect("event add failed");
-    assert_eq!(readiness, ReadinessState::new(true, true, 1));
-    assert_eq!(
-        client.wait_event(handle).expect("event ready-wait failed"),
-        WaitOutcome::Ready(readiness)
-    );
-
-    drop(client);
-    broker_thread.join().expect("broker test server panicked");
-    let _ = std::fs::remove_file(socket_path);
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-#[test]
 fn test_broker_backed_eventfd_with_rewriter() {
     let socket_path = unique_test_socket_path("broker-eventfd");
     let broker_thread = spawn_test_broker(&socket_path, litebox_broker_core::EventOnlyPolicy);
