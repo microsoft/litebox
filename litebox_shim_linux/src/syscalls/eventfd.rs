@@ -1354,6 +1354,7 @@ mod tests {
         use alloc::sync::Arc;
         use litebox_broker::fd_token_socket::spawn_control_listener;
         use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
+        use litebox_broker::inotify_dispatcher::InotifyDispatcher;
         use litebox_broker::state_registry::BrokerStateRegistry;
         use litebox_common_linux::EfdFlags;
         use litebox_common_linux::broker_eventfd_provider::{
@@ -1442,11 +1443,13 @@ mod tests {
         let fd_registry = std::sync::Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = std::sync::Arc::new(BrokerStateRegistry::new());
         let process_registry = std::sync::Arc::new(BrokerStateRegistry::new());
+        let inotify_dispatcher = std::sync::Arc::new(InotifyDispatcher::new());
         let _listener_handle = spawn_control_listener(
             &path,
             std::sync::Arc::clone(&fd_registry),
             std::sync::Arc::clone(&state_registry),
             std::sync::Arc::clone(&process_registry),
+            std::sync::Arc::clone(&inotify_dispatcher),
         )
         .expect("spawn listener");
         for _ in 0..100 {
@@ -1524,6 +1527,7 @@ mod tests {
         use alloc::sync::Arc;
         use litebox_broker::fd_token_socket::spawn_control_listener;
         use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
+        use litebox_broker::inotify_dispatcher::InotifyDispatcher;
         use litebox_broker::state_registry::BrokerStateRegistry;
         use litebox_common_linux::EfdFlags;
         use litebox_common_linux::broker_eventfd_provider::{
@@ -1601,11 +1605,13 @@ mod tests {
         let fd_registry = std::sync::Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = std::sync::Arc::new(BrokerStateRegistry::new());
         let process_registry = std::sync::Arc::new(BrokerStateRegistry::new());
+        let inotify_dispatcher = std::sync::Arc::new(InotifyDispatcher::new());
         let _listener_handle = spawn_control_listener(
             &path,
             std::sync::Arc::clone(&fd_registry),
             std::sync::Arc::clone(&state_registry),
             std::sync::Arc::clone(&process_registry),
+            std::sync::Arc::clone(&inotify_dispatcher),
         )
         .expect("spawn listener");
         for _ in 0..100 {
@@ -1668,6 +1674,7 @@ mod tests {
         use alloc::sync::Arc;
         use litebox_broker::fd_token_socket::spawn_control_listener;
         use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
+        use litebox_broker::inotify_dispatcher::InotifyDispatcher;
         use litebox_broker::state_registry::BrokerStateRegistry;
         use litebox_common_linux::{
             broker_eventfd_provider::BrokerEventfdProvider,
@@ -1740,11 +1747,13 @@ mod tests {
         let fd_registry = std::sync::Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = std::sync::Arc::new(BrokerStateRegistry::new());
         let process_registry = std::sync::Arc::new(BrokerStateRegistry::new());
+        let inotify_dispatcher = std::sync::Arc::new(InotifyDispatcher::new());
         let _listener = spawn_control_listener(
             &path,
             std::sync::Arc::clone(&fd_registry),
             std::sync::Arc::clone(&state_registry),
             std::sync::Arc::clone(&process_registry),
+            std::sync::Arc::clone(&inotify_dispatcher),
         )
         .expect("spawn listener");
         for _ in 0..100 {

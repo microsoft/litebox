@@ -605,6 +605,7 @@ fn maybe_reset_lie_impl(vfork_parking: &VforkParking, has_lied: &core::sync::ato
 
 // require network support
 #[cfg(target_os = "linux")]
+#[cfg(feature = "worker_local_inet")]
 #[cfg(test)]
 mod tests {
     extern crate std;

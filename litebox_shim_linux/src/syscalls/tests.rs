@@ -46,6 +46,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
     let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, tar_ro_fs));
     let task = shim_builder.build().new_test_task(fs);
 
+    #[cfg(feature = "worker_local_inet")]
     if tun_device_name.is_some() {
         let global = task.global.clone();
         // Start a background thread to perform network interaction
@@ -62,6 +63,8 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
             }
         });
     }
+    #[cfg(not(feature = "worker_local_inet"))]
+    let _ = tun_device_name;
     task
 }
 
