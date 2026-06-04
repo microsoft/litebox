@@ -1201,9 +1201,9 @@ def _last_run_age_at_sha(conn: sqlite3.Connection, sha: str,
     If `worktree_path` is given, restrict to that worktree (legacy
     callers). If None (preferred for agent-coverage), aggregate over
     every clean worktree at the sha — so opportunistic supervisor
-    cycles in `<state-dir>/shadow/` correctly count toward "this HEAD
-    has been tested recently" even though their `runs.worktree_path`
-    is the shadow path, not the agent's path.
+    cycles in `<state-dir>/shadows/<branch>/` correctly count toward
+    "this HEAD has been tested recently" even though their
+    `runs.worktree_path` is the shadow path, not the agent's path.
     """
     if worktree_path is None:
         row = conn.execute(
@@ -2619,23 +2619,120 @@ def _drive_ref(
 
 
 def _shadow_worktree_path(state_dir: Path) -> Path:
-    """Persistent shadow worktree used for opportunistic cycles.
-    Created on first use; reused thereafter so cargo incremental
-    target/ wins persist across cycles."""
+    """Legacy single-shadow path (deprecated; kept for migration GC).
+    New code uses `_per_branch_shadow_path(state_dir, branch)`."""
     return state_dir / "shadow"
 
 
+def _shadows_root(state_dir: Path) -> Path:
+    """Parent directory holding per-branch shadow worktrees. Each
+    immediate child is one shadow keyed by a filesystem-safe encoding
+    of the branch name."""
+    return state_dir / "shadows"
+
+
+def _branch_to_shadow_dirname(branch: str) -> str:
+    """Filesystem-safe encoding of `branch` for use as a directory
+    name. `/` is encoded `%2f` so the encoding is unambiguous and
+    flat (no nested directories). Empty branch is rejected upstream
+    (detached worktrees are filtered out of the candidate set
+    earlier)."""
+    return branch.replace("/", "%2f")
+
+
+def _per_branch_shadow_path(state_dir: Path, branch: str) -> Path:
+    """Per-branch shadow worktree path. Eliminates the cargo
+    incremental-recompile cost that the previous single shared
+    shadow paid on every branch flip. Tradeoff: ~10-15 GB disk
+    per branch under `target/`; GC reaps stale shadows whose
+    branch no longer exists in the canonical clone."""
+    return _shadows_root(state_dir) / _branch_to_shadow_dirname(branch)
+
+
+def _gc_shadow_worktrees(canonical: Path, state_dir: Path,
+                         live_branches: set[str]) -> int:
+    """Remove per-branch shadow worktrees whose branch no longer
+    exists in the canonical clone, plus the legacy single-shadow
+    path (`<state-dir>/shadow`) if present. Returns count removed.
+
+    Best-effort: failures don't abort the supervisor. Live-branches
+    set must be non-empty (an empty set would reap every shadow,
+    likely indicating git failure; safer to skip GC in that case).
+    """
+    if not live_branches:
+        return 0
+    removed = 0
+    # 1) Legacy single-shadow path. It's a real git worktree; use
+    # `git worktree remove --force` so the canonical's worktree
+    # list stays consistent. Best-effort.
+    legacy = _shadow_worktree_path(state_dir)
+    if legacy.exists():
+        try:
+            subprocess.run(
+                ["git", "-C", str(canonical), "worktree", "remove",
+                 "--force", str(legacy)],
+                check=False, capture_output=True, text=True, timeout=60,
+            )
+            if not legacy.exists():
+                removed += 1
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    # 2) Per-branch shadows under <state-dir>/shadows/.
+    root = _shadows_root(state_dir)
+    if root.is_dir():
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            # Decode dirname back to branch.
+            branch = child.name.replace("%2f", "/")
+            if branch in live_branches:
+                continue
+            try:
+                subprocess.run(
+                    ["git", "-C", str(canonical), "worktree", "remove",
+                     "--force", str(child)],
+                    check=False, capture_output=True, text=True, timeout=60,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+            if not child.exists():
+                removed += 1
+    if removed:
+        # `git worktree remove` already updates the admin DB but
+        # `prune` mops up any half-removed entries from prior runs.
+        try:
+            subprocess.run(
+                ["git", "-C", str(canonical), "worktree", "prune"],
+                check=False, capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    return removed
+
+
 def _ensure_shadow_worktree(canonical: Path, state_dir: Path,
+                            agent_branch: str,
                             agent_head: str) -> Optional[Path]:
-    """Ensure `<state-dir>/shadow/` exists as a `git worktree`
+    """Ensure `<state-dir>/shadows/<branch>/` exists as a `git worktree`
     sharing `canonical`'s object DB, checked out to `agent_head`.
+
+    Per-branch shadows eliminate the cargo incremental-recompile cost
+    that the previous single shared shadow paid on every branch flip:
+    each branch keeps its own `target/` across cycles, so only the
+    *first* opportunistic cycle for a branch pays a cold build, and
+    subsequent cycles on the same branch are incremental even if
+    other branches were tested in between.
 
     Returns the shadow path on success, None on failure (shadow
     cannot be set up — caller should skip the cycle rather than
     fall back to in-place execution, which would race the agent's
     `target/` and `docker build`).
     """
-    shadow = _shadow_worktree_path(state_dir)
+    if not agent_branch:
+        # Detached HEADs shouldn't reach here (filtered upstream),
+        # but defensively: no per-branch shadow is well-defined.
+        return None
+    shadow = _per_branch_shadow_path(state_dir, agent_branch)
     if not shadow.exists():
         shadow.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -2645,13 +2742,14 @@ def _ensure_shadow_worktree(canonical: Path, state_dir: Path,
                 check=True, capture_output=True, text=True, timeout=60,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            print(f"[auto] agent-coverage: shadow setup failed: {e}",
-                  file=sys.stderr)
+            print(f"[auto] agent-coverage: shadow setup failed "
+                  f"({agent_branch}): {e}", file=sys.stderr)
             return None
         return shadow
-    # Existing shadow — switch to agent_head. Use `git checkout
-    # --detach -f` to overwrite anything (the shadow is owned by
-    # the supervisor; no one else should be writing to it).
+    # Existing shadow for this branch — switch to agent_head. Use
+    # `git checkout --detach -f` to overwrite anything (the shadow
+    # is owned by the supervisor; no one else should be writing
+    # to it).
     try:
         subprocess.run(
             ["git", "-C", str(shadow), "checkout", "--detach", "-f",
@@ -2660,7 +2758,7 @@ def _ensure_shadow_worktree(canonical: Path, state_dir: Path,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print(f"[auto] agent-coverage: shadow checkout {agent_head} "
-              f"failed: {e}", file=sys.stderr)
+              f"failed ({agent_branch}): {e}", file=sys.stderr)
         return None
     return shadow
 
@@ -2679,6 +2777,15 @@ def _maybe_drive_agent_worktree(
     canonical = _canonical_worktree(args, state_dir)
     conn = open_db(state_dir)
     try:
+        # GC stale shadows once per cycle, before scheduling. Cheap
+        # (a few seconds at most) and keeps disk usage bounded as
+        # branches come and go.
+        live_branches = _live_branches(conn, canonical)
+        if live_branches:
+            n_gc = _gc_shadow_worktrees(canonical, state_dir, live_branches)
+            if n_gc and not args.quiet:
+                print(f"[auto] agent-coverage: gc'd {n_gc} stale shadow(s)",
+                      file=sys.stderr)
         tips, non_tips = _agent_tip_worktrees(conn, canonical)
         if not tips:
             return
@@ -2741,7 +2848,9 @@ def _drive_agent_worktree(
     env = os.environ.copy()
     state_dir = resolve_state_dir(args.state_dir)
     canonical = _canonical_worktree(args, state_dir)
-    shadow = _ensure_shadow_worktree(canonical, state_dir, wt["head"])
+    shadow = _ensure_shadow_worktree(
+        canonical, state_dir, wt.get("branch") or "", wt["head"],
+    )
     if shadow is None:
         return False
     env["LITEBOX_DASHBOARD_DIR"] = str(state_dir)

@@ -95,12 +95,15 @@ lease entry from that worktree), the supervisor spawns a short
 180s) at that worktree's HEAD. To guarantee isolation from the
 agent's own `target/` and `docker build`, the supervisor never
 runs cargo inside the agent's worktree itself — instead it
-maintains a single shadow worktree at `<state-dir>/shadow/`
+maintains per-branch shadow worktrees at
+`<state-dir>/shadows/<branch>/` (one per agent branch, branch name
+encoded with `%2f` for `/`)
 (shared canonical git object DB, separate working tree +
 separate `target/` + separate per-worktree docker image tag) and
 `git checkout --detach`s the agent's HEAD into it before each
 cycle. Opportunistic runs land in `runs` with
-`worktree_path=<state-dir>/shadow` and the agent's branch in
+`worktree_path=<state-dir>/shadows/<branch>` and the agent's
+branch in
 `runs.branch` — so they're trivially distinguishable from agent's
 own runs by the literal shadow path (same self-evidence trick
 the tracked-ref CI worktrees use). Aggregation still works: the
@@ -130,7 +133,10 @@ worktree is skipped. Solo sessions and fully-independent
 worktrees are always tips — no behavior change. Detection is
 automatic with no env knob (intentional — knobs leak into agent
 shell contexts). The render section marks tips with `→` and
-subsumed rows with `~`.
+subsumed rows with `~`. Per-branch shadows persist across
+cycles so each branch keeps its own incremental `target/`; stale
+shadows whose branch no longer exists in the canonical clone are
+GC'd at the start of each scheduling cycle.
 
 ## Multi-wave platform-fix workflow
 
