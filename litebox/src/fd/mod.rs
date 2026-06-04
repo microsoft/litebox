@@ -525,6 +525,26 @@ pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabled
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     EntryHandle<Platform, Subsystem>
 {
+    /// Get the entry behind this handle.
+    ///
+    /// Note: this grabs a lock, thus the result should not be held for too long, to prevent
+    /// deadlocks. Prefer using [`Self::with_entry`] when possible, to make life easier.
+    pub fn get_entry(
+        &self,
+    ) -> impl core::ops::Deref<Target = Subsystem::Entry> + use<'_, Platform, Subsystem> {
+        crate::sync::RwLockReadGuard::map(self.0.read(), |e| e.as_subsystem::<Subsystem>())
+    }
+
+    /// Get the entry behind this handle mutably.
+    ///
+    /// Note: this grabs a lock, thus the result should not be held for too long, to prevent
+    /// deadlocks. Prefer using [`Self::with_entry_mut`] when possible, to make life easier.
+    pub fn get_entry_mut(
+        &self,
+    ) -> impl core::ops::DerefMut<Target = Subsystem::Entry> + use<'_, Platform, Subsystem> {
+        crate::sync::RwLockWriteGuard::map(self.0.write(), |e| e.as_subsystem_mut::<Subsystem>())
+    }
+
     pub fn with_entry<R>(&self, f: impl FnOnce(&Subsystem::Entry) -> R) -> R {
         f(self.0.read().as_subsystem::<Subsystem>())
     }
