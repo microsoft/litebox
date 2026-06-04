@@ -5,7 +5,7 @@
 //!
 //! This crate wires `litebox_broker_core` to any implementation of the neutral
 //! server control-channel trait. Concrete channels live in separate crates such as
-//! `litebox_broker_unix_socket`.
+//! `litebox_broker_transport`.
 
 #![no_std]
 

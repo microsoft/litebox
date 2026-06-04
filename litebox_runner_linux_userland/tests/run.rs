@@ -313,13 +313,13 @@ where
                 .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
                 .expect("failed to configure broker test write timeout");
             let mut channel =
-                litebox_broker_unix_socket::UnixStreamServerControlChannel::from_accepted(stream);
+                litebox_broker_transport::unix_socket::UnixStreamServerControlChannel::from_accepted(stream);
             let mut core = litebox_broker_core::BrokerCore::new(policy);
-            let termination = litebox_broker_server::serve_connection(&mut core, &mut channel)
+            let termination = litebox_broker_host::serve_connection(&mut core, &mut channel)
                 .expect("broker server failed");
             assert_eq!(
                 termination,
-                litebox_broker_server::ConnectionTermination::PeerClosed
+                litebox_broker_host::ConnectionTermination::PeerClosed
             );
         }));
         let _ = std::fs::remove_file(&server_socket_path);

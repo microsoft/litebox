@@ -3,9 +3,9 @@
 
 //! Unix-domain-socket broker channel for hosted userland deployments.
 //!
-//! This crate deliberately uses `std` because Unix-domain sockets and `std::io`
+//! This module deliberately uses `std` because Unix-domain sockets and `std::io`
 //! framing are hosted userland concerns. Portable broker interfaces live in the
-//! no_std protocol, wire, client, core, and server crates.
+//! no_std protocol, wire, local, core, and host crates.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;

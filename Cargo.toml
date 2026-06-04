@@ -2,11 +2,11 @@
 resolver = "2"
 members = [
     "litebox",
-    "litebox_broker_client",
+    "litebox_broker_local",
     "litebox_broker_core",
     "litebox_broker_protocol",
-    "litebox_broker_server",
-    "litebox_broker_unix_socket",
+    "litebox_broker_host",
+    "litebox_broker_transport",
     "litebox_broker_userland",
     "litebox_broker_wire",
     "litebox_common_linux",
@@ -36,11 +36,11 @@ members = [
 ]
 default-members = [
     "litebox",
-    "litebox_broker_client",
+    "litebox_broker_local",
     "litebox_broker_core",
     "litebox_broker_protocol",
-    "litebox_broker_server",
-    "litebox_broker_unix_socket",
+    "litebox_broker_host",
+    "litebox_broker_transport",
     "litebox_broker_userland",
     "litebox_broker_wire",
     "litebox_common_linux",

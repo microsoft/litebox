@@ -9,10 +9,10 @@ use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use litebox_broker_client::BrokerClient;
+use litebox_broker_host::SUPPORTED_PROTOCOL_VERSION;
+use litebox_broker_local::BrokerClient;
 use litebox_broker_protocol::{ReadinessState, WaitOutcome};
-use litebox_broker_server::SUPPORTED_PROTOCOL_VERSION;
-use litebox_broker_unix_socket::UnixStreamClientControlChannel;
+use litebox_broker_transport::unix_socket::UnixStreamClientControlChannel;
 
 #[test]
 fn separate_process_broker_serves_event_object_requests() {

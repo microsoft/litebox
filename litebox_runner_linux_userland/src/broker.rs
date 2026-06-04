@@ -11,9 +11,9 @@ use std::{
 use alloc::sync::Arc;
 use anyhow::{Context as _, Result};
 use litebox::{BrokerControl, BrokerControlError};
-use litebox_broker_client::{BrokerClient, BrokerClientWorker};
+use litebox_broker_local::{BrokerClient, BrokerClientWorker};
 use litebox_broker_protocol::{BrokerRequest, BrokerResponse, CoreRequest, CoreResponse};
-use litebox_broker_unix_socket::UnixStreamClientControlChannel;
+use litebox_broker_transport::unix_socket::UnixStreamClientControlChannel;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

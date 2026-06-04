@@ -1476,14 +1476,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "litebox_broker_client"
+name = "litebox_broker_core"
 version = "0.1.0"
 dependencies = [
  "litebox_broker_protocol",
 ]
 
 [[package]]
-name = "litebox_broker_core"
+name = "litebox_broker_host"
+version = "0.1.0"
+dependencies = [
+ "litebox_broker_core",
+ "litebox_broker_protocol",
+]
+
+[[package]]
+name = "litebox_broker_local"
 version = "0.1.0"
 dependencies = [
  "litebox_broker_protocol",
@@ -1494,15 +1502,7 @@ name = "litebox_broker_protocol"
 version = "0.1.0"
 
 [[package]]
-name = "litebox_broker_server"
-version = "0.1.0"
-dependencies = [
- "litebox_broker_core",
- "litebox_broker_protocol",
-]
-
-[[package]]
-name = "litebox_broker_unix_socket"
+name = "litebox_broker_transport"
 version = "0.1.0"
 dependencies = [
  "litebox_broker_protocol",
@@ -1513,11 +1513,11 @@ dependencies = [
 name = "litebox_broker_userland"
 version = "0.1.0"
 dependencies = [
- "litebox_broker_client",
  "litebox_broker_core",
+ "litebox_broker_host",
+ "litebox_broker_local",
  "litebox_broker_protocol",
- "litebox_broker_server",
- "litebox_broker_unix_socket",
+ "litebox_broker_transport",
 ]
 
 [[package]]
@@ -1700,11 +1700,11 @@ dependencies = [
  "glob",
  "libc",
  "litebox",
- "litebox_broker_client",
  "litebox_broker_core",
+ "litebox_broker_host",
+ "litebox_broker_local",
  "litebox_broker_protocol",
- "litebox_broker_server",
- "litebox_broker_unix_socket",
+ "litebox_broker_transport",
  "litebox_common_linux",
  "litebox_platform_linux_userland",
  "litebox_platform_multiplex",

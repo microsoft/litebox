@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, EventOnlyPolicy};
-use litebox_broker_server::{BrokerServeError, serve_connection};
-use litebox_broker_unix_socket::UnixStreamServerControlChannel;
+use litebox_broker_host::{BrokerServeError, serve_connection};
+use litebox_broker_transport::unix_socket::UnixStreamServerControlChannel;
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 

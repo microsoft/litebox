@@ -230,7 +230,7 @@ jobs:
           # - `litebox_platform_windows_userland` is allowed to have `std` access,
           #   since it is a purely-userland implementation.
           #
-          # - `litebox_broker_unix_socket` is allowed to have `std` access,
+          # - `litebox_broker_transport` is allowed to have `std` access,
           #   since it is the concrete Unix-domain-socket channel for the
           #   userland broker proof of concept.
           #
@@ -293,7 +293,7 @@ jobs:
           #   can safely use std.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
-            -not -path './litebox_broker_unix_socket/Cargo.toml' \
+            -not -path './litebox_broker_transport/Cargo.toml' \
             -not -path './litebox_broker_userland/Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
