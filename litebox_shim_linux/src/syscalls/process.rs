@@ -6029,6 +6029,10 @@ impl<FS: ShimFS> Task<FS> {
             &mux_stream_specs,
             &bidi_pt,
             &local_pipe_pairs,
+            // Phase 3 D5 starting hook: no streams migrated out of mux yet.
+            // Future commits append `--broker-fd-bridge` specs here per
+            // stream kind (host-backed → virtual pipe → socket → PTY).
+            &[],
         ) {
             Ok(pid) => {
                 phase_tick!("post_spawn_worker_host");
@@ -6349,6 +6353,7 @@ impl<FS: ShimFS> Task<FS> {
             &snapshot_bytes,
             stdio,
             None,
+            &[],
             &[],
             &[],
             &[],

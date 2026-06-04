@@ -1964,6 +1964,14 @@ impl LinuxUserland {
         mux_streams: &[(u32, usize, u8, u8, bool)],
         passthrough_fds: &[(usize, i32, u8)],
         local_pipe_pairs: &[(usize, usize, Vec<u8>, u32, u32)],
+        // Phase 3 (legacy-pipes retirement): broker-fd-bridge specs for
+        // mux streams migrated out of the mux relay to direct broker
+        // handles. Each entry is forwarded to the worker as
+        // `--broker-fd-bridge <spec>` and consumed by the existing
+        // install_broker_fd_bridge_spec path in the runner. Empty until
+        // D5 begins migrating stream kinds (host-backed first, then
+        // virtual pipe / socket / PTY).
+        broker_fd_bridge_specs: &[String],
     ) -> Result<i32, i32>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -2068,6 +2076,17 @@ impl LinuxUserland {
             spawn_argv.push(
                 CString::new(format!("{guest_fd}:{dir_char}:{host_fd}")).map_err(|_| -1_i32)?,
             );
+        }
+
+        // Phase 3 (legacy-pipes retirement): forward broker-fd-bridge
+        // specs for mux streams that have been promoted out of the mux
+        // relay to direct broker handles. The runner already consumes
+        // `--broker-fd-bridge` for cross-binary-type exec fd inheritance
+        // (`install_broker_fd_bridge_spec`); reusing the same flag keeps
+        // the install path uniform.
+        for spec in broker_fd_bridge_specs {
+            spawn_argv.push(CString::new("--broker-fd-bridge").unwrap());
+            spawn_argv.push(CString::new(spec.as_str()).map_err(|_| -1_i32)?);
         }
 
         // Add --local-pipe for child-only pipe pairs (both ends in the
