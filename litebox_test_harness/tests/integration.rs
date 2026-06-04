@@ -1423,13 +1423,41 @@ fn main() {
         lease::register();
         // Print the (initial) dispatch cap for visibility — it can
         // shift during execution as peers come and go.
+        let intrinsic = current_jobs_cap();
+        let global = global_cap();
+        let live = lease::live_lease_count();
+        let effective = dynamic_dispatch_cap();
         eprintln!(
-            "[integration] dispatch cap: intrinsic={} global={} live_peers={} effective={}",
-            current_jobs_cap(),
-            global_cap(),
-            lease::live_lease_count(),
-            dynamic_dispatch_cap(),
+            "[integration] dispatch cap: intrinsic={intrinsic} global={global} \
+             live_peers={live} effective={effective}",
         );
+        // Advisory: if the user set LITEBOX_TEST_JOBS explicitly and it's
+        // strictly less than the share the lease would otherwise grant,
+        // they're self-limiting below their fair share for no benefit
+        // (the lease coordinator handles fairness across concurrent
+        // runners on its own). The most common cause is a cargo-culted
+        // "LITEBOX_TEST_JOBS=4" or "=$(nproc)" in a shared script; both
+        // are usually wrong. Speak up at startup so it's discoverable in
+        // the agent's own log, not just on a host-debug deep-dive.
+        if std::env::var("LITEBOX_TEST_JOBS").is_ok() {
+            let lease_share = (global / live).max(1);
+            if intrinsic < lease_share {
+                eprintln!(
+                    "[integration] advisory: LITEBOX_TEST_JOBS={intrinsic} is below \
+                     your lease share ({lease_share}); you are self-throttling. The \
+                     lease coordinator already divides global={global} fairly across \
+                     {live} live runner(s). Unset LITEBOX_TEST_JOBS unless you have \
+                     a specific stress-test reason to override.",
+                );
+            } else if intrinsic > lease_share {
+                eprintln!(
+                    "[integration] advisory: LITEBOX_TEST_JOBS={intrinsic} exceeds \
+                     your lease share ({lease_share}); effective dispatch is clamped \
+                     to {lease_share}. The env var only matters when you're the only \
+                     test runner on the host; otherwise the lease auto-shares.",
+                );
+            }
+        }
     }
 
     let mut trials: Vec<Trial> = Vec::new();
