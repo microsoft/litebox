@@ -419,6 +419,7 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     parts.append(_render_leases(conn))
     parts.append(_render_velocity(conn))
     parts.append(_render_tracked_refs(conn))
+    parts.append(_render_agent_worktrees(conn, state_dir))
     parts.append(_render_result_groups(conn))
     parts.append(_render_suite_group_breakdown(conn))
     parts.append(_render_current_fails(conn))
@@ -717,6 +718,413 @@ def _remote_for_ref(worktree: str, ref: str) -> Optional[str]:
     if candidate in out.split():
         return candidate
     return None
+
+
+# ─── Agent worktree coverage ─────────────────────────────────────────
+#
+# "Agent worktrees" = any worktree visible to the canonical clone via
+# `git worktree list` that is NOT registered as a `tracked_refs.ci_worktree`.
+# These are typically per-session work branches owned by coding agents.
+# The supervisor opportunistically runs short `--fill` cycles against
+# them when they're idle, so the dashboard can surface regressions vs
+# the tracked-ref baseline the agent forked from. No branch-name
+# hardcoding — tracked_refs is the source of truth for "already
+# permanently covered;" everything else is agent work.
+
+
+def _canonical_worktree(args: argparse.Namespace, state_dir: Path) -> Path:
+    """Resolve the canonical clone root used for `git worktree list`
+    and merge-base queries. Precedence: --canonical-worktree arg >
+    state_dir.parent."""
+    val = getattr(args, "canonical_worktree", None) if args is not None else None
+    if val:
+        return Path(val).resolve()
+    return state_dir.parent.resolve()
+
+
+def _list_worktrees(canonical: Path) -> list[dict]:
+    """Parse `git worktree list --porcelain` into a list of
+    `{path, head, branch}` dicts. `branch` is None for detached HEAD."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(canonical), "worktree", "list", "--porcelain"],
+            check=True, capture_output=True, text=True, timeout=15,
+        ).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError):
+        return []
+    worktrees: list[dict] = []
+    cur: dict = {}
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            if cur:
+                worktrees.append(cur)
+            cur = {"path": line[len("worktree "):].strip(),
+                   "head": None, "branch": None}
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):].strip()
+        elif line.startswith("branch "):
+            ref = line[len("branch "):].strip()
+            if ref.startswith("refs/heads/"):
+                ref = ref[len("refs/heads/"):]
+            cur["branch"] = ref
+        elif line == "detached":
+            cur["branch"] = None
+    if cur:
+        worktrees.append(cur)
+    return worktrees
+
+
+def _tracked_ci_worktree_paths(conn: sqlite3.Connection) -> set[str]:
+    """Resolved-absolute set of `tracked_refs.ci_worktree` paths."""
+    out: set[str] = set()
+    for r in conn.execute("SELECT ci_worktree FROM tracked_refs"):
+        try:
+            out.add(str(Path(r["ci_worktree"]).resolve()))
+        except (OSError, ValueError):
+            out.add(r["ci_worktree"])
+    return out
+
+
+_AGENT_SRC_GLOBS = ("**/*.rs", "**/*.toml", "**/Dockerfile", "**/*.py")
+_AGENT_SRC_SKIP_DIRS = {"target", ".git", "node_modules", ".dashboard"}
+
+
+def _worktree_max_source_mtime(path: Path) -> Optional[float]:
+    """Best-effort: walk `path` skipping `target/`, `.git/`, return max
+    mtime over source-ish files. Bounded by an internal file-count cap
+    so a huge tree doesn't stall the supervisor."""
+    if not path.is_dir():
+        return None
+    max_mt = 0.0
+    seen = 0
+    CAP = 5000
+    try:
+        for root, dirs, files in os.walk(path):
+            dirs[:] = [d for d in dirs if d not in _AGENT_SRC_SKIP_DIRS
+                       and not d.startswith(".")]
+            for f in files:
+                if not (f.endswith(".rs") or f.endswith(".toml")
+                        or f.endswith(".py") or f == "Dockerfile"):
+                    continue
+                try:
+                    mt = os.stat(os.path.join(root, f)).st_mtime
+                except OSError:
+                    continue
+                if mt > max_mt:
+                    max_mt = mt
+                seen += 1
+                if seen >= CAP:
+                    return max_mt if max_mt > 0 else None
+    except OSError:
+        pass
+    return max_mt if max_mt > 0 else None
+
+
+def _lease_pids_in_worktree(conn: sqlite3.Connection,
+                            worktree: str) -> list[int]:
+    """Return live-heartbeat lease PIDs whose /proc/<pid>/cwd is
+    under `worktree`. Used so the supervisor doesn't race an agent's
+    own in-flight `cargo test` from the same worktree."""
+    try:
+        rows = conn.execute(
+            "SELECT pid, heartbeat_at_ms FROM harness_leases"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    now = now_ms()
+    stale = 30_000
+    wt_resolved = str(Path(worktree).resolve())
+    out: list[int] = []
+    for r in rows:
+        if (now - r["heartbeat_at_ms"]) >= stale:
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{r['pid']}/cwd")
+        except OSError:
+            continue
+        if cwd == wt_resolved or cwd.startswith(wt_resolved + "/"):
+            out.append(r["pid"])
+    return out
+
+
+def _discover_agent_worktrees(
+    conn: sqlite3.Connection, canonical: Path,
+) -> list[dict]:
+    """Return list of agent-worktree dicts (subset of `_list_worktrees`)
+    excluding tracked-ref CI worktrees and detached / missing HEADs."""
+    tracked = _tracked_ci_worktree_paths(conn)
+    out: list[dict] = []
+    for wt in _list_worktrees(canonical):
+        if not wt.get("branch") or not wt.get("head"):
+            continue
+        path = wt.get("path") or ""
+        if not path:
+            continue
+        try:
+            resolved = str(Path(path).resolve())
+        except (OSError, ValueError):
+            resolved = path
+        if resolved in tracked:
+            continue
+        # Skip canonical clone itself if it's checked out to the
+        # amalgamation (or any tracked_ref branch). It's covered by
+        # the tracked_ref drive already.
+        if resolved == str(canonical) and _branch_is_tracked(
+            conn, wt["branch"]
+        ):
+            continue
+        if not Path(path).is_dir():
+            continue
+        out.append({**wt, "path": resolved})
+    return out
+
+
+def _branch_is_tracked(conn: sqlite3.Connection, branch: str) -> bool:
+    """True if `branch` (or `origin/<branch>`) appears in tracked_refs.ref."""
+    rows = conn.execute("SELECT ref FROM tracked_refs").fetchall()
+    refs = {r["ref"] for r in rows}
+    if branch in refs:
+        return True
+    # tracked refs often look like `origin/wportnoy/foo`; allow match
+    # on the trailing branch path.
+    for ref in refs:
+        if ref.split("/", 1)[-1] == branch or ref.endswith("/" + branch):
+            return True
+    return False
+
+
+def _agent_worktree_is_idle(wt: dict, idle_secs: int,
+                            conn: sqlite3.Connection) -> tuple[bool, str]:
+    """Returns (idle, reason). idle=True means safe to schedule
+    opportunistic coverage."""
+    pids = _lease_pids_in_worktree(conn, wt["path"])
+    if pids:
+        return (False, f"lease pid {pids[0]} live in worktree")
+    mt = _worktree_max_source_mtime(Path(wt["path"]))
+    if mt is None:
+        # No source files found — treat as idle (unusual but harmless).
+        return (True, "no source files seen")
+    age = time.time() - mt
+    if age < idle_secs:
+        return (False, f"source touched {int(age)}s ago (< {idle_secs}s)")
+    return (True, f"idle {int(age)}s")
+
+
+def _merge_base(canonical: Path, a: str, b: str) -> Optional[str]:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(canonical), "merge-base", a, b],
+            check=False, capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    sha = r.stdout.strip()
+    return sha or None
+
+
+def _commit_ts(canonical: Path, sha: str) -> Optional[int]:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(canonical), "log", "-1", "--format=%ct", sha],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    s = r.stdout.strip()
+    return int(s) if s.isdigit() else None
+
+
+def _resolve_ref_head(canonical: Path, ref: str) -> Optional[str]:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(canonical), "rev-parse", ref],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    s = r.stdout.strip()
+    return s if len(s) >= 7 else None
+
+
+def _pick_baseline_ref(
+    conn: sqlite3.Connection, canonical: Path, agent_head: str,
+) -> Optional[dict]:
+    """Pick the tracked_ref whose HEAD shares the most recent
+    merge-base with `agent_head` (= the upstream the agent forked
+    from most recently). Returns `{ref, ci_worktree, ref_head,
+    merge_base, mb_ts}` or None.
+
+    With a single tracked_ref this trivially returns that ref.
+    """
+    refs = conn.execute(
+        "SELECT ref, ci_worktree FROM tracked_refs"
+    ).fetchall()
+    if not refs:
+        return None
+    best: Optional[dict] = None
+    best_ts = -1
+    for r in refs:
+        ref = r["ref"]
+        # Resolve ref's tip in the canonical clone. Local-name first,
+        # then origin/<ref> fallback.
+        ref_head = (_resolve_ref_head(canonical, ref)
+                    or _resolve_ref_head(canonical, f"origin/{ref}"))
+        if not ref_head:
+            continue
+        mb = _merge_base(canonical, agent_head, ref_head)
+        if not mb:
+            continue
+        ts = _commit_ts(canonical, mb) or 0
+        if ts > best_ts:
+            best_ts = ts
+            best = {"ref": ref, "ci_worktree": r["ci_worktree"],
+                    "ref_head": ref_head, "merge_base": mb, "mb_ts": ts}
+    return best
+
+
+def _regression_counts(
+    conn: sqlite3.Connection,
+    baseline_sha: str, agent_sha: str,
+) -> dict[str, dict[str, int]]:
+    """Compare state-scoped freshest verdicts at `baseline_sha` (clean)
+    vs `agent_sha` (clean). Returns
+    `{pass: {regressions, improvements, common}}`.
+
+    "Regression" = passed at baseline, failed at agent_sha.
+    "Improvement" = failed at baseline, passed at agent_sha.
+    "Common" = (test_id, pass) with verdicts at both states.
+    Uses the state_test_pass TEMP TABLE (clean filter via
+    `state_wt IS NULL AND dirty_hash IS NULL`).
+    """
+    out: dict[str, dict[str, int]] = {}
+    for pass_name in ("native", "litebox"):
+        b = {
+            r["test_id"]: r["freshest_verdict"]
+            for r in conn.execute(
+                "SELECT test_id, freshest_verdict FROM state_test_pass "
+                " WHERE commit_sha = ? AND state_wt IS NULL AND pass = ?",
+                (baseline_sha, pass_name),
+            )
+        }
+        a = {
+            r["test_id"]: r["freshest_verdict"]
+            for r in conn.execute(
+                "SELECT test_id, freshest_verdict FROM state_test_pass "
+                " WHERE commit_sha = ? AND state_wt IS NULL AND pass = ?",
+                (agent_sha, pass_name),
+            )
+        }
+        regressions = sum(
+            1 for tid, va in a.items()
+            if tid in b and b[tid] == "pass" and va != "pass"
+        )
+        improvements = sum(
+            1 for tid, va in a.items()
+            if tid in b and b[tid] != "pass" and va == "pass"
+        )
+        common = sum(1 for tid in a if tid in b)
+        out[pass_name] = {
+            "regressions": regressions,
+            "improvements": improvements,
+            "common": common,
+            "agent_cov": len(a),
+            "baseline_cov": len(b),
+        }
+    return out
+
+
+def _regression_test_ids(
+    conn: sqlite3.Connection,
+    baseline_sha: str, agent_sha: str, pass_name: str,
+    limit: int = 20,
+) -> list[str]:
+    """Return up to `limit` test_ids that regressed (pass at baseline,
+    fail at agent_sha) for the given pass."""
+    b = {
+        r["test_id"]: r["freshest_verdict"]
+        for r in conn.execute(
+            "SELECT test_id, freshest_verdict FROM state_test_pass "
+            " WHERE commit_sha = ? AND state_wt IS NULL AND pass = ?",
+            (baseline_sha, pass_name),
+        )
+    }
+    out: list[str] = []
+    for r in conn.execute(
+        "SELECT test_id FROM state_test_pass "
+        " WHERE commit_sha = ? AND state_wt IS NULL AND pass = ? "
+        "   AND freshest_verdict <> 'pass' "
+        " ORDER BY test_id",
+        (agent_sha, pass_name),
+    ):
+        tid = r["test_id"]
+        if b.get(tid) == "pass":
+            out.append(tid)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _last_run_age_at_sha(conn: sqlite3.Connection, sha: str,
+                        worktree_path: str) -> Optional[int]:
+    """Newest run_results.finished_ts_ms for clean rows at this
+    (sha, worktree_path). None if no coverage yet."""
+    row = conn.execute(
+        "SELECT MAX(rr.finished_ts_ms)"
+        "  FROM run_results rr JOIN runs r ON r.run_id = rr.run_id"
+        " WHERE r.commit_sha = ? AND r.dirty_hash IS NULL"
+        "   AND r.worktree_path = ?",
+        (sha, worktree_path),
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def _pick_opportunistic_worktree(
+    conn: sqlite3.Connection,
+    candidates: list[dict],
+) -> Optional[dict]:
+    """Round-robin selection over idle candidates, biased toward
+    worktrees whose current HEAD has the stalest (or absent) coverage.
+
+    Strategy: per candidate compute `coverage_age_ms` (None if no
+    coverage yet at HEAD). Sort so None comes first (never tested),
+    then oldest first. Apply round-robin tiebreak via the
+    `meta` key `agent_coverage_last_picked` to ensure no single
+    worktree starves the others over long runs.
+    """
+    if not candidates:
+        return None
+    last_picked_row = conn.execute(
+        "SELECT value FROM meta WHERE key = 'agent_coverage_last_picked'"
+    ).fetchone()
+    last_picked = last_picked_row[0] if last_picked_row else None
+
+    def keyed(c: dict) -> tuple:
+        age = _last_run_age_at_sha(conn, c["head"], c["path"])
+        never_tested = age is None
+        ms_since = (now_ms() - age) if age is not None else 10**18
+        same_as_last = c["path"] == last_picked
+        # Tuple: never-tested first (False < True), then deprioritize
+        # the most-recently-picked, then oldest coverage first.
+        return (not never_tested, same_as_last, -ms_since)
+
+    candidates_sorted = sorted(candidates, key=keyed)
+    return candidates_sorted[0]
+
+
+def _record_picked(conn: sqlite3.Connection, path: str) -> None:
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('agent_coverage_last_picked', ?)"
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (path,),
+    )
+    conn.commit()
 
 
 def _coverage_pass_fail(
@@ -1390,6 +1798,130 @@ def _verdict_history(
     return "".join(chars) or "—"
 
 
+def _render_agent_worktrees(conn: sqlite3.Connection,
+                            state_dir: Path) -> str:
+    """Per-agent-worktree coverage + regression delta vs the best-fit
+    tracked-ref baseline. Auto-discovered from `git worktree list` in
+    the canonical clone (any worktree that isn't a tracked-ref CI
+    worktree and has a branch checked out).
+
+    Two regression metrics per worktree:
+      * Δ vs merge-base(HEAD, baseline_ref_HEAD) — agent's own
+        regressions since they forked.
+      * Δ vs baseline_ref_HEAD — absolute drift vs current upstream.
+    """
+    canonical = _canonical_worktree_for_render(state_dir)
+    candidates = _discover_agent_worktrees(conn, canonical)
+    if not candidates:
+        # Section omitted entirely when there are no agent worktrees
+        # — keeps summary.md uncluttered for single-session use.
+        return ""
+    lines = [
+        "## Agent worktrees\n",
+        "_Opportunistic coverage for live worktrees. Each row's "
+        "regression columns compare the worktree's HEAD against the "
+        "tracked-ref baseline whose HEAD shares the most recent "
+        "merge-base — i.e., the upstream this branch forked from._\n",
+        "| Worktree | Branch | HEAD | Baseline ref | "
+        "Δ vs merge-base (native) | Δ vs merge-base (litebox) | "
+        "Δ vs baseline HEAD (native) | Δ vs baseline HEAD (litebox) | "
+        "Cov (native) | Cov (litebox) | Last tested |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    details: list[str] = []
+    for wt in candidates:
+        agent_head = wt["head"]
+        path = wt["path"]
+        branch = _branch_display(wt.get("branch"))
+        baseline = _pick_baseline_ref(conn, canonical, agent_head)
+        if baseline is None:
+            lines.append(
+                f"| `{Path(path).name}` | {branch} | "
+                f"`{short_sha(agent_head)}` | _no baseline_ | — | — | — | — | "
+                f"— | — | — |"
+            )
+            continue
+        mb = baseline["merge_base"]
+        ref_head = baseline["ref_head"]
+        # Δ vs merge-base
+        delta_mb = _regression_counts(conn, mb, agent_head)
+        # Δ vs baseline HEAD
+        delta_bh = _regression_counts(conn, ref_head, agent_head)
+        last_age = _last_run_age_at_sha(conn, agent_head, path)
+        last_age_str = (
+            f"{fmt_age_ms(now_ms() - last_age)} ago"
+            if last_age is not None else "_never_"
+        )
+        def cell(d: dict, p: str) -> str:
+            r = d[p]["regressions"]
+            i = d[p]["improvements"]
+            if r == 0 and i == 0:
+                if d[p]["common"] == 0:
+                    return "—"
+                return "0"
+            parts = [f"**{r}**"] if r else []
+            if i:
+                parts.append(f"_+{i}_")
+            return " ".join(parts) or "0"
+        lines.append(
+            f"| `{Path(path).name}` | {branch} | "
+            f"`{short_sha(agent_head)}` | "
+            f"`{baseline['ref']}` @ `{short_sha(ref_head)}` | "
+            f"{cell(delta_mb, 'native')} | {cell(delta_mb, 'litebox')} | "
+            f"{cell(delta_bh, 'native')} | {cell(delta_bh, 'litebox')} | "
+            f"{delta_mb['native']['agent_cov']} | "
+            f"{delta_mb['litebox']['agent_cov']} | "
+            f"{last_age_str} |"
+        )
+        # Per-worktree regression detail block (only if non-zero).
+        if last_age is not None:
+            blocks: list[str] = []
+            for label, base_sha in (
+                (f"merge-base `{short_sha(mb)}`", mb),
+                (f"baseline HEAD `{short_sha(ref_head)}`", ref_head),
+            ):
+                for pass_name in ("native", "litebox"):
+                    ids = _regression_test_ids(conn, base_sha, agent_head,
+                                               pass_name, limit=20)
+                    if not ids:
+                        continue
+                    blocks.append(
+                        f"  - vs {label} ({pass_name}, {len(ids)} shown):\n    "
+                        + ", ".join(f"`{tid}`" for tid in ids)
+                    )
+            if blocks:
+                details.append(
+                    f"\n<details><summary>"
+                    f"Regressed test_ids — `{Path(path).name}` "
+                    f"@ `{short_sha(agent_head)}`</summary>\n\n"
+                    + "\n".join(blocks)
+                    + "\n\n</details>"
+                )
+    lines.append("")
+    lines.append(
+        "_Bold = regressions (pass → fail). Italic `+N` = improvements "
+        "(fail → pass). `—` = no overlapping coverage with that "
+        "baseline yet (run more cycles). Worktrees are auto-discovered "
+        "from `git worktree list`; tracked-ref CI worktrees are "
+        "excluded. Idle gate: source files untouched for "
+        "`LITEBOX_AGENT_IDLE_SECS` (default 300s) AND no live lease "
+        "from the worktree._"
+    )
+    out = "\n".join(lines) + "\n"
+    if details:
+        out += "\n" + "\n".join(details) + "\n"
+    return out
+
+
+def _canonical_worktree_for_render(state_dir: Path) -> Path:
+    """Render-time resolution (no argparse Namespace here): use the
+    `LITEBOX_DASHBOARD_CANONICAL` env override else state_dir.parent."""
+    env = os.environ.get("LITEBOX_DASHBOARD_CANONICAL")
+    if env:
+        return Path(env).resolve()
+    return state_dir.parent.resolve()
+
+
 def _render_recent_runs(conn: sqlite3.Connection) -> str:
     rows = conn.execute(
         """
@@ -1722,6 +2254,21 @@ def cmd_auto(args: argparse.Namespace) -> int:
                     ok = False
                 if not args.quiet:
                     print(f"[auto] {ref} @ {wt}: {'ok' if ok else 'failed'}")
+            # Opportunistic agent-worktree coverage: pick one idle
+            # agent worktree per cycle (if any) and run a short fill.
+            # Lease coordinator already shares concurrency fairly with
+            # any in-flight tracked-ref cycle.
+            if not getattr(args, "agent_coverage_disable", False):
+                try:
+                    _maybe_drive_agent_worktree(
+                        args, pidfile=pidfile,
+                        supervisor_state=_supervisor_state,
+                    )
+                except Exception as e:
+                    print(f"[auto] agent-coverage drive crashed: "
+                          f"{type(e).__name__}: {e}", file=sys.stderr)
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
             # The background freshness thread (started above the loop)
             # handles continuous summary.md updates every
             # FRESHNESS_INTERVAL_SECS regardless of cycle phase, so we
@@ -1874,6 +2421,183 @@ def _drive_ref(
             _write_pidfile(pidfile, supervisor_pid=os.getpid())
 
     return rc == 0
+
+
+def _maybe_drive_agent_worktree(
+    args: argparse.Namespace,
+    *,
+    pidfile: Optional[Path] = None,
+    supervisor_state: Optional[dict] = None,
+) -> None:
+    """One-cycle wrapper: discover agent worktrees, pick an idle one,
+    drive a short `--fill` from it. Best-effort — failures don't
+    abort the supervisor's main loop.
+    """
+    state_dir = resolve_state_dir(args.state_dir)
+    canonical = _canonical_worktree(args, state_dir)
+    conn = open_db(state_dir)
+    try:
+        candidates = _discover_agent_worktrees(conn, canonical)
+        if not candidates:
+            return
+        idle_secs = int(os.environ.get("LITEBOX_AGENT_IDLE_SECS")
+                        or getattr(args, "agent_idle_secs", 300) or 300)
+        eligible: list[dict] = []
+        skipped: list[tuple[str, str]] = []
+        for wt in candidates:
+            ok, reason = _agent_worktree_is_idle(wt, idle_secs, conn)
+            if ok:
+                eligible.append(wt)
+            else:
+                skipped.append((wt["path"], reason))
+        if not eligible:
+            if not args.quiet:
+                summary = "; ".join(
+                    f"{Path(p).name}: {r}" for p, r in skipped[:3]
+                )
+                print(f"[auto] agent-coverage: 0 idle of "
+                      f"{len(candidates)} ({summary})", file=sys.stderr)
+            return
+        pick = _pick_opportunistic_worktree(conn, eligible)
+        if pick is None:
+            return
+        _record_picked(conn, pick["path"])
+    finally:
+        conn.close()
+    if not args.quiet:
+        print(f"[auto] agent-coverage: driving {Path(pick['path']).name} "
+              f"@ {short_sha(pick['head'])} (branch={pick['branch']})",
+              file=sys.stderr)
+    _drive_agent_worktree(
+        pick, args, pidfile=pidfile, supervisor_state=supervisor_state,
+    )
+
+
+def _drive_agent_worktree(
+    wt: dict,
+    args: argparse.Namespace,
+    *,
+    pidfile: Optional[Path] = None,
+    supervisor_state: Optional[dict] = None,
+) -> bool:
+    """Run a short `--fill` cycle from an agent worktree at its
+    current HEAD. Unlike `_drive_ref`, this does NOT checkout —
+    the agent's worktree is alive and we don't touch its working
+    tree state. Whatever HEAD is recorded there at spawn time is
+    what gets tested.
+
+    Smaller wall-time budget than tracked-ref drives so round-robin
+    across multiple agent worktrees stays responsive.
+    """
+    env = os.environ.copy()
+    state_dir = resolve_state_dir(args.state_dir)
+    env["LITEBOX_DASHBOARD_DIR"] = str(state_dir)
+    env["LITEBOX_DASHBOARD_REF"] = wt.get("branch") or "<detached>"
+    fill_budget = int(os.environ.get("LITEBOX_AGENT_FILL_BUDGET")
+                      or getattr(args, "agent_fill_budget", 180) or 180)
+    cargo_args = [
+        "cargo", "test", "-p", "litebox_test_harness",
+        "--test", "integration", "--",
+        f"--fill={fill_budget}s",
+    ]
+    if args.jobs:
+        env["LITEBOX_TEST_JOBS"] = str(args.jobs)
+    deadline = time.monotonic() + (fill_budget * 2 + 300)
+    proc = subprocess.Popen(
+        cargo_args, cwd=wt["path"], env=env,
+        start_new_session=True,
+    )
+    cargo_pgid = proc.pid
+    if supervisor_state is not None:
+        supervisor_state["cargo_pgid"] = cargo_pgid
+    if pidfile is not None:
+        _write_pidfile(
+            pidfile, supervisor_pid=os.getpid(),
+            cargo_pid=proc.pid, cargo_pgid=cargo_pgid,
+            agent_worktree=wt["path"],
+        )
+    harness_pid: Optional[int] = None
+    poll_until = time.monotonic() + 30
+    rc: Optional[int] = None
+    try:
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                break
+            if harness_pid is None and time.monotonic() < poll_until:
+                harness_pid = _find_harness_pid(proc.pid)
+                if harness_pid is not None and supervisor_state is not None:
+                    supervisor_state["harness_pid"] = harness_pid
+            if time.monotonic() > deadline:
+                print(f"[auto] agent-coverage cycle exceeded deadline; "
+                      f"reaping PGID {cargo_pgid}", file=sys.stderr)
+                _reap_pgid_and_containers(cargo_pgid, harness_pid,
+                                          quiet=args.quiet)
+                return False
+            time.sleep(0.5)
+    finally:
+        if cargo_pgid is not None:
+            stragglers = _pids_in_pgid(cargo_pgid)
+            if stragglers:
+                _reap_pgid_and_containers(cargo_pgid, harness_pid,
+                                          quiet=args.quiet)
+        if supervisor_state is not None:
+            supervisor_state["cargo_pgid"] = None
+            supervisor_state["harness_pid"] = None
+        if pidfile is not None:
+            _write_pidfile(pidfile, supervisor_pid=os.getpid())
+    # Optional sidecar after a successful cycle.
+    if rc == 0 and (os.environ.get("LITEBOX_AGENT_SIDECAR")
+                    or getattr(args, "agent_sidecar", False)):
+        try:
+            _write_agent_sidecar(wt, args)
+        except Exception as e:
+            print(f"[auto] agent-coverage sidecar failed: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+    return rc == 0
+
+
+def _write_agent_sidecar(wt: dict, args: argparse.Namespace) -> None:
+    """Write a focused `regressions.md` into the agent worktree so
+    they can `cat` it without scrolling the full summary.md."""
+    state_dir = resolve_state_dir(args.state_dir)
+    canonical = _canonical_worktree(args, state_dir)
+    conn = open_db(state_dir)
+    try:
+        agent_head = wt["head"]
+        baseline = _pick_baseline_ref(conn, canonical, agent_head)
+        if baseline is None:
+            return
+        out_dir = Path(wt["path"]) / ".dashboard"
+        out_dir.mkdir(exist_ok=True)
+        out = out_dir / "regressions.md"
+        lines = [
+            f"# Regressions vs `{baseline['ref']}`",
+            "",
+            f"_Worktree HEAD_: `{agent_head}` (branch "
+            f"`{wt.get('branch') or '<detached>'}`)",
+            f"_Baseline_: `{baseline['ref']}` @ "
+            f"`{baseline['ref_head']}`",
+            f"_Merge-base_: `{baseline['merge_base']}`",
+            "",
+        ]
+        for label, base_sha in (
+            ("merge-base", baseline["merge_base"]),
+            ("baseline HEAD", baseline["ref_head"]),
+        ):
+            for pass_name in ("native", "litebox"):
+                ids = _regression_test_ids(conn, base_sha, agent_head,
+                                           pass_name, limit=50)
+                if not ids:
+                    continue
+                lines.append(f"## vs {label} ({pass_name}) — {len(ids)}")
+                lines.append("")
+                for tid in ids:
+                    lines.append(f"- `{tid}`")
+                lines.append("")
+        out.write_text("\n".join(lines))
+    finally:
+        conn.close()
 
 
 # ─── Process-group + pidfile helpers ─────────────────────────────────
@@ -2217,6 +2941,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_auto.add_argument("--once", action="store_true",
                         help="run one pass and exit")
+    p_auto.add_argument(
+        "--canonical-worktree", default=None,
+        help="canonical clone root for `git worktree list` / "
+             "merge-base queries (default: state-dir's parent).",
+    )
+    p_auto.add_argument(
+        "--agent-idle-secs", type=int, default=300,
+        help="seconds a worktree must have no source-file mtime "
+             "change AND no live lease before opportunistic "
+             "coverage will spawn a cycle there (default 300s = "
+             "5min). Env override: LITEBOX_AGENT_IDLE_SECS.",
+    )
+    p_auto.add_argument(
+        "--agent-fill-budget", type=int, default=180,
+        help="`--fill=Ns` budget for opportunistic agent-worktree "
+             "cycles (default 180s). Env override: "
+             "LITEBOX_AGENT_FILL_BUDGET.",
+    )
+    p_auto.add_argument(
+        "--agent-sidecar", action="store_true",
+        help="after a successful agent-worktree cycle, write a "
+             "focused `<worktree>/.dashboard/regressions.md` so the "
+             "agent can `cat` it without scrolling summary.md. Env "
+             "override: LITEBOX_AGENT_SIDECAR.",
+    )
+    p_auto.add_argument(
+        "--agent-coverage-disable", action="store_true",
+        help="disable opportunistic agent-worktree coverage "
+             "entirely; supervisor only drives tracked refs.",
+    )
     p_auto.add_argument("--quiet", "-q", action="store_true")
     p_auto.set_defaults(func=cmd_auto)
 
