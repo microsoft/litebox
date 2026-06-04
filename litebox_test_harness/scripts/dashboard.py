@@ -1258,6 +1258,37 @@ def _pick_opportunistic_worktree(
     return candidates_sorted[0]
 
 
+def _pick_opportunistic_worktrees_topn(
+    conn: sqlite3.Connection,
+    candidates: list[dict],
+    n: int,
+) -> list[dict]:
+    """Top-N variant of `_pick_opportunistic_worktree`. Uses the same
+    sort key — never-tested first, then deprioritize last-picked, then
+    oldest-coverage first — and returns the leading `n` entries (or
+    fewer if the candidate list is shorter). Used by the parallel
+    agent-coverage orchestrator to schedule multiple cargo cycles per
+    supervisor tick. With `n == 1` this is equivalent to
+    `_pick_opportunistic_worktree`.
+    """
+    if not candidates or n <= 0:
+        return []
+    last_picked_row = conn.execute(
+        "SELECT value FROM meta WHERE key = 'agent_coverage_last_picked'"
+    ).fetchone()
+    last_picked = last_picked_row[0] if last_picked_row else None
+
+    def keyed(c: dict) -> tuple:
+        age = _last_run_age_at_sha(conn, c["head"])
+        never_tested = age is None
+        ms_since = (now_ms() - age) if age is not None else 10**18
+        same_as_last = c["path"] == last_picked
+        return (not never_tested, same_as_last, -ms_since)
+
+    candidates_sorted = sorted(candidates, key=keyed)
+    return candidates_sorted[:n]
+
+
 def _record_picked(conn: sqlite3.Connection, path: str) -> None:
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('agent_coverage_last_picked', ?)"
@@ -2320,18 +2351,14 @@ def cmd_auto(args: argparse.Namespace) -> int:
     """
     state_dir = resolve_state_dir(args.state_dir)
     pidfile = state_dir / "auto.pidfile"
-    _supervisor_state: dict = {"cargo_pgid": None, "harness_pid": None}
+    _supervisor_state = _new_supervisor_state()
 
     def _signal_handler(signum, _frame):
         sig_name = signal.Signals(signum).name
         if not args.quiet:
-            print(f"[auto] received {sig_name}; reaping in-flight cargo",
+            print(f"[auto] received {sig_name}; reaping in-flight cargo(s)",
                   file=sys.stderr)
-        _reap_pgid_and_containers(
-            _supervisor_state.get("cargo_pgid"),
-            _supervisor_state.get("harness_pid"),
-            quiet=args.quiet,
-        )
+        _reap_all_children(_supervisor_state, quiet=args.quiet)
         try:
             pidfile.unlink()
         except FileNotFoundError:
@@ -2559,15 +2586,14 @@ def _drive_ref(
         start_new_session=True,
     )
     cargo_pgid = proc.pid  # equals PGID after start_new_session
+    child_id: Optional[int] = None
     if supervisor_state is not None:
-        supervisor_state["cargo_pgid"] = cargo_pgid
-    if pidfile is not None:
-        _write_pidfile(
-            pidfile,
-            supervisor_pid=os.getpid(),
-            cargo_pid=proc.pid,
-            cargo_pgid=cargo_pgid,
+        child_id = _register_child(
+            supervisor_state, kind="tracked-ref", worktree_path=ci_worktree,
         )
+        _update_child(supervisor_state, child_id, cargo_pgid=cargo_pgid)
+        if pidfile is not None:
+            _write_pidfile_from_state(pidfile, os.getpid(), supervisor_state)
 
     # Discover the harness (test binary) PID as it appears under
     # cargo. Best-effort; used as container-name salt for sweeps.
@@ -2581,15 +2607,12 @@ def _drive_ref(
                 break
             if harness_pid is None and time.monotonic() < poll_until:
                 harness_pid = _find_harness_pid(proc.pid)
-                if harness_pid is not None and supervisor_state is not None:
-                    supervisor_state["harness_pid"] = harness_pid
+                if harness_pid is not None and child_id is not None:
+                    _update_child(supervisor_state, child_id,
+                                  harness_pid=harness_pid)
                     if pidfile is not None:
-                        _write_pidfile(
-                            pidfile,
-                            supervisor_pid=os.getpid(),
-                            cargo_pid=proc.pid,
-                            cargo_pgid=cargo_pgid,
-                            harness_pid=harness_pid,
+                        _write_pidfile_from_state(
+                            pidfile, os.getpid(), supervisor_state,
                         )
             if time.monotonic() > deadline:
                 print(f"[auto] cycle exceeded deadline; reaping PGID {cargo_pgid}",
@@ -2609,11 +2632,12 @@ def _drive_ref(
                       file=sys.stderr)
                 _reap_pgid_and_containers(cargo_pgid, harness_pid,
                                           quiet=args.quiet)
-        if supervisor_state is not None:
-            supervisor_state["cargo_pgid"] = None
-            supervisor_state["harness_pid"] = None
-        if pidfile is not None:
-            _write_pidfile(pidfile, supervisor_pid=os.getpid())
+        if child_id is not None and supervisor_state is not None:
+            _unregister_child(supervisor_state, child_id)
+            if pidfile is not None:
+                _write_pidfile_from_state(
+                    pidfile, os.getpid(), supervisor_state,
+                )
 
     return rc == 0
 
@@ -2814,19 +2838,41 @@ def _maybe_drive_agent_worktree(
                 print(f"[auto] agent-coverage: 0 idle of "
                       f"{len(tips)} tips ({summary})", file=sys.stderr)
             return
-        pick = _pick_opportunistic_worktree(conn, eligible)
-        if pick is None:
+        pick_n = max(1, int(getattr(args, "max_parallel_agent_cargos", 1) or 1))
+        picks = _pick_opportunistic_worktrees_topn(conn, eligible, pick_n)
+        if not picks:
             return
-        _record_picked(conn, pick["path"])
+        # Record the LAST pick (preserves the round-robin signal: that
+        # one will be deprioritized next cycle).
+        _record_picked(conn, picks[-1]["path"])
     finally:
         conn.close()
     if not args.quiet:
-        print(f"[auto] agent-coverage: driving {Path(pick['path']).name} "
-              f"@ {short_sha(pick['head'])} (branch={pick['branch']})",
-              file=sys.stderr)
-    _drive_agent_worktree(
-        pick, args, pidfile=pidfile, supervisor_state=supervisor_state,
-    )
+        names = ", ".join(
+            f"{Path(p['path']).name}@{short_sha(p['head'])}" for p in picks
+        )
+        print(f"[auto] agent-coverage: driving {len(picks)} worktree(s) "
+              f"in parallel: {names}", file=sys.stderr)
+    if len(picks) == 1:
+        # Hot path: no thread overhead when parallelism is disabled.
+        _drive_agent_worktree(
+            picks[0], args, pidfile=pidfile,
+            supervisor_state=supervisor_state,
+        )
+        return
+    threads: list[threading.Thread] = []
+    for pick in picks:
+        t = threading.Thread(
+            target=_drive_agent_worktree,
+            args=(pick, args),
+            kwargs={"pidfile": pidfile, "supervisor_state": supervisor_state},
+            name=f"agent-cov:{Path(pick['path']).name}",
+            daemon=False,
+        )
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
 
 
 def _drive_agent_worktree(
@@ -2877,14 +2923,15 @@ def _drive_agent_worktree(
         start_new_session=True,
     )
     cargo_pgid = proc.pid
+    child_id: Optional[int] = None
     if supervisor_state is not None:
-        supervisor_state["cargo_pgid"] = cargo_pgid
-    if pidfile is not None:
-        _write_pidfile(
-            pidfile, supervisor_pid=os.getpid(),
-            cargo_pid=proc.pid, cargo_pgid=cargo_pgid,
-            agent_worktree=wt["path"],
+        child_id = _register_child(
+            supervisor_state, kind="agent-coverage",
+            worktree_path=str(shadow),
         )
+        _update_child(supervisor_state, child_id, cargo_pgid=cargo_pgid)
+        if pidfile is not None:
+            _write_pidfile_from_state(pidfile, os.getpid(), supervisor_state)
     harness_pid: Optional[int] = None
     poll_until = time.monotonic() + 30
     rc: Optional[int] = None
@@ -2895,8 +2942,13 @@ def _drive_agent_worktree(
                 break
             if harness_pid is None and time.monotonic() < poll_until:
                 harness_pid = _find_harness_pid(proc.pid)
-                if harness_pid is not None and supervisor_state is not None:
-                    supervisor_state["harness_pid"] = harness_pid
+                if harness_pid is not None and child_id is not None:
+                    _update_child(supervisor_state, child_id,
+                                  harness_pid=harness_pid)
+                    if pidfile is not None:
+                        _write_pidfile_from_state(
+                            pidfile, os.getpid(), supervisor_state,
+                        )
             if time.monotonic() > deadline:
                 print(f"[auto] agent-coverage cycle exceeded deadline; "
                       f"reaping PGID {cargo_pgid}", file=sys.stderr)
@@ -2910,11 +2962,12 @@ def _drive_agent_worktree(
             if stragglers:
                 _reap_pgid_and_containers(cargo_pgid, harness_pid,
                                           quiet=args.quiet)
-        if supervisor_state is not None:
-            supervisor_state["cargo_pgid"] = None
-            supervisor_state["harness_pid"] = None
-        if pidfile is not None:
-            _write_pidfile(pidfile, supervisor_pid=os.getpid())
+        if child_id is not None and supervisor_state is not None:
+            _unregister_child(supervisor_state, child_id)
+            if pidfile is not None:
+                _write_pidfile_from_state(
+                    pidfile, os.getpid(), supervisor_state,
+                )
     # Optional sidecar after a successful cycle.
     if rc == 0 and (os.environ.get("LITEBOX_AGENT_SIDECAR")
                     or getattr(args, "agent_sidecar", False)):
@@ -2977,6 +3030,103 @@ def _write_pidfile(path: Path, **fields) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(fields))
     tmp.replace(path)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Children registry — supervisor_state["children"] is the canonical
+# in-memory record of every in-flight cargo invocation the supervisor
+# has spawned. The pidfile (`auto.pidfile`) mirrors this to disk so
+# `dashboard.py stop` can reap out-of-band. Multiple children can be
+# alive concurrently when `--max-parallel-agent-cargos > 1`; one
+# tracked-ref drive can also coexist with N agent drives in flight.
+#
+# All registry mutations go through these helpers and hold
+# `supervisor_state["lock"]` so the signal handler can safely
+# snapshot the registry from another thread without racing.
+# ──────────────────────────────────────────────────────────────────
+
+
+def _new_supervisor_state() -> dict:
+    """Construct the supervisor's mutable shared state. Owned by the
+    main loop; mutated from worker threads + the signal handler.
+    Always created via this helper so the lock + counter invariants
+    are uniform."""
+    return {
+        "children": {},        # child_id -> {"cargo_pgid", "harness_pid", "worktree_path", "kind"}
+        "next_child_id": 1,
+        "lock": threading.Lock(),
+    }
+
+
+def _register_child(state: dict, *, kind: str,
+                    worktree_path: Optional[str]) -> int:
+    """Reserve a child_id and record an empty slot. `kind` is
+    'tracked-ref' or 'agent-coverage'; `worktree_path` is the cargo
+    invocation's cwd (the shadow path for agent coverage, the
+    ci_worktree for tracked refs).
+
+    Returns the new child_id. Caller fills in cargo_pgid + harness_pid
+    via `_update_child` once the subprocess is spawned.
+    """
+    with state["lock"]:
+        cid = state["next_child_id"]
+        state["next_child_id"] = cid + 1
+        state["children"][cid] = {
+            "cargo_pgid": None,
+            "harness_pid": None,
+            "worktree_path": worktree_path,
+            "kind": kind,
+        }
+    return cid
+
+
+def _update_child(state: dict, child_id: int, **fields) -> None:
+    """Update fields on an existing child slot. Silently ignores
+    unknown child_ids (the slot may have been removed already)."""
+    with state["lock"]:
+        slot = state["children"].get(child_id)
+        if slot is None:
+            return
+        slot.update(fields)
+
+
+def _unregister_child(state: dict, child_id: int) -> None:
+    with state["lock"]:
+        state["children"].pop(child_id, None)
+
+
+def _snapshot_children(state: dict) -> list[dict]:
+    """Stable copy of the children dict's values. Used by the
+    signal handler and pidfile writer so they can iterate without
+    holding the lock through I/O."""
+    with state["lock"]:
+        return [dict(slot) for slot in state["children"].values()]
+
+
+def _write_pidfile_from_state(pidfile: Path, supervisor_pid: int,
+                              state: dict) -> None:
+    """Mirror the current children registry to disk. Replaces the
+    pidfile atomically. Called whenever the registry changes so
+    `dashboard.py stop` always sees the latest in-flight PGIDs."""
+    children = _snapshot_children(state)
+    _write_pidfile(
+        pidfile,
+        supervisor_pid=supervisor_pid,
+        children=children,
+    )
+
+
+def _reap_all_children(state: dict, *, quiet: bool) -> None:
+    """Reap every in-flight cargo PGID recorded in the registry.
+    Best-effort; failures don't abort. Called from the SIGTERM/SIGINT
+    handler and the cycle-exit safety net."""
+    for slot in _snapshot_children(state):
+        pgid = slot.get("cargo_pgid")
+        if pgid is None:
+            continue
+        _reap_pgid_and_containers(
+            pgid, slot.get("harness_pid"), quiet=quiet,
+        )
 
 
 def _read_pidfile(path: Path) -> Optional[dict]:
@@ -3192,8 +3342,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 0
     sup = state.get("supervisor_pid")
-    cargo_pgid = state.get("cargo_pgid")
-    harness_pid = state.get("harness_pid")
+    children = state.get("children") or []
     if sup:
         try:
             os.kill(sup, signal.SIGTERM)
@@ -3222,9 +3371,13 @@ def cmd_stop(args: argparse.Namespace) -> int:
             except ProcessLookupError:
                 pass
     # Belt-and-suspenders: even if the supervisor handler ran, sweep
-    # the PGID and containers in case it missed anything (e.g. it was
-    # SIGKILL'd above before completing).
-    _reap_pgid_and_containers(cargo_pgid, harness_pid, quiet=args.quiet)
+    # every child PGID + harness in case it missed anything (e.g. it
+    # was SIGKILL'd above before completing).
+    for slot in children:
+        _reap_pgid_and_containers(
+            slot.get("cargo_pgid"), slot.get("harness_pid"),
+            quiet=args.quiet,
+        )
     try:
         pidfile.unlink()
     except FileNotFoundError:
@@ -3334,6 +3487,17 @@ def build_parser() -> argparse.ArgumentParser:
              "focused `<worktree>/.dashboard/regressions.md` so the "
              "agent can `cat` it without scrolling summary.md. Env "
              "override: LITEBOX_AGENT_SIDECAR.",
+    )
+    p_auto.add_argument(
+        "--max-parallel-agent-cargos", type=int, default=2,
+        metavar="N",
+        help="maximum number of agent-coverage cargo cycles to spawn "
+             "in parallel per supervisor tick (default 2). Each "
+             "cycle runs in its own per-branch shadow worktree, so "
+             "they don't collide on `target/` or docker image tags; "
+             "CPU is throttled automatically by the harness lease "
+             "table (LITEBOX_GLOBAL_JOBS / live_lease_count). Set to "
+             "1 to disable parallelism.",
     )
     p_auto.add_argument(
         "--agent-coverage-disable", action="store_true",
