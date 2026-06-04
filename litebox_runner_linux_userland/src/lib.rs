@@ -1550,15 +1550,38 @@ fn set_broker_fd_bridge_caller_pid_scope(
 }
 
 fn install_broker_fd_bridge_specs_and_ack_with<F>(
-    _task_params: litebox_common_linux::TaskParams,
-    _specs: &[String],
+    task_params: litebox_common_linux::TaskParams,
+    specs: &[String],
     ack_fd: i32,
-    _install_spec: F,
+    mut install_spec: F,
 ) -> Result<()>
 where
     F: FnMut(&str) -> Result<()>,
 {
+    let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
+    for spec in specs {
+        if let Err(err) = install_spec(spec) {
+            let _ = write_fork_restore_ack_status(
+                ack_fd,
+                litebox_common_linux::errno::Errno::EIO.as_neg(),
+            );
+            return Err(err.context("fork-restore broker-fd-bridge install failed before ack"));
+        }
+    }
     write_fork_restore_ack_status(ack_fd, 0)
+}
+
+fn fork_restore_task_params(
+    identity: &litebox_shim_linux::syscalls::fork_snapshot::ProcessIdentitySnapshot,
+) -> litebox_common_linux::TaskParams {
+    litebox_common_linux::TaskParams {
+        pid: identity.pid,
+        ppid: identity.ppid,
+        uid: identity.credentials.uid,
+        euid: identity.credentials.euid,
+        gid: identity.credentials.gid,
+        egid: identity.credentials.egid,
+    }
 }
 
 fn write_fork_restore_ack_status(ack_fd: i32, status: i32) -> Result<()> {
@@ -1884,6 +1907,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             ack_fd,
             &pipe_bridges,
             &local_pipes,
+            &cli_args.broker_fd_bridge,
         )?;
 
         // Re-register inherited listen ports through this worker's IPC.
@@ -1908,6 +1932,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             ack_fd,
             &pipe_bridges,
             &local_pipes,
+            &cli_args.broker_fd_bridge,
         )?;
         run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
     }
@@ -2004,9 +2029,9 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     ack_fd: i32,
     pipe_bridges: &[PipeBridgeSpec],
     local_pipes: &[LocalPipeSpec],
+    broker_fd_bridge_specs: &[String],
 ) -> Result<litebox_shim_linux::LoadedProgram<FS>> {
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
+    let broker_fd_bridge_task_params = fork_restore_task_params(&snapshot.identity);
 
     match shim.restore_process(snapshot, fs) {
         Ok(program) => {
@@ -2207,17 +2232,19 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                 }
             }
 
-            // Verify local pipe data before starting guest.
-            // Report successful restore to parent via ack pipe.
-            let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
-            ack_file.write_all(&0i32.to_le_bytes())?;
+            // Install migrated broker-direct handles before acking the parent;
+            // the parent releases transit refs as soon as it reads the ack.
+            install_broker_fd_bridge_specs_and_ack_with(
+                broker_fd_bridge_task_params,
+                broker_fd_bridge_specs,
+                ack_fd,
+                |spec| install_broker_fd_bridge_spec(&program.entrypoints, spec),
+            )?;
             Ok(program)
         }
         Err(e) => {
             // Report failure to parent via ack pipe.
-            let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
-            let _ = ack_file.write_all(&e.as_neg().to_le_bytes());
-            drop(ack_file);
+            let _ = write_fork_restore_ack_status(ack_fd, e.as_neg());
             anyhow::bail!("fork-restore failed: {e:?}");
         }
     }
