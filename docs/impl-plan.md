@@ -4,25 +4,25 @@
 
 Implement the broker architecture as incremental vertical slices while keeping the existing LiteBox behavior working.
 
-The target architecture is:
+The target architecture has two trust domains:
 
 ```text
 User mode:
-  Shim + UserLiteBox + optional shim-specific user clients
+  Shim + local core + optional BrokerService clients
 
 Authority domain:
-  broker entry/server + BrokerCore + optional BrokerServices + PolicyEngine + BrokerPlatform
-
-Kernel-broker deployments:
-  BrokerHost supports user-mode UserLiteBox execution and broker channel
+  broker entry/server + litebox_broker_host + BrokerCore + optional BrokerServices + PolicyEngine + BrokerPlatform
+  broker-kernel user-mode support, in kernel-backed deployments
 ```
+
+The local core reaches local mechanics and broker channels through deployment support: the host OS user-mode ABI plus a broker transport endpoint in hosted userland, or calls into broker-kernel user-mode support plus broker-channel delivery in a broker-kernel deployment.
 
 The baseline is the stricter durable-unicorn model: no host fd/HANDLE delegation to untrusted code, ABI-neutral broker objects, broker-owned control/event/data channels, authenticated per-process broker associations, and fail-closed behavior.
 
 ## Implementation principles
 
 - Build vertical slices, not a big-bang refactor.
-- Keep UserLiteBox untrusted and broker authority explicit.
+- Keep local core untrusted and broker authority explicit.
 - Keep BrokerCore shim-neutral.
 - Keep BrokerCore protocol-neutral and channel-neutral. BrokerCore exposes in-domain authority methods and domain types; broker entry/server code adapts protocol requests and channel credentials before calling it.
 - Keep the broker protocol modular: the outer request/response envelope is for connection-level broker messages and coarse authority routing, while object/domain operations live in nested request/response families such as `CoreRequest::Event` and `EventResponse`.
@@ -30,25 +30,27 @@ The baseline is the stricter durable-unicorn model: no host fd/HANDLE delegation
 - Put domain-specific authority in BrokerServices.
 - Put final allow/deny/audit decisions in PolicyEngine.
 - Keep BrokerPlatform as authorized backend execution, not a policy owner.
-- Keep BrokerHost separate from broker request decode/authorization.
+- Keep broker-kernel user-mode support separate from broker request decode/authorization; `litebox_broker_host` owns the reusable protocol-to-core adapter for both userland and kernel brokers.
 - Start in userland; move to kernel-broker deployment after broker semantics are proven.
 
 ## Phase 0: Boundary freeze
 
 Define and document the core vocabulary in code and docs:
 
-- `UserLiteBox`
-- `BrokerClient` adapter
+- `local core`
+- `litebox_broker_local` adapter
+- optional BrokerService client
 - `BrokerCore`
 - `BrokerService`
 - `PolicyEngine`
 - `BrokerPlatform`
-- `BrokerHost`
+- `litebox_broker_host`
+- broker-kernel user-mode support
 
 Exit criteria:
 
 - Design doc and code comments use one vocabulary.
-- No new code treats UserLiteBox as trusted.
+- No new code treats local core as trusted.
 - No broker API is modeled as host syscall proxying.
 
 ## Phase 1: Shared protocol/types crate
@@ -95,7 +97,7 @@ Initial scope:
 
 Exit criteria:
 
-- A user-side client can connect and negotiate. In the current hosted PoC, `litebox_runner_linux_userland` consumes an externally owned Unix-socket endpoint via `--broker-socket`, uses `litebox_broker_local` to negotiate, constructs the `LiteBox` local core with broker control already present, and the Linux shim reaches migrated event objects through the local-core event domain rather than through broker-specific APIs.
+- A user-side client can connect and negotiate. In the current hosted userland path, `litebox_runner_linux_userland` consumes an externally owned Unix-socket endpoint via `--broker-socket`, uses `litebox_broker_local` to negotiate, constructs the `LiteBox` local core with broker control already present, and the Linux shim reaches migrated event objects through the local-core event domain rather than through broker-specific APIs.
 - Broker binds caller identity to the authenticated channel endpoint. The first hosted executable passes the explicit unauthenticated placeholder through the same server API that later deployment-specific authentication will use.
 - Userland channel code only receives/sends decoded frames and supplies peer credentials; the generic server owns broker protocol dispatch and reports successful termination as peer-close or broker-close with a reason.
 - The Unix-socket channel adapter and hosted broker executable live in separate crates, so clients can depend on the channel without pulling in broker core/server deployment code.
@@ -108,14 +110,14 @@ Exit criteria:
 - BrokerCore/object operations are grouped below the broker envelope instead of added as unrelated top-level `BrokerRequest` and `BrokerResponse` variants.
 - Control-channel contracts live in `litebox_broker_protocol::channel`, separate from semantic message DTO modules but in the same shared protocol crate. Future broker-initiated readiness, interrupt, fault, revocation, or session-failure traffic must use a separate notification channel/message family rather than unsolicited control-channel responses.
 
-## Phase 3: UserLiteBox facade
+## Phase 3: Local core facade
 
-Introduce UserLiteBox without moving every subsystem.
+Introduce the local core without moving every subsystem.
 
 Initial scope:
 
-- wrap existing LiteBox ergonomics behind UserLiteBox;
-- add BrokerClient adapter;
+- wrap existing LiteBox ergonomics in the local core;
+- add the `litebox_broker_local` adapter;
 - keep existing local implementations available behind a profile/feature;
 - add a broker-backed handle-table view for experimental objects.
 
@@ -123,7 +125,7 @@ Exit criteria:
 
 - Current tests can still use the local profile.
 - A broker-backed profile can issue a simple broker request.
-- UserLiteBox handle entries can store opaque broker reference handles plus local cached rights hints.
+- local-core handle entries can store opaque broker reference handles plus local cached rights hints.
 
 ## Phase 4: First broker-owned object
 
@@ -136,7 +138,7 @@ Broker owns:
 - readiness state;
 - wait/wakeup state.
 
-UserLiteBox owns:
+The local core owns:
 
 - guest-visible handle number;
 - typed facade;
@@ -150,7 +152,7 @@ Exit criteria:
 
 ## Phase 5: Broker-backed fd semantics
 
-Move fd authority to BrokerCore while keeping guest fd numbers in UserLiteBox.
+Move fd authority to BrokerCore while keeping guest fd numbers in local core.
 
 BrokerCore owns:
 
@@ -162,7 +164,7 @@ BrokerCore owns:
 - inherited object tables;
 - process-exit cleanup.
 
-UserLiteBox owns:
+The local core owns:
 
 - guest fd number allocation;
 - raw-int fd conversion;
@@ -172,7 +174,7 @@ UserLiteBox owns:
 Exit criteria:
 
 - Double close, stale fd, dup, inherited refs, and process-exit cleanup are tested.
-- UserLiteBox cannot create a live broker object by editing local fd state.
+- The local core cannot create a live broker object by editing local fd state.
 
 ## Phase 6: Control/notification/data channels
 
@@ -216,7 +218,7 @@ Linux targets:
 Exit criteria:
 
 - Direct guest `mmap`, `mprotect`, `munmap`, `mremap`, `memfd_create`, `open/openat`, `ioctl`, and `fcntl` cannot bypass broker policy after lockdown.
-- Guest-visible mapping operations enter shim/UserLiteBox and are emulated or broker-mediated.
+- Guest-visible mapping operations enter the shim/local-core path and are emulated or broker-mediated.
 
 ## Phase 8: Filesystem BrokerService
 
@@ -234,7 +236,7 @@ Broker side owns:
 - permissions;
 - read/write policy.
 
-UserLiteBox owns:
+The local core owns:
 
 - path string conversion;
 - buffer marshalling;
@@ -244,7 +246,7 @@ UserLiteBox owns:
 Exit criteria:
 
 - Filesystem operations are directory-relative.
-- No host fd/HANDLE is exposed to UserLiteBox.
+- No host fd/HANDLE is exposed to local core.
 - File data uses mediated control/data channel or broker-owned ring.
 - PolicyEngine can deny open/read/write independently.
 
@@ -260,7 +262,7 @@ Broker side owns:
 - executable mapping policy;
 - page-fault decisions where applicable.
 
-UserLiteBox owns:
+The local core owns:
 
 - loader helpers;
 - guest pointer handling;
@@ -271,7 +273,7 @@ Exit criteria:
 
 - Broker-visible mappings require BrokerCore validation and PolicyEngine authorization.
 - Executable memory cannot be created without rewrite/validation policy.
-- Shared memory grants cannot be forged by UserLiteBox.
+- Shared memory grants cannot be forged by local core.
 
 ## Phase 10: Multiprocess
 
@@ -286,7 +288,7 @@ Broker owns:
 - process-exit cleanup;
 - inherited broker object table.
 
-Shim/UserLiteBox owns:
+Shim/local core owns:
 
 - ABI-specific fork semantics;
 - ABI-specific exec semantics;
@@ -313,7 +315,7 @@ Broker side owns:
 - firewall policy context;
 - TX/RX rings where enabled.
 
-UserLiteBox owns:
+The local core owns:
 
 - socket syscall facade;
 - send/recv marshalling;
@@ -322,7 +324,7 @@ UserLiteBox owns:
 Exit criteria:
 
 - L3/L4 firewall policy is enforced by PolicyEngine.
-- UserLiteBox cannot send or receive guest-visible network traffic directly through host network devices.
+- The local core cannot send or receive guest-visible network traffic directly through host network devices.
 - Data path uses broker-mediated operations or broker-owned rings.
 
 ## Phase 12: Kernel-broker deployment
@@ -331,14 +333,15 @@ Only after userland semantics are stable, implement broker-kernel deployment.
 
 Separate trusted deployment code into:
 
-- BrokerHost: user-mode execution support and channel delivery;
+- broker-kernel user-mode support: trusted-domain support for user-mode execution and channel delivery;
+- `litebox_broker_host`: broker protocol/core adaptation reused from the userland broker;
 - BrokerPlatform: privileged backend execution;
 - BrokerCore/BrokerServices/PolicyEngine: shared authority logic.
 
 Exit criteria:
 
-- BrokerHost does not decode or authorize BrokerRequest.
-- Broker server/entry protocol semantics and BrokerCore object semantics are reused through the same protocol-to-core adapter boundary.
+- Broker-kernel user-mode support does not decode or authorize BrokerRequest.
+- `litebox_broker_host` protocol semantics and BrokerCore object semantics are reused through the same protocol-to-core adapter boundary.
 - Kernel-broker deployment passes the same broker-object conformance tests as userland broker.
 
 ## Phase 13: OP-TEE BrokerService
@@ -360,7 +363,7 @@ Exit criteria:
 
 - OP-TEE shim remains user-mode ABI code.
 - Trusted deployment does not need the full OP-TEE shim.
-- OP-TEE authority cannot be created in UserLiteBox.
+- OP-TEE authority cannot be created in local core.
 
 ## Suggested first milestone
 
@@ -369,11 +372,11 @@ The smallest useful milestone is:
 ```text
 single process
 userland broker
-typed broker client
+typed control client
 control channel only
 minimal PolicyEngine
 broker-owned event object
-UserLiteBox fd table maps guest fd -> broker reference handle
+local-core fd table maps guest fd -> broker reference handle
 ```
 
 This proves the trust boundary before taking on filesystem, networking, mapping, or multiprocess complexity.
@@ -388,7 +391,7 @@ Add conformance tests at each layer:
 - stale reference IDs fail;
 - wrong reference generation fails;
 - process disconnect cleans up refs;
-- UserLiteBox local handle edits cannot create authority;
+- local-core handle edits cannot create authority;
 - shared-memory cursor/frame corruption fails closed;
 - broker failure forces session failure.
 

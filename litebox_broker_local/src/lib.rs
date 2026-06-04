@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Typed client adapter for broker requests.
+//! Typed control-channel client adapter for broker requests.
 //!
-//! The client owns request/response sequencing but does not own a channel.
+//! The control client owns request/response sequencing but does not own a channel.
 //! Userland, kernel, or ring-buffer deployments can provide channels by
 //! implementing [`litebox_broker_protocol::ClientControlChannel`].
 
@@ -24,13 +24,13 @@ use litebox_broker_protocol::{
 
 pub use error::{ClientError, Result};
 #[cfg(feature = "std")]
-pub use worker::{BrokerClientWorker, BrokerClientWorkerError};
+pub use worker::{ControlClientWorker, ControlClientWorkerError};
 
 /// Protocol version this client implementation requests by default.
 pub const CLIENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 2);
 
-/// Typed client for broker operations.
-pub struct BrokerClient<T> {
+/// Typed control-channel client for broker operations.
+pub struct ControlClient<T> {
     channel: T,
     state: ConnectionState,
 }
@@ -43,8 +43,8 @@ enum ConnectionState {
     },
 }
 
-impl<T> BrokerClient<T> {
-    /// Creates a broker client over an already-connected control channel.
+impl<T> ControlClient<T> {
+    /// Creates a control client over an already-connected control channel.
     pub const fn new(channel: T) -> Self {
         Self {
             channel,
@@ -58,7 +58,7 @@ impl<T> BrokerClient<T> {
     }
 }
 
-impl<T: ClientControlChannel> BrokerClient<T> {
+impl<T: ClientControlChannel> ControlClient<T> {
     /// Returns the effective protocol version this connection negotiated.
     ///
     /// Feature gating must use this effective version because the broker may
@@ -123,7 +123,7 @@ mod tests {
     fn event_operations_require_negotiation_without_sending() {
         let channel =
             FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::ProtocolState)));
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
 
         assert!(matches!(
             client.create_event(),
@@ -136,7 +136,7 @@ mod tests {
     fn event_operations_require_event_protocol_version_without_sending() {
         let channel =
             FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::UnsupportedOperation)));
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
         client.state = ConnectionState::Active {
             negotiated_protocol_version: ProtocolVersion::new(CLIENT_PROTOCOL_VERSION.major, 1),
         };
@@ -161,7 +161,7 @@ mod tests {
         let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
             broker_protocol_version: CLIENT_PROTOCOL_VERSION,
         }));
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
 
         assert_eq!(client.negotiate_version(requested).unwrap(), requested);
         assert_eq!(
@@ -180,7 +180,7 @@ mod tests {
         let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
             broker_protocol_version: broker_version,
         }));
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
 
         assert!(matches!(
             client.negotiate_version(requested),
@@ -201,7 +201,7 @@ mod tests {
         let channel = FakeControlChannel::new(Some(BrokerResponse::VersionMismatch {
             broker_protocol_version: CLIENT_PROTOCOL_VERSION,
         }));
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
 
         assert!(matches!(
             client.negotiate_version(too_new),
@@ -224,7 +224,7 @@ mod tests {
         let channel = FakeControlChannel::new(Some(BrokerResponse::VersionMismatch {
             broker_protocol_version: fallback,
         }));
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
 
         assert!(matches!(
             client.negotiate_version(requested),

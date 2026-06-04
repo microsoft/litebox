@@ -11,7 +11,7 @@ use std::{
 use alloc::sync::Arc;
 use anyhow::{Context as _, Result};
 use litebox::{BrokerControl, BrokerControlError};
-use litebox_broker_local::{BrokerClient, BrokerClientWorker};
+use litebox_broker_local::{ControlClient, ControlClientWorker};
 use litebox_broker_protocol::{BrokerRequest, BrokerResponse, CoreRequest, CoreResponse};
 use litebox_broker_transport::unix_socket::UnixStreamClientControlChannel;
 
@@ -19,8 +19,8 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
-type Client = BrokerClient<UnixStreamClientControlChannel>;
-type ClientWorker = BrokerClientWorker<UnixStreamClientControlChannel>;
+type Client = ControlClient<UnixStreamClientControlChannel>;
+type ClientWorker = ControlClientWorker<UnixStreamClientControlChannel>;
 
 pub(crate) struct BrokerConnection {
     control: Arc<BrokerControlClient>,
@@ -56,7 +56,7 @@ impl Drop for BrokerConnection {
 impl BrokerControlClient {
     fn new(client: Client, shutdown_stream: std::os::unix::net::UnixStream) -> Self {
         Self {
-            worker: BrokerClientWorker::new_with_shutdown_hook(client, move || {
+            worker: ControlClientWorker::new_with_shutdown_hook(client, move || {
                 let _ = shutdown_stream.shutdown(Shutdown::Both);
             }),
         }
@@ -108,7 +108,7 @@ fn connect_with_retry(socket_path: &Path, setup_deadline: Instant) -> Result<Cli
                 channel
                     .set_io_deadline(Some(setup_deadline))
                     .context("failed to configure broker setup deadline")?;
-                let mut client = BrokerClient::new(channel);
+                let mut client = ControlClient::new(channel);
                 client.negotiate().context("broker negotiation failed")?;
                 return Ok(client);
             }

@@ -305,7 +305,9 @@ where
                 .expect("failed to bind broker test socket");
             ready_tx.send(()).expect("failed to report broker ready");
 
-            let (stream, _) = listener.accept().expect("failed to accept broker client");
+            let (stream, _) = listener
+                .accept()
+                .expect("failed to accept broker control client");
             stream
                 .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
                 .expect("failed to configure broker test read timeout");

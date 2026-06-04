@@ -231,12 +231,11 @@ jobs:
           #   since it is a purely-userland implementation.
           #
           # - `litebox_broker_transport` is allowed to have `std` access,
-          #   since it is the concrete Unix-domain-socket channel for the
-          #   userland broker proof of concept.
+          #   since it owns hosted concrete broker transport implementations,
+          #   including the current Unix-domain-socket control channel.
           #
           # - `litebox_broker_userland` is allowed to have `std` access,
-          #   since it is the hosted broker executable for the userland
-          #   broker proof of concept.
+          #   since it is the hosted userland broker executable.
           #
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.

@@ -15,7 +15,7 @@ use std::{
 
 use litebox_broker_protocol::{BrokerRequest, BrokerResponse, ClientControlChannel};
 
-use crate::{BrokerClient, ClientError};
+use crate::{ClientError, ControlClient};
 
 const PHASE_IDLE: u8 = 0;
 const PHASE_RESERVED: u8 = 1;
@@ -24,26 +24,26 @@ const PHASE_RESPONSE_READY: u8 = 3;
 const PHASE_SHUTDOWN: u8 = 4;
 const DEFAULT_SHUTDOWN_WAIT: Duration = Duration::from_millis(100);
 
-/// Error returned by [`BrokerClientWorker`].
+/// Error returned by [`ControlClientWorker`].
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum BrokerClientWorkerError<E> {
-    /// The wrapped broker client returned an error.
+pub enum ControlClientWorkerError<E> {
+    /// The wrapped control client returned an error.
     Client(ClientError<E>),
     /// The worker is shutting down or has already shut down.
     Shutdown,
 }
 
-impl<E: fmt::Display> fmt::Display for BrokerClientWorkerError<E> {
+impl<E: fmt::Display> fmt::Display for ControlClientWorkerError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Client(error) => write!(f, "broker client worker request failed: {error}"),
-            Self::Shutdown => f.write_str("broker client worker is shut down"),
+            Self::Client(error) => write!(f, "control client worker request failed: {error}"),
+            Self::Shutdown => f.write_str("control client worker is shut down"),
         }
     }
 }
 
-impl<E> core::error::Error for BrokerClientWorkerError<E>
+impl<E> core::error::Error for ControlClientWorkerError<E>
 where
     E: core::error::Error + 'static,
 {
@@ -55,28 +55,28 @@ where
     }
 }
 
-type WorkerResult<E> = core::result::Result<BrokerResponse, BrokerClientWorkerError<E>>;
+type WorkerResult<E> = core::result::Result<BrokerResponse, ControlClientWorkerError<E>>;
 type ShutdownHook = Box<dyn FnOnce() + Send + 'static>;
 
-/// Dedicated worker for broker clients that must not run channel I/O on the caller thread.
+/// Dedicated worker for control clients that must not run channel I/O on the caller thread.
 ///
-/// The worker owns the [`BrokerClient`] and performs blocking channel operations
+/// The worker owns the [`ControlClient`] and performs blocking channel operations
 /// on a dedicated thread. Callers submit one raw broker request at a time and
 /// block on an in-process condition variable until the worker publishes the
 /// response. This preserves the serial control-channel contract while keeping
 /// deployment-specific threads, such as rewritten guest syscall threads, away
 /// from host IPC syscalls.
-pub struct BrokerClientWorker<T>
+pub struct ControlClientWorker<T>
 where
     T: ClientControlChannel + Send + 'static,
     T::Error: Send + 'static,
 {
-    state: Arc<BrokerClientWorkerState<T::Error>>,
+    state: Arc<ControlClientWorkerState<T::Error>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     finished: Mutex<Receiver<()>>,
 }
 
-struct BrokerClientWorkerState<E> {
+struct ControlClientWorkerState<E> {
     shutdown_requested: AtomicBool,
     phase: AtomicU8,
     request: Mutex<Option<BrokerRequest>>,
@@ -87,18 +87,18 @@ struct BrokerClientWorkerState<E> {
     shutdown_hook: Mutex<Option<ShutdownHook>>,
 }
 
-impl<T> BrokerClientWorker<T>
+impl<T> ControlClientWorker<T>
 where
     T: ClientControlChannel + Send + 'static,
     T::Error: Send + 'static,
 {
-    /// Starts a worker for an already-negotiated broker client.
+    /// Starts a worker for an already-negotiated control client.
     ///
     /// # Panics
     ///
     /// Panics if the worker-thread bookkeeping mutex is poisoned while the
     /// worker is being started.
-    pub fn new(client: BrokerClient<T>) -> Self {
+    pub fn new(client: ControlClient<T>) -> Self {
         Self::new_with_shutdown_hook(client, || {})
     }
 
@@ -108,11 +108,11 @@ where
     ///
     /// Panics if the worker-thread bookkeeping mutex is poisoned while the
     /// worker is being started.
-    pub fn new_with_shutdown_hook<F>(client: BrokerClient<T>, shutdown_hook: F) -> Self
+    pub fn new_with_shutdown_hook<F>(client: ControlClient<T>, shutdown_hook: F) -> Self
     where
         F: FnOnce() + Send + 'static,
     {
-        let state = Arc::new(BrokerClientWorkerState {
+        let state = Arc::new(ControlClientWorkerState {
             shutdown_requested: AtomicBool::new(false),
             phase: AtomicU8::new(PHASE_IDLE),
             request: Mutex::new(None),
@@ -125,13 +125,13 @@ where
         let worker_state = state.clone();
         let (finished_tx, finished_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
-            run_broker_client_worker(client, worker_state);
+            run_control_client_worker(client, worker_state);
             let _ = finished_tx.send(());
         });
         *state
             .worker_thread
             .lock()
-            .expect("broker client worker-thread mutex poisoned") = Some(worker.thread().clone());
+            .expect("control client worker-thread mutex poisoned") = Some(worker.thread().clone());
 
         Self {
             state,
@@ -140,11 +140,11 @@ where
         }
     }
 
-    /// Sends one request on the active broker client and returns the raw protocol response.
+    /// Sends one request on the active control client and returns the raw protocol response.
     pub fn active_raw_request(
         &self,
         request: BrokerRequest,
-    ) -> core::result::Result<BrokerResponse, BrokerClientWorkerError<T::Error>> {
+    ) -> core::result::Result<BrokerResponse, ControlClientWorkerError<T::Error>> {
         self.state.submit(request)
     }
 
@@ -163,18 +163,18 @@ where
         let mut worker = self
             .worker
             .lock()
-            .expect("broker client worker mutex poisoned");
+            .expect("control client worker mutex poisoned");
         if let Some(worker) = worker.take() {
             self.state.request_shutdown();
             match self
                 .finished
                 .lock()
-                .expect("broker client worker-finished mutex poisoned")
+                .expect("control client worker-finished mutex poisoned")
                 .recv_timeout(DEFAULT_SHUTDOWN_WAIT)
             {
-                Ok(()) => worker.join().expect("broker client worker panicked"),
+                Ok(()) => worker.join().expect("control client worker panicked"),
                 Err(RecvTimeoutError::Disconnected) => {
-                    worker.join().expect("broker client worker panicked");
+                    worker.join().expect("control client worker panicked");
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     drop(worker);
@@ -184,7 +184,7 @@ where
     }
 }
 
-impl<T> Drop for BrokerClientWorker<T>
+impl<T> Drop for ControlClientWorker<T>
 where
     T: ClientControlChannel + Send + 'static,
     T::Error: Send + 'static,
@@ -194,11 +194,11 @@ where
     }
 }
 
-impl<E> BrokerClientWorkerState<E> {
+impl<E> ControlClientWorkerState<E> {
     fn submit(&self, request: BrokerRequest) -> WorkerResult<E> {
         loop {
             if self.shutdown_requested.load(Ordering::Acquire) {
-                return Err(BrokerClientWorkerError::Shutdown);
+                return Err(ControlClientWorkerError::Shutdown);
             }
             match self.phase.load(Ordering::Acquire) {
                 PHASE_IDLE => {
@@ -214,12 +214,12 @@ impl<E> BrokerClientWorkerState<E> {
                     {
                         if self.shutdown_requested.load(Ordering::Acquire) {
                             self.cancel_reserved_request_on_shutdown();
-                            return Err(BrokerClientWorkerError::Shutdown);
+                            return Err(ControlClientWorkerError::Shutdown);
                         }
                         break;
                     }
                 }
-                PHASE_SHUTDOWN => return Err(BrokerClientWorkerError::Shutdown),
+                PHASE_SHUTDOWN => return Err(ControlClientWorkerError::Shutdown),
                 phase => self.wait_for_phase_change(phase, true),
             }
         }
@@ -227,17 +227,17 @@ impl<E> BrokerClientWorkerState<E> {
         *self
             .request
             .lock()
-            .expect("broker client worker request mutex poisoned") = Some(request);
+            .expect("control client worker request mutex poisoned") = Some(request);
         self.phase.store(PHASE_REQUEST_READY, Ordering::Release);
         self.wake_worker();
 
         loop {
             if self.shutdown_requested.load(Ordering::Acquire) {
-                return Err(BrokerClientWorkerError::Shutdown);
+                return Err(ControlClientWorkerError::Shutdown);
             }
             match self.phase.load(Ordering::Acquire) {
                 PHASE_RESPONSE_READY => break,
-                PHASE_SHUTDOWN => return Err(BrokerClientWorkerError::Shutdown),
+                PHASE_SHUTDOWN => return Err(ControlClientWorkerError::Shutdown),
                 phase => self.wait_for_phase_change(phase, true),
             }
         }
@@ -245,9 +245,9 @@ impl<E> BrokerClientWorkerState<E> {
         let response = self
             .response
             .lock()
-            .expect("broker client worker response mutex poisoned")
+            .expect("control client worker response mutex poisoned")
             .take()
-            .expect("broker client worker did not publish a response");
+            .expect("control client worker did not publish a response");
         self.store_phase_and_notify(PHASE_IDLE);
         response
     }
@@ -270,7 +270,7 @@ impl<E> BrokerClientWorkerState<E> {
             *self
                 .response
                 .lock()
-                .expect("broker client worker response mutex poisoned") = Some(response);
+                .expect("control client worker response mutex poisoned") = Some(response);
             self.store_phase_and_notify(PHASE_RESPONSE_READY);
             true
         }
@@ -283,9 +283,9 @@ impl<E> BrokerClientWorkerState<E> {
         let request = self
             .request
             .lock()
-            .expect("broker client worker request mutex poisoned")
+            .expect("control client worker request mutex poisoned")
             .take()
-            .expect("broker client worker request missing");
+            .expect("control client worker request missing");
         if self.shutdown_requested.load(Ordering::Acquire) {
             self.store_phase_and_notify(PHASE_SHUTDOWN);
             None
@@ -354,7 +354,7 @@ impl<E> BrokerClientWorkerState<E> {
             let _guard = self
                 .requester_wait
                 .lock()
-                .expect("broker client worker requester-wait mutex poisoned");
+                .expect("control client worker requester-wait mutex poisoned");
             self.shutdown_requested.store(true, Ordering::Release);
             self.requester_wakeup.notify_all();
         }
@@ -366,7 +366,7 @@ impl<E> BrokerClientWorkerState<E> {
         let _guard = self
             .requester_wait
             .lock()
-            .expect("broker client worker requester-wait mutex poisoned");
+            .expect("control client worker requester-wait mutex poisoned");
         self.phase.store(phase, Ordering::Release);
         self.requester_wakeup.notify_all();
     }
@@ -375,14 +375,14 @@ impl<E> BrokerClientWorkerState<E> {
         let mut guard = self
             .requester_wait
             .lock()
-            .expect("broker client worker requester-wait mutex poisoned");
+            .expect("control client worker requester-wait mutex poisoned");
         while self.phase.load(Ordering::Acquire) == observed
             && !(wake_on_shutdown && self.shutdown_requested.load(Ordering::Acquire))
         {
             guard = self
                 .requester_wakeup
                 .wait(guard)
-                .expect("broker client worker requester-wait mutex poisoned");
+                .expect("control client worker requester-wait mutex poisoned");
         }
     }
 
@@ -390,7 +390,7 @@ impl<E> BrokerClientWorkerState<E> {
         if let Some(worker) = self
             .worker_thread
             .lock()
-            .expect("broker client worker-thread mutex poisoned")
+            .expect("control client worker-thread mutex poisoned")
             .as_ref()
         {
             worker.unpark();
@@ -401,7 +401,7 @@ impl<E> BrokerClientWorkerState<E> {
         if let Some(hook) = self
             .shutdown_hook
             .lock()
-            .expect("broker client worker shutdown-hook mutex poisoned")
+            .expect("control client worker shutdown-hook mutex poisoned")
             .take()
         {
             hook();
@@ -409,9 +409,9 @@ impl<E> BrokerClientWorkerState<E> {
     }
 }
 
-fn run_broker_client_worker<T>(
-    mut client: BrokerClient<T>,
-    state: Arc<BrokerClientWorkerState<T::Error>>,
+fn run_control_client_worker<T>(
+    mut client: ControlClient<T>,
+    state: Arc<ControlClientWorkerState<T::Error>>,
 ) where
     T: ClientControlChannel,
 {
@@ -423,7 +423,7 @@ fn run_broker_client_worker<T>(
                 };
                 let response = client
                     .active_raw_request(request)
-                    .map_err(BrokerClientWorkerError::Client);
+                    .map_err(ControlClientWorkerError::Client);
                 if !state.publish_worker_response(response) {
                     break;
                 }
@@ -454,7 +454,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{BrokerClient, CLIENT_PROTOCOL_VERSION};
+    use crate::{CLIENT_PROTOCOL_VERSION, ControlClient};
 
     #[test]
     fn worker_returns_raw_protocol_errors() {
@@ -468,9 +468,9 @@ mod tests {
                 BrokerResponse::Error(ErrorCode::WouldBlock),
             ],
         );
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
         client.negotiate().unwrap();
-        let worker = BrokerClientWorker::new(client);
+        let worker = ControlClientWorker::new(client);
 
         let response = worker
             .active_raw_request(BrokerRequest::Negotiate {
@@ -492,9 +492,9 @@ mod tests {
                 broker_protocol_version: CLIENT_PROTOCOL_VERSION,
             }],
         );
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
         client.negotiate().unwrap();
-        let worker = BrokerClientWorker::new(client);
+        let worker = ControlClientWorker::new(client);
 
         worker.shutdown();
 
@@ -502,7 +502,7 @@ mod tests {
             worker.active_raw_request(BrokerRequest::Negotiate {
                 protocol_version: CLIENT_PROTOCOL_VERSION,
             }),
-            Err(BrokerClientWorkerError::Shutdown)
+            Err(ControlClientWorkerError::Shutdown)
         ));
     }
 
@@ -511,9 +511,9 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let interrupted = Arc::new((Mutex::new(false), Condvar::new()));
         let channel = BlockingControlChannel::new(sent, interrupted.clone());
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
         client.negotiate().unwrap();
-        let worker = Arc::new(BrokerClientWorker::new_with_shutdown_hook(client, {
+        let worker = Arc::new(ControlClientWorker::new_with_shutdown_hook(client, {
             let interrupted = interrupted.clone();
             move || {
                 let (lock, wakeup) = &*interrupted;
@@ -538,8 +538,8 @@ mod tests {
 
         assert!(matches!(
             requester.join().unwrap(),
-            Err(BrokerClientWorkerError::Shutdown
-                | BrokerClientWorkerError::Client(ClientError::Channel(_)))
+            Err(ControlClientWorkerError::Shutdown
+                | ControlClientWorkerError::Client(ClientError::Channel(_)))
         ));
     }
 
@@ -548,9 +548,9 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let interrupted = Arc::new((Mutex::new(false), Condvar::new()));
         let channel = BlockingControlChannel::new(sent, interrupted);
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
         client.negotiate().unwrap();
-        let worker = Arc::new(BrokerClientWorker::new(client));
+        let worker = Arc::new(ControlClientWorker::new(client));
 
         let requester = {
             let worker = worker.clone();
@@ -573,7 +573,7 @@ mod tests {
         );
         assert!(matches!(
             requester.join().unwrap(),
-            Err(BrokerClientWorkerError::Shutdown)
+            Err(ControlClientWorkerError::Shutdown)
         ));
     }
 
@@ -582,9 +582,9 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let interrupted = Arc::new((Mutex::new(false), Condvar::new()));
         let channel = BlockingControlChannel::new(sent, interrupted.clone());
-        let mut client = BrokerClient::new(channel);
+        let mut client = ControlClient::new(channel);
         client.negotiate().unwrap();
-        let worker = Arc::new(BrokerClientWorker::new_with_shutdown_hook(client, {
+        let worker = Arc::new(ControlClientWorker::new_with_shutdown_hook(client, {
             let interrupted = interrupted.clone();
             move || {
                 let (lock, wakeup) = &*interrupted;
@@ -610,8 +610,8 @@ mod tests {
         let (lock, _) = &*interrupted;
         assert!(*lock.lock().unwrap(), "shutdown hook was not invoked");
         match requester.join().unwrap() {
-            Err(BrokerClientWorkerError::Shutdown) => {}
-            Err(BrokerClientWorkerError::Client(ClientError::Channel(error)))
+            Err(ControlClientWorkerError::Shutdown) => {}
+            Err(ControlClientWorkerError::Client(ClientError::Channel(error)))
                 if error.kind() == io::ErrorKind::Interrupted => {}
             result => panic!("unexpected requester result: {result:?}"),
         }

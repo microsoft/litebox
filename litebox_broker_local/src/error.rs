@@ -5,7 +5,7 @@ use core::fmt;
 
 use litebox_broker_protocol::{BrokerResponse, ErrorCode, ProtocolVersion};
 
-/// Errors returned by the broker client adapter.
+/// Errors returned by the control client adapter.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ClientError<E> {
@@ -57,8 +57,8 @@ impl<E: fmt::Display> fmt::Display for ClientError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Channel(error) => write!(f, "broker channel failed: {error}"),
-            Self::NotNegotiated => write!(f, "broker client has not negotiated protocol version"),
-            Self::AlreadyNegotiated => f.write_str("broker client already negotiated"),
+            Self::NotNegotiated => write!(f, "control client has not negotiated protocol version"),
+            Self::AlreadyNegotiated => f.write_str("control client already negotiated"),
             Self::ChannelClosed => write!(f, "broker closed the channel"),
             Self::UnknownResponse => f.write_str("unknown broker response"),
             Self::IncompatibleNegotiation {
@@ -73,7 +73,7 @@ impl<E: fmt::Display> fmt::Display for ClientError<E> {
                 client_protocol_version,
             } => write!(
                 f,
-                "broker client cannot request protocol version {requested:?}; client supports {client_protocol_version:?}"
+                "control client cannot request protocol version {requested:?}; client supports {client_protocol_version:?}"
             ),
             Self::UnsupportedNegotiatedVersion {
                 required,
@@ -118,5 +118,5 @@ where
     }
 }
 
-/// Broker client result type.
+/// Control client result type.
 pub type Result<T, E> = core::result::Result<T, ClientError<E>>;

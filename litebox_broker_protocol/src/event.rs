@@ -147,18 +147,21 @@ impl ConsumeEventRequest {
     }
 }
 
-/// Response to an event consume request.
+/// Result of consuming readiness credits from a broker-owned event object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConsumeEventResponse {
-    /// The number of credits consumed.
+pub struct EventConsumption {
+    /// Number of readiness credits consumed.
     pub value: u64,
     /// Readiness state after consuming credits.
     pub readiness: ReadinessState,
 }
 
-impl ConsumeEventResponse {
-    /// Creates an event consume response.
+impl EventConsumption {
+    /// Creates an event consumption result.
     pub const fn new(value: u64, readiness: ReadinessState) -> Self {
         Self { value, readiness }
     }
 }
+
+/// Response to an event consume request.
+pub type ConsumeEventResponse = EventConsumption;

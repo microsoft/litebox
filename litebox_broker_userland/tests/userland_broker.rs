@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use litebox_broker_host::SUPPORTED_PROTOCOL_VERSION;
-use litebox_broker_local::BrokerClient;
+use litebox_broker_local::ControlClient;
 use litebox_broker_protocol::{ReadinessState, WaitOutcome};
 use litebox_broker_transport::unix_socket::UnixStreamClientControlChannel;
 
@@ -22,7 +22,7 @@ fn separate_process_broker_serves_event_object_requests() {
     channel
         .set_io_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let mut client = BrokerClient::new(channel);
+    let mut client = ControlClient::new(channel);
 
     assert_eq!(client.negotiate().unwrap(), SUPPORTED_PROTOCOL_VERSION);
 

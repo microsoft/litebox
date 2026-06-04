@@ -5,25 +5,11 @@ use crate::object::{ObjectId, ObjectKind};
 use crate::{
     BrokerAssociation, BrokerCore, BrokerError, ObjectRights, ObjectType, PolicyEngine, Result,
 };
-use litebox_broker_protocol::{EventConsumeMode, ObjectHandle, ReadinessState, WaitOutcome};
+use litebox_broker_protocol::{
+    EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState, WaitOutcome,
+};
 
 const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
-
-/// Result of consuming readiness credits from a broker-owned event object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EventConsumption {
-    /// Number of readiness credits consumed.
-    pub value: u64,
-    /// Readiness state after consuming credits.
-    pub readiness: ReadinessState,
-}
-
-impl EventConsumption {
-    /// Creates an event consumption result.
-    pub const fn new(value: u64, readiness: ReadinessState) -> Self {
-        Self { value, readiness }
-    }
-}
 
 impl<P: PolicyEngine> BrokerCore<P> {
     /// Creates a broker-owned event object.

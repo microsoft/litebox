@@ -26,7 +26,6 @@ mod policy;
 use alloc::collections::BTreeMap;
 
 pub use error::BrokerError;
-pub use event::EventConsumption;
 use identity::BrokerCoreId;
 pub use identity::{BrokerAssociation, CallerCredential};
 use litebox_broker_protocol::ObjectReferenceId;
@@ -51,7 +50,7 @@ pub struct BrokerCoreLimits {
 }
 
 impl BrokerCoreLimits {
-    /// Conservative default limits for the first broker proof of concept.
+    /// Conservative default limits for initial broker deployments.
     pub const DEFAULT: Self = Self {
         max_objects: 4096,
         max_references: 4096,

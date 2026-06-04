@@ -26,8 +26,8 @@ pub use channel::{
 pub use error::ErrorCode;
 pub use event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
-    CreateEventRequest, CreateEventResponse, EventConsumeMode, ReadinessState, WaitEventRequest,
-    WaitEventResponse, WaitOutcome,
+    CreateEventRequest, CreateEventResponse, EventConsumeMode, EventConsumption, ReadinessState,
+    WaitEventRequest, WaitEventResponse, WaitOutcome,
 };
 pub use message::{
     BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, EventRequest, EventResponse,

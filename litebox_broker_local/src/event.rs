@@ -8,11 +8,11 @@ use litebox_broker_protocol::{
     WaitOutcome,
 };
 
-use crate::{BrokerClient, ClientError, Result};
+use crate::{ClientError, ControlClient, Result};
 
 const EVENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 2);
 
-impl<T: ClientControlChannel> BrokerClient<T> {
+impl<T: ClientControlChannel> ControlClient<T> {
     /// Creates a broker-owned event object.
     pub fn create_event(&mut self) -> Result<ObjectHandle, T::Error> {
         self.create_event_with_count(0)
@@ -86,7 +86,7 @@ const fn event_request(request: EventRequest) -> BrokerRequest {
     BrokerRequest::Core(CoreRequest::Event(request))
 }
 
-impl<T: ClientControlChannel> BrokerClient<T> {
+impl<T: ClientControlChannel> ControlClient<T> {
     fn ensure_event_protocol(&self) -> Result<(), T::Error> {
         let negotiated = self.ensure_negotiated()?;
         if EVENT_PROTOCOL_VERSION.is_supported_by(negotiated) {
