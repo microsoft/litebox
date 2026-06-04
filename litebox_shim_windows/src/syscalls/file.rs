@@ -16,7 +16,8 @@ use crate::nt_types::{
 };
 use crate::syscalls::Handle;
 use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, raw_handle_entry, remove_raw_handle,
+    ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
+    raw_handle_entry, remove_raw_handle,
 };
 
 const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
@@ -643,18 +644,8 @@ fn probe_file_outputs<Platform: RawPointerProvider>(
     file_handle: MutPtr<Platform, Handle>,
     io_status_block: MutPtr<Platform, IoStatusBlock>,
 ) -> Result<(), NtStatus> {
-    probe_writable::<Platform, Handle>(file_handle)?;
-    probe_writable::<Platform, IoStatusBlock>(io_status_block)
-}
-
-fn probe_writable<Platform, T>(ptr: MutPtr<Platform, T>) -> Result<(), NtStatus>
-where
-    Platform: RawPointerProvider,
-    T: zerocopy::FromBytes + zerocopy::IntoBytes,
-{
-    let value = ptr.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION)?;
-    ptr.write_at_offset(0, value)
-        .ok_or(NtStatus::ACCESS_VIOLATION)
+    probe_guest_output_preserving_value::<Platform, Handle>(file_handle)?;
+    probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block)
 }
 
 fn write_file_result<Platform: RawPointerProvider>(

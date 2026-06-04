@@ -11,10 +11,11 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
@@ -68,6 +69,8 @@ pub(crate) type MutPtr<Platform, T> =
 pub(crate) type WindowsPageManager<Platform> = PageManager<Platform, PAGE_SIZE>;
 pub(crate) type WindowsHandleStore<Platform> =
     litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
+pub(crate) type WindowsNlsSectionMappings<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
 
 pub type DefaultFS<Platform> = WindowsFS<Platform>;
 
@@ -108,6 +111,18 @@ where
         ptr.write_at_offset(index.try_into().ok()?, value)?;
     }
     Some(())
+}
+
+pub(crate) fn probe_guest_output_preserving_value<Platform, T>(
+    ptr: MutPtr<Platform, T>,
+) -> Result<(), NtStatus>
+where
+    Platform: RawPointerProvider,
+    T: zerocopy::FromBytes + zerocopy::IntoBytes,
+{
+    let value = ptr.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION)?;
+    ptr.write_at_offset(0, value)
+        .ok_or(NtStatus::ACCESS_VIOLATION)
 }
 
 fn set_guest_teb<Platform>(platform: &Platform, teb_address: usize) -> bool
@@ -278,7 +293,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager).load(path)?;
         let process = Arc::new(Process {
             ntdll_mapping: load_info.ntdll_mapping,
+            peb_address: load_info.environment.peb,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
+            nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
+            system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
+            user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
+            user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
         });
         Ok(LoadedProgram {
@@ -311,7 +331,12 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
 /// Per-process Windows state shared by every thread in the process.
 pub struct Process<Platform: RawSyncPrimitivesProvider> {
     ntdll_mapping: Option<MappingInfo>,
+    peb_address: usize,
     handles: WindowsHandleStore<Platform>,
+    nls_section_mappings: WindowsNlsSectionMappings<Platform>,
+    system_lcid: AtomicU32,
+    user_lcid: AtomicU32,
+    user_ui_language: AtomicU32,
     exit_code: AtomicI32,
 }
 
@@ -455,6 +480,66 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     length,
                     result_length,
                 );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtGetNlsSectionPtr {
+                section_type,
+                section_data,
+                context_data,
+                section_pointer,
+                section_size,
+            } => {
+                let status = self.sys_nt_get_nls_section_ptr(
+                    section_type,
+                    section_data,
+                    context_data,
+                    section_pointer,
+                    section_size,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtInitializeNlsFiles {
+                base_address,
+                default_locale_id,
+                default_casing_table_size,
+            } => {
+                let status = self.sys_nt_initialize_nls_files(
+                    base_address,
+                    default_locale_id,
+                    default_casing_table_size,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryDefaultLocale {
+                user_profile,
+                default_locale_id,
+            } => {
+                let status = self.sys_nt_query_default_locale(user_profile, default_locale_id);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetDefaultLocale {
+                user_profile,
+                default_locale_id,
+            } => {
+                let status = self.sys_nt_set_default_locale(user_profile, default_locale_id);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryDefaultUILanguage {
+                default_ui_language,
+            } => {
+                let status = self.sys_nt_query_default_ui_language(default_ui_language);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetDefaultUILanguage {
+                default_ui_language,
+            } => {
+                let status = self.sys_nt_set_default_ui_language(default_ui_language);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryInstallUILanguage {
+                install_ui_language,
+            } => {
+                let status = self.sys_nt_query_install_ui_language(install_ui_language);
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtAllocateVirtualMemory {

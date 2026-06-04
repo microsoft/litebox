@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 pub(crate) mod file;
+pub(crate) mod nls;
 pub(crate) mod registry;
 
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
@@ -123,6 +124,35 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         length: u32,
         result_length: Platform::RawMutPointer<u32>,
     },
+    NtGetNlsSectionPtr {
+        section_type: u32,
+        section_data: u32,
+        context_data: usize,
+        section_pointer: Platform::RawMutPointer<usize>,
+        section_size: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtInitializeNlsFiles {
+        base_address: Platform::RawMutPointer<usize>,
+        default_locale_id: Platform::RawMutPointer<u32>,
+        default_casing_table_size: Platform::RawMutPointer<i64>,
+    },
+    NtQueryDefaultLocale {
+        user_profile: u8,
+        default_locale_id: Platform::RawMutPointer<u32>,
+    },
+    NtSetDefaultLocale {
+        user_profile: u8,
+        default_locale_id: u32,
+    },
+    NtQueryDefaultUILanguage {
+        default_ui_language: Platform::RawMutPointer<u16>,
+    },
+    NtSetDefaultUILanguage {
+        default_ui_language: u16,
+    },
+    NtQueryInstallUILanguage {
+        install_ui_language: Platform::RawMutPointer<u16>,
+    },
     NtAllocateVirtualMemory {
         process_handle: ProcessHandle,
         base_address: Platform::RawMutPointer<usize>,
@@ -194,6 +224,35 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 key_value_information:*,
                 length,
                 result_length:*,
+            })),
+            NtSysno::NtGetNlsSectionPtr => Some(sys_req!(NtGetNlsSectionPtr {
+                section_type,
+                section_data,
+                context_data,
+                section_pointer:*,
+                section_size:*,
+            })),
+            NtSysno::NtInitializeNlsFiles => Some(sys_req!(NtInitializeNlsFiles {
+                base_address:*,
+                default_locale_id:*,
+                default_casing_table_size:*,
+            })),
+            NtSysno::NtQueryDefaultLocale => Some(sys_req!(NtQueryDefaultLocale {
+                user_profile,
+                default_locale_id:*,
+            })),
+            NtSysno::NtSetDefaultLocale => Some(sys_req!(NtSetDefaultLocale {
+                user_profile,
+                default_locale_id,
+            })),
+            NtSysno::NtQueryDefaultUILanguage => Some(sys_req!(NtQueryDefaultUILanguage {
+                default_ui_language:*,
+            })),
+            NtSysno::NtSetDefaultUILanguage => Some(sys_req!(NtSetDefaultUILanguage {
+                default_ui_language,
+            })),
+            NtSysno::NtQueryInstallUILanguage => Some(sys_req!(NtQueryInstallUILanguage {
+                install_ui_language:*,
             })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },
