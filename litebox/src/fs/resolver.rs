@@ -141,10 +141,6 @@ struct ResolvedPath {
 }
 
 impl ResolvedPath {
-    fn components(&self) -> Vec<&str> {
-        self.components.iter().map(String::as_str).collect()
-    }
-
     fn parent_and_name(&self) -> Option<(Vec<&str>, &str)> {
         let (name, parent) = self.components.split_last()?;
         Some((parent.iter().map(String::as_str).collect(), name.as_str()))
@@ -340,7 +336,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             ));
         }
 
-        let components = path.components();
+        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
         let walk = self.walk_path(
             &context,
             self.backend.root(),
