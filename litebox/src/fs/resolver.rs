@@ -423,30 +423,38 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let table = self.litebox.descriptor_table();
-        let mut entry = table.get_entry_mut(fd).ok_or(ReadError::ClosedFd)?;
-        let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(ReadError::NotAFile),
-        };
-        let seek_behavior = entry.entry.seek_behavior;
-        if !entry.entry.read_allowed {
-            return Err(ReadError::NotForReading);
-        }
-        if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("read from O_PATH fd")
-        }
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ReadError::ClosedFd)?;
+        entry.with_entry_mut(|entry| {
+            // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
+            // smaller per-open-file-description primitive for position/append serialization, so the
+            // descriptor entry can be unlocked before potentially blocking backend calls.
+            let file = match &entry.entry.handle {
+                OwnedHandle::File(file) => file,
+                OwnedHandle::Dir(_) => return Err(ReadError::NotAFile),
+            };
+            let seek_behavior = entry.entry.seek_behavior;
+            if !entry.entry.read_allowed {
+                return Err(ReadError::NotForReading);
+            }
+            if entry.entry.path_only {
+                // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
+                unimplemented!("read from O_PATH fd")
+            }
 
-        let read_offset = match seek_behavior {
-            SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
-            SeekBehavior::PositionBased => offset.unwrap_or(entry.entry.position),
-        };
-        let read = self.backend.read(file, buf, read_offset)?;
-        if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
-            entry.entry.position = read_offset.checked_add(read).unwrap();
-        }
-        Ok(read)
+            let read_offset = match seek_behavior {
+                SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
+                SeekBehavior::PositionBased => offset.unwrap_or(entry.entry.position),
+            };
+            let read = self.backend.read(file, buf, read_offset)?;
+            if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
+                entry.entry.position = read_offset.checked_add(read).unwrap();
+            }
+            Ok(read)
+        })
     }
 
     fn write(
@@ -455,36 +463,44 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        let table = self.litebox.descriptor_table();
-        let mut entry = table.get_entry_mut(fd).ok_or(WriteError::ClosedFd)?;
-        let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(WriteError::NotAFile),
-        };
-        let seek_behavior = entry.entry.seek_behavior;
-        if !entry.entry.write_allowed {
-            return Err(WriteError::NotForWriting);
-        }
-        if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("write to O_PATH fd")
-        }
-
-        let write_offset = match seek_behavior {
-            SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
-            SeekBehavior::PositionBased if entry.entry.append_mode && offset.is_none() => {
-                self.backend
-                    .file_status(file)
-                    .map_err(|_| WriteError::Io)?
-                    .size
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(WriteError::ClosedFd)?;
+        entry.with_entry_mut(|entry| {
+            // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
+            // smaller per-open-file-description primitive for position/append serialization, so the
+            // descriptor entry can be unlocked before potentially blocking backend calls.
+            let file = match &entry.entry.handle {
+                OwnedHandle::File(file) => file,
+                OwnedHandle::Dir(_) => return Err(WriteError::NotAFile),
+            };
+            let seek_behavior = entry.entry.seek_behavior;
+            if !entry.entry.write_allowed {
+                return Err(WriteError::NotForWriting);
             }
-            SeekBehavior::PositionBased => offset.unwrap_or(entry.entry.position),
-        };
-        let written = self.backend.write(file, buf, write_offset)?;
-        if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
-            entry.entry.position = write_offset.checked_add(written).unwrap();
-        }
-        Ok(written)
+            if entry.entry.path_only {
+                // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
+                unimplemented!("write to O_PATH fd")
+            }
+
+            let write_offset = match seek_behavior {
+                SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
+                SeekBehavior::PositionBased if entry.entry.append_mode && offset.is_none() => {
+                    self.backend
+                        .file_status(file)
+                        .map_err(|_| WriteError::Io)?
+                        .size
+                }
+                SeekBehavior::PositionBased => offset.unwrap_or(entry.entry.position),
+            };
+            let written = self.backend.write(file, buf, write_offset)?;
+            if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
+                entry.entry.position = write_offset.checked_add(written).unwrap();
+            }
+            Ok(written)
+        })
     }
 
     fn seek(
@@ -493,43 +509,48 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
-        let table = self.litebox.descriptor_table();
-        let mut entry = table.get_entry_mut(fd).ok_or(SeekError::ClosedFd)?;
-        let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(SeekError::NotAFile),
-        };
-        if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("seek on O_PATH fd")
-        }
-
-        match entry.entry.seek_behavior {
-            SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
-            SeekBehavior::ZeroPosition => Ok(0),
-            SeekBehavior::PositionBased => {
-                let file_len = self
-                    .backend
-                    .file_status(file)
-                    .map_err(|_| SeekError::Io)?
-                    .size;
-                let base = match whence {
-                    super::SeekWhence::RelativeToBeginning => 0,
-                    super::SeekWhence::RelativeToCurrentOffset => entry.entry.position,
-                    super::SeekWhence::RelativeToEnd => file_len,
-                };
-                let new_position = base
-                    .checked_add_signed(offset)
-                    .ok_or(SeekError::InvalidOffset)?;
-                // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
-                // file types may not. Model that distinction instead of using one resolver rule.
-                if new_position > file_len {
-                    return Err(SeekError::InvalidOffset);
-                }
-                entry.entry.position = new_position;
-                Ok(new_position)
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(SeekError::ClosedFd)?;
+        entry.with_entry_mut(|entry| {
+            let file = match &entry.entry.handle {
+                OwnedHandle::File(file) => file,
+                OwnedHandle::Dir(_) => return Err(SeekError::NotAFile),
+            };
+            if entry.entry.path_only {
+                // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
+                unimplemented!("seek on O_PATH fd")
             }
-        }
+
+            match entry.entry.seek_behavior {
+                SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
+                SeekBehavior::ZeroPosition => Ok(0),
+                SeekBehavior::PositionBased => {
+                    let file_len = self
+                        .backend
+                        .file_status(file)
+                        .map_err(|_| SeekError::Io)?
+                        .size;
+                    let base = match whence {
+                        super::SeekWhence::RelativeToBeginning => 0,
+                        super::SeekWhence::RelativeToCurrentOffset => entry.entry.position,
+                        super::SeekWhence::RelativeToEnd => file_len,
+                    };
+                    let new_position = base
+                        .checked_add_signed(offset)
+                        .ok_or(SeekError::InvalidOffset)?;
+                    // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
+                    // file types may not. Model that distinction instead of using one resolver rule.
+                    if new_position > file_len {
+                        return Err(SeekError::InvalidOffset);
+                    }
+                    entry.entry.position = new_position;
+                    Ok(new_position)
+                }
+            }
+        })
     }
 
     fn truncate(
@@ -538,25 +559,30 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         length: usize,
         reset_offset: bool,
     ) -> Result<(), TruncateError> {
-        let table = self.litebox.descriptor_table();
-        let mut entry = table.get_entry_mut(fd).ok_or(TruncateError::ClosedFd)?;
-        let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(TruncateError::IsDirectory),
-        };
-        if !entry.entry.write_allowed {
-            return Err(TruncateError::NotForWriting);
-        }
-        if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("truncate O_PATH fd")
-        }
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(TruncateError::ClosedFd)?;
+        entry.with_entry_mut(|entry| {
+            let file = match &entry.entry.handle {
+                OwnedHandle::File(file) => file,
+                OwnedHandle::Dir(_) => return Err(TruncateError::IsDirectory),
+            };
+            if !entry.entry.write_allowed {
+                return Err(TruncateError::NotForWriting);
+            }
+            if entry.entry.path_only {
+                // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
+                unimplemented!("truncate O_PATH fd")
+            }
 
-        self.backend.truncate(file, length)?;
-        if reset_offset {
-            entry.entry.position = 0;
-        }
-        Ok(())
+            self.backend.truncate(file, length)?;
+            if reset_offset {
+                entry.entry.position = 0;
+            }
+            Ok(())
+        })
     }
 
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
@@ -648,31 +674,36 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<super::DirEntry>, ReadDirError> {
-        let table = self.litebox.descriptor_table();
-        let entry = table.get_entry(fd).ok_or(ReadDirError::ClosedFd)?;
-        if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("read_dir on O_PATH fd")
-        }
-        let dir = match &entry.entry.handle {
-            OwnedHandle::File(_) => return Err(ReadDirError::NotADirectory),
-            OwnedHandle::Dir(dir) => dir,
-        };
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ReadDirError::ClosedFd)?;
+        entry.with_entry(|entry| {
+            if entry.entry.path_only {
+                // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
+                unimplemented!("read_dir on O_PATH fd")
+            }
+            let dir = match &entry.entry.handle {
+                OwnedHandle::File(_) => return Err(ReadDirError::NotADirectory),
+                OwnedHandle::Dir(dir) => dir,
+            };
 
-        let mut entries = Vec::new();
-        // TODO(jayb): Fill in inode info for synthesized dot entries.
-        entries.push(super::DirEntry {
-            name: String::from("."),
-            file_type: FileType::Directory,
-            ino_info: None,
-        });
-        entries.push(super::DirEntry {
-            name: String::from(".."),
-            file_type: FileType::Directory,
-            ino_info: None,
-        });
-        entries.extend(self.backend.list_dir_at(dir.clone())?);
-        Ok(entries)
+            let mut entries = Vec::new();
+            // TODO(jayb): Fill in inode info for synthesized dot entries.
+            entries.push(super::DirEntry {
+                name: String::from("."),
+                file_type: FileType::Directory,
+                ino_info: None,
+            });
+            entries.push(super::DirEntry {
+                name: String::from(".."),
+                file_type: FileType::Directory,
+                ino_info: None,
+            });
+            entries.extend(self.backend.list_dir_at(dir.clone())?);
+            Ok(entries)
+        })
     }
 
     fn file_status(&self, path: impl Arg) -> Result<super::FileStatus, FileStatusError> {
@@ -695,21 +726,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<super::FileStatus, FileStatusError> {
-        let table = self.litebox.descriptor_table();
-        let entry = table.get_entry(fd).ok_or(FileStatusError::ClosedFd)?;
-        match &entry.entry.handle {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(FileStatusError::ClosedFd)?;
+        entry.with_entry(|entry| match &entry.entry.handle {
             OwnedHandle::File(file) => self.backend.file_status(file),
             OwnedHandle::Dir(dir) => self.backend.dir_status(dir),
-        }
+        })
     }
 
     fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
-        let table = self.litebox.descriptor_table();
-        let entry = table.get_entry(fd)?;
-        match &entry.entry.handle {
+        let entry = self.litebox.descriptor_table().entry_handle(fd)?;
+        entry.with_entry(|entry| match &entry.entry.handle {
             OwnedHandle::File(file) => self.backend.get_static_backing_data(file),
             OwnedHandle::Dir(_) => None,
-        }
+        })
     }
 }
 
