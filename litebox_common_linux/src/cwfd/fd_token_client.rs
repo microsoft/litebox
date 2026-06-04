@@ -27,24 +27,25 @@
 
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
-    build_create_eventfd_request, build_create_pidfd_request, build_create_pipe_request,
-    build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
-    build_deliver_signal_inbox_request, build_inet_listener_accept_request,
-    build_inet_listener_bind_request, build_inet_listener_create_request,
-    build_inet_listener_getsockname_request, build_inet_listener_getsockopt_request,
-    build_inet_listener_listen_request, build_inet_listener_query_events_request,
-    build_inet_listener_setsockopt_request, build_inet_raw_create_request,
-    build_inet_raw_query_events_request, build_inet_raw_recvfrom_request,
-    build_inet_raw_sendto_request, build_inet_tcp_conn_connect_request,
-    build_inet_tcp_conn_create_request, build_inet_tcp_conn_getpeername_request,
-    build_inet_tcp_conn_getsockname_request, build_inet_tcp_conn_getsockopt_request,
-    build_inet_tcp_conn_query_events_request, build_inet_tcp_conn_setsockopt_request,
-    build_inotify_add_watch_request, build_inotify_init1_request, build_inotify_read_request,
-    build_inotify_rm_watch_request, build_mark_process_exited_request, build_materialize_request,
-    build_open_pty_slave_request, build_pidfd_exited_request, build_poll_tcp_conn_events_request,
-    build_pty_ioctl_request, build_pty_read_request, build_pty_write_request,
-    build_push_siginfo_request, build_read_eventfd_request, build_read_pipe_request,
-    build_read_siginfo_request, build_read_socketpair_request, build_read_tcp_conn_request,
+    build_attach_host_fd_request, build_create_eventfd_request, build_create_pidfd_request,
+    build_create_pipe_request, build_create_pty_request, build_create_signalfd_request,
+    build_create_socketpair_request, build_deliver_signal_inbox_request,
+    build_inet_listener_accept_request, build_inet_listener_bind_request,
+    build_inet_listener_create_request, build_inet_listener_getsockname_request,
+    build_inet_listener_getsockopt_request, build_inet_listener_listen_request,
+    build_inet_listener_query_events_request, build_inet_listener_setsockopt_request,
+    build_inet_raw_create_request, build_inet_raw_query_events_request,
+    build_inet_raw_recvfrom_request, build_inet_raw_sendto_request,
+    build_inet_tcp_conn_connect_request, build_inet_tcp_conn_create_request,
+    build_inet_tcp_conn_getpeername_request, build_inet_tcp_conn_getsockname_request,
+    build_inet_tcp_conn_getsockopt_request, build_inet_tcp_conn_query_events_request,
+    build_inet_tcp_conn_setsockopt_request, build_inotify_add_watch_request,
+    build_inotify_init1_request, build_inotify_read_request, build_inotify_rm_watch_request,
+    build_mark_process_exited_request, build_materialize_request, build_open_pty_slave_request,
+    build_pidfd_exited_request, build_poll_tcp_conn_events_request, build_pty_ioctl_request,
+    build_pty_read_request, build_pty_write_request, build_push_siginfo_request,
+    build_read_eventfd_request, build_read_pipe_request, build_read_siginfo_request,
+    build_read_socketpair_request, build_read_tcp_conn_request,
     build_register_notification_ring_request, build_register_process_request,
     build_register_request, build_release_request, build_set_pgid_request, build_set_sid_request,
     build_shutdown_socketpair_write_request, build_shutdown_tcp_conn_request,
@@ -52,8 +53,8 @@ use crate::fd_token_protocol::{
     build_subscribe_pty_request, build_subscribe_signal_inbox_request, build_unsubscribe_request,
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
     build_write_socketpair_request, build_write_tcp_conn_request, decode,
-    parse_create_pidfd_response_ok, parse_create_pty_response_ok,
-    parse_create_socketpair_response_body, parse_handle_body,
+    parse_attach_host_fd_response_body, parse_create_pidfd_response_ok,
+    parse_create_pty_response_ok, parse_create_socketpair_response_body, parse_handle_body,
     parse_inet_listener_accept_response_ok, parse_inet_listener_bind_response_ok,
     parse_inet_listener_create_response_ok, parse_inet_listener_getsockname_response_ok,
     parse_inet_listener_getsockopt_response_ok, parse_inet_listener_query_events_response_ok,
@@ -1269,6 +1270,37 @@ impl FdTokenClient {
         match resp.status {
             StatusCode::Ok => crate::fd_token_protocol::parse_create_pipe_response_body(resp.body)
                 .map_err(ClientError::Protocol),
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    /// Attaches a host fd to the broker as a `BrokerPipe`-shaped
+    /// handle. The `direction` argument (one of
+    /// `proto::host_fd_direction::{READ, WRITE, READ_WRITE}`) declares
+    /// which of `read_pipe`/`write_pipe` the worker may invoke against
+    /// the returned handle. The host fd is consumed (passed via
+    /// SCM_RIGHTS; broker takes ownership thereafter).
+    ///
+    /// Phase 3 (legacy-pipes retirement) entry point: this replaces
+    /// the parent dispatcher's host-fd relay. The worker installs the
+    /// returned handle as a regular `BrokerPipeFd`, with all data
+    /// flow routed through the broker's host-fd state machine.
+    pub fn attach_host_fd(&self, fd: OwnedFd, direction: u8) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_attach_host_fd_request(direction), Some(&fd))?;
+        drop(fd);
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::AttachHostFdResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_attach_host_fd_response_body(resp.body).map_err(ClientError::Protocol)
+            }
             s => Err(map_status_no_handle(resp.opcode, s)),
         }
     }
