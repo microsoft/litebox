@@ -14,7 +14,9 @@ use alloc::vec::Vec;
 use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;
 
-use super::backend::{Backend, SeekBehavior, WalkOutcome, WalkedComponent};
+use super::backend::{
+    Backend, PermissionCheck, Permissioned, SeekBehavior, WalkOutcome, WalkedComponent,
+};
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
@@ -208,7 +210,9 @@ where
         for &c in components {
             match (location, c) {
                 (Location::Root, "dev") => {
-                    walked_components.push(WalkedComponent { permissions: None });
+                    walked_components.push(WalkedComponent {
+                        permissions: PermissionCheck::ByBackend,
+                    });
                     location = Location::Dev;
                 }
                 (Location::Dev, name) if Device::from_name(name).is_some() => {
@@ -238,7 +242,7 @@ where
         dir: Self::WalkingDirHandle<'_>,
         name: &str,
         flags: OFlags,
-    ) -> Result<Self::FileHandle, OpenError> {
+    ) -> Result<Permissioned<Self::FileHandle>, OpenError> {
         if dir.location != Location::Dev {
             return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
         }
@@ -266,7 +270,10 @@ where
             ));
         }
 
-        Ok(DeviceFileHandle { device })
+        Ok(Permissioned {
+            item: DeviceFileHandle { device },
+            permissions: PermissionCheck::ByBackend,
+        })
     }
 
     fn list_dir_at(&self, handle: Self::DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {

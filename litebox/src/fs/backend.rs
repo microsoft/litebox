@@ -53,6 +53,8 @@ pub trait Backend: private::Sealed + Send + Sync + 'static {
 
     /// Walk one or more `components` starting from the `from` handle.
     ///
+    /// `components` must be non-empty. Backends may panic if called with an empty slice.
+    ///
     /// This function explicitly does not support files, and will return a
     /// [`PathError::ComponentNotADirectory`](super::errors::PathError::ComponentNotADirectory) if
     /// the last component is a file.
@@ -82,7 +84,7 @@ pub trait Backend: private::Sealed + Send + Sync + 'static {
         dir: Self::WalkingDirHandle<'_>,
         name: &str,
         flags: OFlags,
-    ) -> Result<Self::FileHandle, OpenError>;
+    ) -> Result<Permissioned<Self::FileHandle>, OpenError>;
 
     /// Read directory entries at `dir`.
     fn list_dir_at(&self, handle: Self::DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;
@@ -188,13 +190,33 @@ pub struct WalkOutcome<Walking> {
     pub(super) last: Walking,
 }
 
+/// A backend item plus permission metadata for resolver-side checks.
+pub struct Permissioned<H> {
+    pub(super) item: H,
+    pub(super) permissions: PermissionCheck,
+}
+
+/// Whether a resolved component should be permission-checked by the resolver.
+#[derive(Clone, Debug)]
+#[must_use]
+pub(super) enum PermissionCheck {
+    /// The backend is self-enforcing permissions for this item.
+    ByBackend,
+    /// The resolver should check this permission metadata.
+    #[expect(
+        dead_code,
+        reason = "only backend-self-enforced devices exist during migration"
+    )]
+    ByResolver(PermissionInfo),
+}
+
 /// Per-component status returned by a backend walk
 #[derive(Clone, Debug)]
 #[must_use]
 pub(super) struct WalkedComponent {
     /// Permissions that the resolver must check; if this is `None`, the backend has is
     /// self-enforcing permissions for this component, and the resolver need not check it.
-    pub(super) permissions: Option<PermissionInfo>,
+    pub(super) permissions: PermissionCheck,
 }
 
 /// Permission information for a particular component of the walk.

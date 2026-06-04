@@ -18,7 +18,7 @@ use super::errors::{
 };
 use super::{
     FileType, Mode, OFlags,
-    backend::{PermissionInfo, SeekBehavior, WalkOutcome},
+    backend::{PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome},
 };
 
 /// The north-facing filesystem entry point, generic over a [`Backend`](super::backend::Backend).
@@ -107,6 +107,26 @@ impl Context {
             permissions.mode.contains(Mode::XOTH)
         }
     }
+
+    fn can_read(&self, permissions: &PermissionInfo) -> bool {
+        if self.user_info.user == permissions.owner.user {
+            permissions.mode.contains(Mode::RUSR)
+        } else if self.user_info.group == permissions.owner.group {
+            permissions.mode.contains(Mode::RGRP)
+        } else {
+            permissions.mode.contains(Mode::ROTH)
+        }
+    }
+
+    fn can_write(&self, permissions: &PermissionInfo) -> bool {
+        if self.user_info.user == permissions.owner.user {
+            permissions.mode.contains(Mode::WUSR)
+        } else if self.user_info.group == permissions.owner.group {
+            permissions.mode.contains(Mode::WGRP)
+        } else {
+            permissions.mode.contains(Mode::WOTH)
+        }
+    }
 }
 
 impl Default for Context {
@@ -193,23 +213,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         outcome: &WalkOutcome<Backend::WalkingDirHandle<'_>>,
     ) -> Result<(), PathError> {
         for (idx, walked) in outcome.components.iter().enumerate() {
-            let Some(permissions) = &walked.permissions else {
-                continue;
-            };
-            if !context.can_execute(permissions) {
-                return Err(PathError::NoSearchPerms {
-                    #[cfg(debug_assertions)]
-                    dir: {
-                        let mut path = String::new();
-                        for component in &absolute_components[..=idx] {
-                            path.push('/');
-                            path.push_str(component);
-                        }
-                        path
-                    },
-                    #[cfg(debug_assertions)]
-                    perms: permissions.mode,
-                });
+            match &walked.permissions {
+                PermissionCheck::ByBackend => {}
+                PermissionCheck::ByResolver(permissions) => {
+                    if !context.can_execute(permissions) {
+                        return Err(PathError::NoSearchPerms {
+                            #[cfg(debug_assertions)]
+                            dir: {
+                                let mut path = String::new();
+                                for component in &absolute_components[..=idx] {
+                                    path.push('/');
+                                    path.push_str(component);
+                                }
+                                path
+                            },
+                            #[cfg(debug_assertions)]
+                            perms: permissions.mode,
+                        });
+                    }
+                }
             }
         }
         Ok(())
@@ -296,8 +318,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
-                let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(insert(OwnedHandle::File(file), seek_behavior))
+                if !path_only
+                    && let PermissionCheck::ByResolver(permissions) = &file.permissions
+                    && ((read_allowed && !context.can_read(permissions))
+                        || (write_allowed && !context.can_write(permissions)))
+                {
+                    return Err(OpenError::AccessNotAllowed);
+                }
+                let seek_behavior = self.backend.seek_behavior(&file.item);
+                Ok(insert(OwnedHandle::File(file.item), seek_behavior))
             }
             Err(
                 error @ OpenError::PathError(
