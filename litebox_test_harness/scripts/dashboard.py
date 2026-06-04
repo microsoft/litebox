@@ -91,7 +91,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 SCHEMA_VERSION_EXPECTED = 3
 DEFAULT_FILL_BATCH = 300
@@ -909,6 +909,89 @@ def _agent_worktree_is_idle(wt: dict, idle_secs: int,
     if age < idle_secs:
         return (False, f"source touched {int(age)}s ago (< {idle_secs}s)")
     return (True, f"idle {int(age)}s")
+
+
+def _is_ancestor(canonical: Path, ancestor: str, descendant: str) -> bool:
+    """True iff commit `ancestor` is an ancestor of commit `descendant`
+    in `canonical`'s object graph (i.e., `descendant` already contains
+    all of `ancestor`'s history). Reflexive: a commit is its own
+    ancestor."""
+    if not ancestor or not descendant:
+        return False
+    if ancestor == descendant:
+        return True
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(canonical), "merge-base",
+             "--is-ancestor", ancestor, descendant],
+            check=False, capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    return r.returncode == 0
+
+
+def _compute_tip_set(
+    worktrees: list[dict],
+    is_ancestor: Callable[[str, str], bool],
+) -> list[dict]:
+    """Return the subset of `worktrees` that are *tips* — i.e. no
+    other worktree's HEAD has them as an ancestor.
+
+    Pure-functional with an injected ancestor predicate so it can be
+    unit-tested with a fake graph. Order-preserving over the input
+    list.
+
+    Cases this handles uniformly:
+      * Solo worktree: trivially a tip (no others to subsume it).
+      * Fan-out from session (session HEAD is ancestor of subagent
+        HEADs): session is dropped, subagents are tips.
+      * Merge-back into session (subagent HEADs are ancestors of
+        session HEAD): subagents are dropped, session is the tip.
+      * Independent worktrees: all are tips.
+      * Disjoint clusters: one tip per cluster.
+
+    Worktrees missing a `head` key are skipped entirely.
+    """
+    out: list[dict] = []
+    for wt in worktrees:
+        head = wt.get("head")
+        if not head:
+            continue
+        subsumed = False
+        for other in worktrees:
+            if other is wt:
+                continue
+            other_head = other.get("head")
+            if not other_head or other_head == head:
+                continue
+            if is_ancestor(head, other_head):
+                # Some other worktree's HEAD contains this one's
+                # entire history — testing the other subsumes us.
+                subsumed = True
+                break
+        if not subsumed:
+            out.append(wt)
+    return out
+
+
+def _agent_tip_worktrees(
+    conn: sqlite3.Connection, canonical: Path,
+) -> tuple[list[dict], list[dict]]:
+    """Convenience wrapper: discover agent worktrees and partition
+    into (tips, non_tips) using the canonical clone's object graph.
+    """
+    candidates = _discover_agent_worktrees(conn, canonical)
+    if len(candidates) <= 1:
+        # Trivial: either zero or a single solo worktree.
+        return (candidates, [])
+    tips = _compute_tip_set(
+        candidates,
+        lambda a, b: _is_ancestor(canonical, a, b),
+    )
+    tip_paths = {t["path"] for t in tips}
+    non_tips = [w for w in candidates if w["path"] not in tip_paths]
+    return (tips, non_tips)
 
 
 def _merge_base(canonical: Path, a: str, b: str) -> Optional[str]:
@@ -1826,32 +1909,39 @@ def _render_agent_worktrees(conn: sqlite3.Connection,
       * Δ vs baseline_ref_HEAD — absolute drift vs current upstream.
     """
     canonical = _canonical_worktree_for_render(state_dir)
-    candidates = _discover_agent_worktrees(conn, canonical)
+    tips, non_tips = _agent_tip_worktrees(conn, canonical)
+    candidates = tips + non_tips
     if not candidates:
         # Section omitted entirely when there are no agent worktrees
         # — keeps summary.md uncluttered for single-session use.
         return ""
+    tip_paths = {t["path"] for t in tips}
     lines = [
         "## Agent worktrees\n",
         "_Opportunistic coverage for live worktrees. Each row's "
         "regression columns compare the worktree's HEAD against the "
         "tracked-ref baseline whose HEAD shares the most recent "
         "merge-base — i.e., the upstream this branch forked from._\n",
-        "| Worktree | Branch | HEAD | Baseline ref | "
+        "_Marker: `→` = tip (the supervisor opportunistically tests "
+        "this worktree). `~` = subsumed (another worktree's HEAD "
+        "already contains this one's history; testing the tip covers "
+        "it too)._\n",
+        "| | Worktree | Branch | HEAD | Baseline ref | "
         "Δ vs merge-base (native) | Δ vs merge-base (litebox) | "
         "Δ vs baseline HEAD (native) | Δ vs baseline HEAD (litebox) | "
         "Cov (native) | Cov (litebox) | Last tested |",
-        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---|",
+        "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     details: list[str] = []
     for wt in candidates:
         agent_head = wt["head"]
         path = wt["path"]
+        marker = "→" if path in tip_paths else "~"
         branch = _branch_display(wt.get("branch"))
         baseline = _pick_baseline_ref(conn, canonical, agent_head)
         if baseline is None:
             lines.append(
-                f"| `{Path(path).name}` | {branch} | "
+                f"| {marker} | `{Path(path).name}` | {branch} | "
                 f"`{short_sha(agent_head)}` | _no baseline_ | — | — | — | — | "
                 f"— | — | — |"
             )
@@ -1879,7 +1969,7 @@ def _render_agent_worktrees(conn: sqlite3.Connection,
                 parts.append(f"_+{i}_")
             return " ".join(parts) or "0"
         lines.append(
-            f"| `{Path(path).name}` | {branch} | "
+            f"| {marker} | `{Path(path).name}` | {branch} | "
             f"`{short_sha(agent_head)}` | "
             f"`{baseline['ref']}` @ `{short_sha(ref_head)}` | "
             f"{cell(delta_mb, 'native')} | {cell(delta_mb, 'litebox')} | "
@@ -1918,9 +2008,12 @@ def _render_agent_worktrees(conn: sqlite3.Connection,
         "(fail → pass). `—` = no overlapping coverage with that "
         "baseline yet (run more cycles). Worktrees are auto-discovered "
         "from `git worktree list`; tracked-ref CI worktrees are "
-        "excluded. Idle gate: source files untouched for "
-        "`LITEBOX_AGENT_IDLE_SECS` (default 300s) AND no live lease "
-        "from the worktree._"
+        "excluded. The supervisor opportunistically tests only the "
+        "tip-set (marker `→`) — when subagents fan out from a session "
+        "branch, only the worktrees whose HEAD isn't already contained "
+        "in another worktree's HEAD are tested directly. Idle gate: "
+        "source files untouched for `LITEBOX_AGENT_IDLE_SECS` (default "
+        "300s) AND no live lease from the worktree._"
     )
     out = "\n".join(lines) + "\n"
     if details:
@@ -2499,14 +2592,21 @@ def _maybe_drive_agent_worktree(
     canonical = _canonical_worktree(args, state_dir)
     conn = open_db(state_dir)
     try:
-        candidates = _discover_agent_worktrees(conn, canonical)
-        if not candidates:
+        tips, non_tips = _agent_tip_worktrees(conn, canonical)
+        if not tips:
             return
+        if not args.quiet and non_tips:
+            subsumed = ", ".join(
+                f"{Path(w['path']).name}" for w in non_tips[:4]
+            )
+            print(f"[auto] agent-coverage: tip-set has "
+                  f"{len(tips)} of {len(tips) + len(non_tips)} "
+                  f"worktrees (subsumed: {subsumed})", file=sys.stderr)
         idle_secs = int(os.environ.get("LITEBOX_AGENT_IDLE_SECS")
                         or getattr(args, "agent_idle_secs", 300) or 300)
         eligible: list[dict] = []
         skipped: list[tuple[str, str]] = []
-        for wt in candidates:
+        for wt in tips:
             ok, reason = _agent_worktree_is_idle(wt, idle_secs, conn)
             if ok:
                 eligible.append(wt)
@@ -2518,7 +2618,7 @@ def _maybe_drive_agent_worktree(
                     f"{Path(p).name}: {r}" for p, r in skipped[:3]
                 )
                 print(f"[auto] agent-coverage: 0 idle of "
-                      f"{len(candidates)} ({summary})", file=sys.stderr)
+                      f"{len(tips)} tips ({summary})", file=sys.stderr)
             return
         pick = _pick_opportunistic_worktree(conn, eligible)
         if pick is None:

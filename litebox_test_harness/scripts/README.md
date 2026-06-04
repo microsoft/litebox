@@ -298,13 +298,40 @@ This avoids competing with the agent's own active edit/build/test
 work.
 
 **Scheduling.** Round-robin across eligible candidates, biased
-toward never-tested or stalest HEADs. The supervisor records the
-last-picked worktree in `meta.agent_coverage_last_picked` to
-ensure no single worktree starves the others over long runs. The
-opportunistic `cargo test` registers with `harness_leases` the
-same way any other invocation does, so the existing cross-session
-concurrency lease (`LITEBOX_GLOBAL_JOBS / N`) fairly shares CPU
-between this cycle and any tracked-ref cycle that's in flight.
+toward never-tested or stalest HEADs, restricted to the *tip set*
+(see below). The supervisor records the last-picked worktree in
+`meta.agent_coverage_last_picked` to ensure no single worktree
+starves the others over long runs. The opportunistic `cargo test`
+registers with `harness_leases` the same way any other invocation
+does, so the existing cross-session concurrency lease
+(`LITEBOX_GLOBAL_JOBS / N`) fairly shares CPU between this cycle
+and any tracked-ref cycle that's in flight.
+
+**Tip-set targeting.** When a coding session fans out to subagent
+worktrees, the agent worktree list contains multiple branches
+related by ancestry. The supervisor drives only the **tip set** —
+worktrees whose HEAD is not contained in some other worktree's
+HEAD as an ancestor. This generalizes both fan-out shapes
+uniformly:
+
+- **Subagents merge back into the session branch** (session's
+  HEAD is a merge commit containing subagent HEADs as ancestors):
+  subagent worktrees are dropped, the session branch is the tip.
+- **Subagents branch off the session and add new commits**
+  (session HEAD is ancestor of subagent HEADs): the session
+  worktree is dropped, subagents are tips.
+- **Solo / independent worktrees**: every worktree is a tip — no
+  behavior change.
+- **Disjoint sessions**: one tip per cluster; both driven.
+
+Detection is automatic, recomputed every supervisor cycle, and
+has no configuration knob (intentional — a knob would leak into
+agent shell contexts the same way `LITEBOX_TEST_JOBS=1` did).
+If detection is wrong in some real workflow, the rule itself
+gets fixed. The render section ("Agent worktrees") shows every
+agent worktree but marks tips with `→` and subsumed worktrees
+with `~`, so it's visually clear which rows the supervisor is
+actually scheduling.
 
 **Budget.** Each opportunistic cycle is `--fill=<budget>s` with
 `budget = LITEBOX_AGENT_FILL_BUDGET` (default `180`), kept small
