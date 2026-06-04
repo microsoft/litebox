@@ -194,6 +194,12 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         self.task.fs_free_fid_number(fid);
     }
 
+    /// Issue a real close/clunk for a server-visible 9P fid that failed to
+    /// become a guest descriptor.
+    pub fn fs_clunk_fid_number(&self, fid: u32) {
+        self.task.fs_clunk_fid_number(fid);
+    }
+
     /// Install a worker-side FS fd at `guest_fd` that wraps an
     /// existing server-side 9P fid. See
     /// [`syscalls::file::Task::install_brokerfile_bridge_fd_by_fid`]

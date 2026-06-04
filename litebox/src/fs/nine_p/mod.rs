@@ -1185,6 +1185,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         self.client.free_fid(fid);
     }
 
+    fn clunk_fid_number(&self, fid: u32) {
+        self.client.clunk_async(fid);
+    }
+
     fn wrap_existing_fid(
         &self,
         remote_fid: u32,

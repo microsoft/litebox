@@ -543,21 +543,29 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
         })?;
         let path = decode_brokerfile_bridge_path(parts[4])?;
 
+        let provider = litebox_shim_linux::syscalls::broker_fs_provider().ok_or_else(|| {
+            anyhow!("broker-fd-bridge: fs_fid {spec:?}: no broker_fs_provider registered")
+        })?;
+
         let new_fid = entrypoints
             .fs_allocate_fid_number()
             .map_err(|err| anyhow!("broker-fd-bridge: fs_fid allocate {spec:?}: {err:?}"))?;
 
-        let provider = litebox_shim_linux::syscalls::broker_fs_provider().ok_or_else(|| {
-            anyhow!("broker-fd-bridge: fs_fid {spec:?}: no broker_fs_provider registered")
-        })?;
         if let Err(e) = provider.clone_ofd(open_file_id, new_fid) {
             entrypoints.fs_free_fid_number(new_fid);
             anyhow::bail!("broker-fd-bridge: fs_fid {spec:?}: clone_ofd: {e:?}");
         }
 
-        return entrypoints
-            .install_brokerfile_bridge_fd_by_fid(guest_fd, new_fid, &path, 0, status_flags_bits)
-            .map_err(|err| anyhow!("broker-fd-bridge: fs_fid install {spec:?}: {err:?}"));
+        let install_result = entrypoints.install_brokerfile_bridge_fd_by_fid(
+            guest_fd,
+            new_fid,
+            &path,
+            0,
+            status_flags_bits,
+        );
+        return cleanup_cloned_fs_fid_after_install_result(spec, new_fid, install_result, |fid| {
+            entrypoints.fs_clunk_fid_number(fid);
+        });
     }
 
     if parts.get(1) == Some(&"timerfd") && parts.len() == 10 {
@@ -1597,14 +1605,22 @@ fn write_fork_restore_ack_status(ack_fd: i32, status: i32) -> Result<()> {
 
 fn cleanup_cloned_fs_fid_after_install_result<F>(
     spec: &str,
-    _new_fid: u32,
+    new_fid: u32,
     install_result: Result<(), litebox_common_linux::errno::Errno>,
-    _clunk_fid: F,
+    clunk_fid: F,
 ) -> Result<()>
 where
     F: FnOnce(u32),
 {
-    install_result.map_err(|err| anyhow!("broker-fd-bridge: fs_fid {spec:?}: install: {err:?}"))
+    match install_result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            clunk_fid(new_fid);
+            Err(anyhow!(
+                "broker-fd-bridge: fs_fid {spec:?}: install: {err:?}"
+            ))
+        }
+    }
 }
 
 fn worker_task_params(cli_args: &CliArgs) -> litebox_common_linux::TaskParams {
