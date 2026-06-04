@@ -18,7 +18,6 @@ use litebox::event::wait::WaitError;
 use litebox::fs::OFlags;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::mm::linux::VmFlags;
-use litebox::pipes::HalfPipeType;
 use litebox::platform::PageManagementProvider;
 use litebox::platform::ThreadProvider;
 use litebox::platform::{
@@ -2595,99 +2594,7 @@ impl<FS: ShimFS> Task<FS> {
                 exit_signal: i32::try_from(args.exit_signal).unwrap_or(0),
                 parent_process_id: self.process_id,
                 parent_controlling_pty: *self.process_state.borrow().controlling_pty.lock(),
-                parent_pipe_fds: {
-                    let files = self.files.borrow();
-                    let rds = files.raw_descriptor_store.read();
-
-                    // Pass 1: collect pair_ids of all live pipe fds.
-                    let mut live_pair_ids: Vec<usize> = Vec::new();
-                    for raw_fd in rds.iter_alive() {
-                        if let Ok(typed) = rds
-                            .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                        {
-                            if let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) {
-                                live_pair_ids.push(pair_id);
-                            }
-                        }
-                    }
-
-                    // Purge stale entries from mux_pipe_pair_ids BEFORE the
-                    // mux check.  pipe_pair_id() returns Arc::as_ptr() — a
-                    // heap pointer.  When old relay pipes are freed, their
-                    // addresses can be reused for new pipes.  Stale entries
-                    // would cause new pipes to be incorrectly filtered.
-                    {
-                        let mut mux_ids = self.mux_pipe_pair_ids.borrow_mut();
-                        #[cfg(feature = "trace_syscalls")]
-                        let before = mux_ids.len();
-                        mux_ids.retain(|id| live_pair_ids.contains(id));
-                        #[cfg(feature = "trace_syscalls")]
-                        if mux_ids.len() < before {
-                            litebox::log_println!(
-                                self.global.platform,
-                                "[FORK-DIAG] pid={}: purged {} stale mux_pipe_pair_ids ({} → {})",
-                                self.pid,
-                                before - mux_ids.len(),
-                                before,
-                                mux_ids.len(),
-                            );
-                        }
-                    }
-
-                    // Pass 2: build pipe_fds, skipping mux-managed pipes.
-                    let mux_ids = self.mux_pipe_pair_ids.borrow();
-                    let mut pipe_fds = Vec::new();
-                    for raw_fd in rds.iter_alive() {
-                        if let Ok(typed) = rds
-                            .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                        {
-                            let direction = match self.global.pipes.half_pipe_type(&typed) {
-                                Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
-                                    crate::syscalls::external_fd::ExternalFdDirection::Read
-                                }
-                                Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
-                                    crate::syscalls::external_fd::ExternalFdDirection::Write
-                                }
-                                Err(_) => continue,
-                            };
-                            let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) else {
-                                continue;
-                            };
-                            // Skip mux-managed pipes — these are infrastructure
-                            // virtual pipes installed by a prior sibling's mux
-                            // dispatcher or fd-replacement relay.  Bridging them
-                            // again would create nested mux-over-mux and destroy
-                            // the first mux's data flow.
-                            if mux_ids.contains(&pair_id) {
-                                #[cfg(feature = "trace_syscalls")]
-                                litebox::log_println!(
-                                    self.global.platform,
-                                    "[FORK-DIAG] pid={}: skipping mux-managed pipe fd={} pair_id={:#x}",
-                                    self.pid,
-                                    raw_fd,
-                                    pair_id,
-                                );
-                                continue;
-                            }
-                            pipe_fds.push((raw_fd, direction, pair_id));
-                        }
-                    }
-                    drop(mux_ids);
-
-                    // Diagnostic: log ALL alive fds in the parent's fd table
-                    #[cfg(feature = "trace_syscalls")]
-                    {
-                        let all_alive: alloc::vec::Vec<usize> = rds.iter_alive().collect();
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[FORK-DIAG] pid={}: parent all_alive_fds={:?} pipe_fds={:?}",
-                            self.pid,
-                            all_alive,
-                            pipe_fds,
-                        );
-                    }
-                    pipe_fds
-                },
+                parent_pipe_fds: Vec::new(),
                 parent_unix_socket_fds: {
                     let files = self.files.borrow();
                     let rds = files.raw_descriptor_store.read();
@@ -3022,65 +2929,6 @@ impl<FS: ShimFS> Task<FS> {
             // refcounts live in the shared descriptor entry; child close/exec
             // activity must not be able to remove or resurrect the parent's
             // writer refs.
-            let pipe_positions: alloc::vec::Vec<(
-                alloc::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>>,
-                usize,
-            )> = {
-                let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
-                let mut positions = alloc::vec::Vec::new();
-                for raw_fd in rds.iter_alive() {
-                    if let Ok(typed) =
-                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                    {
-                        if let Some(pos) = self.global.pipes.snapshot_consumer_position(&typed) {
-                            positions.push((typed, pos));
-                        }
-                    }
-                }
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[PIPE-COW] snapshotted {} pipe receiver positions",
-                    positions.len(),
-                );
-                positions
-            };
-            let pipe_writer_ref_counts: alloc::vec::Vec<(
-                alloc::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>>,
-                usize,
-            )> = {
-                let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
-                let mut counts = BTreeMap::<
-                    u64,
-                    (
-                        alloc::sync::Arc<
-                            litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
-                        >,
-                        usize,
-                    ),
-                >::new();
-                for raw_fd in rds.iter_alive() {
-                    if let Ok(typed) =
-                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                    {
-                        if self
-                            .global
-                            .pipes
-                            .snapshot_writer_ref_count(&typed)
-                            .is_some()
-                        {
-                            counts
-                                .entry(typed.object_id().as_u64())
-                                .and_modify(|(_, count)| *count += 1)
-                                .or_insert((typed, 1));
-                        }
-                    }
-                }
-                counts.into_values().collect()
-            };
-
             // Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
             // interrupted, because parent and child share the same guest stack.
             while !vd.is_done() {
@@ -3093,37 +2941,6 @@ impl<FS: ShimFS> Task<FS> {
             if let Some(cow) = &cow_state {
                 self.restore_cow_layer(cow, true);
             }
-
-            // Restore pipe receiver consumer positions so the parent
-            // sees data that the child consumed from the shared ring buffer.
-            for (typed, saved_pos) in &pipe_positions {
-                self.global
-                    .pipes
-                    .restore_consumer_position(typed, *saved_pos);
-            }
-            // Verify restoration worked by checking positions match
-            #[cfg(feature = "trace_syscalls")]
-            for (typed, saved_pos) in &pipe_positions {
-                if let Some(current) = self.global.pipes.snapshot_consumer_position(typed) {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[PIPE-COW] restored consumer: saved={} current={}",
-                        saved_pos,
-                        current,
-                    );
-                }
-            }
-            drop(pipe_positions);
-
-            // Restore pipe writer fd_ref_counts to the parent's fd table
-            // contribution.  Restoring the pre-fork global count would include
-            // the child's transient dup refs and keep readers from seeing EOF.
-            for (typed, saved_count) in &pipe_writer_ref_counts {
-                self.global
-                    .pipes
-                    .restore_writer_ref_count(typed, *saved_count);
-            }
-            drop(pipe_writer_ref_counts);
 
             // Apply fd replacements deposited by commit_delayed_fork.
             // Instead of replacing with ExternalFd (which has a no-op
@@ -3200,21 +3017,6 @@ impl<FS: ShimFS> Task<FS> {
                             drop(rds);
                             let _ = self.global.litebox.descriptor_table_mut().remove(&old_sock);
                             rds = files.raw_descriptor_store.write();
-                        }
-                        // For direct Read+Pipe replacements only: consume the
-                        // parent's existing virtual pipe at this slot so
-                        // fd_into_specific_raw_integer below can install the
-                        // ExternalFd. mem::forget keeps the underlying virtual
-                        // pipe alive (drop would close it which the in-progress
-                        // exec_on_remote_host syscall may still reference).
-                        if repl.direct && repl.direction == ExternalFdDirection::Read {
-                            if let Ok(old_pipe) = rds
-                                .fd_consume_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                    repl.guest_fd,
-                                )
-                            {
-                                core::mem::forget(old_pipe);
-                            }
                         }
                         let _ = rds.fd_into_specific_raw_integer(typed_fd, repl.guest_fd);
                         continue;
@@ -3677,21 +3479,6 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::BrokerInetListener(_)
                         | crate::RawFdRef::BrokerInetDgram(_)
                         | crate::RawFdRef::BrokerInetRaw(_) => {}
-                        crate::RawFdRef::Pipes(typed) => {
-                            let direction = match self.global.pipes.half_pipe_type(typed) {
-                                Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
-                                    ExternalFdDirection::Read
-                                }
-                                Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
-                                    ExternalFdDirection::Write
-                                }
-                                Err(_) => return,
-                            };
-                            let Ok(pair_id) = self.global.pipes.pipe_pair_id(typed) else {
-                                return;
-                            };
-                            child_pipes.push((raw_fd, direction, pair_id));
-                        }
                         crate::RawFdRef::ExternalFd(typed) => {
                             // Already host-backed — collect for later extraction
                             // (need descriptor_table lock which we acquire after rds).
@@ -3791,39 +3578,7 @@ impl<FS: ShimFS> Task<FS> {
                     if let (Some(&primary_w), Some(&primary_r)) =
                         (write_fds.first(), read_fds.first())
                     {
-                        // Drain any buffered data from the read end so
-                        // it can be pre-filled in the worker's pipe.
-                        // Capture per-end flags (e.g. O_NONBLOCK).
-                        let (drained, w_flags, r_flags) = {
-                            let files = self.files.borrow();
-                            let rds = files.raw_descriptor_store.read();
-                            let r_typed = rds
-                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                    primary_r,
-                                )
-                                .ok();
-                            let w_typed = rds
-                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                    primary_w,
-                                )
-                                .ok();
-                            drop(rds);
-                            let data = r_typed
-                                .as_ref()
-                                .and_then(|t| self.global.pipes.drain_available(t).ok())
-                                .unwrap_or_default();
-                            let rf = r_typed
-                                .as_ref()
-                                .and_then(|t| self.global.pipes.get_flags(t).ok())
-                                .unwrap_or(litebox::pipes::Flags::empty())
-                                .bits();
-                            let wf = w_typed
-                                .as_ref()
-                                .and_then(|t| self.global.pipes.get_flags(t).ok())
-                                .unwrap_or(litebox::pipes::Flags::empty())
-                                .bits();
-                            (data, wf, rf)
-                        };
+                        let (drained, w_flags, r_flags) = (Vec::new(), 0, 0);
                         local_pipe_pairs.push((primary_w, primary_r, drained, w_flags, r_flags));
                         // Extra write aliases.
                         for &fd in &write_fds[1..] {
@@ -4006,55 +3761,7 @@ impl<FS: ShimFS> Task<FS> {
                         self.pid,
                         child_fd,
                     );
-                    if let Ok(typed) =
-                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(child_fd)
-                    {
-                        drop(rds);
-                        #[cfg(feature = "trace_syscalls")]
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[DELAYED-FORK] pid={}: drain: calling drain_available for fd={}",
-                            self.pid,
-                            child_fd,
-                        );
-                        if let Ok(data) = self.global.pipes.drain_available(&typed)
-                            && !data.is_empty()
-                        {
-                            this_drained.clone_from(&data);
-
-                            // Enlarge the OS pipe to hold all drained data so the
-                            // blocking write below cannot deadlock (no reader exists
-                            // yet — the child worker is spawned later).
-                            let capacity = i32::try_from(data.len())
-                                .unwrap_or(i32::MAX)
-                                .saturating_add(4096);
-                            self.global
-                                .platform
-                                .try_set_pipe_capacity(parent_os_fd, capacity);
-
-                            #[cfg(feature = "trace_syscalls")]
-                            litebox::log_println!(
-                                self.global.platform,
-                                "[DELAYED-FORK] pid={}: drained {} bytes from virtual pipe fd={} into OS pipe",
-                                self.pid,
-                                data.len(),
-                                child_fd,
-                            );
-                            let mut offset = 0;
-                            while offset < data.len() {
-                                match self
-                                    .global
-                                    .platform
-                                    .write_host_fd(parent_os_fd, &data[offset..])
-                                {
-                                    Ok(n) => offset += n,
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                    } else {
-                        drop(rds);
-                    }
+                    drop(rds);
                     drop(files);
                 }
 
@@ -4948,25 +4655,9 @@ impl<FS: ShimFS> Task<FS> {
                         bridge_parent_info.get(i).is_some_and(|parents| {
                             !parents.is_empty()
                                 && parents.iter().all(|&(parent_fd, parent_dir, _)| {
-                                    if parent_dir == ExternalFdDirection::Write {
-                                        // Parent is a writer — check if the
-                                        // source pipe already has EOF.
-                                        let files = self.files.borrow();
-                                        let rds = files.raw_descriptor_store.read();
-                                        if let Ok(typed) = rds.fd_from_raw_integer::<
-                                            litebox::pipes::Pipes<crate::Platform>,
-                                        >(
-                                            parent_fd
-                                        ) {
-                                            drop(rds);
-                                            self.global.pipes.is_read_eof(&typed)
-                                        } else {
-                                            drop(rds);
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
+                                    let _ = parent_fd;
+                                    let _ = parent_dir;
+                                    false
                                 })
                         })
                     } else {
@@ -5101,15 +4792,7 @@ impl<FS: ShimFS> Task<FS> {
                                                 .insert(bp_fd);
                                             let files = self.files.borrow();
                                             let mut rds = files.raw_descriptor_store.write();
-                                            if let Ok(old_pipe) = rds
-                                                .fd_consume_raw_integer::<
-                                                    litebox::pipes::Pipes<crate::Platform>,
-                                                >(parent_fd)
-                                            {
-                                                drop(rds);
-                                                let _ = self.global.pipes.close(&old_pipe);
-                                                rds = files.raw_descriptor_store.write();
-                                            } else if let Ok(old_broker_pipe) = rds
+                                            if let Ok(old_broker_pipe) = rds
                                                 .fd_consume_raw_integer::<
                                                     super::broker_pipe::BrokerPipeSubsystem,
                                                 >(parent_fd)
@@ -6405,9 +6088,6 @@ impl<FS: ShimFS> Task<FS> {
                         crate::RawFdRef::Net(fd) => {
                             (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
                         }
-                        crate::RawFdRef::Pipes(fd) => {
-                            (FdClass::Pipe, Some(fd.object_id()), None, None)
-                        }
                         crate::RawFdRef::Eventfd(fd) => {
                             (FdClass::EventFd, Some(fd.object_id()), None, None)
                         }
@@ -7437,13 +7117,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
-        if let Ok(old_pipe) =
-            rds.fd_consume_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(guest_fd)
-        {
-            drop(rds);
-            let _ = self.global.pipes.close(&old_pipe);
-            rds = files.raw_descriptor_store.write();
-        } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+        if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
             drop(rds);
             let _ = files.fs.close(&old_fs);
             rds = files.raw_descriptor_store.write();
@@ -8853,30 +8527,8 @@ impl<FS: ShimFS> Task<FS> {
             signal_on_error(&vfork_info);
         })?;
         let placeholder_stdio_bridge_fds = worker_exec_stdio_bridge_fds(&worker_stdio);
-        let stdio_pipe_info: Vec<(i32, usize, super::external_fd::ExternalFdDirection)> = {
-            let files = self.files.borrow();
-            let rds = files.raw_descriptor_store.read();
-            let mut out = Vec::new();
-            for raw_fd in 0..=2_usize {
-                if let Ok(typed) =
-                    rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                {
-                    let direction = match self.global.pipes.half_pipe_type(&typed) {
-                        Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
-                            super::external_fd::ExternalFdDirection::Read
-                        }
-                        Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
-                            super::external_fd::ExternalFdDirection::Write
-                        }
-                        Err(_) => continue,
-                    };
-                    if let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) {
-                        out.push((raw_fd as i32, pair_id, direction));
-                    }
-                }
-            }
-            out
-        };
+        let stdio_pipe_info: Vec<(i32, usize, super::external_fd::ExternalFdDirection)> =
+            Vec::new();
 
         let use_direct_stdio = if let Some((_, parent_pipe_fds, _)) = &vfork_info {
             !stdio_pipe_info.is_empty()
@@ -9723,7 +9375,7 @@ impl<FS: ShimFS> Task<FS> {
         Ok(0)
     }
 
-    fn worker_exec_stdio_bindings(&self) -> Result<WorkerExecStdioBindings<FS, Platform>, Errno> {
+    fn worker_exec_stdio_bindings(&self) -> Result<WorkerExecStdioBindings<FS>, Errno> {
         let files = self.files.borrow();
         if worker_exec_has_unsupported_stdio(&self.global, &files) {
             return Err(Errno::ENOTSUP);
@@ -10501,40 +10153,6 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 log_worker_exec_stdio_unsupported(global, raw_fd, "network socket-backed stdio");
                 true
             },
-    crate::RawFdRef::Pipes(fd) => {
-                let nonblocking = global
-                    .pipes
-                    .get_flags(fd)
-                    .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
-                    .unwrap_or(true);
-                global.pipes.half_pipe_type(fd).map_or_else(
-                    |_| {
-                        log_worker_exec_stdio_unsupported(global, raw_fd, "closed pipe descriptor");
-                        true
-                    },
-                    |half| match (raw_fd, half) {
-                        (0, HalfPipeType::ReceiverHalf) => {
-                            if nonblocking {
-                                log_worker_exec_stdio_unsupported(
-                                    global,
-                                    raw_fd,
-                                    "nonblocking pipe-backed stdin",
-                                );
-                            }
-                            nonblocking
-                        }
-                        (1 | 2, HalfPipeType::SenderHalf) => false,
-                        _ => {
-                            log_worker_exec_stdio_unsupported(
-                                global,
-                                raw_fd,
-                                "wrong pipe direction",
-                            );
-                            true
-                        }
-                    },
-                )
-            },
     crate::RawFdRef::Eventfd(fd) => {
                 let nonblocking = global
                     .litebox
@@ -10683,9 +10301,7 @@ fn worker_exec_host_stdio_fd<FS: ShimFS>(
         .and_then(|idx| i32::try_from(idx).ok())
 }
 
-fn worker_exec_stdio_bridge_fds<FS: ShimFS>(
-    stdio: &WorkerExecStdioBindings<FS, Platform>,
-) -> Vec<usize> {
+fn worker_exec_stdio_bridge_fds<FS: ShimFS>(stdio: &WorkerExecStdioBindings<FS>) -> Vec<usize> {
     let mut fds = Vec::new();
     if matches!(&stdio.stdin, WorkerExecInputBinding::Fs { .. }) {
         fds.push(0);
@@ -10702,7 +10318,7 @@ fn worker_exec_input_binding<FS: ShimFS>(
     raw_fd: usize,
     global: &crate::GlobalState<FS>,
     files: &crate::syscalls::file::FilesState<FS>,
-) -> WorkerExecInputBinding<FS, Platform> {
+) -> WorkerExecInputBinding<FS> {
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return WorkerExecInputBinding::Close;
     }
@@ -10746,14 +10362,6 @@ fn worker_exec_input_binding<FS: ShimFS>(
             // Network sockets: not supported across worker exec.
             #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(_net) => WorkerExecInputBinding::Close,
-            crate::RawFdRef::Pipes(fd) => match global.pipes.half_pipe_type(fd) {
-                Ok(HalfPipeType::ReceiverHalf) => WorkerExecInputBinding::Pipe {
-                    pipes: global.pipes.clone(),
-                    fd: fd.clone(),
-                },
-                Ok(HalfPipeType::SenderHalf) | Err(_) => WorkerExecInputBinding::Close,
-            },
-
             // eventfd: not bridgeable as stdin.
             crate::RawFdRef::Eventfd(_eventfd) => WorkerExecInputBinding::Close,
 
@@ -10863,7 +10471,7 @@ fn worker_exec_output_binding<FS: ShimFS>(
     raw_fd: usize,
     global: &crate::GlobalState<FS>,
     files: &crate::syscalls::file::FilesState<FS>,
-) -> WorkerExecOutputBinding<FS, Platform> {
+) -> WorkerExecOutputBinding<FS> {
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return WorkerExecOutputBinding::Close;
     }
@@ -10907,14 +10515,6 @@ fn worker_exec_output_binding<FS: ShimFS>(
             // Network sockets: not supported as stdout/stderr across worker exec.
             #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(_net) => WorkerExecOutputBinding::Close,
-            crate::RawFdRef::Pipes(fd) => match global.pipes.half_pipe_type(fd) {
-                Ok(HalfPipeType::SenderHalf) => WorkerExecOutputBinding::Pipe {
-                    pipes: global.pipes.clone(),
-                    fd: fd.clone(),
-                },
-                Ok(HalfPipeType::ReceiverHalf) | Err(_) => WorkerExecOutputBinding::Close,
-            },
-
             // eventfd: not bridgeable as stdout/stderr.
             crate::RawFdRef::Eventfd(_eventfd) => WorkerExecOutputBinding::Close,
 
@@ -12552,117 +12152,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_exec_stdio_bindings_forward_pipe_backed_stdout() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (_read_fd, write_fd) = task
-            .sys_pipe2(OFlags::empty())
-            .expect("pipe2 should succeed");
-        let write_fd = i32::try_from(write_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(write_fd, Some(1), None)
-            .expect("dup2 onto stdout should succeed");
-
-        let bindings = task
-            .worker_exec_stdio_bindings()
-            .expect("stdio bindings should succeed");
-        // reason: unsupported variants intentionally share this fallback path.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match bindings.stdout {
-            WorkerExecOutputBinding::Pipe { .. } => {}
-            _ => panic!("stdout should be proxied through a worker pipe binding"),
-        }
-    }
-
-    #[test]
-    fn worker_exec_stdio_bindings_reject_read_end_on_stdout() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (read_fd, _write_fd) = task
-            .sys_pipe2(OFlags::empty())
-            .expect("pipe2 should succeed");
-        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(read_fd, Some(1), None)
-            .expect("dup2 onto stdout should succeed");
-
-        let Err(err) = task.worker_exec_stdio_bindings() else {
-            panic!("stdout wired to a pipe read end should be rejected")
-        };
-        assert_eq!(err, Errno::ENOTSUP);
-    }
-
-    #[test]
-    fn worker_exec_stdio_bindings_preserve_nonblocking_pipe_backed_stdout() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (_read_fd, write_fd) = task
-            .sys_pipe2(OFlags::NONBLOCK)
-            .expect("pipe2 should succeed");
-        let write_fd = i32::try_from(write_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(write_fd, Some(1), None)
-            .expect("dup2 onto stdout should succeed");
-
-        let bindings = task
-            .worker_exec_stdio_bindings()
-            .expect("nonblocking stdout pipe should be preserved for remote exec");
-        // reason: unsupported variants intentionally share this fallback path.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match bindings.stdout {
-            WorkerExecOutputBinding::Pipe { .. } => {}
-            _ => panic!("nonblocking stdout should still be proxied through a worker pipe binding"),
-        }
-    }
-
-    #[test]
-    fn worker_exec_stdio_bindings_forward_pipe_backed_stdin() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (read_fd, _write_fd) = task
-            .sys_pipe2(OFlags::empty())
-            .expect("pipe2 should succeed");
-        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(read_fd, Some(0), None)
-            .expect("dup2 onto stdin should succeed");
-
-        let bindings = task
-            .worker_exec_stdio_bindings()
-            .expect("stdio bindings should succeed");
-        // reason: unsupported variants intentionally share this fallback path.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match bindings.stdin {
-            WorkerExecInputBinding::Pipe { .. } => {}
-            _ => panic!("stdin should be proxied through a worker pipe binding"),
-        }
-    }
-
-    #[test]
-    fn worker_exec_stdio_bindings_reject_nonblocking_pipe_backed_stdin() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (read_fd, _write_fd) = task
-            .sys_pipe2(OFlags::NONBLOCK)
-            .expect("pipe2 should succeed");
-        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(read_fd, Some(0), None)
-            .expect("dup2 onto stdin should succeed");
-
-        let Err(err) = task.worker_exec_stdio_bindings() else {
-            panic!("nonblocking pipe stdin should still be rejected")
-        };
-        assert_eq!(err, Errno::ENOTSUP);
-    }
-
-    #[test]
-    fn worker_exec_stdio_bindings_reject_write_end_on_stdin() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (_read_fd, write_fd) = task
-            .sys_pipe2(OFlags::empty())
-            .expect("pipe2 should succeed");
-        let write_fd = i32::try_from(write_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(write_fd, Some(0), None)
-            .expect("dup2 onto stdin should succeed");
-
-        let Err(err) = task.worker_exec_stdio_bindings() else {
-            panic!("stdin wired to a pipe write end should be rejected")
-        };
-        assert_eq!(err, Errno::ENOTSUP);
-    }
-
-    #[test]
     fn worker_exec_stdio_bindings_preserve_host_stdio_aliases() {
         let task = crate::syscalls::tests::init_platform(None);
         task.sys_dup(1, Some(2), None)
@@ -12698,9 +12187,6 @@ mod tests {
             WorkerExecOutputBinding::Close => panic!("stderr alias should not be closed"),
             WorkerExecOutputBinding::Fs { .. } => {
                 panic!("stderr alias should not be proxied through the guest FS")
-            }
-            WorkerExecOutputBinding::Pipe { .. } => {
-                panic!("stderr alias should not be proxied through a guest pipe")
             }
             WorkerExecOutputBinding::Stream(_) => {
                 panic!("stderr alias should not be proxied through a guest byte stream")

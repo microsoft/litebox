@@ -2925,7 +2925,6 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::Fs(_) => Err(Errno::ENOTSOCK),
             #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(fd) => self.global.shutdown(fd, read, write),
-            crate::RawFdRef::Pipes(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Epoll(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Unix(fd) => {
@@ -3291,10 +3290,6 @@ impl<FS: ShimFS> Task<FS> {
                         #[cfg(feature = "worker_local_inet")]
                         crate::RawFdRef::Net(_) => {
                             // Network descriptors are kernel-backed and transfer as PassedFd.
-                            Ok(false)
-                        }
-                        crate::RawFdRef::Pipes(_) => {
-                            // Pipes are kernel-backed and transfer as PassedFd.
                             Ok(false)
                         }
                         crate::RawFdRef::Eventfd(typed) => {

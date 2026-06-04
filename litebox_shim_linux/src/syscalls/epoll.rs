@@ -61,7 +61,6 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
     File(Arc<crate::FileFd<FS>>),
     #[cfg(feature = "worker_local_inet")]
     Socket(Arc<super::net::SocketFd>),
-    Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
     ExternalFd(Arc<TypedFd<super::external_fd::ExternalFdSubsystem>>),
     BrokerPipe(Arc<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
@@ -81,7 +80,6 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             crate::RawFdRef::Fs(fd) => Ok(EpollDescriptor::File(Arc::clone(fd))),
             #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(fd) => Ok(EpollDescriptor::Socket(Arc::clone(fd))),
-            crate::RawFdRef::Pipes(fd) => Ok(EpollDescriptor::Pipe(Arc::clone(fd))),
             crate::RawFdRef::Eventfd(fd) => Ok(EpollDescriptor::Eventfd(Arc::clone(fd))),
             crate::RawFdRef::Epoll(fd) => {
                 let handle = global
@@ -127,7 +125,6 @@ enum DescriptorRef<FS: ShimFS> {
     File(Weak<crate::FileFd<FS>>),
     #[cfg(feature = "worker_local_inet")]
     Socket(Weak<super::net::SocketFd>),
-    Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
     Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
     ExternalFd(Weak<TypedFd<super::external_fd::ExternalFdSubsystem>>),
     BrokerPipe(Weak<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
@@ -151,7 +148,6 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             EpollDescriptor::File(file) => Self::File(Arc::downgrade(file)),
             #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
-            EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
             EpollDescriptor::Unix(unix) => Self::Unix(Arc::downgrade(unix)),
             EpollDescriptor::ExternalFd(hp) => Self::ExternalFd(Arc::downgrade(hp)),
             EpollDescriptor::BrokerPipe(bp) => Self::BrokerPipe(Arc::downgrade(bp)),
@@ -177,7 +173,6 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::File(file) => file.upgrade().map(EpollDescriptor::File),
             #[cfg(feature = "worker_local_inet")]
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
-            DescriptorRef::Pipe(pipe) => pipe.upgrade().map(EpollDescriptor::Pipe),
             DescriptorRef::Unix(unix) => unix.upgrade().map(EpollDescriptor::Unix),
             DescriptorRef::ExternalFd(hp) => hp.upgrade().map(EpollDescriptor::ExternalFd),
             DescriptorRef::BrokerPipe(bp) => bp.upgrade().map(EpollDescriptor::BrokerPipe),
@@ -201,7 +196,6 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::File(_) => "File",
             #[cfg(feature = "worker_local_inet")]
             DescriptorRef::Socket(_) => "Socket",
-            DescriptorRef::Pipe(_) => "Pipe",
             DescriptorRef::Unix(_) => "Unix",
             DescriptorRef::ExternalFd(_) => "ExternalFd",
             DescriptorRef::BrokerPipe(_) => "BrokerPipe",
@@ -224,7 +218,6 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             | DescriptorRef::BrokerInetRaw(_)
             | DescriptorRef::Epoll(_)
             | DescriptorRef::File(_)
-            | DescriptorRef::Pipe(_)
             | DescriptorRef::Unix(_)
             | DescriptorRef::ExternalFd(_)
             | DescriptorRef::BrokerPipe(_)
@@ -303,7 +296,6 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 };
                 Some(poll(&proxy))
             }
-            EpollDescriptor::Pipe(fd) => global.pipes.with_iopollable(fd, poll).ok(),
             EpollDescriptor::Unix(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
@@ -360,7 +352,6 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             EpollDescriptor::BrokerTcpConn(_) => false,
             #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(_) => false,
-            EpollDescriptor::Pipe(_) => false,
             EpollDescriptor::Unix(fd) => global
                 .litebox
                 .descriptor_table()
@@ -895,7 +886,6 @@ impl<FS: ShimFS> EpollFile<FS> {
                 EpollDescriptor::File(_) => "File",
                 #[cfg(feature = "worker_local_inet")]
                 EpollDescriptor::Socket(_) => "Socket",
-                EpollDescriptor::Pipe(_) => "Pipe",
                 EpollDescriptor::Unix(_) => "Unix",
                 EpollDescriptor::ExternalFd(_) => "ExternalFd",
                 EpollDescriptor::BrokerPipe(_) => "BrokerPipe",
@@ -992,7 +982,6 @@ impl EpollEntryKey {
             EpollDescriptor::File(file) => file.object_id(),
             #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(socket_fd) => socket_fd.object_id(),
-            EpollDescriptor::Pipe(pipe_fd) => pipe_fd.object_id(),
             EpollDescriptor::Unix(unix) => unix.object_id(),
             EpollDescriptor::ExternalFd(hp) => hp.object_id(),
             EpollDescriptor::BrokerPipe(bp) => bp.object_id(),
@@ -2036,56 +2025,6 @@ mod test {
         let events_bits = event.events;
         assert_eq!(data, 0x1111);
         assert_eq!(events_bits, Events::IN.bits());
-    }
-
-    #[test]
-    fn test_epoll_with_pipe() {
-        let (task, epoll, fs) = setup_epoll();
-        let (producer, consumer) =
-            task.global
-                .pipes
-                .create_pipe(2, litebox::pipes::Flags::empty(), None);
-        let consumer = Arc::new(consumer);
-        let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));
-        epoll
-            .add_interest(
-                &task.global,
-                &*fs,
-                10,
-                &reader,
-                EpollEvent {
-                    events: Events::IN.bits(),
-                    data: 0,
-                },
-            )
-            .unwrap();
-
-        // spawn a thread to write to the pipe
-        let global = task.global.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(core::time::Duration::from_millis(100));
-            assert_eq!(
-                global
-                    .pipes
-                    .write(&WaitState::new(platform()).context(), &producer, &[1, 2])
-                    .unwrap(),
-                2
-            );
-        });
-        epoll
-            .wait(
-                &task.global,
-                &*fs,
-                &WaitState::new(platform()).context(),
-                1024,
-            )
-            .unwrap();
-        let mut buf = [0; 2];
-        task.global
-            .pipes
-            .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
-            .unwrap();
-        assert_eq!(buf, [1, 2]);
     }
 
     #[test]

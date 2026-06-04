@@ -625,46 +625,6 @@ impl From<litebox::sync::futex::FutexError> for Errno {
     }
 }
 
-impl From<litebox::pipes::errors::ReadError> for Errno {
-    fn from(value: litebox::pipes::errors::ReadError) -> Self {
-        match value {
-            litebox::pipes::errors::ReadError::ClosedFd => Errno::EBADFD,
-            litebox::pipes::errors::ReadError::NotForReading => Errno::EINVAL,
-            litebox::pipes::errors::ReadError::WouldBlock => Errno::EWOULDBLOCK,
-            litebox::pipes::errors::ReadError::WaitError(_) => Errno::EINTR,
-            litebox::pipes::errors::ReadError::Deadlock => Errno::EDEADLK,
-            _ => Errno::EIO,
-        }
-    }
-}
-
-impl From<litebox::pipes::errors::WriteError> for Errno {
-    fn from(value: litebox::pipes::errors::WriteError) -> Self {
-        match value {
-            litebox::pipes::errors::WriteError::ClosedFd => Errno::EBADF,
-            litebox::pipes::errors::WriteError::ReadEndClosed => Errno::EPIPE,
-            litebox::pipes::errors::WriteError::NotForWriting => Errno::EINVAL,
-            litebox::pipes::errors::WriteError::WouldBlock => Errno::EWOULDBLOCK,
-            litebox::pipes::errors::WriteError::WaitError(_) => Errno::EINTR,
-            _ => Errno::EIO,
-        }
-    }
-}
-
-impl From<litebox::pipes::errors::CloseError> for Errno {
-    fn from(_value: litebox::pipes::errors::CloseError) -> Self {
-        Errno::EIO
-    }
-}
-
-impl From<litebox::pipes::errors::ClosedError> for Errno {
-    fn from(value: litebox::pipes::errors::ClosedError) -> Self {
-        match value {
-            litebox::pipes::errors::ClosedError::ClosedFd => Errno::EBADF,
-        }
-    }
-}
-
 impl From<litebox::fs::errors::TruncateError> for Errno {
     fn from(value: litebox::fs::errors::TruncateError) -> Self {
         match value {

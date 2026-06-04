@@ -209,10 +209,6 @@ enum WorkerExecInputSource<FS: litebox::fs::FileSystem + Send + Sync + 'static> 
         fs: std::sync::Arc<FS>,
         fd: std::sync::Arc<litebox::fd::TypedFd<FS>>,
     },
-    Pipe {
-        pipes: litebox::pipes::Pipes<LinuxUserland>,
-        fd: std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<LinuxUserland>>>,
-    },
     Stream(std::sync::Arc<dyn litebox::process::WorkerExecStreamReader>),
 }
 
@@ -226,17 +222,12 @@ enum WorkerExecOutputSink<FS: litebox::fs::FileSystem + Send + Sync + 'static> {
         fs: std::sync::Arc<FS>,
         fd: std::sync::Arc<litebox::fd::TypedFd<FS>>,
     },
-    Pipe {
-        pipes: litebox::pipes::Pipes<LinuxUserland>,
-        fd: std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<LinuxUserland>>>,
-    },
     Stream(std::sync::Arc<dyn litebox::process::WorkerExecStreamWriter>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerExecOutputGroupKey {
     Fs(litebox::fd::DescriptorObjectId),
-    Pipe(litebox::fd::DescriptorObjectId),
     /// Streams are grouped by underlying object identity so aliased
     /// stdout/stderr (e.g. same socket via `dup2`) share one bridge thread.
     Stream(u64),
@@ -1302,7 +1293,7 @@ impl LinuxUserland {
         guest_egid: u32,
         guest_exec_image: Option<&[u8]>,
         guest_interp_image: Option<(&str, &[u8])>,
-        stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
+        stdio: WorkerExecStdioBindings<FS>,
         direct_pipe_io: bool,
         extra_fds: &[(usize, i32)],
         broker_eventfd_specs: &[alloc::string::String],
@@ -1594,27 +1585,9 @@ impl LinuxUserland {
         let mut output_bridges = Vec::new();
         let mut worker_output_write_fds = Vec::new();
         for group in output_groups.drain(..) {
-            let direct_output_pipe = direct_pipe_io
-                && group.target_fds.contains(&1)
-                && matches!(&group.sink, WorkerExecOutputSink::Pipe { .. });
-            let (write_nonblocking, write_capacity) = if direct_output_pipe {
-                (false, None)
-            } else {
-                match &group.sink {
-                    WorkerExecOutputSink::Pipe { pipes, fd } => (
-                        pipes
-                            .get_flags(fd.as_ref())
-                            .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
-                            .unwrap_or(false),
-                        pipes
-                            .writable_bytes(fd.as_ref())
-                            .ok()
-                            .filter(|capacity| supports_bridge_pipe_capacity(*capacity)),
-                    ),
-                    WorkerExecOutputSink::Fs { .. } | WorkerExecOutputSink::Stream(_) => {
-                        (false, None)
-                    }
-                }
+            let direct_output_pipe = false;
+            let (write_nonblocking, write_capacity) = match &group.sink {
+                WorkerExecOutputSink::Fs { .. } | WorkerExecOutputSink::Stream(_) => (false, None),
             };
             if write_nonblocking && write_capacity.is_none() {
                 return Err(-1_i32);
@@ -1688,17 +1661,9 @@ impl LinuxUserland {
         drop(worker_output_write_fds);
         drop(host_stdio_temp_sources);
         let mut bridge_threads = Vec::new();
-        let mut direct_pipes = Vec::new();
+        let mut direct_pipes: Vec<ExecPipeDirectIo> = Vec::new();
         for (source, write_fd) in input_bridges {
-            if direct_pipe_io && matches!(&source, WorkerExecInputSource::Pipe { .. }) {
-                // Skip bridge thread: the caller will install a ExternalFd for
-                // the parent's corresponding pipe endpoint.
-                let raw_fd = write_fd.into_raw_fd();
-                direct_pipes.push(ExecPipeDirectIo {
-                    child_stdio_fd: 0,
-                    parent_os_fd: raw_fd,
-                });
-            } else {
+            {
                 let Ok(bridge) = spawn_worker_input_bridge(self, source, write_fd) else {
                     for dp in &direct_pipes {
                         close_raw_fd(dp.parent_os_fd);
@@ -1709,17 +1674,8 @@ impl LinuxUserland {
                 bridge_threads.push(bridge);
             }
         }
-        for (sink, read_fd, target_fd) in output_bridges {
-            if direct_pipe_io
-                && target_fd == 1
-                && matches!(&sink, WorkerExecOutputSink::Pipe { .. })
+        for (sink, read_fd, _target_fd) in output_bridges {
             {
-                let raw_fd = read_fd.into_raw_fd();
-                direct_pipes.push(ExecPipeDirectIo {
-                    child_stdio_fd: target_fd,
-                    parent_os_fd: raw_fd,
-                });
-            } else {
                 let bridge = if let Ok(handle) = spawn_worker_output_bridge(self, sink, read_fd) {
                     DetachedWorkerBridge {
                         handle,
@@ -1957,7 +1913,7 @@ impl LinuxUserland {
     pub fn spawn_worker_host_for_fork_restore<FS>(
         &'static self,
         snapshot_bytes: &[u8],
-        stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
+        stdio: WorkerExecStdioBindings<FS>,
         passthrough_fds: &[(usize, i32, u8)],
         local_pipe_pairs: &[(usize, usize, Vec<u8>, u32, u32)],
         // Phase 3 (legacy-pipes retirement): broker-fd-bridge specs for
@@ -2654,7 +2610,7 @@ fn worker_host_stdio_index(fd: i32) -> Option<usize> {
 }
 
 fn duplicate_host_stdio_sources_for_spawn<FS>(
-    stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
+    stdio: &WorkerExecStdioBindings<FS>,
 ) -> std::io::Result<[Option<std::os::fd::OwnedFd>; 3]>
 where
     FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -2818,7 +2774,7 @@ fn create_worker_stdio_pipe(
 }
 
 fn collect_worker_exec_input_source<FS>(
-    stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
+    stdio: &WorkerExecStdioBindings<FS>,
 ) -> Option<WorkerExecInputSource<FS>>
 where
     FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -2826,10 +2782,6 @@ where
     match &stdio.stdin {
         WorkerExecInputBinding::Fs { fs, fd } => Some(WorkerExecInputSource::Fs {
             fs: fs.clone(),
-            fd: fd.clone(),
-        }),
-        WorkerExecInputBinding::Pipe { pipes, fd } => Some(WorkerExecInputSource::Pipe {
-            pipes: pipes.clone(),
             fd: fd.clone(),
         }),
         WorkerExecInputBinding::Stream(reader) => {
@@ -2843,7 +2795,7 @@ where
 }
 
 fn collect_worker_exec_output_groups<FS>(
-    stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
+    stdio: &WorkerExecStdioBindings<FS>,
 ) -> Vec<WorkerExecOutputGroup<FS>>
 where
     FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -2855,13 +2807,6 @@ where
                 WorkerExecOutputGroupKey::Fs(fd.object_id()),
                 WorkerExecOutputSink::Fs {
                     fs: fs.clone(),
-                    fd: fd.clone(),
-                },
-            ),
-            WorkerExecOutputBinding::Pipe { pipes, fd } => (
-                WorkerExecOutputGroupKey::Pipe(fd.object_id()),
-                WorkerExecOutputSink::Pipe {
-                    pipes: pipes.clone(),
                     fd: fd.clone(),
                 },
             ),
@@ -2913,29 +2858,6 @@ where
                 }),
             })
         }
-        WorkerExecInputSource::Pipe { pipes, fd } => {
-            let thread_cancel = cancel.clone();
-            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            let handle = std::thread::Builder::new().spawn(move || {
-                block_guest_signals();
-                bridge_worker_input_from_pipe(
-                    platform,
-                    pipes,
-                    fd,
-                    host_write_fd,
-                    thread_cancel,
-                    sender,
-                );
-            })?;
-            let thread_handle = receiver.recv().ok();
-            Ok(DetachedWorkerBridge {
-                handle,
-                input_control: Some(WorkerInputBridgeControl {
-                    cancel,
-                    thread_handle,
-                }),
-            })
-        }
         WorkerExecInputSource::Stream(reader) => {
             let thread_cancel = cancel.clone();
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -2973,9 +2895,6 @@ where
         block_guest_signals();
         match sink {
             WorkerExecOutputSink::Fs { fs, fd } => bridge_worker_output_to_fs(fs, fd, host_read_fd),
-            WorkerExecOutputSink::Pipe { pipes, fd } => {
-                bridge_worker_output_to_pipe(platform, pipes, fd, host_read_fd);
-            }
             WorkerExecOutputSink::Stream(writer) => {
                 bridge_worker_output_to_stream(writer, host_read_fd);
             }
@@ -3135,50 +3054,6 @@ fn bridge_worker_input_from_fs<FS>(
     });
 }
 
-fn bridge_worker_input_from_pipe(
-    platform: &'static LinuxUserland,
-    pipes: litebox::pipes::Pipes<LinuxUserland>,
-    fd: std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<LinuxUserland>>>,
-    host_write_fd: std::os::fd::OwnedFd,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread_handle_sender: std::sync::mpsc::SyncSender<
-        litebox::event::wait::ThreadHandle<LinuxUserland>,
-    >,
-) {
-    ThreadHandle::run_with_handle(|| {
-        let mut host_write = std::fs::File::from(host_write_fd);
-        let wait_state = litebox::event::wait::WaitState::new(platform);
-        let _ = thread_handle_sender.send(wait_state.thread_handle());
-        let cx = wait_state.context();
-        let mut buf = [0_u8; 8192];
-        loop {
-            if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                break;
-            }
-            if !worker_stdio_pipe_has_readers(&host_write) {
-                break;
-            }
-            match pipes.read(&cx, fd.as_ref(), &mut buf) {
-                Ok(0) => break,
-                Ok(read) => {
-                    if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
-                        break;
-                    }
-                }
-                Err(litebox::pipes::errors::ReadError::WaitError(
-                    litebox::event::wait::WaitError::Interrupted,
-                )) => {
-                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                        break;
-                    }
-                }
-                Err(litebox::pipes::errors::ReadError::WouldBlock) => std::thread::yield_now(),
-                Err(_) => break,
-            }
-        }
-    });
-}
-
 fn bridge_worker_output_to_fs<FS>(
     fs: std::sync::Arc<FS>,
     fd: std::sync::Arc<litebox::fd::TypedFd<FS>>,
@@ -3209,68 +3084,6 @@ fn bridge_worker_output_to_fs<FS>(
             Err(_) => break,
         }
     }
-}
-
-fn bridge_worker_output_to_pipe(
-    platform: &'static LinuxUserland,
-    pipes: litebox::pipes::Pipes<LinuxUserland>,
-    fd: std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<LinuxUserland>>>,
-    host_read_fd: std::os::fd::OwnedFd,
-) {
-    let mut host_read = std::fs::File::from(host_read_fd);
-    let wait_state = litebox::event::wait::WaitState::new(platform);
-    let cx = wait_state.context();
-    let mut buf = [0_u8; 8192];
-    loop {
-        match host_read.read(&mut buf) {
-            Ok(0) => break,
-            Ok(mut remaining) => {
-                let mut offset = 0;
-                while remaining > 0 {
-                    match pipes.write(&cx, fd.as_ref(), &buf[offset..offset + remaining]) {
-                        Ok(0) => {
-                            // Local reader gone — drop our sender ref.
-                            pipes.remove_fd(fd.as_ref());
-                            return;
-                        }
-                        Ok(written) => {
-                            offset += written;
-                            remaining -= written;
-                        }
-                        Err(
-                            litebox::pipes::errors::WriteError::WouldBlock
-                            | litebox::pipes::errors::WriteError::WaitError(
-                                litebox::event::wait::WaitError::Interrupted,
-                            ),
-                        ) => {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(_) => {
-                            pipes.remove_fd(fd.as_ref());
-                            return;
-                        }
-                    }
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
-        }
-    }
-    // C.5h: explicitly drop our sender ref so the peer reader observes
-    // EOF.  Just dropping the Arc<TypedFd> is not enough — the placeholder
-    // shim task in worker 10 ALSO holds a guest-fd-table reference to the
-    // same Pipe SenderHalf SharedEntry (cross-bt Stdio::piped() spawns
-    // dup'd the original parent fd into placeholder fd 1 before exec).
-    // Without explicit remove, the placeholder's reference keeps the
-    // sender refcount at 1 until the placeholder exits, which doesn't
-    // happen until after the parent has reaped the child — a deadlock
-    // for any test that waits for stdout EOF before waitpid.
-    //
-    // remove_fd calls descriptor_table.remove → on_close on the entry,
-    // which (for a pipe SenderHalf) signals shutdown to the receiver
-    // peer regardless of remaining Arc refs.  Safe: the placeholder is
-    // not running guest code that could use the dropped fd.
-    pipes.remove_fd(fd.as_ref());
 }
 
 fn bridge_worker_input_from_stream(

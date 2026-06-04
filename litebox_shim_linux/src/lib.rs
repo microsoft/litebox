@@ -27,7 +27,6 @@ use litebox::{
     LiteBox,
     fd::TypedFd,
     mm::{PageManager, linux::PAGE_SIZE},
-    pipes::Pipes,
     platform::{RawConstPointer as _, RawMutPointer as _, TimeProvider},
     shim::ContinueOperation,
     sync::futex::FutexManager,
@@ -292,13 +291,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         // the init process if fd_table restore is not yet implemented), or
         // nothing at all.  Close the consumed descriptor properly to avoid
         // leaking descriptor-table entries.
-        if let Ok(old_pipe) =
-            rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(guest_fd)
-        {
-            drop(rds);
-            let _ = self.task.global.pipes.close(&old_pipe);
-            rds = files.raw_descriptor_store.write();
-        } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+        if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
             drop(rds);
             let _ = files.fs.close(&old_fs);
             rds = files.raw_descriptor_store.write();
@@ -422,13 +415,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .descriptor_table_mut()
                     .insert(bp_fd);
                 let mut rds = files.raw_descriptor_store.write();
-                if let Ok(old_pipe) =
-                    rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(guest_fd)
-                {
-                    drop(rds);
-                    let _ = self.task.global.pipes.close(&old_pipe);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+                if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
                     drop(rds);
                     let _ = files.fs.close(&old_fs);
                     rds = files.raw_descriptor_store.write();
@@ -556,12 +543,6 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                         .litebox
                         .descriptor_table_mut()
                         .remove(&old_unix);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_pipe) = rds
-                    .fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(guest_fd)
-                {
-                    drop(rds);
-                    let _ = self.task.global.pipes.close(&old_pipe);
                     rds = files.raw_descriptor_store.write();
                 } else if let Ok(old_eventfd) = rds
                     .fd_consume_raw_integer::<syscalls::eventfd::EventfdSubsystem>(guest_fd)
@@ -1056,7 +1037,6 @@ impl LinuxShimBuilder {
         let global = Arc::new(GlobalState {
             platform: self.platform,
             futex_manager: FutexManager::new(),
-            pipes: Pipes::new(&self.litebox),
             #[cfg(feature = "worker_local_inet")]
             net,
             boot_time: self.platform.now(),
@@ -2915,10 +2895,6 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(f(RawFdRef::Pipes(&fd)));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
-            drop(rds);
             return Ok(f(RawFdRef::Eventfd(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -2983,7 +2959,6 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     Fs(&'a Arc<TypedFd<FS>>),
     #[cfg(feature = "worker_local_inet")]
     Net(&'a Arc<TypedFd<litebox::net::Network<Platform>>>),
-    Pipes(&'a Arc<TypedFd<Pipes<Platform>>>),
     Eventfd(&'a Arc<TypedFd<syscalls::eventfd::EventfdSubsystem>>),
     Epoll(&'a Arc<TypedFd<syscalls::epoll::EpollSubsystem<FS>>>),
     Unix(&'a Arc<TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>>),
@@ -3062,9 +3037,6 @@ impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
             #[cfg(feature = "worker_local_inet")]
             RawFdRef::Net(_fd) => {
                 todo!("encode TcpListenBridgeState when socket is a bridged listener")
-            }
-            RawFdRef::Pipes(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::KernelFdInherited)
             }
             RawFdRef::Eventfd(_fd) => {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::KernelFdInherited)
@@ -3341,7 +3313,6 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 #[cfg(feature = "worker_local_inet")]
                 crate::RawFdRef::Net(_fd) => alloc::format!("raw={raw_fd} net"),
-                crate::RawFdRef::Pipes(_fd) => alloc::format!("raw={raw_fd} pipes"),
                 crate::RawFdRef::Eventfd(_fd) => alloc::format!("raw={raw_fd} eventfd"),
                 crate::RawFdRef::Epoll(_fd) => alloc::format!("raw={raw_fd} epoll"),
                 crate::RawFdRef::Unix(_fd) => alloc::format!("raw={raw_fd} unix"),
@@ -4894,8 +4865,6 @@ struct GlobalState<FS: ShimFS> {
     litebox: litebox::LiteBox<Platform>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
-    /// The anonymous pipe implementation.
-    pipes: Pipes<Platform>,
     /// The optional worker-local network subsystem.
     #[cfg(feature = "worker_local_inet")]
     net: LocalNetwork,
