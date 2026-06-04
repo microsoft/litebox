@@ -289,16 +289,15 @@ type BrokerFdBridgeParsed = (
 ///
 /// `subkind` is required for pipe direction, unix socketpair endpoint, and PTY role.
 /// Unix socket specs may append `:0` or `:1` to preserve per-fd NONBLOCK.
-/// Map `litebox::pipes::Flags` bits (as serialised by the parent in
-/// the fork snapshot) to a `litebox::fs::OFlags` value carrying just
-/// the per-fd status flags relevant for broker pipes (NONBLOCK).
+/// Map legacy pipe flags bits (as serialised by the parent in
+/// the fork snapshot) to `OFlags::NONBLOCK` when bit 0 is set.
+/// Bit 0 corresponded to `litebox::pipes::Flags::NON_BLOCKING`.
 fn pipe_nonblock_oflags(flags_bits: u32) -> litebox::fs::OFlags {
-    let f = litebox::pipes::Flags::from_bits_truncate(flags_bits);
-    let mut o = litebox::fs::OFlags::empty();
-    if f.contains(litebox::pipes::Flags::NON_BLOCKING) {
-        o |= litebox::fs::OFlags::NONBLOCK;
+    if flags_bits & 0x1 != 0 {
+        litebox::fs::OFlags::NONBLOCK
+    } else {
+        litebox::fs::OFlags::empty()
     }
-    o
 }
 
 #[deny(clippy::wildcard_enum_match_arm)]
