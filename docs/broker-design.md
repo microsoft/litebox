@@ -68,7 +68,7 @@ The local core contains:
 - guest pointer and guest memory marshalling helpers;
 - local caches and non-authoritative views of broker state;
 - private synchronization and wait helpers;
-- broker-owned control/event/data channel wrappers;
+- broker-owned control/notification/data channel wrappers;
 - the `litebox_broker_local` adapter;
 - internal deployment-support calls for local mechanics.
 
@@ -221,14 +221,16 @@ Each sandboxed process has exactly one authenticated broker association. That as
 | Channel | Direction | Purpose |
 |---|---|---|
 | control | bidirectional | handshake, object operations, operation responses |
-| event | broker to process | lifecycle, readiness, interrupt-like events, broker/session failure |
+| notification | broker to process | lifecycle, readiness, interrupt-like notifications, broker/session failure |
 | data | bidirectional | bulk payload bytes associated with authorized object operations |
 
 The broker creates or authorizes all channels and binds them to the host-authenticated peer identity of the guest process. The local core does not prove identity by filling in request fields.
 
+Use "notification channel" for broker-initiated asynchronous traffic. Avoid "event channel" because event already names a broker-owned object family and guest-visible eventfd-like behavior.
+
 The protocol exposes broker-owned objects through opaque per-association reference handles: a reference identifier plus a reference generation. Object identifiers stay broker-internal. Shims may map those handles to guest-visible integers, but the broker remains authoritative for object type, object lifetime, reference lifetime, reference generations, rights, and policy. Object types and rights are broker-internal for authorization; the local core cannot amplify authority by editing request fields.
 
-The protocol never passes host file descriptors, handles, sockets, directory handles, or other host-native resources to untrusted code in the baseline design. The local core receives only broker reference handles, response data, event data, and broker-created channel endpoints whose authority is already bound by the broker.
+The protocol never passes host file descriptors, handles, sockets, directory handles, or other host-native resources to untrusted code in the baseline design. The local core receives only broker reference handles, response data, notification payloads, and broker-created channel endpoints whose authority is already bound by the broker.
 
 Bulk I/O uses broker-owned data channels or broker-owned shared memory rings. The control channel authorizes an operation and binds it to an object and request identifier; the data channel carries bytes for that authorized operation. Shared memory is an optimization, not an authority transfer, and all shared-memory contents remain untrusted.
 
@@ -314,8 +316,8 @@ The initial Linux ring set can use five unidirectional rings:
 |---|---|---|
 | control | broker to runner | broker responses, setup, control messages |
 | control | runner to broker | broker requests and responses |
-| event | broker to runner | asynchronous events and fail-closed notifications |
-| data | broker to runner | bulk response/event payload bytes |
+| notification | broker to runner | asynchronous notifications and fail-closed notices |
+| data | broker to runner | bulk response/notification payload bytes |
 | data | runner to broker | bulk request payload bytes |
 
 Broker-to-runner rings can be SPSC because there is one broker-side producer and one runner-side consumer. Runner-to-broker rings may need MPSC in fast local mode, where multiple host threads can produce directly. Strict mode may route all production through a local core scheduler, but keeping the MPSC layout preserves one ring format.
@@ -344,7 +346,7 @@ Shared spec crates should define:
 - PolicyEngine policy versions, policy profile IDs, and audit requirements;
 - broker capability names and profiles;
 - deployment-support ABI names and versions;
-- control/event/data channel formats;
+- control/notification/data channel formats;
 - shared-memory/ring layout versions and validation rules;
 - host syscall profiles for bootstrap, fast local mode, and strict mode;
 - deployment profiles that bind a shim, local-core profile, broker channel, required services, and required broker features.
@@ -601,7 +603,7 @@ Authority domain:
 |---|---|
 | local-core cache diverges from BrokerCore | generation-tagged handles, invalidation, broker authority checks |
 | user shim bypasses policy | broker validates every security-relevant request and routes policy decisions through PolicyEngine |
-| ABI becomes too chatty | batching, shared memory data planes, control/event/data channel separation, local private fast paths |
+| ABI becomes too chatty | batching, shared memory data planes, control/notification/data channel separation, local private fast paths |
 | duplicated logic | keep policy in PolicyEngine, authority state in BrokerCore/BrokerServices, and ABI translation in local core |
 | handle/resource lifetime bugs | broker-owned object IDs, refcounts, cleanup on lifecycle transitions |
 | broker bottleneck from no host-handle delegation | use broker-owned rings, batching, object-specific data channels, and policy caching |

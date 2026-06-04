@@ -17,7 +17,7 @@ Authority domain:
 
 The local core reaches local mechanics and broker channels through deployment support: the host OS user-mode ABI plus a broker transport endpoint in hosted userland, or calls into broker-kernel user-mode support plus broker-channel delivery in a broker-kernel deployment.
 
-The baseline is the stricter durable-unicorn model: no host fd/HANDLE delegation to untrusted code, ABI-neutral broker objects, broker-owned control/event/data channels, authenticated per-process broker associations, and fail-closed behavior.
+The baseline is the stricter durable-unicorn model: no host fd/HANDLE delegation to untrusted code, ABI-neutral broker objects, broker-owned control/notification/data channels, authenticated per-process broker associations, and fail-closed behavior.
 
 ## Implementation principles
 
@@ -65,7 +65,7 @@ Initial contents:
 - readiness and wait outcome payloads;
 - ABI-neutral error categories;
 
-Richer request/response envelopes, control/event/data channel frame headers, policy profile IDs, host syscall profile IDs, and feature negotiation structures are added when later milestones need them.
+Richer request/response envelopes, control/notification/data channel frame headers, policy profile IDs, host syscall profile IDs, and feature negotiation structures are added when later milestones need them.
 
 Prefer `no_std` for shared types, adding `alloc` only in crates that need owned buffers, so they can be reused by userland and kernel-broker deployments.
 
@@ -183,7 +183,7 @@ Add the durable-unicorn-style control/notification/data channel separation.
 Channels:
 
 - control: object operations and responses;
-- event: broker-to-process async events;
+- notification: broker-to-process asynchronous notifications;
 - data: bulk payload bytes.
 
 Linux hosted prototype:
