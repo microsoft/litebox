@@ -148,6 +148,13 @@ pub enum Opcode {
     CreatePipe = 0x50,
     ReadPipe = 0x51,
     WritePipe = 0x52,
+    /// Legacy-pipes Phase 3 (D2): SCM_RIGHTS-pass a host fd to the
+    /// broker, which takes ownership and exposes it as a
+    /// BrokerPipe-shaped state handle. Body: `(direction: u8,
+    /// _reserved: [u8; 7])` — 8 bytes. Direction values: 0=Read,
+    /// 1=Write, 2=ReadWrite. The host fd itself rides in the
+    /// SCM_RIGHTS cmsg (exactly one fd; protocol error otherwise).
+    AttachHostFd = 0x53,
     CreateSocketPair = 0x30,
     ReadSocketPair = 0x31,
     WriteSocketPair = 0x32,
@@ -252,6 +259,9 @@ pub enum Opcode {
     CreatePipeResponse = 0xD0,
     ReadPipeResponse = 0xD1,
     WritePipeResponse = 0xD2,
+    /// Response for [`Opcode::AttachHostFd`]. Body on success:
+    /// `(handle_id: u64)` — 8 bytes.
+    AttachHostFdResponse = 0xD3,
     CreateSocketPairResponse = 0xB0,
     ReadSocketPairResponse = 0xB1,
     WriteSocketPairResponse = 0xB2,
@@ -445,6 +455,7 @@ impl Opcode {
             Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
             Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
             Opcode::WritePipe => Some(Opcode::WritePipeResponse),
+            Opcode::AttachHostFd => Some(Opcode::AttachHostFdResponse),
             Opcode::CreateSocketPair => Some(Opcode::CreateSocketPairResponse),
             Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
             Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
@@ -534,6 +545,7 @@ impl Opcode {
                 | Opcode::CreatePipe
                 | Opcode::ReadPipe
                 | Opcode::WritePipe
+                | Opcode::AttachHostFd
                 | Opcode::CreateSocketPair
                 | Opcode::ReadSocketPair
                 | Opcode::WriteSocketPair
@@ -636,6 +648,7 @@ impl TryFrom<u8> for Opcode {
             0x50 => Ok(Opcode::CreatePipe),
             0x51 => Ok(Opcode::ReadPipe),
             0x52 => Ok(Opcode::WritePipe),
+            0x53 => Ok(Opcode::AttachHostFd),
             0x30 => Ok(Opcode::CreateSocketPair),
             0x31 => Ok(Opcode::ReadSocketPair),
             0x32 => Ok(Opcode::WriteSocketPair),
@@ -715,6 +728,7 @@ impl TryFrom<u8> for Opcode {
             0xD0 => Ok(Opcode::CreatePipeResponse),
             0xD1 => Ok(Opcode::ReadPipeResponse),
             0xD2 => Ok(Opcode::WritePipeResponse),
+            0xD3 => Ok(Opcode::AttachHostFdResponse),
             0xB0 => Ok(Opcode::CreateSocketPairResponse),
             0xB1 => Ok(Opcode::ReadSocketPairResponse),
             0xB2 => Ok(Opcode::WriteSocketPairResponse),
@@ -2661,6 +2675,79 @@ pub fn build_write_pipe_response_ok(written: u64) -> OwnedFrame {
 
 pub fn parse_write_pipe_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
     parse_handle_body(body, Opcode::WritePipeResponse)
+}
+
+// =====================================================================
+// AttachHostFd wire format. Legacy-pipes Phase 3 (D2).
+//
+// SCM_RIGHTS-pass a host fd to the broker, which takes ownership and
+// exposes it as a BrokerPipe-shaped state handle. The host fd itself
+// rides in the cmsg attached to the request frame; the body carries
+// only the direction byte (so subsequent ReadPipe/WritePipe RPCs
+// against the returned handle can be validated against the original
+// direction).
+// =====================================================================
+
+/// Direction wire codes for `Opcode::AttachHostFd`. Allocated separately
+/// from `BrokerPipeEnd` to keep the wire surface stable independent of
+/// the shim-side type evolution.
+pub mod host_fd_direction {
+    /// Worker may only `ReadPipe` against the returned handle.
+    pub const READ: u8 = 0;
+    /// Worker may only `WritePipe` against the returned handle.
+    pub const WRITE: u8 = 1;
+    /// Worker may both `ReadPipe` and `WritePipe` (full duplex, e.g.
+    /// for an attached socket).
+    pub const READ_WRITE: u8 = 2;
+}
+
+/// Body for [`Opcode::AttachHostFd`]: `(direction: u8, _reserved: [u8; 7])` —
+/// 8 bytes, 8-byte-aligned. The host fd rides in the SCM_RIGHTS cmsg
+/// (caller must include exactly one fd).
+pub fn build_attach_host_fd_request(direction: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.push(direction);
+    body.extend_from_slice(&[0u8; 7]);
+    OwnedFrame {
+        opcode: Opcode::AttachHostFd,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_attach_host_fd_body(body: &[u8]) -> Result<u8, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::AttachHostFd,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    // Reserved bytes are tolerated but must be zero for forward
+    // compatibility.
+    if body[1..].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::AttachHostFd,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    Ok(body[0])
+}
+
+/// Body for [`Opcode::AttachHostFdResponse`] on success: `(handle_id: u64)`.
+pub fn build_attach_host_fd_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::AttachHostFdResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_attach_host_fd_response_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::AttachHostFdResponse)
 }
 
 // =====================================================================
@@ -5206,6 +5293,69 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// Legacy-pipes Phase 3 (D2): `AttachHostFd` wire format
+    /// round-trip. Request body shape: 1 direction byte + 7 reserved
+    /// bytes (8-byte-aligned). Response body shape: 8-byte handle id.
+    #[test]
+    fn attach_host_fd_request_round_trip() {
+        for &dir in &[
+            host_fd_direction::READ,
+            host_fd_direction::WRITE,
+            host_fd_direction::READ_WRITE,
+        ] {
+            let frame = build_attach_host_fd_request(dir);
+            let encoded = frame.encode().expect("encode");
+            let decoded = decode(&encoded).expect("decode");
+            assert_eq!(decoded.opcode, Opcode::AttachHostFd);
+            let parsed = parse_attach_host_fd_body(decoded.body).expect("parse body");
+            assert_eq!(parsed, dir);
+        }
+    }
+
+    /// `parse_attach_host_fd_body` rejects wrong body length.
+    #[test]
+    fn attach_host_fd_request_rejects_wrong_body_len() {
+        assert!(parse_attach_host_fd_body(&[]).is_err());
+        assert!(parse_attach_host_fd_body(&[0u8; 4]).is_err());
+        assert!(parse_attach_host_fd_body(&[0u8; 7]).is_err());
+        assert!(parse_attach_host_fd_body(&[0u8; 9]).is_err());
+    }
+
+    /// `parse_attach_host_fd_body` rejects non-zero reserved bytes
+    /// (forward-compat reservation).
+    #[test]
+    fn attach_host_fd_request_rejects_nonzero_reserved() {
+        let mut body = alloc::vec![0u8; 8];
+        body[0] = host_fd_direction::READ;
+        body[3] = 0xFF; // non-zero reserved byte
+        assert!(parse_attach_host_fd_body(&body).is_err());
+    }
+
+    /// `AttachHostFdResponse` round-trip with a representative handle id.
+    #[test]
+    fn attach_host_fd_response_round_trip() {
+        let handle_id = 0xDEAD_BEEF_CAFE_BABE_u64;
+        let frame = build_attach_host_fd_response_ok(handle_id);
+        let encoded = frame.encode().expect("encode");
+        let decoded = decode(&encoded).expect("decode");
+        assert_eq!(decoded.opcode, Opcode::AttachHostFdResponse);
+        let parsed = parse_attach_host_fd_response_body(decoded.body).expect("parse body");
+        assert_eq!(parsed, handle_id);
+    }
+
+    /// `Opcode::AttachHostFd` is classified as a request and its
+    /// response pairing is correct.
+    #[test]
+    fn attach_host_fd_opcode_classification() {
+        assert!(Opcode::AttachHostFd.is_request());
+        assert_eq!(
+            Opcode::AttachHostFd.response_for(),
+            Some(Opcode::AttachHostFdResponse)
+        );
+        assert_eq!(Opcode::try_from(0x53u8).unwrap(), Opcode::AttachHostFd);
+        assert_eq!(Opcode::try_from(0xD3u8).unwrap(), Opcode::AttachHostFdResponse);
     }
 
     /// Phase F: socketpair wire format mirrors the pipe ops. Verifies
