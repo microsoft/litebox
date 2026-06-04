@@ -9,6 +9,7 @@ Stdlib only — no third-party deps.
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import sys
 import tempfile
@@ -295,6 +296,109 @@ class ShadowPathTests(unittest.TestCase):
         self.assertNotEqual(legacy, root)
         self.assertEqual(legacy.name, "shadow")
         self.assertEqual(root.name, "shadows")
+
+
+class ChildrenRegistryTests(unittest.TestCase):
+    """Round-trip tests for the supervisor children registry that
+    backs parallel agent-coverage driving. The registry is the source
+    of truth for which cargo PGIDs are in flight; the pidfile mirrors
+    it and the signal handler reaps over it."""
+
+    def test_register_update_snapshot_unregister(self):
+        s = dashboard._new_supervisor_state()
+        self.assertEqual(dashboard._snapshot_children(s), [])
+        c1 = dashboard._register_child(s, kind="agent-coverage",
+                                       worktree_path="/x")
+        c2 = dashboard._register_child(s, kind="tracked-ref",
+                                       worktree_path="/y")
+        self.assertNotEqual(c1, c2)
+        dashboard._update_child(s, c1, cargo_pgid=100, harness_pid=200)
+        dashboard._update_child(s, c2, cargo_pgid=300)
+        snap = sorted(dashboard._snapshot_children(s),
+                      key=lambda d: d["cargo_pgid"])
+        self.assertEqual(snap[0]["cargo_pgid"], 100)
+        self.assertEqual(snap[0]["harness_pid"], 200)
+        self.assertEqual(snap[1]["cargo_pgid"], 300)
+        self.assertIsNone(snap[1]["harness_pid"])
+        dashboard._unregister_child(s, c1)
+        snap = dashboard._snapshot_children(s)
+        self.assertEqual(len(snap), 1)
+        self.assertEqual(snap[0]["cargo_pgid"], 300)
+        # Unknown child id is a no-op.
+        dashboard._update_child(s, 9999, cargo_pgid=42)
+        dashboard._unregister_child(s, 9999)
+
+    def test_pidfile_round_trip_from_state(self):
+        import tempfile
+        s = dashboard._new_supervisor_state()
+        c = dashboard._register_child(s, kind="agent-coverage",
+                                      worktree_path="/x")
+        dashboard._update_child(s, c, cargo_pgid=111, harness_pid=222)
+        with tempfile.TemporaryDirectory() as td:
+            pf = Path(td) / "auto.pidfile"
+            dashboard._write_pidfile_from_state(pf, 9001, s)
+            data = json.loads(pf.read_text())
+        self.assertEqual(data["supervisor_pid"], 9001)
+        self.assertEqual(len(data["children"]), 1)
+        self.assertEqual(data["children"][0]["cargo_pgid"], 111)
+        self.assertEqual(data["children"][0]["harness_pid"], 222)
+        self.assertEqual(data["children"][0]["kind"], "agent-coverage")
+        self.assertEqual(data["children"][0]["worktree_path"], "/x")
+
+
+class PickTopNTests(unittest.TestCase):
+    """The parallel orchestrator picks the top-N worktrees by the
+    same scoring tuple the single-pick selector uses. These tests
+    don't try to recompute scoring (covered elsewhere) — they just
+    confirm the top-N variant respects N and is consistent with the
+    single-pick variant when N==1."""
+
+    def _conn(self):
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        # The picker reads run_results joined with runs to age coverage;
+        # with no rows everything is "never tested" and order falls back
+        # to round-robin / input order.
+        conn.execute(
+            "CREATE TABLE runs (run_id INT, commit_sha TEXT, "
+            "dirty_hash TEXT, worktree_path TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE run_results (run_id INT, finished_ts_ms INT)"
+        )
+        return conn
+
+    def test_topn_returns_at_most_n(self):
+        conn = self._conn()
+        cands = [{"path": f"/w{i}", "head": f"{i:040x}", "branch": "b"}
+                 for i in range(5)]
+        picks = dashboard._pick_opportunistic_worktrees_topn(conn, cands, 3)
+        self.assertEqual(len(picks), 3)
+
+    def test_topn_handles_n_larger_than_candidates(self):
+        conn = self._conn()
+        cands = [{"path": "/w0", "head": "a" * 40, "branch": "b"}]
+        picks = dashboard._pick_opportunistic_worktrees_topn(conn, cands, 5)
+        self.assertEqual(len(picks), 1)
+
+    def test_topn_zero_returns_empty(self):
+        conn = self._conn()
+        cands = [{"path": "/w0", "head": "a" * 40, "branch": "b"}]
+        self.assertEqual(
+            dashboard._pick_opportunistic_worktrees_topn(conn, cands, 0), [],
+        )
+
+    def test_topn_with_n1_agrees_with_single_pick(self):
+        conn = self._conn()
+        cands = [{"path": f"/w{i}", "head": f"{i:040x}", "branch": "b"}
+                 for i in range(3)]
+        single = dashboard._pick_opportunistic_worktree(conn, cands)
+        topn = dashboard._pick_opportunistic_worktrees_topn(conn, cands, 1)
+        self.assertEqual(len(topn), 1)
+        self.assertEqual(topn[0]["path"], single["path"])
 
 
 if __name__ == "__main__":

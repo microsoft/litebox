@@ -136,7 +136,12 @@ shell contexts). The render section marks tips with `→` and
 subsumed rows with `~`. Per-branch shadows persist across
 cycles so each branch keeps its own incremental `target/`; stale
 shadows whose branch no longer exists in the canonical clone are
-GC'd at the start of each scheduling cycle.
+GC'd at the start of each scheduling cycle. When multiple tips
+are eligible in the same supervisor tick, the orchestrator drives
+up to `--max-parallel-agent-cargos N` (default `2`) in parallel —
+each in its own per-branch shadow, CPU throttled automatically by
+the harness lease table (`max(1, LITEBOX_GLOBAL_JOBS /
+live_lease_count)`).
 
 ## Multi-wave platform-fix workflow
 
