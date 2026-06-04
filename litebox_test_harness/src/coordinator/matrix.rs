@@ -1251,7 +1251,7 @@ const NET_ADDR_PAIRS: &[(AgentName, AgentName)] = &[
 // under test. Including all 5 binary-type parents ensures we
 // exercise the parent-side syscall instrumentation / vDSO / fd-bridge
 // paths for every leg, not just PIE-glibc and non-PIE-glibc.
-const EXEC_AGENTS: &[AgentName] = &[
+pub(crate) const EXEC_AGENTS: &[AgentName] = &[
     AgentName::Dpg1,         // PIE-glibc
     AgentName::Dpg1Dpg1,     // PIE-glibc, depth-2
     AgentName::Dpg1Dpg1Dpg1, // PIE-glibc, depth-3
