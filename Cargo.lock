@@ -1506,7 +1506,6 @@ name = "litebox_broker_transport"
 version = "0.1.0"
 dependencies = [
  "litebox_broker_protocol",
- "litebox_broker_wire",
 ]
 
 [[package]]
@@ -1518,13 +1517,6 @@ dependencies = [
  "litebox_broker_local",
  "litebox_broker_protocol",
  "litebox_broker_transport",
-]
-
-[[package]]
-name = "litebox_broker_wire"
-version = "0.1.0"
-dependencies = [
- "litebox_broker_protocol",
 ]
 
 [[package]]

@@ -5,19 +5,21 @@
 //!
 //! This module deliberately uses `std` because Unix-domain sockets and `std::io`
 //! framing are hosted userland concerns. Portable broker interfaces live in the
-//! no_std protocol, wire, local, core, and host crates.
+//! no_std protocol, local, core, and host crates.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use litebox_broker_protocol::wire::{
+    WireError, decode_request, decode_response, encode_request, encode_response,
+};
 use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::{
     ClientControlChannel, PeerCredential, ReceivedBrokerRequest, ReceivedBrokerResponse,
     ServerControlChannel,
 };
-use litebox_broker_wire::{decode_request, decode_response, encode_request, encode_response};
 
 const MAX_FRAME_LEN: usize = 64 * 1024;
 
@@ -130,7 +132,7 @@ impl ClientControlChannel for UnixStreamClientControlChannel {
     type Error = io::Error;
 
     fn send_request(&mut self, request: &BrokerRequest) -> io::Result<()> {
-        let frame = encode_request(request.clone()).map_err(wire_error)?;
+        let frame = encode_request(request.clone());
         let deadline = self.current_deadline()?;
         let result = write_frame_with_deadline(&mut self.stream, &frame, deadline);
         if result.is_err() {
@@ -169,7 +171,7 @@ impl ServerControlChannel for UnixStreamServerControlChannel {
     fn send_response(&mut self, response: &BrokerResponse) -> io::Result<()> {
         write_frame_with_deadline(
             &mut self.stream,
-            &encode_response(response.clone()).map_err(wire_error)?,
+            &encode_response(response.clone()),
             self.io_deadline,
         )
     }
@@ -273,7 +275,7 @@ fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn wire_error(error: litebox_broker_wire::WireError) -> io::Error {
+fn wire_error(error: WireError) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!("invalid broker wire message: {error}"),

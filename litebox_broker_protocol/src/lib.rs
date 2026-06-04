@@ -10,11 +10,14 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod channel;
 pub mod error;
 pub mod event;
 pub mod message;
 pub mod object;
+pub mod wire;
 
 pub use channel::{
     ClientControlChannel, PeerCredential, ReceivedBrokerRequest, ReceivedBrokerResponse,
