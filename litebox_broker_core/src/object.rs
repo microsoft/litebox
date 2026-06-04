@@ -4,7 +4,7 @@
 use core::ops::BitOr;
 
 use crate::event::EventObject;
-use crate::identity::{AssociationIdentity, BrokerAssociation};
+use crate::identity::{BrokerAssociation, ProcessId};
 use crate::{BrokerCore, BrokerError, PolicyDecision, PolicyOperation, Result, allocate_id};
 use litebox_broker_protocol::{ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId};
 
@@ -72,7 +72,7 @@ const FIRST_REFERENCE_GENERATION: ObjectReferenceGeneration = ObjectReferenceGen
 pub(crate) struct ObjectReference {
     pub(crate) object_id: ObjectId,
     pub(crate) reference_generation: ObjectReferenceGeneration,
-    pub(crate) owner: AssociationIdentity,
+    pub(crate) owner: ProcessId,
     pub(crate) object_type: ObjectType,
     pub(crate) rights: ObjectRights,
 }
@@ -125,7 +125,7 @@ impl BrokerCore {
             ObjectReference {
                 object_id,
                 reference_generation,
-                owner: association.identity(),
+                owner: association.process_id(),
                 object_type,
                 rights,
             },
@@ -239,9 +239,9 @@ impl BrokerCore {
 
     /// Closes a broker association and releases references owned by it.
     pub fn close_association(&mut self, association: BrokerAssociation) {
-        let identity = association.identity();
+        let process_id = association.process_id();
         self.references
-            .retain(|_, reference| reference.owner != identity);
+            .retain(|_, reference| reference.owner != process_id);
         let references = &self.references;
         self.objects.retain(|object_id, _| {
             references
@@ -259,7 +259,7 @@ impl BrokerCore {
             .references
             .get(&handle.reference_id)
             .ok_or(BrokerError::UnknownObject)?;
-        if reference.owner != association.identity() {
+        if reference.owner != association.process_id() {
             return Err(BrokerError::UnknownObject);
         }
         if reference.reference_generation != handle.reference_generation {
@@ -288,11 +288,13 @@ pub(crate) struct AuthorizedObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine};
+    use crate::{
+        BrokerCoreLimits, BrokerError, CallerCredential, PolicyEngine, test_support::TestBrokerCore,
+    };
 
     #[test]
     fn object_and_reference_allocators_issue_max_id_then_exhaust() {
-        let mut core = BrokerCore::new(PolicyEngine::default_deny());
+        let mut core = TestBrokerCore::new(PolicyEngine::default_deny());
         let association = core
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
@@ -324,32 +326,40 @@ mod tests {
 
     #[test]
     fn insert_object_with_reference_enforces_object_and_reference_limits() {
-        let mut object_limited =
-            BrokerCore::new_with_limits(PolicyEngine::event_only(), BrokerCoreLimits::new(0, 1));
-        let association = object_limited
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
+        {
+            let mut object_limited = TestBrokerCore::new_with_limits(
+                PolicyEngine::event_only(),
+                BrokerCoreLimits::new(0, 1),
+            );
+            let association = object_limited
+                .create_association(CallerCredential::Unauthenticated)
+                .unwrap();
 
-        assert_eq!(
-            object_limited.create_event(&association),
-            Err(BrokerError::ResourceExhausted)
-        );
+            assert_eq!(
+                object_limited.create_event(&association),
+                Err(BrokerError::ResourceExhausted)
+            );
+        }
 
-        let mut reference_limited =
-            BrokerCore::new_with_limits(PolicyEngine::event_only(), BrokerCoreLimits::new(1, 0));
-        let association = reference_limited
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
+        {
+            let mut reference_limited = TestBrokerCore::new_with_limits(
+                PolicyEngine::event_only(),
+                BrokerCoreLimits::new(1, 0),
+            );
+            let association = reference_limited
+                .create_association(CallerCredential::Unauthenticated)
+                .unwrap();
 
-        assert_eq!(
-            reference_limited.create_event(&association),
-            Err(BrokerError::ResourceExhausted)
-        );
+            assert_eq!(
+                reference_limited.create_event(&association),
+                Err(BrokerError::ResourceExhausted)
+            );
+        }
     }
 
     #[test]
     fn close_association_releases_owned_references_and_orphaned_objects() {
-        let mut core = BrokerCore::new(PolicyEngine::event_only());
+        let mut core = TestBrokerCore::new(PolicyEngine::event_only());
         let association = core
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
@@ -365,29 +375,8 @@ mod tests {
     }
 
     #[test]
-    fn foreign_core_association_cannot_authorize_matching_handle_values() {
-        let mut owner_core = BrokerCore::new(PolicyEngine::event_only());
-        let owner = owner_core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        let handle = owner_core.create_event(&owner).unwrap();
-
-        let mut other_core = BrokerCore::new(PolicyEngine::event_only());
-        let other = other_core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        let other_handle = other_core.create_event(&other).unwrap();
-        assert_eq!(handle, other_handle);
-
-        assert_eq!(
-            other_core.wait_event(&owner, handle),
-            Err(BrokerError::UnknownObject)
-        );
-    }
-
-    #[test]
     fn close_object_reference_releases_reference_and_orphaned_object() {
-        let mut core = BrokerCore::new(PolicyEngine::event_only());
+        let mut core = TestBrokerCore::new(PolicyEngine::event_only());
         let association = core
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
@@ -404,7 +393,7 @@ mod tests {
 
     #[test]
     fn close_object_reference_rejects_stale_and_foreign_handles() {
-        let mut core = BrokerCore::new(PolicyEngine::event_only());
+        let mut core = TestBrokerCore::new(PolicyEngine::event_only());
         let owner = core
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();

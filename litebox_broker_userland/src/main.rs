@@ -22,7 +22,7 @@ fn main() -> io::Result<()> {
     let (stream, _) = listener.accept()?;
     let mut channel = UnixStreamServerControlChannel::from_accepted(stream);
     channel.set_io_deadline(Some(Instant::now() + SESSION_TIMEOUT))?;
-    let mut broker = BrokerCore::new(PolicyEngine::event_only());
+    let mut broker = BrokerCore::new(PolicyEngine::event_only()).map_err(io::Error::other)?;
     serve_connection(&mut broker, &mut channel)
         .map(|_| ())
         .map_err(broker_error)

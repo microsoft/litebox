@@ -167,12 +167,12 @@ impl EventObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BrokerCore, CallerCredential, PolicyEngine};
+    use crate::{CallerCredential, PolicyEngine, test_support::TestBrokerCore};
     use litebox_broker_protocol::ObjectReferenceGeneration;
 
     #[test]
     fn wait_rejects_invalid_references_with_expected_errors() {
-        let mut core = BrokerCore::new(PolicyEngine::event_only());
+        let mut core = TestBrokerCore::new(PolicyEngine::event_only());
         let association = core
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn create_event_uses_policy_granted_reference_rights() {
-        let mut core = BrokerCore::new(PolicyEngine::event_only_with_reference_rights(
+        let mut core = TestBrokerCore::new(PolicyEngine::event_only_with_reference_rights(
             ObjectRights::WAIT,
         ));
         let association = core
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn event_readiness_state_only_reports_authorized_directions() {
-        let mut core = BrokerCore::new(PolicyEngine::event_only_with_reference_rights(
+        let mut core = TestBrokerCore::new(PolicyEngine::event_only_with_reference_rights(
             ObjectRights::WAIT,
         ));
         let association = core

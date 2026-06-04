@@ -24,9 +24,9 @@ mod object;
 mod policy;
 
 use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub use error::BrokerError;
-use identity::BrokerCoreId;
 pub use identity::{BrokerAssociation, CallerCredential};
 use litebox_broker_protocol::ObjectReferenceId;
 use object::{ObjectEntry, ObjectId, ObjectReference};
@@ -69,8 +69,11 @@ impl Default for BrokerCoreLimits {
 }
 
 /// Channel-independent broker authority state.
+///
+/// A broker process may construct only one broker core for its process
+/// lifetime. Constructors return [`BrokerError::BrokerCoreAlreadyExists`] if a
+/// core has already been constructed.
 pub struct BrokerCore {
-    core_id: BrokerCoreId,
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
     next_process_id: u64,
@@ -80,16 +83,96 @@ pub struct BrokerCore {
     references: BTreeMap<ObjectReferenceId, ObjectReference>,
 }
 
+static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
+
 impl BrokerCore {
-    /// Creates a broker core with the provided policy engine.
-    pub fn new(policy: PolicyEngine) -> Self {
+    /// Creates the broker core with the provided policy engine.
+    pub fn new(policy: PolicyEngine) -> Result<Self> {
         Self::new_with_limits(policy, BrokerCoreLimits::DEFAULT)
     }
 
-    /// Creates a broker core with explicit authority-state limits.
-    pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Self {
-        Self {
-            core_id: identity::allocate_core_id(),
+    /// Creates the broker core with explicit authority-state limits.
+    pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Result<Self> {
+        BROKER_CORE_CREATED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
+
+        Ok(Self {
+            policy,
+            limits,
+            next_process_id: 1,
+            next_object_id: 1,
+            next_reference_id: 1,
+            objects: BTreeMap::new(),
+            references: BTreeMap::new(),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use alloc::collections::BTreeMap;
+    use core::ops::{Deref, DerefMut};
+    use std::sync::{Mutex, MutexGuard};
+
+    use crate::{BrokerCore, BrokerCoreLimits, PolicyEngine};
+
+    static BROKER_CORE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_broker_core() -> MutexGuard<'static, ()> {
+        BROKER_CORE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Repeatable broker core wrapper for tests.
+    ///
+    /// This bypasses the production one-shot constructor while serializing test
+    /// cores in the current process. Production code must use
+    /// [`BrokerCore::new`] or [`BrokerCore::new_with_limits`].
+    pub struct TestBrokerCore {
+        core: BrokerCore,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl TestBrokerCore {
+        /// Creates a repeatable test broker core with the provided policy.
+        pub fn new(policy: PolicyEngine) -> Self {
+            let guard = lock_broker_core();
+            let core = new_test_core(policy, BrokerCoreLimits::DEFAULT);
+            Self {
+                core,
+                _guard: guard,
+            }
+        }
+
+        /// Creates a repeatable test broker core with explicit limits.
+        pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Self {
+            let guard = lock_broker_core();
+            let core = new_test_core(policy, limits);
+            Self {
+                core,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Deref for TestBrokerCore {
+        type Target = BrokerCore;
+
+        fn deref(&self) -> &Self::Target {
+            &self.core
+        }
+    }
+
+    impl DerefMut for TestBrokerCore {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.core
+        }
+    }
+
+    fn new_test_core(policy: PolicyEngine, limits: BrokerCoreLimits) -> BrokerCore {
+        BrokerCore {
             policy,
             limits,
             next_process_id: 1,
@@ -111,4 +194,25 @@ fn allocate_id(next_id: &mut u64) -> Result<u64> {
     let id = *next_id;
     *next_id = id.checked_add(1).unwrap_or(EXHAUSTED_ID);
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constructor_rejects_second_core_even_after_drop() {
+        let core = BrokerCore::new(PolicyEngine::default_deny()).unwrap();
+
+        assert!(matches!(
+            BrokerCore::new(PolicyEngine::default_deny()),
+            Err(BrokerError::BrokerCoreAlreadyExists)
+        ));
+
+        drop(core);
+        assert!(matches!(
+            BrokerCore::new(PolicyEngine::default_deny()),
+            Err(BrokerError::BrokerCoreAlreadyExists)
+        ));
+    }
 }
