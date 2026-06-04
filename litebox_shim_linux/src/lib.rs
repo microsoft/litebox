@@ -342,6 +342,129 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         debug_assert!(ok, "install_external_fd: slot {guest_fd} still occupied");
     }
 
+    fn dup_broker_bridge_handle(
+        releaser: alloc::sync::Arc<
+            dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+        >,
+        handle_id: u64,
+    ) -> Result<(), ()> {
+        releaser.dup_handle(handle_id).map_err(|_| ())
+    }
+
+    fn remove_typed_fd<Subsystem>(&self, typed: &litebox::fd::TypedFd<Subsystem>)
+    where
+        Subsystem: litebox::fd::FdEnabledSubsystem,
+    {
+        let _ = self
+            .task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .remove(typed);
+    }
+
+    fn consume_broker_bridge_slot(&self, files: &syscalls::file::FilesState<FS>, guest_fd: usize) {
+        let mut rds = files.raw_descriptor_store.write();
+        #[cfg(feature = "worker_local_inet")]
+        if let Ok(old_sock) =
+            rds.fd_consume_raw_integer::<litebox::net::Network<Platform>>(guest_fd)
+        {
+            drop(rds);
+            let _ = self
+                .task
+                .global
+                .net
+                .lock()
+                .close(&old_sock, litebox::net::CloseBehavior::Immediate);
+            return;
+        }
+        if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+            drop(rds);
+            let _ = files.fs.close(&old_fs);
+        } else if let Ok(old_unix) =
+            rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
+        {
+            drop(rds);
+            self.remove_typed_fd(&old_unix);
+        } else if let Ok(old_eventfd) =
+            rds.fd_consume_raw_integer::<syscalls::eventfd::EventfdSubsystem>(guest_fd)
+        {
+            drop(rds);
+            self.remove_typed_fd(&old_eventfd);
+        } else if let Ok(old_broker_pipe) =
+            rds.fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
+        {
+            drop(rds);
+            self.remove_typed_fd(&old_broker_pipe);
+        } else if let Ok(old_broker_sp) = rds
+            .fd_consume_raw_integer::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+                guest_fd,
+            )
+        {
+            drop(rds);
+            self.remove_typed_fd(&old_broker_sp);
+        } else if let Ok(old_tcp) = rds
+            .fd_consume_raw_integer::<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(guest_fd)
+        {
+            drop(rds);
+            self.remove_typed_fd(&old_tcp);
+        } else if let Ok(old_listener) = rds
+            .fd_consume_raw_integer::<syscalls::broker_inet_listener::BrokerInetListenerSubsystem>(
+            guest_fd,
+        ) {
+            drop(rds);
+            self.remove_typed_fd(&old_listener);
+        } else if let Ok(old_dgram) = rds
+            .fd_consume_raw_integer::<syscalls::broker_inet_dgram::BrokerInetDgramSubsystem>(
+                guest_fd,
+            )
+        {
+            drop(rds);
+            self.remove_typed_fd(&old_dgram);
+        } else if let Ok(old_host) =
+            rds.fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
+        {
+            drop(rds);
+            if let Some(entry) = self
+                .task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_host)
+            {
+                let host_fd = entry.take_fd();
+                if host_fd >= 0 {
+                    self.task.global.platform.close_host_fd(host_fd);
+                }
+            }
+        }
+    }
+
+    fn install_typed_broker_bridge_fd_at_slot<Subsystem>(
+        &self,
+        typed: litebox::fd::TypedFd<Subsystem>,
+        guest_fd: usize,
+        files: &syscalls::file::FilesState<FS>,
+        label: &str,
+    ) -> Result<(), ()>
+    where
+        Subsystem: litebox::fd::FdEnabledSubsystem,
+    {
+        self.consume_broker_bridge_slot(files, guest_fd);
+        let mut rds = files.raw_descriptor_store.write();
+        if rds.is_alive(guest_fd) {
+            drop(rds);
+            self.remove_typed_fd(&typed);
+            return Err(());
+        }
+        let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
+        debug_assert!(
+            ok,
+            "install_broker_bridge_fd({label}): slot {guest_fd} still occupied"
+        );
+        if ok { Ok(()) } else { Err(()) }
+    }
+
     /// Install a broker-backed shim fd entry at `guest_fd`, materializing
     /// it from a broker handle that the parent dup'd before spawn. Called
     /// by the runner during worker-exec startup for every `--broker-fd-bridge`
@@ -403,7 +526,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
                 let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
                     alloc::sync::Arc::clone(&provider) as _;
-                let _ = releaser.dup_handle(handle_id);
+                Self::dup_broker_bridge_handle(releaser, handle_id)?;
                 let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
                     provider, handle_id, direction, pipe_flags,
                     1, // creation_site: install_broker_bridge_fd
@@ -414,57 +537,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .litebox
                     .descriptor_table_mut()
                     .insert(bp_fd);
-                let mut rds = files.raw_descriptor_store.write();
-                if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
-                    drop(rds);
-                    let _ = files.fs.close(&old_fs);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_sock) =
-                    rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
-                {
-                    drop(rds);
-                    let _ = self
-                        .task
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .remove(&old_sock);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_broker_pipe) = rds
-                    .fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
-                {
-                    drop(rds);
-                    let _ = self
-                        .task
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .remove(&old_broker_pipe);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_host) = rds
-                    .fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
-                {
-                    drop(rds);
-                    if let Some(entry) = self
-                        .task
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .remove(&old_host)
-                    {
-                        let host_fd = entry.take_fd();
-                        if host_fd >= 0 {
-                            self.task.global.platform.close_host_fd(host_fd);
-                        }
-                    }
-                    rds = files.raw_descriptor_store.write();
-                }
-                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
-                debug_assert!(
-                    ok,
-                    "install_broker_bridge_fd(pipe): slot {guest_fd} still occupied"
-                );
-                Ok(())
+                self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "pipe")
             }
             BrokerHandleKind::UnixSocket => {
                 let provider =
@@ -477,7 +550,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
                 let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
                     alloc::sync::Arc::clone(&provider) as _;
-                let _ = releaser.dup_handle(handle_id);
+                Self::dup_broker_bridge_handle(releaser, handle_id)?;
                 let sp_fd = syscalls::broker_socketpair::BrokerSocketPairFd::<Platform>::new(
                     provider, handle_id, endpoint, pipe_flags,
                 );
@@ -489,21 +562,14 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .litebox
                     .descriptor_table_mut()
                     .insert(sp_fd);
-                let mut rds = files.raw_descriptor_store.write();
-                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
-                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
-                debug_assert!(
-                    ok,
-                    "install_broker_bridge_fd(unix_socket): slot {guest_fd} still occupied"
-                );
-                Ok(())
+                self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "unix_socket")
             }
             BrokerHandleKind::TcpConn => {
                 let provider = syscalls::broker_tcp_conn::broker_tcp_conn_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
                 let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
                     alloc::sync::Arc::clone(&provider) as _;
-                let _ = releaser.dup_handle(handle_id);
+                Self::dup_broker_bridge_handle(releaser, handle_id)?;
                 let tcp_fd = syscalls::broker_tcp_conn::BrokerTcpConnFd::<Platform>::new(
                     provider,
                     handle_id,
@@ -515,107 +581,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                         .litebox
                         .descriptor_table_mut()
                         .insert(tcp_fd);
-                let mut rds = files.raw_descriptor_store.write();
-                #[cfg(feature = "worker_local_inet")]
-                if let Ok(old_sock) =
-                    rds.fd_consume_raw_integer::<litebox::net::Network<Platform>>(guest_fd)
-                {
-                    drop(rds);
-                    let _ = self
-                        .task
-                        .global
-                        .net
-                        .lock()
-                        .close(&old_sock, litebox::net::CloseBehavior::Immediate);
-                    rds = files.raw_descriptor_store.write();
-                }
-                if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
-                    drop(rds);
-                    let _ = files.fs.close(&old_fs);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_unix) =
-                    rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
-                {
-                    drop(rds);
-                    let _ = self
-                        .task
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .remove(&old_unix);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_eventfd) = rds
-                    .fd_consume_raw_integer::<syscalls::eventfd::EventfdSubsystem>(guest_fd)
-                {
-                    drop(rds);
-                    let _ = self
-                        .task
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .remove(&old_eventfd);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_broker_pipe) = rds
-                    .fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
-                {
-                    drop(rds);
-                    let _ = self
-                        .task
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .remove(&old_broker_pipe);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_broker_sp) = rds
-                    .fd_consume_raw_integer::<
-                        syscalls::broker_socketpair::BrokerSocketPairSubsystem,
-                    >(guest_fd)
-                {
-                    drop(rds);
-                    let _ = self
-                        .task
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .remove(&old_broker_sp);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_host) = rds
-                    .fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
-                {
-                    drop(rds);
-                    if let Some(entry) = self
-                        .task
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .remove(&old_host)
-                    {
-                        let host_fd = entry.take_fd();
-                        if host_fd >= 0 {
-                            self.task.global.platform.close_host_fd(host_fd);
-                        }
-                    }
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_tcp) = rds
-                    .fd_consume_raw_integer::<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>(
-                        guest_fd,
-                    )
-                {
-                    drop(rds);
-                    let _ = self
-                        .task
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .remove(&old_tcp);
-                    rds = files.raw_descriptor_store.write();
-                }
-                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
-                debug_assert!(
-                    ok,
-                    "install_broker_bridge_fd(tcp_conn): slot {guest_fd} still occupied"
-                );
-                Ok(())
+                self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "tcp_conn")
             }
             BrokerHandleKind::InetDgram => {
                 let provider =
@@ -623,7 +589,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
                 let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
                     alloc::sync::Arc::clone(&provider) as _;
-                let _ = releaser.dup_handle(handle_id);
+                Self::dup_broker_bridge_handle(releaser, handle_id)?;
                 let dgram = syscalls::broker_inet_dgram::BrokerInetDgramFd::<Platform>::new(
                     provider,
                     handle_id,
@@ -637,14 +603,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .litebox
                     .descriptor_table_mut()
                     .insert(dgram);
-                let mut rds = files.raw_descriptor_store.write();
-                let _ = rds.fd_consume_raw_integer::<FS>(guest_fd);
-                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
-                debug_assert!(
-                    ok,
-                    "install_broker_bridge_fd(inet_dgram): slot {guest_fd} still occupied"
-                );
-                Ok(())
+                self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "inet_dgram")
             }
             BrokerHandleKind::InetListener => {
                 let provider =
@@ -652,7 +611,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
                 let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
                     alloc::sync::Arc::clone(&provider) as _;
-                let _ = releaser.dup_handle(handle_id);
+                Self::dup_broker_bridge_handle(releaser, handle_id)?;
                 let listener =
                     syscalls::broker_inet_listener::BrokerInetListenerFd::<Platform>::new(
                         provider,
@@ -668,35 +627,12 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .litebox
                     .descriptor_table_mut()
                     .insert(listener);
-                let mut rds = files.raw_descriptor_store.write();
-                if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
-                    drop(rds);
-                    let _ = files.fs.close(&old_fs);
-                    rds = files.raw_descriptor_store.write();
-                } else if let Ok(old_host) = rds
-                    .fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
-                {
-                    drop(rds);
-                    if let Some(entry) = self
-                        .task
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .remove(&old_host)
-                    {
-                        let host_fd = entry.take_fd();
-                        if host_fd >= 0 {
-                            self.task.global.platform.close_host_fd(host_fd);
-                        }
-                    }
-                    rds = files.raw_descriptor_store.write();
-                }
-                let ok = rds.fd_into_specific_raw_integer(typed, guest_fd);
-                debug_assert!(
-                    ok,
-                    "install_broker_bridge_fd(inet_listener): slot {guest_fd} still occupied"
-                );
-                Ok(())
+                self.install_typed_broker_bridge_fd_at_slot(
+                    typed,
+                    guest_fd,
+                    &files,
+                    "inet_listener",
+                )
             }
             // C.5l guardrail: Signalfd / Pty are accepted by the
             // emit-side fork-snapshot code, but the install side
