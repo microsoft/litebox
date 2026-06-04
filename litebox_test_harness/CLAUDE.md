@@ -118,6 +118,20 @@ and Δ vs baseline HEAD (drift vs current upstream). Set
 cycle for direct agent consumption. Disable entirely with
 `--agent-coverage-disable` on the supervisor invocation.
 
+When a coding session fans out to subagent worktrees, the
+supervisor only drives the *tip set*: worktrees whose HEAD is
+not already contained in some other worktree's HEAD as an
+ancestor. So if subagent branches have been merged back into a
+session branch, the supervisor drives the session branch and
+skips the subagent worktrees (their content is already in the
+session HEAD). If subagents have fresh work that hasn't been
+merged yet, the subagents are tips and the (now-stale) session
+worktree is skipped. Solo sessions and fully-independent
+worktrees are always tips — no behavior change. Detection is
+automatic with no env knob (intentional — knobs leak into agent
+shell contexts). The render section marks tips with `→` and
+subsumed rows with `~`.
+
 ## Multi-wave platform-fix workflow
 
 When the test harness is reporting tens or hundreds of failures (e.g., after a

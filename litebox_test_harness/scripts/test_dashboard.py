@@ -174,5 +174,89 @@ class TrackedRefsTests(unittest.TestCase):
         self.assertEqual(rows[0]["ci_worktree"], "/tmp/ci-main")
 
 
+class TipSetTests(unittest.TestCase):
+    """Tip-set rule: drop any worktree whose HEAD is an ancestor of
+    another worktree's HEAD. Uses a fake ancestor predicate over a
+    small DAG so the test is hermetic (no git)."""
+
+    @staticmethod
+    def _ancestor_pred(graph):
+        """graph: {child_sha: {ancestor_shas...}} (reflexive ancestor
+        relationship is implied by tip-set's `head == other_head`
+        short-circuit). Returns a predicate is_ancestor(a, b) = True
+        iff `a` is in `b`'s ancestor set."""
+        def pred(a: str, b: str) -> bool:
+            return a in graph.get(b, set())
+        return pred
+
+    @staticmethod
+    def _wts(*shas):
+        return [{"path": f"/wt/{s}", "head": s, "branch": s} for s in shas]
+
+    def test_solo_worktree_is_tip(self):
+        wts = self._wts("A")
+        out = dashboard._compute_tip_set(
+            wts, self._ancestor_pred({}))
+        self.assertEqual([w["head"] for w in out], ["A"])
+
+    def test_all_independent_all_tips(self):
+        wts = self._wts("A", "B", "C")
+        out = dashboard._compute_tip_set(
+            wts, self._ancestor_pred({}))
+        self.assertEqual([w["head"] for w in out], ["A", "B", "C"])
+
+    def test_fanout_from_session_subagents_are_tips(self):
+        # SESSION is ancestor of S1, S2 (subagents branched off and
+        # added commits): drop SESSION, keep S1 + S2.
+        graph = {"S1": {"SESSION"}, "S2": {"SESSION"}}
+        wts = self._wts("SESSION", "S1", "S2")
+        out = dashboard._compute_tip_set(
+            wts, self._ancestor_pred(graph))
+        self.assertEqual([w["head"] for w in out], ["S1", "S2"])
+
+    def test_mergeback_into_session_session_is_tip(self):
+        # SESSION's HEAD is a merge containing S1 + S2 as ancestors:
+        # drop S1 + S2, keep SESSION.
+        graph = {"SESSION": {"S1", "S2"}}
+        wts = self._wts("SESSION", "S1", "S2")
+        out = dashboard._compute_tip_set(
+            wts, self._ancestor_pred(graph))
+        self.assertEqual([w["head"] for w in out], ["SESSION"])
+
+    def test_disjoint_clusters_one_tip_per_cluster(self):
+        # Cluster 1: SESSION-A is mergeback parent of A1.
+        # Cluster 2: SESSION-B and B1 unrelated to cluster 1.
+        graph = {"SESSION-A": {"A1"}}
+        wts = self._wts("SESSION-A", "A1", "SESSION-B", "B1")
+        out = dashboard._compute_tip_set(
+            wts, self._ancestor_pred(graph))
+        self.assertEqual(
+            sorted(w["head"] for w in out),
+            ["B1", "SESSION-A", "SESSION-B"],
+        )
+
+    def test_worktree_missing_head_skipped(self):
+        wts = self._wts("A", "B")
+        wts.insert(1, {"path": "/wt/no-head", "branch": "weird"})
+        out = dashboard._compute_tip_set(
+            wts, self._ancestor_pred({}))
+        self.assertEqual([w["head"] for w in out], ["A", "B"])
+
+    def test_chain_only_youngest_is_tip(self):
+        # A <- B <- C linear: only C survives.
+        graph = {"B": {"A"}, "C": {"A", "B"}}
+        wts = self._wts("A", "B", "C")
+        out = dashboard._compute_tip_set(
+            wts, self._ancestor_pred(graph))
+        self.assertEqual([w["head"] for w in out], ["C"])
+
+    def test_preserves_input_order(self):
+        # Two unrelated tips presented out of alphabetical order.
+        wts = self._wts("Z", "A")
+        out = dashboard._compute_tip_set(
+            wts, self._ancestor_pred({}))
+        self.assertEqual([w["head"] for w in out], ["Z", "A"])
+
+
 if __name__ == "__main__":
     unittest.main()
