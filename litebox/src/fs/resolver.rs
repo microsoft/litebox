@@ -18,7 +18,7 @@ use super::errors::{
 };
 use super::{
     FileType, Mode, OFlags,
-    backend::{PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome},
+    backend::{PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome, WalkStopReason},
 };
 
 /// The north-facing filesystem entry point, generic over a [`Backend`](super::backend::Backend).
@@ -188,6 +188,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         #[cfg(debug_assertions)] absolute_components: &[&str],
     ) -> Result<Backend::WalkingDirHandle<'a>, WalkError> {
         if components.is_empty() {
+            // TODO(jayb): Decide whether empty walks from a non-root handle need permission checks.
             return Ok(from);
         }
 
@@ -199,12 +200,56 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             &outcome,
         )?;
 
-        if outcome.components.len() != components.len() {
-            // TODO(jayb): Continue walking from `outcome.last` once backends can return partial walks.
-            unimplemented!("partial backend walks are not supported yet");
+        match outcome.stop_reason {
+            WalkStopReason::CompleteDirectory => {
+                assert_eq!(outcome.components.len(), components.len());
+                Ok(outcome.last)
+            }
+            WalkStopReason::StoppedAtNonDirectory => {
+                Err(WalkError::PathError(PathError::ComponentNotADirectory))
+            }
+            WalkStopReason::Continue => {
+                // TODO(jayb): Continue walking from `outcome.last` once partial backend walks are
+                // supported by the resolver.
+                unimplemented!("partial backend walks are not supported yet")
+            }
         }
+    }
 
-        Ok(outcome.last)
+    fn walk_path<'a>(
+        &'a self,
+        context: &Context,
+        from: Backend::WalkingDirHandle<'a>,
+        components: &[&str],
+        #[cfg(debug_assertions)] absolute_components: &[&str],
+    ) -> Result<(WalkOutcome<Backend::WalkingDirHandle<'a>>, usize), WalkError> {
+        assert!(!components.is_empty());
+        let outcome = self.backend.walk_directories(from, components)?;
+        Self::check_walk_permissions(
+            context,
+            #[cfg(debug_assertions)]
+            absolute_components,
+            &outcome,
+        )?;
+
+        let walked = outcome.components.len();
+        match outcome.stop_reason {
+            WalkStopReason::CompleteDirectory => {
+                assert_eq!(walked, components.len());
+                Ok((outcome, walked))
+            }
+            WalkStopReason::StoppedAtNonDirectory if walked + 1 == components.len() => {
+                Ok((outcome, walked))
+            }
+            WalkStopReason::StoppedAtNonDirectory => {
+                Err(WalkError::PathError(PathError::ComponentNotADirectory))
+            }
+            WalkStopReason::Continue => {
+                // TODO(jayb): Continue walking from `outcome.last` once partial backend walks are
+                // supported by the resolver.
+                unimplemented!("partial backend walks are not supported yet")
+            }
+        }
     }
 
     fn check_walk_permissions(
@@ -295,26 +340,31 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             ));
         }
 
-        let Some((parent_components, name)) = path.parent_and_name() else {
-            unreachable!("root path was handled above")
-        };
-        let parent = self
-            .walk_to_directory(
-                &context,
-                self.backend.root(),
-                &parent_components,
-                #[cfg(debug_assertions)]
-                &parent_components,
-            )
-            .map_err(|error| match error {
-                WalkError::Io => OpenError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
-        let parent = self.backend.owned_dir_at(parent);
-
-        let walking_parent = self.backend.walking_dir_at(&parent).ok_or(OpenError::Io)?;
-        match self.backend.open_file_at(walking_parent, name, flags) {
-            Ok(file) => {
+        let components = path.components();
+        let walk = self.walk_path(
+            &context,
+            self.backend.root(),
+            &components,
+            #[cfg(debug_assertions)]
+            &components,
+        );
+        match walk {
+            Ok((outcome, _)) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
+                if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
+                    return Err(OpenError::AlreadyExists);
+                }
+                Ok(insert(
+                    OwnedHandle::Dir(self.backend.owned_dir_at(outcome.last)),
+                    SeekBehavior::NonSeekable,
+                ))
+            }
+            Ok((outcome, walked))
+                if outcome.stop_reason == WalkStopReason::StoppedAtNonDirectory =>
+            {
+                let name = components[walked];
+                // TODO(jayb): Reject O_CREAT | O_EXCL before invoking the backend, so open-time
+                // side effects like truncation cannot happen before AlreadyExists is returned.
+                let file = self.backend.open_file_at(outcome.last, name, flags)?;
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
@@ -328,40 +378,37 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 let seek_behavior = self.backend.seek_behavior(&file.item);
                 Ok(insert(OwnedHandle::File(file.item), seek_behavior))
             }
-            Err(
-                error @ OpenError::PathError(
-                    PathError::NoSuchFileOrDirectory | PathError::ComponentNotADirectory,
-                ),
-            ) => {
-                let walking_parent = self.backend.walking_dir_at(&parent).ok_or(OpenError::Io)?;
-                match self.walk_to_directory(
-                    &context,
-                    walking_parent,
-                    &[name],
-                    #[cfg(debug_assertions)]
-                    &path.components(),
-                ) {
-                    Ok(dir) => {
-                        if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                            return Err(OpenError::AlreadyExists);
-                        }
-                        Ok(insert(
-                            OwnedHandle::Dir(self.backend.owned_dir_at(dir)),
-                            SeekBehavior::NonSeekable,
-                        ))
-                    }
-                    Err(_) if flags.contains(OFlags::CREAT) => match error {
-                        OpenError::PathError(PathError::NoSuchFileOrDirectory) => {
-                            let file = self.backend.create_file_at(parent, name, mode)?;
-                            let seek_behavior = self.backend.seek_behavior(&file);
-                            Ok(insert(OwnedHandle::File(file), seek_behavior))
-                        }
-                        _ => Err(error),
-                    },
-                    Err(_) => Err(error),
-                }
+            Ok(_) => {
+                // `walk_path` validates stop reasons before returning.
+                unreachable!()
             }
-            Err(error) => Err(error),
+            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+                if flags.contains(OFlags::CREAT) =>
+            {
+                let Some((parent_components, name)) = path.parent_and_name() else {
+                    unreachable!("root path was handled above")
+                };
+                let parent = self
+                    .walk_to_directory(
+                        &context,
+                        self.backend.root(),
+                        &parent_components,
+                        #[cfg(debug_assertions)]
+                        &parent_components,
+                    )
+                    .map_err(|error| match error {
+                        WalkError::Io => OpenError::Io,
+                        WalkError::PathError(error) => error.into(),
+                    })?;
+                let parent = self.backend.owned_dir_at(parent);
+                let file = self.backend.create_file_at(parent, name, mode)?;
+                let seek_behavior = self.backend.seek_behavior(&file);
+                Ok(insert(OwnedHandle::File(file), seek_behavior))
+            }
+            Err(error) => match error {
+                WalkError::Io => Err(OpenError::Io),
+                WalkError::PathError(error) => Err(error.into()),
+            },
         }
     }
 

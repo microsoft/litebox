@@ -15,7 +15,8 @@ use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
-    Backend, PermissionCheck, Permissioned, SeekBehavior, WalkOutcome, WalkedComponent,
+    Backend, PermissionCheck, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason,
+    WalkedComponent,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -216,7 +217,11 @@ where
                     location = Location::Dev;
                 }
                 (Location::Dev, name) if Device::from_name(name).is_some() => {
-                    return Err(WalkError::PathError(PathError::ComponentNotADirectory));
+                    return Ok(WalkOutcome {
+                        components: walked_components,
+                        last: DeviceDirHandle { location },
+                        stop_reason: WalkStopReason::StoppedAtNonDirectory,
+                    });
                 }
                 _ => {
                     return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
@@ -226,6 +231,7 @@ where
         Ok(WalkOutcome {
             components: walked_components,
             last: DeviceDirHandle { location },
+            stop_reason: WalkStopReason::CompleteDirectory,
         })
     }
 

@@ -55,9 +55,9 @@ pub trait Backend: private::Sealed + Send + Sync + 'static {
     ///
     /// `components` must be non-empty. Backends may panic if called with an empty slice.
     ///
-    /// This function explicitly does not support files, and will return a
-    /// [`PathError::ComponentNotADirectory`](super::errors::PathError::ComponentNotADirectory) if
-    /// the last component is a file.
+    /// This function explicitly does not walk into files. If the next component exists but is not a
+    /// directory, the backend should stop at its parent and return
+    /// `WalkStopReason::StoppedAtNonDirectory`.
     fn walk_directories<'a>(
         &'a self,
         from: Self::WalkingDirHandle<'a>,
@@ -173,21 +173,29 @@ pub trait Backend: private::Sealed + Send + Sync + 'static {
 pub struct WalkOutcome<Walking> {
     /// A component per walked element.
     ///
-    /// It is guaranteed that this vector is non-empty (i.e., it is a bug if a backend returns an
-    /// empty vector).
+    /// This vector can be empty when the first input component is a non-directory element.
     ///
     /// Components are in natural order (i.e., the last element is the last component visited thus
     /// far).
     pub(super) components: Vec<WalkedComponent>,
     /// The last handle of the walk thus far.
     ///
-    /// If only some (smaller) number of components were resolved by the backend, rather than the
-    /// complete path (i.e., if the components returned here does not match the components passed
-    /// into `walk_directories`), then the resolver must continue at this point.
-    // XXX(jayb): To support symlinks from directories, this will likely need to change to an enum
-    // or we might need to add another field or something so that the resolver can know what the new
-    // set of components needs to be.
     pub(super) last: Walking,
+    /// Why this walk stopped at `last`.
+    pub(super) stop_reason: WalkStopReason,
+}
+
+/// Why a backend directory walk stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(super) enum WalkStopReason {
+    /// All requested components were walked, and `last` is the requested directory.
+    CompleteDirectory,
+    /// The next requested component exists but is not a directory; `last` is its parent directory.
+    StoppedAtNonDirectory,
+    /// The backend stopped early; the resolver should continue walking from `last`.
+    #[expect(dead_code, reason = "no backend currently returns partial walks")]
+    Continue,
 }
 
 /// A backend item plus permission metadata for resolver-side checks.
@@ -214,8 +222,7 @@ pub(super) enum PermissionCheck {
 #[derive(Clone, Debug)]
 #[must_use]
 pub(super) struct WalkedComponent {
-    /// Permissions that the resolver must check; if this is `None`, the backend has is
-    /// self-enforcing permissions for this component, and the resolver need not check it.
+    /// How permissions for this component should be checked.
     pub(super) permissions: PermissionCheck,
 }
 
