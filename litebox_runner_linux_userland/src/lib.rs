@@ -798,6 +798,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_broker_inet_delay_ns(ns);
     }
 
+    // Phase 3 D5 feature flag (`LITEBOX_NEW_MUX=1`): when set, mux
+    // stream kinds with direct broker-handle replacements are
+    // migrated off the mux dispatcher onto `--broker-fd-bridge`
+    // specs. Default-off until each migrated kind passes the harness
+    // gate; see plan.md "D3 decision" item 4.
+    litebox_shim_linux::syscalls::set_new_mux_enabled(env_flag_enabled("LITEBOX_NEW_MUX"));
+
     // Stage 3a/Phase B: broker-backed TCP accept promotion remains opt-in.
     // Phase B's outbound-TCP gate also enables the accept-promoted path.
     litebox_shim_linux::syscalls::set_broker_tcp_conn_accept_enabled(

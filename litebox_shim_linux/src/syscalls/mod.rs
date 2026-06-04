@@ -77,6 +77,25 @@ pub fn broker_inet_delay_ns() -> u64 {
     BROKER_INET_DELAY_NS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Phase 3 D5 feature flag (`LITEBOX_NEW_MUX=1`). When enabled, mux
+/// stream kinds that have a direct broker-handle replacement are
+/// migrated out of the mux relay onto `--broker-fd-bridge` specs
+/// shipped to the worker. When disabled (the default), the legacy mux
+/// dispatcher handles every stream — preserving the pre-Phase-3
+/// production path until each migrated kind passes the harness gate.
+///
+/// Set from the runner at startup via [`set_new_mux_enabled`] (the
+/// runner reads `LITEBOX_NEW_MUX` via `env_flag_enabled`).
+static NEW_MUX_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_new_mux_enabled(enabled: bool) {
+    NEW_MUX_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn new_mux_enabled() -> bool {
+    NEW_MUX_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 macro_rules! common_functions_for_file_status {
     () => {
         pub(crate) fn get_status(&self) -> litebox::fs::OFlags {

@@ -4444,6 +4444,29 @@ impl<FS: ShimFS> Task<FS> {
         let mut mux_worker_fd_raw: i32 = -1;
         // (stream_id, guest_fd, dir_byte, type_byte, initial_eof)
         let mut mux_stream_specs: Vec<(u32, usize, u8, u8, bool)> = Vec::new();
+        // Phase 3 D5: broker-fd-bridge specs for mux streams migrated
+        // out of the mux relay onto direct broker handles. Each entry
+        // is shipped to the worker as `--broker-fd-bridge <spec>` and
+        // consumed by `install_broker_fd_bridge_spec`
+        // (runner/lib.rs:428).
+        let mut broker_fd_bridge_specs: alloc::vec::Vec<alloc::string::String> =
+            alloc::vec::Vec::new();
+        // Phase 3 D5: transit refs for broker handles shipped via
+        // broker_fd_bridge_specs. Drained AFTER
+        // `spawn_worker_host_for_fork_restore` returns. The spawn
+        // function reads the worker ack synchronously, so by the time
+        // it returns the worker has already called
+        // `install_broker_fd_bridge_spec` which acquired its own ref
+        // via `dup_handle`. Releasing here drops the creation ref the
+        // parent held since `attach_host_fd` returned.
+        type TransitRelease = (
+            alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            >,
+            u64,
+        );
+        let mut broker_fd_bridge_transit_release: alloc::vec::Vec<TransitRelease> =
+            alloc::vec::Vec::new();
         // (write_fd, read_fd, drained_data, write_flags, read_flags)
         let mut local_pipe_pairs: Vec<(usize, usize, Vec<u8>, u32, u32)> = Vec::new();
         // Dup'd pipe aliases: (alias_fd, primary_bridge_index).
@@ -5767,8 +5790,77 @@ impl<FS: ShimFS> Task<FS> {
                     // (orphan with drained data). If so, skip adding to
                     // mux_stream_specs — the worker handles it via --local-pipe.
                     let mut handled_as_local_pipe = false;
+                    // Phase 3 D5: when set, the stream has been migrated
+                    // out of the mux relay onto a direct broker handle
+                    // (via `attach_host_fd` of a `dup` of the host fd).
+                    // Parent keeps its own copy of the host fd (so its
+                    // existing ExternalFd entries remain valid post-fork
+                    // — matches normal fork-inheritance semantics, where
+                    // the underlying file description is shared); the
+                    // broker owns a separate dup that the worker accesses
+                    // via the broker's BrokerPipeFd install path.
+                    let mut handled_as_broker_bridge = false;
 
-                    if is_host_backed {
+                    if is_host_backed && super::new_mux_enabled() {
+                        let host_fd = bridge_host_fd[i];
+                        // Try to migrate this host-backed stream onto a
+                        // direct broker handle, eliminating its need for
+                        // the mux relay. Falls back to the mux path on
+                        // any failure (provider unavailable, dup failed,
+                        // broker refused attach) so a missing broker
+                        // doesn't break the fork-restore build.
+                        let broker_dir = if dir_byte == b'r' {
+                            litebox_common_linux::cwfd::fd_token_protocol::host_fd_direction::READ
+                        } else {
+                            litebox_common_linux::cwfd::fd_token_protocol::host_fd_direction::WRITE
+                        };
+                        if let Some(provider) = super::broker_pipe::broker_pipe_provider()
+                            && let Ok(dup_fd) = self.global.platform.dup_host_fd(host_fd)
+                        {
+                            match provider.attach_host_fd(dup_fd, broker_dir) {
+                                Ok(handle_id) => {
+                                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                                        alloc::sync::Arc::clone(&provider) as _;
+                                    let dir_char = if dir_byte == b'r' { 'r' } else { 'w' };
+                                    broker_fd_bridge_specs.push(alloc::format!(
+                                        "{guest_fd}:pipe:{handle_id}:{dir_char}"
+                                    ));
+                                    broker_fd_bridge_transit_release.push((releaser, handle_id));
+                                    handled_as_broker_bridge = true;
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: stream={} host_fd={} (dup'd) migrated to broker handle {} (dir={})",
+                                        self.pid,
+                                        stream_id,
+                                        host_fd,
+                                        handle_id,
+                                        dir_char,
+                                    );
+                                }
+                                Err(_) => {
+                                    // attach_host_fd consumed the dup
+                                    // via SCM_RIGHTS on success; on the
+                                    // Err path the dup was also taken
+                                    // (the OwnedFd in
+                                    // RunnerBrokerPipeProvider::attach_host_fd
+                                    // is constructed from raw_fd and
+                                    // dropped on error too). Nothing to
+                                    // clean up here.
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: stream={} attach_host_fd failed; falling back to mux",
+                                        self.pid,
+                                        stream_id,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if is_host_backed && !handled_as_broker_bridge {
                         // Host-backed pipe: parent mux dispatcher relays to
                         // the existing host OS fd.  The child worker gets a
                         // virtual pipe via the mux stream instead.
@@ -5788,7 +5880,7 @@ impl<FS: ShimFS> Task<FS> {
                             external_fd_fd: bridge_host_fd[i],
                             use_existing_pipe: false,
                         });
-                    } else {
+                    } else if !is_host_backed {
                         // Virtual pipe/socket bridge: close the child-side OS
                         // pipe fd (the mux creates a virtual pipe on the worker
                         // side instead).
@@ -5881,8 +5973,10 @@ impl<FS: ShimFS> Task<FS> {
                     }
 
                     // Push to mux_stream_specs only if not handled as a
-                    // local pipe (orphan read-end with drained data).
-                    if !handled_as_local_pipe {
+                    // local pipe (orphan read-end with drained data) and
+                    // not migrated to a direct broker handle
+                    // (Phase 3 D5).
+                    if !handled_as_local_pipe && !handled_as_broker_bridge {
                         mux_stream_specs.push((
                             stream_id,
                             guest_fd,
@@ -6029,13 +6123,25 @@ impl<FS: ShimFS> Task<FS> {
             &mux_stream_specs,
             &bidi_pt,
             &local_pipe_pairs,
-            // Phase 3 D5 starting hook: no streams migrated out of mux yet.
-            // Future commits append `--broker-fd-bridge` specs here per
-            // stream kind (host-backed → virtual pipe → socket → PTY).
-            &[],
+            // Phase 3 D5: streams migrated out of mux onto direct
+            // broker handles via `--broker-fd-bridge`. Currently
+            // includes host-backed streams (attach_host_fd on a dup
+            // of the parent's host fd, so the parent's existing
+            // ExternalFd entries remain valid); future commits add
+            // virtual pipe/socket/PTY and FS-backed.
+            &broker_fd_bridge_specs,
         ) {
             Ok(pid) => {
                 phase_tick!("post_spawn_worker_host");
+                // Phase 3 D5: spawn returned Ok only after the worker's
+                // ack arrived; the worker has finished
+                // `install_broker_fd_bridge_spec` for every spec we
+                // shipped, which means each spec's handle has been
+                // dup_handled into the worker's connection. Safe to
+                // drop the parent's creation ref now.
+                for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
+                    releaser.release(handle_id);
+                }
                 pid
             }
             Err(_err) => {
@@ -6060,6 +6166,15 @@ impl<FS: ShimFS> Task<FS> {
                 // Clean up parent-side OS pipe FDs on failure.
                 for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
                     self.global.platform.close_host_fd(pr.host_fd);
+                }
+                // Phase 3 D5: release transit refs for broker handles
+                // shipped via broker_fd_bridge_specs. The worker never
+                // came up, so its install_broker_fd_bridge_spec never
+                // ran. Each handle still has the creation ref from
+                // attach_host_fd; releasing here drops it and frees
+                // the broker's dup'd host fd via HostFdState::drop.
+                for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
+                    releaser.release(handle_id);
                 }
                 put_fc_back(self, fc);
                 return Err(Errno::ENOMEM);
