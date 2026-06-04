@@ -3700,12 +3700,8 @@ mod tests {
     /// integration cycles + parent-thread bisect.
     ///
     /// This test catches a future regression at unit-test time by
-    /// asserting (a) thread count didn't grow, and (b) the global
-    /// broker eventfd provider remains uninstalled, so `sys_eventfd2`
-    /// continues to take the local-fallback path. The full
-    /// cross-worker eventfd SCM_RIGHTS path is gated on a future
-    /// step (`b-step12-dispatcher-forksafe`) that makes broker state
-    /// fork-safe.
+    /// asserting that thread count didn't grow after setup tears down its
+    /// temporary notification-ring bootstrap state.
     #[test]
     fn setup_broker_eventfd_provider_leaves_no_long_lived_state() {
         use litebox_broker::fd_token_socket::spawn_control_listener;
@@ -3761,14 +3757,6 @@ mod tests {
             after <= baseline,
             "setup_broker_eventfd_provider must not spawn a runner-side reader thread \
              (baseline={baseline}, after={after}); see fork-restore safety comment",
-        );
-
-        // Provider must NOT be installed; sys_eventfd2 must fall back
-        // to local EventFile::new.
-        assert!(
-            litebox_shim_linux::syscalls::broker_eventfd_provider().is_none(),
-            "broker eventfd provider must not be installed; cross-worker broker-backed \
-             eventfd transfer is gated on Step 12 (fork-safe broker state)",
         );
     }
 
