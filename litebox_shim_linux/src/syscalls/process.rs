@@ -3605,9 +3605,6 @@ impl<FS: ShimFS> Task<FS> {
         > = Vec::new();
         // - host OS fd for external fds (-1 for new OS pipe bridges)
         let mut bridge_host_fd: Vec<i32> = Vec::new();
-        let mut mux_worker_fd_raw: i32 = -1;
-        // (stream_id, guest_fd, dir_byte, type_byte, initial_eof)
-        let mut mux_stream_specs: Vec<(u32, usize, u8, u8, bool)> = Vec::new();
         // Phase 3 D5: broker-fd-bridge specs for mux streams migrated
         // out of the mux relay onto direct broker handles. Each entry
         // is shipped to the worker as `--broker-fd-bridge <spec>` and
@@ -4847,20 +4844,22 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            // --- Multiplexer setup ---
-            // Replace per-fd OS pipe bridges with a single multiplexed channel.
-            // The child worker gets virtual pipe endpoints via --mux-stream,
-            // and the parent's mux dispatcher relays data through the socketpair.
+            // --- D5 broker-bridge setup ---
+            // Migrate each child pipe bridge directly onto a broker handle
+            // (BrokerPipe / BrokerSocketPair / BrokerPty / HostFd-attached
+            // BrokerPipe). The resulting `--broker-fd-bridge` specs replace
+            // what was previously a mux-relay socketpair plus per-stream
+            // dispatcher endpoints.
             if child_pipe_bridges.is_empty() {
-                // No bridges at all — store parent replacements for the old
-                // relay path (exec-on-remote-host may still use fd_replacements).
+                // No bridges at all — store parent replacements for the
+                // remote-host exec path which still uses fd_replacements.
                 if !parent_replacements.is_empty() {
                     *fc.vfork_done.fd_replacements.lock() = parent_replacements;
                 }
             } else {
                 // Store any bidirectional (ReadWrite) replacements in
-                // fd_replacements — these bypass the mux and need direct
-                // external fd fd installation on the parent side.
+                // fd_replacements — these get direct external-fd installation
+                // on the parent side.
                 let bidi_repls: Vec<crate::FdReplacement> = parent_replacements
                     .iter()
                     .filter(|r| r.direction == ExternalFdDirection::ReadWrite)
@@ -4869,38 +4868,7 @@ impl<FS: ShimFS> Task<FS> {
                 if !bidi_repls.is_empty() {
                     *fc.vfork_done.fd_replacements.lock() = bidi_repls;
                 }
-                let (mux_parent_raw, mux_worker_raw) =
-                    match self.global.platform.create_host_socketpair() {
-                        Ok(pair) => pair,
-                        Err(_e) => {
-                            #[cfg(feature = "trace_syscalls")]
-                            litebox::log_println!(
-                                self.global.platform,
-                                "[DELAYED-FORK] pid={}: create_host_socketpair failed: {}",
-                                self.pid,
-                                _e,
-                            );
-                            for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                                // Close newly-created pipe fds, but NOT fds
-                                // that are owned by the external fd system (where
-                                // os_fd == bridge_host_fd[i]).
-                                let is_host_owned =
-                                    bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
-                                if !is_host_owned {
-                                    self.global.platform.close_host_fd(os_fd);
-                                }
-                            }
-                            for pr in &parent_replacements {
-                                self.global.platform.close_host_fd(pr.host_fd);
-                            }
-                            put_fc_back(self, fc);
-                            return Err(Errno::ENOMEM);
-                        }
-                    };
-                mux_worker_fd_raw = mux_worker_raw;
 
-                let mut mux_parent_streams: Vec<crate::MuxParentStream> = Vec::new();
-                let mut orphan_stream_ids: Vec<(u32, Vec<u8>)> = Vec::new();
                 let mut broker_migrated_streams: Vec<Option<(u64, BrokerReleaser, char)>> =
                     (0..child_pipe_bridges.len()).map(|_| None).collect();
                 let mut d5_pty_bridge_handles: alloc::vec::Vec<(
@@ -5601,47 +5569,15 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     }
 
-                    let stream_id = u32::try_from(primary_idx).unwrap_or(0);
-                    let &(_, _, direction) = &child_pipe_bridges[primary_idx];
-                    let dir_byte = match direction {
-                        ExternalFdDirection::Read => b'r',
-                        ExternalFdDirection::Write => b'w',
-                        ExternalFdDirection::ReadWrite => b'b',
-                    };
-                    let type_byte = bridge_parent_info
-                        .get(primary_idx)
-                        .and_then(|v| v.first())
-                        .map_or(b'p', |&(_, _, sub)| match sub {
-                            crate::ReplacedSubsystem::Pipe => b'p',
-                            crate::ReplacedSubsystem::UnixSocket => b's',
-                            crate::ReplacedSubsystem::Pty => b't',
-                            crate::ReplacedSubsystem::Filesystem => b'f',
-                        });
-                    mux_stream_specs.push((stream_id, alias_fd, dir_byte, type_byte, false));
+                    let _stream_id = u32::try_from(primary_idx).unwrap_or(0);
+                    let _ = alias_fd;
                 }
 
-                // Store mux info in VforkDone for the parent to consume, unless
-                // every stream was migrated to direct broker handles and the
-                // legacy mux socketpair is now unused.  D5-vsocket's
-                // socketpair_parent_installs is parent-side state, independent
-                // of the mux relay, and is always stored.
+                // D5-vsocket parent-side install metadata is stored
+                // regardless of whether other streams migrated; it's
+                // independent of the legacy mux relay.
                 *fc.vfork_done.broker_socketpair_parent_installs.lock() =
                     broker_socketpair_parent_installs;
-                if mux_stream_specs.is_empty()
-                    && mux_parent_streams.is_empty()
-                    && orphan_stream_ids.is_empty()
-                {
-                    self.global.platform.close_host_fd(mux_parent_raw);
-                    self.global.platform.close_host_fd(mux_worker_raw);
-                    mux_worker_fd_raw = -1;
-                } else {
-                    fc.vfork_done
-                        .mux_parent_fd
-                        .store(mux_parent_raw, core::sync::atomic::Ordering::Release);
-                    *fc.vfork_done.mux_parent_streams.lock() = mux_parent_streams;
-                    *fc.vfork_done.mux_orphan_streams.lock() = orphan_stream_ids;
-                }
-                // Don't store fd_replacements — the mux replaces per-fd relay.
 
                 // Clear child_pipe_bridges — child OS fds for non-host-backed
                 // bridges were already closed above, and parent_replacements fds
@@ -5717,30 +5653,11 @@ impl<FS: ShimFS> Task<FS> {
                     .broker_socketpair_parent_installs
                     .lock()
                     .clear();
-                // Clean up mux socketpair on failure.
-                let mux_pfd = fc
-                    .vfork_done
-                    .mux_parent_fd
-                    .swap(-1, core::sync::atomic::Ordering::Relaxed);
-                if mux_pfd >= 0 {
-                    self.global.platform.close_host_fd(mux_pfd);
-                }
-                if mux_worker_fd_raw >= 0 {
-                    self.global.platform.close_host_fd(mux_worker_fd_raw);
-                }
-                fc.vfork_done.mux_parent_streams.lock().clear();
                 put_fc_back(self, fc);
                 todo!(
                     "ENOSYS audit: delayed fork worker stdio bindings; reachable but not implemented"
                 );
             }
-        };
-
-        // Mux fd for the worker (None if no mux was set up).
-        let mux_fd_opt = if mux_worker_fd_raw >= 0 {
-            Some(mux_worker_fd_raw)
-        } else {
-            None
         };
 
         // Spawn the child worker host.
@@ -5780,17 +5697,6 @@ impl<FS: ShimFS> Task<FS> {
                     self.pid,
                     _err,
                 );
-                // Clean up mux socketpair on failure.
-                // The worker fd was already closed by the spawn function
-                // (it takes ownership).  Clean up the parent fd.
-                let mux_pfd = fc
-                    .vfork_done
-                    .mux_parent_fd
-                    .swap(-1, core::sync::atomic::Ordering::Relaxed);
-                if mux_pfd >= 0 {
-                    self.global.platform.close_host_fd(mux_pfd);
-                }
-                fc.vfork_done.mux_parent_streams.lock().clear();
                 // Clean up parent-side OS pipe FDs on failure.
                 for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
                     self.global.platform.close_host_fd(pr.host_fd);

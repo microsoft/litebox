@@ -99,9 +99,6 @@ pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
 pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
 impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
-#[derive(Clone)]
-pub(crate) struct MuxPtySlaveFd;
-
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     #[cfg(debug_assertions)]
@@ -351,110 +348,6 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         // Install the ExternalFd FD at the same guest fd number.
         let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
         debug_assert!(ok, "install_external_fd: slot {guest_fd} still occupied");
-    }
-
-    /// Install a virtual pipe FD for a multiplexer stream endpoint.
-    ///
-    /// Called by the runner after `restore_process` to replace the restored
-    /// virtual fd at `guest_fd` with the given pipe endpoint (half of a new
-    /// virtual pipe pair whose other half is connected to the mux dispatcher).
-    pub fn install_mux_pipe_fd(
-        &self,
-        guest_fd: usize,
-        pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
-    ) {
-        self.install_mux_pipe_fd_with_pty_metadata(guest_fd, pipe_fd, false);
-    }
-
-    /// Install a virtual pipe endpoint that represents a fork-restored PTY slave.
-    pub fn install_mux_pty_slave_fd(
-        &self,
-        guest_fd: usize,
-        pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
-    ) {
-        self.install_mux_pipe_fd_with_pty_metadata(guest_fd, pipe_fd, true);
-    }
-
-    fn install_mux_pipe_fd_with_pty_metadata(
-        &self,
-        guest_fd: usize,
-        pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
-        is_pty_slave: bool,
-    ) {
-        if is_pty_slave {
-            self.task
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .set_entry_metadata(&pipe_fd, MuxPtySlaveFd);
-            if let Some(pgid) = self
-                .task
-                .global
-                .litebox
-                .process_registry()
-                .get_pgid(self.task.process_id)
-            {
-                self.task.global.ensure_pgrp_signal_subscription(pgid.0);
-            }
-        }
-
-        let files = self.task.files.borrow();
-        let mut rds = files.raw_descriptor_store.write();
-
-        // Consume the existing entry at this slot.
-        if let Ok(old_pipe) =
-            rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(guest_fd)
-        {
-            drop(rds);
-            let _ = self.task.global.pipes.close(&old_pipe);
-            rds = files.raw_descriptor_store.write();
-        } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
-            drop(rds);
-            let _ = files.fs.close(&old_fs);
-            rds = files.raw_descriptor_store.write();
-        } else if let Ok(old_sock) =
-            rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
-        {
-            drop(rds);
-            let _ = self
-                .task
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .remove(&old_sock);
-            rds = files.raw_descriptor_store.write();
-        } else if let Ok(old_broker_pipe) =
-            rds.fd_consume_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(guest_fd)
-        {
-            drop(rds);
-            let _ = self
-                .task
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .remove(&old_broker_pipe);
-            rds = files.raw_descriptor_store.write();
-        } else if let Ok(old_host) =
-            rds.fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
-        {
-            drop(rds);
-            let entry = self
-                .task
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .remove(&old_host);
-            if let Some(entry) = entry {
-                let host_fd = entry.take_fd();
-                if host_fd >= 0 {
-                    self.task.global.platform.close_host_fd(host_fd);
-                }
-            }
-            rds = files.raw_descriptor_store.write();
-        }
-
-        let ok = rds.fd_into_specific_raw_integer(pipe_fd, guest_fd);
-        debug_assert!(ok, "install_mux_pipe_fd: slot {guest_fd} still occupied");
     }
 
     /// Install a broker-backed shim fd entry at `guest_fd`, materializing
@@ -5282,8 +5175,7 @@ enum ReplacedSubsystem {
 /// Describes a single fd endpoint that should be replaced with a host OS
 /// pipe after the delayed-fork child has been migrated.
 ///
-/// Used by the exec-on-remote-host path.  The fork-restore path uses the
-/// stream multiplexer instead (see [`MuxParentStream`]).
+/// Used by the exec-on-remote-host path.
 #[derive(Debug, Clone)]
 struct FdReplacement {
     /// The guest FD number to replace.
@@ -5324,35 +5216,6 @@ struct BrokerSocketPairParentInstall {
     dup_before_install: bool,
 }
 
-/// Describes a single stream in the multiplexer that the parent dispatcher
-/// must service after the fork-restore child has been migrated.
-struct MuxParentStream {
-    /// Stream ID matching the child's `--mux-stream` argument.
-    stream_id: u32,
-    /// The guest FD number whose virtual endpoint is replaced with a new pipe.
-    /// For virtual pipe/socket streams, this is the parent's fd that gets a new
-    /// virtual pipe endpoint.  For host-backed streams, this is the child's
-    /// guest fd (informational only — no parent fd replacement occurs).
-    guest_fd: usize,
-    /// Read = parent reads (child writes, WorkerToParent).
-    /// Write = parent writes (child reads, ParentToWorker).
-    direction: syscalls::external_fd::ExternalFdDirection,
-    /// Which virtual subsystem owned the original fd.
-    #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
-    subsystem: ReplacedSubsystem,
-    /// Data drained from the virtual channel before migration.
-    /// Sent as the first mux message(s) when the parent dispatcher starts.
-    drained_data: Vec<u8>,
-    /// For external fds from prior bridges: the raw OS fd to relay.
-    /// The parent dispatcher bridges between this fd and the mux.
-    /// -1 for virtual pipe/socket streams (parent creates a new virtual pipe).
-    external_fd_fd: i32,
-    /// When true, the parent's existing pipe at `guest_fd` is used directly
-    /// by the dispatcher (nested fork case — one-sided pipe, other end is in
-    /// the parent's own mux dispatcher).  The fd table entry is NOT replaced.
-    use_existing_pipe: bool,
-}
-
 struct VforkDone {
     done: core::sync::atomic::AtomicBool,
     completion: core::sync::atomic::AtomicU8,
@@ -5362,17 +5225,6 @@ struct VforkDone {
     /// FD replacements the parent should apply after VforkDone is signaled.
     /// Filled by `commit_delayed_fork` (exec path), consumed by `do_fork` after resume.
     fd_replacements: litebox::sync::Mutex<Platform, Vec<FdReplacement>>,
-    /// Parent's end of the multiplexer socketpair.  -1 if no mux is active.
-    /// Filled by `commit_delayed_fork` (fork-restore path).
-    mux_parent_fd: core::sync::atomic::AtomicI32,
-    /// Stream mappings for the parent mux dispatcher.
-    mux_parent_streams: litebox::sync::Mutex<Platform, Vec<MuxParentStream>>,
-    /// Stream IDs with no parent counterpart (broken pipe).
-    /// The parent dispatcher sends RESET for these at startup.
-    /// Each entry is (stream_id, drained_data): for orphan read-end pipes
-    /// where data was buffered before migration, the drained bytes are
-    /// sent as DATA messages before the RESET so the worker doesn't lose them.
-    mux_orphan_streams: litebox::sync::Mutex<Platform, Vec<(u32, Vec<u8>)>>,
     /// Broker socketpair endpoints that should replace parent-side UnixSocket
     /// peers after a fork-restore child migrates the other endpoint.
     broker_socketpair_parent_installs:
@@ -5386,9 +5238,6 @@ impl VforkDone {
             completion: core::sync::atomic::AtomicU8::new(0),
             parent_waker,
             fd_replacements: litebox::sync::Mutex::new(Vec::new()),
-            mux_parent_fd: core::sync::atomic::AtomicI32::new(-1),
-            mux_parent_streams: litebox::sync::Mutex::new(Vec::new()),
-            mux_orphan_streams: litebox::sync::Mutex::new(Vec::new()),
             broker_socketpair_parent_installs: litebox::sync::Mutex::new(Vec::new()),
         }
     }

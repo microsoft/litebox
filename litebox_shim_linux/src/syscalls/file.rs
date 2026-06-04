@@ -7858,62 +7858,7 @@ impl<FS: ShimFS> Task<FS> {
                     },
                     #[cfg(feature = "worker_local_inet")]
                     crate::RawFdRef::Net(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
-                    crate::RawFdRef::Pipes(pipe_fd) => {
-                        let is_mux_pty = self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .with_metadata(pipe_fd, |_: &crate::MuxPtySlaveFd| ())
-                            .is_ok();
-                        if !is_mux_pty {
-                            return Err(Errno::ENOTTY);
-                        }
-
-                        // reason: unsupported variants intentionally share this fallback path.
-                        #[allow(clippy::wildcard_enum_match_arm)]
-                        match arg {
-                            IoctlArg::TIOCGPGRP(pgrp) => {
-                                pgrp.write_at_offset(0, self.pid).ok_or(Errno::EFAULT)?;
-                                Ok(0)
-                            }
-                            IoctlArg::TIOCSPGRP(pgrp) => {
-                                let pgrp: i32 = pgrp.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                                if pgrp <= 0 {
-                                    return Err(Errno::EINVAL);
-                                }
-                                if let Ok(pgid) = u32::try_from(pgrp) {
-                                    self.global.ensure_pgrp_signal_subscription(pgid);
-                                }
-                                Ok(0)
-                            }
-                            IoctlArg::TIOCSCTTY => {
-                                if let Some(pgid) = self
-                                    .global
-                                    .litebox
-                                    .process_registry()
-                                    .get_pgid(self.process_id)
-                                {
-                                    self.global.ensure_pgrp_signal_subscription(pgid.0);
-                                }
-                                Ok(0)
-                            }
-                            IoctlArg::TIOCGWINSZ(ws) => {
-                                ws.write_at_offset(
-                                    0,
-                                    litebox_common_linux::Winsize {
-                                        row: 41,
-                                        col: 132,
-                                        xpixel: 0,
-                                        ypixel: 0,
-                                    },
-                                )
-                                .ok_or(Errno::EFAULT)?;
-                                Ok(0)
-                            }
-                            IoctlArg::TIOCSWINSZ(_) => Ok(0),
-                            _ => Err(Errno::ENOTTY),
-                        }
-                    }
+                    crate::RawFdRef::Pipes(_pipe_fd) => Err(Errno::ENOTTY),
                     crate::RawFdRef::Eventfd(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::Epoll(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
                     crate::RawFdRef::Unix(_fd) => Err(Errno::ENOTTY), // real Linux: ENOTTY for this ioctl on non-tty fd
