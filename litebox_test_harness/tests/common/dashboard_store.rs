@@ -377,11 +377,8 @@ fn insert_run_row(conn: &Connection) -> i64 {
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| git_capture(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|s| s != "HEAD"));
-    let worktree_path = std::env::var("LITEBOX_DASHBOARD_WORKTREE_PATH")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| git_capture(&["rev-parse", "--show-toplevel"]))
-        .unwrap_or_else(|| "unknown".to_string());
+    let worktree_path =
+        git_capture(&["rev-parse", "--show-toplevel"]).unwrap_or_else(|| "unknown".to_string());
     let dirty_status = git_capture(&["status", "--porcelain"]).unwrap_or_default();
     let dirty_hash = if dirty_status.is_empty() {
         None
