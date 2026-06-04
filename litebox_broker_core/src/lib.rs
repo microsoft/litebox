@@ -31,10 +31,7 @@ pub use identity::{BrokerAssociation, CallerCredential};
 use litebox_broker_protocol::ObjectReferenceId;
 use object::{ObjectEntry, ObjectId, ObjectReference};
 pub use object::{ObjectRights, ObjectType};
-pub use policy::{
-    DefaultDenyPolicy, EventOnlyPolicy, ObjectOperation, PolicyDecision, PolicyEngine,
-    PolicyOperation,
-};
+pub use policy::{ObjectOperation, PolicyDecision, PolicyEngine, PolicyOperation, PolicyProfile};
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -72,9 +69,9 @@ impl Default for BrokerCoreLimits {
 }
 
 /// Channel-independent broker authority state.
-pub struct BrokerCore<P> {
+pub struct BrokerCore {
     core_id: BrokerCoreId,
-    policy: P,
+    policy: PolicyEngine,
     limits: BrokerCoreLimits,
     next_process_id: u64,
     next_object_id: u64,
@@ -83,14 +80,14 @@ pub struct BrokerCore<P> {
     references: BTreeMap<ObjectReferenceId, ObjectReference>,
 }
 
-impl<P> BrokerCore<P> {
+impl BrokerCore {
     /// Creates a broker core with the provided policy engine.
-    pub fn new(policy: P) -> Self {
+    pub fn new(policy: PolicyEngine) -> Self {
         Self::new_with_limits(policy, BrokerCoreLimits::DEFAULT)
     }
 
     /// Creates a broker core with explicit authority-state limits.
-    pub fn new_with_limits(policy: P, limits: BrokerCoreLimits) -> Self {
+    pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Self {
         Self {
             core_id: identity::allocate_core_id(),
             policy,

@@ -2,16 +2,14 @@
 // Licensed under the MIT license.
 
 use crate::object::{ObjectId, ObjectKind};
-use crate::{
-    BrokerAssociation, BrokerCore, BrokerError, ObjectRights, ObjectType, PolicyEngine, Result,
-};
+use crate::{BrokerAssociation, BrokerCore, BrokerError, ObjectRights, ObjectType, Result};
 use litebox_broker_protocol::{
     EventConsumeMode, EventConsumption, ObjectHandle, ReadinessState, WaitOutcome,
 };
 
 const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
 
-impl<P: PolicyEngine> BrokerCore<P> {
+impl BrokerCore {
     /// Creates a broker-owned event object.
     pub fn create_event(&mut self, association: &BrokerAssociation) -> Result<ObjectHandle> {
         self.create_event_with_count(association, 0)
@@ -169,15 +167,12 @@ impl EventObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        BrokerCore, CallerCredential, EventOnlyPolicy, ObjectOperation, PolicyDecision,
-        PolicyEngine, PolicyOperation,
-    };
+    use crate::{BrokerCore, CallerCredential, PolicyEngine};
     use litebox_broker_protocol::ObjectReferenceGeneration;
 
     #[test]
     fn wait_rejects_invalid_references_with_expected_errors() {
-        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let mut core = BrokerCore::new(PolicyEngine::event_only());
         let association = core
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
@@ -217,7 +212,9 @@ mod tests {
 
     #[test]
     fn create_event_uses_policy_granted_reference_rights() {
-        let mut core = BrokerCore::new(WaitOnlyCreatePolicy);
+        let mut core = BrokerCore::new(PolicyEngine::event_only_with_reference_rights(
+            ObjectRights::WAIT,
+        ));
         let association = core
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
@@ -236,7 +233,9 @@ mod tests {
 
     #[test]
     fn event_readiness_state_only_reports_authorized_directions() {
-        let mut core = BrokerCore::new(WaitOnlyCreatePolicy);
+        let mut core = BrokerCore::new(PolicyEngine::event_only_with_reference_rights(
+            ObjectRights::WAIT,
+        ));
         let association = core
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
@@ -277,26 +276,5 @@ mod tests {
         );
         assert_eq!(event.count, 1);
         assert_eq!(event.readiness_generation, u64::MAX);
-    }
-
-    struct WaitOnlyCreatePolicy;
-
-    impl PolicyEngine for WaitOnlyCreatePolicy {
-        fn authorize(&mut self, operation: PolicyOperation) -> Result<PolicyDecision> {
-            match operation {
-                PolicyOperation::Object {
-                    object_type: ObjectType::Event,
-                    operation: ObjectOperation::Create,
-                    ..
-                } => Ok(PolicyDecision::GrantObjectReference {
-                    rights: ObjectRights::WAIT,
-                }),
-                PolicyOperation::Object {
-                    object_type: ObjectType::Event,
-                    operation: ObjectOperation::Use { .. },
-                    ..
-                } => Ok(PolicyDecision::Authorized),
-            }
-        }
     }
 }

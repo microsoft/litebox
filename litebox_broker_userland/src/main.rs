@@ -9,7 +9,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::{BrokerCore, EventOnlyPolicy};
+use litebox_broker_core::{BrokerCore, PolicyEngine};
 use litebox_broker_host::{BrokerServeError, serve_connection};
 use litebox_broker_transport::unix_socket::UnixStreamServerControlChannel;
 
@@ -22,7 +22,7 @@ fn main() -> io::Result<()> {
     let (stream, _) = listener.accept()?;
     let mut channel = UnixStreamServerControlChannel::from_accepted(stream);
     channel.set_io_deadline(Some(Instant::now() + SESSION_TIMEOUT))?;
-    let mut broker = BrokerCore::new(EventOnlyPolicy);
+    let mut broker = BrokerCore::new(PolicyEngine::event_only());
     serve_connection(&mut broker, &mut channel)
         .map(|_| ())
         .map_err(broker_error)

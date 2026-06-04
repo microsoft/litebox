@@ -3,9 +3,7 @@
 
 use core::fmt;
 
-use litebox_broker_core::{
-    BrokerAssociation, BrokerCore, BrokerError, CallerCredential, PolicyEngine,
-};
+use litebox_broker_core::{BrokerAssociation, BrokerCore, BrokerError, CallerCredential};
 use litebox_broker_protocol::{
     AddEventResponse, BrokerRequest, BrokerResponse, CoreRequest, CoreResponse,
     CreateEventResponse, ErrorCode, EventRequest, EventResponse, PeerCredential, ProtocolVersion,
@@ -16,12 +14,11 @@ use litebox_broker_protocol::{
 pub const SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 2);
 
 /// Serves one broker connection over the provided connected control channel.
-pub fn serve_connection<P, T>(
-    core: &mut BrokerCore<P>,
+pub fn serve_connection<T>(
+    core: &mut BrokerCore,
     channel: &mut T,
 ) -> Result<ConnectionTermination, BrokerServeError<T::Error>>
 where
-    P: PolicyEngine,
     T: ServerControlChannel,
 {
     let peer_credential = channel
@@ -38,13 +35,12 @@ where
     result
 }
 
-fn serve_request_loop<P, T>(
-    core: &mut BrokerCore<P>,
+fn serve_request_loop<T>(
+    core: &mut BrokerCore,
     channel: &mut T,
     association: &BrokerAssociation,
 ) -> Result<ConnectionTermination, BrokerServeError<T::Error>>
 where
-    P: PolicyEngine,
     T: ServerControlChannel,
 {
     let mut state = ConnectionState::AwaitingNegotiation;
@@ -73,8 +69,8 @@ fn caller_credential_from_peer(peer_credential: PeerCredential) -> Result<Caller
     }
 }
 
-fn handle_received_request<P: PolicyEngine>(
-    core: &mut BrokerCore<P>,
+fn handle_received_request(
+    core: &mut BrokerCore,
     association: &BrokerAssociation,
     state: &mut ConnectionState,
     received: ReceivedBrokerRequest,
@@ -87,8 +83,8 @@ fn handle_received_request<P: PolicyEngine>(
     }
 }
 
-fn handle_request<P: PolicyEngine>(
-    core: &mut BrokerCore<P>,
+fn handle_request(
+    core: &mut BrokerCore,
     association: &BrokerAssociation,
     state: &mut ConnectionState,
     request: BrokerRequest,
@@ -109,8 +105,8 @@ fn handle_request<P: PolicyEngine>(
     }
 }
 
-fn handle_active_request<P: PolicyEngine>(
-    core: &mut BrokerCore<P>,
+fn handle_active_request(
+    core: &mut BrokerCore,
     association: &BrokerAssociation,
     _negotiated_protocol_version: ProtocolVersion,
     request: BrokerRequest,
@@ -127,8 +123,8 @@ fn handle_active_request<P: PolicyEngine>(
     }
 }
 
-fn handle_core_request<P: PolicyEngine>(
-    core: &mut BrokerCore<P>,
+fn handle_core_request(
+    core: &mut BrokerCore,
     association: &BrokerAssociation,
     request: CoreRequest,
 ) -> BrokerResponse {
@@ -138,8 +134,8 @@ fn handle_core_request<P: PolicyEngine>(
     }
 }
 
-fn handle_event_request<P: PolicyEngine>(
-    core: &mut BrokerCore<P>,
+fn handle_event_request(
+    core: &mut BrokerCore,
     association: &BrokerAssociation,
     request: EventRequest,
 ) -> BrokerResponse {
@@ -318,7 +314,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_core::EventOnlyPolicy;
+    use litebox_broker_core::PolicyEngine;
     use litebox_broker_protocol::CreateEventRequest;
 
     #[test]
@@ -410,7 +406,7 @@ mod tests {
 
     #[test]
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed() {
-        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let mut core = BrokerCore::new(PolicyEngine::event_only());
         let mut channel = FakeServerChannel::new(std::vec::Vec::from([
             Ok(Some(ReceivedBrokerRequest::Request(
                 BrokerRequest::Negotiate {
@@ -444,7 +440,7 @@ mod tests {
 
     #[test]
     fn serve_connection_closes_after_protocol_violation() {
-        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let mut core = BrokerCore::new(PolicyEngine::event_only());
         let mut channel = FakeServerChannel::new(std::vec::Vec::from([
             Ok(Some(ReceivedBrokerRequest::Request(event_create_request(
                 0,
@@ -469,7 +465,7 @@ mod tests {
 
     #[test]
     fn serve_connection_returns_channel_error_when_response_send_fails() {
-        let mut core = BrokerCore::new(EventOnlyPolicy);
+        let mut core = BrokerCore::new(PolicyEngine::event_only());
         let mut channel = FakeServerChannel::new(std::vec::Vec::from([Ok(Some(
             ReceivedBrokerRequest::Request(BrokerRequest::Negotiate {
                 protocol_version: SUPPORTED_PROTOCOL_VERSION,
@@ -495,20 +491,16 @@ mod tests {
         );
     }
 
-    fn new_association() -> (
-        BrokerCore<EventOnlyPolicy>,
-        BrokerAssociation,
-        ConnectionState,
-    ) {
-        let mut core = BrokerCore::new(EventOnlyPolicy);
+    fn new_association() -> (BrokerCore, BrokerAssociation, ConnectionState) {
+        let mut core = BrokerCore::new(PolicyEngine::event_only());
         let association = core
             .create_association(CallerCredential::Unauthenticated)
             .unwrap();
         (core, association, ConnectionState::AwaitingNegotiation)
     }
 
-    fn negotiate<P: PolicyEngine>(
-        core: &mut BrokerCore<P>,
+    fn negotiate(
+        core: &mut BrokerCore,
         association: &BrokerAssociation,
         state: &mut ConnectionState,
     ) {

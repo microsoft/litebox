@@ -289,10 +289,7 @@ impl Drop for TestBroker {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn spawn_test_broker<P>(socket_path: &Path, policy: P) -> TestBroker
-where
-    P: litebox_broker_core::PolicyEngine + Send + 'static,
-{
+fn spawn_test_broker(socket_path: &Path, policy: litebox_broker_core::PolicyEngine) -> TestBroker {
     let _ = std::fs::remove_file(socket_path);
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -345,7 +342,10 @@ where
 #[test]
 fn test_runner_connects_to_broker() {
     let socket_path = unique_test_socket_path("runner-broker");
-    let broker_thread = spawn_test_broker(&socket_path, litebox_broker_core::DefaultDenyPolicy);
+    let broker_thread = spawn_test_broker(
+        &socket_path,
+        litebox_broker_core::PolicyEngine::default_deny(),
+    );
 
     let true_path = run_which("true");
     Runner::new(&true_path, "broker_true_rewriter")
@@ -358,7 +358,10 @@ fn test_runner_connects_to_broker() {
 #[test]
 fn test_broker_backed_eventfd_with_rewriter() {
     let socket_path = unique_test_socket_path("broker-eventfd");
-    let broker_thread = spawn_test_broker(&socket_path, litebox_broker_core::EventOnlyPolicy);
+    let broker_thread = spawn_test_broker(
+        &socket_path,
+        litebox_broker_core::PolicyEngine::event_only(),
+    );
     let target = common::compile("./tests/eventfd.c", "broker_eventfd_rewriter", false, false);
 
     Runner::new(&target, "broker_eventfd_rewriter")

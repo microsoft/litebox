@@ -113,7 +113,7 @@ impl BrokerAssociation {
     }
 }
 
-impl<P> BrokerCore<P> {
+impl BrokerCore {
     /// Allocates broker authority state for one authenticated caller association.
     pub fn create_association(
         &mut self,
@@ -135,11 +135,11 @@ impl<P> BrokerCore<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DefaultDenyPolicy;
+    use crate::PolicyEngine;
 
     #[test]
     fn create_association_assigns_distinct_identities_and_preserves_credential() {
-        let mut core = BrokerCore::new(DefaultDenyPolicy);
+        let mut core = BrokerCore::new(PolicyEngine::default_deny());
 
         let first = core
             .create_association(CallerCredential::Unauthenticated)
@@ -158,8 +158,8 @@ mod tests {
 
     #[test]
     fn create_association_scopes_identity_to_core_instance() {
-        let mut first_core = BrokerCore::new(DefaultDenyPolicy);
-        let mut second_core = BrokerCore::new(DefaultDenyPolicy);
+        let mut first_core = BrokerCore::new(PolicyEngine::default_deny());
+        let mut second_core = BrokerCore::new(PolicyEngine::default_deny());
 
         let first = first_core
             .create_association(CallerCredential::Unauthenticated)
