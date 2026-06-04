@@ -2799,6 +2799,12 @@ impl<FS: ShimFS> Task<FS> {
         self.files.borrow().fs.free_fid_number(fid);
     }
 
+    /// Issue a real close/clunk for a server-visible 9P fid that failed to
+    /// become a guest descriptor.
+    pub(crate) fn fs_clunk_fid_number(&self, fid: u32) {
+        self.files.borrow().fs.clunk_fid_number(fid);
+    }
+
     pub(crate) fn install_brokerfile_bridge_fd_by_fid(
         &self,
         guest_fd: usize,

@@ -37,8 +37,7 @@ pub fn install_with_path(process_label: &'static str, path: impl Into<PathBuf>) 
 
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let bt = std::backtrace::Backtrace::force_capture();
         let location = info.location().map_or_else(
             || "<unknown>".to_string(),

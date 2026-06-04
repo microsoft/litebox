@@ -44,8 +44,8 @@ fn open_from_env() -> Option<RawFd> {
         // process and reaches the test's stderr log.
         let errno = std::io::Error::last_os_error();
         eprintln!(
-            "[litebox_timing] open({:?}) failed: {errno}",
-            std::path::Path::new(std::ffi::OsStr::new(&path))
+            "[litebox_timing] open({}) failed: {errno}",
+            std::path::Path::new(std::ffi::OsStr::new(&path)).display()
         );
         None
     } else {

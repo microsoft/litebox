@@ -115,6 +115,14 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn free_fid_number(&self, fid: u32) {}
 
+    /// Issue a real close/clunk for an externally installed fid that was
+    /// already made visible to the backing server but could not be wrapped in a
+    /// guest descriptor.
+    ///
+    /// No-op by default.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn clunk_fid_number(&self, fid: u32) {}
+
     /// Wrap an externally installed 9P fid in a guest descriptor.
     ///
     /// See [`crate::fs::nine_p::FileSystem::wrap_existing_fid`] for the

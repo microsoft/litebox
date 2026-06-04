@@ -543,21 +543,29 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
         })?;
         let path = decode_brokerfile_bridge_path(parts[4])?;
 
+        let provider = litebox_shim_linux::syscalls::broker_fs_provider().ok_or_else(|| {
+            anyhow!("broker-fd-bridge: fs_fid {spec:?}: no broker_fs_provider registered")
+        })?;
+
         let new_fid = entrypoints
             .fs_allocate_fid_number()
             .map_err(|err| anyhow!("broker-fd-bridge: fs_fid allocate {spec:?}: {err:?}"))?;
 
-        let provider = litebox_shim_linux::syscalls::broker_fs_provider().ok_or_else(|| {
-            anyhow!("broker-fd-bridge: fs_fid {spec:?}: no broker_fs_provider registered")
-        })?;
         if let Err(e) = provider.clone_ofd(open_file_id, new_fid) {
             entrypoints.fs_free_fid_number(new_fid);
             anyhow::bail!("broker-fd-bridge: fs_fid {spec:?}: clone_ofd: {e:?}");
         }
 
-        return entrypoints
-            .install_brokerfile_bridge_fd_by_fid(guest_fd, new_fid, &path, 0, status_flags_bits)
-            .map_err(|err| anyhow!("broker-fd-bridge: fs_fid install {spec:?}: {err:?}"));
+        let install_result = entrypoints.install_brokerfile_bridge_fd_by_fid(
+            guest_fd,
+            new_fid,
+            &path,
+            0,
+            status_flags_bits,
+        );
+        return cleanup_cloned_fs_fid_after_install_result(spec, new_fid, install_result, |fid| {
+            entrypoints.fs_clunk_fid_number(fid);
+        });
     }
 
     if parts.get(1) == Some(&"timerfd") && parts.len() == 10 {
@@ -1549,6 +1557,72 @@ fn set_broker_fd_bridge_caller_pid_scope(
         .map(litebox_common_linux::fd_token_client::set_caller_pid_scope)
 }
 
+fn install_broker_fd_bridge_specs_and_ack_with<F>(
+    task_params: litebox_common_linux::TaskParams,
+    specs: &[String],
+    ack_fd: i32,
+    mut install_spec: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
+    for spec in specs {
+        if let Err(err) = install_spec(spec) {
+            let _ = write_fork_restore_ack_status(
+                ack_fd,
+                litebox_common_linux::errno::Errno::EIO.as_neg(),
+            );
+            return Err(err.context("fork-restore broker-fd-bridge install failed before ack"));
+        }
+    }
+    write_fork_restore_ack_status(ack_fd, 0)
+}
+
+fn fork_restore_task_params(
+    identity: &litebox_shim_linux::syscalls::fork_snapshot::ProcessIdentitySnapshot,
+) -> litebox_common_linux::TaskParams {
+    litebox_common_linux::TaskParams {
+        pid: identity.pid,
+        ppid: identity.ppid,
+        uid: identity.credentials.uid,
+        euid: identity.credentials.euid,
+        gid: identity.credentials.gid,
+        egid: identity.credentials.egid,
+    }
+}
+
+fn write_fork_restore_ack_status(ack_fd: i32, status: i32) -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    // SAFETY: `ack_fd` is a live fork-restore ack fd transferred to this
+    // helper, and this helper takes ownership so the fd is closed after write.
+    let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
+    ack_file.write_all(&status.to_le_bytes())?;
+    Ok(())
+}
+
+fn cleanup_cloned_fs_fid_after_install_result<F>(
+    spec: &str,
+    new_fid: u32,
+    install_result: Result<(), litebox_common_linux::errno::Errno>,
+    clunk_fid: F,
+) -> Result<()>
+where
+    F: FnOnce(u32),
+{
+    match install_result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            clunk_fid(new_fid);
+            Err(anyhow!(
+                "broker-fd-bridge: fs_fid {spec:?}: install: {err:?}"
+            ))
+        }
+    }
+}
+
 fn worker_task_params(cli_args: &CliArgs) -> litebox_common_linux::TaskParams {
     let pid: i32 = cli_args.guest_pid.unwrap_or(1);
     let ppid: i32 = cli_args.guest_ppid.unwrap_or(0);
@@ -1849,6 +1923,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             ack_fd,
             &pipe_bridges,
             &local_pipes,
+            &cli_args.broker_fd_bridge,
         )?;
 
         // Re-register inherited listen ports through this worker's IPC.
@@ -1873,6 +1948,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             ack_fd,
             &pipe_bridges,
             &local_pipes,
+            &cli_args.broker_fd_bridge,
         )?;
         run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
     }
@@ -1969,9 +2045,9 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     ack_fd: i32,
     pipe_bridges: &[PipeBridgeSpec],
     local_pipes: &[LocalPipeSpec],
+    broker_fd_bridge_specs: &[String],
 ) -> Result<litebox_shim_linux::LoadedProgram<FS>> {
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
+    let broker_fd_bridge_task_params = fork_restore_task_params(&snapshot.identity);
 
     match shim.restore_process(snapshot, fs) {
         Ok(program) => {
@@ -2172,17 +2248,19 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                 }
             }
 
-            // Verify local pipe data before starting guest.
-            // Report successful restore to parent via ack pipe.
-            let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
-            ack_file.write_all(&0i32.to_le_bytes())?;
+            // Install migrated broker-direct handles before acking the parent;
+            // the parent releases transit refs as soon as it reads the ack.
+            install_broker_fd_bridge_specs_and_ack_with(
+                broker_fd_bridge_task_params,
+                broker_fd_bridge_specs,
+                ack_fd,
+                |spec| install_broker_fd_bridge_spec(&program.entrypoints, spec),
+            )?;
             Ok(program)
         }
         Err(e) => {
             // Report failure to parent via ack pipe.
-            let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
-            let _ = ack_file.write_all(&e.as_neg().to_le_bytes());
-            drop(ack_file);
+            let _ = write_fork_restore_ack_status(ack_fd, e.as_neg());
             anyhow::bail!("fork-restore failed: {e:?}");
         }
     }
@@ -3339,6 +3417,98 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fork_restore_broker_fd_bridge_installs_before_success_ack_with_restored_pid_scope() {
+        use std::io::Read as _;
+        use std::os::fd::IntoRawFd as _;
+        use std::sync::{Arc, Mutex};
+
+        let (mut ack_reader, ack_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let specs = vec!["7:tcp_conn:42".to_string()];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_install = seen.clone();
+        let outer_guard = litebox_common_linux::fd_token_client::set_caller_pid_scope(77);
+
+        install_broker_fd_bridge_specs_and_ack_with(
+            litebox_common_linux::TaskParams {
+                pid: 123,
+                ppid: 1,
+                uid: 0,
+                euid: 0,
+                gid: 0,
+                egid: 0,
+            },
+            &specs,
+            ack_writer.into_raw_fd(),
+            |spec| {
+                assert_eq!(
+                    litebox_common_linux::fd_token_client::current_caller_pid(),
+                    123
+                );
+                seen_for_install.lock().unwrap().push(spec.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let mut ack = [0u8; 4];
+        ack_reader.read_exact(&mut ack).unwrap();
+        assert_eq!(i32::from_le_bytes(ack), 0);
+        assert_eq!(seen.lock().unwrap().as_slice(), specs.as_slice());
+        drop(outer_guard);
+    }
+
+    #[test]
+    fn fork_restore_broker_fd_bridge_install_error_writes_failed_ack() {
+        use std::io::Read as _;
+        use std::os::fd::IntoRawFd as _;
+        use std::sync::{Arc, Mutex};
+
+        let (mut ack_reader, ack_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let specs = vec!["7:tcp_conn:42".to_string()];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_install = seen.clone();
+
+        let result = install_broker_fd_bridge_specs_and_ack_with(
+            litebox_common_linux::TaskParams {
+                pid: 123,
+                ppid: 1,
+                uid: 0,
+                euid: 0,
+                gid: 0,
+                egid: 0,
+            },
+            &specs,
+            ack_writer.into_raw_fd(),
+            |spec| {
+                seen_for_install.lock().unwrap().push(spec.to_string());
+                anyhow::bail!("injected install failure")
+            },
+        );
+
+        assert!(result.is_err());
+        let mut ack = [0u8; 4];
+        ack_reader.read_exact(&mut ack).unwrap();
+        assert_ne!(i32::from_le_bytes(ack), 0);
+        assert_eq!(seen.lock().unwrap().as_slice(), specs.as_slice());
+    }
+
+    #[test]
+    fn fs_fid_post_clone_install_failure_clunks_cloned_fid() {
+        let clunked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let clunked_for_cleanup = clunked.clone();
+
+        let result = cleanup_cloned_fs_fid_after_install_result(
+            "9:fs_fid:11:0:2f",
+            55,
+            Err(litebox_common_linux::errno::Errno::EIO),
+            move |fid| clunked_for_cleanup.lock().unwrap().push(fid),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(clunked.lock().unwrap().as_slice(), &[55]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn initial_exec_path_canonicalizes_without_nine_p() {
@@ -3530,12 +3700,8 @@ mod tests {
     /// integration cycles + parent-thread bisect.
     ///
     /// This test catches a future regression at unit-test time by
-    /// asserting (a) thread count didn't grow, and (b) the global
-    /// broker eventfd provider remains uninstalled, so `sys_eventfd2`
-    /// continues to take the local-fallback path. The full
-    /// cross-worker eventfd SCM_RIGHTS path is gated on a future
-    /// step (`b-step12-dispatcher-forksafe`) that makes broker state
-    /// fork-safe.
+    /// asserting that thread count didn't grow after setup tears down its
+    /// temporary notification-ring bootstrap state.
     #[test]
     fn setup_broker_eventfd_provider_leaves_no_long_lived_state() {
         use litebox_broker::fd_token_socket::spawn_control_listener;
@@ -3551,11 +3717,14 @@ mod tests {
         let fd_registry = Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = Arc::new(BrokerStateRegistry::new());
         let process_registry = Arc::new(BrokerStateRegistry::new());
+        let inotify_dispatcher =
+            Arc::new(litebox_broker::inotify_dispatcher::InotifyDispatcher::new());
         let _listener = spawn_control_listener(
             &path,
             Arc::clone(&fd_registry),
             Arc::clone(&state_registry),
             Arc::clone(&process_registry),
+            inotify_dispatcher,
         )
         .expect("spawn listener");
 
@@ -3588,14 +3757,6 @@ mod tests {
             after <= baseline,
             "setup_broker_eventfd_provider must not spawn a runner-side reader thread \
              (baseline={baseline}, after={after}); see fork-restore safety comment",
-        );
-
-        // Provider must NOT be installed; sys_eventfd2 must fall back
-        // to local EventFile::new.
-        assert!(
-            litebox_shim_linux::syscalls::broker_eventfd_provider().is_none(),
-            "broker eventfd provider must not be installed; cross-worker broker-backed \
-             eventfd transfer is gated on Step 12 (fork-safe broker state)",
         );
     }
 
