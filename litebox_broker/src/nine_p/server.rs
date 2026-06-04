@@ -38,6 +38,10 @@ use super::transport::{self, Read, Write};
 use crate::inotify_dispatcher::InotifyDispatcher;
 use crate::policy::{Action, Decision, Policy};
 
+#[cfg(test)]
+static REGISTER_FID_BEFORE_WRITE_LOCK_HOOK: Mutex<Option<Arc<std::sync::Barrier>>> =
+    Mutex::new(None);
+
 /// Maximum number of FIDs per connection to prevent resource exhaustion.
 const MAX_FIDS: usize = 8192;
 const IN_MODIFY: u32 = 0x0000_0002;
@@ -245,6 +249,14 @@ impl Server {
             }
             state.path.clone()
         };
+        #[cfg(test)]
+        if let Some(barrier) = {
+            mutex_lock(&REGISTER_FID_BEFORE_WRITE_LOCK_HOOK, "register_hook")
+                .as_ref()
+                .cloned()
+        } {
+            barrier.wait();
+        }
         // Acquire write lock to set the id atomically with the
         // registry insertion. The file reference is read again
         // under the write lock to avoid races with a concurrent
@@ -282,6 +294,17 @@ impl Server {
         id: crate::ofd_registry::OpenFileId,
         new_fid: u32,
     ) -> Result<(), u32> {
+        self.clone_ofd_into_fid_with_qid(id, new_fid, |file| {
+            file.metadata().map(|meta| metadata_to_qid(&meta))
+        })
+    }
+
+    fn clone_ofd_into_fid_with_qid(
+        &self,
+        id: crate::ofd_registry::OpenFileId,
+        new_fid: u32,
+        qid_for: impl FnOnce(&fs::File) -> std::io::Result<fcall::Qid>,
+    ) -> Result<(), u32> {
         let registry = self.ofd_registry.as_ref().ok_or(libc::ENOTSUP as u32)?;
         let cloned = registry.clone_for(id).map_err(|e| match e {
             crate::ofd_registry::OfdRegistryError::UnknownId => libc::EBADF as u32,
@@ -289,8 +312,8 @@ impl Server {
         })?;
         // Synthesize a Qid from the cloned file's metadata so the
         // worker sees a consistent type bit.
-        let qid = match cloned.file.metadata() {
-            Ok(meta) => metadata_to_qid(&meta),
+        let qid = match qid_for(&cloned.file) {
+            Ok(qid) => qid,
             Err(_) => return Err(libc::EIO as u32),
         };
         let new_state = FidState {
@@ -2582,6 +2605,129 @@ impl OwnedRequest {
             Fcall::Treadlink(r) => OwnedRequest::Readlink { fid: r.fid },
             _ => OwnedRequest::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, Write};
+    use std::thread;
+
+    fn temp_root() -> tempfile::TempDir {
+        let base = std::env::current_dir()
+            .expect("current dir")
+            .join("target/litebox_broker_server_tests");
+        fs::create_dir_all(&base).expect("create test temp base");
+        tempfile::Builder::new()
+            .prefix("server-")
+            .tempdir_in(base)
+            .expect("tempdir")
+    }
+
+    fn server_with_registry(
+        root: PathBuf,
+        registry: Arc<crate::ofd_registry::OfdRegistry>,
+    ) -> Server {
+        let mut server = Server::new(
+            root,
+            Arc::new(crate::policy::AllowAllPolicy),
+            false,
+            Arc::new(InotifyDispatcher::new()),
+        );
+        server.set_ofd_registry(registry);
+        server
+    }
+
+    fn insert_open_fid(server: &Server, fid: u32, path: &Path) {
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open fid file");
+        file.write_all(b"data").expect("seed fid file");
+        let qid = metadata_to_qid(&file.metadata().expect("fid metadata"));
+        let state = FidState {
+            path: path.to_path_buf(),
+            readlink_path: None,
+            file: Some(file),
+            patched_data: None,
+            patched_offset: 0,
+            qid,
+            is_open: true,
+            is_canonical: true,
+            open_file_id: None,
+        };
+        write_lock(&server.fids, "fids").insert(fid, Arc::new(RwLock::new(state)));
+    }
+
+    #[test]
+    fn register_racing_clunk_does_not_leave_orphan_registry_entries() {
+        const N: usize = 16;
+
+        let root = temp_root();
+        let registry = Arc::new(crate::ofd_registry::OfdRegistry::new());
+        let server = Arc::new(server_with_registry(
+            root.path().to_path_buf(),
+            Arc::clone(&registry),
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(N + 1));
+        *mutex_lock(&REGISTER_FID_BEFORE_WRITE_LOCK_HOOK, "register_hook") =
+            Some(Arc::clone(&barrier));
+
+        for i in 0..N {
+            let path = root.path().join(format!("fid-{i}"));
+            fs::write(&path, b"").expect("create fid file");
+            insert_open_fid(&server, i as u32, &path);
+        }
+
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.register_fid_in_ofd_registry(i as u32))
+            })
+            .collect();
+
+        barrier.wait();
+        for i in 0..N {
+            assert!(matches!(
+                server.handle_clunk(fcall::Tclunk { fid: i as u32 }),
+                Fcall::Rclunk(_)
+            ));
+        }
+        *mutex_lock(&REGISTER_FID_BEFORE_WRITE_LOCK_HOOK, "register_hook") = None;
+
+        for handle in handles {
+            let _ = handle.join().expect("register thread join");
+        }
+        assert_eq!(registry.len(), 0, "clunk/register race leaked OFD entries");
+    }
+
+    #[test]
+    fn clone_ofd_metadata_error_releases_refcount() {
+        let root = temp_root();
+        let registry = Arc::new(crate::ofd_registry::OfdRegistry::new());
+        let server = server_with_registry(root.path().to_path_buf(), Arc::clone(&registry));
+        let path = root.path().join("parent");
+        fs::write(&path, b"data").expect("create parent file");
+        let parent = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open parent");
+        let id = registry.register(&parent, &path).expect("register parent");
+        assert_eq!(registry.refcount_of(id), Some(1));
+
+        let err = server
+            .clone_ofd_into_fid_with_qid(id, 42, |_| Err(Error::from_raw_os_error(libc::EBADF)))
+            .expect_err("metadata failure should return EIO");
+
+        assert_eq!(err, libc::EIO as u32);
+        assert_eq!(
+            registry.refcount_of(id),
+            Some(1),
+            "failed metadata must release clone_for refcount"
+        );
     }
 }
 
