@@ -97,22 +97,31 @@ where
     /// check, triggers a PROTOCOL VIOLATION that closes the broker
     /// conn).
     ///
-    /// PE.13 (2026-05-18) fixed a violation of this invariant in the
-    /// fork-snapshot restore path at lib.rs:1573 (now correctly calls
-    /// dup_handle). Other construction sites:
-    /// - file.rs:4812 (sys_pipe2): `create_pipe` provides the
-    ///   refcount=1 baseline; no additional dup needed.
-    /// - lib.rs:285 (install_broker_bridge_fd): explicit dup_handle
-    ///   call before construction.
-    /// - process.rs D5-vpipe parent install: `create_pipe` provides
-    ///   the first parent end's refcount; additional parent aliases
-    ///   call `dup_handle` before construction.
+    /// Current construction sites and their refcount pairing:
+    /// - `syscalls/file.rs` `sys_pipe2`: `create_pipe` returns each end with
+    ///   refcount=1; the read and write `BrokerPipeFd`s consume those baselines.
+    /// - `syscalls/net.rs` NETLINK sentinel: `create_pipe` returns refcount=1;
+    ///   the unused write end is released immediately and the read fd consumes
+    ///   the read baseline.
+    /// - `LinuxShimEntrypoints::install_broker_bridge_fd` in `lib.rs`: calls
+    ///   `dup_handle` before constructing the receiving fd-table slot.
+    /// - fork-snapshot restore in `lib.rs`: calls `dup_handle` before creating
+    ///   the child-side restored `BrokerPipeFd`.
+    /// - SCM_RIGHTS receive in `syscalls/net.rs`: calls `dup_handle` before
+    ///   installing the received pipe endpoint; descriptor-table removal balances
+    ///   the dup on local install failure.
+    /// - D5 vpipe parent install in `syscalls/process.rs`: `create_pipe`
+    ///   provides the first parent end's baseline; additional parent aliases
+    ///   call `dup_handle`; failure before install releases all baselines/dups.
     ///
-    /// If you add another construction site, AUDIT the caller for
-    /// a matching dup_handle.
+    /// If you add another construction site, AUDIT the caller for a successful
+    /// matching `dup_handle` or one of the documented baseline-1 sources above,
+    /// and verify every post-dup/pre-install error path releases or removes the
+    /// partially-installed fd.
     /// Per PE.14 instrumentation: `creation_site` is a small tag
-    /// (0=sys_pipe2, 1=install_broker_bridge_fd, 2=fork_snapshot_restore,
-    /// 3=SCM_RIGHTS, 4=D5-vpipe parent install) recorded on this slot. When `on_close` fires with
+    /// (0=sys_pipe2-equivalent baseline, 1=install_broker_bridge_fd,
+    /// 2=fork_snapshot_restore, 3=SCM_RIGHTS, 4=D5-vpipe parent install)
+    /// recorded on this slot. When `on_close` fires with
     /// read_count==0 (orphan read-end), the tag is logged so we can
     /// identify which construction path produced the orphan slot.
     pub(crate) fn new(
