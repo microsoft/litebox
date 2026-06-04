@@ -566,10 +566,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     alloc::sync::Arc::clone(&provider) as _;
                 let _ = releaser.dup_handle(handle_id);
                 let sp_fd = syscalls::broker_socketpair::BrokerSocketPairFd::<Platform>::new(
-                    provider,
-                    handle_id,
-                    endpoint,
-                    litebox::fs::OFlags::empty(),
+                    provider, handle_id, endpoint, pipe_flags,
                 );
                 let typed: litebox::fd::TypedFd<
                     syscalls::broker_socketpair::BrokerSocketPairSubsystem,
@@ -5285,6 +5282,14 @@ struct FdReplacement {
     direct: bool,
 }
 
+#[derive(Debug, Clone)]
+struct BrokerSocketPairParentInstall {
+    guest_fd: usize,
+    handle_id: u64,
+    endpoint: litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint,
+    dup_before_install: bool,
+}
+
 /// Describes a single stream in the multiplexer that the parent dispatcher
 /// must service after the fork-restore child has been migrated.
 struct MuxParentStream {
@@ -5334,6 +5339,10 @@ struct VforkDone {
     /// where data was buffered before migration, the drained bytes are
     /// sent as DATA messages before the RESET so the worker doesn't lose them.
     mux_orphan_streams: litebox::sync::Mutex<Platform, Vec<(u32, Vec<u8>)>>,
+    /// Broker socketpair endpoints that should replace parent-side UnixSocket
+    /// peers after a fork-restore child migrates the other endpoint.
+    broker_socketpair_parent_installs:
+        litebox::sync::Mutex<Platform, Vec<BrokerSocketPairParentInstall>>,
 }
 
 impl VforkDone {
@@ -5346,6 +5355,7 @@ impl VforkDone {
             mux_parent_fd: core::sync::atomic::AtomicI32::new(-1),
             mux_parent_streams: litebox::sync::Mutex::new(Vec::new()),
             mux_orphan_streams: litebox::sync::Mutex::new(Vec::new()),
+            broker_socketpair_parent_installs: litebox::sync::Mutex::new(Vec::new()),
         }
     }
 

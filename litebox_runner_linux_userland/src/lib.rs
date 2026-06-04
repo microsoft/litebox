@@ -291,12 +291,14 @@ type BrokerFdBridgeParsed = (
     Option<litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint>,
     Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
     Option<u32>,
+    litebox::fs::OFlags,
 );
 
 /// Parses a `--broker-fd-bridge` spec string of the form
 /// `fd:kind:handle_id[:subkind]` and returns the components.
 ///
 /// `subkind` is required for pipe direction, unix socketpair endpoint, and PTY role.
+/// Unix socket specs may append `:0` or `:1` to preserve per-fd NONBLOCK.
 /// Map `litebox::pipes::Flags` bits (as serialised by the parent in
 /// the fork snapshot) to a `litebox::fs::OFlags` value carrying just
 /// the per-fd status flags relevant for broker pipes (NONBLOCK).
@@ -399,13 +401,33 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
             None => None,
         }
     } else {
-        if parts.len() == 5 {
-            anyhow::bail!("broker-fd-bridge: pty id is only valid for pty specs");
-        }
         None
     };
+    let bridge_flags = if kind == BrokerHandleKind::UnixSocket {
+        match parts.get(4) {
+            Some(&"0") | None => litebox::fs::OFlags::empty(),
+            Some(&"1") => litebox::fs::OFlags::NONBLOCK,
+            Some(other) => anyhow::bail!(
+                "broker-fd-bridge: unix_socket nonblock flag must be '0' or '1', got {other:?}"
+            ),
+        }
+    } else {
+        if parts.len() == 5 && kind != BrokerHandleKind::Pty {
+            anyhow::bail!(
+                "broker-fd-bridge: fifth field is only valid for pty or unix_socket specs"
+            );
+        }
+        litebox::fs::OFlags::empty()
+    };
     Ok((
-        guest_fd, kind, handle_id, direction, endpoint, pty_role, pty_id,
+        guest_fd,
+        kind,
+        handle_id,
+        direction,
+        endpoint,
+        pty_role,
+        pty_id,
+        bridge_flags,
     ))
 }
 
@@ -578,8 +600,16 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             .map_err(|err| anyhow!("broker-fd-bridge: timerfd {spec:?}: {err:?}"));
     }
 
-    let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
-        parse_broker_fd_bridge_spec(spec)?;
+    let (
+        guest_fd,
+        kind,
+        handle_id,
+        pipe_direction,
+        socketpair_endpoint,
+        pty_role,
+        pty_id,
+        bridge_flags,
+    ) = parse_broker_fd_bridge_spec(spec)?;
     entrypoints
         .install_broker_bridge_fd(
             guest_fd,
@@ -589,7 +619,7 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             socketpair_endpoint,
             pty_role,
             pty_id,
-            litebox::fs::OFlags::empty(),
+            bridge_flags,
         )
         .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))
 }
