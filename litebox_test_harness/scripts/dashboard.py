@@ -415,15 +415,17 @@ def render(conn: sqlite3.Connection, state_dir: Path) -> str:
     FAILs grouped by worktree, and recent runs.
     """
     parts: list[str] = ["# litebox integration-test dashboard\n"]
+    canonical_render = _canonical_worktree_for_render(state_dir)
+    live_branches = _live_branches(conn, canonical_render)
     parts.append(_render_meta(conn, state_dir))
     parts.append(_render_leases(conn))
     parts.append(_render_velocity(conn))
     parts.append(_render_tracked_refs(conn))
     parts.append(_render_agent_worktrees(conn, state_dir))
-    parts.append(_render_result_groups(conn))
+    parts.append(_render_result_groups(conn, live_branches))
     parts.append(_render_suite_group_breakdown(conn))
     parts.append(_render_current_fails(conn))
-    parts.append(_render_recent_runs(conn))
+    parts.append(_render_recent_runs(conn, live_branches))
     parts.append(_render_footer(conn, state_dir))
     return "\n".join(p for p in parts if p)
 
@@ -783,6 +785,46 @@ def _tracked_ci_worktree_paths(conn: sqlite3.Connection) -> set[str]:
             out.add(str(Path(r["ci_worktree"]).resolve()))
         except (OSError, ValueError):
             out.add(r["ci_worktree"])
+    return out
+
+
+def _live_branches(conn: sqlite3.Connection, canonical: Path) -> set[str]:
+    """Branches that exist *right now*, used to filter dead-branch
+    rows out of render sections (data stays in sqlite). Union of:
+
+      * Local heads in the canonical clone (`git for-each-ref
+        refs/heads/`). This covers every worktree's checked-out
+        branch plus any unchecked local branches.
+      * `tracked_refs.ref` entries (with any leading `origin/`
+        stripped, since `runs.branch` records the bare branch
+        name even when the tracked ref is `origin/<name>`).
+
+    Returns an empty set on git failure (caller treats empty set
+    as "don't filter" — safer than dropping every row).
+    """
+    out: set[str] = set()
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(canonical), "for-each-ref",
+             "--format=%(refname:short)", "refs/heads/"],
+            check=False, capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    out.add(line)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    for row in conn.execute("SELECT ref FROM tracked_refs"):
+        ref = row["ref"] or ""
+        if not ref:
+            continue
+        out.add(ref)
+        # Tracked refs are sometimes recorded as `origin/<branch>`
+        # but `runs.branch` records the bare `<branch>`. Normalize.
+        if "/" in ref and ref.startswith(("origin/", "upstream/")):
+            out.add(ref.split("/", 1)[1])
     return out
 
 
@@ -1361,7 +1403,8 @@ def _last_run_age_for_ci_worktree(conn: sqlite3.Connection, wt: str) -> str:
     return f"{fmt_age_ms(now_ms() - int(row[0]))} ago"
 
 
-def _render_result_groups(conn: sqlite3.Connection) -> str:
+def _render_result_groups(conn: sqlite3.Connection,
+                          live_branches: Optional[set[str]] = None) -> str:
     """One row per `(commit_sha, dirty_hash)` partition that has any
     results. Per-pass cov/pass/fail use the freshest verdict per
     (test_id, pass) within the state (so `cov = pass + fail` always
@@ -1471,9 +1514,10 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
     # LITEBOX_DASHBOARD_DIRTY_MIN_COV=N (set to 0 to disable filtering).
     dirty_min_cov = int(os.environ.get("LITEBOX_DASHBOARD_DIRTY_MIN_COV", "10"))
     hidden = 0
+    hidden_dead_branch = 0
     visible: list[tuple[tuple[str, Optional[str], Optional[str]], dict]] = []
     for entry in ordered:
-        (_sha, dirty_hash, _wt), g = entry
+        (sha, dirty_hash, _wt), g = entry
         if dirty_hash and dirty_min_cov > 0:
             max_cov = max(
                 _counts_from_verdicts(g["verdicts"], p)[0]
@@ -1481,6 +1525,18 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
             )
             if max_cov < dirty_min_cov:
                 hidden += 1
+                continue
+        # Live-branch filter: a row survives if any of its recorded
+        # branches still exists in the canonical clone OR the row's
+        # sha matches a tracked_ref HEAD (tracked refs are live by
+        # definition — keeps the tracked-ref tag visible even if the
+        # branch label happened to drift). Empty live_branches means
+        # "filter disabled" (test/fallback path).
+        if live_branches:
+            has_live = bool(g["branches"] & live_branches)
+            is_tracked = sha in tracked_by_sha and dirty_hash is None
+            if not has_live and not is_tracked:
+                hidden_dead_branch += 1
                 continue
         visible.append(entry)
 
@@ -1538,6 +1594,13 @@ def _render_result_groups(conn: sqlite3.Connection) -> str:
             f"\n_{hidden} dirty partition(s) hidden "
             f"(cov < {dirty_min_cov}); set "
             f"`LITEBOX_DASHBOARD_DIRTY_MIN_COV=0` to show all._"
+        )
+    if hidden_dead_branch:
+        lines.append(
+            f"\n_{hidden_dead_branch} state(s) hidden whose only "
+            f"recorded branches no longer exist in the canonical "
+            f"clone (rows are kept in sqlite — re-create the branch "
+            f"or query `runs` directly to inspect)._"
         )
     return "\n".join(lines) + "\n"
 
@@ -2030,7 +2093,12 @@ def _canonical_worktree_for_render(state_dir: Path) -> Path:
     return state_dir.parent.resolve()
 
 
-def _render_recent_runs(conn: sqlite3.Connection) -> str:
+def _render_recent_runs(conn: sqlite3.Connection,
+                        live_branches: Optional[set[str]] = None) -> str:
+    # Pull a generous window then post-filter — a recent run from a
+    # since-deleted branch is hidden from the report (data stays in
+    # sqlite). Without filtering we'd just take the top 10.
+    over_fetch = 50 if live_branches else 10
     rows = conn.execute(
         """
         SELECT run_id, started_ts_ms, finished_ts_ms, hostname,
@@ -2038,9 +2106,23 @@ def _render_recent_runs(conn: sqlite3.Connection) -> str:
                pass_count, fail_count, universe_size
           FROM runs
          ORDER BY started_ts_ms DESC
-         LIMIT 10
-        """
+         LIMIT ?
+        """,
+        (over_fetch,),
     ).fetchall()
+    if not rows:
+        return ""
+    if live_branches:
+        filtered = [
+            r for r in rows
+            if (r["branch"] or "") in live_branches
+            or not r["branch"]  # detached HEAD / no branch recorded
+        ]
+        hidden_n = len(rows) - len(filtered)
+        rows = filtered[:10]
+    else:
+        hidden_n = 0
+        rows = rows[:10]
     if not rows:
         return ""
     lines = ["## Recent runs\n",
@@ -2058,6 +2140,11 @@ def _render_recent_runs(conn: sqlite3.Connection) -> str:
             f"`{branch}` | `{short_sha(r['commit_sha'])}` | {dirty} | "
             f"{r['pass_count'] or 0} | {r['fail_count'] or 0} | "
             f"{r['universe_size'] or '?'} |"
+        )
+    if hidden_n:
+        lines.append(
+            f"\n_{hidden_n} recent run(s) hidden whose branch no "
+            f"longer exists in the canonical clone._"
         )
     return "\n".join(lines) + "\n"
 

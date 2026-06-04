@@ -413,6 +413,17 @@ their own rows.
 
 Plus a current-FAILs list and recent-runs log.
 
+**Live-branch filter.** Per-branch sections (Result groups, Recent
+runs) hide rows whose only branch attribution is a branch that no
+longer exists in the canonical clone (`git for-each-ref refs/heads/`
+union `tracked_refs.ref`). This keeps the report focused on
+in-flight work — data is never deleted from sqlite, just not
+rendered. Tracked-ref-tagged rows always survive (tracked refs
+are live by definition). A small footer note records the count of
+hidden rows so the omission is visible. The Agent worktrees and
+Tracked refs sections are already live-only (driven by `git
+worktree list` and the explicit `tracked_refs` table).
+
 ### Consuming the dashboard from a coding-agent session
 
 Every UI input is also on disk:
