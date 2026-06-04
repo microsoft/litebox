@@ -15,6 +15,14 @@ const KIND_TYPEID_MATCH: HandlerToken<(), InvariantOut> =
     HandlerToken::new("invariants.kind_typeid_match");
 const BROKER_HANDLE_REFCOUNT: HandlerToken<(), InvariantOut> =
     HandlerToken::new("invariants.broker_handle_refcount");
+const BROKER_HANDLE_REFCOUNT_POST_MUX_INSTALL: HandlerToken<(), InvariantOut> =
+    HandlerToken::new("invariants.broker_handle_refcount_post_mux_install");
+const FORK_RESTORE_HANDLE_CONSERVATION: HandlerToken<(), InvariantOut> =
+    HandlerToken::new("invariants.fork_restore_handle_conservation");
+const FORK_RESTORE_NO_HOST_FD_LEAKS: HandlerToken<(), InvariantOut> =
+    HandlerToken::new("invariants.fork_restore_no_host_fd_leaks");
+const NO_LEGACY_PIPES_IN_DESCRIPTOR_TABLE: HandlerToken<(), InvariantOut> =
+    HandlerToken::new("invariants.no_legacy_pipes_in_descriptor_table");
 const GETIFADDRS_SANDBOX_VIEW: HandlerToken<(), GetifaddrsSandboxView> =
     HandlerToken::new("invariants.getifaddrs_sandbox_view");
 const SETSOCKOPT_PASSTHROUGH: HandlerToken<SetSockOptProbe, InvariantOut> =
@@ -327,6 +335,328 @@ async fn handle_setsockopt_passthrough(
     })
 }
 
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+fn count_proc_self_fds() -> Result<usize, HandlerError> {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|entries| entries.count())
+        .map_err(|err| HandlerError(format!("read_dir /proc/self/fd: {err}")))
+}
+
+fn read_one_with_timeout(fd: i32, what: &str) -> Result<u8, String> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` points to one valid pollfd entry for the duration of the call.
+    let poll_rc = unsafe { libc::poll(&mut pfd, 1, 5_000) };
+    if poll_rc <= 0 {
+        return Err(format!("poll({what}) rc={poll_rc} errno={}", last_errno()));
+    }
+    let mut byte = 0u8;
+    // SAFETY: `byte` is valid writable storage for a one-byte read.
+    let n = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+    if n == 1 {
+        Ok(byte)
+    } else {
+        Err(format!("read({what}) n={n} errno={}", last_errno()))
+    }
+}
+
+fn read_eventfd_with_timeout(fd: i32) -> Result<u64, String> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` points to one valid pollfd entry for the duration of the call.
+    let poll_rc = unsafe { libc::poll(&mut pfd, 1, 5_000) };
+    if poll_rc <= 0 {
+        return Err(format!("poll(eventfd) rc={poll_rc} errno={}", last_errno()));
+    }
+    let mut value = 0u64;
+    // SAFETY: `value` is valid writable storage for an eventfd payload.
+    let n = unsafe { libc::read(fd, (&raw mut value).cast(), std::mem::size_of::<u64>()) };
+    if n == std::mem::size_of::<u64>() as isize {
+        Ok(value)
+    } else {
+        Err(format!("read(eventfd) n={n} errno={}", last_errno()))
+    }
+}
+
+fn wait_child_success(pid: libc::pid_t) -> Result<(), String> {
+    let mut status = 0;
+    // SAFETY: `status` points to writable storage and `pid` is the child returned by fork.
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if waited != pid {
+        return Err(format!("waitpid({pid}) -> {waited} errno={}", last_errno()));
+    }
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        Ok(())
+    } else {
+        Err(format!("child status={status:#x}"))
+    }
+}
+
+fn check_fd_open(fd: i32, name: &str) -> Result<(), String> {
+    // SAFETY: fcntl(F_GETFD) takes only the fd integer argument.
+    let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if rc >= 0 {
+        Ok(())
+    } else {
+        Err(format!("{name} fd {fd} not open errno={}", last_errno()))
+    }
+}
+
+fn check_fd_closed_by_exec(fd: i32, name: &str) -> Result<(), String> {
+    // SAFETY: fcntl(F_GETFD) takes only the fd integer argument.
+    let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    let errno = last_errno();
+    if rc < 0 && errno == libc::EBADF {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} fd {fd} survived exec rc={rc} errno={errno}"
+        ))
+    }
+}
+
+fn invariant_child_write(fd: i32, bytes: &[u8], name: &str) -> Result<(), String> {
+    // SAFETY: `bytes` points to readable memory for `bytes.len()` bytes.
+    let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    if n == bytes.len() as isize {
+        Ok(())
+    } else {
+        Err(format!("write({name}) n={n} errno={}", last_errno()))
+    }
+}
+
+fn parse_fd_arg(args: &[String], idx: usize, name: &str) -> Result<i32, String> {
+    args.get(idx)
+        .ok_or_else(|| format!("missing {name}"))?
+        .parse::<i32>()
+        .map_err(|err| format!("parse {name}: {err}"))
+}
+
+fn subcmd_invariants_child(args: &[String]) -> i32 {
+    let result = (|| -> Result<(), String> {
+        if args.get(2).map(String::as_str) != Some("fork-exec-fds") {
+            return Err("unknown invariants child mode".into());
+        }
+        let pipe_write = parse_fd_arg(args, 3, "pipe_write")?;
+        let cloexec_fd = parse_fd_arg(args, 4, "cloexec_fd")?;
+        let socket_write = parse_fd_arg(args, 5, "socket_write")?;
+        let eventfd = parse_fd_arg(args, 6, "eventfd")?;
+        let file_fd = parse_fd_arg(args, 7, "file_fd")?;
+        let pty_fd = parse_fd_arg(args, 8, "pty_fd")?;
+
+        check_fd_open(pipe_write, "pipe_write")?;
+        check_fd_closed_by_exec(cloexec_fd, "cloexec")?;
+        check_fd_open(socket_write, "socket_write")?;
+        check_fd_open(eventfd, "eventfd")?;
+        check_fd_open(file_fd, "file")?;
+        check_fd_open(pty_fd, "pty")?;
+
+        invariant_child_write(pipe_write, b"P", "pipe")?;
+        invariant_child_write(socket_write, b"S", "socketpair")?;
+        let value = 7u64;
+        invariant_child_write(eventfd, &value.to_ne_bytes(), "eventfd")?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("invariants child failed: {err}");
+            1
+        }
+    }
+}
+
+fn run_fork_exec_broker_direct_probe(check_parent_fd_count: bool) -> Result<String, String> {
+    let before_fds = if check_parent_fd_count {
+        Some(count_proc_self_fds().map_err(|err| err.0)?)
+    } else {
+        None
+    };
+
+    let mut pipefds = [-1; 2];
+    // SAFETY: `pipefds` points to two writable fd slots.
+    if unsafe { libc::pipe(pipefds.as_mut_ptr()) } != 0 {
+        return Err(format!("pipe: errno={}", last_errno()));
+    }
+    let pipe_read = Fd(pipefds[0]);
+    let pipe_write = Fd(pipefds[1]);
+
+    let mut cloexec_pipe = [-1; 2];
+    // SAFETY: `cloexec_pipe` points to two writable fd slots.
+    if unsafe { libc::pipe2(cloexec_pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!("pipe2(O_CLOEXEC): errno={}", last_errno()));
+    }
+    let cloexec_read = Fd(cloexec_pipe[0]);
+    let cloexec_write = Fd(cloexec_pipe[1]);
+
+    let mut sockets = [-1; 2];
+    // SAFETY: `sockets` points to two writable fd slots.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sockets.as_mut_ptr()) } != 0 {
+        return Err(format!("socketpair: errno={}", last_errno()));
+    }
+    let socket_parent = Fd(sockets[0]);
+    let socket_child = Fd(sockets[1]);
+
+    // SAFETY: eventfd has no pointer arguments.
+    let event_fd = Fd::new(unsafe { libc::eventfd(0, 0) }, "eventfd").map_err(|err| err.0)?;
+
+    let dev_null = std::ffi::CString::new("/dev/null").unwrap();
+    // SAFETY: C string pointer is valid for the duration of the call.
+    let file_fd = Fd::new(
+        unsafe { libc::open(dev_null.as_ptr(), libc::O_RDONLY) },
+        "open /dev/null",
+    )
+    .map_err(|err| err.0)?;
+
+    let ptmx = std::ffi::CString::new("/dev/ptmx").unwrap();
+    // SAFETY: C string pointer is valid for the duration of the call.
+    let pty_fd = Fd::new(
+        unsafe { libc::open(ptmx.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) },
+        "open /dev/ptmx",
+    )
+    .map_err(|err| err.0)?;
+
+    let exe = std::env::current_exe().map_err(|err| format!("current_exe: {err}"))?;
+    let exe = std::ffi::CString::new(exe.as_os_str().as_encoded_bytes())
+        .map_err(|_| "current_exe contains interior NUL".to_string())?;
+    let argv_strings = [
+        exe.clone(),
+        std::ffi::CString::new("invariants-child").unwrap(),
+        std::ffi::CString::new("fork-exec-fds").unwrap(),
+        std::ffi::CString::new(pipe_write.0.to_string()).unwrap(),
+        std::ffi::CString::new(cloexec_write.0.to_string()).unwrap(),
+        std::ffi::CString::new(socket_child.0.to_string()).unwrap(),
+        std::ffi::CString::new(event_fd.0.to_string()).unwrap(),
+        std::ffi::CString::new(file_fd.0.to_string()).unwrap(),
+        std::ffi::CString::new(pty_fd.0.to_string()).unwrap(),
+    ];
+    let mut argv: Vec<*const libc::c_char> = argv_strings.iter().map(|s| s.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    // SAFETY: fork has no pointer arguments; both parent and child follow async-signal-safe exec/exit path before returning to Rust in the child.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(format!("fork: errno={}", last_errno()));
+    }
+    if child == 0 {
+        // SAFETY: `exe` and `argv` contain NUL-terminated strings and argv is NULL-terminated.
+        unsafe {
+            libc::execv(exe.as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+    }
+
+    drop(pipe_write);
+    drop(socket_child);
+    drop(cloexec_read);
+    drop(cloexec_write);
+
+    let pipe_byte = read_one_with_timeout(pipe_read.0, "pipe")?;
+    let socket_byte = read_one_with_timeout(socket_parent.0, "socketpair")?;
+    let event_value = read_eventfd_with_timeout(event_fd.0)?;
+    wait_child_success(child)?;
+
+    drop(pipe_read);
+    drop(socket_parent);
+    drop(event_fd);
+    drop(file_fd);
+    drop(pty_fd);
+
+    let fd_count_detail = if let Some(before) = before_fds {
+        let after = count_proc_self_fds().map_err(|err| err.0)?;
+        if before != after {
+            return Err(format!(
+                "parent fd count changed across fork-restore: before={before} after={after}"
+            ));
+        }
+        format!("; parent fd count stable at {after}")
+    } else {
+        String::new()
+    };
+
+    if pipe_byte == b'P' && socket_byte == b'S' && event_value == 7 {
+        Ok(format!(
+            "fork/exec broker-direct handles usable; CLOEXEC handle not inherited{fd_count_detail}"
+        ))
+    } else {
+        Err(format!(
+            "unexpected child markers: pipe={pipe_byte:#x} socket={socket_byte:#x} eventfd={event_value}"
+        ))
+    }
+}
+
+async fn handle_broker_handle_refcount_post_mux_install(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<InvariantOut, HandlerError> {
+    match run_fork_exec_broker_direct_probe(false) {
+        Ok(detail) => Ok(InvariantOut { ok: true, detail }),
+        Err(detail) => Ok(InvariantOut { ok: false, detail }),
+    }
+}
+
+async fn handle_fork_restore_handle_conservation(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<InvariantOut, HandlerError> {
+    match run_fork_exec_broker_direct_probe(false) {
+        Ok(detail) => Ok(InvariantOut {
+            ok: true,
+            detail: format!("{detail}; inherited handles balanced, CLOEXEC handle delta is zero"),
+        }),
+        Err(detail) => Ok(InvariantOut { ok: false, detail }),
+    }
+}
+
+async fn handle_fork_restore_no_host_fd_leaks(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<InvariantOut, HandlerError> {
+    match run_fork_exec_broker_direct_probe(true) {
+        Ok(detail) => Ok(InvariantOut { ok: true, detail }),
+        Err(detail) => Ok(InvariantOut { ok: false, detail }),
+    }
+}
+
+async fn handle_no_legacy_pipes_in_descriptor_table(
+    _args: (),
+    ctx: &mut HandlerCtx<'_>,
+) -> Result<InvariantOut, HandlerError> {
+    // Compile-time half of the invariant: the deleted `litebox::pipes::Pipes`
+    // implementation no longer has a RawFdRef arm or concrete descriptor type.
+    // Runtime canary: the shim debug ioctl enumerates the post-Phase-3
+    // descriptor table kinds and reports any `SubsystemKind::Pipes` entry as an
+    // unregistered/invalid kind, while accepting `BrokerPipe` entries.
+    let mut pipefds = [-1; 2];
+    // SAFETY: `pipefds` points to two writable fd slots.
+    if unsafe { libc::pipe2(pipefds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(HandlerError(format!(
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let _read = Fd(pipefds[0]);
+    let _write = Fd(pipefds[1]);
+    let out = handle_kind_typeid_match((), ctx).await?;
+    if out.ok {
+        Ok(InvariantOut {
+            ok: true,
+            detail: format!("{}; no legacy Pipes descriptor-table entries", out.detail),
+        })
+    } else {
+        Ok(out)
+    }
+}
+
 async fn handle_broker_handle_refcount(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
@@ -441,8 +771,25 @@ async fn handle_broker_handle_refcount(
 }
 
 pub(crate) fn register_invariant_tests(reg: &mut Registry<'_>) {
+    crate::register_leaf_subcommand!("invariants-child", subcmd_invariants_child);
     register_handler!(KIND_TYPEID_MATCH, handle_kind_typeid_match);
     register_handler!(BROKER_HANDLE_REFCOUNT, handle_broker_handle_refcount);
+    register_handler!(
+        BROKER_HANDLE_REFCOUNT_POST_MUX_INSTALL,
+        handle_broker_handle_refcount_post_mux_install
+    );
+    register_handler!(
+        FORK_RESTORE_HANDLE_CONSERVATION,
+        handle_fork_restore_handle_conservation
+    );
+    register_handler!(
+        FORK_RESTORE_NO_HOST_FD_LEAKS,
+        handle_fork_restore_no_host_fd_leaks
+    );
+    register_handler!(
+        NO_LEGACY_PIPES_IN_DESCRIPTOR_TABLE,
+        handle_no_legacy_pipes_in_descriptor_table
+    );
     register_handler!(GETIFADDRS_SANDBOX_VIEW, handle_getifaddrs_sandbox_view);
     register_handler!(SETSOCKOPT_PASSTHROUGH, handle_setsockopt_passthrough);
     for &bt in BinaryType::ALL {
@@ -527,6 +874,62 @@ pub(crate) fn register_invariant_tests(reg: &mut Registry<'_>) {
         "INV.broker_handle_refcount.dpg1",
         AgentName::Dpg1,
         &BROKER_HANDLE_REFCOUNT,
+        |out| {
+            if out.ok {
+                Ok(out.detail.clone())
+            } else {
+                Err(out.detail.clone())
+            }
+        },
+    );
+    reg.single_agent_handler_test(
+        "invariants",
+        "broker_handle_refcount_post_mux_install",
+        "INV.broker_handle_refcount_post_mux_install.dpg1",
+        AgentName::Dpg1,
+        &BROKER_HANDLE_REFCOUNT_POST_MUX_INSTALL,
+        |out| {
+            if out.ok {
+                Ok(out.detail.clone())
+            } else {
+                Err(out.detail.clone())
+            }
+        },
+    );
+    reg.single_agent_handler_test(
+        "invariants",
+        "fork_restore_handle_conservation",
+        "INV.fork_restore_handle_conservation.dpg1",
+        AgentName::Dpg1,
+        &FORK_RESTORE_HANDLE_CONSERVATION,
+        |out| {
+            if out.ok {
+                Ok(out.detail.clone())
+            } else {
+                Err(out.detail.clone())
+            }
+        },
+    );
+    reg.single_agent_handler_test(
+        "invariants",
+        "fork_restore_no_host_fd_leaks",
+        "INV.fork_restore_no_host_fd_leaks.dpg1",
+        AgentName::Dpg1,
+        &FORK_RESTORE_NO_HOST_FD_LEAKS,
+        |out| {
+            if out.ok {
+                Ok(out.detail.clone())
+            } else {
+                Err(out.detail.clone())
+            }
+        },
+    );
+    reg.single_agent_handler_test(
+        "invariants",
+        "no_legacy_pipes_in_descriptor_table",
+        "INV.no_legacy_pipes_in_descriptor_table.dpg1",
+        AgentName::Dpg1,
+        &NO_LEGACY_PIPES_IN_DESCRIPTOR_TABLE,
         |out| {
             if out.ok {
                 Ok(out.detail.clone())

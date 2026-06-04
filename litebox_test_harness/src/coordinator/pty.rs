@@ -21,6 +21,7 @@ use crate::register_handler;
 
 use super::TestOutcome;
 use super::agents::AgentName;
+use super::matrix::EXEC_AGENTS;
 use super::registry::Registry;
 use super::run_context::RunContext;
 
@@ -342,6 +343,16 @@ const PTYR_WRITE_THEN_EXEC_THEN_WRITE: HandlerToken<TargetArgs, PtyOut> =
 const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
 const PARENT_EXIT_THEN_CHILD_IO: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.parent_exit_then_child_io");
+const TERMIOS_ICANON_ECHO: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.termios.icanon_echo");
+const WINSIZE_TIOCSWINSZ_PROPAGATES: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.winsize.tiocswinsz_propagates");
+const SIGWINCH_DELIVERED_ON_RESIZE: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.sigwinch.delivered_on_resize");
+const CONTROLLING_TTY_TIOCSCTTY_SIGTTIN: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.controlling_tty.tiocsctty_sigttin");
+const LINE_DISCIPLINE_CR_TO_NL: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.line_discipline.cr_to_nl");
 
 // ─── Handlers ────────────────────────────────────────────────────────
 
@@ -1079,6 +1090,103 @@ async fn handle_ptyr_isatty(
     Ok(PtyOut { detail })
 }
 
+async fn handle_termios_icanon_echo(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-termios-icanon-echo".into()], true)?;
+    read_until(&pty, "READY\r\n")?;
+
+    pty.write_all(b"abc\n")?;
+    let first = read_until(&pty, "ECHO_OFF_READY\r\n")?;
+    if !first.ends_with("abc\r\nLINE1=abc\r\nECHO_OFF_READY\r\n") {
+        return Err(format!("expected canonical echo + line report, got {first:?}").into());
+    }
+
+    pty.write_all(b"xyz\n")?;
+    let second = read_until(&pty, "LINE2=xyz\r\n")?;
+    if second.contains("xyz\r\nLINE2=xyz") {
+        return Err(format!("ECHO-off input was echoed: {second:?}").into());
+    }
+    expect_exit_zero(pid)?;
+    Ok(PtyOut {
+        detail: "ICANON line buffering and ECHO on/off matched native".into(),
+    })
+}
+
+async fn handle_winsize_tiocswinsz_propagates(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-winsize-propagates".into()], true)?;
+    read_until(&pty, "READY\r\n")?;
+    pty.resize(57, 143)?;
+    pty.write_all(b"\n")?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    let detail = exact(&data, "WINSIZE rows=57 cols=143\r\n")?;
+    Ok(PtyOut { detail })
+}
+
+async fn handle_sigwinch_delivered_on_resize(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-sigwinch-delivered".into()], true)?;
+    read_until(&pty, "READY\r\n")?;
+    pty.resize(58, 144)?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    let detail = exact(&data, "SIGWINCH count=1 rows=58 cols=144\r\n")?;
+    Ok(PtyOut { detail })
+}
+
+// FOLLOWUP(#902)-broker-pty-background-read-sigttin: native passes this
+// reproducer across EXEC_AGENTS; Litebox currently times out because a
+// background pgrp read on the controlling tty does not complete with
+// SIGTTIN semantics under broker-direct PTY.
+async fn handle_controlling_tty_tiocsctty_sigttin(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-tiocsctty-sigttin".into()], true)?;
+    let status = wait_child_or_stopped_timeout(pid, Duration::from_secs(10))?;
+    let data = pty.read(None)?;
+    if status != 0 {
+        return Err(format!("expected child exit 0, got {status}; output={data:?}").into());
+    }
+    let detail = exact(&data, "SIGTTIN_OK\r\n")?;
+    Ok(PtyOut { detail })
+}
+
+async fn handle_line_discipline_cr_to_nl(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-line-discipline-cr-to-nl".into()], true)?;
+    read_until(&pty, "READY\r\n")?;
+    pty.write_all(b"\r")?;
+    let first = read_until(&pty, "RAW_READY\r\n")?;
+    if !first.contains("FIRST=10\r\n") {
+        return Err(format!("ICRNL-on CR was not translated to NL: {first:?}").into());
+    }
+    pty.write_all(b"\r")?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    let detail = exact(&data, "ICRNL on=10 off=13\r\n")?;
+    Ok(PtyOut { detail })
+}
+
 async fn handle_parent_exit_then_child_io(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -1177,6 +1285,20 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     );
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
     register_handler!(PARENT_EXIT_THEN_CHILD_IO, handle_parent_exit_then_child_io);
+    register_handler!(TERMIOS_ICANON_ECHO, handle_termios_icanon_echo);
+    register_handler!(
+        WINSIZE_TIOCSWINSZ_PROPAGATES,
+        handle_winsize_tiocswinsz_propagates
+    );
+    register_handler!(
+        SIGWINCH_DELIVERED_ON_RESIZE,
+        handle_sigwinch_delivered_on_resize
+    );
+    register_handler!(
+        CONTROLLING_TTY_TIOCSCTTY_SIGTTIN,
+        handle_controlling_tty_tiocsctty_sigttin
+    );
+    register_handler!(LINE_DISCIPLINE_CR_TO_NL, handle_line_discipline_cr_to_nl);
 
     crate::register_leaf_subcommand!("pty-tiocgpgrp", leaf_subcmd::subcmd_pty_tiocgpgrp);
     crate::register_leaf_subcommand!("pty-tiocspgrp", leaf_subcmd::subcmd_pty_tiocspgrp);
@@ -1222,7 +1344,28 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         "pty-parent-exit-then-child-io",
         leaf_subcmd::subcmd_pty_parent_exit_then_child_io
     );
+    crate::register_leaf_subcommand!(
+        "pty-termios-icanon-echo",
+        leaf_subcmd::subcmd_pty_termios_icanon_echo
+    );
+    crate::register_leaf_subcommand!(
+        "pty-winsize-propagates",
+        leaf_subcmd::subcmd_pty_winsize_propagates
+    );
+    crate::register_leaf_subcommand!(
+        "pty-sigwinch-delivered",
+        leaf_subcmd::subcmd_pty_sigwinch_delivered
+    );
+    crate::register_leaf_subcommand!(
+        "pty-tiocsctty-sigttin",
+        leaf_subcmd::subcmd_pty_tiocsctty_sigttin
+    );
+    crate::register_leaf_subcommand!(
+        "pty-line-discipline-cr-to-nl",
+        leaf_subcmd::subcmd_pty_line_discipline_cr_to_nl
+    );
 
+    register_pty_semantics_tests(reg);
     register_parent_exit_then_child_io(reg);
     register_slave_write_after_master_close(reg);
 
@@ -1269,6 +1412,64 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
                     _ => unreachable!("invalid pty scenario/binary-type combination"),
                 }
             }
+        }
+    }
+}
+
+fn register_pty_semantics_tests(reg: &mut Registry<'_>) {
+    #[derive(Clone, Copy)]
+    struct SemanticsCase {
+        id: &'static str,
+        token: &'static HandlerToken<TargetArgs, PtyOut>,
+    }
+
+    const CASES: &[SemanticsCase] = &[
+        SemanticsCase {
+            id: "PTY.termios.icanon_echo",
+            token: &TERMIOS_ICANON_ECHO,
+        },
+        SemanticsCase {
+            id: "PTY.winsize.tiocswinsz_propagates",
+            token: &WINSIZE_TIOCSWINSZ_PROPAGATES,
+        },
+        SemanticsCase {
+            id: "PTY.sigwinch.delivered_on_resize",
+            token: &SIGWINCH_DELIVERED_ON_RESIZE,
+        },
+        SemanticsCase {
+            id: "PTY.controlling_tty.tiocsctty_sigttin",
+            token: &CONTROLLING_TTY_TIOCSCTTY_SIGTTIN,
+        },
+        SemanticsCase {
+            id: "PTY.line_discipline.cr_to_nl",
+            token: &LINE_DISCIPLINE_CR_TO_NL,
+        },
+    ];
+
+    for &agent in EXEC_AGENTS {
+        for case in CASES {
+            let test_id = format!("{}.{agent}", case.id);
+            let label = agent.to_string();
+            let token = case.token;
+            reg.test("vscode", "pty", test_id)
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    let label = label.clone();
+                    Box::new(move |run| {
+                        Box::pin(async move {
+                            let target =
+                                crate::binary_path(crate::BinaryType::PieGlibc, run.self_exe());
+                            let result = run
+                                .send_named_typed(&handle, token, TargetArgs { target })
+                                .await;
+                            match result {
+                                Ok(out) => TestOutcome::new(&label, true, out.detail),
+                                Err(detail) => TestOutcome::new(&label, false, detail),
+                            }
+                        })
+                    })
+                });
         }
     }
 }
@@ -1559,6 +1760,51 @@ fn expect_exit_zero(pid: libc::pid_t) -> Result<(), String> {
     }
 }
 
+fn wait_child_or_stopped_timeout(pid: libc::pid_t, timeout: Duration) -> Result<i32, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut status = 0;
+    loop {
+        // SAFETY: waiting for a child pid returned by fork in this process.
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if rc == pid {
+            if libc::WIFEXITED(status) {
+                return Ok(libc::WEXITSTATUS(status));
+            }
+            if libc::WIFSIGNALED(status) {
+                return Ok(128 + libc::WTERMSIG(status));
+            }
+            if libc::WIFSTOPPED(status) {
+                let sig = libc::WSTOPSIG(status);
+                // SAFETY: terminate and reap a stopped child before reporting the failure.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                return Err(format!("child {pid} stopped by signal {sig}"));
+            }
+            return Ok(-1);
+        }
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                return Err(format!("waitpid {pid}: {err}"));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // SAFETY: terminate and reap the child after timeout.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+            return Err(format!(
+                "child {pid} timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn ensure_slave_path(pty: &Pty) -> Result<(), String> {
     if pty.slave_path().is_empty() {
         Err("pty slave path is empty".into())
@@ -1665,7 +1911,7 @@ fn read_until_ordered_fd(
 /// These cannot be handlers because the child's stdin must BE the PTY slave (set up by the parent
 /// before execve via openpty + dup2), and an agent's stdin is its protocol pipe.
 mod leaf_subcmd {
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
 
     static PTY_SIGWINCH_SEEN: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -2002,6 +2248,256 @@ mod leaf_subcmd {
         println!("isatty: 0={} 1={} 2={}", label(0), label(1), label(2));
         let _ = std::io::stdout().flush();
         0
+    }
+
+    pub(super) fn subcmd_pty_termios_icanon_echo(_args: &[String]) -> i32 {
+        if set_stdin_termios(|termios| {
+            termios.c_lflag |= libc::ICANON | libc::ECHO;
+            termios.c_iflag |= libc::ICRNL;
+        })
+        .is_err()
+        {
+            return 1;
+        }
+        println!("READY");
+        let _ = std::io::stdout().flush();
+
+        let mut line1 = String::new();
+        if std::io::stdin().read_line(&mut line1).is_err() {
+            return 1;
+        }
+        println!("LINE1={}", line1.trim_end_matches(['\r', '\n']));
+        if set_stdin_termios(|termios| {
+            termios.c_lflag |= libc::ICANON;
+            termios.c_lflag &= !libc::ECHO;
+            termios.c_iflag |= libc::ICRNL;
+        })
+        .is_err()
+        {
+            return 1;
+        }
+        println!("ECHO_OFF_READY");
+        let _ = std::io::stdout().flush();
+
+        let mut line2 = String::new();
+        if std::io::stdin().read_line(&mut line2).is_err() {
+            return 1;
+        }
+        println!("LINE2={}", line2.trim_end_matches(['\r', '\n']));
+        let _ = std::io::stdout().flush();
+        0
+    }
+
+    pub(super) fn subcmd_pty_winsize_propagates(_args: &[String]) -> i32 {
+        if set_stdin_termios(|termios| termios.c_lflag &= !libc::ECHO).is_err() {
+            return 1;
+        }
+        println!("READY");
+        let _ = std::io::stdout().flush();
+        let mut byte = [0u8; 1];
+        if std::io::stdin().read_exact(&mut byte).is_err() {
+            return 1;
+        }
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: TIOCGWINSZ writes winsize to the provided pointer for fd 0.
+        if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } != 0 {
+            eprintln!("TIOCGWINSZ failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        println!("WINSIZE rows={} cols={}", ws.ws_row, ws.ws_col);
+        let _ = std::io::stdout().flush();
+        0
+    }
+
+    pub(super) fn subcmd_pty_sigwinch_delivered(_args: &[String]) -> i32 {
+        PTY_LDISC_SIGNAL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: installing a simple one-argument handler for SIGWINCH.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = pty_ldisc_signal_handler as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = 0;
+            if libc::sigaction(libc::SIGWINCH, &action, std::ptr::null_mut()) != 0 {
+                eprintln!(
+                    "sigaction SIGWINCH failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                return 1;
+            }
+        }
+        println!("READY");
+        let _ = std::io::stdout().flush();
+        for _ in 0..200 {
+            if PTY_LDISC_SIGNAL_COUNT.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            // SAFETY: usleep only blocks the current process briefly while waiting for SIGWINCH.
+            unsafe { libc::usleep(10_000) };
+        }
+        let count = PTY_LDISC_SIGNAL_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: TIOCGWINSZ writes winsize to the provided pointer for fd 0.
+        if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } != 0 {
+            return 1;
+        }
+        println!(
+            "SIGWINCH count={count} rows={} cols={}",
+            ws.ws_row, ws.ws_col
+        );
+        let _ = std::io::stdout().flush();
+        if count == 1 { 0 } else { 1 }
+    }
+
+    pub(super) fn subcmd_pty_tiocsctty_sigttin(_args: &[String]) -> i32 {
+        // SAFETY: getpgrp has no preconditions.
+        let mut fg = unsafe { libc::getpgrp() };
+        // SAFETY: TIOCSPGRP reads a pid_t from the provided pointer for fd 0.
+        if unsafe { libc::ioctl(0, libc::TIOCSPGRP, &mut fg) } != 0 {
+            eprintln!("TIOCSPGRP failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        let mut pipe_fds = [0i32; 2];
+        // SAFETY: pipe2 initializes a two-fd array owned by this process.
+        if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            eprintln!("pipe2 failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        // SAFETY: fork creates a child that will become a background pgrp member.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // SAFETY: child-only signal setup, process-group setup, and pipe notification.
+            unsafe {
+                libc::close(pipe_fds[0]);
+                PTY_LDISC_SIGNAL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = pty_ldisc_signal_handler as *const () as usize;
+                libc::sigemptyset(&mut action.sa_mask);
+                action.sa_flags = 0;
+                if libc::sigaction(libc::SIGTTIN, &action, std::ptr::null_mut()) != 0 {
+                    libc::_exit(2);
+                }
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(2);
+                }
+                let mut byte = [0u8; 1];
+                let _ = libc::read(0, byte.as_mut_ptr().cast(), 1);
+                if PTY_LDISC_SIGNAL_COUNT.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    let _ = libc::write(pipe_fds[1], b"S".as_ptr().cast(), 1);
+                    libc::_exit(0);
+                }
+                libc::_exit(3);
+            }
+        }
+        // SAFETY: parent no longer writes to the notification pipe.
+        unsafe { libc::close(pipe_fds[1]) };
+        if child < 0 {
+            // SAFETY: close read end on fork failure.
+            unsafe { libc::close(pipe_fds[0]) };
+            eprintln!("fork failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        // FOLLOWUP(#902)-broker-pty-background-read-sigttin: native delivers
+        // SIGTTIN to the background pgrp immediately. Litebox currently
+        // leaves the child blocked in read(), so this poll times out and
+        // reports a minimal reproducer without marking the test xfail.
+        let mut pfd = libc::pollfd {
+            fd: pipe_fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd points to one live pipe read end.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 2000) };
+        let mut status = 0;
+        if ready > 0 && pfd.revents & libc::POLLIN != 0 {
+            let mut byte = [0u8; 1];
+            // SAFETY: byte is writable and pipe_fds[0] is readable.
+            let n = unsafe { libc::read(pipe_fds[0], byte.as_mut_ptr().cast(), 1) };
+            // SAFETY: reap the child that reported SIGTTIN delivery.
+            unsafe { libc::waitpid(child, &mut status, 0) };
+            // SAFETY: close read end after use.
+            unsafe { libc::close(pipe_fds[0]) };
+            if n == 1
+                && byte[0] == b'S'
+                && libc::WIFEXITED(status)
+                && libc::WEXITSTATUS(status) == 0
+            {
+                println!("SIGTTIN_OK");
+                let _ = std::io::stdout().flush();
+                return 0;
+            }
+            println!("SIGTTIN_BAD_STATUS status={status:#x}");
+            let _ = std::io::stdout().flush();
+            return 1;
+        }
+        // SAFETY: child did not report SIGTTIN; terminate and reap it before failing.
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, &mut status, 0);
+            libc::close(pipe_fds[0]);
+        }
+        println!("SIGTTIN_MISSING background read stayed blocked");
+        let _ = std::io::stdout().flush();
+        1
+    }
+
+    pub(super) fn subcmd_pty_line_discipline_cr_to_nl(_args: &[String]) -> i32 {
+        if set_stdin_termios(|termios| {
+            termios.c_lflag &= !(libc::ICANON | libc::ECHO);
+            termios.c_iflag |= libc::ICRNL;
+            termios.c_cc[libc::VMIN] = 1;
+            termios.c_cc[libc::VTIME] = 0;
+        })
+        .is_err()
+        {
+            return 1;
+        }
+        println!("READY");
+        let _ = std::io::stdout().flush();
+        let mut first = [0u8; 1];
+        if std::io::stdin().read_exact(&mut first).is_err() {
+            return 1;
+        }
+        println!("FIRST={}", first[0]);
+        if set_stdin_termios(|termios| {
+            termios.c_lflag &= !(libc::ICANON | libc::ECHO);
+            termios.c_iflag &= !libc::ICRNL;
+            termios.c_cc[libc::VMIN] = 1;
+            termios.c_cc[libc::VTIME] = 0;
+        })
+        .is_err()
+        {
+            return 1;
+        }
+        println!("RAW_READY");
+        let _ = std::io::stdout().flush();
+        let mut second = [0u8; 1];
+        if std::io::stdin().read_exact(&mut second).is_err() {
+            return 1;
+        }
+        println!("ICRNL on={} off={}", first[0], second[0]);
+        let _ = std::io::stdout().flush();
+        if first[0] == b'\n' && second[0] == b'\r' {
+            0
+        } else {
+            1
+        }
+    }
+
+    fn set_stdin_termios(mut update: impl FnMut(&mut libc::termios)) -> Result<(), ()> {
+        // SAFETY: tcgetattr/tcsetattr operate on the process's live PTY slave stdin fd.
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut termios) != 0 {
+                eprintln!("tcgetattr failed: {}", std::io::Error::last_os_error());
+                return Err(());
+            }
+            update(&mut termios);
+            if libc::tcsetattr(0, libc::TCSANOW, &termios) != 0 {
+                eprintln!("tcsetattr failed: {}", std::io::Error::last_os_error());
+                return Err(());
+            }
+        }
+        Ok(())
     }
 
     /// Shim-aware parent half for PTY.parent_exit_then_child_io. It owns the PTY,

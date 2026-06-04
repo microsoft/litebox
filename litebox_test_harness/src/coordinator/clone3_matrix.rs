@@ -14,6 +14,7 @@
     clippy::similar_names
 )]
 
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::Ordering;
@@ -96,6 +97,37 @@ struct DropbearSessionArgs {
     stage: DropbearSessionStage,
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum MuxPipeScenario {
+    SharedBrokerHandle,
+    AliasDup,
+    WriteEofOnLastClose,
+    InitialEofSynchronous,
+}
+
+impl MuxPipeScenario {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::SharedBrokerHandle => "shared_broker_handle",
+            Self::AliasDup => "alias_dup",
+            Self::WriteEofOnLastClose => "write_eof_on_last_close",
+            Self::InitialEofSynchronous => "initial_eof_synchronous",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct MuxPipeArgs {
+    scenario: MuxPipeScenario,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct MuxPipeOut {
+    ok: bool,
+    detail: String,
+}
+
 // ─── Typed handler tokens ───────────────────────────────────────────
 
 const THREAD: HandlerToken<(), Clone3Out> = HandlerToken::new("clone3.thread");
@@ -110,6 +142,7 @@ const DROPBEAR_VFORK: HandlerToken<(), Clone3Out> = HandlerToken::new("clone3.dr
 const DROPBEAR_CLONE: HandlerToken<(), Clone3Out> = HandlerToken::new("clone.dropbear_vfork");
 const DROPBEAR_SESSION_SETUP: HandlerToken<DropbearSessionArgs, Clone3Out> =
     HandlerToken::new("clone.dropbear_session_setup");
+const MUX_PIPE: HandlerToken<MuxPipeArgs, MuxPipeOut> = HandlerToken::new("clone3.mux_pipe");
 
 // ─── Handlers ───────────────────────────────────────────────────────
 
@@ -190,6 +223,15 @@ async fn handle_dropbear_session_setup(
         .map_err(|e| HandlerError(format!("clone dropbear session setup task join: {e}")))
 }
 
+async fn handle_mux_pipe(
+    args: MuxPipeArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<MuxPipeOut, HandlerError> {
+    tokio::task::spawn_blocking(move || run_mux_pipe(args.scenario))
+        .await
+        .map_err(|e| HandlerError(format!("clone3 mux_pipe task join: {e}")))
+}
+
 // ─── Registration ──────────────────────────────────────────────────
 
 pub(crate) fn register_clone3_matrix(reg: &mut Registry<'_>) {
@@ -202,6 +244,7 @@ pub(crate) fn register_clone3_matrix(reg: &mut Registry<'_>) {
     register_handler!(DROPBEAR_VFORK, handle_dropbear_vfork);
     register_handler!(DROPBEAR_CLONE, handle_dropbear_clone);
     register_handler!(DROPBEAR_SESSION_SETUP, handle_dropbear_session_setup);
+    register_handler!(MUX_PIPE, handle_mux_pipe);
 
     for &agent in CL3_AGENTS {
         reg.single_agent_handler_test(
@@ -259,6 +302,36 @@ pub(crate) fn register_clone3_matrix(reg: &mut Registry<'_>) {
             check_dropbear_clone_success,
         );
         register_dropbear_session_setup_cases(reg, agent);
+    }
+
+    for scenario in [
+        MuxPipeScenario::SharedBrokerHandle,
+        MuxPipeScenario::AliasDup,
+        MuxPipeScenario::WriteEofOnLastClose,
+        MuxPipeScenario::InitialEofSynchronous,
+    ] {
+        for &agent in CL3_AGENTS {
+            let label = agent.to_string();
+            let test_id = format!("CL3.mux_pipe.{}.{agent}", scenario.id());
+            reg.test("vscode", "clone3", test_id)
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let label = label.clone();
+                        Box::pin(async move {
+                            let result = run
+                                .send_named_typed(&handle, &MUX_PIPE, MuxPipeArgs { scenario })
+                                .await;
+                            match result {
+                                Ok(out) if out.ok => TestOutcome::new(&label, true, out.detail),
+                                Ok(out) => TestOutcome::new(&label, false, out.detail),
+                                Err(error) => TestOutcome::new(&label, false, error),
+                            }
+                        })
+                    })
+                });
+        }
     }
 }
 
@@ -504,6 +577,254 @@ fn documented_error(error: &str, names: &[&str]) -> bool {
     names
         .iter()
         .any(|name| error == *name || error.contains(name))
+}
+
+fn run_mux_pipe(scenario: MuxPipeScenario) -> MuxPipeOut {
+    let before = proc_fd_socket_set().unwrap_or_default();
+    let result = match scenario {
+        MuxPipeScenario::SharedBrokerHandle => run_mux_pipe_shared_broker_handle(),
+        MuxPipeScenario::AliasDup => run_mux_pipe_alias_dup(),
+        MuxPipeScenario::WriteEofOnLastClose => run_mux_pipe_write_eof_on_last_close(),
+        MuxPipeScenario::InitialEofSynchronous => run_mux_pipe_initial_eof_synchronous(),
+    };
+    let after = match proc_fd_socket_set() {
+        Ok(set) => set,
+        Err(error) => {
+            return MuxPipeOut {
+                ok: false,
+                detail: format!("{}; proc fd inspection failed: {error}", result.detail),
+            };
+        }
+    };
+    let leaked: Vec<_> = after.difference(&before).cloned().collect();
+    if !leaked.is_empty() {
+        return MuxPipeOut {
+            ok: false,
+            detail: format!(
+                "{}; unexpected post-install socket fds (legacy --mux-fd shape): {leaked:?}",
+                result.detail
+            ),
+        };
+    }
+    result
+}
+
+fn proc_fd_socket_set() -> Result<BTreeSet<String>, String> {
+    let mut set = BTreeSet::new();
+    for entry in std::fs::read_dir("/proc/self/fd").map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.to_string_lossy().into_owned();
+        if target.starts_with("socket:[") {
+            set.insert(format!("{}->{target}", entry.file_name().to_string_lossy()));
+        }
+    }
+    Ok(set)
+}
+
+fn clone3_process_or_fork() -> Result<(libc::pid_t, bool), String> {
+    let mut args = CloneArgs {
+        exit_signal: libc::SIGCHLD as u64,
+        ..CloneArgs::default()
+    };
+    // SAFETY: args is a clone_args-compatible struct. Child returns to caller
+    // and must use raw _exit after its branch completes.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &raw mut args,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if rc == 0 {
+        return Ok((0, true));
+    }
+    if rc > 0 {
+        return Ok((rc as libc::pid_t, false));
+    }
+    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if err == libc::ENOSYS || err == libc::EPERM {
+        // SAFETY: fallback preserves the same process-inheritance semantics on
+        // native environments that block clone3 via kernel config or seccomp.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            Ok((0, true))
+        } else if pid > 0 {
+            Ok((pid, false))
+        } else {
+            Err(format!("fork fallback: {}", last_errno_name()))
+        }
+    } else {
+        Err(last_errno_name())
+    }
+}
+
+fn run_mux_pipe_shared_broker_handle() -> MuxPipeOut {
+    let mut fds = [0i32; 2];
+    // SAFETY: fds points to two writable fd slots.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return mux_fail(format!("pipe:{}", last_errno_name()));
+    }
+    let [rd, wr] = fds;
+    let (pid, child) = match clone3_process_or_fork() {
+        Ok(v) => v,
+        Err(e) => return mux_fail(format!("clone3:{e}")),
+    };
+    if child {
+        // SAFETY: child writes its inherited write endpoint and exits.
+        unsafe { libc::close(rd) };
+        let msg = b"mux-shared";
+        // SAFETY: wr is inherited and msg is initialized.
+        let n = unsafe { libc::write(wr, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
+        // SAFETY: child is done with wr.
+        unsafe { libc::close(wr) };
+        // SAFETY: child must not run parent destructors after clone/fork.
+        unsafe { libc::_exit(i32::from(n != msg.len() as isize)) };
+    }
+    // SAFETY: parent only reads.
+    unsafe { libc::close(wr) };
+    let mut buf = [0u8; 32];
+    // SAFETY: rd is live and buf is writable.
+    let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    // SAFETY: rd is no longer needed.
+    unsafe { libc::close(rd) };
+    let wait = wait_for_child(pid);
+    if n == 10 && &buf[..10] == b"mux-shared" && wait.is_ok() {
+        mux_ok("shared broker-handle pipe data round-trip")
+    } else {
+        mux_fail(format!("shared data mismatch n={n} wait={wait:?}"))
+    }
+}
+
+fn run_mux_pipe_alias_dup() -> MuxPipeOut {
+    let mut fds = [0i32; 2];
+    // SAFETY: fds points to two writable fd slots.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return mux_fail(format!("pipe:{}", last_errno_name()));
+    }
+    let [rd, wr] = fds;
+    // SAFETY: dup duplicates a live read fd.
+    let rd2 = unsafe { libc::dup(rd) };
+    if rd2 < 0 {
+        return mux_fail(format!("dup:{}", last_errno_name()));
+    }
+    // SAFETY: wr is live and payload is initialized.
+    let n = unsafe { libc::write(wr, b"AB".as_ptr().cast::<libc::c_void>(), 2) };
+    // SAFETY: parent/child need no writer after payload is queued.
+    unsafe { libc::close(wr) };
+    if n != 2 {
+        return mux_fail(format!("seed write n={n}:{}", last_errno_name()));
+    }
+    let (pid, child) = match clone3_process_or_fork() {
+        Ok(v) => v,
+        Err(e) => return mux_fail(format!("clone3:{e}")),
+    };
+    if child {
+        let mut a = [0u8; 1];
+        let mut b = [0u8; 1];
+        // SAFETY: rd/rd2 are inherited read aliases and buffers are writable.
+        let n1 = unsafe { libc::read(rd, a.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        let n2 = unsafe { libc::read(rd2, b.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        let ok = n1 == 1 && n2 == 1 && a[0] == b'A' && b[0] == b'B';
+        // SAFETY: child cleanup.
+        unsafe {
+            libc::close(rd);
+            libc::close(rd2);
+            libc::_exit(i32::from(!ok));
+        }
+    }
+    // SAFETY: parent releases both aliases; child inherited its copies.
+    unsafe {
+        libc::close(rd);
+        libc::close(rd2);
+    }
+    match wait_for_child(pid) {
+        Ok(()) => mux_ok("dup aliases drained one shared pipe stream"),
+        Err(e) => mux_fail(format!("alias child failed: {e}")),
+    }
+}
+
+fn run_mux_pipe_write_eof_on_last_close() -> MuxPipeOut {
+    let mut fds = [0i32; 2];
+    // SAFETY: fds points to two writable fd slots.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return mux_fail(format!("pipe:{}", last_errno_name()));
+    }
+    let [rd, wr] = fds;
+    let (pid, child) = match clone3_process_or_fork() {
+        Ok(v) => v,
+        Err(e) => return mux_fail(format!("clone3:{e}")),
+    };
+    if child {
+        // SAFETY: child releases its inherited write endpoint and exits.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+            libc::_exit(0);
+        }
+    }
+    // SAFETY: parent releases last local write endpoint.
+    unsafe { libc::close(wr) };
+    let mut byte = [0u8; 1];
+    // SAFETY: rd is live and byte is writable; with no writers, read returns EOF.
+    let n = unsafe { libc::read(rd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+    // SAFETY: rd is no longer needed.
+    unsafe { libc::close(rd) };
+    let wait = wait_for_child(pid);
+    if n == 0 && wait.is_ok() {
+        mux_ok("reader observed EOF after last writer close")
+    } else {
+        mux_fail(format!("expected EOF n={n} wait={wait:?}"))
+    }
+}
+
+fn run_mux_pipe_initial_eof_synchronous() -> MuxPipeOut {
+    let mut fds = [0i32; 2];
+    // SAFETY: fds points to two writable fd slots.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return mux_fail(format!("pipe:{}", last_errno_name()));
+    }
+    let [rd, wr] = fds;
+    // SAFETY: close write handle before shipping read handle to child.
+    unsafe { libc::close(wr) };
+    let (pid, child) = match clone3_process_or_fork() {
+        Ok(v) => v,
+        Err(e) => return mux_fail(format!("clone3:{e}")),
+    };
+    if child {
+        // SAFETY: alarm bounds an unexpected blocking read in the child.
+        unsafe { libc::alarm(3) };
+        let mut byte = [0u8; 1];
+        // SAFETY: rd is inherited and byte is writable.
+        let n = unsafe { libc::read(rd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        // SAFETY: child cleanup/exit.
+        unsafe {
+            libc::close(rd);
+            libc::_exit(i32::from(n != 0));
+        }
+    }
+    // SAFETY: parent does not use read endpoint.
+    unsafe { libc::close(rd) };
+    match wait_for_child(pid) {
+        Ok(()) => mux_ok("initial EOF observed synchronously by clone sibling"),
+        Err(e) => mux_fail(format!("initial EOF child failed: {e}")),
+    }
+}
+
+fn mux_ok(detail: impl Into<String>) -> MuxPipeOut {
+    MuxPipeOut {
+        ok: true,
+        detail: detail.into(),
+    }
+}
+
+fn mux_fail(detail: impl Into<String>) -> MuxPipeOut {
+    MuxPipeOut {
+        ok: false,
+        detail: detail.into(),
+    }
 }
 
 // ─── clone3 syscall probes ──────────────────────────────────────────
