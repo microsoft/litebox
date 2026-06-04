@@ -4769,8 +4769,8 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     }
 
-                    // Phase 3 D5-fs: when LITEBOX_NEW_MUX is on and a
-                    // BrokerFsProvider is registered, migrate the
+                    // Phase 3 D5-fs: when a BrokerFsProvider is
+                    // registered, migrate the
                     // child's inherited FS fd directly onto a broker
                     // OFD registry handle. The worker then runs a
                     // CloneOfd against this `open_file_id` and wraps

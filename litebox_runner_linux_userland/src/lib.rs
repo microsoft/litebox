@@ -863,16 +863,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_broker_inet_delay_ns(ns);
     }
 
-    // Phase 3 D5 feature flag (`LITEBOX_NEW_MUX`). All five mux
-    // stream kinds (hostbacked, vsocket, vpipe, vpty, fs) now have
-    // direct broker-handle replacements that supersede the legacy
-    // mux dispatcher. Defaults ON (Session 11). Set `LITEBOX_NEW_MUX=0`
-    // for emergency opt-out; the legacy mux relay path will be
-    // deleted in D6/D7 cleanup once the default flip has soaked.
-    litebox_shim_linux::syscalls::set_new_mux_enabled(env_flag_enabled_default_on(
-        "LITEBOX_NEW_MUX",
-    ));
-
     // Stage 3a/Phase B: broker-backed TCP accept promotion remains opt-in.
     // Phase B's outbound-TCP gate also enables the accept-promoted path.
     litebox_shim_linux::syscalls::set_broker_tcp_conn_accept_enabled(
@@ -3059,17 +3049,6 @@ fn env_flag_enabled(name: &str) -> bool {
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
-}
-
-/// Like `env_flag_enabled` but defaults to `true` when the env var is
-/// unset. Returns `false` only when the var is explicitly set to a
-/// recognised off-value (`"0"`, `"false"`, `"no"`). Use for opt-out
-/// flags where the broker-held codepath is the new default.
-fn env_flag_enabled_default_on(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
-        .unwrap_or(true)
 }
 
 fn broker_inet_tcp_enabled() -> bool {

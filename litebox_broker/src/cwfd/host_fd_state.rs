@@ -139,7 +139,7 @@ impl HostFdState {
     /// dropbear's PTY-master) into non-blocking mode and broke their
     /// blocking read loops with unexpected `EAGAIN`. That was the
     /// root cause of `echo_two_lines`/`pipe_head_early_exit` failures
-    /// under `LITEBOX_NEW_MUX=1` (see plan.md §A "Semantic guidance
+    /// during D5 bring-up (see plan.md §A "Semantic guidance
     /// after Sessions 7-8").
     ///
     /// Instead, every `read()` / `write()` call in this module is
