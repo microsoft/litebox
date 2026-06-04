@@ -2450,20 +2450,28 @@ def cmd_auto(args: argparse.Namespace) -> int:
                           "register one with `dashboard.py track`.",
                           file=sys.stderr)
             for r in refs:
-                ref = r["ref"]
                 wt = r["ci_worktree"]
                 if not Path(wt).is_dir():
-                    print(f"[auto] {ref}: worktree {wt} missing, skipping",
-                          file=sys.stderr)
-                    continue
-                # Wrap each ref's drive in try/except so a single
-                # ref's failure (or an unexpected exception in
-                # _drive_ref's recovery paths) doesn't take down
-                # the whole supervisor. The auto-loop's value is in
-                # being long-running; one bad cycle shouldn't
-                # require manual restart.
+                    print(f"[auto] {r['ref']}: worktree {wt} missing, "
+                          f"skipping", file=sys.stderr)
+            ref_jobs: list[tuple[str, str]] = [
+                (r["ref"], r["ci_worktree"]) for r in refs
+                if Path(r["ci_worktree"]).is_dir()
+            ]
+            max_parallel_refs = max(
+                1, int(getattr(args, "max_parallel_tracked_refs", 1) or 1),
+            )
+            # Wrap each ref's drive in try/except so a single ref's
+            # failure (or an unexpected exception in _drive_ref's
+            # recovery paths) doesn't take down the whole supervisor.
+            # Parallelism here is safe because each tracked-ref has
+            # its own ci_worktree (and thus its own target/, its own
+            # per-pid docker container names via harness pid salt);
+            # CPU is throttled by the harness lease table the same
+            # way as agent-coverage parallelism.
+            def _drive_one_ref(ref: str, wt: str) -> bool:
                 try:
-                    ok = _drive_ref(
+                    return _drive_ref(
                         ref, wt, args,
                         pidfile=pidfile,
                         supervisor_state=_supervisor_state,
@@ -2473,9 +2481,50 @@ def cmd_auto(args: argparse.Namespace) -> int:
                           f"{type(e).__name__}: {e}", file=sys.stderr)
                     import traceback
                     traceback.print_exc(file=sys.stderr)
-                    ok = False
+                    return False
+
+            results: dict[str, bool] = {}
+            if max_parallel_refs <= 1 or len(ref_jobs) <= 1:
+                for ref, wt in ref_jobs:
+                    results[ref] = _drive_one_ref(ref, wt)
+                    if not args.quiet:
+                        ok = results[ref]
+                        print(f"[auto] {ref} @ {wt}: "
+                              f"{'ok' if ok else 'failed'}")
+            else:
+                # Run in fixed-size batches so the supervisor doesn't
+                # spawn more cargos than the operator asked for. The
+                # leases throttle CPU per cargo, but spawning 20
+                # parallel cold builds at once still thrashes I/O +
+                # docker daemon — batch size caps the burst.
                 if not args.quiet:
-                    print(f"[auto] {ref} @ {wt}: {'ok' if ok else 'failed'}")
+                    print(f"[auto] tracked refs: driving "
+                          f"{len(ref_jobs)} ref(s), up to "
+                          f"{max_parallel_refs} in parallel",
+                          file=sys.stderr)
+                for i in range(0, len(ref_jobs), max_parallel_refs):
+                    batch = ref_jobs[i:i + max_parallel_refs]
+                    threads = []
+                    out_slot: dict[str, bool] = {}
+
+                    def _runner(ref=None, wt=None):
+                        out_slot[ref] = _drive_one_ref(ref, wt)
+
+                    for ref, wt in batch:
+                        t = threading.Thread(
+                            target=_runner, kwargs={"ref": ref, "wt": wt},
+                            name=f"tracked-ref:{ref}", daemon=False,
+                        )
+                        t.start()
+                        threads.append(t)
+                    for t in threads:
+                        t.join()
+                    results.update(out_slot)
+                    if not args.quiet:
+                        for ref, wt in batch:
+                            ok = out_slot.get(ref, False)
+                            print(f"[auto] {ref} @ {wt}: "
+                                  f"{'ok' if ok else 'failed'}")
             # Opportunistic agent-worktree coverage: pick one idle
             # agent worktree per cycle (if any) and run a short fill.
             # Lease coordinator already shares concurrency fairly with
@@ -3489,14 +3538,25 @@ def build_parser() -> argparse.ArgumentParser:
              "override: LITEBOX_AGENT_SIDECAR.",
     )
     p_auto.add_argument(
-        "--max-parallel-agent-cargos", type=int, default=2,
+        "--max-parallel-agent-cargos", type=int, default=4,
         metavar="N",
         help="maximum number of agent-coverage cargo cycles to spawn "
-             "in parallel per supervisor tick (default 2). Each "
+             "in parallel per supervisor tick (default 4). Each "
              "cycle runs in its own per-branch shadow worktree, so "
              "they don't collide on `target/` or docker image tags; "
              "CPU is throttled automatically by the harness lease "
-             "table (LITEBOX_GLOBAL_JOBS / live_lease_count). Set to "
+             "table (LITEBOX_GLOBAL_JOBS / live_lease_count), so no "
+             "one cargo starves at higher N — each still gets at "
+             "least 1 job. Set to 1 to disable parallelism.",
+    )
+    p_auto.add_argument(
+        "--max-parallel-tracked-refs", type=int, default=4,
+        metavar="N",
+        help="maximum number of tracked-ref cargo cycles to drive "
+             "in parallel per supervisor tick (default 4). Each "
+             "ref has its own ci_worktree, so parallel drives don't "
+             "collide on `target/` or docker container names; same "
+             "lease-throttled CPU sharing as agent-coverage. Set to "
              "1 to disable parallelism.",
     )
     p_auto.add_argument(

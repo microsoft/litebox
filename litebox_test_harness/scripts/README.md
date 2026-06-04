@@ -351,16 +351,24 @@ so the round-robin is responsive across many worktrees.
 **Parallelism.** When multiple tip worktrees are eligible in the
 same supervisor tick, the orchestrator spawns up to
 `--max-parallel-agent-cargos N` cargo cycles concurrently (default
-`2`). Each cycle runs in its own per-branch shadow
+`4`). Each cycle runs in its own per-branch shadow
 (`<state-dir>/shadows/<branch>/`), so they don't collide on
 `target/` or per-worktree docker image tags. CPU is throttled
 automatically by the harness lease table: each cargo registers in
 `harness_leases` and computes its job count as
-`max(1, LITEBOX_GLOBAL_JOBS / live_lease_count)`. No supervisor-
-side rate limit is needed; the leases divide CPU fairly across
-every in-flight harness (including tracked-ref drives and
-other-state-dir supervisors sharing the host). Set
-`--max-parallel-agent-cargos=1` to disable parallelism.
+`max(1, LITEBOX_GLOBAL_JOBS / live_lease_count)`. No cargo is
+ever starved — every harness gets at least 1 job — so raising
+`N` is safe; the practical ceiling is cold-build I/O and docker
+daemon load, not CPU. Set `--max-parallel-agent-cargos=1` to
+disable parallelism.
+
+The supervisor's tracked-ref loop applies the same model:
+`--max-parallel-tracked-refs N` (default `4`) drives up to N
+tracked refs concurrently per cycle. Each ref already has its
+own `ci_worktree`, so parallel drives don't collide on `target/`
+or docker container names (the harness pid salt keeps containers
+namespaced per cargo). Set to `1` to fall back to sequential
+driving.
 
 **Surfacing.** Results land in the existing `runs` /
 `run_results` tables under the worktree's own `(commit_sha,
