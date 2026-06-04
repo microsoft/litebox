@@ -52,6 +52,9 @@ impl<FS: ShimFS> Task<FS> {
                     <litebox::net::Network<Platform> as FdEnabledSubsystem>::Entry,
                 >(),
             ),
+            // Phase 3 removed the legacy `litebox::pipes::Pipes` implementation.
+            // Any live descriptor table entry with this tag is therefore a hard
+            // invariant violation; no concrete entry type should be registered.
             litebox::fd::SubsystemKind::Pipes => return None,
             litebox::fd::SubsystemKind::Eventfd => (
                 TypeId::of::<super::eventfd::EventFile<Platform>>(),
