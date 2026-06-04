@@ -73,7 +73,6 @@ pub(crate) mod channel;
 pub mod loader;
 #[cfg_attr(not(test), allow(dead_code))]
 mod multihost;
-pub mod multiplexer;
 pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
