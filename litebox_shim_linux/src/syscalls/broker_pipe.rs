@@ -104,12 +104,15 @@ where
     ///   refcount=1 baseline; no additional dup needed.
     /// - lib.rs:285 (install_broker_bridge_fd): explicit dup_handle
     ///   call before construction.
+    /// - process.rs D5-vpipe parent install: `create_pipe` provides
+    ///   the first parent end's refcount; additional parent aliases
+    ///   call `dup_handle` before construction.
     ///
-    /// If you add a fourth construction site, AUDIT the caller for
+    /// If you add another construction site, AUDIT the caller for
     /// a matching dup_handle.
     /// Per PE.14 instrumentation: `creation_site` is a small tag
     /// (0=sys_pipe2, 1=install_broker_bridge_fd, 2=fork_snapshot_restore,
-    /// 3=SCM_RIGHTS) recorded on this slot. When `on_close` fires with
+    /// 3=SCM_RIGHTS, 4=D5-vpipe parent install) recorded on this slot. When `on_close` fires with
     /// read_count==0 (orphan read-end), the tag is logged so we can
     /// identify which construction path produced the orphan slot.
     pub(crate) fn new(

@@ -4554,12 +4554,10 @@ impl<FS: ShimFS> Task<FS> {
         // `install_broker_fd_bridge_spec` which acquired its own ref
         // via `dup_handle`. Releasing here drops the creation ref the
         // parent held since `attach_host_fd` returned.
-        type TransitRelease = (
-            alloc::sync::Arc<
-                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-            >,
-            u64,
-        );
+        type BrokerReleaser = alloc::sync::Arc<
+            dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+        >;
+        type TransitRelease = (BrokerReleaser, u64);
         let mut broker_fd_bridge_transit_release: alloc::vec::Vec<TransitRelease> =
             alloc::vec::Vec::new();
         let mut broker_socketpair_parent_installs: alloc::vec::Vec<
@@ -5777,6 +5775,8 @@ impl<FS: ShimFS> Task<FS> {
 
                 let mut mux_parent_streams: Vec<crate::MuxParentStream> = Vec::new();
                 let mut orphan_stream_ids: Vec<(u32, Vec<u8>)> = Vec::new();
+                let mut broker_migrated_streams: Vec<Option<(u64, BrokerReleaser, char)>> =
+                    (0..child_pipe_bridges.len()).map(|_| None).collect();
 
                 for (i, &(guest_fd, child_os_fd, direction)) in
                     child_pipe_bridges.iter().enumerate()
@@ -5890,21 +5890,185 @@ impl<FS: ShimFS> Task<FS> {
                     }
 
                     let is_host_backed = bridge_host_fd.get(i).is_some_and(|&hf| hf >= 0);
+                    let is_virtual_pipe = !is_host_backed && type_byte == b'p';
 
                     // Track whether this stream is handled as a local pipe
                     // (orphan with drained data). If so, skip adding to
                     // mux_stream_specs — the worker handles it via --local-pipe.
                     let mut handled_as_local_pipe = false;
                     // Phase 3 D5: when set, the stream has been migrated
-                    // out of the mux relay onto a direct broker handle
-                    // (via `attach_host_fd` of a `dup` of the host fd).
-                    // Parent keeps its own copy of the host fd (so its
-                    // existing ExternalFd entries remain valid post-fork
-                    // — matches normal fork-inheritance semantics, where
-                    // the underlying file description is shared); the
-                    // broker owns a separate dup that the worker accesses
-                    // via the broker's BrokerPipeFd install path.
+                    // out of the mux relay onto a direct broker handle.
+                    // Migrated streams emit --broker-fd-bridge specs and
+                    // must not also be emitted as legacy --mux-stream specs.
                     let mut handled_as_broker_bridge = false;
+
+                    if is_virtual_pipe && super::new_mux_enabled() {
+                        let drained = bridge_drained.get(i).cloned().unwrap_or_default();
+                        let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
+                        if let Some(provider) = super::broker_pipe::broker_pipe_provider() {
+                            use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
+                            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+
+                            let capacity =
+                                u64::try_from(drained.len().saturating_add(4096).max(1024 * 1024))
+                                    .unwrap_or(u64::MAX);
+                            if let Ok((read_handle, write_handle)) =
+                                provider.create_pipe(capacity, 4096)
+                            {
+                                let (worker_handle, parent_handle, worker_end, parent_end) =
+                                    match direction {
+                                        ExternalFdDirection::Read => (
+                                            read_handle,
+                                            write_handle,
+                                            BrokerPipeEnd::Read,
+                                            BrokerPipeEnd::Write,
+                                        ),
+                                        ExternalFdDirection::Write => (
+                                            write_handle,
+                                            read_handle,
+                                            BrokerPipeEnd::Write,
+                                            BrokerPipeEnd::Read,
+                                        ),
+                                        ExternalFdDirection::ReadWrite => {
+                                            unreachable!("bidi sockets use passthrough")
+                                        }
+                                    };
+                                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                                    alloc::sync::Arc::clone(&provider) as _;
+
+                                let mut wrote_prefill = true;
+                                let mut prefill_offset = 0;
+                                while prefill_offset < drained.len() {
+                                    match provider
+                                        .write_pipe(write_handle, &drained[prefill_offset..])
+                                    {
+                                        Ok(0) => {
+                                            wrote_prefill = false;
+                                            break;
+                                        }
+                                        Ok(n) => prefill_offset += n,
+                                        Err(_) => {
+                                            wrote_prefill = false;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                let installs_parent = !initial_eof && !parents.is_empty();
+                                let mut parent_dups_ok = true;
+                                let mut parent_dups_made = 0usize;
+                                if installs_parent {
+                                    for _ in 1..parents.len() {
+                                        if releaser.dup_handle(parent_handle).is_err() {
+                                            parent_dups_ok = false;
+                                            break;
+                                        }
+                                        parent_dups_made += 1;
+                                    }
+                                }
+
+                                if wrote_prefill && parent_dups_ok {
+                                    let worker_dir_char = match worker_end {
+                                        BrokerPipeEnd::Read => 'r',
+                                        BrokerPipeEnd::Write => 'w',
+                                    };
+                                    broker_fd_bridge_specs.push(alloc::format!(
+                                        "{guest_fd}:pipe:{worker_handle}:{worker_dir_char}"
+                                    ));
+                                    broker_fd_bridge_transit_release
+                                        .push((alloc::sync::Arc::clone(&releaser), worker_handle));
+
+                                    if installs_parent {
+                                        for &(parent_fd, _, _) in &parents {
+                                            let bp_fd = super::broker_pipe::BrokerPipeFd::<
+                                                crate::Platform,
+                                            >::new(
+                                                alloc::sync::Arc::clone(&provider),
+                                                parent_handle,
+                                                parent_end,
+                                                OFlags::empty(),
+                                                4, // creation_site: D5-vpipe parent install
+                                            );
+                                            let typed: litebox::fd::TypedFd<
+                                                super::broker_pipe::BrokerPipeSubsystem,
+                                            > = self
+                                                .global
+                                                .litebox
+                                                .descriptor_table_mut()
+                                                .insert(bp_fd);
+                                            let files = self.files.borrow();
+                                            let mut rds = files.raw_descriptor_store.write();
+                                            if let Ok(old_pipe) = rds
+                                                .fd_consume_raw_integer::<
+                                                    litebox::pipes::Pipes<crate::Platform>,
+                                                >(parent_fd)
+                                            {
+                                                drop(rds);
+                                                let _ = self.global.pipes.close(&old_pipe);
+                                                rds = files.raw_descriptor_store.write();
+                                            } else if let Ok(old_broker_pipe) = rds
+                                                .fd_consume_raw_integer::<
+                                                    super::broker_pipe::BrokerPipeSubsystem,
+                                                >(parent_fd)
+                                            {
+                                                drop(rds);
+                                                let _ = self
+                                                    .global
+                                                    .litebox
+                                                    .descriptor_table_mut()
+                                                    .remove(&old_broker_pipe);
+                                                rds = files.raw_descriptor_store.write();
+                                            }
+                                            let ok =
+                                                rds.fd_into_specific_raw_integer(typed, parent_fd);
+                                            debug_assert!(
+                                                ok,
+                                                "D5-vpipe parent install: slot {parent_fd} still occupied"
+                                            );
+                                        }
+                                    } else {
+                                        releaser.release(parent_handle);
+                                    }
+
+                                    if initial_eof {
+                                        // The worker receives the read end only after the
+                                        // drained prefill has been written and the write end
+                                        // has been released, so its first read observes
+                                        // buffered data followed by synchronous EOF.
+                                        debug_assert_eq!(worker_end, BrokerPipeEnd::Read);
+                                    }
+
+                                    handled_as_broker_bridge = true;
+                                    broker_migrated_streams[i] = Some((
+                                        worker_handle,
+                                        alloc::sync::Arc::clone(&releaser),
+                                        worker_dir_char,
+                                    ));
+                                    self.global.platform.close_host_fd(child_os_fd);
+
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: stream={} virtual pipe migrated to broker worker_handle={} worker_dir={} parent_handle={} parents={} drained={} initial_eof={}",
+                                        self.pid,
+                                        stream_id,
+                                        worker_handle,
+                                        worker_dir_char,
+                                        parent_handle,
+                                        parents.len(),
+                                        drained.len(),
+                                        initial_eof,
+                                    );
+                                } else {
+                                    for _ in 0..parent_dups_made {
+                                        releaser.release(parent_handle);
+                                    }
+                                    releaser.release(read_handle);
+                                    releaser.release(write_handle);
+                                }
+                            }
+                        }
+                    }
 
                     if is_host_backed && super::new_mux_enabled() {
                         let host_fd = bridge_host_fd[i];
@@ -5998,7 +6162,7 @@ impl<FS: ShimFS> Task<FS> {
                             external_fd_fd: bridge_host_fd[i],
                             use_existing_pipe: false,
                         });
-                    } else if !is_host_backed {
+                    } else if !is_host_backed && !handled_as_broker_bridge {
                         // Virtual pipe/socket bridge: close the child-side OS
                         // pipe fd (the mux creates a virtual pipe on the worker
                         // side instead).
@@ -6236,6 +6400,24 @@ impl<FS: ShimFS> Task<FS> {
                 // fd.  The parent `seen_streams` dedup installs a
                 // dup'd dispatch pipe for the alias.
                 for &(alias_fd, primary_idx) in &mux_aliases {
+                    // D5-vpipe: alias references a primary that was
+                    // migrated to a BrokerPipe; dup the partner handle
+                    // and emit a broker_fd_bridge spec.
+                    if let Some((handle_id, releaser, dir_char)) =
+                        broker_migrated_streams[primary_idx].as_ref()
+                    {
+                        if releaser.dup_handle(*handle_id).is_ok() {
+                            broker_fd_bridge_specs
+                                .push(alloc::format!("{alias_fd}:pipe:{handle_id}:{dir_char}"));
+                            broker_fd_bridge_transit_release
+                                .push((alloc::sync::Arc::clone(releaser), *handle_id));
+                        }
+                        continue;
+                    }
+                    // D5-vsocket: alias references a primary that was
+                    // migrated to a BrokerSocketPair; emit a
+                    // broker_fd_bridge spec with NONBLOCK inherited
+                    // from either the alias fd or the primary.
                     if let Some(&(_, handle_id, endpoint_char, primary_nonblock)) =
                         broker_socketpair_migrated_streams
                             .iter()
@@ -6288,14 +6470,27 @@ impl<FS: ShimFS> Task<FS> {
                     mux_stream_specs.push((stream_id, alias_fd, dir_byte, type_byte, false));
                 }
 
-                // Store mux info in VforkDone for the parent to consume.
-                fc.vfork_done
-                    .mux_parent_fd
-                    .store(mux_parent_raw, core::sync::atomic::Ordering::Release);
-                *fc.vfork_done.mux_parent_streams.lock() = mux_parent_streams;
-                *fc.vfork_done.mux_orphan_streams.lock() = orphan_stream_ids;
+                // Store mux info in VforkDone for the parent to consume, unless
+                // every stream was migrated to direct broker handles and the
+                // legacy mux socketpair is now unused.  D5-vsocket's
+                // socketpair_parent_installs is parent-side state, independent
+                // of the mux relay, and is always stored.
                 *fc.vfork_done.broker_socketpair_parent_installs.lock() =
                     broker_socketpair_parent_installs;
+                if mux_stream_specs.is_empty()
+                    && mux_parent_streams.is_empty()
+                    && orphan_stream_ids.is_empty()
+                {
+                    self.global.platform.close_host_fd(mux_parent_raw);
+                    self.global.platform.close_host_fd(mux_worker_raw);
+                    mux_worker_fd_raw = -1;
+                } else {
+                    fc.vfork_done
+                        .mux_parent_fd
+                        .store(mux_parent_raw, core::sync::atomic::Ordering::Release);
+                    *fc.vfork_done.mux_parent_streams.lock() = mux_parent_streams;
+                    *fc.vfork_done.mux_orphan_streams.lock() = orphan_stream_ids;
+                }
                 // Don't store fd_replacements — the mux replaces per-fd relay.
 
                 // Clear child_pipe_bridges — child OS fds for non-host-backed
