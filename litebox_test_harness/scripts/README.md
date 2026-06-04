@@ -248,6 +248,36 @@ eligible worktree, it can spawn one short `--fill` cycle per
 loop iteration. Discovery + scheduling is automatic; no marker
 file, no per-worktree configuration.
 
+**Isolation.** The supervisor never runs cargo inside the agent's
+worktree. Doing so would race the agent's own `target/` and
+`docker build` if the agent kicked off a cargo invocation in the
+brief gap between idle-gate checks. Instead it maintains a single
+**shadow worktree** at `<state-dir>/shadow/` — a `git worktree
+add --detach` off the canonical clone (so it shares `.git/objects`
+but has its own working tree + its own `target/`). Per cycle:
+
+1. `git -C <shadow> checkout --detach -f --quiet <agent_HEAD>`
+2. `cargo test ...` from `<shadow>`, with
+   `LITEBOX_DASHBOARD_WORKTREE_PATH=<agent_worktree>` so
+   `runs.worktree_path` attributes back to the agent's path (and
+   the new rows stack correctly under the agent's branch in
+   Result-groups).
+
+The shadow persists across cycles — incremental cargo `target/`
+artifacts are reused, so only the *first* opportunistic cycle
+ever pays a full cold-build cost. Switching the shadow between
+agent HEADs costs ~2–3 min of incremental recompile when the
+diff between two opportunistically-tested branches is large,
+which is the deliberate tradeoff: full safety vs occasional
+rebuild. Per-branch shadows (one persistent `target/` per agent
+branch) would eliminate the branch-flip cost at the price of
+~10–15 GB disk per branch; left as a future improvement.
+
+The shadow's Docker image is its own per-worktree tag (`litebox-
+test:wt-<sha256(shadow_path)[..8]>`, per the per-session image
+tag scheme), so the shadow's `docker build` never overwrites the
+agent's image either.
+
 **Idle gate.** A worktree is eligible only when:
 
 - No source-ish file (`*.rs`, `*.toml`, `*.py`, `Dockerfile`) has

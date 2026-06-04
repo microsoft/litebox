@@ -92,16 +92,24 @@ worktree has been idle for at least `LITEBOX_AGENT_IDLE_SECS`
 (default 300s = 5min — no source-file mtime change AND no live
 lease entry from that worktree), the supervisor spawns a short
 `cargo test --fill=<LITEBOX_AGENT_FILL_BUDGET>s` cycle (default
-180s) from it. Results appear automatically in the dashboard's
-new "Agent worktrees" section, which compares the worktree's HEAD
-against the tracked-ref baseline whose HEAD shares the most
-recent merge-base (= the upstream this branch forked from). Two
-columns per pass: Δ vs merge-base (the agent's own regressions)
-and Δ vs baseline HEAD (drift vs current upstream). Set
-`LITEBOX_AGENT_SIDECAR=1` to also write a focused
-`<worktree>/.dashboard/regressions.md` after each successful
-cycle for direct agent consumption. Disable entirely with
-`--agent-coverage-disable` on the supervisor invocation.
+180s) at that worktree's HEAD. To guarantee isolation from the
+agent's own `target/` and `docker build`, the supervisor never
+runs cargo inside the agent's worktree itself — instead it
+maintains a single shadow worktree at `<state-dir>/shadow/`
+(shared canonical git object DB, separate working tree + separate
+`target/`) and `git checkout --detach`s the agent's HEAD into it
+before each cycle. The run is attributed back to the agent's
+worktree via `LITEBOX_DASHBOARD_WORKTREE_PATH` so result-groups
+stacks the rows under the agent's branch correctly. Results
+appear in the dashboard's new "Agent worktrees" section, which
+compares the worktree's HEAD against the tracked-ref baseline
+whose HEAD shares the most recent merge-base (= the upstream
+this branch forked from). Two columns per pass: Δ vs merge-base
+(the agent's own regressions) and Δ vs baseline HEAD (drift vs
+current upstream). Set `LITEBOX_AGENT_SIDECAR=1` to also write a
+focused `<worktree>/.dashboard/regressions.md` after each
+successful cycle for direct agent consumption. Disable entirely
+with `--agent-coverage-disable` on the supervisor invocation.
 
 ## Multi-wave platform-fix workflow
 

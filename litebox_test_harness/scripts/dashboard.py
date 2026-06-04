@@ -2423,6 +2423,53 @@ def _drive_ref(
     return rc == 0
 
 
+def _shadow_worktree_path(state_dir: Path) -> Path:
+    """Persistent shadow worktree used for opportunistic cycles.
+    Created on first use; reused thereafter so cargo incremental
+    target/ wins persist across cycles."""
+    return state_dir / "shadow"
+
+
+def _ensure_shadow_worktree(canonical: Path, state_dir: Path,
+                            agent_head: str) -> Optional[Path]:
+    """Ensure `<state-dir>/shadow/` exists as a `git worktree`
+    sharing `canonical`'s object DB, checked out to `agent_head`.
+
+    Returns the shadow path on success, None on failure (shadow
+    cannot be set up — caller should skip the cycle rather than
+    fall back to in-place execution, which would race the agent's
+    `target/` and `docker build`).
+    """
+    shadow = _shadow_worktree_path(state_dir)
+    if not shadow.exists():
+        shadow.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(
+                ["git", "-C", str(canonical), "worktree", "add",
+                 "--detach", str(shadow), agent_head],
+                check=True, capture_output=True, text=True, timeout=60,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            print(f"[auto] agent-coverage: shadow setup failed: {e}",
+                  file=sys.stderr)
+            return None
+        return shadow
+    # Existing shadow — switch to agent_head. Use `git checkout
+    # --detach -f` to overwrite anything (the shadow is owned by
+    # the supervisor; no one else should be writing to it).
+    try:
+        subprocess.run(
+            ["git", "-C", str(shadow), "checkout", "--detach", "-f",
+             "--quiet", agent_head],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"[auto] agent-coverage: shadow checkout {agent_head} "
+              f"failed: {e}", file=sys.stderr)
+        return None
+    return shadow
+
+
 def _maybe_drive_agent_worktree(
     args: argparse.Namespace,
     *,
@@ -2491,8 +2538,16 @@ def _drive_agent_worktree(
     """
     env = os.environ.copy()
     state_dir = resolve_state_dir(args.state_dir)
+    canonical = _canonical_worktree(args, state_dir)
+    shadow = _ensure_shadow_worktree(canonical, state_dir, wt["head"])
+    if shadow is None:
+        return False
     env["LITEBOX_DASHBOARD_DIR"] = str(state_dir)
     env["LITEBOX_DASHBOARD_REF"] = wt.get("branch") or "<detached>"
+    # Critical: attribute the run back to the agent's worktree path
+    # (not the shadow) so result-groups stacks the new state under
+    # the agent's branch, not under a generic "shadow" bucket.
+    env["LITEBOX_DASHBOARD_WORKTREE_PATH"] = wt["path"]
     fill_budget = int(os.environ.get("LITEBOX_AGENT_FILL_BUDGET")
                       or getattr(args, "agent_fill_budget", 180) or 180)
     cargo_args = [
@@ -2502,9 +2557,9 @@ def _drive_agent_worktree(
     ]
     if args.jobs:
         env["LITEBOX_TEST_JOBS"] = str(args.jobs)
-    deadline = time.monotonic() + (fill_budget * 2 + 300)
+    deadline = time.monotonic() + (fill_budget * 2 + 600)
     proc = subprocess.Popen(
-        cargo_args, cwd=wt["path"], env=env,
+        cargo_args, cwd=str(shadow), env=env,
         start_new_session=True,
     )
     cargo_pgid = proc.pid
