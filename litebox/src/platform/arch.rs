@@ -11,13 +11,21 @@ use thiserror::Error;
 /// A provider of architecture-specific functionality.
 #[cfg(target_arch = "x86_64")]
 pub trait ArchSpecificProvider {
-    /// Get the architecture-specific `reg`, for the current context
+    /// Get the architecture-specific `reg`, for the current guest context.
+    ///
+    /// Broadly speaking, the platform may use some architecture-specific registers for its own
+    /// purposes, and the guest may not be able to directly access or work with them. This function
+    /// (along with [`Self::set_arch_specific_register`]) provides the special handling for such
+    /// registers. This allows the shim, on behalf of the guest, consistently handle such registers
+    /// without needing to worry about platform-specifics.
     fn get_arch_specific_register(
         &self,
         reg: &ArchSpecificRegister,
     ) -> Result<usize, ArchSpecificError>;
 
-    /// Set the architecture-specific `reg` to `val`, for the current context
+    /// Set the architecture-specific `reg` to `val`, for the current guest context.
+    ///
+    /// See [`Self::get_arch_specific_register`] for details.
     fn set_arch_specific_register(
         &self,
         reg: &ArchSpecificRegister,
