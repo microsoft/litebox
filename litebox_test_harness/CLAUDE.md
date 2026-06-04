@@ -96,20 +96,27 @@ lease entry from that worktree), the supervisor spawns a short
 agent's own `target/` and `docker build`, the supervisor never
 runs cargo inside the agent's worktree itself — instead it
 maintains a single shadow worktree at `<state-dir>/shadow/`
-(shared canonical git object DB, separate working tree + separate
-`target/`) and `git checkout --detach`s the agent's HEAD into it
-before each cycle. The run is attributed back to the agent's
-worktree via `LITEBOX_DASHBOARD_WORKTREE_PATH` so result-groups
-stacks the rows under the agent's branch correctly. Results
-appear in the dashboard's new "Agent worktrees" section, which
-compares the worktree's HEAD against the tracked-ref baseline
-whose HEAD shares the most recent merge-base (= the upstream
-this branch forked from). Two columns per pass: Δ vs merge-base
-(the agent's own regressions) and Δ vs baseline HEAD (drift vs
-current upstream). Set `LITEBOX_AGENT_SIDECAR=1` to also write a
-focused `<worktree>/.dashboard/regressions.md` after each
-successful cycle for direct agent consumption. Disable entirely
-with `--agent-coverage-disable` on the supervisor invocation.
+(shared canonical git object DB, separate working tree +
+separate `target/` + separate per-worktree docker image tag) and
+`git checkout --detach`s the agent's HEAD into it before each
+cycle. Opportunistic runs land in `runs` with
+`worktree_path=<state-dir>/shadow` and the agent's branch in
+`runs.branch` — so they're trivially distinguishable from agent's
+own runs by the literal shadow path (same self-evidence trick
+the tracked-ref CI worktrees use). Aggregation still works: the
+state key is `(commit_sha, dirty_hash, state_wt)` and `state_wt`
+is NULL for clean rows regardless of worktree, so shadow + agent
+clean runs at the same sha collapse to the same state and
+combine cleanly. Results appear in the dashboard's new "Agent
+worktrees" section, which compares the worktree's HEAD against
+the tracked-ref baseline whose HEAD shares the most recent
+merge-base (= the upstream this branch forked from). Two
+columns per pass: Δ vs merge-base (the agent's own regressions)
+and Δ vs baseline HEAD (drift vs current upstream). Set
+`LITEBOX_AGENT_SIDECAR=1` to also write a focused
+`<worktree>/.dashboard/regressions.md` after each successful
+cycle for direct agent consumption. Disable entirely with
+`--agent-coverage-disable` on the supervisor invocation.
 
 ## Multi-wave platform-fix workflow
 

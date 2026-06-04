@@ -1070,16 +1070,31 @@ def _regression_test_ids(
 
 
 def _last_run_age_at_sha(conn: sqlite3.Connection, sha: str,
-                        worktree_path: str) -> Optional[int]:
-    """Newest run_results.finished_ts_ms for clean rows at this
-    (sha, worktree_path). None if no coverage yet."""
-    row = conn.execute(
-        "SELECT MAX(rr.finished_ts_ms)"
-        "  FROM run_results rr JOIN runs r ON r.run_id = rr.run_id"
-        " WHERE r.commit_sha = ? AND r.dirty_hash IS NULL"
-        "   AND r.worktree_path = ?",
-        (sha, worktree_path),
-    ).fetchone()
+                        worktree_path: Optional[str] = None) -> Optional[int]:
+    """Newest run_results.finished_ts_ms for clean rows at this sha.
+
+    If `worktree_path` is given, restrict to that worktree (legacy
+    callers). If None (preferred for agent-coverage), aggregate over
+    every clean worktree at the sha — so opportunistic supervisor
+    cycles in `<state-dir>/shadow/` correctly count toward "this HEAD
+    has been tested recently" even though their `runs.worktree_path`
+    is the shadow path, not the agent's path.
+    """
+    if worktree_path is None:
+        row = conn.execute(
+            "SELECT MAX(rr.finished_ts_ms)"
+            "  FROM run_results rr JOIN runs r ON r.run_id = rr.run_id"
+            " WHERE r.commit_sha = ? AND r.dirty_hash IS NULL",
+            (sha,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT MAX(rr.finished_ts_ms)"
+            "  FROM run_results rr JOIN runs r ON r.run_id = rr.run_id"
+            " WHERE r.commit_sha = ? AND r.dirty_hash IS NULL"
+            "   AND r.worktree_path = ?",
+            (sha, worktree_path),
+        ).fetchone()
     if not row or row[0] is None:
         return None
     return int(row[0])
@@ -1106,7 +1121,7 @@ def _pick_opportunistic_worktree(
     last_picked = last_picked_row[0] if last_picked_row else None
 
     def keyed(c: dict) -> tuple:
-        age = _last_run_age_at_sha(conn, c["head"], c["path"])
+        age = _last_run_age_at_sha(conn, c["head"])
         never_tested = age is None
         ms_since = (now_ms() - age) if age is not None else 10**18
         same_as_last = c["path"] == last_picked
@@ -1847,7 +1862,7 @@ def _render_agent_worktrees(conn: sqlite3.Connection,
         delta_mb = _regression_counts(conn, mb, agent_head)
         # Δ vs baseline HEAD
         delta_bh = _regression_counts(conn, ref_head, agent_head)
-        last_age = _last_run_age_at_sha(conn, agent_head, path)
+        last_age = _last_run_age_at_sha(conn, agent_head)
         last_age_str = (
             f"{fmt_age_ms(now_ms() - last_age)} ago"
             if last_age is not None else "_never_"
@@ -2544,10 +2559,13 @@ def _drive_agent_worktree(
         return False
     env["LITEBOX_DASHBOARD_DIR"] = str(state_dir)
     env["LITEBOX_DASHBOARD_REF"] = wt.get("branch") or "<detached>"
-    # Critical: attribute the run back to the agent's worktree path
-    # (not the shadow) so result-groups stacks the new state under
-    # the agent's branch, not under a generic "shadow" bucket.
-    env["LITEBOX_DASHBOARD_WORKTREE_PATH"] = wt["path"]
+    # We deliberately do NOT override LITEBOX_DASHBOARD_WORKTREE_PATH
+    # here — let runs.worktree_path record the shadow path. This makes
+    # opportunistic runs trivially distinguishable in result-groups
+    # (same trick the tracked-ref CI worktrees use), and the new
+    # "Agent worktrees" section's aggregations are sha-scoped over
+    # clean states anyway, so shadow + agent runs at the same HEAD
+    # combine correctly without further coordination.
     fill_budget = int(os.environ.get("LITEBOX_AGENT_FILL_BUDGET")
                       or getattr(args, "agent_fill_budget", 180) or 180)
     cargo_args = [

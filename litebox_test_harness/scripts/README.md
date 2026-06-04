@@ -257,11 +257,19 @@ add --detach` off the canonical clone (so it shares `.git/objects`
 but has its own working tree + its own `target/`). Per cycle:
 
 1. `git -C <shadow> checkout --detach -f --quiet <agent_HEAD>`
-2. `cargo test ...` from `<shadow>`, with
-   `LITEBOX_DASHBOARD_WORKTREE_PATH=<agent_worktree>` so
-   `runs.worktree_path` attributes back to the agent's path (and
-   the new rows stack correctly under the agent's branch in
-   Result-groups).
+2. `cargo test ...` from `<shadow>`.
+
+Opportunistic runs land in `runs` with
+`worktree_path=<state-dir>/shadow` and `branch=<agent_branch>`
+(via `LITEBOX_DASHBOARD_REF`). This makes them trivially
+distinguishable in result-groups by the literal shadow path —
+same self-evidence trick the tracked-ref CI worktrees rely on.
+Aggregation across shadow + agent runs at the same HEAD still
+works correctly: the state key is `(commit_sha, dirty_hash,
+state_wt)` and `state_wt` is NULL for clean rows regardless of
+worktree, so two clean runs at the same sha (one from agent's
+own worktree, one from the shadow) collapse to the same state
+and their `state_test_pass` rows combine.
 
 The shadow persists across cycles — incremental cargo `target/`
 artifacts are reused, so only the *first* opportunistic cycle
