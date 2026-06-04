@@ -1915,7 +1915,6 @@ impl LinuxUserland {
         snapshot_bytes: &[u8],
         stdio: WorkerExecStdioBindings<FS>,
         passthrough_fds: &[(usize, i32, u8)],
-        local_pipe_pairs: &[(usize, usize, Vec<u8>, u32, u32)],
         // Phase 3 (legacy-pipes retirement): broker-fd-bridge specs for
         // streams migrated directly to broker handles. Each entry is
         // forwarded to the worker as `--broker-fd-bridge <spec>` and
@@ -2021,30 +2020,6 @@ impl LinuxUserland {
         // where drain_fd is a memfd containing buffered data and
         // w_flags/r_flags are per-end OFlags as decimal integers.
         // Keep OwnedFds alive until posix_spawn (Drop closes them).
-        // Collected here so early returns automatically close them.
-        let mut drain_owned_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
-        for &(write_fd, read_fd, ref drained, w_flags, r_flags) in local_pipe_pairs {
-            spawn_argv.push(CString::new("--local-pipe").unwrap());
-            if drained.is_empty() {
-                spawn_argv.push(
-                    CString::new(format!("{write_fd}:{read_fd}::{w_flags}:{r_flags}"))
-                        .map_err(|_| -1_i32)?,
-                );
-            } else {
-                // Write drained data to a memfd (avoids E2BIG on large buffers).
-                let drain_fd = create_worker_fork_snapshot_fd(drained).map_err(|_| -1_i32)?;
-                let raw_drain_fd = drain_fd.as_raw_fd();
-                let _ = self.clear_cloexec(raw_drain_fd);
-                // Keep OwnedFd alive until after posix_spawn.
-                drain_owned_fds.push(drain_fd);
-                spawn_argv.push(
-                    CString::new(format!(
-                        "{write_fd}:{read_fd}:{raw_drain_fd}:{w_flags}:{r_flags}"
-                    ))
-                    .map_err(|_| -1_i32)?,
-                );
-            }
-        }
 
         let argv_ptrs: Vec<*const libc::c_char> = spawn_argv
             .iter()
@@ -2183,7 +2158,6 @@ impl LinuxUserland {
             )
         };
         if ret != 0 {
-            // drain_owned_fds dropped automatically (OwnedFd::drop closes).
             return Err(ret);
         }
         drop(host_stdio_temp_sources);
@@ -2198,9 +2172,6 @@ impl LinuxUserland {
         for &(_, host_fd, _) in passthrough_fds {
             self.close_host_fd(host_fd);
         }
-
-        // Close drain memfds (child inherited them via posix_spawn).
-        drop(drain_owned_fds);
 
         // Read ack from child: 0 = success, non-zero = error.
         let ack_status = read_fork_restore_ack(ack_read_fd);

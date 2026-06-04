@@ -3438,8 +3438,6 @@ impl<FS: ShimFS> Task<FS> {
         // own --broker-fd-bridge specs.
         let mut broker_socketpair_migrated_streams: alloc::vec::Vec<(usize, u64, char, bool)> =
             alloc::vec::Vec::new();
-        // (write_fd, read_fd, drained_data, write_flags, read_flags)
-        let mut local_pipe_pairs: Vec<(usize, usize, Vec<u8>, u32, u32)> = Vec::new();
         // Dup'd pipe aliases: (alias_fd, primary_bridge_index).
         // The worker dups the primary stream's pipe end to alias_fd.
         let mut mux_aliases: Vec<(usize, usize)> = Vec::new();
@@ -3531,88 +3529,6 @@ impl<FS: ShimFS> Task<FS> {
                 child_pipes.len(),
                 child_external_fd_fds.len(),
             );
-
-            // Detect child-only pipe pairs: both ends (same pair_id,
-            // opposite directions) are in the child but NOT in
-            // parent_pipe_fds.  These were created by the child
-            // between fork and exec.  They don't need mux bridging —
-            // the worker creates a connected pipe pair instead.
-            //
-            // Collect ALL fds per pair (including dup'd aliases) so
-            // the worker can install pipe ends at every alias fd.
-            {
-                let mut seen_pair_ids: Vec<usize> = Vec::new();
-                for &(_, dir_a, pair_id) in &child_pipes {
-                    if seen_pair_ids.contains(&pair_id) {
-                        continue;
-                    }
-                    // Require both directions present in the child.
-                    let has_opposite = child_pipes
-                        .iter()
-                        .any(|&(_, dir_b, pid)| pid == pair_id && dir_b != dir_a);
-                    if !has_opposite {
-                        continue;
-                    }
-                    // Check the parent doesn't have this pair.
-                    let in_parent = fc.parent_pipe_fds.iter().any(|&(_, _, pid)| pid == pair_id);
-                    if in_parent {
-                        continue;
-                    }
-                    seen_pair_ids.push(pair_id);
-                    // Collect ALL write and read fds for this pair.
-                    let write_fds: Vec<usize> = child_pipes
-                        .iter()
-                        .filter(|&&(_, dir, pid)| {
-                            pid == pair_id && dir == ExternalFdDirection::Write
-                        })
-                        .map(|&(fd, _, _)| fd)
-                        .collect();
-                    let read_fds: Vec<usize> = child_pipes
-                        .iter()
-                        .filter(|&&(_, dir, pid)| {
-                            pid == pair_id && dir == ExternalFdDirection::Read
-                        })
-                        .map(|&(fd, _, _)| fd)
-                        .collect();
-                    // Store primary pair + any aliases.
-                    if let (Some(&primary_w), Some(&primary_r)) =
-                        (write_fds.first(), read_fds.first())
-                    {
-                        let (drained, w_flags, r_flags) = (Vec::new(), 0, 0);
-                        local_pipe_pairs.push((primary_w, primary_r, drained, w_flags, r_flags));
-                        // Extra write aliases.
-                        for &fd in &write_fds[1..] {
-                            local_pipe_pairs.push((fd, primary_r, Vec::new(), w_flags, r_flags));
-                        }
-                        // Extra read aliases.
-                        for &fd in &read_fds[1..] {
-                            local_pipe_pairs.push((primary_w, fd, Vec::new(), w_flags, r_flags));
-                        }
-                    }
-                }
-            }
-            if !local_pipe_pairs.is_empty() {
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: {} child-only pipe pair(s) → local in worker",
-                    self.pid,
-                    local_pipe_pairs.len(),
-                );
-                // Remove ALL fds sharing a child-only pair_id from
-                // child_pipes — not just the two representative fds.
-                // This handles dup'd aliases that share the same pair.
-                let local_pair_ids: Vec<usize> = child_pipes
-                    .iter()
-                    .filter(|&&(fd, _, _)| {
-                        local_pipe_pairs
-                            .iter()
-                            .any(|&(w, r, _, _, _)| fd == w || fd == r)
-                    })
-                    .map(|&(_, _, pair_id)| pair_id)
-                    .collect();
-                child_pipes.retain(|&(_, _, pair_id)| !local_pair_ids.contains(&pair_id));
-            }
 
             // Extract OS fd + direction from collected external-fd TypedFds.
             // Done after dropping rds to maintain dt→rds lock ordering.
@@ -5353,7 +5269,6 @@ impl<FS: ShimFS> Task<FS> {
             &snapshot_bytes,
             stdio,
             &bidi_pt,
-            &local_pipe_pairs,
             // Phase 3 D5: streams migrated directly to broker handles
             // via `--broker-fd-bridge`. Includes host-backed,
             // virtual-pipe / socket / PTY, and FS-backed.
@@ -5691,7 +5606,6 @@ impl<FS: ShimFS> Task<FS> {
         let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
             &snapshot_bytes,
             stdio,
-            &[],
             &[],
             &[],
         ) {
