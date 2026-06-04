@@ -123,10 +123,32 @@ pub struct HostFdState {
 
 impl HostFdState {
     /// Wrap an SCM_RIGHTS-received host fd as a broker state object.
-    /// Sets `O_NONBLOCK` on the fd (best-effort; failure is logged
-    /// but does not abort). Spawns the readiness poll thread.
+    /// Spawns the readiness poll thread.
+    ///
+    /// # Semantic note: OFD flags are NOT mutated
+    ///
+    /// The broker holds ONE fd ref to a shared open file description
+    /// (OFD). The original opener (parent shim, dropbear, etc.) holds
+    /// sibling refs that may still be in use by their own I/O loops.
+    /// OFD-level state (`F_SETFL` including `O_NONBLOCK`, `F_SETOWN`,
+    /// etc.) is set by `fcntl(F_SETFL, ...)` per POSIX `fcntl(2)` —
+    /// the file-status flags live **on the OFD**, not on the fd.
+    ///
+    /// Earlier versions of this function called `fcntl(F_SETFL,
+    /// |O_NONBLOCK)` here, which silently flipped sibling fds (e.g.
+    /// dropbear's PTY-master) into non-blocking mode and broke their
+    /// blocking read loops with unexpected `EAGAIN`. That was the
+    /// root cause of `echo_two_lines`/`pipe_head_early_exit` failures
+    /// under `LITEBOX_NEW_MUX=1` (see plan.md §A "Semantic guidance
+    /// after Sessions 7-8").
+    ///
+    /// Instead, every `read()` / `write()` call in this module is
+    /// preceded by a `poll(timeout=0)` readiness probe. The kernel
+    /// will return `EAGAIN` only if the OFD already carries
+    /// `O_NONBLOCK` from the opener — in that case the WouldBlock is
+    /// propagated to the worker's `BrokerPipeFd` retry path, same as
+    /// any other notification-driven WouldBlock.
     pub fn from_received(fd: OwnedFd, direction: HostFdDirection) -> Arc<Self> {
-        set_nonblocking(fd.as_raw_fd());
         let state = Arc::new(Self {
             fd,
             direction,
@@ -144,12 +166,24 @@ impl HostFdState {
 
     /// Non-blocking read into a freshly-allocated buffer of up to
     /// `max_len` bytes. Returns an empty `Vec` on EOF.
+    ///
+    /// Gated on a `poll(POLLIN, timeout=0)` readiness check rather
+    /// than relying on `O_NONBLOCK` on the OFD (see [`from_received`]
+    /// docs for why). If POLLIN is not set, returns `WouldBlock`
+    /// without issuing the `read(2)` — the worker's `BrokerPipeFd`
+    /// retry loop will re-issue when the poll thread notifies.
+    ///
+    /// [`from_received`]: Self::from_received
     pub fn read(&self, max_len: usize) -> Result<Vec<u8>, HostFdError> {
         if !self.direction.allows_read() {
             return Err(HostFdError::DirectionMismatch);
         }
         if max_len == 0 {
             return Ok(Vec::new());
+        }
+        let revents = poll_fd_events(self.fd.as_raw_fd());
+        if revents & (NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP | NOTIFY_EVENT_ERR) == 0 {
+            return Err(HostFdError::WouldBlock);
         }
         let mut buf = vec![0u8; max_len];
         // SAFETY: `buf` is a valid writable slice of length `max_len`;
@@ -176,12 +210,31 @@ impl HostFdState {
 
     /// Non-blocking write. Returns number of bytes actually written
     /// (may be less than `bytes.len()` for partial writes).
+    ///
+    /// Gated on a `poll(POLLOUT, timeout=0)` readiness check rather
+    /// than relying on `O_NONBLOCK` on the OFD (see [`from_received`]
+    /// docs for why). If POLLOUT is not set, returns `WouldBlock`.
+    ///
+    /// **Does NOT chunk writes to `PIPE_BUF`.** Earlier Session 7
+    /// experiment chunked at `PIPE_BUF=4096` defensively to avoid
+    /// the case where the kernel partially accepts a large write
+    /// after POLLOUT; that caused `echo_sleep_zero` to regress
+    /// because it broke write atomicity expectations of upstream
+    /// readers. Per `write(2)`, partial writes are explicitly
+    /// permitted and the worker's `BrokerPipeFd` already loops on
+    /// short writes. Pass `bytes` through as-is.
+    ///
+    /// [`from_received`]: Self::from_received
     pub fn write(&self, bytes: &[u8]) -> Result<usize, HostFdError> {
         if !self.direction.allows_write() {
             return Err(HostFdError::DirectionMismatch);
         }
         if bytes.is_empty() {
             return Ok(0);
+        }
+        let revents = poll_fd_events(self.fd.as_raw_fd());
+        if revents & (NOTIFY_EVENT_OUT | NOTIFY_EVENT_ERR) == 0 {
+            return Err(HostFdError::WouldBlock);
         }
         // SAFETY: `bytes` is a valid readable slice; `self.fd` is a
         // live host fd owned for the lifetime of `self`.
@@ -289,18 +342,6 @@ impl StateObject for HostFdState {
     fn try_flush_subscriptions(&self) {
         self.subject.try_flush();
     }
-}
-
-fn set_nonblocking(fd: libc::c_int) {
-    // SAFETY: `fd` is a live host fd. `F_GETFL` and `F_SETFL` are
-    // standard fcntl operations with no out-buffer requirements.
-    let cur = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
-    if cur < 0 {
-        return;
-    }
-    let new = cur | libc::O_NONBLOCK;
-    // SAFETY: same as above; `new` is an integer flags word.
-    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, new) };
 }
 
 fn poll_fd_events(fd: libc::c_int) -> u32 {
