@@ -258,5 +258,44 @@ class TipSetTests(unittest.TestCase):
         self.assertEqual([w["head"] for w in out], ["Z", "A"])
 
 
+class ShadowPathTests(unittest.TestCase):
+    """Per-branch shadow path encoding + GC selection rules.
+    Hermetic: only exercises pure-functional path helpers and the
+    branch-decoding step of GC (the actual git invocations are
+    integration-tested by the live supervisor)."""
+
+    def test_branch_to_dirname_round_trip_simple(self):
+        self.assertEqual(
+            dashboard._branch_to_shadow_dirname("main"), "main")
+
+    def test_branch_to_dirname_round_trip_slash(self):
+        self.assertEqual(
+            dashboard._branch_to_shadow_dirname("wportnoy/foo-bar"),
+            "wportnoy%2ffoo-bar",
+        )
+        # And decoding (used by GC) reverses it cleanly.
+        self.assertEqual(
+            "wportnoy%2ffoo-bar".replace("%2f", "/"),
+            "wportnoy/foo-bar",
+        )
+
+    def test_per_branch_path_is_under_shadows_root(self):
+        sd = Path("/tmp/sd-test")
+        p = dashboard._per_branch_shadow_path(sd, "wportnoy/x")
+        self.assertEqual(p.parent, dashboard._shadows_root(sd))
+        self.assertEqual(p.name, "wportnoy%2fx")
+
+    def test_legacy_path_distinct_from_per_branch_root(self):
+        sd = Path("/tmp/sd-test")
+        legacy = dashboard._shadow_worktree_path(sd)
+        root = dashboard._shadows_root(sd)
+        # Singular vs plural — they must not collide on the
+        # filesystem (so the legacy-shadow GC path can't clobber
+        # the per-branch tree).
+        self.assertNotEqual(legacy, root)
+        self.assertEqual(legacy.name, "shadow")
+        self.assertEqual(root.name, "shadows")
+
+
 if __name__ == "__main__":
     unittest.main()

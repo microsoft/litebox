@@ -251,39 +251,50 @@ file, no per-worktree configuration.
 **Isolation.** The supervisor never runs cargo inside the agent's
 worktree. Doing so would race the agent's own `target/` and
 `docker build` if the agent kicked off a cargo invocation in the
-brief gap between idle-gate checks. Instead it maintains a single
-**shadow worktree** at `<state-dir>/shadow/` — a `git worktree
-add --detach` off the canonical clone (so it shares `.git/objects`
-but has its own working tree + its own `target/`). Per cycle:
+brief gap between idle-gate checks. Instead it maintains a
+**per-branch shadow worktree** at `<state-dir>/shadows/<branch>/`
+— a `git worktree add --detach` off the canonical clone (so it
+shares `.git/objects` but has its own working tree + its own
+`target/` + its own per-worktree-path docker image tag). Branch
+names with `/` are encoded as `%2f` so the directory layout stays
+flat. Per cycle:
 
 1. `git -C <shadow> checkout --detach -f --quiet <agent_HEAD>`
 2. `cargo test ...` from `<shadow>`.
 
 Opportunistic runs land in `runs` with
-`worktree_path=<state-dir>/shadow` and `branch=<agent_branch>`
-(via `LITEBOX_DASHBOARD_REF`). This makes them trivially
-distinguishable in result-groups by the literal shadow path —
-same self-evidence trick the tracked-ref CI worktrees rely on.
-Aggregation across shadow + agent runs at the same HEAD still
-works correctly: the state key is `(commit_sha, dirty_hash,
-state_wt)` and `state_wt` is NULL for clean rows regardless of
-worktree, so two clean runs at the same sha (one from agent's
-own worktree, one from the shadow) collapse to the same state
-and their `state_test_pass` rows combine.
+`worktree_path=<state-dir>/shadows/<branch>` and
+`branch=<agent_branch>` (via `LITEBOX_DASHBOARD_REF`). This makes
+them trivially distinguishable in result-groups by the literal
+shadow path — same self-evidence trick the tracked-ref CI
+worktrees rely on. Aggregation across shadow + agent runs at the
+same HEAD still works correctly: the state key is `(commit_sha,
+dirty_hash, state_wt)` and `state_wt` is NULL for clean rows
+regardless of worktree, so two clean runs at the same sha (one
+from agent's own worktree, one from the shadow) collapse to the
+same state and their `state_test_pass` rows combine.
 
-The shadow persists across cycles — incremental cargo `target/`
-artifacts are reused, so only the *first* opportunistic cycle
-ever pays a full cold-build cost. Switching the shadow between
-agent HEADs costs ~2–3 min of incremental recompile when the
-diff between two opportunistically-tested branches is large,
-which is the deliberate tradeoff: full safety vs occasional
-rebuild. Per-branch shadows (one persistent `target/` per agent
-branch) would eliminate the branch-flip cost at the price of
-~10–15 GB disk per branch; left as a future improvement.
+Each branch's shadow persists across cycles — incremental cargo
+`target/` artifacts are reused, so only the *first* opportunistic
+cycle for a given branch pays a full cold-build cost. Subsequent
+cycles on the same branch are incremental even if other branches
+were tested in between (the earlier single-shadow design paid a
+2–3 min recompile on every branch flip; per-branch shadows
+eliminate that). Tradeoff: ~10–15 GB disk under `target/` per
+branch. Mitigated by GC.
+
+**GC.** At the start of each opportunistic scheduling cycle, the
+supervisor reaps any shadow under `<state-dir>/shadows/` whose
+decoded branch name no longer exists in the canonical clone's
+local refs (`git for-each-ref refs/heads/`). Branches deleted by
+the user (e.g. after merging back) immediately free their
+shadow's `target/`. The legacy single-shadow path
+(`<state-dir>/shadow/`) is also reaped on first GC for migration.
 
 The shadow's Docker image is its own per-worktree tag (`litebox-
 test:wt-<sha256(shadow_path)[..8]>`, per the per-session image
-tag scheme), so the shadow's `docker build` never overwrites the
+tag scheme), so each per-branch shadow has a distinct docker
+image and the shadow's `docker build` never overwrites the
 agent's image either.
 
 **Idle gate.** A worktree is eligible only when:
