@@ -238,6 +238,113 @@ advances atomically.
 After each full round-trip, the driver re-renders `summary.md`,
 sleeps `--interval` seconds, and repeats.
 
+### Opportunistic coverage of agent worktrees
+
+After each tracked-ref pass, the supervisor also discovers any
+worktree visible via `git worktree list` in the canonical clone
+that is NOT a `tracked_refs.ci_worktree` — these are "agent
+worktrees" (typically per-session work branches). For each
+eligible worktree, it can spawn one short `--fill` cycle per
+loop iteration. Discovery + scheduling is automatic; no marker
+file, no per-worktree configuration.
+
+**Isolation.** The supervisor never runs cargo inside the agent's
+worktree. Doing so would race the agent's own `target/` and
+`docker build` if the agent kicked off a cargo invocation in the
+brief gap between idle-gate checks. Instead it maintains a single
+**shadow worktree** at `<state-dir>/shadow/` — a `git worktree
+add --detach` off the canonical clone (so it shares `.git/objects`
+but has its own working tree + its own `target/`). Per cycle:
+
+1. `git -C <shadow> checkout --detach -f --quiet <agent_HEAD>`
+2. `cargo test ...` from `<shadow>`.
+
+Opportunistic runs land in `runs` with
+`worktree_path=<state-dir>/shadow` and `branch=<agent_branch>`
+(via `LITEBOX_DASHBOARD_REF`). This makes them trivially
+distinguishable in result-groups by the literal shadow path —
+same self-evidence trick the tracked-ref CI worktrees rely on.
+Aggregation across shadow + agent runs at the same HEAD still
+works correctly: the state key is `(commit_sha, dirty_hash,
+state_wt)` and `state_wt` is NULL for clean rows regardless of
+worktree, so two clean runs at the same sha (one from agent's
+own worktree, one from the shadow) collapse to the same state
+and their `state_test_pass` rows combine.
+
+The shadow persists across cycles — incremental cargo `target/`
+artifacts are reused, so only the *first* opportunistic cycle
+ever pays a full cold-build cost. Switching the shadow between
+agent HEADs costs ~2–3 min of incremental recompile when the
+diff between two opportunistically-tested branches is large,
+which is the deliberate tradeoff: full safety vs occasional
+rebuild. Per-branch shadows (one persistent `target/` per agent
+branch) would eliminate the branch-flip cost at the price of
+~10–15 GB disk per branch; left as a future improvement.
+
+The shadow's Docker image is its own per-worktree tag (`litebox-
+test:wt-<sha256(shadow_path)[..8]>`, per the per-session image
+tag scheme), so the shadow's `docker build` never overwrites the
+agent's image either.
+
+**Idle gate.** A worktree is eligible only when:
+
+- No source-ish file (`*.rs`, `*.toml`, `*.py`, `Dockerfile`) has
+  been touched in the last `LITEBOX_AGENT_IDLE_SECS` (default
+  `300` = 5min); AND
+- No live `harness_leases` row's `/proc/<pid>/cwd` is inside the
+  worktree path.
+
+This avoids competing with the agent's own active edit/build/test
+work.
+
+**Scheduling.** Round-robin across eligible candidates, biased
+toward never-tested or stalest HEADs. The supervisor records the
+last-picked worktree in `meta.agent_coverage_last_picked` to
+ensure no single worktree starves the others over long runs. The
+opportunistic `cargo test` registers with `harness_leases` the
+same way any other invocation does, so the existing cross-session
+concurrency lease (`LITEBOX_GLOBAL_JOBS / N`) fairly shares CPU
+between this cycle and any tracked-ref cycle that's in flight.
+
+**Budget.** Each opportunistic cycle is `--fill=<budget>s` with
+`budget = LITEBOX_AGENT_FILL_BUDGET` (default `180`), kept small
+so the round-robin is responsive across many worktrees.
+
+**Surfacing.** Results land in the existing `runs` /
+`run_results` tables under the worktree's own `(commit_sha,
+dirty_hash, worktree_path)`, so they automatically appear in the
+Result-groups stacked-state breakdown. A NEW "Agent worktrees"
+section in `summary.md` adds two regression columns per pass:
+
+- **Δ vs merge-base** — pass-at-baseline-merge-base → fail-at-HEAD.
+  This is "regressions the agent introduced since they forked."
+- **Δ vs baseline HEAD** — pass-at-baseline-HEAD → fail-at-HEAD.
+  This is "absolute drift from current upstream."
+
+The "baseline" for each agent worktree is picked dynamically: the
+tracked_ref whose HEAD shares the most recent merge-base with the
+agent worktree's HEAD (= the upstream they most recently forked
+from). With one tracked_ref this is trivially that ref. The
+section is omitted entirely when no agent worktrees are
+discovered.
+
+**Optional sidecar.** Set `LITEBOX_AGENT_SIDECAR=1` (or pass
+`--agent-sidecar` to `dashboard.py auto`) to also write
+`<worktree>/.dashboard/regressions.md` after each successful
+agent cycle, listing the regressed test_ids per pass. Convenient
+for an agent to `cat` directly without scrolling `summary.md`.
+
+**Disable.** Pass `--agent-coverage-disable` to the supervisor
+to skip opportunistic coverage entirely (supervisor only drives
+tracked refs).
+
+| Env var | Default | Effect |
+|---|---|---|
+| `LITEBOX_AGENT_IDLE_SECS` | `300` | Minimum seconds since last source-file mtime AND no live lease for a worktree to be eligible. |
+| `LITEBOX_AGENT_FILL_BUDGET` | `180` | `--fill=Ns` budget for each opportunistic cycle. |
+| `LITEBOX_AGENT_SIDECAR` | unset | When set (any value), write `<worktree>/.dashboard/regressions.md` after each successful cycle. |
+| `LITEBOX_DASHBOARD_CANONICAL` | state-dir parent | Override the canonical clone path for `git worktree list` / merge-base queries (renderer-side; the supervisor accepts `--canonical-worktree` instead). |
+
 ### Bootstrap a tracked ref
 
 ```sh

@@ -84,6 +84,40 @@ Docker daemon. The `--target` argument to `docker build` always
 uses the bare stage name (`litebox-test`, `litebox-agent-cli`) —
 that's a Dockerfile-internal handle, not a tag.
 
+**Opportunistic dashboard coverage for agent worktrees.** When the
+`dashboard.py auto` supervisor is running, it scans `git worktree
+list` each cycle and identifies any worktree that is NOT a
+`tracked_refs.ci_worktree` as an "agent worktree." If such a
+worktree has been idle for at least `LITEBOX_AGENT_IDLE_SECS`
+(default 300s = 5min — no source-file mtime change AND no live
+lease entry from that worktree), the supervisor spawns a short
+`cargo test --fill=<LITEBOX_AGENT_FILL_BUDGET>s` cycle (default
+180s) at that worktree's HEAD. To guarantee isolation from the
+agent's own `target/` and `docker build`, the supervisor never
+runs cargo inside the agent's worktree itself — instead it
+maintains a single shadow worktree at `<state-dir>/shadow/`
+(shared canonical git object DB, separate working tree +
+separate `target/` + separate per-worktree docker image tag) and
+`git checkout --detach`s the agent's HEAD into it before each
+cycle. Opportunistic runs land in `runs` with
+`worktree_path=<state-dir>/shadow` and the agent's branch in
+`runs.branch` — so they're trivially distinguishable from agent's
+own runs by the literal shadow path (same self-evidence trick
+the tracked-ref CI worktrees use). Aggregation still works: the
+state key is `(commit_sha, dirty_hash, state_wt)` and `state_wt`
+is NULL for clean rows regardless of worktree, so shadow + agent
+clean runs at the same sha collapse to the same state and
+combine cleanly. Results appear in the dashboard's new "Agent
+worktrees" section, which compares the worktree's HEAD against
+the tracked-ref baseline whose HEAD shares the most recent
+merge-base (= the upstream this branch forked from). Two
+columns per pass: Δ vs merge-base (the agent's own regressions)
+and Δ vs baseline HEAD (drift vs current upstream). Set
+`LITEBOX_AGENT_SIDECAR=1` to also write a focused
+`<worktree>/.dashboard/regressions.md` after each successful
+cycle for direct agent consumption. Disable entirely with
+`--agent-coverage-disable` on the supervisor invocation.
+
 ## Multi-wave platform-fix workflow
 
 When the test harness is reporting tens or hundreds of failures (e.g., after a
