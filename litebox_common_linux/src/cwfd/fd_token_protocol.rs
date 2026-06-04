@@ -5278,9 +5278,10 @@ mod tests {
     #[test]
     fn decode_unknown_opcode() {
         let mut buf = build_register_request().encode().unwrap();
-        buf[6] = 0x55;
+        // 0x0D is unallocated. Update if 0x0D ever gets allocated.
+        buf[6] = 0x0D;
         match decode(&buf) {
-            Err(ProtocolError::UnknownOpcode { opcode: 0x55 }) => {}
+            Err(ProtocolError::UnknownOpcode { opcode: 0x0D }) => {}
             other => panic!("expected UnknownOpcode, got {other:?}"),
         }
     }

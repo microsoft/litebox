@@ -150,6 +150,7 @@ fn build_local_services(
     elf_cache: Arc<Mutex<litebox_broker::nine_p::server::ElfCache>>,
     sandbox_policy: &Option<Arc<litebox_broker::sandbox_policy::SandboxPolicy>>,
     inotify_dispatcher: Arc<litebox_broker::inotify_dispatcher::InotifyDispatcher>,
+    ofd_registry: Arc<litebox_broker::ofd_registry::OfdRegistry>,
 ) -> Option<litebox_broker::net_proxy::LocalServiceRegistry> {
     let root_dir = cli.root_dir.as_ref()?;
     let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
@@ -164,6 +165,7 @@ fn build_local_services(
         let policy = Arc::clone(&policy);
         let elf_cache = Arc::clone(&elf_cache);
         let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
+        let ofd_registry = Arc::clone(&ofd_registry);
         registry.register(
             5640,
             Box::new(move |stream| {
@@ -171,15 +173,21 @@ fn build_local_services(
                 let policy = Arc::clone(&policy);
                 let elf_cache = Arc::clone(&elf_cache);
                 let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
+                let ofd_registry = Arc::clone(&ofd_registry);
                 std::thread::spawn(move || {
                     let mut stream = stream;
-                    let server = litebox_broker::nine_p::server::Server::with_elf_cache(
+                    let mut server = litebox_broker::nine_p::server::Server::with_elf_cache(
                         root,
                         policy,
                         rewrite_syscalls,
                         elf_cache,
                         inotify_dispatcher,
                     );
+                    // Legacy-pipes Phase 3 (D3): every 9P Server
+                    // shares the broker-global OFD registry so
+                    // RegisterOfd/CloneOfd can plumb host OFDs
+                    // across connections.
+                    server.set_ofd_registry(ofd_registry);
                     server.serve(&mut stream);
                     info!("9P local service session ended");
                 })
@@ -194,6 +202,7 @@ fn build_local_services(
         let policy = Arc::clone(&policy);
         let elf_cache = Arc::clone(&elf_cache);
         let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
+        let ofd_registry = Arc::clone(&ofd_registry);
         registry.register_ring(
             5640,
             Arc::new(move |writer, reader| {
@@ -201,14 +210,17 @@ fn build_local_services(
                 let policy = Arc::clone(&policy);
                 let elf_cache = Arc::clone(&elf_cache);
                 let inotify_dispatcher = Arc::clone(&inotify_dispatcher);
+                let ofd_registry = Arc::clone(&ofd_registry);
                 std::thread::spawn(move || {
-                    let server = Arc::new(litebox_broker::nine_p::server::Server::with_elf_cache(
+                    let mut server_inner = litebox_broker::nine_p::server::Server::with_elf_cache(
                         root,
                         policy,
                         rewrite_syscalls,
                         elf_cache,
                         inotify_dispatcher,
-                    ));
+                    );
+                    server_inner.set_ofd_registry(ofd_registry);
+                    let server = Arc::new(server_inner);
                     litebox_broker::nine_p::server::Server::serve_threaded(
                         server, reader, writer, 8,
                     );
@@ -246,6 +258,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Arc clones survive for the lifetime of the broker process.
     let inotify_dispatcher =
         std::sync::Arc::new(litebox_broker::inotify_dispatcher::InotifyDispatcher::new());
+    // Legacy-pipes Phase 3 (D3 step 1+2): broker-global OFD
+    // registry. Every `nine_p::Server` shares this Arc so that an
+    // `OpenFileId` minted on the parent's 9P session is resolvable
+    // by the worker's 9P session (the registry is the only piece
+    // of state that crosses connections). Per-connection
+    // fd-token-socket → 9P-server pairing is a follow-up: the
+    // shim needs to register its 9P session id over the
+    // fd-token-socket so the broker can route `RegisterOfd` /
+    // `CloneOfd` to the right `Server`. Until that handshake
+    // lands, the D3 wire-protocol surface is reachable but the
+    // handlers return `SubsystemMismatch` (paired-server lookup
+    // returns `None`).
+    let ofd_registry = std::sync::Arc::new(litebox_broker::ofd_registry::OfdRegistry::new());
     let shared_state_registry = cli
         .fd_token_broker_listen
         .as_ref()
@@ -330,6 +355,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             elf_cache,
             &sandbox_policy,
             Arc::clone(&inotify_dispatcher),
+            Arc::clone(&ofd_registry),
         );
         let forwards = parse_forward_specs(&cli.forward_port);
         return litebox_broker::net_proxy::run(
@@ -418,6 +444,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&elf_cache),
                 &sandbox_policy,
                 Arc::clone(&inotify_dispatcher),
+                Arc::clone(&ofd_registry),
             );
             let ipc = match litebox_broker::net_proxy::accept_ipc_client(
                 &listener,
@@ -489,12 +516,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let server = litebox_broker::nine_p::server::Server::new(
+        let mut server = litebox_broker::nine_p::server::Server::new(
             root.clone(),
             Arc::clone(&policy),
             cli.rewrite_syscalls,
             Arc::clone(&inotify_dispatcher),
         );
+        server.set_ofd_registry(Arc::clone(&ofd_registry));
         server.serve(&mut stream);
         info!("9P client disconnected");
     }
