@@ -5752,16 +5752,11 @@ impl<FS: ShimFS> Task<FS> {
         let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
             &snapshot_bytes,
             stdio,
-            mux_fd_opt,
-            &mux_stream_specs,
             &bidi_pt,
             &local_pipe_pairs,
-            // Phase 3 D5: streams migrated out of mux onto direct
-            // broker handles via `--broker-fd-bridge`. Currently
-            // includes host-backed streams (attach_host_fd on a dup
-            // of the parent's host fd, so the parent's existing
-            // ExternalFd entries remain valid); future commits add
-            // virtual pipe/socket/PTY and FS-backed.
+            // Phase 3 D5: streams migrated directly to broker handles
+            // via `--broker-fd-bridge`. Includes host-backed,
+            // virtual-pipe / socket / PTY, and FS-backed.
             &broker_fd_bridge_specs,
         ) {
             Ok(pid) => {
@@ -6107,8 +6102,6 @@ impl<FS: ShimFS> Task<FS> {
         let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
             &snapshot_bytes,
             stdio,
-            None,
-            &[],
             &[],
             &[],
             &[],

@@ -1941,10 +1941,8 @@ impl LinuxUserland {
     /// child to report restore success/failure, and launches a new host process
     /// via `posix_spawn`.
     ///
-    /// The multiplexer socketpair fd (`mux_fd`) and per-stream mappings
-    /// (`mux_streams`) replace the old per-fd `--pipe-bridge` arguments.
     /// Host-pipe fds from prior bridges are passed via `passthrough_fds`
-    /// and inherit directly (not through the mux).
+    /// and inherit directly.
     ///
     /// Returns `Ok(host_pid)` if the child was spawned and reported successful
     /// restore via the ack pipe.  Returns `Err(errno)` on failure.
@@ -1960,17 +1958,13 @@ impl LinuxUserland {
         &'static self,
         snapshot_bytes: &[u8],
         stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
-        mux_fd: Option<i32>,
-        mux_streams: &[(u32, usize, u8, u8, bool)],
         passthrough_fds: &[(usize, i32, u8)],
         local_pipe_pairs: &[(usize, usize, Vec<u8>, u32, u32)],
         // Phase 3 (legacy-pipes retirement): broker-fd-bridge specs for
-        // mux streams migrated out of the mux relay to direct broker
-        // handles. Each entry is forwarded to the worker as
-        // `--broker-fd-bridge <spec>` and consumed by the existing
-        // install_broker_fd_bridge_spec path in the runner. Empty until
-        // D5 begins migrating stream kinds (host-backed first, then
-        // virtual pipe / socket / PTY).
+        // streams migrated directly to broker handles. Each entry is
+        // forwarded to the worker as `--broker-fd-bridge <spec>` and
+        // consumed by the existing install_broker_fd_bridge_spec path in
+        // the runner.
         broker_fd_bridge_specs: &[String],
     ) -> Result<i32, i32>
     where
@@ -2036,32 +2030,6 @@ impl LinuxUserland {
             for flag in flags.iter() {
                 spawn_argv.push(flag.clone());
             }
-        }
-
-        // Add --mux-fd if a socketpair was created.
-        if let Some(mux_fd) = mux_fd {
-            let _ = self.clear_cloexec(mux_fd);
-            spawn_argv.push(CString::new("--mux-fd").unwrap());
-            spawn_argv.push(CString::new(mux_fd.to_string()).map_err(|_| -1_i32)?);
-        }
-
-        // Add --mux-stream for each muxed stream.
-        // Format: stream_id:guest_fd:direction:type[:e]
-        // The optional :e suffix marks streams with initial EOF.
-        for &(stream_id, guest_fd, dir, stype, initial_eof) in mux_streams {
-            spawn_argv.push(CString::new("--mux-stream").unwrap());
-            let spec = if initial_eof {
-                format!(
-                    "{}:{}:{}:{}:e",
-                    stream_id, guest_fd, dir as char, stype as char,
-                )
-            } else {
-                format!(
-                    "{}:{}:{}:{}",
-                    stream_id, guest_fd, dir as char, stype as char,
-                )
-            };
-            spawn_argv.push(CString::new(spec).map_err(|_| -1_i32)?);
         }
 
         // Add --pipe-bridge for external-fd passthrough fds (from prior bridges).
@@ -2259,11 +2227,6 @@ impl LinuxUserland {
             )
         };
         if ret != 0 {
-            // Close mux fd — child was never spawned, so caller must not
-            // close it (the function takes ownership).
-            if let Some(mux_fd) = mux_fd {
-                self.close_host_fd(mux_fd);
-            }
             // drain_owned_fds dropped automatically (OwnedFd::drop closes).
             return Err(ret);
         }
@@ -2282,11 +2245,6 @@ impl LinuxUserland {
 
         // Close drain memfds (child inherited them via posix_spawn).
         drop(drain_owned_fds);
-
-        // Close the worker's mux socketpair end (the child inherited it).
-        if let Some(mux_fd) = mux_fd {
-            self.close_host_fd(mux_fd);
-        }
 
         // Read ack from child: 0 = success, non-zero = error.
         let ack_status = read_fork_restore_ack(ack_read_fd);
