@@ -6225,18 +6225,13 @@ const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
-        let (pipe_flags, cloexec) = {
-            use litebox::pipes::Flags;
-            let mut f = Flags::empty();
-            if flags.contains((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
-                return Err(Errno::EINVAL);
-            }
-            f.set(Flags::NON_BLOCKING, flags.contains(OFlags::NONBLOCK));
-            if flags.contains(OFlags::DIRECT) {
-                todo!("O_DIRECT not supported");
-            }
-            (f, flags.contains(OFlags::CLOEXEC))
-        };
+        if flags.contains((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(OFlags::DIRECT) {
+            todo!("O_DIRECT not supported");
+        }
+        let cloexec = flags.contains(OFlags::CLOEXEC);
 
         let provider = super::broker_pipe::broker_pipe_provider().ok_or(Errno::ENODEV)?;
         let entry_flags = flags & OFlags::STATUS_FLAGS_MASK;
@@ -6266,7 +6261,7 @@ impl<FS: ShimFS> Task<FS> {
         let writer = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(writer_entry);
         let reader = dt.insert::<super::broker_pipe::BrokerPipeSubsystem>(reader_entry);
         {
-            let initial_status = OFlags::from(pipe_flags);
+            let initial_status = flags & OFlags::NONBLOCK;
             let _ = dt.set_entry_metadata(
                 &writer,
                 crate::PipeStatusFlags(initial_status | OFlags::WRONLY),
