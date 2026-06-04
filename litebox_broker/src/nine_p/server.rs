@@ -312,7 +312,10 @@ impl Server {
         // worker sees a consistent type bit.
         let qid = match qid_for(&cloned.file) {
             Ok(qid) => qid,
-            Err(_) => return Err(libc::EIO as u32),
+            Err(_) => {
+                let _ = registry.release(id);
+                return Err(libc::EIO as u32);
+            }
         };
         let new_state = FidState {
             path: cloned.path,
