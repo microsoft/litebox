@@ -5557,7 +5557,210 @@ mod tests {
     use super::*;
     use litebox::fs::OFlags;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
-    use litebox_common_linux::{FcntlArg, FileDescriptorFlags};
+    use litebox_common_linux::{
+        FcntlArg, FileDescriptorFlags, SockFlags, SockType,
+        broker_pipe_provider::{BrokerOpError, BrokerPipeEnd, BrokerPipeProvider},
+        broker_socketpair_provider::{BrokerSocketPairEndpoint, BrokerSocketPairProvider},
+        cwfd::broker_subscribable::{BrokerEventCallback, BrokerSubscribable},
+    };
+
+    const DUP_FAIL_HANDLE: u64 = 0xd0_fa_11;
+
+    struct TestBrokerPipeProvider;
+
+    impl BrokerSubscribable for TestBrokerPipeProvider {
+        fn subscribe(
+            &self,
+            _handle: u64,
+            _events_mask: u32,
+            _callback: Arc<dyn BrokerEventCallback>,
+        ) -> Result<u64, BrokerOpError> {
+            Ok(1)
+        }
+
+        fn unsubscribe(&self, _handle: u64, _subscription_id: u64) {}
+
+        fn release(&self, _handle: u64) {}
+
+        fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
+            if handle == DUP_FAIL_HANDLE {
+                Err(BrokerOpError::UnknownHandle)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn query_events(&self, _handle: u64) -> Result<u32, BrokerOpError> {
+            Ok(0)
+        }
+    }
+
+    impl BrokerPipeProvider for TestBrokerPipeProvider {
+        fn create_pipe(
+            &self,
+            _capacity: u64,
+            _atomic_write_size: u64,
+        ) -> Result<(u64, u64), BrokerOpError> {
+            Ok((10, 11))
+        }
+
+        fn read_pipe(
+            &self,
+            _handle: u64,
+            _max_len: u64,
+        ) -> Result<alloc::vec::Vec<u8>, BrokerOpError> {
+            Ok(alloc::vec::Vec::new())
+        }
+
+        fn write_pipe(&self, _handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError> {
+            Ok(bytes.len())
+        }
+    }
+
+    struct TestBrokerSocketPairProvider;
+
+    impl BrokerSubscribable for TestBrokerSocketPairProvider {
+        fn subscribe(
+            &self,
+            _handle: u64,
+            _events_mask: u32,
+            _callback: Arc<dyn BrokerEventCallback>,
+        ) -> Result<u64, BrokerOpError> {
+            Ok(1)
+        }
+
+        fn unsubscribe(&self, _handle: u64, _subscription_id: u64) {}
+
+        fn release(&self, _handle: u64) {}
+
+        fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
+            Ok(())
+        }
+
+        fn query_events(&self, _handle: u64) -> Result<u32, BrokerOpError> {
+            Ok(0)
+        }
+    }
+
+    impl BrokerSocketPairProvider for TestBrokerSocketPairProvider {
+        fn create_socketpair(
+            &self,
+            _capacity: u64,
+            _atomic_write_size: u64,
+        ) -> Result<(u64, u64), BrokerOpError> {
+            Ok((20, 21))
+        }
+
+        fn read_socketpair(
+            &self,
+            _handle: u64,
+            _max_len: u64,
+        ) -> Result<alloc::vec::Vec<u8>, BrokerOpError> {
+            Ok(alloc::vec::Vec::new())
+        }
+
+        fn write_socketpair(&self, _handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError> {
+            Ok(bytes.len())
+        }
+
+        fn shutdown_socketpair_write(&self, _handle: u64) -> Result<(), BrokerOpError> {
+            Ok(())
+        }
+    }
+
+    fn install_test_broker_providers() {
+        let _ = crate::syscalls::set_broker_pipe_provider(Arc::new(TestBrokerPipeProvider));
+        let _ =
+            crate::syscalls::set_broker_socketpair_provider(Arc::new(TestBrokerSocketPairProvider));
+    }
+
+    fn test_entrypoints() -> LinuxShimEntrypoints<DefaultFS> {
+        let task = crate::syscalls::tests::init_platform(None);
+        LinuxShimEntrypoints {
+            task,
+            _not_send: core::marker::PhantomData,
+        }
+    }
+
+    #[test]
+    fn install_broker_unix_socket_replaces_restored_unix_socket_slot() {
+        install_test_broker_providers();
+        let entrypoints = test_entrypoints();
+        let guest_fd = 91;
+
+        let unix_socket =
+            syscalls::unix::UnixSocket::<DefaultFS>::new(SockType::Stream, SockFlags::empty())
+                .expect("test unix socket should be constructible");
+        let typed: litebox::fd::TypedFd<syscalls::unix::UnixSocketSubsystem<DefaultFS>> =
+            entrypoints
+                .task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .insert(unix_socket);
+        {
+            let files = entrypoints.task.files.borrow();
+            let mut rds = files.raw_descriptor_store.write();
+            assert!(rds.fd_into_specific_raw_integer(typed, guest_fd));
+        }
+
+        assert_eq!(
+            entrypoints.install_broker_bridge_fd(
+                guest_fd,
+                syscalls::fork_snapshot::BrokerHandleKind::UnixSocket,
+                1234,
+                None,
+                Some(BrokerSocketPairEndpoint::A),
+                None,
+                None,
+                OFlags::empty(),
+            ),
+            Ok(())
+        );
+
+        let files = entrypoints.task.files.borrow();
+        let rds = files.raw_descriptor_store.read();
+        assert!(
+            rds.fd_from_raw_integer::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+                guest_fd,
+            )
+            .is_ok(),
+            "replacement slot should hold the broker-backed socketpair fd"
+        );
+        assert!(
+            rds.fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<DefaultFS>>(guest_fd)
+                .is_err(),
+            "restored in-shim unix socket should have been consumed"
+        );
+    }
+
+    #[test]
+    fn install_broker_pipe_dup_handle_failure_leaves_slot_empty() {
+        install_test_broker_providers();
+        let entrypoints = test_entrypoints();
+        let guest_fd = 92;
+
+        assert_eq!(
+            entrypoints.install_broker_bridge_fd(
+                guest_fd,
+                syscalls::fork_snapshot::BrokerHandleKind::Pipe,
+                DUP_FAIL_HANDLE,
+                Some(BrokerPipeEnd::Read),
+                None,
+                None,
+                None,
+                OFlags::empty(),
+            ),
+            Err(())
+        );
+
+        let files = entrypoints.task.files.borrow();
+        let rds = files.raw_descriptor_store.read();
+        assert!(
+            !rds.is_alive(guest_fd),
+            "failed install should not leave a raw fd slot behind"
+        );
+    }
 
     #[test]
     fn reserve_thread_id_advances_allocator_past_bootstrap_tid() {
