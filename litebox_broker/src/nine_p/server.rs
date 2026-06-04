@@ -73,6 +73,19 @@ struct FidState {
     /// True when `path` was set by walk and is already canonical.
     /// Allows lopen/lcreate to skip redundant re-canonicalization.
     is_canonical: bool,
+    /// Legacy-pipes Phase 3 (D3): if this fid was materialised by a
+    /// `CloneOfd` op (worker side) — or marked by a `RegisterOfd`
+    /// op (parent side) — this field carries the broker-global
+    /// [`OpenFileId`] for the underlying open file description. On
+    /// `Tclunk`, the handler calls
+    /// [`OfdRegistry::release`][crate::ofd_registry::OfdRegistry::release]
+    /// with this id so the registry's refcount tracks the live
+    /// inheriting fids exactly.
+    ///
+    /// `None` means the fid was created the usual way (Tlopen,
+    /// Tlcreate, Twalk-clone) and the registry has no entry to
+    /// release on clunk.
+    open_file_id: Option<crate::ofd_registry::OpenFileId>,
 }
 
 /// 9P2000.L server that serves files from a host directory.
@@ -97,6 +110,17 @@ pub struct Server {
     audit_log: Option<crate::audit::AuditLog>,
     /// Broker-global inotify fan-out for filesystem mutations.
     inotify_dispatcher: Arc<InotifyDispatcher>,
+    /// Legacy-pipes Phase 3 (D3): broker-global registry of open
+    /// file descriptions that fork-restored workers can clone to
+    /// inherit POSIX shared-position semantics from the parent.
+    /// Shared across every per-connection `Server` instance so a
+    /// `RegisterOfd` on the parent's connection and a `CloneOfd` on
+    /// the worker's connection see the same id space.
+    ///
+    /// `None` for legacy bring-up paths (test fixtures that don't
+    /// exercise OFD inheritance); production wiring in
+    /// `litebox_broker/src/main.rs` always supplies a real registry.
+    ofd_registry: Option<Arc<crate::ofd_registry::OfdRegistry>>,
 }
 
 impl Server {
@@ -147,7 +171,130 @@ impl Server {
             canonical_cache: Mutex::new(HashMap::new()),
             audit_log: None,
             inotify_dispatcher,
+            ofd_registry: None,
         }
+    }
+
+    /// Set the broker-global OFD registry handle for legacy-pipes
+    /// Phase 3 (D3) `RegisterOfd` / `CloneOfd` plumbing. Production
+    /// wiring in `litebox_broker/src/main.rs` calls this after
+    /// constructing the `Server`; tests that don't exercise OFD
+    /// inheritance can leave it `None`.
+    pub fn set_ofd_registry(&mut self, registry: Arc<crate::ofd_registry::OfdRegistry>) {
+        self.ofd_registry = Some(registry);
+    }
+
+    /// Returns the broker-global OFD registry handle, if any. Used
+    /// by D3 state-service handlers; `None` for legacy bring-up
+    /// paths.
+    pub fn ofd_registry(&self) -> Option<&Arc<crate::ofd_registry::OfdRegistry>> {
+        self.ofd_registry.as_ref()
+    }
+
+    /// Legacy-pipes Phase 3 (D3): register the open file underlying
+    /// 9P fid `fid` in the broker-global OFD registry. Mutates the
+    /// fid's [`FidState::open_file_id`] to remember the assignment,
+    /// so the parent's clunk later releases the registry entry.
+    ///
+    /// # Errors
+    ///
+    /// - `libc::EBADF as u32` if `fid` is unknown or not yet opened
+    ///   (`is_open && file.is_some()`).
+    /// - `libc::ENOTSUP as u32` if no OFD registry is bound (the
+    ///   server was constructed without `set_ofd_registry`).
+    /// - `libc::EIO as u32` if the underlying `dup(2)` fails.
+    pub fn register_fid_in_ofd_registry(
+        &self,
+        fid: u32,
+    ) -> Result<crate::ofd_registry::OpenFileId, u32> {
+        let registry = self.ofd_registry.as_ref().ok_or(libc::ENOTSUP as u32)?;
+        let fid_arc = self.get_fid(fid)?;
+        let path = {
+            let state = read_lock(&fid_arc, "fid");
+            if !state.is_open || state.file.is_none() {
+                return Err(libc::EBADF as u32);
+            }
+            // Idempotent: if the fid already has an id, return it.
+            if let Some(existing) = state.open_file_id {
+                return Ok(existing);
+            }
+            state.path.clone()
+        };
+        // Acquire write lock to set the id atomically with the
+        // registry insertion. The file reference is read again
+        // under the write lock to avoid races with a concurrent
+        // Tclunk.
+        let mut state = write_lock(&fid_arc, "fid");
+        if let Some(existing) = state.open_file_id {
+            return Ok(existing);
+        }
+        let file = state.file.as_ref().ok_or(libc::EBADF as u32)?;
+        let id = registry
+            .register(file, path)
+            .map_err(|_| libc::EIO as u32)?;
+        state.open_file_id = Some(id);
+        Ok(id)
+    }
+
+    /// Legacy-pipes Phase 3 (D3): clone a previously-registered
+    /// open file description into a fresh 9P fid on this server's
+    /// own connection. Increments the registry entry's refcount.
+    ///
+    /// The resulting `FidState` is marked open and canonical (the
+    /// path was canonicalized when the parent originally walked to
+    /// it), and carries `open_file_id = Some(id)` so the worker's
+    /// eventual Tclunk releases the registry entry.
+    ///
+    /// # Errors
+    ///
+    /// - `libc::ENOTSUP as u32` if no OFD registry is bound.
+    /// - `libc::EBADF as u32` if `id` is unknown / already-released
+    ///   in the registry, or if the underlying `dup(2)` fails.
+    /// - `libc::EEXIST as u32` if `new_fid` is already in use.
+    /// - `libc::ENOMEM as u32` if the fid table is full.
+    pub fn clone_ofd_into_fid(
+        &self,
+        id: crate::ofd_registry::OpenFileId,
+        new_fid: u32,
+    ) -> Result<(), u32> {
+        let registry = self.ofd_registry.as_ref().ok_or(libc::ENOTSUP as u32)?;
+        let cloned = registry.clone_for(id).map_err(|e| match e {
+            crate::ofd_registry::OfdRegistryError::UnknownId => libc::EBADF as u32,
+            crate::ofd_registry::OfdRegistryError::Io(_) => libc::EBADF as u32,
+        })?;
+        // Synthesize a Qid from the cloned file's metadata so the
+        // worker sees a consistent type bit.
+        let qid = match cloned.file.metadata() {
+            Ok(meta) => metadata_to_qid(&meta),
+            Err(_) => return Err(libc::EIO as u32),
+        };
+        let new_state = FidState {
+            path: cloned.path,
+            readlink_path: None,
+            file: Some(cloned.file),
+            patched_data: None,
+            patched_offset: 0,
+            qid,
+            is_open: true,
+            is_canonical: true,
+            open_file_id: Some(id),
+        };
+        let mut fids = write_lock(&self.fids, "fids");
+        if fids.contains_key(&new_fid) {
+            // Release the just-incremented refcount: the clone
+            // succeeded but the install can't proceed. The
+            // worker should pick a different new_fid.
+            drop(fids);
+            let _ = registry.release(id);
+            return Err(libc::EEXIST as u32);
+        }
+        if fids.len() >= MAX_FIDS {
+            drop(fids);
+            let _ = registry.release(id);
+            return Err(libc::ENOMEM as u32);
+        }
+        fids.insert(new_fid, Arc::new(RwLock::new(new_state)));
+        Ok(())
     }
 
     /// Set the audit log for structured policy events.
@@ -859,6 +1006,7 @@ impl Server {
                 qid,
                 is_open: false,
                 is_canonical: true,
+                open_file_id: None,
             })),
         );
 
@@ -924,6 +1072,7 @@ impl Server {
                         qid,
                         is_open: false,
                         is_canonical,
+                        open_file_id: None,
                     })),
                 );
             }
@@ -1035,6 +1184,7 @@ impl Server {
                         qid,
                         is_open: false,
                         is_canonical: current_is_canonical,
+                        open_file_id: None,
                     })),
                 );
             }
@@ -1899,9 +2049,31 @@ impl Server {
     }
 
     fn handle_clunk<'a>(&self, req: fcall::Tclunk) -> Fcall<'a> {
-        // Remove the FID; the file handle (if any) is dropped automatically
-        let mut fids = write_lock(&self.fids, "fids");
-        fids.remove(&req.fid);
+        // Remove the FID; the file handle (if any) is dropped automatically.
+        // Legacy-pipes Phase 3 (D3): if the fid carries an
+        // `open_file_id` (set by `CloneOfd` on the worker side, and
+        // by `RegisterOfd` on the parent side if we ever wire the
+        // parent's own clunk into the release flow), decrement the
+        // broker-global OFD registry refcount so the kernel OFD is
+        // freed when the last inheriting fid clunks.
+        let removed = {
+            let mut fids = write_lock(&self.fids, "fids");
+            fids.remove(&req.fid)
+        };
+        if let Some(fid_arc) = removed
+            && let Some(registry) = self.ofd_registry.as_ref()
+        {
+            let open_file_id = {
+                let state = read_lock(&fid_arc, "fid");
+                state.open_file_id
+            };
+            if let Some(id) = open_file_id {
+                // `release` returns None for an unknown id (race
+                // with connection-close cleanup); intentionally
+                // ignored.
+                let _ = registry.release(id);
+            }
+        }
         Fcall::Rclunk(fcall::Rclunk {})
     }
 
