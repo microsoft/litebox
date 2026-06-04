@@ -93,6 +93,43 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         Err(errors::CreateAnonymousFileError::NotSupported)
     }
 
+    /// Allocate a fresh client-side fid number without issuing any
+    /// 9P (or backend-equivalent) request.
+    ///
+    /// Used by the legacy-pipes Phase 3 D5-fs install path on
+    /// 9P-backed file systems: the worker pre-allocates a fid that
+    /// the broker will install state for via `CloneOfd`.
+    ///
+    /// Default implementation returns `Err(OpenError::Io)`
+    /// — backends that don't expose externally-routable fid numbers
+    /// (e.g. the in-memory test FS) opt out by inheriting the
+    /// default.
+    fn allocate_fid_number(&self) -> Result<u32, errors::OpenError> {
+        Err(errors::OpenError::Io)
+    }
+
+    /// Release a fid number previously obtained from
+    /// [`Self::allocate_fid_number`] without issuing a clunk.
+    ///
+    /// No-op by default.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn free_fid_number(&self, fid: u32) {}
+
+    /// Wrap an externally installed 9P fid in a guest descriptor.
+    ///
+    /// See [`crate::fs::nine_p::FileSystem::wrap_existing_fid`] for the
+    /// full semantics. Default implementation returns
+    /// `Err(OpenError::Io)`.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn wrap_existing_fid(
+        &self,
+        remote_fid: u32,
+        path: &str,
+        status_flags: OFlags,
+    ) -> Result<TypedFd<Self>, errors::OpenError> {
+        Err(errors::OpenError::Io)
+    }
+
     /// Close the file at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.

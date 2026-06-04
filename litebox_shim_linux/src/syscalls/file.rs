@@ -2812,6 +2812,70 @@ impl<FS: ShimFS> Task<FS> {
             .open(path, status_flags, Mode::empty())
             .map_err(Errno::from)?;
 
+        self.install_brokerfile_finalize(guest_fd, file, position, status_flags)
+    }
+
+    /// Install a worker-side FS fd at `guest_fd` that wraps an
+    /// existing server-side 9P fid (already installed by a broker
+    /// `CloneOfd`). Used by the legacy-pipes Phase 3 D5-fs install
+    /// path: parent shim issues `RegisterOfd` to mint an
+    /// `OpenFileId`, ships `--broker-fd-bridge fs_fid:<id>:<flags>`,
+    /// worker side allocates a fresh client-side fid number, issues
+    /// `CloneOfd { open_file_id, new_fid }`, then calls this to wrap
+    /// the resulting fid in a guest descriptor.
+    ///
+    /// The new descriptor entry is indistinguishable from one
+    /// installed by [`Self::install_brokerfile_bridge_fd`]: same
+    /// `RawFdRef::Fs` dispatch, same data plane (worker 9P client →
+    /// broker 9P server → host file). POSIX shared-offset semantics
+    /// across inheriting fds are preserved by the kernel OFD that
+    /// underlies the broker's `Arc<File>` clones.
+    /// Allocate a fresh client-side 9P fid via the underlying
+    /// filesystem (passes through to [`super::FileSystem::allocate_fid_number`]).
+    /// Returns the fid number for the caller to ship to the broker in
+    /// a `CloneOfd` request. Caller must call
+    /// [`Self::install_brokerfile_bridge_fd_by_fid`] (or
+    /// [`super::FileSystem::free_fid_number`] on failure) so the fid
+    /// is not leaked.
+    pub(crate) fn fs_allocate_fid_number(&self) -> Result<u32, Errno> {
+        self.files
+            .borrow()
+            .fs
+            .allocate_fid_number()
+            .map_err(Errno::from)
+    }
+
+    /// Free a client-side 9P fid via the underlying filesystem.
+    pub(crate) fn fs_free_fid_number(&self, fid: u32) {
+        self.files.borrow().fs.free_fid_number(fid);
+    }
+
+    pub(crate) fn install_brokerfile_bridge_fd_by_fid(
+        &self,
+        guest_fd: usize,
+        remote_fid: u32,
+        path: &str,
+        position: usize,
+        status_flags_bits: u32,
+    ) -> Result<(), Errno> {
+        let status_flags = OFlags::from_bits_retain(status_flags_bits) & OFlags::STATUS_FLAGS_MASK;
+        let file = self
+            .files
+            .borrow()
+            .fs
+            .wrap_existing_fid(remote_fid, path, status_flags)
+            .map_err(Errno::from)?;
+
+        self.install_brokerfile_finalize(guest_fd, file, position, status_flags)
+    }
+
+    fn install_brokerfile_finalize(
+        &self,
+        guest_fd: usize,
+        file: crate::FileFd<FS>,
+        position: usize,
+        status_flags: OFlags,
+    ) -> Result<(), Errno> {
         {
             let mut dt = self.global.litebox.descriptor_table_mut();
             let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status_flags)) else {

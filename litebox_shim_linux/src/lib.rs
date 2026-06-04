@@ -186,6 +186,40 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             .install_brokerfile_bridge_fd(guest_fd, path, position, status_flags_bits)
     }
 
+    /// Allocate a fresh client-side 9P fid via the underlying
+    /// filesystem. See
+    /// [`syscalls::file::Task::fs_allocate_fid_number`] for callers'
+    /// obligation to install or free the resulting fid.
+    pub fn fs_allocate_fid_number(&self) -> Result<u32, litebox_common_linux::errno::Errno> {
+        self.task.fs_allocate_fid_number()
+    }
+
+    /// Free a client-side 9P fid via the underlying filesystem.
+    pub fn fs_free_fid_number(&self, fid: u32) {
+        self.task.fs_free_fid_number(fid);
+    }
+
+    /// Install a worker-side FS fd at `guest_fd` that wraps an
+    /// existing server-side 9P fid. See
+    /// [`syscalls::file::Task::install_brokerfile_bridge_fd_by_fid`]
+    /// for the legacy-pipes Phase 3 D5-fs install path documentation.
+    pub fn install_brokerfile_bridge_fd_by_fid(
+        &self,
+        guest_fd: usize,
+        remote_fid: u32,
+        path: &str,
+        position: usize,
+        status_flags_bits: u32,
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
+        self.task.install_brokerfile_bridge_fd_by_fid(
+            guest_fd,
+            remote_fid,
+            path,
+            position,
+            status_flags_bits,
+        )
+    }
+
     pub fn install_timerfd_bridge_fd(
         &self,
         guest_fd: usize,

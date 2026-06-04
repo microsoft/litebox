@@ -917,6 +917,22 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
         self.inner.fids.free(fid);
     }
 
+    /// Allocate a fresh client-side fid number without issuing any 9P
+    /// request. Caller is responsible for ensuring the broker installs
+    /// state for this fid (e.g. via the fd-token-socket `CloneOfd`
+    /// opcode) before any guest-visible operation references it, and
+    /// for calling [`Self::free_fid`] (or letting Tclunk on the
+    /// resulting fid's drop free it) if installation fails.
+    ///
+    /// Used by the legacy-pipes Phase 3 D5-fs install path:
+    /// the worker pre-allocates a fid number, sends it to the broker
+    /// in a `CloneOfd { open_file_id, new_fid }` request, then wraps
+    /// the resulting server-side `FidState` in a guest descriptor via
+    /// [`super::FileSystem::wrap_existing_fid`].
+    pub(super) fn allocate_fid(&self) -> Result<fcall::Fid, Error> {
+        self.inner.fids.next()
+    }
+
     /// Read the target of a symlink identified by `fid`.
     pub(super) fn readlink(&self, fid: fcall::Fid) -> Result<alloc::vec::Vec<u8>, Error> {
         self.fcall(

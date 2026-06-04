@@ -527,6 +527,51 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             .map_err(|err| anyhow!("broker-fd-bridge: brokerfile {spec:?}: {err:?}"));
     }
 
+    // legacy-pipes Phase 3 D5-fs: inherit a 9P fid from the parent.
+    // spec format: {raw_fd}:fs_fid:{open_file_id_u64}:{status_flags_u32}:{path_hex}
+    // Parent shim registers an OFD via `RegisterOfd` → `open_file_id`,
+    // ships this spec; worker allocates a fresh client-side fid,
+    // sends `CloneOfd(open_file_id, new_fid)` to broker so it
+    // installs a `FidState` referencing the kernel-shared OFD, then
+    // wraps it in a guest descriptor via
+    // `install_brokerfile_bridge_fd_by_fid`. POSIX inherited-fd
+    // shared-position semantics preserved by the broker's
+    // `Arc<File>` clones (see D3 step 1 `litebox_broker::ofd_registry`).
+    if parts.get(1) == Some(&"fs_fid") && parts.len() == 5 {
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let open_file_id: u64 = parts[2].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad fs_fid open_file_id {:?}: {e}",
+                parts[2]
+            )
+        })?;
+        let status_flags_bits: u32 = parts[3].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad fs_fid status flags {:?}: {e}",
+                parts[3]
+            )
+        })?;
+        let path = decode_brokerfile_bridge_path(parts[4])?;
+
+        let new_fid = entrypoints
+            .fs_allocate_fid_number()
+            .map_err(|err| anyhow!("broker-fd-bridge: fs_fid allocate {spec:?}: {err:?}"))?;
+
+        let provider = litebox_shim_linux::syscalls::broker_fs_provider().ok_or_else(|| {
+            anyhow!("broker-fd-bridge: fs_fid {spec:?}: no broker_fs_provider registered")
+        })?;
+        if let Err(e) = provider.clone_ofd(open_file_id, new_fid) {
+            entrypoints.fs_free_fid_number(new_fid);
+            anyhow::bail!("broker-fd-bridge: fs_fid {spec:?}: clone_ofd: {e:?}");
+        }
+
+        return entrypoints
+            .install_brokerfile_bridge_fd_by_fid(guest_fd, new_fid, &path, 0, status_flags_bits)
+            .map_err(|err| anyhow!("broker-fd-bridge: fs_fid install {spec:?}: {err:?}"));
+    }
+
     if parts.get(1) == Some(&"timerfd") && parts.len() == 10 {
         // spec format: {raw_fd}:timerfd:{clockid_u32}:{nonblock_u8}:{value_sec}:{value_nsec}:{interval_sec}:{interval_nsec}:{pending}:{snapshot_now_ns}
         let guest_fd: usize = parts[0]
