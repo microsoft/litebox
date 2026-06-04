@@ -26,6 +26,20 @@ pub enum ClientError<E> {
         /// Protocol version advertised by the broker.
         broker_protocol_version: ProtocolVersion,
     },
+    /// This client cannot speak the requested protocol version.
+    UnsupportedClientVersion {
+        /// Protocol version requested by the caller.
+        requested: ProtocolVersion,
+        /// Protocol version supported by this client implementation.
+        client_protocol_version: ProtocolVersion,
+    },
+    /// The active broker session cannot serve an operation requiring a newer version.
+    UnsupportedNegotiatedVersion {
+        /// Protocol version required by the operation.
+        required: ProtocolVersion,
+        /// Effective protocol version negotiated for this connection.
+        negotiated_protocol_version: ProtocolVersion,
+    },
     /// The broker does not support the requested protocol version.
     UnsupportedVersion {
         /// Protocol version requested by this client.
@@ -53,6 +67,20 @@ impl<E: fmt::Display> fmt::Display for ClientError<E> {
             } => write!(
                 f,
                 "broker accepted incompatible protocol negotiation: requested {requested:?}, broker supports {broker_protocol_version:?}"
+            ),
+            Self::UnsupportedClientVersion {
+                requested,
+                client_protocol_version,
+            } => write!(
+                f,
+                "broker client cannot request protocol version {requested:?}; client supports {client_protocol_version:?}"
+            ),
+            Self::UnsupportedNegotiatedVersion {
+                required,
+                negotiated_protocol_version,
+            } => write!(
+                f,
+                "broker session protocol version {negotiated_protocol_version:?} does not support required version {required:?}"
             ),
             Self::UnsupportedVersion {
                 requested,
@@ -82,6 +110,8 @@ where
             | Self::ChannelClosed
             | Self::UnknownResponse
             | Self::IncompatibleNegotiation { .. }
+            | Self::UnsupportedClientVersion { .. }
+            | Self::UnsupportedNegotiatedVersion { .. }
             | Self::UnsupportedVersion { .. }
             | Self::UnexpectedResponse(_) => None,
         }

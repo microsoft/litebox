@@ -5,11 +5,25 @@ use crate::object::{ObjectId, ObjectKind};
 use crate::{
     BrokerAssociation, BrokerCore, BrokerError, ObjectRights, ObjectType, PolicyEngine, Result,
 };
-use litebox_broker_protocol::{
-    ConsumeEventResponse, EventConsumeMode, ObjectHandle, ReadinessState, WaitOutcome,
-};
+use litebox_broker_protocol::{EventConsumeMode, ObjectHandle, ReadinessState, WaitOutcome};
 
 const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
+
+/// Result of consuming readiness credits from a broker-owned event object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventConsumption {
+    /// Number of readiness credits consumed.
+    pub value: u64,
+    /// Readiness state after consuming credits.
+    pub readiness: ReadinessState,
+}
+
+impl EventConsumption {
+    /// Creates an event consumption result.
+    pub const fn new(value: u64, readiness: ReadinessState) -> Self {
+        Self { value, readiness }
+    }
+}
 
 impl<P: PolicyEngine> BrokerCore<P> {
     /// Creates a broker-owned event object.
@@ -81,12 +95,12 @@ impl<P: PolicyEngine> BrokerCore<P> {
         association: &BrokerAssociation,
         handle: ObjectHandle,
         mode: EventConsumeMode,
-    ) -> Result<ConsumeEventResponse> {
+    ) -> Result<EventConsumption> {
         let authorized =
             self.authorize_use_object(association, handle, ObjectType::Event, ObjectRights::WAIT)?;
         match &mut self.object_mut(authorized.object_id)?.kind {
             ObjectKind::Event(event) => event.consume(mode).map(|response| {
-                ConsumeEventResponse::new(
+                EventConsumption::new(
                     response.value,
                     Self::filter_readiness_for_rights(response.readiness, authorized.rights),
                 )
@@ -143,7 +157,7 @@ impl EventObject {
         Ok(self.readiness_state())
     }
 
-    fn consume(&mut self, mode: EventConsumeMode) -> Result<ConsumeEventResponse> {
+    fn consume(&mut self, mode: EventConsumeMode) -> Result<EventConsumption> {
         if self.count == 0 {
             return Err(BrokerError::WouldBlock);
         }
@@ -156,7 +170,7 @@ impl EventObject {
         let next_generation = self.next_generation()?;
         self.count -= value;
         self.readiness_generation = next_generation;
-        Ok(ConsumeEventResponse::new(value, self.readiness_state()))
+        Ok(EventConsumption::new(value, self.readiness_state()))
     }
 
     fn next_generation(&self) -> Result<u64> {

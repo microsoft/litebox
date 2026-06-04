@@ -1,12 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Protocol- and channel-independent broker authority core.
+//! Broker authority core independent of protocol envelopes and channels.
 //!
 //! `litebox_broker_core` owns broker-side object identity, reference lifetime,
-//! rights checks, reference generation checks, and policy calls. It deliberately has no
-//! dependency on protocol envelopes, Unix sockets, shared-memory rings, kernel
-//! traps, or any other channel implementation.
+//! rights checks, reference generation checks, and policy calls. It may use
+//! shared semantic DTOs from `litebox_broker_protocol` for values that both the
+//! local core and broker understand, such as handles and readiness state. It
+//! deliberately has no dependency on protocol envelopes, channel traits, wire
+//! codecs, Unix sockets, shared-memory rings, kernel traps, or any other
+//! channel implementation.
 
 #![no_std]
 
@@ -23,6 +26,7 @@ mod policy;
 use alloc::collections::BTreeMap;
 
 pub use error::BrokerError;
+pub use event::EventConsumption;
 use identity::BrokerCoreId;
 pub use identity::{BrokerAssociation, CallerCredential};
 use litebox_broker_protocol::ObjectReferenceId;

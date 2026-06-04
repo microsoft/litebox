@@ -7,9 +7,9 @@ use litebox_broker_core::{
     BrokerAssociation, BrokerCore, BrokerError, CallerCredential, PolicyEngine,
 };
 use litebox_broker_protocol::{
-    AddEventResponse, BrokerRequest, BrokerResponse, CoreRequest, CoreResponse,
-    CreateEventResponse, ErrorCode, EventRequest, EventResponse, PeerCredential, ProtocolVersion,
-    ReceivedBrokerRequest, ServerControlChannel, WaitEventResponse,
+    AddEventResponse, BrokerRequest, BrokerResponse, ConsumeEventResponse, CoreRequest,
+    CoreResponse, CreateEventResponse, ErrorCode, EventRequest, EventResponse, PeerCredential,
+    ProtocolVersion, ReceivedBrokerRequest, ServerControlChannel, WaitEventResponse,
 };
 
 /// Protocol version this broker server implementation supports.
@@ -159,7 +159,12 @@ fn handle_event_request<P: PolicyEngine>(
         ),
         EventRequest::Consume(request) => handle_core_result(
             core.consume_event(association, request.handle, request.mode),
-            |response| event_response(EventResponse::Consume(response)),
+            |consumption| {
+                event_response(EventResponse::Consume(ConsumeEventResponse::new(
+                    consumption.value,
+                    consumption.readiness,
+                )))
+            },
         ),
         _ => BrokerResponse::Error(ErrorCode::UnsupportedOperation),
     }

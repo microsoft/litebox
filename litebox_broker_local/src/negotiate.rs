@@ -28,9 +28,9 @@ impl<T: ClientControlChannel> BrokerClient<T> {
             return Err(ClientError::AlreadyNegotiated);
         }
         if !protocol_version.is_supported_by(CLIENT_PROTOCOL_VERSION) {
-            return Err(ClientError::UnsupportedVersion {
+            return Err(ClientError::UnsupportedClientVersion {
                 requested: protocol_version,
-                broker_protocol_version: CLIENT_PROTOCOL_VERSION,
+                client_protocol_version: CLIENT_PROTOCOL_VERSION,
             });
         }
 

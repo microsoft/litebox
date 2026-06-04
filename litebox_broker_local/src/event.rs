@@ -92,9 +92,9 @@ impl<T: ClientControlChannel> BrokerClient<T> {
         if EVENT_PROTOCOL_VERSION.is_supported_by(negotiated) {
             Ok(())
         } else {
-            Err(ClientError::UnsupportedVersion {
-                requested: EVENT_PROTOCOL_VERSION,
-                broker_protocol_version: negotiated,
+            Err(ClientError::UnsupportedNegotiatedVersion {
+                required: EVENT_PROTOCOL_VERSION,
+                negotiated_protocol_version: negotiated,
             })
         }
     }

@@ -143,11 +143,11 @@ mod tests {
 
         assert!(matches!(
             client.create_event(),
-            Err(ClientError::UnsupportedVersion {
-                requested,
-                broker_protocol_version
-            }) if requested == CLIENT_PROTOCOL_VERSION
-                && broker_protocol_version == ProtocolVersion::new(CLIENT_PROTOCOL_VERSION.major, 1)
+            Err(ClientError::UnsupportedNegotiatedVersion {
+                required,
+                negotiated_protocol_version
+            }) if required == CLIENT_PROTOCOL_VERSION
+                && negotiated_protocol_version == ProtocolVersion::new(CLIENT_PROTOCOL_VERSION.major, 1)
         ));
         assert_eq!(client.channel.sent_request, None);
     }
@@ -193,26 +193,53 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_version_reports_supported_version_and_allows_retry() {
+    fn negotiate_version_rejects_locally_unsupported_version_without_sending() {
         let too_new = ProtocolVersion::new(
             CLIENT_PROTOCOL_VERSION.major,
             CLIENT_PROTOCOL_VERSION.minor + 1,
         );
-        let fallback = CLIENT_PROTOCOL_VERSION;
+        let channel = FakeControlChannel::new(Some(BrokerResponse::VersionMismatch {
+            broker_protocol_version: CLIENT_PROTOCOL_VERSION,
+        }));
+        let mut client = BrokerClient::new(channel);
+
+        assert!(matches!(
+            client.negotiate_version(too_new),
+            Err(ClientError::UnsupportedClientVersion {
+                requested,
+                client_protocol_version
+            }) if requested == too_new && client_protocol_version == CLIENT_PROTOCOL_VERSION
+        ));
+        assert_eq!(client.negotiated_protocol_version(), None);
+        assert_eq!(client.channel.sent_request, None);
+    }
+
+    #[test]
+    fn negotiate_version_reports_broker_supported_version_and_allows_retry() {
+        let requested = CLIENT_PROTOCOL_VERSION;
+        let fallback = ProtocolVersion::new(
+            CLIENT_PROTOCOL_VERSION.major,
+            CLIENT_PROTOCOL_VERSION.minor - 1,
+        );
         let channel = FakeControlChannel::new(Some(BrokerResponse::VersionMismatch {
             broker_protocol_version: fallback,
         }));
         let mut client = BrokerClient::new(channel);
 
         assert!(matches!(
-            client.negotiate_version(too_new),
+            client.negotiate_version(requested),
             Err(ClientError::UnsupportedVersion {
-                requested,
+                requested: actual_requested,
                 broker_protocol_version
-            }) if requested == too_new && broker_protocol_version == fallback
+            }) if actual_requested == requested && broker_protocol_version == fallback
         ));
         assert_eq!(client.negotiated_protocol_version(), None);
-        assert_eq!(client.channel.sent_request, None);
+        assert_eq!(
+            client.channel.sent_request,
+            Some(BrokerRequest::Negotiate {
+                protocol_version: requested
+            })
+        );
 
         client.channel.response = Some(BrokerResponse::Negotiated {
             broker_protocol_version: fallback,
