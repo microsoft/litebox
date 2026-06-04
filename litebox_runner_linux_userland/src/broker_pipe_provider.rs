@@ -113,6 +113,18 @@ impl BrokerPipeProvider for RunnerBrokerPipeProvider {
             .write_pipe(handle, bytes)
             .map_err(client_err_to_broker_err)
     }
+
+    fn attach_host_fd(&self, raw_fd: i32, direction: u8) -> Result<u64, BrokerOpError> {
+        // Safety: caller guarantees `raw_fd` is a valid live fd they
+        // are transferring to us; wrapping in OwnedFd takes ownership
+        // so `FdTokenClient::attach_host_fd` (which consumes the
+        // OwnedFd via SCM_RIGHTS) is the sole closer.
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        self.client
+            .attach_host_fd(fd, direction)
+            .map_err(client_err_to_broker_err)
+    }
 }
 
 struct CallbackBridge {

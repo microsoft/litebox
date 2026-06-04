@@ -12,6 +12,8 @@ pub mod audit;
 pub mod cwfd;
 pub mod net_proxy;
 pub mod nine_p;
+pub mod nine_p_session_registry;
+pub mod ofd_registry;
 pub mod policy;
 pub mod sandbox_policy;
 pub mod sock_compat;

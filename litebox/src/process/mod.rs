@@ -141,10 +141,7 @@ pub trait WorkerExecStreamWriter: Send + Sync + 'static {
 }
 
 /// Worker-exec stdin binding for a host-process handoff.
-pub enum WorkerExecInputBinding<
-    FS: crate::fs::FileSystem + Send + Sync + 'static,
-    Platform: RawSyncPrimitivesProvider + TimeProvider,
-> {
+pub enum WorkerExecInputBinding<FS: crate::fs::FileSystem + Send + Sync + 'static> {
     /// Keep the existing worker stdin inherited from the parent host process.
     Inherit,
     /// Duplicate one of the parent host stdio fds onto worker stdin.
@@ -158,20 +155,12 @@ pub enum WorkerExecInputBinding<
         fs: Arc<FS>,
         fd: Arc<crate::fd::TypedFd<FS>>,
     },
-    /// Proxy worker stdin reads from an existing guest pipe receiver.
-    Pipe {
-        pipes: crate::pipes::Pipes<Platform>,
-        fd: Arc<crate::fd::TypedFd<crate::pipes::Pipes<Platform>>>,
-    },
     /// Proxy worker stdin from a guest byte stream (e.g., a unix socket).
     Stream(Arc<dyn WorkerExecStreamReader>),
 }
 
 /// Worker-exec output binding for a host-process handoff.
-pub enum WorkerExecOutputBinding<
-    FS: crate::fs::FileSystem + Send + Sync + 'static,
-    Platform: RawSyncPrimitivesProvider + TimeProvider,
-> {
+pub enum WorkerExecOutputBinding<FS: crate::fs::FileSystem + Send + Sync + 'static> {
     /// Keep the existing worker stream inherited from the parent host process.
     Inherit,
     /// Duplicate one of the parent host stdio fds onto this worker stream.
@@ -185,26 +174,18 @@ pub enum WorkerExecOutputBinding<
         fs: Arc<FS>,
         fd: Arc<crate::fd::TypedFd<FS>>,
     },
-    /// Proxy the worker stream into an existing guest pipe sender.
-    Pipe {
-        pipes: crate::pipes::Pipes<Platform>,
-        fd: Arc<crate::fd::TypedFd<crate::pipes::Pipes<Platform>>>,
-    },
     /// Proxy the worker stream into a guest byte stream (e.g., a unix socket).
     Stream(Arc<dyn WorkerExecStreamWriter>),
 }
 
 /// Worker-exec stdio bindings for a host-process handoff.
-pub struct WorkerExecStdioBindings<
-    FS: crate::fs::FileSystem + Send + Sync + 'static,
-    Platform: RawSyncPrimitivesProvider + TimeProvider,
-> {
+pub struct WorkerExecStdioBindings<FS: crate::fs::FileSystem + Send + Sync + 'static> {
     /// Binding for file descriptor 0.
-    pub stdin: WorkerExecInputBinding<FS, Platform>,
+    pub stdin: WorkerExecInputBinding<FS>,
     /// Binding for file descriptor 1.
-    pub stdout: WorkerExecOutputBinding<FS, Platform>,
+    pub stdout: WorkerExecOutputBinding<FS>,
     /// Binding for file descriptor 2.
-    pub stderr: WorkerExecOutputBinding<FS, Platform>,
+    pub stderr: WorkerExecOutputBinding<FS>,
 }
 
 // ---------------------------------------------------------------------------

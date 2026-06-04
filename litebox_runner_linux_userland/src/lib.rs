@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 pub mod broker_eventfd_provider;
+pub mod broker_fs_provider;
 pub mod broker_inet_dgram_provider;
 pub mod broker_inet_listener_provider;
 pub mod broker_inet_raw_provider;
@@ -245,17 +246,6 @@ pub struct CliArgs {
     #[arg(long = "controlling-pty", hide = true)]
     pub controlling_pty: Option<u32>,
 
-    /// Internal: inherited socketpair fd for the stream multiplexer.
-    #[arg(long = "mux-fd", hide = true, requires = "fork_restore")]
-    pub mux_fd: Option<i32>,
-
-    /// Internal: stream mapping for the multiplexer.
-    /// Format: `stream_id:guest_fd:direction:type` where direction is
-    /// 'r' (read/ParentToWorker) or 'w' (write/WorkerToParent), and type
-    /// is 'p' (pipe), 's' (socket), or 't' (PTY slave).
-    #[arg(long = "mux-stream", hide = true, requires = "fork_restore")]
-    pub mux_stream: Vec<String>,
-
     /// Internal: child-only pipe pairs (both ends in the child, not in the
     /// parent).  The worker creates a connected pipe pair and installs both
     /// ends.  Format: `write_fd:read_fd`.
@@ -291,22 +281,23 @@ type BrokerFdBridgeParsed = (
     Option<litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint>,
     Option<litebox_common_linux::broker_pty_provider::BrokerPtyRole>,
     Option<u32>,
+    litebox::fs::OFlags,
 );
 
 /// Parses a `--broker-fd-bridge` spec string of the form
 /// `fd:kind:handle_id[:subkind]` and returns the components.
 ///
 /// `subkind` is required for pipe direction, unix socketpair endpoint, and PTY role.
-/// Map `litebox::pipes::Flags` bits (as serialised by the parent in
-/// the fork snapshot) to a `litebox::fs::OFlags` value carrying just
-/// the per-fd status flags relevant for broker pipes (NONBLOCK).
+/// Unix socket specs may append `:0` or `:1` to preserve per-fd NONBLOCK.
+/// Map legacy pipe flags bits (as serialised by the parent in
+/// the fork snapshot) to `OFlags::NONBLOCK` when bit 0 is set.
+/// Bit 0 corresponded to `litebox::pipes::Flags::NON_BLOCKING`.
 fn pipe_nonblock_oflags(flags_bits: u32) -> litebox::fs::OFlags {
-    let f = litebox::pipes::Flags::from_bits_truncate(flags_bits);
-    let mut o = litebox::fs::OFlags::empty();
-    if f.contains(litebox::pipes::Flags::NON_BLOCKING) {
-        o |= litebox::fs::OFlags::NONBLOCK;
+    if flags_bits & 0x1 != 0 {
+        litebox::fs::OFlags::NONBLOCK
+    } else {
+        litebox::fs::OFlags::empty()
     }
-    o
 }
 
 #[deny(clippy::wildcard_enum_match_arm)]
@@ -399,13 +390,33 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
             None => None,
         }
     } else {
-        if parts.len() == 5 {
-            anyhow::bail!("broker-fd-bridge: pty id is only valid for pty specs");
-        }
         None
     };
+    let bridge_flags = if kind == BrokerHandleKind::UnixSocket {
+        match parts.get(4) {
+            Some(&"0") | None => litebox::fs::OFlags::empty(),
+            Some(&"1") => litebox::fs::OFlags::NONBLOCK,
+            Some(other) => anyhow::bail!(
+                "broker-fd-bridge: unix_socket nonblock flag must be '0' or '1', got {other:?}"
+            ),
+        }
+    } else {
+        if parts.len() == 5 && kind != BrokerHandleKind::Pty {
+            anyhow::bail!(
+                "broker-fd-bridge: fifth field is only valid for pty or unix_socket specs"
+            );
+        }
+        litebox::fs::OFlags::empty()
+    };
     Ok((
-        guest_fd, kind, handle_id, direction, endpoint, pty_role, pty_id,
+        guest_fd,
+        kind,
+        handle_id,
+        direction,
+        endpoint,
+        pty_role,
+        pty_id,
+        bridge_flags,
     ))
 }
 
@@ -504,6 +515,59 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             .map_err(|err| anyhow!("broker-fd-bridge: brokerfile {spec:?}: {err:?}"));
     }
 
+    // legacy-pipes Phase 3 D5-fs: inherit a 9P fid from the parent.
+    // spec format: {raw_fd}:fs_fid:{open_file_id_u64}:{status_flags_u32}:{path_hex}
+    // Parent shim registers an OFD via `RegisterOfd` → `open_file_id`,
+    // ships this spec; worker allocates a fresh client-side fid,
+    // sends `CloneOfd(open_file_id, new_fid)` to broker so it
+    // installs a `FidState` referencing the kernel-shared OFD, then
+    // wraps it in a guest descriptor via
+    // `install_brokerfile_bridge_fd_by_fid`. POSIX inherited-fd
+    // shared-position semantics preserved by the broker's
+    // `Arc<File>` clones (see D3 step 1 `litebox_broker::ofd_registry`).
+    if parts.get(1) == Some(&"fs_fid") && parts.len() == 5 {
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let open_file_id: u64 = parts[2].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad fs_fid open_file_id {:?}: {e}",
+                parts[2]
+            )
+        })?;
+        let status_flags_bits: u32 = parts[3].parse().map_err(|e| {
+            anyhow!(
+                "broker-fd-bridge: bad fs_fid status flags {:?}: {e}",
+                parts[3]
+            )
+        })?;
+        let path = decode_brokerfile_bridge_path(parts[4])?;
+
+        let provider = litebox_shim_linux::syscalls::broker_fs_provider().ok_or_else(|| {
+            anyhow!("broker-fd-bridge: fs_fid {spec:?}: no broker_fs_provider registered")
+        })?;
+
+        let new_fid = entrypoints
+            .fs_allocate_fid_number()
+            .map_err(|err| anyhow!("broker-fd-bridge: fs_fid allocate {spec:?}: {err:?}"))?;
+
+        if let Err(e) = provider.clone_ofd(open_file_id, new_fid) {
+            entrypoints.fs_free_fid_number(new_fid);
+            anyhow::bail!("broker-fd-bridge: fs_fid {spec:?}: clone_ofd: {e:?}");
+        }
+
+        let install_result = entrypoints.install_brokerfile_bridge_fd_by_fid(
+            guest_fd,
+            new_fid,
+            &path,
+            0,
+            status_flags_bits,
+        );
+        return cleanup_cloned_fs_fid_after_install_result(spec, new_fid, install_result, |fid| {
+            entrypoints.fs_clunk_fid_number(fid);
+        });
+    }
+
     if parts.get(1) == Some(&"timerfd") && parts.len() == 10 {
         // spec format: {raw_fd}:timerfd:{clockid_u32}:{nonblock_u8}:{value_sec}:{value_nsec}:{interval_sec}:{interval_nsec}:{pending}:{snapshot_now_ns}
         let guest_fd: usize = parts[0]
@@ -578,8 +642,16 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             .map_err(|err| anyhow!("broker-fd-bridge: timerfd {spec:?}: {err:?}"));
     }
 
-    let (guest_fd, kind, handle_id, pipe_direction, socketpair_endpoint, pty_role, pty_id) =
-        parse_broker_fd_bridge_spec(spec)?;
+    let (
+        guest_fd,
+        kind,
+        handle_id,
+        pipe_direction,
+        socketpair_endpoint,
+        pty_role,
+        pty_id,
+        bridge_flags,
+    ) = parse_broker_fd_bridge_spec(spec)?;
     entrypoints
         .install_broker_bridge_fd(
             guest_fd,
@@ -589,7 +661,7 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             socketpair_endpoint,
             pty_role,
             pty_id,
-            litebox::fs::OFlags::empty(),
+            bridge_flags,
         )
         .map_err(|()| anyhow!("broker-fd-bridge: no provider for spec {spec:?}"))
 }
@@ -1191,7 +1263,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(program, shutdown, net_worker, None, None);
+        run_program(program, shutdown, net_worker, None);
     }
 }
 
@@ -1244,7 +1316,8 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // IPC mode: --nine-p-broker points to a Unix socket path.
     // Open a dedicated 9P channel using shared-memory ring buffers.
     if !is_tcp {
-        let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
+        let (ring_writer, ring_reader, nine_p_conn_id) = connect_nine_p_channel(broker_addr)?;
+        bind_nine_p_session_for_broker(nine_p_conn_id);
         litebox_timing::emit("runner_broker_connected_ns");
 
         let shim = shim_builder.build();
@@ -1339,7 +1412,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             program.entrypoints.set_controlling_pty(pty_id);
         }
 
-        run_program(program, shutdown, net_worker, worker_result_fd, None);
+        run_program(program, shutdown, net_worker, worker_result_fd);
     }
 
     // TUN mode: connect via TCP through the guest's smoltcp network stack.
@@ -1435,7 +1508,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         program.entrypoints.set_controlling_pty(pty_id);
     }
 
-    run_program(program, shutdown, net_worker, worker_result_fd, None);
+    run_program(program, shutdown, net_worker, worker_result_fd);
 }
 
 /// Process-global override for the root init's guest pid, set by the
@@ -1482,6 +1555,72 @@ fn set_broker_fd_bridge_caller_pid_scope(
     u32::try_from(task_params.pid)
         .ok()
         .map(litebox_common_linux::fd_token_client::set_caller_pid_scope)
+}
+
+fn install_broker_fd_bridge_specs_and_ack_with<F>(
+    task_params: litebox_common_linux::TaskParams,
+    specs: &[String],
+    ack_fd: i32,
+    mut install_spec: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
+    for spec in specs {
+        if let Err(err) = install_spec(spec) {
+            let _ = write_fork_restore_ack_status(
+                ack_fd,
+                litebox_common_linux::errno::Errno::EIO.as_neg(),
+            );
+            return Err(err.context("fork-restore broker-fd-bridge install failed before ack"));
+        }
+    }
+    write_fork_restore_ack_status(ack_fd, 0)
+}
+
+fn fork_restore_task_params(
+    identity: &litebox_shim_linux::syscalls::fork_snapshot::ProcessIdentitySnapshot,
+) -> litebox_common_linux::TaskParams {
+    litebox_common_linux::TaskParams {
+        pid: identity.pid,
+        ppid: identity.ppid,
+        uid: identity.credentials.uid,
+        euid: identity.credentials.euid,
+        gid: identity.credentials.gid,
+        egid: identity.credentials.egid,
+    }
+}
+
+fn write_fork_restore_ack_status(ack_fd: i32, status: i32) -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    // SAFETY: `ack_fd` is a live fork-restore ack fd transferred to this
+    // helper, and this helper takes ownership so the fd is closed after write.
+    let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
+    ack_file.write_all(&status.to_le_bytes())?;
+    Ok(())
+}
+
+fn cleanup_cloned_fs_fid_after_install_result<F>(
+    spec: &str,
+    new_fid: u32,
+    install_result: Result<(), litebox_common_linux::errno::Errno>,
+    clunk_fid: F,
+) -> Result<()>
+where
+    F: FnOnce(u32),
+{
+    match install_result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            clunk_fid(new_fid);
+            Err(anyhow!(
+                "broker-fd-bridge: fs_fid {spec:?}: install: {err:?}"
+            ))
+        }
+    }
 }
 
 fn worker_task_params(cli_args: &CliArgs) -> litebox_common_linux::TaskParams {
@@ -1671,15 +1810,11 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     // Parse pipe bridge specs (external-fd passthrough from prior bridges).
     let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
 
-    // Parse mux stream specs.
-    let mux_streams = parse_mux_stream_specs(&cli_args.mux_stream)?;
-    let mux_fd = cli_args.mux_fd;
-
     // Parse local pipe pair specs (child-only pipes).
     let local_pipes = parse_local_pipe_specs(&cli_args.local_pipe)?;
 
-    // Mark inherited fds as close-on-exec(except pipe bridge FDs and mux fd
-    // which the shim/dispatcher will use directly).
+    // Mark inherited fds as close-on-exec (except pipe bridge FDs which the
+    // shim will use directly).
     for fd in [Some(snapshot_fd), Some(ack_fd), cli_args.worker_result_fd]
         .into_iter()
         .flatten()
@@ -1751,7 +1886,8 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             anyhow::bail!("fork-restore does not support TCP 9P brokers");
         }
 
-        let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
+        let (ring_writer, ring_reader, nine_p_conn_id) = connect_nine_p_channel(broker_addr)?;
+        bind_nine_p_session_for_broker(nine_p_conn_id);
 
         let shim = shim_builder.build();
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -1780,15 +1916,14 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         );
         let combined_fs = std::sync::Arc::new(combined);
 
-        let (program, mux_handle) = fork_restore_and_ack(
+        let program = fork_restore_and_ack(
             &shim,
             snapshot,
             combined_fs,
             ack_fd,
             &pipe_bridges,
-            mux_fd,
-            &mux_streams,
             &local_pipes,
+            &cli_args.broker_fd_bridge,
         )?;
 
         // Re-register inherited listen ports through this worker's IPC.
@@ -1798,13 +1933,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         // so the broker routes inbound connections to the correct worker.
         shim.reannounce_listen_ports();
 
-        run_program(
-            program,
-            shutdown,
-            net_worker,
-            cli_args.worker_result_fd,
-            mux_handle,
-        );
+        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
     } else {
         let initial_file_system = std::sync::Arc::new(default_fs);
 
@@ -1812,23 +1941,16 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let net_worker = start_network_worker(&shim, &shutdown);
 
-        let (program, mux_handle) = fork_restore_and_ack(
+        let program = fork_restore_and_ack(
             &shim,
             snapshot,
             initial_file_system,
             ack_fd,
             &pipe_bridges,
-            mux_fd,
-            &mux_streams,
             &local_pipes,
+            &cli_args.broker_fd_bridge,
         )?;
-        run_program(
-            program,
-            shutdown,
-            net_worker,
-            cli_args.worker_result_fd,
-            mux_handle,
-        );
+        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
     }
 }
 
@@ -1867,57 +1989,6 @@ fn parse_pipe_bridge_specs(specs: &[String]) -> Result<Vec<PipeBridgeSpec>> {
         });
     }
     Ok(bridges)
-}
-
-/// A parsed mux stream specification from the `--mux-stream` CLI arg.
-#[allow(dead_code)]
-struct MuxStreamSpec {
-    stream_id: u32,
-    guest_fd: usize,
-    /// 'r' = ParentToWorker (worker reads), 'w' = WorkerToParent (worker writes).
-    direction: u8,
-    /// 'p' = pipe, 's' = socket, 't' = PTY slave.
-    stream_type: u8,
-    /// If true, the parent's pipe is already EOF at setup time.
-    /// The worker pre-closes the relay sender so the child sees
-    /// immediate EOF (preserving POSIX synchronous EOF semantics).
-    initial_eof: bool,
-}
-
-fn parse_mux_stream_specs(specs: &[String]) -> Result<Vec<MuxStreamSpec>> {
-    let mut streams = Vec::new();
-    for spec in specs {
-        let parts: Vec<&str> = spec.split(':').collect();
-        if parts.len() < 4 || parts.len() > 5 {
-            anyhow::bail!("invalid --mux-stream format: {spec}");
-        }
-        let stream_id: u32 = parts[0]
-            .parse()
-            .map_err(|_| anyhow!("bad stream_id in --mux-stream: {spec}"))?;
-        let guest_fd: usize = parts[1]
-            .parse()
-            .map_err(|_| anyhow!("bad guest_fd in --mux-stream: {spec}"))?;
-        let direction = match parts[2] {
-            "r" => b'r',
-            "w" => b'w',
-            _ => anyhow::bail!("bad direction in --mux-stream: {spec}"),
-        };
-        let stream_type = match parts[3] {
-            "p" => b'p',
-            "s" => b's',
-            "t" => b't',
-            _ => anyhow::bail!("bad type in --mux-stream: {spec}"),
-        };
-        let initial_eof = parts.get(4) == Some(&"e");
-        streams.push(MuxStreamSpec {
-            stream_id,
-            guest_fd,
-            direction,
-            stream_type,
-            initial_eof,
-        });
-    }
-    Ok(streams)
 }
 
 /// Parsed local-pipe specification: `(write_fd, read_fd, drained_data, w_flags, r_flags)`.
@@ -1965,29 +2036,21 @@ fn parse_local_pipe_specs(specs: &[String]) -> Result<Vec<LocalPipeSpec>> {
 
 /// Restore a child process from a fork snapshot and write the ack status to the parent.
 ///
-/// Sets up both external-fd passthrough fds and multiplexer stream endpoints,
-/// then starts the worker mux dispatcher thread before acking.
-#[allow(clippy::too_many_arguments)]
+/// Installs external-fd passthrough fds and local broker pipe pairs, then
+/// acks the parent over `ack_fd`.
 fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     shim: &litebox_shim_linux::LinuxShim<FS>,
     snapshot: litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot,
     fs: std::sync::Arc<FS>,
     ack_fd: i32,
     pipe_bridges: &[PipeBridgeSpec],
-    mux_fd: Option<i32>,
-    mux_streams: &[MuxStreamSpec],
     local_pipes: &[LocalPipeSpec],
-) -> Result<(
-    litebox_shim_linux::LoadedProgram<FS>,
-    Option<std::thread::JoinHandle<()>>,
-)> {
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
+    broker_fd_bridge_specs: &[String],
+) -> Result<litebox_shim_linux::LoadedProgram<FS>> {
+    let broker_fd_bridge_task_params = fork_restore_task_params(&snapshot.identity);
 
     match shim.restore_process(snapshot, fs) {
         Ok(program) => {
-            let mut mux_thread_handle: Option<std::thread::JoinHandle<()>> = None;
-
             // Install ExternalFd FDs for passthrough pipe bridges.
             for bridge in pipe_bridges {
                 let direction = match bridge.direction {
@@ -2185,138 +2248,19 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                 }
             }
 
-            // Set up mux stream endpoints: for each stream, create a virtual
-            // pipe pair, install the guest-facing end at the guest_fd slot,
-            // and collect the relay end for the dispatcher.
-            if let Some(mux_fd) = mux_fd
-                && !mux_streams.is_empty()
-            {
-                let platform = litebox_platform_multiplex::platform();
-                let litebox_ref = shim.litebox();
-                let pipes = litebox::pipes::Pipes::new(litebox_ref);
-
-                // (stream_id, direction, relay_fd)
-                #[allow(clippy::type_complexity)]
-                let mut relay_endpoints: Vec<(
-                    u32,
-                    u8,
-                    std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>>,
-                )> = Vec::new();
-
-                // Track seen stream_ids for dup'd alias handling:
-                // if a stream_id repeats, dup the already-created
-                // guest pipe end instead of creating a new pair.
-                let mut guest_pipe_dups: std::collections::HashMap<
-                    u32,
-                    litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
-                > = std::collections::HashMap::new();
-
-                for ms in mux_streams {
-                    if let Some(primary_dup) = guest_pipe_dups.get(&ms.stream_id) {
-                        // Alias: dup the pipe end from the primary.
-                        if let Some(duped) =
-                            litebox_ref.descriptor_table_mut().duplicate(primary_dup)
-                        {
-                            if ms.stream_type == b't' {
-                                program
-                                    .entrypoints
-                                    .install_mux_pty_slave_fd(ms.guest_fd, duped);
-                            } else {
-                                program.entrypoints.install_mux_pipe_fd(ms.guest_fd, duped);
-                            }
-                        }
-                        continue;
-                    }
-
-                    // TODO(legacy-pipes-migration): Phase 3 — migrate this
-                    // mux-stream endpoint pair to BrokerPipe. Paired with
-                    // process.rs:3464 (parent mux dispatcher).
-                    #[allow(deprecated)]
-                    let (sender, receiver) = pipes.create_pipe(
-                        1024 * 1024,
-                        litebox::pipes::Flags::NON_BLOCKING,
-                        core::num::NonZero::new(4096),
-                    );
-
-                    // 'r' = ParentToWorker: worker reads → install receiver
-                    //   as guest fd, relay writes via sender.
-                    // 'w' = WorkerToParent: worker writes → install sender
-                    //   as guest fd, relay reads via receiver.
-                    let (guest_pipe_fd, relay_pipe_fd) = if ms.direction == b'r' {
-                        (receiver, sender)
-                    } else {
-                        (sender, receiver)
-                    };
-
-                    // Clear NON_BLOCKING on the guest end so guest
-                    // reads/writes block normally.  The relay end stays
-                    // non-blocking for the mux dispatcher thread (which
-                    // can't use pollee.wait due to GS-based TLS).
-                    let _ = pipes.update_flags(
-                        &guest_pipe_fd,
-                        litebox::pipes::Flags::NON_BLOCKING,
-                        false,
-                    );
-
-                    // Dup guest pipe before install (install consumes it).
-                    let guest_dup = litebox_ref.descriptor_table_mut().duplicate(&guest_pipe_fd);
-                    if ms.stream_type == b't' {
-                        program
-                            .entrypoints
-                            .install_mux_pty_slave_fd(ms.guest_fd, guest_pipe_fd);
-                    } else {
-                        program
-                            .entrypoints
-                            .install_mux_pipe_fd(ms.guest_fd, guest_pipe_fd);
-                    }
-                    if let Some(d) = guest_dup {
-                        guest_pipe_dups.insert(ms.stream_id, d);
-                    }
-
-                    // For ParentToWorker streams with initial_eof:
-                    // pre-close the relay sender so the child's receiver
-                    // sees immediate EOF (POSIX synchronous semantics).
-                    if ms.initial_eof && ms.direction == b'r' {
-                        let _ = pipes.close(&relay_pipe_fd);
-                        // Don't add to relay_endpoints — stream is
-                        // already closed, no relay needed.
-                        continue;
-                    }
-
-                    relay_endpoints.push((ms.stream_id, ms.direction, relay_pipe_fd.into()));
-                }
-
-                // Clean up guest pipe dups.
-                for (_, fd) in guest_pipe_dups {
-                    let _ = pipes.close(&fd);
-                }
-
-                #[cfg(feature = "trace_syscalls")]
-                for (sid, dir, relay_fd) in &relay_endpoints {
-                    let eof = pipes.is_read_eof(relay_fd);
-                    eprintln!(
-                        "[WORKER-MUX] preflight stream={} dir={} is_read_eof={}",
-                        sid, *dir as char, eof,
-                    );
-                }
-
-                // Spawn the worker mux dispatcher thread.
-                let mux_handle =
-                    spawn_worker_mux_dispatcher(platform, pipes, mux_fd, relay_endpoints);
-                mux_thread_handle = Some(mux_handle);
-            }
-
-            // Verify local pipe data before starting guest.
-            // Report successful restore to parent via ack pipe.
-            let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
-            ack_file.write_all(&0i32.to_le_bytes())?;
-            Ok((program, mux_thread_handle))
+            // Install migrated broker-direct handles before acking the parent;
+            // the parent releases transit refs as soon as it reads the ack.
+            install_broker_fd_bridge_specs_and_ack_with(
+                broker_fd_bridge_task_params,
+                broker_fd_bridge_specs,
+                ack_fd,
+                |spec| install_broker_fd_bridge_spec(&program.entrypoints, spec),
+            )?;
+            Ok(program)
         }
         Err(e) => {
             // Report failure to parent via ack pipe.
-            let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
-            let _ = ack_file.write_all(&e.as_neg().to_le_bytes());
-            drop(ack_file);
+            let _ = write_fork_restore_ack_status(ack_fd, e.as_neg());
             anyhow::bail!("fork-restore failed: {e:?}");
         }
     }
@@ -2331,269 +2275,6 @@ fn read_fork_snapshot_from_fd(fd: i32) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
     Ok(data)
-}
-
-/// Spawn the worker-side multiplexer dispatcher thread.
-///
-/// This single thread handles all mux streams for this worker:
-/// - For WorkerToParent (`w`) streams: reads from virtual pipe receiver,
-///   sends mux messages to the parent via the socketpair.
-/// - For ParentToWorker (`r`) streams: reads mux messages from the socketpair,
-///   writes data to virtual pipe sender.
-#[allow(clippy::type_complexity)]
-fn spawn_worker_mux_dispatcher(
-    platform: &'static Platform,
-    pipes: litebox::pipes::Pipes<Platform>,
-    mux_fd: i32,
-    relay_endpoints: Vec<(
-        u32,
-        u8,
-        std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>>,
-    )>,
-) -> std::thread::JoinHandle<()> {
-    use litebox_shim_linux::multiplexer::{
-        HEADER_SIZE, MSG_FLAG_EOF, MSG_FLAG_RESET, MSG_TYPE_DATA, MuxMessage,
-    };
-
-    /// Maximum payload per mux message (60 KB, well under the ~212 KB kernel
-    /// SEQPACKET limit and within the 64 KB recv buffer).
-    const MUX_MAX_PAYLOAD: usize = 61440;
-
-    litebox_platform_linux_userland::spawn_host_thread(move || {
-        // NOTE: Do NOT use WaitState / WaitContext / pollee.wait on
-        // background threads — the update_waker function uses GS-based
-        // TLS which isn't initialized for non-guest threads.  Relay
-        // pipes are created with NON_BLOCKING so pipes.write returns
-        // WouldBlock instead of blocking in pollee.wait.
-
-        // Create a WaitContext for drain_available (read-side, doesn't
-        // need pollee.wait for non-blocking pipes).
-        let wait_state = litebox::event::wait::WaitState::new(platform);
-        let cx = wait_state.context();
-
-        // Set socketpair to non-blocking for the poll loop.
-        let _ = platform.set_host_fd_nonblock(mux_fd);
-
-        let mut recv_buf = vec![0u8; MUX_MAX_PAYLOAD + HEADER_SIZE];
-        let mut closed_endpoints: Vec<bool> = vec![false; relay_endpoints.len()];
-
-        // Helper: send a control frame (EOF/RESET) reliably.
-        // Retries on EAGAIN since the socketpair is non-blocking.
-        let send_control = |mux_fd: i32, msg: &MuxMessage| {
-            let buf = msg.serialize();
-            loop {
-                match platform.write_host_fd(mux_fd, &buf) {
-                    Ok(_) => return true,
-                    Err(litebox_common_linux::errno::Errno::EAGAIN) => {
-                        std::thread::sleep(std::time::Duration::from_micros(100));
-                    }
-                    Err(_) => return false,
-                }
-            }
-        };
-
-        loop {
-            let mut did_work = false;
-
-            // 1. Check socketpair for incoming messages (ParentToWorker data).
-            match platform.read_host_fd(mux_fd, &mut recv_buf) {
-                Ok(0) => {
-                    // Socketpair closed — parent exited. Close all relay fds.
-                    #[cfg(feature = "trace_syscalls")]
-                    eprintln!(
-                        "[WORKER-MUX] socketpair closed (parent gone), {} open endpoints",
-                        closed_endpoints.iter().filter(|&&c| !c).count(),
-                    );
-                    for (_, _, relay_fd) in &relay_endpoints {
-                        let _ = pipes.close(relay_fd);
-                    }
-                    platform.close_host_fd(mux_fd);
-                    return;
-                }
-                Ok(n) => {
-                    did_work = true;
-                    if let Some(msg) = MuxMessage::deserialize(&recv_buf[..n])
-                        && msg.msg_type == MSG_TYPE_DATA
-                    {
-                        #[cfg(feature = "trace_syscalls")]
-                        eprintln!(
-                            "[WORKER-MUX] recv stream={} flags={:#x} len={}",
-                            msg.stream_id,
-                            msg.flags,
-                            msg.data.len(),
-                        );
-                        if msg.flags & MSG_FLAG_EOF != 0 || msg.flags & MSG_FLAG_RESET != 0 {
-                            for (idx, (sid, _, relay_fd)) in relay_endpoints.iter().enumerate() {
-                                if *sid == msg.stream_id && !closed_endpoints[idx] {
-                                    let _ = pipes.close(relay_fd);
-                                    closed_endpoints[idx] = true;
-                                }
-                            }
-                        } else if !msg.data.is_empty() {
-                            for (idx, (sid, _, relay_fd)) in relay_endpoints.iter().enumerate() {
-                                if *sid == msg.stream_id && !closed_endpoints[idx] {
-                                    let mut offset = 0;
-                                    while offset < msg.data.len() {
-                                        // Non-blocking write with spin-sleep
-                                        // retry.  We can't use pollee.wait
-                                        // because update_waker uses GS-based
-                                        // TLS which isn't available on
-                                        // background threads.
-                                        match pipes.write(&cx, relay_fd, &msg.data[offset..]) {
-                                            Ok(w) => {
-                                                offset += w;
-                                            }
-                                            Err(litebox::pipes::errors::WriteError::WouldBlock) => {
-                                                // Pipe full — sleep briefly and retry.
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_micros(100),
-                                                );
-                                            }
-                                            Err(_) => {
-                                                // Local reader gone — close endpoint
-                                                // and notify peer.
-                                                let _ = pipes.close(relay_fd);
-                                                closed_endpoints[idx] = true;
-                                                let rst = MuxMessage::reset(*sid);
-                                                send_control(mux_fd, &rst);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(litebox_common_linux::errno::Errno::EAGAIN) => {}
-                Err(e) => {
-                    let _ = e;
-                    for (_, _, relay_fd) in &relay_endpoints {
-                        let _ = pipes.close(relay_fd);
-                    }
-                    platform.close_host_fd(mux_fd);
-                    return;
-                }
-            }
-
-            // 2. Check WorkerToParent streams for data to send.
-            for (idx, (stream_id, direction, relay_fd)) in relay_endpoints.iter().enumerate() {
-                if *direction != b'w' || closed_endpoints[idx] {
-                    continue;
-                }
-                match pipes.drain_available(relay_fd) {
-                    Ok(data) if data.is_empty() => {
-                        // Nothing buffered — check if sender closed.
-                        if pipes.is_read_eof(relay_fd) {
-                            // Final drain: the sender may have written data
-                            // and then closed between our drain and the eof
-                            // check.  Drain one more time to capture any
-                            // last-moment writes.
-                            if let Ok(final_data) = pipes.drain_available(relay_fd) {
-                                if !final_data.is_empty() {
-                                    did_work = true;
-                                    for chunk in final_data.chunks(MUX_MAX_PAYLOAD) {
-                                        let msg = MuxMessage::data(*stream_id, chunk.to_vec());
-                                        let buf = msg.serialize();
-                                        loop {
-                                            match platform.write_host_fd(mux_fd, &buf) {
-                                                Ok(w) if w == buf.len() => break,
-                                                Err(litebox_common_linux::errno::Errno::EAGAIN) => {
-                                                    std::thread::sleep(
-                                                        std::time::Duration::from_micros(100),
-                                                    );
-                                                }
-                                                _ => break,
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let _ = pipes.close(relay_fd);
-                            let msg = MuxMessage::eof(*stream_id);
-                            send_control(mux_fd, &msg);
-                            closed_endpoints[idx] = true;
-                        }
-                    }
-                    Ok(data) => {
-                        did_work = true;
-                        #[cfg(feature = "trace_syscalls")]
-                        eprintln!("[WORKER-MUX] send stream={} len={}", stream_id, data.len(),);
-                        for chunk in data.chunks(MUX_MAX_PAYLOAD) {
-                            let msg = MuxMessage::data(*stream_id, chunk.to_vec());
-                            let buf = msg.serialize();
-                            loop {
-                                match platform.write_host_fd(mux_fd, &buf) {
-                                    Ok(w) if w == buf.len() => break,
-                                    Err(litebox_common_linux::errno::Errno::EAGAIN) => {
-                                        std::thread::sleep(std::time::Duration::from_micros(100));
-                                    }
-                                    other => {
-                                        #[cfg(feature = "trace_syscalls")]
-                                        eprintln!(
-                                            "[WORKER-MUX] mux write failed: {:?} (expected {} bytes)",
-                                            other,
-                                            buf.len(),
-                                        );
-                                        let _ = &other;
-                                        for (_, _, rfd) in &relay_endpoints {
-                                            let _ = pipes.close(rfd);
-                                        }
-                                        platform.close_host_fd(mux_fd);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Pipe closed — send EOF.
-                        #[cfg(feature = "trace_syscalls")]
-                        eprintln!(
-                            "[WORKER-MUX] stream={stream_id} drain_available=Err, sending EOF",
-                        );
-                        let _ = pipes.close(relay_fd);
-                        let msg = MuxMessage::eof(*stream_id);
-                        send_control(mux_fd, &msg);
-                        closed_endpoints[idx] = true;
-                    }
-                }
-            }
-
-            // Exit when all WorkerToParent (b'w') endpoints are
-            // drained and EOF sent.  The child's output is fully
-            // relayed.  ParentToWorker (b'r') endpoints don't need
-            // to keep the thread alive — the parent will close the
-            // socketpair when it's done receiving.
-            let all_write_done = relay_endpoints
-                .iter()
-                .enumerate()
-                .all(|(idx, (_, dir, _))| *dir != b'w' || closed_endpoints[idx]);
-            if all_write_done {
-                platform.close_host_fd(mux_fd);
-                return;
-            }
-
-            if !did_work {
-                // No work this iteration — wait for the mux socketpair to
-                // become readable (incoming data from parent) or a short
-                // timeout (to drain outgoing relay pipes).  The previous
-                // 100µs sleep burned an entire CPU core per worker.
-                let mut pfd = libc::pollfd {
-                    fd: mux_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let ts = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 5_000_000, // 5ms — short enough for relay responsiveness
-                };
-                unsafe {
-                    libc::ppoll(&raw mut pfd, 1, &raw const ts, std::ptr::null());
-                }
-            }
-        }
-    })
 }
 
 /// Worker host entry point for a non-PIE child exec.
@@ -2789,13 +2470,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             program.entrypoints.set_controlling_pty(pty_id);
         }
 
-        run_program(
-            program,
-            shutdown,
-            net_worker,
-            cli_args.worker_result_fd,
-            None,
-        );
+        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
     }
 }
 
@@ -2807,7 +2482,6 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     shutdown: std::sync::Arc<core::sync::atomic::AtomicBool>,
     net_worker: Option<std::thread::JoinHandle<()>>,
     worker_result_fd: Option<i32>,
-    mux_handle: Option<std::thread::JoinHandle<()>>,
 ) -> ! {
     let local_process_count = program.entrypoints.local_process_count_fn();
 
@@ -2881,16 +2555,10 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
             String::new()
         },
     );
-    // Wait for the mux dispatcher to drain remaining data
-    // before exiting.
-    if let Some(handle) = mux_handle {
-        let _ = handle.join();
-    }
-    // Join ALL background tasks (parent mux dispatchers for child
-    // forks, background waiters, etc.) before exiting.  Without
-    // this, std::process::exit() kills threads and buffered mux
-    // data is lost.  Use a 2-second timeout to avoid hanging on
-    // stuck dispatcher threads.
+    // Join ALL background tasks (background waiters, etc.) before
+    // exiting.  Without this, std::process::exit() kills threads and
+    // buffered data is lost.  Use a 2-second timeout to avoid hanging
+    // on stuck threads.
     litebox_platform_multiplex::platform()
         .join_background_tasks_timeout(std::time::Duration::from_secs(2));
     if let Some(worker_result_fd) = worker_result_fd {
@@ -2996,6 +2664,7 @@ fn connect_nine_p_channel(
 ) -> Result<(
     litebox_common_linux::shmem_ring::RingWriter,
     litebox_common_linux::shmem_ring::RingReader,
+    u64,
 )> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -3064,26 +2733,31 @@ fn connect_nine_p_channel(
     // Send the two ring-buffer fds to the broker via SCM_RIGHTS.
     send_ring_fds(&fd, &tx_fd, &rx_fd)?;
 
-    // Wait for a 1-byte ACK from the broker confirming the ring pair was
-    // opened successfully.  This keeps the Unix socket alive long enough for
-    // the broker (which reads with non-blocking I/O in an event loop) to
-    // receive the magic bytes and SCM_RIGHTS message.
-    let mut ack = [0u8; 1];
-    // SAFETY: `fd` is a valid connected socket, `ack` is 1 byte.
+    // Wait for a 9-byte ACK from the broker confirming the ring pair was
+    // opened successfully and carrying the broker-assigned 9P
+    // `conn_id` (LE u64).  The conn_id pairs this 9P session with a
+    // sibling fd-token-socket via `FdTokenClient::bind_nine_p_session`
+    // — see `litebox_broker/src/nine_p_session_registry.rs`.
+    let mut ack = [0u8; 9];
+    // SAFETY: `fd` is a valid connected socket, `ack` is 9 bytes.
     let ret = unsafe {
         libc::recv(
             fd.as_raw_fd(),
             ack.as_mut_ptr().cast::<libc::c_void>(),
-            1,
-            0, // blocking
+            9,
+            libc::MSG_WAITALL,
         )
     };
-    if ret != 1 || ack[0] != b'K' {
+    if ret != 9 || ack[0] != b'K' {
         anyhow::bail!("9P shared-memory handshake: broker did not ACK ring fds");
     }
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&ack[1..9]);
+    let nine_p_conn_id = u64::from_le_bytes(id_bytes);
 
     // The Unix socket can now be dropped — all 9P I/O uses the ring buffers.
-    Ok(pair.into_parts())
+    let (writer, reader) = pair.into_parts();
+    Ok((writer, reader, nine_p_conn_id))
 }
 
 /// Send two file descriptors over a Unix socket using `SCM_RIGHTS`.
@@ -3454,17 +3128,6 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Like `env_flag_enabled` but defaults to `true` when the env var is
-/// unset. Returns `false` only when the var is explicitly set to a
-/// recognised off-value (`"0"`, `"false"`, `"no"`). Use for opt-out
-/// flags where the broker-held codepath is the new default.
-fn env_flag_enabled_default_on(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
-        .unwrap_or(true)
-}
-
 fn broker_inet_tcp_enabled() -> bool {
     // Broker-held outbound TCP is the only linux_userland path; worker-local
     // inet is no longer available to opt back into.
@@ -3481,6 +3144,46 @@ fn broker_tcp_conn_accept_or_outbound_enabled() -> bool {
     env_flag_enabled("LITEBOX_BROKER_TCP_CONN") || broker_inet_tcp_enabled()
 }
 
+/// Process-global storage for the runner's `FdTokenClient`, set by
+/// [`setup_broker_eventfd_provider`]. Used by callers that need to
+/// issue control-plane RPCs against the broker outside the
+/// shim/provider call paths — currently
+/// [`bind_nine_p_session_for_broker`] (legacy-pipes Phase 3 D3
+/// step 2d.2).
+fn runner_fd_token_client_storage() -> &'static std::sync::OnceLock<
+    std::sync::Arc<litebox_common_linux::fd_token_client::FdTokenClient>,
+> {
+    use std::sync::OnceLock;
+    static STORAGE: OnceLock<std::sync::Arc<litebox_common_linux::fd_token_client::FdTokenClient>> =
+        OnceLock::new();
+    &STORAGE
+}
+
+fn set_runner_fd_token_client(
+    client: std::sync::Arc<litebox_common_linux::fd_token_client::FdTokenClient>,
+) {
+    let _ = runner_fd_token_client_storage().set(client);
+}
+
+/// Legacy-pipes Phase 3 (D3 step 2d.2): bind the runner's
+/// fd-token-socket connection to the 9P session whose conn_id was
+/// returned by [`connect_nine_p_channel`]. Best-effort: if the
+/// fd-token-socket was never set up (no `--fd-token-broker` arg)
+/// this is a no-op. Errors are logged but not fatal — the legacy
+/// (non-fd-inherit) install paths still work.
+fn bind_nine_p_session_for_broker(conn_id: u64) {
+    let Some(client) = runner_fd_token_client_storage().get().cloned() else {
+        return;
+    };
+    if let Err(e) = client.bind_nine_p_session(conn_id) {
+        tracing::warn!(
+            error = %e,
+            conn_id,
+            "BindNinePSession failed; D3 fd-inherit ops will be unavailable on this session",
+        );
+    }
+}
+
 fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     use litebox_common_linux::broker_eventfd::NotificationDispatcher;
     use litebox_common_linux::fd_token_client::FdTokenClient;
@@ -3489,6 +3192,7 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     use std::sync::Arc;
     let path = std::path::Path::new(broker_path);
     let client = Arc::new(FdTokenClient::connect(path).map_err(|e| anyhow!("connect: {e}"))?);
+    set_runner_fd_token_client(Arc::clone(&client));
     let (pair, tx_fd, rx_fd) = ShmemRingPair::create().map_err(|e| anyhow!("ring: {e:?}"))?;
     let (_unused, worker_reader) = pair.into_parts();
     client
@@ -3524,6 +3228,12 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     ));
     litebox_shim_linux::syscalls::set_broker_pipe_provider(pipe_provider)
         .map_err(|_| anyhow!("pipe provider already set"))?;
+
+    let fs_provider = Arc::new(crate::broker_fs_provider::RunnerBrokerFsProvider::new(
+        Arc::clone(&client),
+    ));
+    litebox_shim_linux::syscalls::set_broker_fs_provider(fs_provider)
+        .map_err(|_| anyhow!("fs provider already set"))?;
 
     let socketpair_provider = Arc::new(
         crate::broker_socketpair_provider::RunnerBrokerSocketPairProvider::new(
@@ -3701,12 +3411,102 @@ mod tests {
             fork_restore_ack_fd: None,
             pipe_bridge: Vec::new(),
             broker_fd_bridge: Vec::new(),
-            mux_fd: None,
-            mux_stream: Vec::new(),
             local_pipe: Vec::new(),
             #[cfg(feature = "audit_log")]
             audit_log: None,
         }
+    }
+
+    #[test]
+    fn fork_restore_broker_fd_bridge_installs_before_success_ack_with_restored_pid_scope() {
+        use std::io::Read as _;
+        use std::os::fd::IntoRawFd as _;
+        use std::sync::{Arc, Mutex};
+
+        let (mut ack_reader, ack_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let specs = vec!["7:tcp_conn:42".to_string()];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_install = seen.clone();
+        let outer_guard = litebox_common_linux::fd_token_client::set_caller_pid_scope(77);
+
+        install_broker_fd_bridge_specs_and_ack_with(
+            litebox_common_linux::TaskParams {
+                pid: 123,
+                ppid: 1,
+                uid: 0,
+                euid: 0,
+                gid: 0,
+                egid: 0,
+            },
+            &specs,
+            ack_writer.into_raw_fd(),
+            |spec| {
+                assert_eq!(
+                    litebox_common_linux::fd_token_client::current_caller_pid(),
+                    123
+                );
+                seen_for_install.lock().unwrap().push(spec.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let mut ack = [0u8; 4];
+        ack_reader.read_exact(&mut ack).unwrap();
+        assert_eq!(i32::from_le_bytes(ack), 0);
+        assert_eq!(seen.lock().unwrap().as_slice(), specs.as_slice());
+        drop(outer_guard);
+    }
+
+    #[test]
+    fn fork_restore_broker_fd_bridge_install_error_writes_failed_ack() {
+        use std::io::Read as _;
+        use std::os::fd::IntoRawFd as _;
+        use std::sync::{Arc, Mutex};
+
+        let (mut ack_reader, ack_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let specs = vec!["7:tcp_conn:42".to_string()];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_install = seen.clone();
+
+        let result = install_broker_fd_bridge_specs_and_ack_with(
+            litebox_common_linux::TaskParams {
+                pid: 123,
+                ppid: 1,
+                uid: 0,
+                euid: 0,
+                gid: 0,
+                egid: 0,
+            },
+            &specs,
+            ack_writer.into_raw_fd(),
+            |spec| {
+                seen_for_install.lock().unwrap().push(spec.to_string());
+                anyhow::bail!("injected install failure")
+            },
+        );
+
+        assert!(result.is_err());
+        let mut ack = [0u8; 4];
+        ack_reader.read_exact(&mut ack).unwrap();
+        assert_ne!(i32::from_le_bytes(ack), 0);
+        assert_eq!(seen.lock().unwrap().as_slice(), specs.as_slice());
+    }
+
+    #[test]
+    fn fs_fid_post_clone_install_failure_clunks_cloned_fid() {
+        let clunked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let clunked_for_cleanup = clunked.clone();
+
+        let result = cleanup_cloned_fs_fid_after_install_result(
+            "9:fs_fid:11:0:2f",
+            55,
+            Err(litebox_common_linux::errno::Errno::EIO),
+            move |fid| clunked_for_cleanup.lock().unwrap().push(fid),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(clunked.lock().unwrap().as_slice(), &[55]);
     }
 
     #[cfg(unix)]
@@ -3900,12 +3700,8 @@ mod tests {
     /// integration cycles + parent-thread bisect.
     ///
     /// This test catches a future regression at unit-test time by
-    /// asserting (a) thread count didn't grow, and (b) the global
-    /// broker eventfd provider remains uninstalled, so `sys_eventfd2`
-    /// continues to take the local-fallback path. The full
-    /// cross-worker eventfd SCM_RIGHTS path is gated on a future
-    /// step (`b-step12-dispatcher-forksafe`) that makes broker state
-    /// fork-safe.
+    /// asserting that thread count didn't grow after setup tears down its
+    /// temporary notification-ring bootstrap state.
     #[test]
     fn setup_broker_eventfd_provider_leaves_no_long_lived_state() {
         use litebox_broker::fd_token_socket::spawn_control_listener;
@@ -3921,11 +3717,14 @@ mod tests {
         let fd_registry = Arc::new(BrokerFdTokenRegistry::new());
         let state_registry = Arc::new(BrokerStateRegistry::new());
         let process_registry = Arc::new(BrokerStateRegistry::new());
+        let inotify_dispatcher =
+            Arc::new(litebox_broker::inotify_dispatcher::InotifyDispatcher::new());
         let _listener = spawn_control_listener(
             &path,
             Arc::clone(&fd_registry),
             Arc::clone(&state_registry),
             Arc::clone(&process_registry),
+            inotify_dispatcher,
         )
         .expect("spawn listener");
 
@@ -3958,14 +3757,6 @@ mod tests {
             after <= baseline,
             "setup_broker_eventfd_provider must not spawn a runner-side reader thread \
              (baseline={baseline}, after={after}); see fork-restore safety comment",
-        );
-
-        // Provider must NOT be installed; sys_eventfd2 must fall back
-        // to local EventFile::new.
-        assert!(
-            litebox_shim_linux::syscalls::broker_eventfd_provider().is_none(),
-            "broker eventfd provider must not be installed; cross-worker broker-backed \
-             eventfd transfer is gated on Step 12 (fork-safe broker state)",
         );
     }
 

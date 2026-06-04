@@ -18,7 +18,6 @@ use litebox::event::wait::WaitError;
 use litebox::fs::OFlags;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::mm::linux::VmFlags;
-use litebox::pipes::HalfPipeType;
 use litebox::platform::PageManagementProvider;
 use litebox::platform::ThreadProvider;
 use litebox::platform::{
@@ -44,7 +43,6 @@ use litebox_platform_multiplex::Platform;
 /// `exec_on_remote_host` so it can set up ExternalFd replacements.
 type ExecVforkInfo = (
     Arc<crate::VforkDone>,
-    Vec<(usize, super::external_fd::ExternalFdDirection, usize)>,
     // parent_unix_socket_fds: (fd, pair_id, object_id)
     Vec<(usize, usize, u64)>,
 );
@@ -2595,99 +2593,6 @@ impl<FS: ShimFS> Task<FS> {
                 exit_signal: i32::try_from(args.exit_signal).unwrap_or(0),
                 parent_process_id: self.process_id,
                 parent_controlling_pty: *self.process_state.borrow().controlling_pty.lock(),
-                parent_pipe_fds: {
-                    let files = self.files.borrow();
-                    let rds = files.raw_descriptor_store.read();
-
-                    // Pass 1: collect pair_ids of all live pipe fds.
-                    let mut live_pair_ids: Vec<usize> = Vec::new();
-                    for raw_fd in rds.iter_alive() {
-                        if let Ok(typed) = rds
-                            .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                        {
-                            if let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) {
-                                live_pair_ids.push(pair_id);
-                            }
-                        }
-                    }
-
-                    // Purge stale entries from mux_pipe_pair_ids BEFORE the
-                    // mux check.  pipe_pair_id() returns Arc::as_ptr() — a
-                    // heap pointer.  When old relay pipes are freed, their
-                    // addresses can be reused for new pipes.  Stale entries
-                    // would cause new pipes to be incorrectly filtered.
-                    {
-                        let mut mux_ids = self.mux_pipe_pair_ids.borrow_mut();
-                        #[cfg(feature = "trace_syscalls")]
-                        let before = mux_ids.len();
-                        mux_ids.retain(|id| live_pair_ids.contains(id));
-                        #[cfg(feature = "trace_syscalls")]
-                        if mux_ids.len() < before {
-                            litebox::log_println!(
-                                self.global.platform,
-                                "[FORK-DIAG] pid={}: purged {} stale mux_pipe_pair_ids ({} → {})",
-                                self.pid,
-                                before - mux_ids.len(),
-                                before,
-                                mux_ids.len(),
-                            );
-                        }
-                    }
-
-                    // Pass 2: build pipe_fds, skipping mux-managed pipes.
-                    let mux_ids = self.mux_pipe_pair_ids.borrow();
-                    let mut pipe_fds = Vec::new();
-                    for raw_fd in rds.iter_alive() {
-                        if let Ok(typed) = rds
-                            .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                        {
-                            let direction = match self.global.pipes.half_pipe_type(&typed) {
-                                Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
-                                    crate::syscalls::external_fd::ExternalFdDirection::Read
-                                }
-                                Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
-                                    crate::syscalls::external_fd::ExternalFdDirection::Write
-                                }
-                                Err(_) => continue,
-                            };
-                            let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) else {
-                                continue;
-                            };
-                            // Skip mux-managed pipes — these are infrastructure
-                            // virtual pipes installed by a prior sibling's mux
-                            // dispatcher or fd-replacement relay.  Bridging them
-                            // again would create nested mux-over-mux and destroy
-                            // the first mux's data flow.
-                            if mux_ids.contains(&pair_id) {
-                                #[cfg(feature = "trace_syscalls")]
-                                litebox::log_println!(
-                                    self.global.platform,
-                                    "[FORK-DIAG] pid={}: skipping mux-managed pipe fd={} pair_id={:#x}",
-                                    self.pid,
-                                    raw_fd,
-                                    pair_id,
-                                );
-                                continue;
-                            }
-                            pipe_fds.push((raw_fd, direction, pair_id));
-                        }
-                    }
-                    drop(mux_ids);
-
-                    // Diagnostic: log ALL alive fds in the parent's fd table
-                    #[cfg(feature = "trace_syscalls")]
-                    {
-                        let all_alive: alloc::vec::Vec<usize> = rds.iter_alive().collect();
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[FORK-DIAG] pid={}: parent all_alive_fds={:?} pipe_fds={:?}",
-                            self.pid,
-                            all_alive,
-                            pipe_fds,
-                        );
-                    }
-                    pipe_fds
-                },
                 parent_unix_socket_fds: {
                     let files = self.files.borrow();
                     let rds = files.raw_descriptor_store.read();
@@ -2733,7 +2638,6 @@ impl<FS: ShimFS> Task<FS> {
                         })
                         .collect()
                 },
-                parent_mux_pipe_pair_ids: self.mux_pipe_pair_ids.borrow().clone(),
                 parent_is_delayed_fork: self.delayed_fork_pending.get() || nested_delayed_fork,
                 fork_snapshot_broker_transit: Vec::new(),
                 fork_snapshot_pidfd_process_transit: Vec::new(),
@@ -3022,65 +2926,6 @@ impl<FS: ShimFS> Task<FS> {
             // refcounts live in the shared descriptor entry; child close/exec
             // activity must not be able to remove or resurrect the parent's
             // writer refs.
-            let pipe_positions: alloc::vec::Vec<(
-                alloc::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>>,
-                usize,
-            )> = {
-                let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
-                let mut positions = alloc::vec::Vec::new();
-                for raw_fd in rds.iter_alive() {
-                    if let Ok(typed) =
-                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                    {
-                        if let Some(pos) = self.global.pipes.snapshot_consumer_position(&typed) {
-                            positions.push((typed, pos));
-                        }
-                    }
-                }
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[PIPE-COW] snapshotted {} pipe receiver positions",
-                    positions.len(),
-                );
-                positions
-            };
-            let pipe_writer_ref_counts: alloc::vec::Vec<(
-                alloc::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>>,
-                usize,
-            )> = {
-                let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
-                let mut counts = BTreeMap::<
-                    u64,
-                    (
-                        alloc::sync::Arc<
-                            litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
-                        >,
-                        usize,
-                    ),
-                >::new();
-                for raw_fd in rds.iter_alive() {
-                    if let Ok(typed) =
-                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                    {
-                        if self
-                            .global
-                            .pipes
-                            .snapshot_writer_ref_count(&typed)
-                            .is_some()
-                        {
-                            counts
-                                .entry(typed.object_id().as_u64())
-                                .and_modify(|(_, count)| *count += 1)
-                                .or_insert((typed, 1));
-                        }
-                    }
-                }
-                counts.into_values().collect()
-            };
-
             // Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
             // interrupted, because parent and child share the same guest stack.
             while !vd.is_done() {
@@ -3093,37 +2938,6 @@ impl<FS: ShimFS> Task<FS> {
             if let Some(cow) = &cow_state {
                 self.restore_cow_layer(cow, true);
             }
-
-            // Restore pipe receiver consumer positions so the parent
-            // sees data that the child consumed from the shared ring buffer.
-            for (typed, saved_pos) in &pipe_positions {
-                self.global
-                    .pipes
-                    .restore_consumer_position(typed, *saved_pos);
-            }
-            // Verify restoration worked by checking positions match
-            #[cfg(feature = "trace_syscalls")]
-            for (typed, saved_pos) in &pipe_positions {
-                if let Some(current) = self.global.pipes.snapshot_consumer_position(typed) {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[PIPE-COW] restored consumer: saved={} current={}",
-                        saved_pos,
-                        current,
-                    );
-                }
-            }
-            drop(pipe_positions);
-
-            // Restore pipe writer fd_ref_counts to the parent's fd table
-            // contribution.  Restoring the pre-fork global count would include
-            // the child's transient dup refs and keep readers from seeing EOF.
-            for (typed, saved_count) in &pipe_writer_ref_counts {
-                self.global
-                    .pipes
-                    .restore_writer_ref_count(typed, *saved_count);
-            }
-            drop(pipe_writer_ref_counts);
 
             // Apply fd replacements deposited by commit_delayed_fork.
             // Instead of replacing with ExternalFd (which has a no-op
@@ -3201,21 +3015,6 @@ impl<FS: ShimFS> Task<FS> {
                             let _ = self.global.litebox.descriptor_table_mut().remove(&old_sock);
                             rds = files.raw_descriptor_store.write();
                         }
-                        // For direct Read+Pipe replacements only: consume the
-                        // parent's existing virtual pipe at this slot so
-                        // fd_into_specific_raw_integer below can install the
-                        // ExternalFd. mem::forget keeps the underlying virtual
-                        // pipe alive (drop would close it which the in-progress
-                        // exec_on_remote_host syscall may still reference).
-                        if repl.direct && repl.direction == ExternalFdDirection::Read {
-                            if let Ok(old_pipe) = rds
-                                .fd_consume_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                    repl.guest_fd,
-                                )
-                            {
-                                core::mem::forget(old_pipe);
-                            }
-                        }
                         let _ = rds.fd_into_specific_raw_integer(typed_fd, repl.guest_fd);
                         continue;
                     }
@@ -3228,934 +3027,98 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            // --- Parent mux dispatcher ---
-            // If commit_delayed_fork set up a multiplexer, start the parent
-            // dispatcher that relays data between the mux socketpair and
-            // per-stream virtual pipe endpoints.
-            let parent_mux_raw = vd.mux_parent_fd.load(core::sync::atomic::Ordering::Acquire);
-            if parent_mux_raw >= 0 {
-                use super::external_fd::ExternalFdDirection;
-
-                let mux_streams: Vec<crate::MuxParentStream> =
-                    vd.mux_parent_streams.lock().drain(..).collect();
-                let mut orphan_streams: Vec<(u32, Vec<u8>)> =
-                    vd.mux_orphan_streams.lock().drain(..).collect();
-
-                if mux_streams.is_empty() && !orphan_streams.is_empty() {
-                    // All streams are orphans — no parent endpoints needed.
-                    // Send drained DATA + RESETs and close the socketpair so
-                    // the worker doesn't hang.
-                    let platform = self.global.platform;
-                    let mux_fd = parent_mux_raw;
-                    self.global.platform.spawn_background_task(move || {
-                        use crate::multiplexer::MuxMessage;
-                        const MUX_MAX_PAYLOAD: usize = 61440;
-                        for (sid, drained) in &orphan_streams {
-                            // Send drained data before RESET so the worker
-                            // receives buffered bytes before EOF.
-                            if !drained.is_empty() {
-                                for chunk in drained.chunks(MUX_MAX_PAYLOAD) {
-                                    let msg = MuxMessage::data(*sid, chunk.to_vec());
-                                    let buf = msg.serialize();
-                                    let _ = platform.write_host_fd(mux_fd, &buf);
-                                }
-                            }
-                            #[cfg(feature = "trace_syscalls")]
-                            litebox::log_println!(
-                                platform,
-                                "[PARENT-MUX] sending RESET for orphan stream={} (no dispatcher, drained={})",
-                                sid,
-                                drained.len(),
-                            );
-                            let msg = MuxMessage::reset(*sid);
-                            let buf = msg.serialize();
-                            let _ = platform.write_host_fd(mux_fd, &buf);
-                        }
-                        platform.close_host_fd(mux_fd);
-                    });
-                } else if !mux_streams.is_empty() {
-                    type PipeFd = alloc::sync::Arc<
-                        litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
-                    >;
-
+            // --- Parent broker socketpair installs ---
+            // D5-vsocket: replace parent-side UnixSocket peers with the broker
+            // endpoint paired with the worker endpoint shipped via
+            // --broker-fd-bridge. The first install consumes create_socketpair's
+            // creation ref; alias installs dup_handle before constructing their
+            // BrokerSocketPairFd so on_close has a matching release.
+            let parent_socketpair_installs: Vec<crate::BrokerSocketPairParentInstall> = vd
+                .broker_socketpair_parent_installs
+                .lock()
+                .drain(..)
+                .collect();
+            if !parent_socketpair_installs.is_empty() {
+                if let Some(provider) = super::broker_socketpair::broker_socketpair_provider() {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
                     let files = self.files.borrow();
-
-                    // Collect (stream_id, direction, relay_pipe_fd, drained_data)
-                    // for the dispatcher, and optionally spawn relay threads for
-                    // external fd streams.
-                    //
-                    // When multiple MuxParentStream entries share the same
-                    // stream_id (dup'd socket aliases), only the first creates
-                    // a pipe pair and dispatch endpoint.  Subsequent aliases
-                    // get a dup'd TypedFd installed at their guest_fd so all
-                    // aliases share one receive queue (matching real dup
-                    // semantics).
-                    let mut dispatch_endpoints: Vec<(u32, u8, PipeFd, Vec<u8>)> = Vec::new();
-                    // Keepalive references: old pipe/socket ends consumed
-                    // during replacement, plus duplicates of the new parent
-                    // pipe ends.  These prevent SharedEntry drops that would
-                    // kill Weak peer links in other processes.  Moved into
-                    // the dispatcher thread so they live as long as the mux.
-                    let mut keepalive_pipes: Vec<
-                        alloc::sync::Arc<
-                            litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
-                        >,
-                    > = Vec::new();
-                    let mut keepalive_sockets: Vec<
-                        alloc::sync::Arc<
-                            litebox::fd::TypedFd<super::unix::UnixSocketSubsystem<FS>>,
-                        >,
-                    > = Vec::new();
-                    // Track which stream_ids have been processed: (stream_id, first_guest_fd).
-                    let mut seen_streams: Vec<(u32, usize)> = Vec::new();
-
-                    for ms in mux_streams {
-                        // Check if an earlier alias already created a pipe for
-                        // this stream_id.
-                        if let Some(&(_, first_guest_fd)) =
-                            seen_streams.iter().find(|(sid, _)| *sid == ms.stream_id)
+                    for install in parent_socketpair_installs {
+                        if install.dup_before_install
+                            && releaser.dup_handle(install.handle_id).is_err()
                         {
-                            // Aliased parent fd — dup the existing pipe into
-                            // this guest_fd slot.
-                            if ms.external_fd_fd < 0 {
-                                let old_pipe;
-                                let old_socket;
-                                {
-                                    let rds = files.raw_descriptor_store.read();
-                                    let src_typed = rds
-                                        .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                            first_guest_fd,
-                                        );
-                                    drop(rds);
-
-                                    if let Ok(src) = src_typed {
-                                        let dup_fd = self
-                                            .global
-                                            .litebox
-                                            .descriptor_table_mut()
-                                            .duplicate(&src);
-                                        if let Some(dup_fd) = dup_fd {
-                                            let mut rds = files.raw_descriptor_store.write();
-                                            let consumed_pipe = rds
-                                                .fd_consume_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                                    ms.guest_fd,
-                                                )
-                                                .ok();
-                                            let consumed_socket = if consumed_pipe.is_none() {
-                                                rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
-                                                    ms.guest_fd,
-                                                )
-                                                .ok()
-                                            } else {
-                                                None
-                                            };
-                                            old_pipe = consumed_pipe;
-                                            old_socket = consumed_socket;
-                                            let ok = rds
-                                                .fd_into_specific_raw_integer(dup_fd, ms.guest_fd);
-                                            debug_assert!(
-                                                ok,
-                                                "mux dup fd: slot {} still occupied",
-                                                ms.guest_fd
-                                            );
-                                        } else {
-                                            old_pipe = None;
-                                            old_socket = None;
-                                        }
-                                    } else {
-                                        old_pipe = None;
-                                        old_socket = None;
-                                    }
-                                }
-                                if let Some(old_typed) = old_pipe {
-                                    // Keep alive — don't close. Same
-                                    // rationale as the primary path.
-                                    keepalive_pipes.push(old_typed);
-                                }
-                                if let Some(old_typed) = old_socket {
-                                    keepalive_sockets.push(old_typed);
-                                }
-                            }
-                            // No new dispatch_endpoint — the first alias's
-                            // endpoint handles this stream_id.
                             continue;
                         }
 
-                        seen_streams.push((ms.stream_id, ms.guest_fd));
-
-                        #[cfg(feature = "trace_syscalls")]
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[PARENT-MUX] setup stream={} guest_fd={} dir={:?} use_existing={} external_fd={}",
-                            ms.stream_id,
-                            ms.guest_fd,
-                            ms.direction,
-                            ms.use_existing_pipe,
-                            ms.external_fd_fd,
-                        );
-
-                        let dir_byte = match ms.direction {
-                            ExternalFdDirection::Read => b'r',
-                            ExternalFdDirection::Write => b'w',
-                            ExternalFdDirection::ReadWrite => b'b',
-                        };
-
-                        if ms.use_existing_pipe {
-                            // use_existing_pipe: the parent already has a pipe
-                            // at guest_fd.  For Read (b'r', WorkerToParent),
-                            // this is a SenderHalf — the dispatcher writes mux
-                            // data INTO it, and whoever holds the matching
-                            // ReceiverHalf (e.g. copilot's Go runtime) reads
-                            // from it.  For Write (b'w', ParentToWorker), this
-                            // is a ReceiverHalf — the dispatcher reads from it.
-                            //
-                            // Don't create a new pipe or replace the fd table
-                            // entry.  Duplicate the pipe so the DT entry
-                            // survives if the parent later closes this guest_fd.
+                        let flags = {
                             let rds = files.raw_descriptor_store.read();
-                            if let Ok(existing_fd) = rds
-                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                    ms.guest_fd,
+                            let typed = rds
+                                .fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
+                                    install.guest_fd,
                                 )
-                            {
-                                #[cfg(feature = "trace_syscalls")]
-                                {
-                                    let pipe_type = self.global.pipes.half_pipe_type(&existing_fd);
-                                    litebox::log_println!(
-                                        self.global.platform,
-                                        "[PARENT-MUX] use_existing_pipe: stream={} guest_fd={} dir={} pipe_type={:?}",
-                                        ms.stream_id,
-                                        ms.guest_fd,
-                                        dir_byte as char,
-                                        pipe_type,
+                                .ok();
+                            drop(rds);
+                            typed
+                                .and_then(|typed| {
+                                    let dt = self.global.litebox.descriptor_table();
+                                    let flags = dt.with_entry(
+                                        &typed,
+                                        |sock: &super::unix::UnixSocket<FS>| sock.get_status(),
                                     );
-                                }
-                                drop(rds);
-                                // The dispatch endpoint uses a DUPLICATE.
-                                // The duplicate keeps the DT entry alive
-                                // regardless of when the parent closes the fd.
-                                if let Some(dup_fd) = self
-                                    .global
-                                    .litebox
-                                    .descriptor_table_mut()
-                                    .duplicate(&existing_fd)
-                                {
-                                    dispatch_endpoints.push((
-                                        ms.stream_id,
-                                        dir_byte,
-                                        dup_fd.into(),
-                                        ms.drained_data,
-                                    ));
-                                } else {
-                                    orphan_streams.push((ms.stream_id, Vec::new()));
-                                }
-                            } else {
-                                drop(rds);
-                                orphan_streams.push((ms.stream_id, Vec::new()));
-                            }
-                            continue;
-                        }
-
-                        // Create pipe with NON_BLOCKING flag so both ends
-                        // start non-blocking. The dispatch end stays
-                        // non-blocking for the mux background thread (which
-                        // can't use pollee.wait due to GS-based TLS).
-                        // The guest end is cleared to blocking below.
-                        // TODO(legacy-pipes-migration): Phase 3 — migrate this
-                        // mux-dispatcher pipe pair to BrokerPipe so that
-                        // `litebox::pipes::Pipes` can be deleted entirely.
-                        // See files/legacy-pipes-migration.md.
-                        #[allow(deprecated)]
-                        let (sender, receiver) = self.global.pipes.create_pipe(
-                            1024 * 1024,
-                            litebox::pipes::Flags::NON_BLOCKING,
-                            core::num::NonZero::new(4096),
-                        );
-
-                        // Record this pipe's pair_id as mux-managed so future
-                        // children don't try to bridge it again.
-                        if let Ok(pair_id) = self.global.pipes.pipe_pair_id(&sender) {
-                            self.mux_pipe_pair_ids.borrow_mut().push(pair_id);
-                        }
-
-                        let (parent_pipe_fd, dispatch_pipe_fd) = match ms.direction {
-                            ExternalFdDirection::Read => (receiver, sender),
-                            ExternalFdDirection::Write => (sender, receiver),
-                            ExternalFdDirection::ReadWrite => {
-                                unreachable!("bidi sockets use passthrough")
-                            }
-                        };
-
-                        // Clear NON_BLOCKING on the guest end so guest
-                        // reads/writes block normally.
-                        let _ = self.global.pipes.update_flags(
-                            &parent_pipe_fd,
-                            litebox::pipes::Flags::NON_BLOCKING,
-                            false,
-                        );
-
-                        if ms.external_fd_fd >= 0 {
-                            // Host-backed pipe: spawn a relay thread that
-                            // bridges between the virtual pipe and the host
-                            // OS fd.  The dispatcher relays between the mux
-                            // socketpair and the virtual pipe as usual.
-                            let platform = self.global.platform;
-                            let pipes_clone = self.global.pipes.clone();
-                            let host_fd = ms.external_fd_fd;
-                            let direction = ms.direction;
-                            let relay_fd: alloc::sync::Arc<
-                                litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
-                            > = parent_pipe_fd.into();
-
-                            self.global.platform.spawn_background_task(move || {
-                                let wait_state = litebox::event::wait::WaitState::new(platform);
-                                let cx = wait_state.context();
-                                let mut buf = alloc::vec![0u8; 65536];
-
-                                match direction {
-                                    ExternalFdDirection::Read => {
-                                        loop {
-                                            match pipes_clone.read(&cx, &relay_fd, &mut buf) {
-                                                Ok(0) | Err(_) => break,
-                                                Ok(n) => {
-                                                    let mut off = 0;
-                                                    while off < n {
-                                                        if let Ok(w) = platform
-                                                            .write_host_fd(host_fd, &buf[off..n])
-                                                        {
-                                                            off += w;
-                                                        } else {
-                                                            let _ = pipes_clone.close(&relay_fd);
-                                                            // Don't close host stdio fds (0/1/2) —
-                                                            // they're shared with the terminal.
-                                                            if host_fd > 2 {
-                                                                platform.close_host_fd(host_fd);
-                                                            }
-                                                            return;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // Don't close host stdio fds (0/1/2).
-                                        if host_fd > 2 {
-                                            platform.close_host_fd(host_fd);
-                                        }
-                                        let _ = pipes_clone.close(&relay_fd);
-                                    }
-                                    ExternalFdDirection::Write => {
-                                        loop {
-                                            match platform.read_host_fd(host_fd, &mut buf) {
-                                                Ok(0) | Err(_) => break,
-                                                Ok(n) => {
-                                                    let mut off = 0;
-                                                    while off < n {
-                                                        if let Ok(w) = pipes_clone.write(
-                                                            &cx,
-                                                            &relay_fd,
-                                                            &buf[off..n],
-                                                        ) {
-                                                            off += w;
-                                                        } else {
-                                                            let _ = pipes_clone.close(&relay_fd);
-                                                            // Don't close host stdio fds (0/1/2).
-                                                            if host_fd > 2 {
-                                                                platform.close_host_fd(host_fd);
-                                                            }
-                                                            return;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // Don't close host stdio fds (0/1/2).
-                                        if host_fd > 2 {
-                                            platform.close_host_fd(host_fd);
-                                        }
-                                        let _ = pipes_clone.close(&relay_fd);
-                                    }
-                                    ExternalFdDirection::ReadWrite => {
-                                        unreachable!("bidi sockets use passthrough")
-                                    }
-                                }
-                            });
-                        } else if ms.subsystem == crate::ReplacedSubsystem::Filesystem {
-                            // Filesystem fd stream: the child writes into the
-                            // mux; relay those bytes back into a duplicate of
-                            // the parent's original file descriptor so path
-                            // reads in the parent observe the data.
-                            let fs_fd = {
-                                let rds = files.raw_descriptor_store.read();
-                                let existing = rds.fd_from_raw_integer::<FS>(ms.guest_fd).ok();
-                                drop(rds);
-                                existing.and_then(|fd| {
-                                    self.global.litebox.descriptor_table_mut().duplicate(&fd)
+                                    drop(dt);
+                                    flags
                                 })
-                            };
-
-                            if let Some(fs_fd) = fs_fd {
-                                let fs = files.fs.clone();
-                                let platform = self.global.platform;
-                                let pipes_clone = self.global.pipes.clone();
-                                let relay_fd: alloc::sync::Arc<
-                                    litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
-                                > = parent_pipe_fd.into();
-
-                                self.global.platform.spawn_background_task(move || {
-                                    let wait_state = litebox::event::wait::WaitState::new(platform);
-                                    let cx = wait_state.context();
-                                    let mut buf = alloc::vec![0u8; 65536];
-
-                                    if ms.direction == ExternalFdDirection::Read {
-                                        loop {
-                                            match pipes_clone.read(&cx, &relay_fd, &mut buf) {
-                                                Ok(0) | Err(_) => break,
-                                                Ok(n) => {
-                                                    let _ = fs.write(&fs_fd, &buf[..n], None);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let _ = pipes_clone.close(&relay_fd);
-                                    let _ = fs.close(&fs_fd);
-                                });
-                            } else {
-                                orphan_streams.push((ms.stream_id, Vec::new()));
-                            }
-                        } else {
-                            // Virtual pipe/socket stream: install the parent
-                            // end in the fd table, consuming the old entry.
-                            //
-                            // For Read (WorkerToParent) direction:
-                            //   parent_pipe_fd is a ReceiverHalf. Duplicate it
-                            //   so the dispatcher holds an independent reference.
-                            //   When the parent later closes this guest_fd, the
-                            //   duplicate keeps the pipe's SharedEntry alive,
-                            //   preventing premature EOF on the dispatch
-                            //   (sender) end.
-                            //
-                            // For Write (ParentToWorker) direction:
-                            //   parent_pipe_fd is a SenderHalf. Do NOT keep it
-                            //   alive — when the parent closes the guest_fd,
-                            //   we WANT the SenderHalf's SharedEntry to drop
-                            //   so is_peer_shutdown() returns true on the
-                            //   dispatch ReceiverHalf, triggering is_read_eof()
-                            //   and sending EOF to the worker.
-                            let parent_pipe_keepalive = if ms.direction == ExternalFdDirection::Read
-                            {
-                                self.global
-                                    .litebox
-                                    .descriptor_table_mut()
-                                    .duplicate(&parent_pipe_fd)
-                            } else {
-                                None
-                            };
-
-                            #[cfg(feature = "trace_syscalls")]
-                            litebox::log_println!(
-                                self.global.platform,
-                                "[PARENT-MUX] stream={} dir={:?} keepalive={}",
-                                ms.stream_id,
-                                ms.direction,
-                                parent_pipe_keepalive.is_some(),
-                            );
-
-                            let old_pipe;
-                            let old_socket;
-                            {
-                                let mut rds = files.raw_descriptor_store.write();
-                                let consumed_pipe = rds
-                                    .fd_consume_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                        ms.guest_fd,
-                                    )
-                                    .ok();
-                                let consumed_socket = if consumed_pipe.is_none() {
-                                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
-                                        ms.guest_fd,
-                                    )
-                                    .ok()
-                                } else {
-                                    None
-                                };
-                                old_pipe = consumed_pipe;
-                                old_socket = consumed_socket;
-                                let ok =
-                                    rds.fd_into_specific_raw_integer(parent_pipe_fd, ms.guest_fd);
-                                debug_assert!(
-                                    ok,
-                                    "mux fd replacement: slot {} still occupied",
-                                    ms.guest_fd
-                                );
-                            }
-
-                            // Drain any data already in the old pipe and
-                            // pre-fill the new pipe. This handles the case
-                            // where a pipeline child (e.g. cat) wrote to the
-                            // capture pipe before delayed-fork migration.
-                            // Without this, the data would be silently lost.
-                            if ms.direction == ExternalFdDirection::Read {
-                                if let Some(ref old_typed) = old_pipe {
-                                    if let Ok(drained) =
-                                        self.global.pipes.drain_available(old_typed)
-                                    {
-                                        if !drained.is_empty() {
-                                            #[cfg(feature = "trace_syscalls")]
-                                            litebox::log_println!(
-                                                self.global.platform,
-                                                "[PARENT-MUX] drained {} bytes from old pipe at fd={} into new pipe",
-                                                drained.len(),
-                                                ms.guest_fd,
-                                            );
-                                            // Write drained data into the
-                                            // dispatch pipe (sender end) so
-                                            // the parent's new receiver has it.
-                                            let wait_state = litebox::event::wait::WaitState::new(
-                                                self.global.platform,
-                                            );
-                                            let cx = wait_state.context();
-                                            let _ = self.global.pipes.write(
-                                                &cx,
-                                                &dispatch_pipe_fd,
-                                                &drained,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(old_typed) = old_pipe {
-                                // Keep the old pipe end alive — don't call
-                                // pipes.close().  The fd slot is already freed
-                                // by fd_consume_raw_integer above.  Calling
-                                // close would remove the global DT entry,
-                                // dropping the SharedEntry if this was the
-                                // last Arc.  That would kill the Weak peer
-                                // link in the OTHER end (held by copilot's
-                                // worker or a relay thread), cascading into
-                                // a shutdown of the whole sandbox.
-                                //
-                                // The old pipe end lives in keepalive_pipes
-                                // until the dispatcher thread exits.
-                                keepalive_pipes.push(old_typed);
-                            }
-                            if let Some(old_typed) = old_socket {
-                                // Same treatment for sockets — keep alive.
-                                keepalive_sockets.push(old_typed);
-                            }
-
-                            // Move the keepalive into the dispatch endpoint so
-                            // it is dropped only when the dispatcher thread
-                            // exits, not when the parent closes the guest fd.
-                            if let Some(k) = parent_pipe_keepalive {
-                                keepalive_pipes.push(alloc::sync::Arc::new(k));
-                            }
-                        }
-
-                        dispatch_endpoints.push((
-                            ms.stream_id,
-                            dir_byte,
-                            dispatch_pipe_fd.into(),
-                            ms.drained_data,
-                        ));
-                    }
-
-                    // Spawn the parent mux dispatcher thread.
-                    let platform = self.global.platform;
-                    let pipes = self.global.pipes.clone();
-                    let mux_fd = parent_mux_raw;
-
-                    // Send orphan DATA+RESET from the main thread, before
-                    // spawning the dispatcher.  The dispatcher's background
-                    // thread may be delayed by platform scheduling; sending
-                    // orphan messages synchronously ensures the worker
-                    // receives buffered pipe data promptly.
-                    {
-                        use crate::multiplexer::MuxMessage;
-                        const MUX_MAX_PAYLOAD: usize = 61440;
-                        for (sid, drained) in &orphan_streams {
-                            if !drained.is_empty() {
-                                for chunk in drained.chunks(MUX_MAX_PAYLOAD) {
-                                    let msg = MuxMessage::data(*sid, chunk.to_vec());
-                                    let buf = msg.serialize();
-                                    let _ = platform.write_host_fd(mux_fd, &buf);
-                                }
-                                #[cfg(feature = "trace_syscalls")]
-                                litebox::log_println!(
-                                    platform,
-                                    "[PARENT-MUX] sent {} orphan drained bytes for stream={}",
-                                    drained.len(),
-                                    sid,
-                                );
-                            }
-                            let msg = MuxMessage::reset(*sid);
-                            let buf = msg.serialize();
-                            let _ = platform.write_host_fd(mux_fd, &buf);
-                            #[cfg(feature = "trace_syscalls")]
-                            litebox::log_println!(
-                                platform,
-                                "[PARENT-MUX] sent orphan RESET for stream={}",
-                                sid,
-                            );
-                        }
-                        // Clear orphan_streams so the dispatcher doesn't
-                        // re-send them.
-                        orphan_streams.clear();
-                    }
-
-                    self.global.platform.spawn_background_task(move || {
-                        use crate::multiplexer::{
-                            HEADER_SIZE, MSG_FLAG_EOF, MSG_FLAG_RESET, MSG_TYPE_DATA, MuxMessage,
+                                .unwrap_or_else(litebox::fs::OFlags::empty)
+                                & litebox::fs::OFlags::STATUS_FLAGS_MASK
                         };
-                        const MUX_MAX_PAYLOAD: usize = 61440;
 
-                        // Keepalive references prevent SharedEntry drops
-                        // while the dispatcher runs.  They must be
-                        // explicitly closed on exit to free DT entries
-                        // and unblock peer-shutdown detection.
-                        //
-                        // Use a Drop guard so cleanup runs even on panic.
-                        // Type-erased to avoid generic struct inside fn.
-                        struct KeepaliveGuard(Option<Box<dyn FnOnce()>>);
-                        impl Drop for KeepaliveGuard {
-                            fn drop(&mut self) {
-                                if let Some(f) = self.0.take() {
-                                    f();
-                                }
-                            }
-                        }
-                        let kp = keepalive_pipes;
-                        let ks = keepalive_sockets;
-                        let pipes_for_guard = pipes.clone();
-                        let _keepalive_guard = KeepaliveGuard(Some(Box::new(move || {
-                            for fd in &kp {
-                                let _ = pipes_for_guard.close(fd);
-                            }
-                            for fd in &ks {
-                                pipes_for_guard.remove_fd(fd);
-                            }
-                        })));
-
-                        // The dispatcher body runs inline. The
-                        // _keepalive_guard Drop ensures cleanup on
-                        // all exit paths including panics.
-
-                        #[cfg(feature = "trace_syscalls")]
-                        litebox::log_println!(
-                            platform,
-                            "[PARENT-MUX] dispatcher started, {} endpoints, {} orphans ({} drained bytes), mux_fd={}",
-                            dispatch_endpoints.len(),
-                            orphan_streams.len(),
-                            orphan_streams.iter().map(|(_, d)| d.len()).sum::<usize>(),
-                            mux_fd,
+                        let sp_fd =
+                            super::broker_socketpair::BrokerSocketPairFd::<crate::Platform>::new(
+                                alloc::sync::Arc::clone(&provider),
+                                install.handle_id,
+                                install.endpoint,
+                                flags,
+                            );
+                        let typed = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .insert::<super::broker_socketpair::BrokerSocketPairSubsystem>(
+                            sp_fd,
                         );
 
-                        let wait_state = litebox::event::wait::WaitState::new(platform);
-                        let cx = wait_state.context();
-
-                        // Send initial drained data BEFORE setting non-blocking,
-                        // so writes block until the kernel buffer accepts them.
-                        // This data was consumed from the virtual pipe/socket
-                        // and must not be lost.
-                        'drain: for (stream_id, _, _, drained) in &dispatch_endpoints {
-                            if !drained.is_empty() {
-                                #[cfg(feature = "trace_syscalls")]
-                                litebox::log_println!(
-                                    platform,
-                                    "[PARENT-MUX] sending initial drained data stream={} len={}",
-                                    stream_id,
-                                    drained.len(),
-                                );
-                                for chunk in drained.chunks(MUX_MAX_PAYLOAD) {
-                                    let msg = MuxMessage::data(*stream_id, chunk.to_vec());
-                                    let buf = msg.serialize();
-                                    match platform.write_host_fd(mux_fd, &buf) {
-                                        Ok(w) if w == buf.len() => {}
-                                        other => {
-                                            #[cfg(feature = "trace_syscalls")]
-                                            litebox::log_println!(
-                                                platform,
-                                                "[PARENT-MUX] initial drain send failed for stream={}: {:?} (expected {} bytes)",
-                                                stream_id,
-                                                other,
-                                                buf.len(),
-                                            );
-                                            let _ = &other;
-                                            break 'drain;
-                                        }
-                                    }
-                                }
-                            }
+                        let mut rds = files.raw_descriptor_store.write();
+                        if let Ok(old_sock) = rds
+                            .fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
+                                install.guest_fd,
+                            )
+                        {
+                            drop(rds);
+                            let _ = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .remove(&old_sock);
+                            rds = files.raw_descriptor_store.write();
+                        } else if let Ok(old_broker_sock) = rds.fd_consume_raw_integer::<
+                            super::broker_socketpair::BrokerSocketPairSubsystem,
+                        >(install.guest_fd) {
+                            drop(rds);
+                            let _ = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .remove(&old_broker_sock);
+                            rds = files.raw_descriptor_store.write();
                         }
-
-                        // Send drained data + RESET for orphan streams (no
-                        // parent counterpart).  For orphan read-end pipes, the
-                        // child-only pipe may have data buffered from before
-                        // migration (e.g. grandchild wrote, then closed).  Send
-                        // the drained bytes as DATA before RESET so the worker
-                        // delivers them to the guest before signaling EOF.
-                        for (sid, drained) in &orphan_streams {
-                            if !drained.is_empty() {
-                                for chunk in drained.chunks(MUX_MAX_PAYLOAD) {
-                                    let msg = MuxMessage::data(*sid, chunk.to_vec());
-                                    let buf = msg.serialize();
-                                    let _ = platform.write_host_fd(mux_fd, &buf);
-                                }
-                                #[cfg(feature = "trace_syscalls")]
-                                litebox::log_println!(
-                                    platform,
-                                    "[PARENT-MUX] sent {} drained bytes for orphan stream={}",
-                                    drained.len(),
-                                    sid,
-                                );
-                            }
-                            #[cfg(feature = "trace_syscalls")]
-                            litebox::log_println!(
-                                platform,
-                                "[PARENT-MUX] sending RESET for orphan stream={}",
-                                sid,
-                            );
-                            let msg = MuxMessage::reset(*sid);
-                            let buf = msg.serialize();
-                            let _ = platform.write_host_fd(mux_fd, &buf);
-                        }
-
-                        // Set socketpair to non-blocking for the poll loop.
-                        let _ = platform.set_host_fd_nonblock(mux_fd);
-
-                        // Dispatch pipe endpoints are already NON_BLOCKING
-                        // (created that way above, guest end cleared).
-
-                        let mut recv_buf = alloc::vec![0u8; MUX_MAX_PAYLOAD + HEADER_SIZE];
-                        let mut closed_endpoints: Vec<bool> =
-                            alloc::vec![false; dispatch_endpoints.len()];
-
-                        // Helper: send a control frame (EOF/RESET) reliably.
-                        // Retries on EAGAIN since the socketpair is non-blocking.
-                        let send_control =
-                            |platform: &crate::Platform, mux_fd: i32, msg: &MuxMessage| {
-                                let buf = msg.serialize();
-                                loop {
-                                    match platform.write_host_fd(mux_fd, &buf) {
-                                        Ok(_) => return true,
-                                        Err(litebox_common_linux::errno::Errno::EAGAIN) => {
-                                            platform.host_sleep_us(100);
-                                        }
-                                        Err(_) => return false,
-                                    }
-                                }
-                            };
-
-                        loop {
-                            let mut did_work = false;
-
-                            // 1. Read incoming messages from the worker.
-                            match platform.read_host_fd(mux_fd, &mut recv_buf) {
-                                Ok(0) => {
-                                    // Socketpair closed — worker exited.
-                                    #[cfg(feature = "trace_syscalls")]
-                                    litebox::log_println!(
-                                        platform,
-                                        "[PARENT-MUX] socketpair closed (worker gone), {} open endpoints",
-                                        closed_endpoints.iter().filter(|&&c| !c).count(),
-                                    );
-                                    for (_, _, relay_fd, _) in &dispatch_endpoints {
-                                        let _ = pipes.close(relay_fd);
-                                    }
-                                    platform.close_host_fd(mux_fd);
-                                    return;
-                                }
-                                Ok(n) => {
-                                    did_work = true;
-                                    if let Some(msg) = MuxMessage::deserialize(&recv_buf[..n])
-                                        && msg.msg_type == MSG_TYPE_DATA
-                                    {
-                                        #[cfg(feature = "trace_syscalls")]
-                                        litebox::log_println!(
-                                            platform,
-                                            "[PARENT-MUX] recv stream={} flags={:#x} len={}",
-                                            msg.stream_id,
-                                            msg.flags,
-                                            msg.data.len(),
-                                        );
-                                        if msg.flags & MSG_FLAG_EOF != 0
-                                            || msg.flags & MSG_FLAG_RESET != 0
-                                        {
-                                            // Fan out EOF/RESET to ALL endpoints
-                                            // matching this stream_id.
-                                            for (idx, (sid, _, relay_fd, _)) in
-                                                dispatch_endpoints.iter().enumerate()
-                                            {
-                                                if *sid == msg.stream_id && !closed_endpoints[idx] {
-                                                    let _ = pipes.close(relay_fd);
-                                                    closed_endpoints[idx] = true;
-                                                }
-                                            }
-                                        } else if !msg.data.is_empty() {
-                                            // Fan out data to ALL endpoints
-                                            // matching this stream_id.
-                                            for (idx, (sid, _dir_byte, relay_fd, _)) in
-                                                dispatch_endpoints.iter().enumerate()
-                                            {
-                                                if *sid == msg.stream_id && !closed_endpoints[idx] {
-                                                    #[cfg(feature = "trace_syscalls")]
-                                                    {
-                                                        let pipe_type = pipes.half_pipe_type(relay_fd);
-                                                        litebox::log_println!(
-                                                            platform,
-                                                            "[PARENT-MUX] writing {} bytes to stream={} dir={} relay pipe_type={:?}",
-                                                            msg.data.len(),
-                                                            sid,
-                                                            *_dir_byte as char,
-                                                            pipe_type,
-                                                        );
-                                                    }
-                                                    let mut offset = 0;
-                                                    while offset < msg.data.len() {
-                                                        match pipes.write(
-                                                            &cx,
-                                                            relay_fd,
-                                                            &msg.data[offset..],
-                                                        ) {
-                                                            Ok(w) => {
-                                                                #[cfg(feature = "trace_syscalls")]
-                                                                litebox::log_println!(
-                                                                    platform,
-                                                                    "[PARENT-MUX] pipes.write stream={} wrote {} bytes (offset {}/{})",
-                                                                    sid,
-                                                                    w,
-                                                                    offset + w,
-                                                                    msg.data.len(),
-                                                                );
-                                                                offset += w;
-                                                            }
-                                                            Err(_e) if matches!(_e, litebox::pipes::errors::WriteError::WouldBlock) => {
-                                                                // Pipe full — sleep briefly and retry.
-                                                                platform.host_sleep_us(100);
-                                                            }
-                                                            Err(_e) => {
-                                                                #[cfg(feature = "trace_syscalls")]
-                                                                litebox::log_println!(
-                                                                    platform,
-                                                                    "[PARENT-MUX] pipes.write stream={} FAILED: {:?}",
-                                                                    sid,
-                                                                    _e,
-                                                                );
-                                                                // Local reader gone — close
-                                                                // endpoint and notify peer.
-                                                                let _ = pipes.close(relay_fd);
-                                                                closed_endpoints[idx] = true;
-                                                                let rst = MuxMessage::reset(*sid);
-                                                                send_control(platform, mux_fd, &rst);
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(litebox_common_linux::errno::Errno::EAGAIN) => {}
-                                Err(_) => {
-                                    for (_, _, relay_fd, _) in &dispatch_endpoints {
-                                        let _ = pipes.close(relay_fd);
-                                    }
-                                    platform.close_host_fd(mux_fd);
-                                    return;
-                                }
-                            }
-
-                            // 2. Check ParentToWorker streams for data to send.
-                            for (idx, (stream_id, direction, relay_fd, _)) in
-                                dispatch_endpoints.iter().enumerate()
-                            {
-                                if *direction != b'w' || closed_endpoints[idx] {
-                                    continue;
-                                }
-                                match pipes.drain_available(relay_fd) {
-                                    Ok(data) if data.is_empty() => {
-                                        if pipes.is_read_eof(relay_fd) {
-                                            #[cfg(feature = "trace_syscalls")]
-                                            litebox::log_println!(
-                                                platform,
-                                                "[PARENT-MUX] stream={} is_read_eof=true, sending EOF",
-                                                stream_id,
-                                            );
-                                            let _ = pipes.close(relay_fd);
-                                            let msg = MuxMessage::eof(*stream_id);
-                                            send_control(platform, mux_fd, &msg);
-                                            closed_endpoints[idx] = true;
-                                        }
-                                    }
-                                    Ok(data) => {
-                                        did_work = true;
-                                        #[cfg(feature = "trace_syscalls")]
-                                        litebox::log_println!(
-                                            platform,
-                                            "[PARENT-MUX] send stream={} len={}",
-                                            stream_id,
-                                            data.len(),
-                                        );
-                                        for chunk in data.chunks(MUX_MAX_PAYLOAD) {
-                                            let msg = MuxMessage::data(*stream_id, chunk.to_vec());
-                                            let buf = msg.serialize();
-                                            loop {
-                                                match platform.write_host_fd(mux_fd, &buf) {
-                                                    Ok(w) if w == buf.len() => break,
-                                                    Err(
-                                                        litebox_common_linux::errno::Errno::EAGAIN,
-                                                    ) => {
-                                                        platform.host_sleep_us(100);
-                                                    }
-                                                    other => {
-                                                        #[cfg(feature = "trace_syscalls")]
-                                                        litebox::log_println!(
-                                                            platform,
-                                                            "[PARENT-MUX] mux write failed: {:?} (expected {} bytes)",
-                                                            other,
-                                                            buf.len(),
-                                                        );
-                                                        let _ = &other;
-                                                        for (_, _, rfd, _) in &dispatch_endpoints {
-                                                            let _ = pipes.close(rfd);
-                                                        }
-                                                        platform.close_host_fd(mux_fd);
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(_) => {
-                                        let _ = pipes.close(relay_fd);
-                                        let msg = MuxMessage::eof(*stream_id);
-                                        send_control(platform, mux_fd, &msg);
-                                        closed_endpoints[idx] = true;
-                                    }
-                                }
-                            }
-
-                            // Exit when all WorkerToParent (b'w') endpoints
-                            // on the worker side have been drained and EOF
-                            // received.  These are the Read (b'r') endpoints
-                            // on the parent side — the child's stdout/stderr.
-                            // Once all child output is received, the parent
-                            // no longer needs the relay.
-                            let all_read_done = dispatch_endpoints
-                                .iter()
-                                .enumerate()
-                                .all(|(idx, (_, dir, _, _))| *dir != b'r' || closed_endpoints[idx]);
-                            if all_read_done {
-                                platform.close_host_fd(mux_fd);
-                                return;
-                            }
-
-                            if !did_work {
-                                // Brief sleep to avoid busy-spinning.
-                                platform.host_sleep_us(100);
-                            }
-                        }
-                        // _keepalive_guard dropped here → cleanup runs.
-                    });
+                        let ok = rds.fd_into_specific_raw_integer(typed, install.guest_fd);
+                        debug_assert!(
+                            ok,
+                            "broker socketpair parent install: slot {} still occupied",
+                            install.guest_fd
+                        );
+                    }
                 }
             }
 
@@ -4441,11 +3404,37 @@ impl<FS: ShimFS> Task<FS> {
         > = Vec::new();
         // - host OS fd for external fds (-1 for new OS pipe bridges)
         let mut bridge_host_fd: Vec<i32> = Vec::new();
-        let mut mux_worker_fd_raw: i32 = -1;
-        // (stream_id, guest_fd, dir_byte, type_byte, initial_eof)
-        let mut mux_stream_specs: Vec<(u32, usize, u8, u8, bool)> = Vec::new();
-        // (write_fd, read_fd, drained_data, write_flags, read_flags)
-        let mut local_pipe_pairs: Vec<(usize, usize, Vec<u8>, u32, u32)> = Vec::new();
+        // Phase 3 D5: broker-fd-bridge specs for mux streams migrated
+        // out of the mux relay onto direct broker handles. Each entry
+        // is shipped to the worker as `--broker-fd-bridge <spec>` and
+        // consumed by `install_broker_fd_bridge_spec`
+        // (runner/lib.rs:428).
+        let mut broker_fd_bridge_specs: alloc::vec::Vec<alloc::string::String> =
+            alloc::vec::Vec::new();
+        // Phase 3 D5: transit refs for broker handles shipped via
+        // broker_fd_bridge_specs. Drained AFTER
+        // `spawn_worker_host_for_fork_restore` returns. The spawn
+        // function reads the worker ack synchronously, so by the time
+        // it returns the worker has already called
+        // `install_broker_fd_bridge_spec` which acquired its own ref
+        // via `dup_handle`. Releasing here drops the creation ref the
+        // parent held since `attach_host_fd` returned.
+        type BrokerReleaser = alloc::sync::Arc<
+            dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+        >;
+        type TransitRelease = (BrokerReleaser, u64);
+        let mut broker_fd_bridge_transit_release: alloc::vec::Vec<TransitRelease> =
+            alloc::vec::Vec::new();
+        let mut broker_socketpair_parent_installs: alloc::vec::Vec<
+            crate::BrokerSocketPairParentInstall,
+        > = alloc::vec::Vec::new();
+        let mut broker_socketpair_parent_release_on_failure: alloc::vec::Vec<TransitRelease> =
+            alloc::vec::Vec::new();
+        // (bridge_index, worker_handle_id, endpoint_char, child_nonblock) for
+        // migrated virtual-socket streams whose dup'd child aliases need their
+        // own --broker-fd-bridge specs.
+        let mut broker_socketpair_migrated_streams: alloc::vec::Vec<(usize, u64, char, bool)> =
+            alloc::vec::Vec::new();
         // Dup'd pipe aliases: (alias_fd, primary_bridge_index).
         // The worker dups the primary stream's pipe end to alias_fd.
         let mut mux_aliases: Vec<(usize, usize)> = Vec::new();
@@ -4459,8 +3448,6 @@ impl<FS: ShimFS> Task<FS> {
             let files = self.files.borrow();
             let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
 
-            // Gather child's pipe FDs with their directions and pair IDs.
-            let mut child_pipes: Vec<(usize, ExternalFdDirection, usize)> = Vec::new();
             // Gather child's external fd TypedFds (from prior delayed-fork bridges).
             let mut child_external_fd_fds: Vec<(
                 usize,
@@ -4485,21 +3472,6 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::BrokerInetListener(_)
                         | crate::RawFdRef::BrokerInetDgram(_)
                         | crate::RawFdRef::BrokerInetRaw(_) => {}
-                        crate::RawFdRef::Pipes(typed) => {
-                            let direction = match self.global.pipes.half_pipe_type(typed) {
-                                Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
-                                    ExternalFdDirection::Read
-                                }
-                                Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
-                                    ExternalFdDirection::Write
-                                }
-                                Err(_) => return,
-                            };
-                            let Ok(pair_id) = self.global.pipes.pipe_pair_id(typed) else {
-                                return;
-                            };
-                            child_pipes.push((raw_fd, direction, pair_id));
-                        }
                         crate::RawFdRef::ExternalFd(typed) => {
                             // Already host-backed — collect for later extraction
                             // (need descriptor_table lock which we acquire after rds).
@@ -4515,157 +3487,6 @@ impl<FS: ShimFS> Task<FS> {
             // sibling's mux dispatcher or fd-replacement relay.  Bridging
             // them would create nested mux-over-mux, destroying the first
             // mux's data flow.
-            if !fc.parent_mux_pipe_pair_ids.is_empty() {
-                let _before = child_pipes.len();
-                child_pipes.retain(|&(_raw_fd, _, pair_id)| {
-                    let is_mux = fc.parent_mux_pipe_pair_ids.contains(&pair_id);
-                    #[cfg(feature = "trace_syscalls")]
-                    if is_mux {
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[DELAYED-FORK] pid={}: filtering inherited mux pipe fd={} pair_id={:#x}",
-                            self.pid,
-                            _raw_fd,
-                            pair_id,
-                        );
-                    }
-                    !is_mux
-                });
-                #[cfg(feature = "trace_syscalls")]
-                if child_pipes.len() < _before {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[DELAYED-FORK] pid={}: filtered {} mux-managed pipes from child_pipes ({} → {})",
-                        self.pid,
-                        _before - child_pipes.len(),
-                        _before,
-                        child_pipes.len(),
-                    );
-                }
-            }
-
-            #[cfg(feature = "trace_syscalls")]
-            litebox::log_println!(
-                self.global.platform,
-                "[DELAYED-FORK] pid={}: found {} child_pipes, {} external_fd_fds",
-                self.pid,
-                child_pipes.len(),
-                child_external_fd_fds.len(),
-            );
-
-            // Detect child-only pipe pairs: both ends (same pair_id,
-            // opposite directions) are in the child but NOT in
-            // parent_pipe_fds.  These were created by the child
-            // between fork and exec.  They don't need mux bridging —
-            // the worker creates a connected pipe pair instead.
-            //
-            // Collect ALL fds per pair (including dup'd aliases) so
-            // the worker can install pipe ends at every alias fd.
-            {
-                let mut seen_pair_ids: Vec<usize> = Vec::new();
-                for &(_, dir_a, pair_id) in &child_pipes {
-                    if seen_pair_ids.contains(&pair_id) {
-                        continue;
-                    }
-                    // Require both directions present in the child.
-                    let has_opposite = child_pipes
-                        .iter()
-                        .any(|&(_, dir_b, pid)| pid == pair_id && dir_b != dir_a);
-                    if !has_opposite {
-                        continue;
-                    }
-                    // Check the parent doesn't have this pair.
-                    let in_parent = fc.parent_pipe_fds.iter().any(|&(_, _, pid)| pid == pair_id);
-                    if in_parent {
-                        continue;
-                    }
-                    seen_pair_ids.push(pair_id);
-                    // Collect ALL write and read fds for this pair.
-                    let write_fds: Vec<usize> = child_pipes
-                        .iter()
-                        .filter(|&&(_, dir, pid)| {
-                            pid == pair_id && dir == ExternalFdDirection::Write
-                        })
-                        .map(|&(fd, _, _)| fd)
-                        .collect();
-                    let read_fds: Vec<usize> = child_pipes
-                        .iter()
-                        .filter(|&&(_, dir, pid)| {
-                            pid == pair_id && dir == ExternalFdDirection::Read
-                        })
-                        .map(|&(fd, _, _)| fd)
-                        .collect();
-                    // Store primary pair + any aliases.
-                    if let (Some(&primary_w), Some(&primary_r)) =
-                        (write_fds.first(), read_fds.first())
-                    {
-                        // Drain any buffered data from the read end so
-                        // it can be pre-filled in the worker's pipe.
-                        // Capture per-end flags (e.g. O_NONBLOCK).
-                        let (drained, w_flags, r_flags) = {
-                            let files = self.files.borrow();
-                            let rds = files.raw_descriptor_store.read();
-                            let r_typed = rds
-                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                    primary_r,
-                                )
-                                .ok();
-                            let w_typed = rds
-                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                    primary_w,
-                                )
-                                .ok();
-                            drop(rds);
-                            let data = r_typed
-                                .as_ref()
-                                .and_then(|t| self.global.pipes.drain_available(t).ok())
-                                .unwrap_or_default();
-                            let rf = r_typed
-                                .as_ref()
-                                .and_then(|t| self.global.pipes.get_flags(t).ok())
-                                .unwrap_or(litebox::pipes::Flags::empty())
-                                .bits();
-                            let wf = w_typed
-                                .as_ref()
-                                .and_then(|t| self.global.pipes.get_flags(t).ok())
-                                .unwrap_or(litebox::pipes::Flags::empty())
-                                .bits();
-                            (data, wf, rf)
-                        };
-                        local_pipe_pairs.push((primary_w, primary_r, drained, w_flags, r_flags));
-                        // Extra write aliases.
-                        for &fd in &write_fds[1..] {
-                            local_pipe_pairs.push((fd, primary_r, Vec::new(), w_flags, r_flags));
-                        }
-                        // Extra read aliases.
-                        for &fd in &read_fds[1..] {
-                            local_pipe_pairs.push((primary_w, fd, Vec::new(), w_flags, r_flags));
-                        }
-                    }
-                }
-            }
-            if !local_pipe_pairs.is_empty() {
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: {} child-only pipe pair(s) → local in worker",
-                    self.pid,
-                    local_pipe_pairs.len(),
-                );
-                // Remove ALL fds sharing a child-only pair_id from
-                // child_pipes — not just the two representative fds.
-                // This handles dup'd aliases that share the same pair.
-                let local_pair_ids: Vec<usize> = child_pipes
-                    .iter()
-                    .filter(|&&(fd, _, _)| {
-                        local_pipe_pairs
-                            .iter()
-                            .any(|&(w, r, _, _, _)| fd == w || fd == r)
-                    })
-                    .map(|&(_, _, pair_id)| pair_id)
-                    .collect();
-                child_pipes.retain(|&(_, _, pair_id)| !local_pair_ids.contains(&pair_id));
-            }
 
             // Extract OS fd + direction from collected external-fd TypedFds.
             // Done after dropping rds to maintain dt→rds lock ordering.
@@ -4685,371 +3506,9 @@ impl<FS: ShimFS> Task<FS> {
 
             let mut parent_replacements: Vec<crate::FdReplacement> = Vec::new();
 
-            // Log parent_pipe_fds for debugging counterpart matching.
-            #[cfg(feature = "trace_syscalls")]
-            for &(fd, dir, pair_id) in &fc.parent_pipe_fds {
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: parent_pipe_fd: fd={} dir={:?} pair_id={:#x}",
-                    self.pid,
-                    fd,
-                    dir,
-                    pair_id,
-                );
-            }
-
-            #[cfg(feature = "trace_syscalls")]
-            litebox::log_println!(
-                self.global.platform,
-                "[DELAYED-FORK] pid={}: starting OS pipe creation for {} pipes",
-                self.pid,
-                child_pipes.len(),
-            );
-
-            // Track parent fds already claimed by a bridge so that a
-            // pair_id match on one stream doesn't collide with an
-            // fd-number fallback on another stream.
-            let mut claimed_parent_fds: Vec<usize> = Vec::new();
-
-            // Track (pair_id, direction) → bridge index for dedup.
             // If two child fds share the same pipe end (e.g. after
             // dup2), only the first gets a real OS pipe bridge; the
             // second reuses the same OS pipe fd via dup.
-            let mut pipe_dedup: Vec<(usize, super::external_fd::ExternalFdDirection, usize)> =
-                Vec::new(); // (pair_id, dir, bridge_index)
-
-            for &(child_fd, child_dir, child_pair_id) in &child_pipes {
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: child_pipe: fd={} dir={:?} pair_id={:#x}",
-                    self.pid,
-                    child_fd,
-                    child_dir,
-                    child_pair_id,
-                );
-                // Dedup: if another child fd with the same (pair_id,
-                // direction) was already bridged, DON'T create a
-                // separate bridge/stream.  Instead, record as an
-                // alias — the worker will dup the primary stream's
-                // pipe end to this fd.  This ensures aliases share
-                // one mux stream and one parent counterpart.
-                if let Some(&(_, _, existing_idx)) = pipe_dedup
-                    .iter()
-                    .find(|&&(pid, dir, _)| pid == child_pair_id && dir == child_dir)
-                {
-                    mux_aliases.push((child_fd, existing_idx));
-                    continue;
-                }
-
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: creating OS pipe for child_fd={} dir={:?}",
-                    self.pid,
-                    child_fd,
-                    child_dir,
-                );
-                // Create a real OS pipe pair.
-                let (os_read, os_write) = match self.global.platform.create_external_fd() {
-                    Ok(pair) => pair,
-                    Err(_e) => {
-                        #[cfg(feature = "trace_syscalls")]
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[DELAYED-FORK] pid={}: create_external_fd failed: {}",
-                            self.pid,
-                            _e,
-                        );
-                        // Close any already-created OS pipes.
-                        for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                            let is_host_owned =
-                                bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
-                            if !is_host_owned {
-                                self.global.platform.close_host_fd(os_fd);
-                            }
-                        }
-                        for pr in &parent_replacements {
-                            self.global.platform.close_host_fd(pr.host_fd);
-                        }
-                        put_fc_back(self, fc);
-                        return Err(Errno::ENOMEM);
-                    }
-                };
-
-                // Child direction determines which OS pipe end goes where.
-                let (child_os_fd, parent_os_fd) = match child_dir {
-                    ExternalFdDirection::Read => (os_read, os_write),
-                    ExternalFdDirection::Write => (os_write, os_read),
-                    ExternalFdDirection::ReadWrite => unreachable!("bidi sockets use passthrough"),
-                };
-
-                // For Read-direction children: drain any data already buffered
-                // in the virtual pipe into the OS pipe.
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: OS pipe created for fd={}, starting drain check",
-                    self.pid,
-                    child_fd,
-                );
-                // where a builtin (e.g. `echo`) wrote to the virtual pipe
-                // without triggering delayed fork, then the reader (e.g. `cat`)
-                // commits and needs that data in the OS pipe.
-                let mut this_drained: Vec<u8> = Vec::new();
-                if child_dir == ExternalFdDirection::Read {
-                    #[cfg(feature = "trace_syscalls")]
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[DELAYED-FORK] pid={}: drain: borrowing files for fd={}",
-                        self.pid,
-                        child_fd,
-                    );
-                    let files = self.files.borrow();
-                    let rds = files.raw_descriptor_store.read();
-                    #[cfg(feature = "trace_syscalls")]
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[DELAYED-FORK] pid={}: drain: got rds lock for fd={}",
-                        self.pid,
-                        child_fd,
-                    );
-                    if let Ok(typed) =
-                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(child_fd)
-                    {
-                        drop(rds);
-                        #[cfg(feature = "trace_syscalls")]
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[DELAYED-FORK] pid={}: drain: calling drain_available for fd={}",
-                            self.pid,
-                            child_fd,
-                        );
-                        if let Ok(data) = self.global.pipes.drain_available(&typed)
-                            && !data.is_empty()
-                        {
-                            this_drained.clone_from(&data);
-
-                            // Enlarge the OS pipe to hold all drained data so the
-                            // blocking write below cannot deadlock (no reader exists
-                            // yet — the child worker is spawned later).
-                            let capacity = i32::try_from(data.len())
-                                .unwrap_or(i32::MAX)
-                                .saturating_add(4096);
-                            self.global
-                                .platform
-                                .try_set_pipe_capacity(parent_os_fd, capacity);
-
-                            #[cfg(feature = "trace_syscalls")]
-                            litebox::log_println!(
-                                self.global.platform,
-                                "[DELAYED-FORK] pid={}: drained {} bytes from virtual pipe fd={} into OS pipe",
-                                self.pid,
-                                data.len(),
-                                child_fd,
-                            );
-                            let mut offset = 0;
-                            while offset < data.len() {
-                                match self
-                                    .global
-                                    .platform
-                                    .write_host_fd(parent_os_fd, &data[offset..])
-                                {
-                                    Ok(n) => offset += n,
-                                    Err(_) => break,
-                                }
-                            }
-                        }
-                    } else {
-                        drop(rds);
-                    }
-                    drop(files);
-                }
-
-                child_pipe_bridges.push((child_fd, child_os_fd, child_dir));
-                bridge_drained.push(this_drained);
-                bridge_host_fd.push(-1);
-
-                // Record for dedup so aliases reuse this bridge.
-                pipe_dedup.push((child_pair_id, child_dir, child_pipe_bridges.len() - 1));
-
-                // Find the parent's counterpart(s) for this pipe.
-                //
-                // Strategy (in priority order):
-                // 1. pair_id + opposite direction — the parent has the other
-                //    end of the SAME pipe pair.  Handles dup2'd pipes where
-                //    the child moved the pipe to a different fd number.
-                // 2. Same fd number — the parent has a pipe at the same fd
-                //    slot.  Handles inherited pipes (same or different pair)
-                //    and post-fork pipe() at previously-occupied slots.
-                // 3. Neither — orphan (broken pipe / child-only pipe).
-                //
-                // Both strategies skip parent fds already claimed by a
-                // previous bridge to prevent two streams from replacing
-                // the same parent fd.
-                let parent_counterparts: Vec<(usize, ExternalFdDirection)> = fc
-                    .parent_pipe_fds
-                    .iter()
-                    .filter(|&&(fd, dir, pair_id)| {
-                        pair_id == child_pair_id
-                            && dir != child_dir
-                            && !claimed_parent_fds.contains(&fd)
-                    })
-                    .map(|&(fd, dir, _)| (fd, dir))
-                    .collect();
-
-                // Fallback: match by fd number if pair_id matching found
-                // nothing.  The parent and child may have different pipes at
-                // the same fd slot (e.g. child did close+pipe after fork),
-                // but bridging to the parent's pipe preserves the slot
-                // semantics that the parent expects.
-                //
-                // The direction is always set to the OPPOSITE of the child's
-                // direction (representing the data flow from the parent's
-                // perspective: child-Write → parent-Read, child-Read →
-                // parent-Write).  For pair_id matches this is naturally
-                // correct; for fd-number fallback the parent's pipe half
-                // type may differ from the data flow direction.
-                let flow_dir = match child_dir {
-                    ExternalFdDirection::Read => ExternalFdDirection::Write,
-                    ExternalFdDirection::Write => ExternalFdDirection::Read,
-                    ExternalFdDirection::ReadWrite => unreachable!("bidi sockets use passthrough"),
-                };
-                // Strategy 1.5: pair_id + SAME direction.  Handles
-                // inherited/dup2'd pipe ends where the child got a copy of the
-                // parent's own end (same pair_id, same direction) and the
-                // sender/receiver lives in a different process.  The parent
-                // only holds one end of the pipe so this is never a first-fork
-                // scenario — we set matched_by_pair_id=false so is_first_fork
-                // uses the fd-number fallback which correctly returns false.
-                let parent_same_dir: Vec<(usize, ExternalFdDirection)> = fc
-                    .parent_pipe_fds
-                    .iter()
-                    .filter(|&&(fd, dir, pair_id)| {
-                        pair_id == child_pair_id
-                            && dir == child_dir
-                            && !claimed_parent_fds.contains(&fd)
-                    })
-                    .map(|&(fd, _, _)| (fd, flow_dir))
-                    .collect();
-
-                let (counterparts, matched_by_pair_id) = if !parent_counterparts.is_empty() {
-                    (parent_counterparts, true)
-                } else if !parent_same_dir.is_empty() {
-                    // Same-direction pair_id match — treat like fd-number
-                    // fallback for is_first_fork purposes (parent only has
-                    // one end, never first fork).
-                    (parent_same_dir, false)
-                } else if let Some(&(parent_fd, _, _)) = fc
-                    .parent_pipe_fds
-                    .iter()
-                    .find(|&&(fd, _, _)| fd == child_fd && !claimed_parent_fds.contains(&fd))
-                {
-                    (alloc::vec![(parent_fd, flow_dir)], false)
-                } else {
-                    (Vec::new(), false)
-                };
-
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: counterpart child_fd={} child_pair_id={:#x} child_dir={:?} → {} match(es), by_pair_id={}, counterparts={:?}",
-                    self.pid,
-                    child_fd,
-                    child_pair_id,
-                    child_dir,
-                    counterparts.len(),
-                    matched_by_pair_id,
-                    counterparts,
-                );
-
-                // Mark all matched parent fds as claimed.
-                for &(fd, _) in &counterparts {
-                    claimed_parent_fds.push(fd);
-                }
-
-                if counterparts.is_empty() {
-                    // No counterpart in parent — the parent may have already
-                    // closed this end (broken pipe). Close the unused OS end.
-                    self.global.platform.close_host_fd(parent_os_fd);
-                    bridge_parent_info.push(Vec::new());
-                } else {
-                    // First-fork check: the parent holds an fd on the same
-                    // pipe pair with the OPPOSITE direction from the
-                    // counterpart (i.e. both ends live in the parent's fd
-                    // table).  For pair_id matches this means the parent
-                    // also has child_dir; for fd-number fallback, use the
-                    // parent's ACTUAL direction at the matched fd (not the
-                    // synthetic flow_dir) to avoid self-matching.
-                    let is_first_fork = if matched_by_pair_id {
-                        fc.parent_pipe_fds
-                            .iter()
-                            .any(|&(_, dir, pair_id)| pair_id == child_pair_id && dir == child_dir)
-                    } else {
-                        let matched_fd = counterparts[0].0;
-                        // Look up the parent's actual direction and pair_id
-                        // at the matched fd.
-                        let matched_entry = fc
-                            .parent_pipe_fds
-                            .iter()
-                            .find(|&&(fd, _, _)| fd == matched_fd);
-                        matched_entry.is_some_and(|&(_, actual_dir, pid)| {
-                            // First fork requires a SECOND fd on the same
-                            // pair with the opposite direction.  Using
-                            // actual_dir (not flow_dir) prevents the matched
-                            // fd from satisfying its own predicate.
-                            fc.parent_pipe_fds.iter().any(|&(fd, dir, pair_id)| {
-                                pair_id == pid && dir != actual_dir && fd != matched_fd
-                            })
-                        })
-                    };
-
-                    #[cfg(feature = "trace_syscalls")]
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[DELAYED-FORK] pid={}: child_fd={} is_first_fork={} matched_by_pair_id={}",
-                        self.pid,
-                        child_fd,
-                        is_first_fork,
-                        matched_by_pair_id,
-                    );
-
-                    if is_first_fork {
-                        // First fork: parent has both ends.  The relay
-                        // replaces the parent's counterpart fd(s) with
-                        // new virtual pipe(s).
-                        let mut first = true;
-                        for &(parent_fd, parent_dir) in &counterparts {
-                            let host_fd = if first {
-                                first = false;
-                                parent_os_fd
-                            } else {
-                                match self.global.platform.dup_host_fd(parent_os_fd) {
-                                    Ok(fd) => fd,
-                                    Err(_) => continue,
-                                }
-                            };
-                            parent_replacements.push(crate::FdReplacement {
-                                guest_fd: parent_fd,
-                                host_fd,
-                                direction: parent_dir,
-                                subsystem: crate::ReplacedSubsystem::Pipe,
-                                direct: false,
-                            });
-                        }
-                    } else {
-                        // Nested fork: close the unused OS pipe end — the
-                        // mux relays directly to the parent's existing pipe.
-                        self.global.platform.close_host_fd(parent_os_fd);
-                    }
-                    bridge_parent_info.push(
-                        counterparts
-                            .iter()
-                            .map(|&(fd, dir)| (fd, dir, crate::ReplacedSubsystem::Pipe))
-                            .collect(),
-                    );
-                }
-            }
 
             // Host-backed pipes (from prior delayed-fork bridges) are already
             // backed by real OS fds.  With the mux, these go through the
@@ -5559,7 +4018,6 @@ impl<FS: ShimFS> Task<FS> {
             // layer by reopening the path in the child, so route child writes back
             // through the parent's original open file description.
             {
-                use super::external_fd::ExternalFdDirection;
                 use super::fork_snapshot::FdClass;
 
                 for entry in &fd_table.entries {
@@ -5578,37 +4036,97 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     }
 
-                    let (read_fd, write_fd) = match self.global.platform.create_external_fd() {
-                        Ok(pair) => pair,
-                        Err(_) => continue,
-                    };
-
-                    child_pipe_bridges.push((entry.fd, write_fd, ExternalFdDirection::Write));
-                    bridge_drained.push(Vec::new());
-                    bridge_host_fd.push(-1);
-                    bridge_parent_info.push(alloc::vec![(
-                        entry.fd,
-                        ExternalFdDirection::Read,
-                        crate::ReplacedSubsystem::Filesystem,
-                    )]);
-                    self.global.platform.close_host_fd(read_fd);
+                    // Phase 3 D5-fs: when a BrokerFsProvider is
+                    // registered, migrate the
+                    // child's inherited FS fd directly onto a broker
+                    // OFD registry handle. The worker then runs a
+                    // CloneOfd against this `open_file_id` and wraps
+                    // the resulting 9P fid in a guest descriptor, so
+                    // the child's reads/writes go straight to the
+                    // broker (and through to the same kernel OFD as
+                    // the parent), preserving POSIX inherited-fd
+                    // shared-position semantics. The parent's
+                    // original 9P fid is left in place; `RegisterOfd`
+                    // is idempotent and only mints a broker-side
+                    // `Arc<File>` clone — the parent keeps using its
+                    // fid normally.
+                    {
+                        let parent_info: Option<(u32, alloc::string::String)> = {
+                            let files = self.files.borrow();
+                            files
+                                .run_on_raw_fd(entry.fd, |raw_fd_ref| match raw_fd_ref {
+                                    crate::RawFdRef::Fs(fd) => files
+                                        .fs
+                                        .descriptor_backend_fid(fd)
+                                        .zip(files.fs.fd_path(fd)),
+                                    #[allow(
+                                        clippy::wildcard_enum_match_arm,
+                                        reason = "only Fs-backed entries have 9P fids; \
+                                                  all other RawFdRef kinds opt out of D5-fs"
+                                    )]
+                                    _ => None,
+                                })
+                                .ok()
+                                .flatten()
+                        };
+                        if let (Some((parent_fid, path)), Some(provider)) =
+                            (parent_info, super::broker_fs_provider())
+                        {
+                            match provider.register_ofd(parent_fid) {
+                                Ok(open_file_id) => {
+                                    let status_flags_bits = entry.status_flags;
+                                    let path_hex = brokerfile_bridge_encode_path(&path);
+                                    broker_fd_bridge_specs.push(alloc::format!(
+                                        "{}:fs_fid:{}:{}:{}",
+                                        entry.fd,
+                                        open_file_id,
+                                        status_flags_bits,
+                                        path_hex,
+                                    ));
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: fs fd={} parent_fid={} migrated to broker OFD id={}",
+                                        self.pid,
+                                        entry.fd,
+                                        parent_fid,
+                                        open_file_id,
+                                    );
+                                    continue;
+                                }
+                                Err(_e) => {
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: fs fd={} parent_fid={} register_ofd failed: {:?}",
+                                        self.pid,
+                                        entry.fd,
+                                        parent_fid,
+                                        _e,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
-            // --- Multiplexer setup ---
-            // Replace per-fd OS pipe bridges with a single multiplexed channel.
-            // The child worker gets virtual pipe endpoints via --mux-stream,
-            // and the parent's mux dispatcher relays data through the socketpair.
+            // --- D5 broker-bridge setup ---
+            // Migrate each child pipe bridge directly onto a broker handle
+            // (BrokerPipe / BrokerSocketPair / BrokerPty / HostFd-attached
+            // BrokerPipe). The resulting `--broker-fd-bridge` specs replace
+            // what was previously a mux-relay socketpair plus per-stream
+            // dispatcher endpoints.
             if child_pipe_bridges.is_empty() {
-                // No bridges at all — store parent replacements for the old
-                // relay path (exec-on-remote-host may still use fd_replacements).
+                // No bridges at all — store parent replacements for the
+                // remote-host exec path which still uses fd_replacements.
                 if !parent_replacements.is_empty() {
                     *fc.vfork_done.fd_replacements.lock() = parent_replacements;
                 }
             } else {
                 // Store any bidirectional (ReadWrite) replacements in
-                // fd_replacements — these bypass the mux and need direct
-                // external fd fd installation on the parent side.
+                // fd_replacements — these get direct external-fd installation
+                // on the parent side.
                 let bidi_repls: Vec<crate::FdReplacement> = parent_replacements
                     .iter()
                     .filter(|r| r.direction == ExternalFdDirection::ReadWrite)
@@ -5617,38 +4135,17 @@ impl<FS: ShimFS> Task<FS> {
                 if !bidi_repls.is_empty() {
                     *fc.vfork_done.fd_replacements.lock() = bidi_repls;
                 }
-                let (mux_parent_raw, mux_worker_raw) =
-                    match self.global.platform.create_host_socketpair() {
-                        Ok(pair) => pair,
-                        Err(_e) => {
-                            #[cfg(feature = "trace_syscalls")]
-                            litebox::log_println!(
-                                self.global.platform,
-                                "[DELAYED-FORK] pid={}: create_host_socketpair failed: {}",
-                                self.pid,
-                                _e,
-                            );
-                            for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                                // Close newly-created pipe fds, but NOT fds
-                                // that are owned by the external fd system (where
-                                // os_fd == bridge_host_fd[i]).
-                                let is_host_owned =
-                                    bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
-                                if !is_host_owned {
-                                    self.global.platform.close_host_fd(os_fd);
-                                }
-                            }
-                            for pr in &parent_replacements {
-                                self.global.platform.close_host_fd(pr.host_fd);
-                            }
-                            put_fc_back(self, fc);
-                            return Err(Errno::ENOMEM);
-                        }
-                    };
-                mux_worker_fd_raw = mux_worker_raw;
 
-                let mut mux_parent_streams: Vec<crate::MuxParentStream> = Vec::new();
-                let mut orphan_stream_ids: Vec<(u32, Vec<u8>)> = Vec::new();
+                let mut broker_migrated_streams: Vec<Option<(u64, BrokerReleaser, char)>> =
+                    (0..child_pipe_bridges.len()).map(|_| None).collect();
+                let mut d5_pty_bridge_handles: alloc::vec::Vec<(
+                    usize,
+                    u64,
+                    u32,
+                    alloc::sync::Arc<
+                        dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                    >,
+                )> = alloc::vec::Vec::new();
 
                 for (i, &(guest_fd, child_os_fd, direction)) in
                     child_pipe_bridges.iter().enumerate()
@@ -5718,25 +4215,9 @@ impl<FS: ShimFS> Task<FS> {
                         bridge_parent_info.get(i).is_some_and(|parents| {
                             !parents.is_empty()
                                 && parents.iter().all(|&(parent_fd, parent_dir, _)| {
-                                    if parent_dir == ExternalFdDirection::Write {
-                                        // Parent is a writer — check if the
-                                        // source pipe already has EOF.
-                                        let files = self.files.borrow();
-                                        let rds = files.raw_descriptor_store.read();
-                                        if let Ok(typed) = rds.fd_from_raw_integer::<
-                                            litebox::pipes::Pipes<crate::Platform>,
-                                        >(
-                                            parent_fd
-                                        ) {
-                                            drop(rds);
-                                            self.global.pipes.is_read_eof(&typed)
-                                        } else {
-                                            drop(rds);
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
+                                    let _ = parent_fd;
+                                    let _ = parent_dir;
+                                    false
                                 })
                         })
                     } else {
@@ -5762,36 +4243,368 @@ impl<FS: ShimFS> Task<FS> {
                     }
 
                     let is_host_backed = bridge_host_fd.get(i).is_some_and(|&hf| hf >= 0);
+                    let is_virtual_pipe = !is_host_backed && type_byte == b'p';
+                    let is_pty_stream = type_byte == b't';
 
                     // Track whether this stream is handled as a local pipe
                     // (orphan with drained data). If so, skip adding to
                     // mux_stream_specs — the worker handles it via --local-pipe.
                     let mut handled_as_local_pipe = false;
+                    // Phase 3 D5: when set, the stream has been migrated
+                    // out of the mux relay onto a direct broker handle.
+                    // Migrated streams emit --broker-fd-bridge specs and
+                    // must not also be emitted as legacy --mux-stream specs.
+                    let mut handled_as_broker_bridge = false;
+
+                    if is_virtual_pipe {
+                        let drained = bridge_drained.get(i).cloned().unwrap_or_default();
+                        let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
+                        if let Some(provider) = super::broker_pipe::broker_pipe_provider() {
+                            use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
+                            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+
+                            let capacity =
+                                u64::try_from(drained.len().saturating_add(4096).max(1024 * 1024))
+                                    .unwrap_or(u64::MAX);
+                            if let Ok((read_handle, write_handle)) =
+                                provider.create_pipe(capacity, 4096)
+                            {
+                                let (worker_handle, parent_handle, worker_end, parent_end) =
+                                    match direction {
+                                        ExternalFdDirection::Read => (
+                                            read_handle,
+                                            write_handle,
+                                            BrokerPipeEnd::Read,
+                                            BrokerPipeEnd::Write,
+                                        ),
+                                        ExternalFdDirection::Write => (
+                                            write_handle,
+                                            read_handle,
+                                            BrokerPipeEnd::Write,
+                                            BrokerPipeEnd::Read,
+                                        ),
+                                        ExternalFdDirection::ReadWrite => {
+                                            unreachable!("bidi sockets use passthrough")
+                                        }
+                                    };
+                                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                                    alloc::sync::Arc::clone(&provider) as _;
+
+                                let mut wrote_prefill = true;
+                                let mut prefill_offset = 0;
+                                while prefill_offset < drained.len() {
+                                    match provider
+                                        .write_pipe(write_handle, &drained[prefill_offset..])
+                                    {
+                                        Ok(0) => {
+                                            wrote_prefill = false;
+                                            break;
+                                        }
+                                        Ok(n) => prefill_offset += n,
+                                        Err(_) => {
+                                            wrote_prefill = false;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                let installs_parent = !initial_eof && !parents.is_empty();
+                                let mut parent_dups_ok = true;
+                                let mut parent_dups_made = 0usize;
+                                if installs_parent {
+                                    for _ in 1..parents.len() {
+                                        if releaser.dup_handle(parent_handle).is_err() {
+                                            parent_dups_ok = false;
+                                            break;
+                                        }
+                                        parent_dups_made += 1;
+                                    }
+                                }
+
+                                if wrote_prefill && parent_dups_ok {
+                                    let worker_dir_char = match worker_end {
+                                        BrokerPipeEnd::Read => 'r',
+                                        BrokerPipeEnd::Write => 'w',
+                                    };
+                                    broker_fd_bridge_specs.push(alloc::format!(
+                                        "{guest_fd}:pipe:{worker_handle}:{worker_dir_char}"
+                                    ));
+                                    broker_fd_bridge_transit_release
+                                        .push((alloc::sync::Arc::clone(&releaser), worker_handle));
+
+                                    if installs_parent {
+                                        for &(parent_fd, _, _) in &parents {
+                                            let bp_fd = super::broker_pipe::BrokerPipeFd::<
+                                                crate::Platform,
+                                            >::new(
+                                                alloc::sync::Arc::clone(&provider),
+                                                parent_handle,
+                                                parent_end,
+                                                OFlags::empty(),
+                                                4, // creation_site: D5-vpipe parent install
+                                            );
+                                            let typed: litebox::fd::TypedFd<
+                                                super::broker_pipe::BrokerPipeSubsystem,
+                                            > = self
+                                                .global
+                                                .litebox
+                                                .descriptor_table_mut()
+                                                .insert(bp_fd);
+                                            let files = self.files.borrow();
+                                            let mut rds = files.raw_descriptor_store.write();
+                                            if let Ok(old_broker_pipe) = rds
+                                                .fd_consume_raw_integer::<
+                                                    super::broker_pipe::BrokerPipeSubsystem,
+                                                >(parent_fd)
+                                            {
+                                                drop(rds);
+                                                let _ = self
+                                                    .global
+                                                    .litebox
+                                                    .descriptor_table_mut()
+                                                    .remove(&old_broker_pipe);
+                                                rds = files.raw_descriptor_store.write();
+                                            }
+                                            let ok =
+                                                rds.fd_into_specific_raw_integer(typed, parent_fd);
+                                            debug_assert!(
+                                                ok,
+                                                "D5-vpipe parent install: slot {parent_fd} still occupied"
+                                            );
+                                        }
+                                    } else {
+                                        releaser.release(parent_handle);
+                                    }
+
+                                    if initial_eof {
+                                        // The worker receives the read end only after the
+                                        // drained prefill has been written and the write end
+                                        // has been released, so its first read observes
+                                        // buffered data followed by synchronous EOF.
+                                        debug_assert_eq!(worker_end, BrokerPipeEnd::Read);
+                                    }
+
+                                    handled_as_broker_bridge = true;
+                                    broker_migrated_streams[i] = Some((
+                                        worker_handle,
+                                        alloc::sync::Arc::clone(&releaser),
+                                        worker_dir_char,
+                                    ));
+                                    self.global.platform.close_host_fd(child_os_fd);
+
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: stream={} virtual pipe migrated to broker worker_handle={} worker_dir={} parent_handle={} parents={} drained={} initial_eof={}",
+                                        self.pid,
+                                        stream_id,
+                                        worker_handle,
+                                        worker_dir_char,
+                                        parent_handle,
+                                        parents.len(),
+                                        drained.len(),
+                                        initial_eof,
+                                    );
+                                } else {
+                                    for _ in 0..parent_dups_made {
+                                        releaser.release(parent_handle);
+                                    }
+                                    releaser.release(read_handle);
+                                    releaser.release(write_handle);
+                                }
+                            }
+                        }
+                    }
+
+                    if is_pty_stream && !is_host_backed {
+                        let pty_parent_fds: alloc::vec::Vec<usize> = bridge_parent_info
+                            .get(i)
+                            .map(|parents| {
+                                parents
+                                    .iter()
+                                    .filter_map(|&(parent_fd, _, subsystem)| {
+                                        if subsystem == crate::ReplacedSubsystem::Pty {
+                                            Some(parent_fd)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !pty_parent_fds.is_empty()
+                            && let Some(provider) = super::broker_pty::broker_pty_provider()
+                        {
+                            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                            match provider.create_pty() {
+                                Ok(pair) => {
+                                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                                        alloc::sync::Arc::clone(&provider) as _;
+                                    for (parent_idx, &parent_fd) in
+                                        pty_parent_fds.iter().enumerate()
+                                    {
+                                        let master_ref_acquired = if parent_idx == 0 {
+                                            true
+                                        } else {
+                                            match releaser.dup_handle(pair.master_handle) {
+                                                Ok(()) => true,
+                                                Err(_) => {
+                                                    releaser.release(pair.slave_handle);
+                                                    put_fc_back(self, fc);
+                                                    return Err(Errno::EIO);
+                                                }
+                                            }
+                                        };
+                                        let anchor_handle =
+                                            match releaser.dup_handle(pair.slave_handle) {
+                                                Ok(()) => Some(pair.slave_handle),
+                                                Err(_) => {
+                                                    if master_ref_acquired {
+                                                        releaser.release(pair.master_handle);
+                                                    }
+                                                    releaser.release(pair.slave_handle);
+                                                    put_fc_back(self, fc);
+                                                    return Err(Errno::EIO);
+                                                }
+                                            };
+                                        if self
+                                            .install_d5_mux_master_pty_fd(
+                                                parent_fd,
+                                                alloc::sync::Arc::clone(&provider),
+                                                pair.master_handle,
+                                                pair.pty_id,
+                                                anchor_handle,
+                                            )
+                                            .is_err()
+                                        {
+                                            if master_ref_acquired {
+                                                releaser.release(pair.master_handle);
+                                            }
+                                            if let Some(anchor) = anchor_handle {
+                                                releaser.release(anchor);
+                                            }
+                                            releaser.release(pair.slave_handle);
+                                            put_fc_back(self, fc);
+                                            return Err(Errno::EIO);
+                                        }
+                                    }
+                                    self.global.platform.close_host_fd(child_os_fd);
+                                    broker_fd_bridge_specs.push(alloc::format!(
+                                        "{guest_fd}:pty:{}:s:{}",
+                                        pair.slave_handle,
+                                        pair.pty_id
+                                    ));
+                                    broker_fd_bridge_transit_release.push((
+                                        alloc::sync::Arc::clone(&releaser),
+                                        pair.slave_handle,
+                                    ));
+                                    d5_pty_bridge_handles.push((
+                                        i,
+                                        pair.slave_handle,
+                                        pair.pty_id,
+                                        releaser,
+                                    ));
+                                    handled_as_broker_bridge = true;
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: stream={} PTY migrated to broker pty_id={} master_handle={} slave_handle={}",
+                                        self.pid,
+                                        stream_id,
+                                        pair.pty_id,
+                                        pair.master_handle,
+                                        pair.slave_handle,
+                                    );
+                                }
+                                Err(_) => {
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: stream={} create_pty failed; falling back to mux",
+                                        self.pid,
+                                        stream_id,
+                                    );
+                                }
+                            }
+                        }
+                    }
 
                     if is_host_backed {
-                        // Host-backed pipe: parent mux dispatcher relays to
-                        // the existing host OS fd.  The child worker gets a
-                        // virtual pipe via the mux stream instead.
-                        let parent_dir = match direction {
-                            ExternalFdDirection::Read => ExternalFdDirection::Write,
-                            ExternalFdDirection::Write => ExternalFdDirection::Read,
-                            ExternalFdDirection::ReadWrite => {
-                                unreachable!("bidi sockets use passthrough")
-                            }
+                        let host_fd = bridge_host_fd[i];
+                        // Try to migrate this host-backed stream onto a
+                        // direct broker handle, eliminating its need for
+                        // the mux relay. Falls back to the mux path on
+                        // any failure (provider unavailable, dup failed,
+                        // broker refused attach) so a missing broker
+                        // doesn't break the fork-restore build.
+                        let broker_dir = if dir_byte == b'r' {
+                            litebox_common_linux::cwfd::fd_token_protocol::host_fd_direction::READ
+                        } else {
+                            litebox_common_linux::cwfd::fd_token_protocol::host_fd_direction::WRITE
                         };
-                        mux_parent_streams.push(crate::MuxParentStream {
-                            stream_id,
-                            guest_fd,
-                            direction: parent_dir,
-                            subsystem: crate::ReplacedSubsystem::Pipe,
-                            drained_data: Vec::new(),
-                            external_fd_fd: bridge_host_fd[i],
-                            use_existing_pipe: false,
-                        });
-                    } else {
+                        if let Some(provider) = super::broker_pipe::broker_pipe_provider()
+                            && let Ok(dup_fd) = self.global.platform.dup_host_fd(host_fd)
+                        {
+                            match provider.attach_host_fd(dup_fd, broker_dir) {
+                                Ok(handle_id) => {
+                                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                                        alloc::sync::Arc::clone(&provider) as _;
+                                    let dir_char = if dir_byte == b'r' { 'r' } else { 'w' };
+                                    broker_fd_bridge_specs.push(alloc::format!(
+                                        "{guest_fd}:pipe:{handle_id}:{dir_char}"
+                                    ));
+                                    broker_fd_bridge_transit_release.push((releaser, handle_id));
+                                    handled_as_broker_bridge = true;
+                                    // Close the parent's reference to the host fd so the
+                                    // broker's SCM_RIGHTS-received dup is the sole holder
+                                    // of the OFD's reader/writer refcount. Without this
+                                    // close, dir='w' streams hang because the downstream
+                                    // reader never sees EOF when the worker exits — the
+                                    // parent's lingering fd keeps the writer-side OFD
+                                    // refcount above zero. Mirrors the legacy mux relay's
+                                    // close at the end of the relay loop
+                                    // (process.rs:3531-3543, 3562-3574). Skip stdio
+                                    // (fds 0/1/2) per the relay policy.
+                                    if host_fd > 2 {
+                                        self.global.platform.close_host_fd(host_fd);
+                                    }
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: stream={} host_fd={} (dup'd, original closed) migrated to broker handle {} (dir={})",
+                                        self.pid,
+                                        stream_id,
+                                        host_fd,
+                                        handle_id,
+                                        dir_char,
+                                    );
+                                }
+                                Err(_) => {
+                                    // attach_host_fd consumed the dup
+                                    // via SCM_RIGHTS on success; on the
+                                    // Err path the dup was also taken
+                                    // (the OwnedFd in
+                                    // RunnerBrokerPipeProvider::attach_host_fd
+                                    // is constructed from raw_fd and
+                                    // dropped on error too). Nothing to
+                                    // clean up here.
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: stream={} attach_host_fd failed; falling back to mux",
+                                        self.pid,
+                                        stream_id,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if !is_host_backed && !handled_as_broker_bridge {
                         // Virtual pipe/socket bridge: close the child-side OS
-                        // pipe fd (the mux creates a virtual pipe on the worker
-                        // side instead).
+                        // pipe fd. D5 migrations install broker-backed
+                        // replacements; nothing else is needed here.
                         self.global.platform.close_host_fd(child_os_fd);
 
                         let drained = bridge_drained.get(i).cloned().unwrap_or_default();
@@ -5799,97 +4612,120 @@ impl<FS: ShimFS> Task<FS> {
                         // Build a MuxParentStream for each parent counterpart.
                         let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
 
-                        // Check if the pipe's writer is already closed.
-                        // When a Read-direction child pipe has a closed writer
-                        // and there's drained data, no more data can arrive.
-                        // Treat this like an orphan — use a local pipe on the
-                        // worker.  This avoids setting up a mux relay that
-                        // would consume restored ring-buffer data from the
-                        // parent's pipe after vfork CoW pipe position restore.
-                        let writer_closed = if direction == ExternalFdDirection::Read {
-                            let files = self.files.borrow();
-                            let rds = files.raw_descriptor_store.read();
-                            if let Ok(typed) = rds
-                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                    guest_fd,
-                                )
-                            {
+                        if type_byte == b's' {
+                            let child_nonblock = {
+                                let files = self.files.borrow();
+                                let rds = files.raw_descriptor_store.read();
+                                let typed = rds
+                                    .fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
+                                        guest_fd,
+                                    )
+                                    .ok();
                                 drop(rds);
-                                self.global.pipes.is_writer_closed(&typed)
-                            } else {
-                                drop(rds);
-                                false
-                            }
-                        } else {
-                            false
-                        };
+                                typed
+                                    .and_then(|typed| {
+                                        let dt = self.global.litebox.descriptor_table();
+                                        let flags = dt.with_entry(
+                                            &typed,
+                                            |sock: &super::unix::UnixSocket<FS>| sock.get_status(),
+                                        );
+                                        drop(dt);
+                                        flags
+                                    })
+                                    .is_some_and(|flags| {
+                                        flags.contains(litebox::fs::OFlags::NONBLOCK)
+                                    })
+                            };
 
-                        if parents.is_empty()
-                            || (writer_closed && direction == ExternalFdDirection::Read)
-                        {
-                            #[cfg(feature = "trace_syscalls")]
-                            if writer_closed && !parents.is_empty() {
-                                litebox::log_println!(
-                                    self.global.platform,
-                                    "[DELAYED-FORK] pid={}: fd={} writer closed, treating as orphan (skipping mux relay)",
-                                    self.pid,
-                                    guest_fd,
-                                );
-                            }
+                            if let Some(provider) =
+                                super::broker_socketpair::broker_socketpair_provider()
                             {
-                                // No parent counterpart — the write end of this
-                                // pipe was closed before migration.  Use a local
-                                // pipe on the worker (like child-only pipes): the
-                                // worker creates a connected pair, pre-fills the
-                                // drained data, and closes the write end.  The
-                                // guest reads the data and then gets EOF.
-                                //
-                                // This avoids the mux path entirely for orphans,
-                                // sidestepping the pollee.wait hang that affects
-                                // mux relay writes on fork-restore workers.
-                                if direction == ExternalFdDirection::Read && !drained.is_empty() {
-                                    local_pipe_pairs.push((
-                                        usize::MAX, // write_fd sentinel: close immediately
-                                        guest_fd,   // read_fd: guest reads here
-                                        drained,
-                                        0, // write flags
-                                        0, // read flags
-                                    ));
-                                    handled_as_local_pipe = true;
-                                } else {
-                                    // No data or Write direction — send RESET via mux.
-                                    orphan_stream_ids.push((stream_id, drained));
+                                const SP_CAPACITY: u64 = 64 * 1024;
+                                const SP_ATOMIC: u64 = 4096;
+                                if let Ok((parent_handle, worker_handle)) =
+                                    provider.create_socketpair(SP_CAPACITY, SP_ATOMIC)
+                                {
+                                    let mut drained_ok = true;
+                                    if direction == ExternalFdDirection::Read && !drained.is_empty()
+                                    {
+                                        let mut off = 0;
+                                        while off < drained.len() {
+                                            match provider
+                                                .write_socketpair(parent_handle, &drained[off..])
+                                            {
+                                                Ok(0) | Err(_) => {
+                                                    drained_ok = false;
+                                                    break;
+                                                }
+                                                Ok(n) => off += n,
+                                            }
+                                        }
+                                    }
+
+                                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                                        alloc::sync::Arc::clone(&provider) as _;
+
+                                    if drained_ok {
+                                        let child_nonblock_flag =
+                                            if child_nonblock { 1 } else { 0 };
+                                        broker_fd_bridge_specs.push(alloc::format!(
+                                            "{guest_fd}:unix_socket:{worker_handle}:b:{child_nonblock_flag}"
+                                        ));
+                                        broker_fd_bridge_transit_release.push((
+                                            alloc::sync::Arc::clone(&releaser),
+                                            worker_handle,
+                                        ));
+                                        broker_socketpair_migrated_streams.push((
+                                            i,
+                                            worker_handle,
+                                            'b',
+                                            child_nonblock,
+                                        ));
+
+                                        if parents.is_empty() {
+                                            // No parent peer remains. Drop endpoint A so endpoint B
+                                            // observes peer shutdown after any prefilled bytes drain.
+                                            releaser.release(parent_handle);
+                                        } else {
+                                            for (parent_index, &(parent_fd, _, _)) in
+                                                parents.iter().enumerate()
+                                            {
+                                                broker_socketpair_parent_installs.push(
+                                                    crate::BrokerSocketPairParentInstall {
+                                                        guest_fd: parent_fd,
+                                                        handle_id: parent_handle,
+                                                        endpoint: litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::A,
+                                                        dup_before_install: parent_index > 0,
+                                                    },
+                                                );
+                                            }
+                                            broker_socketpair_parent_release_on_failure
+                                                .push((releaser, parent_handle));
+                                        }
+
+                                        handled_as_broker_bridge = true;
+                                        #[cfg(feature = "trace_syscalls")]
+                                        litebox::log_println!(
+                                            self.global.platform,
+                                            "[DELAYED-FORK] pid={}: stream={} unix socket migrated to broker handles parent={} worker={} child_nonblock={} parents={}",
+                                            self.pid,
+                                            stream_id,
+                                            parent_handle,
+                                            worker_handle,
+                                            child_nonblock,
+                                            parents.len(),
+                                        );
+                                    } else {
+                                        releaser.release(parent_handle);
+                                        releaser.release(worker_handle);
+                                    }
                                 }
                             }
-                        } else {
-                            for (j, &(parent_fd, parent_dir, subsystem)) in
-                                parents.iter().enumerate()
-                            {
-                                mux_parent_streams.push(crate::MuxParentStream {
-                                    stream_id,
-                                    guest_fd: parent_fd,
-                                    direction: parent_dir,
-                                    subsystem,
-                                    drained_data: if j == 0 { drained.clone() } else { Vec::new() },
-                                    external_fd_fd: -1,
-                                    use_existing_pipe: !parent_replacements
-                                        .iter()
-                                        .any(|pr| pr.guest_fd == parent_fd),
-                                });
-                            }
                         }
-                    }
 
-                    // Push to mux_stream_specs only if not handled as a
-                    // local pipe (orphan read-end with drained data).
-                    if !handled_as_local_pipe {
-                        mux_stream_specs.push((
-                            stream_id,
-                            guest_fd,
-                            dir_byte,
-                            type_byte,
-                            initial_eof,
-                        ));
+                        let _ = drained;
+                        let _ = parents;
                     }
                 }
 
@@ -5908,23 +4744,83 @@ impl<FS: ShimFS> Task<FS> {
                 // fd.  The parent `seen_streams` dedup installs a
                 // dup'd dispatch pipe for the alias.
                 for &(alias_fd, primary_idx) in &mux_aliases {
-                    let stream_id = u32::try_from(primary_idx).unwrap_or(0);
-                    let &(_, _, direction) = &child_pipe_bridges[primary_idx];
-                    let dir_byte = match direction {
-                        ExternalFdDirection::Read => b'r',
-                        ExternalFdDirection::Write => b'w',
-                        ExternalFdDirection::ReadWrite => b'b',
-                    };
-                    mux_stream_specs.push((stream_id, alias_fd, dir_byte, b'p', false));
+                    // D5-vpipe: alias references a primary that was
+                    // migrated to a BrokerPipe; dup the partner handle
+                    // and emit a broker_fd_bridge spec.
+                    if let Some((handle_id, releaser, dir_char)) =
+                        broker_migrated_streams[primary_idx].as_ref()
+                    {
+                        if releaser.dup_handle(*handle_id).is_ok() {
+                            broker_fd_bridge_specs
+                                .push(alloc::format!("{alias_fd}:pipe:{handle_id}:{dir_char}"));
+                            broker_fd_bridge_transit_release
+                                .push((alloc::sync::Arc::clone(releaser), *handle_id));
+                        }
+                        continue;
+                    }
+                    // D5-vsocket: alias references a primary that was
+                    // migrated to a BrokerSocketPair; emit a
+                    // broker_fd_bridge spec with NONBLOCK inherited
+                    // from either the alias fd or the primary.
+                    if let Some(&(_, handle_id, endpoint_char, primary_nonblock)) =
+                        broker_socketpair_migrated_streams
+                            .iter()
+                            .find(|&&(idx, _, _, _)| idx == primary_idx)
+                    {
+                        let alias_nonblock = {
+                            let files = self.files.borrow();
+                            let rds = files.raw_descriptor_store.read();
+                            let typed = rds
+                                .fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
+                                    alias_fd,
+                                )
+                                .ok();
+                            drop(rds);
+                            typed
+                                .and_then(|typed| {
+                                    let dt = self.global.litebox.descriptor_table();
+                                    let flags = dt.with_entry(
+                                        &typed,
+                                        |sock: &super::unix::UnixSocket<FS>| sock.get_status(),
+                                    );
+                                    drop(dt);
+                                    flags
+                                })
+                                .is_some_and(|flags| flags.contains(litebox::fs::OFlags::NONBLOCK))
+                        } || primary_nonblock;
+                        let alias_nonblock_flag = if alias_nonblock { 1 } else { 0 };
+                        broker_fd_bridge_specs.push(alloc::format!(
+                            "{alias_fd}:unix_socket:{handle_id}:{endpoint_char}:{alias_nonblock_flag}"
+                        ));
+                        continue;
+                    }
+                    // D5-vpty: alias references a primary that was
+                    // migrated to a BrokerPty; dup the slave handle
+                    // and emit a broker_fd_bridge spec.
+                    if let Some(&(_, slave_handle, pty_id, ref releaser)) = d5_pty_bridge_handles
+                        .iter()
+                        .find(|&&(idx, _, _, _)| idx == primary_idx)
+                    {
+                        if releaser.dup_handle(slave_handle).is_err() {
+                            put_fc_back(self, fc);
+                            return Err(Errno::EIO);
+                        }
+                        broker_fd_bridge_specs
+                            .push(alloc::format!("{alias_fd}:pty:{slave_handle}:s:{pty_id}"));
+                        broker_fd_bridge_transit_release
+                            .push((alloc::sync::Arc::clone(releaser), slave_handle));
+                        continue;
+                    }
+
+                    let _stream_id = u32::try_from(primary_idx).unwrap_or(0);
+                    let _ = alias_fd;
                 }
 
-                // Store mux info in VforkDone for the parent to consume.
-                fc.vfork_done
-                    .mux_parent_fd
-                    .store(mux_parent_raw, core::sync::atomic::Ordering::Release);
-                *fc.vfork_done.mux_parent_streams.lock() = mux_parent_streams;
-                *fc.vfork_done.mux_orphan_streams.lock() = orphan_stream_ids;
-                // Don't store fd_replacements — the mux replaces per-fd relay.
+                // D5-vsocket parent-side install metadata is stored
+                // regardless of whether other streams migrated; it's
+                // independent of the legacy mux relay.
+                *fc.vfork_done.broker_socketpair_parent_installs.lock() =
+                    broker_socketpair_parent_installs;
 
                 // Clear child_pipe_bridges — child OS fds for non-host-backed
                 // bridges were already closed above, and parent_replacements fds
@@ -5990,30 +4886,21 @@ impl<FS: ShimFS> Task<FS> {
                 for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
                     self.global.platform.close_host_fd(pr.host_fd);
                 }
-                // Clean up mux socketpair on failure.
-                let mux_pfd = fc
-                    .vfork_done
-                    .mux_parent_fd
-                    .swap(-1, core::sync::atomic::Ordering::Relaxed);
-                if mux_pfd >= 0 {
-                    self.global.platform.close_host_fd(mux_pfd);
+                for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
+                    releaser.release(handle_id);
                 }
-                if mux_worker_fd_raw >= 0 {
-                    self.global.platform.close_host_fd(mux_worker_fd_raw);
+                for (releaser, handle_id) in broker_socketpair_parent_release_on_failure.drain(..) {
+                    releaser.release(handle_id);
                 }
-                fc.vfork_done.mux_parent_streams.lock().clear();
+                fc.vfork_done
+                    .broker_socketpair_parent_installs
+                    .lock()
+                    .clear();
                 put_fc_back(self, fc);
                 todo!(
                     "ENOSYS audit: delayed fork worker stdio bindings; reachable but not implemented"
                 );
             }
-        };
-
-        // Mux fd for the worker (None if no mux was set up).
-        let mux_fd_opt = if mux_worker_fd_raw >= 0 {
-            Some(mux_worker_fd_raw)
-        } else {
-            None
         };
 
         // Spawn the child worker host.
@@ -6025,13 +4912,23 @@ impl<FS: ShimFS> Task<FS> {
         let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
             &snapshot_bytes,
             stdio,
-            mux_fd_opt,
-            &mux_stream_specs,
             &bidi_pt,
-            &local_pipe_pairs,
+            // Phase 3 D5: streams migrated directly to broker handles
+            // via `--broker-fd-bridge`. Includes host-backed,
+            // virtual-pipe / socket / PTY, and FS-backed.
+            &broker_fd_bridge_specs,
         ) {
             Ok(pid) => {
                 phase_tick!("post_spawn_worker_host");
+                // Phase 3 D5: spawn returned Ok only after the worker's
+                // ack arrived; the worker has finished
+                // `install_broker_fd_bridge_spec` for every spec we
+                // shipped, which means each spec's handle has been
+                // dup_handled into the worker's connection. Safe to
+                // drop the parent's creation ref now.
+                for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
+                    releaser.release(handle_id);
+                }
                 pid
             }
             Err(_err) => {
@@ -6042,21 +4939,26 @@ impl<FS: ShimFS> Task<FS> {
                     self.pid,
                     _err,
                 );
-                // Clean up mux socketpair on failure.
-                // The worker fd was already closed by the spawn function
-                // (it takes ownership).  Clean up the parent fd.
-                let mux_pfd = fc
-                    .vfork_done
-                    .mux_parent_fd
-                    .swap(-1, core::sync::atomic::Ordering::Relaxed);
-                if mux_pfd >= 0 {
-                    self.global.platform.close_host_fd(mux_pfd);
-                }
-                fc.vfork_done.mux_parent_streams.lock().clear();
                 // Clean up parent-side OS pipe FDs on failure.
                 for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
                     self.global.platform.close_host_fd(pr.host_fd);
                 }
+                // Phase 3 D5: release transit refs for broker handles
+                // shipped via broker_fd_bridge_specs. The worker never
+                // came up, so its install_broker_fd_bridge_spec never
+                // ran. Each handle still has the creation ref from
+                // attach_host_fd; releasing here drops it and frees
+                // the broker's dup'd host fd via HostFdState::drop.
+                for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
+                    releaser.release(handle_id);
+                }
+                for (releaser, handle_id) in broker_socketpair_parent_release_on_failure.drain(..) {
+                    releaser.release(handle_id);
+                }
+                fc.vfork_done
+                    .broker_socketpair_parent_installs
+                    .lock()
+                    .clear();
                 put_fc_back(self, fc);
                 return Err(Errno::ENOMEM);
             }
@@ -6348,8 +5250,6 @@ impl<FS: ShimFS> Task<FS> {
         let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
             &snapshot_bytes,
             stdio,
-            None,
-            &[],
             &[],
             &[],
         ) {
@@ -6745,9 +5645,6 @@ impl<FS: ShimFS> Task<FS> {
                         #[cfg(feature = "worker_local_inet")]
                         crate::RawFdRef::Net(fd) => {
                             (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
-                        }
-                        crate::RawFdRef::Pipes(fd) => {
-                            (FdClass::Pipe, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::Eventfd(fd) => {
                             (FdClass::EventFd, Some(fd.object_id()), None, None)
@@ -7751,6 +6648,97 @@ impl<FS: ShimFS> Task<FS> {
         {
             let mut inner = self.thread.process.inner.lock();
             inner.is_forking = false;
+        }
+    }
+
+    fn install_d5_mux_master_pty_fd(
+        &self,
+        guest_fd: usize,
+        provider: alloc::sync::Arc<
+            dyn litebox_common_linux::broker_pty_provider::BrokerPtyProvider,
+        >,
+        master_handle: u64,
+        pty_id: u32,
+        slave_anchor_handle: Option<u64>,
+    ) -> Result<(), Errno> {
+        let pty_fd = super::broker_pty::BrokerPtyFd::<crate::Platform>::new(
+            provider,
+            master_handle,
+            pty_id,
+            true,
+            slave_anchor_handle,
+            litebox::fs::OFlags::empty(),
+        );
+        pty_fd.ensure_subscribed_eager();
+        let typed: litebox::fd::TypedFd<super::broker_pty::BrokerPtySubsystem> =
+            self.global.litebox.descriptor_table_mut().insert(pty_fd);
+
+        let files = self.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+        if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+            drop(rds);
+            let _ = files.fs.close(&old_fs);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_unix) =
+            rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(guest_fd)
+        {
+            drop(rds);
+            let _ = self.global.litebox.descriptor_table_mut().remove(&old_unix);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_external) =
+            rds.fd_consume_raw_integer::<super::external_fd::ExternalFdSubsystem>(guest_fd)
+        {
+            drop(rds);
+            if let Some(entry) = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_external)
+            {
+                let host_fd = entry.take_fd();
+                if host_fd >= 0 {
+                    self.global.platform.close_host_fd(host_fd);
+                }
+            }
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_broker_pipe) =
+            rds.fd_consume_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(guest_fd)
+        {
+            drop(rds);
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_broker_pipe);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_broker_socketpair) =
+            rds.fd_consume_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(
+                guest_fd,
+            )
+        {
+            drop(rds);
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_broker_socketpair);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_broker_pty) =
+            rds.fd_consume_raw_integer::<super::broker_pty::BrokerPtySubsystem>(guest_fd)
+        {
+            drop(rds);
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_broker_pty);
+            rds = files.raw_descriptor_store.write();
+        }
+
+        if rds.fd_into_specific_raw_integer(typed, guest_fd) {
+            Ok(())
+        } else {
+            Err(Errno::ENOMEM)
         }
     }
 }
@@ -9081,7 +8069,7 @@ impl<FS: ShimFS> Task<FS> {
         // Helper: signal VforkDone (if present) so the parent is never left
         // blocked on error.
         let signal_on_error = |vfork_info: &Option<ExecVforkInfo>| {
-            if let Some((vd, _, _)) = vfork_info {
+            if let Some((vd, _)) = vfork_info {
                 vd.signal();
             }
         };
@@ -9097,46 +8085,10 @@ impl<FS: ShimFS> Task<FS> {
             signal_on_error(&vfork_info);
         })?;
         let placeholder_stdio_bridge_fds = worker_exec_stdio_bridge_fds(&worker_stdio);
-        let stdio_pipe_info: Vec<(i32, usize, super::external_fd::ExternalFdDirection)> = {
-            let files = self.files.borrow();
-            let rds = files.raw_descriptor_store.read();
-            let mut out = Vec::new();
-            for raw_fd in 0..=2_usize {
-                if let Ok(typed) =
-                    rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                {
-                    let direction = match self.global.pipes.half_pipe_type(&typed) {
-                        Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
-                            super::external_fd::ExternalFdDirection::Read
-                        }
-                        Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
-                            super::external_fd::ExternalFdDirection::Write
-                        }
-                        Err(_) => continue,
-                    };
-                    if let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) {
-                        out.push((raw_fd as i32, pair_id, direction));
-                    }
-                }
-            }
-            out
-        };
+        let stdio_pipe_info: Vec<(i32, usize, super::external_fd::ExternalFdDirection)> =
+            Vec::new();
 
-        let use_direct_stdio = if let Some((_, parent_pipe_fds, _)) = &vfork_info {
-            !stdio_pipe_info.is_empty()
-                && stdio_pipe_info
-                    .iter()
-                    .all(|(_, child_pair_id, child_direction)| {
-                        parent_pipe_fds
-                            .iter()
-                            .any(|&(_, parent_direction, parent_pair_id)| {
-                                parent_pair_id == *child_pair_id
-                                    && parent_direction != *child_direction
-                            })
-                    })
-        } else {
-            false
-        };
+        let use_direct_stdio = false;
 
         // Non-stdio broker-backed pipe/socketpair fds are transferred to the
         // remote worker via --broker-fd-bridge specs below. Legacy local
@@ -9826,31 +8778,11 @@ impl<FS: ShimFS> Task<FS> {
             );
         }
 
-        if let Some((vd, parent_pipe_fds, _parent_socket_fds)) = &vfork_info {
+        if let Some((vd, _parent_socket_fds)) = &vfork_info {
+            // direct_pipes is always empty since use_direct_stdio is
+            // always false (pipe subsystem removed).
             for direct in spawn_result.direct_pipes {
-                let mut stored = false;
-                if let Some((_, child_pair_id, child_direction)) = stdio_pipe_info
-                    .iter()
-                    .find(|(fd, _, _)| *fd == direct.child_stdio_fd)
-                {
-                    for &(parent_fd, parent_direction, parent_pair_id) in parent_pipe_fds {
-                        if parent_pair_id == *child_pair_id && parent_direction != *child_direction
-                        {
-                            vd.fd_replacements.lock().push(crate::FdReplacement {
-                                guest_fd: parent_fd,
-                                host_fd: direct.parent_os_fd,
-                                direction: parent_direction,
-                                subsystem: crate::ReplacedSubsystem::Pipe,
-                                direct: true,
-                            });
-                            stored = true;
-                            break;
-                        }
-                    }
-                }
-                if !stored {
-                    self.global.platform.close_host_fd(direct.parent_os_fd);
-                }
+                self.global.platform.close_host_fd(direct.parent_os_fd);
             }
 
             vd.signal();
@@ -9967,7 +8899,7 @@ impl<FS: ShimFS> Task<FS> {
         Ok(0)
     }
 
-    fn worker_exec_stdio_bindings(&self) -> Result<WorkerExecStdioBindings<FS, Platform>, Errno> {
+    fn worker_exec_stdio_bindings(&self) -> Result<WorkerExecStdioBindings<FS>, Errno> {
         let files = self.files.borrow();
         if worker_exec_has_unsupported_stdio(&self.global, &files) {
             return Err(Errno::ENOTSUP);
@@ -10209,8 +9141,7 @@ impl<FS: ShimFS> Task<FS> {
                 // Don't signal VforkDone here — exec_on_remote_host will signal
                 // it after spawning the worker and setting up pipe replacements
                 // so the parent can use direct ExternalFd I/O.
-                vfork_info_for_exec =
-                    Some((fc.vfork_done, fc.parent_pipe_fds, fc.parent_unix_socket_fds));
+                vfork_info_for_exec = Some((fc.vfork_done, fc.parent_unix_socket_fds));
                 detached_from_shared_fork = true;
             }
             let remote_interp_image = remote_interp_image
@@ -10745,40 +9676,6 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 log_worker_exec_stdio_unsupported(global, raw_fd, "network socket-backed stdio");
                 true
             },
-    crate::RawFdRef::Pipes(fd) => {
-                let nonblocking = global
-                    .pipes
-                    .get_flags(fd)
-                    .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
-                    .unwrap_or(true);
-                global.pipes.half_pipe_type(fd).map_or_else(
-                    |_| {
-                        log_worker_exec_stdio_unsupported(global, raw_fd, "closed pipe descriptor");
-                        true
-                    },
-                    |half| match (raw_fd, half) {
-                        (0, HalfPipeType::ReceiverHalf) => {
-                            if nonblocking {
-                                log_worker_exec_stdio_unsupported(
-                                    global,
-                                    raw_fd,
-                                    "nonblocking pipe-backed stdin",
-                                );
-                            }
-                            nonblocking
-                        }
-                        (1 | 2, HalfPipeType::SenderHalf) => false,
-                        _ => {
-                            log_worker_exec_stdio_unsupported(
-                                global,
-                                raw_fd,
-                                "wrong pipe direction",
-                            );
-                            true
-                        }
-                    },
-                )
-            },
     crate::RawFdRef::Eventfd(fd) => {
                 let nonblocking = global
                     .litebox
@@ -10927,9 +9824,7 @@ fn worker_exec_host_stdio_fd<FS: ShimFS>(
         .and_then(|idx| i32::try_from(idx).ok())
 }
 
-fn worker_exec_stdio_bridge_fds<FS: ShimFS>(
-    stdio: &WorkerExecStdioBindings<FS, Platform>,
-) -> Vec<usize> {
+fn worker_exec_stdio_bridge_fds<FS: ShimFS>(stdio: &WorkerExecStdioBindings<FS>) -> Vec<usize> {
     let mut fds = Vec::new();
     if matches!(&stdio.stdin, WorkerExecInputBinding::Fs { .. }) {
         fds.push(0);
@@ -10946,7 +9841,7 @@ fn worker_exec_input_binding<FS: ShimFS>(
     raw_fd: usize,
     global: &crate::GlobalState<FS>,
     files: &crate::syscalls::file::FilesState<FS>,
-) -> WorkerExecInputBinding<FS, Platform> {
+) -> WorkerExecInputBinding<FS> {
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return WorkerExecInputBinding::Close;
     }
@@ -10990,14 +9885,6 @@ fn worker_exec_input_binding<FS: ShimFS>(
             // Network sockets: not supported across worker exec.
             #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(_net) => WorkerExecInputBinding::Close,
-            crate::RawFdRef::Pipes(fd) => match global.pipes.half_pipe_type(fd) {
-                Ok(HalfPipeType::ReceiverHalf) => WorkerExecInputBinding::Pipe {
-                    pipes: global.pipes.clone(),
-                    fd: fd.clone(),
-                },
-                Ok(HalfPipeType::SenderHalf) | Err(_) => WorkerExecInputBinding::Close,
-            },
-
             // eventfd: not bridgeable as stdin.
             crate::RawFdRef::Eventfd(_eventfd) => WorkerExecInputBinding::Close,
 
@@ -11107,7 +9994,7 @@ fn worker_exec_output_binding<FS: ShimFS>(
     raw_fd: usize,
     global: &crate::GlobalState<FS>,
     files: &crate::syscalls::file::FilesState<FS>,
-) -> WorkerExecOutputBinding<FS, Platform> {
+) -> WorkerExecOutputBinding<FS> {
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return WorkerExecOutputBinding::Close;
     }
@@ -11151,14 +10038,6 @@ fn worker_exec_output_binding<FS: ShimFS>(
             // Network sockets: not supported as stdout/stderr across worker exec.
             #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(_net) => WorkerExecOutputBinding::Close,
-            crate::RawFdRef::Pipes(fd) => match global.pipes.half_pipe_type(fd) {
-                Ok(HalfPipeType::SenderHalf) => WorkerExecOutputBinding::Pipe {
-                    pipes: global.pipes.clone(),
-                    fd: fd.clone(),
-                },
-                Ok(HalfPipeType::ReceiverHalf) | Err(_) => WorkerExecOutputBinding::Close,
-            },
-
             // eventfd: not bridgeable as stdout/stderr.
             crate::RawFdRef::Eventfd(_eventfd) => WorkerExecOutputBinding::Close,
 
@@ -12796,117 +11675,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_exec_stdio_bindings_forward_pipe_backed_stdout() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (_read_fd, write_fd) = task
-            .sys_pipe2(OFlags::empty())
-            .expect("pipe2 should succeed");
-        let write_fd = i32::try_from(write_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(write_fd, Some(1), None)
-            .expect("dup2 onto stdout should succeed");
-
-        let bindings = task
-            .worker_exec_stdio_bindings()
-            .expect("stdio bindings should succeed");
-        // reason: unsupported variants intentionally share this fallback path.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match bindings.stdout {
-            WorkerExecOutputBinding::Pipe { .. } => {}
-            _ => panic!("stdout should be proxied through a worker pipe binding"),
-        }
-    }
-
-    #[test]
-    fn worker_exec_stdio_bindings_reject_read_end_on_stdout() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (read_fd, _write_fd) = task
-            .sys_pipe2(OFlags::empty())
-            .expect("pipe2 should succeed");
-        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(read_fd, Some(1), None)
-            .expect("dup2 onto stdout should succeed");
-
-        let Err(err) = task.worker_exec_stdio_bindings() else {
-            panic!("stdout wired to a pipe read end should be rejected")
-        };
-        assert_eq!(err, Errno::ENOTSUP);
-    }
-
-    #[test]
-    fn worker_exec_stdio_bindings_preserve_nonblocking_pipe_backed_stdout() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (_read_fd, write_fd) = task
-            .sys_pipe2(OFlags::NONBLOCK)
-            .expect("pipe2 should succeed");
-        let write_fd = i32::try_from(write_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(write_fd, Some(1), None)
-            .expect("dup2 onto stdout should succeed");
-
-        let bindings = task
-            .worker_exec_stdio_bindings()
-            .expect("nonblocking stdout pipe should be preserved for remote exec");
-        // reason: unsupported variants intentionally share this fallback path.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match bindings.stdout {
-            WorkerExecOutputBinding::Pipe { .. } => {}
-            _ => panic!("nonblocking stdout should still be proxied through a worker pipe binding"),
-        }
-    }
-
-    #[test]
-    fn worker_exec_stdio_bindings_forward_pipe_backed_stdin() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (read_fd, _write_fd) = task
-            .sys_pipe2(OFlags::empty())
-            .expect("pipe2 should succeed");
-        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(read_fd, Some(0), None)
-            .expect("dup2 onto stdin should succeed");
-
-        let bindings = task
-            .worker_exec_stdio_bindings()
-            .expect("stdio bindings should succeed");
-        // reason: unsupported variants intentionally share this fallback path.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        match bindings.stdin {
-            WorkerExecInputBinding::Pipe { .. } => {}
-            _ => panic!("stdin should be proxied through a worker pipe binding"),
-        }
-    }
-
-    #[test]
-    fn worker_exec_stdio_bindings_reject_nonblocking_pipe_backed_stdin() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (read_fd, _write_fd) = task
-            .sys_pipe2(OFlags::NONBLOCK)
-            .expect("pipe2 should succeed");
-        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(read_fd, Some(0), None)
-            .expect("dup2 onto stdin should succeed");
-
-        let Err(err) = task.worker_exec_stdio_bindings() else {
-            panic!("nonblocking pipe stdin should still be rejected")
-        };
-        assert_eq!(err, Errno::ENOTSUP);
-    }
-
-    #[test]
-    fn worker_exec_stdio_bindings_reject_write_end_on_stdin() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let (_read_fd, write_fd) = task
-            .sys_pipe2(OFlags::empty())
-            .expect("pipe2 should succeed");
-        let write_fd = i32::try_from(write_fd).expect("pipe fd should fit in i32");
-        task.sys_dup(write_fd, Some(0), None)
-            .expect("dup2 onto stdin should succeed");
-
-        let Err(err) = task.worker_exec_stdio_bindings() else {
-            panic!("stdin wired to a pipe write end should be rejected")
-        };
-        assert_eq!(err, Errno::ENOTSUP);
-    }
-
-    #[test]
     fn worker_exec_stdio_bindings_preserve_host_stdio_aliases() {
         let task = crate::syscalls::tests::init_platform(None);
         task.sys_dup(1, Some(2), None)
@@ -12942,9 +11710,6 @@ mod tests {
             WorkerExecOutputBinding::Close => panic!("stderr alias should not be closed"),
             WorkerExecOutputBinding::Fs { .. } => {
                 panic!("stderr alias should not be proxied through the guest FS")
-            }
-            WorkerExecOutputBinding::Pipe { .. } => {
-                panic!("stderr alias should not be proxied through a guest pipe")
             }
             WorkerExecOutputBinding::Stream(_) => {
                 panic!("stderr alias should not be proxied through a guest byte stream")

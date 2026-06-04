@@ -126,6 +126,26 @@ pub struct ConnState {
     /// cleanup, in addition to the SubscriptionList::notify reactive
     /// auto-removal on send failure). Belt and braces.
     tracked_subscriptions: Vec<(SubscriptionRegistry, u64, u64)>,
+    /// Legacy-pipes Phase 3 (D3): the per-connection 9P `Server` this
+    /// fd-token-socket connection is paired with. Set by the broker
+    /// listener at connection accept time when both channels (the 9P
+    /// connection and this fd-token-socket connection) belong to the
+    /// same shim.
+    ///
+    /// Used exclusively by the `RegisterOfd` and `CloneOfd` handlers
+    /// to look up / mutate the shim's own per-connection fid table.
+    /// Cross-connection access is **not** supported by design — the
+    /// broker-global OFD registry is the only piece of state shared
+    /// across connections (it lives in
+    /// [`crate::ofd_registry::OfdRegistry`] and is reached through
+    /// the `Server` instance held here).
+    ///
+    /// `None` for legacy bring-up paths that don't pair a 9P server
+    /// with the fd-token-socket (test fixtures, the IPC-only control
+    /// listener for cwfd-only flows). Handlers MUST treat `None` as
+    /// "this op is not available on this connection" and return
+    /// `SubsystemMismatch`.
+    nine_p_server: Option<Arc<crate::nine_p::server::Server>>,
 }
 
 impl ConnState {
@@ -142,6 +162,21 @@ impl ConnState {
 
     pub fn notification_sender(&self) -> Option<Arc<Mutex<NotificationSender>>> {
         self.notification_sender.as_ref().cloned()
+    }
+
+    /// Legacy-pipes Phase 3 (D3): pair this fd-token-socket
+    /// connection with its sibling 9P `Server` instance. The broker
+    /// listener calls this immediately after accepting the
+    /// connection if both channels are bound to the same shim.
+    pub fn set_nine_p_server(&mut self, server: Arc<crate::nine_p::server::Server>) {
+        self.nine_p_server = Some(server);
+    }
+
+    /// Returns this connection's paired 9P `Server`, if any. Used
+    /// by D3 handlers; returns `None` for fd-token-socket-only
+    /// connections.
+    pub fn nine_p_server(&self) -> Option<&Arc<crate::nine_p::server::Server>> {
+        self.nine_p_server.as_ref()
     }
 
     /// Record a Subscribe* success. Called from each subscribe
@@ -294,6 +329,10 @@ fn dispatch_request(
         Opcode::CreatePipe => handle_create_pipe(registry, request, in_fds),
         Opcode::ReadPipe => handle_read_pipe(registry, request, in_fds),
         Opcode::WritePipe => handle_write_pipe(registry, request, in_fds),
+        Opcode::AttachHostFd => handle_attach_host_fd(registry, request, in_fds),
+        Opcode::RegisterOfd => handle_register_ofd(conn, request),
+        Opcode::CloneOfd => handle_clone_ofd(conn, request),
+        Opcode::BindNinePSession => handle_bind_nine_p_session(conn, request),
         Opcode::CreateSocketPair => handle_create_socketpair(registry, request, in_fds),
         Opcode::ReadSocketPair => handle_read_socketpair(registry, request, in_fds),
         Opcode::WriteSocketPair => handle_write_socketpair(registry, request, in_fds),
@@ -860,13 +899,211 @@ fn handle_create_pipe(
     }
 }
 
+/// Phase 3 (legacy-pipes retirement): receive an SCM_RIGHTS-passed host
+/// fd, take ownership of it, and register it as a broker state object.
+/// Returns the new state handle id. Workers thereafter interact with
+/// the fd through `ReadPipe`/`WritePipe` RPCs (subject to the declared
+/// direction).
+fn handle_attach_host_fd(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    mut in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    use crate::cwfd::host_fd_state::{HostFdDirection, HostFdState};
+    use litebox_common_linux::fd_token_protocol::{
+        build_attach_host_fd_response_ok, parse_attach_host_fd_body,
+    };
+
+    // Must carry exactly one SCM_RIGHTS fd.
+    if in_fds.len() != 1 {
+        return protocol_err(Opcode::AttachHostFdResponse);
+    }
+    let dir_byte = match parse_attach_host_fd_body(request.body) {
+        Ok(b) => b,
+        Err(_) => return protocol_err(Opcode::AttachHostFdResponse),
+    };
+    let direction = match HostFdDirection::from_wire(dir_byte) {
+        Some(d) => d,
+        None => return protocol_err(Opcode::AttachHostFdResponse),
+    };
+    let fd = in_fds.remove(0);
+    let state = HostFdState::from_received(fd, direction);
+    let handle = registry.register(state);
+    HandlerResult {
+        frame: build_attach_host_fd_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+/// Legacy-pipes Phase 3 (D3): register an open 9P fid in the
+/// broker-global OFD registry on behalf of the **parent** shim.
+/// Handler is expected to run on the parent's fd-token-socket
+/// connection; the `ConnState` carries the parent's per-connection
+/// 9P `Server` instance, which owns the fid lookup.
+///
+/// Returns `SubsystemMismatch` if the connection isn't paired with
+/// a 9P server (e.g., a fd-token-socket-only control connection).
+/// Maps the inner `Server::register_fid_in_ofd_registry` errno to
+/// the corresponding wire `StatusCode`.
+fn handle_register_ofd(conn: &ConnState, request: &Frame<'_>) -> HandlerResult {
+    use litebox_common_linux::fd_token_protocol::{
+        build_register_ofd_response_ok, parse_register_ofd_body,
+    };
+
+    let fid = match parse_register_ofd_body(request.body) {
+        Ok(f) => f,
+        Err(_) => return protocol_err(Opcode::RegisterOfdResponse),
+    };
+    let server = match conn.nine_p_server() {
+        Some(s) => s,
+        None => {
+            return HandlerResult {
+                frame: build_error_response(
+                    Opcode::RegisterOfdResponse,
+                    StatusCode::SubsystemMismatch,
+                ),
+                out_fd: None,
+            };
+        }
+    };
+    match server.register_fid_in_ofd_registry(fid) {
+        Ok(id) => HandlerResult {
+            frame: build_register_ofd_response_ok(id.as_u64()),
+            out_fd: None,
+        },
+        Err(errno) => HandlerResult {
+            frame: build_error_response(Opcode::RegisterOfdResponse, errno_to_status(errno)),
+            out_fd: None,
+        },
+    }
+}
+
+/// Legacy-pipes Phase 3 (D3): clone a previously-registered OFD
+/// into a fresh 9P fid on the **worker's** own connection. Handler
+/// is expected to run on the worker's fd-token-socket; the
+/// `ConnState` carries the worker's per-connection 9P `Server`.
+fn handle_clone_ofd(conn: &ConnState, request: &Frame<'_>) -> HandlerResult {
+    use crate::ofd_registry::OpenFileId;
+    use litebox_common_linux::fd_token_protocol::{
+        build_clone_ofd_response_ok, parse_clone_ofd_body,
+    };
+
+    let (open_file_id, new_fid) = match parse_clone_ofd_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::CloneOfdResponse),
+    };
+    let server = match conn.nine_p_server() {
+        Some(s) => s,
+        None => {
+            return HandlerResult {
+                frame: build_error_response(
+                    Opcode::CloneOfdResponse,
+                    StatusCode::SubsystemMismatch,
+                ),
+                out_fd: None,
+            };
+        }
+    };
+    match server.clone_ofd_into_fid(OpenFileId::from_u64(open_file_id), new_fid) {
+        Ok(()) => HandlerResult {
+            frame: build_clone_ofd_response_ok(),
+            out_fd: None,
+        },
+        Err(errno) => HandlerResult {
+            frame: build_error_response(Opcode::CloneOfdResponse, errno_to_status(errno)),
+            out_fd: None,
+        },
+    }
+}
+
+/// Legacy-pipes Phase 3 (D3 step 2d.2): pair this fd-token-socket
+/// connection with a 9P session by its broker-assigned conn_id.
+/// The shim issues this op early on the fd-token-socket so the
+/// subsequent `RegisterOfd` / `CloneOfd` handlers can resolve fids
+/// against `ConnState::nine_p_server`.
+fn handle_bind_nine_p_session(conn: &mut ConnState, request: &Frame<'_>) -> HandlerResult {
+    use litebox_common_linux::fd_token_protocol::{
+        build_bind_nine_p_session_response_ok, parse_bind_nine_p_session_body,
+    };
+
+    let nine_p_conn_id = match parse_bind_nine_p_session_body(request.body) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::BindNinePSessionResponse),
+    };
+    let registry = match crate::nine_p_session_registry::global_registry() {
+        Some(r) => r,
+        None => {
+            // Broker isn't running with a session registry (e.g.
+            // unit-test contexts that bypass main). Treat as
+            // unknown so callers see a deterministic failure.
+            return HandlerResult {
+                frame: build_error_response(
+                    Opcode::BindNinePSessionResponse,
+                    StatusCode::UnknownNinePSession,
+                ),
+                out_fd: None,
+            };
+        }
+    };
+    match registry.get(nine_p_conn_id) {
+        Some(server) => {
+            conn.set_nine_p_server(server);
+            HandlerResult {
+                frame: build_bind_nine_p_session_response_ok(),
+                out_fd: None,
+            }
+        }
+        None => HandlerResult {
+            frame: build_error_response(
+                Opcode::BindNinePSessionResponse,
+                StatusCode::UnknownNinePSession,
+            ),
+            out_fd: None,
+        },
+    }
+}
+
+/// Map a libc errno (as `u32`) into the closest `StatusCode` wire
+/// value. Used by the D3 handlers which receive errnos directly
+/// from the 9P `Server` layer.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn errno_to_status(errno: u32) -> StatusCode {
+    let signed = errno as i32;
+    match signed {
+        libc::EBADF => StatusCode::UnknownHandle,
+        libc::EEXIST => StatusCode::DuplicateSubscription,
+        libc::ENOMEM => StatusCode::Internal,
+        libc::ENOTSUP | libc::EOPNOTSUPP => StatusCode::SubsystemMismatch,
+        libc::EIO => StatusCode::Io,
+        _ => StatusCode::Internal,
+    }
+}
+
+enum PipeReader {
+    Pipe(Arc<PipeReadEnd>),
+    HostFd(Arc<crate::cwfd::host_fd_state::HostFdState>),
+}
+
+/// Resolved target of a `WritePipe` RPC. See [`PipeReader`].
+enum PipeWriter {
+    Pipe(Arc<PipeWriteEnd>),
+    HostFd(Arc<crate::cwfd::host_fd_state::HostFdState>),
+}
+
 fn resolve_pipe_read(
     registry: &BrokerStateRegistry,
     handle_id: u64,
-) -> Result<Arc<PipeReadEnd>, StatusCode> {
-    match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Pipe) {
+) -> Result<PipeReader, StatusCode> {
+    match registry.resolve_untyped(StateHandle::from_id(handle_id)) {
         Ok(s) => match s.as_ref() {
-            StateObjectEnum::PipeReadEnd(read_end) => Ok(Arc::clone(read_end)),
+            StateObjectEnum::PipeReadEnd(read_end) => Ok(PipeReader::Pipe(Arc::clone(read_end))),
+            StateObjectEnum::HostFdAttached(state) => {
+                if state.direction().allows_read() {
+                    Ok(PipeReader::HostFd(Arc::clone(state)))
+                } else {
+                    Err(StatusCode::SubsystemMismatch)
+                }
+            }
             StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
@@ -889,10 +1126,17 @@ fn resolve_pipe_read(
 fn resolve_pipe_write(
     registry: &BrokerStateRegistry,
     handle_id: u64,
-) -> Result<Arc<PipeWriteEnd>, StatusCode> {
-    match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Pipe) {
+) -> Result<PipeWriter, StatusCode> {
+    match registry.resolve_untyped(StateHandle::from_id(handle_id)) {
         Ok(s) => match s.as_ref() {
-            StateObjectEnum::PipeWriteEnd(write_end) => Ok(Arc::clone(write_end)),
+            StateObjectEnum::PipeWriteEnd(write_end) => Ok(PipeWriter::Pipe(Arc::clone(write_end))),
+            StateObjectEnum::HostFdAttached(state) => {
+                if state.direction().allows_write() {
+                    Ok(PipeWriter::HostFd(Arc::clone(state)))
+                } else {
+                    Err(StatusCode::SubsystemMismatch)
+                }
+            }
             StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
@@ -927,17 +1171,43 @@ fn handle_read_pipe(
     let Ok(max_len) = usize::try_from(max_len) else {
         return protocol_err(Opcode::ReadPipeResponse);
     };
-    let state = match resolve_pipe_read(registry, handle_id) {
-        Ok(s) => s,
+    let target = match resolve_pipe_read(registry, handle_id) {
+        Ok(t) => t,
         Err(status) => return status_err(Opcode::ReadPipeResponse, status),
     };
-    match state.read(max_len) {
-        Ok(bytes) => HandlerResult {
-            frame: build_read_pipe_response_ok(&bytes),
-            out_fd: None,
+    match target {
+        PipeReader::Pipe(state) => match state.read(max_len) {
+            Ok(bytes) => HandlerResult {
+                frame: build_read_pipe_response_ok(&bytes),
+                out_fd: None,
+            },
+            Err(PipeError::WouldBlock) => {
+                status_err(Opcode::ReadPipeResponse, StatusCode::WouldBlock)
+            }
+            Err(_) => status_err(Opcode::ReadPipeResponse, StatusCode::InvalidValue),
         },
-        Err(PipeError::WouldBlock) => status_err(Opcode::ReadPipeResponse, StatusCode::WouldBlock),
-        Err(_) => status_err(Opcode::ReadPipeResponse, StatusCode::InvalidValue),
+        PipeReader::HostFd(state) => {
+            use crate::cwfd::host_fd_state::HostFdError;
+            match state.read(max_len) {
+                Ok(bytes) => HandlerResult {
+                    frame: build_read_pipe_response_ok(&bytes),
+                    out_fd: None,
+                },
+                Err(HostFdError::WouldBlock) => {
+                    status_err(Opcode::ReadPipeResponse, StatusCode::WouldBlock)
+                }
+                Err(HostFdError::DirectionMismatch) => {
+                    status_err(Opcode::ReadPipeResponse, StatusCode::SubsystemMismatch)
+                }
+                Err(HostFdError::PeerClosed) => HandlerResult {
+                    frame: build_read_pipe_response_ok(&[]),
+                    out_fd: None,
+                },
+                Err(HostFdError::Io(_)) => {
+                    status_err(Opcode::ReadPipeResponse, StatusCode::Internal)
+                }
+            }
+        }
     }
 }
 
@@ -953,41 +1223,68 @@ fn handle_write_pipe(
         Ok(t) => t,
         Err(_) => return protocol_err(Opcode::WritePipeResponse),
     };
-    let state = match resolve_pipe_write(registry, handle_id) {
-        Ok(s) => s,
+    let target = match resolve_pipe_write(registry, handle_id) {
+        Ok(t) => t,
         Err(status) => {
             return status_err(Opcode::WritePipeResponse, status);
         }
     };
-    // HypB diag: log producer's handle_id before write fires (matches PIPE WRITE inner_addr).
-    {
-        use std::io::Write;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/rst-diag.log")
-        {
-            let _ = writeln!(
-                f,
-                "[HypB-diag] ts={ts} WRITE-PIPE-RPC handle={handle_id} bytes={}",
-                bytes.len()
-            );
+    match target {
+        PipeWriter::Pipe(state) => {
+            // HypB diag: log producer's handle_id before write fires (matches PIPE WRITE inner_addr).
+            {
+                use std::io::Write;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/rst-diag.log")
+                {
+                    let _ = writeln!(
+                        f,
+                        "[HypB-diag] ts={ts} WRITE-PIPE-RPC handle={handle_id} bytes={}",
+                        bytes.len()
+                    );
+                }
+            }
+            match state.write(&bytes) {
+                Ok(n) => HandlerResult {
+                    frame: build_write_pipe_response_ok(n as u64),
+                    out_fd: None,
+                },
+                Err(PipeError::WouldBlock) => {
+                    status_err(Opcode::WritePipeResponse, StatusCode::WouldBlock)
+                }
+                Err(PipeError::PeerClosed) => {
+                    status_err(Opcode::WritePipeResponse, StatusCode::InvalidValue)
+                }
+                Err(_) => status_err(Opcode::WritePipeResponse, StatusCode::Internal),
+            }
         }
-    }
-    match state.write(&bytes) {
-        Ok(n) => HandlerResult {
-            frame: build_write_pipe_response_ok(n as u64),
-            out_fd: None,
-        },
-        Err(PipeError::WouldBlock) => status_err(Opcode::WritePipeResponse, StatusCode::WouldBlock),
-        Err(PipeError::PeerClosed) => {
-            status_err(Opcode::WritePipeResponse, StatusCode::InvalidValue)
+        PipeWriter::HostFd(state) => {
+            use crate::cwfd::host_fd_state::HostFdError;
+            match state.write(&bytes) {
+                Ok(n) => HandlerResult {
+                    frame: build_write_pipe_response_ok(n as u64),
+                    out_fd: None,
+                },
+                Err(HostFdError::WouldBlock) => {
+                    status_err(Opcode::WritePipeResponse, StatusCode::WouldBlock)
+                }
+                Err(HostFdError::DirectionMismatch) => {
+                    status_err(Opcode::WritePipeResponse, StatusCode::SubsystemMismatch)
+                }
+                Err(HostFdError::PeerClosed) => {
+                    status_err(Opcode::WritePipeResponse, StatusCode::InvalidValue)
+                }
+                Err(HostFdError::Io(_)) => {
+                    status_err(Opcode::WritePipeResponse, StatusCode::Internal)
+                }
+            }
         }
-        Err(_) => status_err(Opcode::WritePipeResponse, StatusCode::Internal),
     }
 }
 
@@ -1043,7 +1340,8 @@ fn resolve_socketpair_end(
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
             | StateObjectEnum::TcpConn(_)
-            | StateObjectEnum::Process(_) => Err(StatusCode::SubsystemMismatch),
+            | StateObjectEnum::Process(_)
+            | StateObjectEnum::HostFdAttached(_) => Err(StatusCode::SubsystemMismatch),
         },
         Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
         Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
@@ -1380,7 +1678,8 @@ fn resolve_tcp_conn(
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pty(_)
             | StateObjectEnum::Pidfd(_)
-            | StateObjectEnum::Process(_) => Err(StatusCode::SubsystemMismatch),
+            | StateObjectEnum::Process(_)
+            | StateObjectEnum::HostFdAttached(_) => Err(StatusCode::SubsystemMismatch),
         },
         Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
         Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
@@ -1729,7 +2028,8 @@ fn resolve_inet_dgram(
         | StateObjectEnum::Inotify(_)
         | StateObjectEnum::Pty(_)
         | StateObjectEnum::Pidfd(_)
-        | StateObjectEnum::Process(_) => {
+        | StateObjectEnum::Process(_)
+        | StateObjectEnum::HostFdAttached(_) => {
             unreachable!("registry returned wrong state variant for InetDgram tag")
         }
     }
@@ -2695,7 +2995,8 @@ fn resolve_pty(
             | StateObjectEnum::Signalfd(_)
             | StateObjectEnum::Inotify(_)
             | StateObjectEnum::Pidfd(_)
-            | StateObjectEnum::Process(_) => {
+            | StateObjectEnum::Process(_)
+            | StateObjectEnum::HostFdAttached(_) => {
                 Err(status_err(response, StatusCode::SubsystemMismatch))
             }
         },
@@ -3140,6 +3441,7 @@ mod tests {
         NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
     };
     use litebox_common_linux::notification_ring::NotificationReceiver;
+    use std::os::fd::FromRawFd;
 
     fn make_ring_for_conn(conn: &mut ConnState) -> NotificationReceiver {
         let (pair, tx_fd, rx_fd) = ShmemRingPair::create().unwrap();
@@ -3450,5 +3752,360 @@ mod tests {
         );
         assert_eq!(release.frame.status, StatusCode::Ok);
         assert_eq!(registry.live_handle_count(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 3 (legacy-pipes retirement): AttachHostFd integration
+    // tests. Drive the dispatch end-to-end (frame → handle_request →
+    // HostFdState → read_pipe/write_pipe routing).
+    // ---------------------------------------------------------------
+
+    fn run_with_fds(
+        registry: &BrokerStateRegistry,
+        conn: &mut ConnState,
+        request: &OwnedFrame,
+        in_fds: Vec<OwnedFd>,
+    ) -> HandlerResult {
+        let bytes = request.encode().unwrap();
+        let frame = decode(&bytes).unwrap();
+        let inotify_dispatcher = Arc::new(InotifyDispatcher::new());
+        handle_request(registry, &inotify_dispatcher, conn, &frame, in_fds)
+    }
+
+    fn make_host_pipe_pair() -> (OwnedFd, OwnedFd) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0i32; 2];
+        // SAFETY: fds is a 2-element c_int array; pipe2 fills both.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(rc, 0, "pipe2 failed");
+        // SAFETY: both fds are freshly created by pipe2.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn attach_host_fd_registers_handle() {
+        use litebox_common_linux::fd_token_protocol::{
+            build_attach_host_fd_request, host_fd_direction,
+        };
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let (r, _w) = make_host_pipe_pair();
+        let result = run_with_fds(
+            &registry,
+            &mut conn,
+            &build_attach_host_fd_request(host_fd_direction::READ),
+            vec![r],
+        );
+        assert_eq!(result.frame.opcode, Opcode::AttachHostFdResponse);
+        assert_eq!(result.frame.status, StatusCode::Ok);
+        assert_eq!(result.frame.body.len(), 8);
+        let handle_id = u64::from_le_bytes(result.frame.body[..8].try_into().unwrap());
+        assert!(handle_id > 0);
+        assert_eq!(registry.live_handle_count(), 1);
+    }
+
+    #[test]
+    fn attach_host_fd_missing_cmsg_is_protocol_error() {
+        use litebox_common_linux::fd_token_protocol::{
+            build_attach_host_fd_request, host_fd_direction,
+        };
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let result = run_with_fds(
+            &registry,
+            &mut conn,
+            &build_attach_host_fd_request(host_fd_direction::READ),
+            vec![],
+        );
+        assert_eq!(result.frame.opcode, Opcode::AttachHostFdResponse);
+        assert_eq!(result.frame.status, StatusCode::Protocol);
+        assert_eq!(registry.live_handle_count(), 0);
+    }
+
+    #[test]
+    fn attach_host_fd_invalid_direction_is_protocol_error() {
+        use litebox_common_linux::fd_token_protocol::build_attach_host_fd_request;
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let (r, _w) = make_host_pipe_pair();
+        let result = run_with_fds(
+            &registry,
+            &mut conn,
+            // 99 is not a valid direction code.
+            &build_attach_host_fd_request(99),
+            vec![r],
+        );
+        assert_eq!(result.frame.opcode, Opcode::AttachHostFdResponse);
+        assert_eq!(result.frame.status, StatusCode::Protocol);
+    }
+
+    #[test]
+    fn attach_host_fd_then_read_pipe_round_trip() {
+        use litebox_common_linux::fd_token_protocol::{
+            build_attach_host_fd_request, build_read_pipe_request, host_fd_direction,
+        };
+        use std::io::Write;
+        use std::os::fd::IntoRawFd;
+
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let (r, w) = make_host_pipe_pair();
+        // Attach the read end.
+        let attach = run_with_fds(
+            &registry,
+            &mut conn,
+            &build_attach_host_fd_request(host_fd_direction::READ),
+            vec![r],
+        );
+        assert_eq!(attach.frame.status, StatusCode::Ok);
+        let handle_id = u64::from_le_bytes(attach.frame.body[..8].try_into().unwrap());
+
+        // Push data into the pipe via the writer end (still owned by
+        // the test, simulating the worker that didn't transfer it).
+        // SAFETY: w is the unique OwnedFd; into_raw_fd transfers
+        // ownership without closing so File::from_raw_fd is sound.
+        let mut writer = unsafe { std::fs::File::from_raw_fd(w.into_raw_fd()) };
+        writer.write_all(b"hello").unwrap();
+        drop(writer); // close → EOF on the broker-held read end
+        // Tiny sleep to let the poll thread/kernel buffer settle.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // ReadPipe RPC against the host-fd handle.
+        let read = run(
+            &registry,
+            &mut conn,
+            &build_read_pipe_request(handle_id, 64),
+        );
+        assert_eq!(read.frame.opcode, Opcode::ReadPipeResponse);
+        assert_eq!(read.frame.status, StatusCode::Ok);
+        // body[..8] = length prefix, then payload
+        let len = u64::from_le_bytes(read.frame.body[..8].try_into().unwrap()) as usize;
+        assert_eq!(len, 5);
+        assert_eq!(&read.frame.body[8..8 + len], b"hello");
+    }
+
+    #[test]
+    fn attach_host_fd_then_write_pipe_round_trip() {
+        use litebox_common_linux::fd_token_protocol::{
+            build_attach_host_fd_request, build_write_pipe_request, host_fd_direction,
+        };
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let (r, w) = make_host_pipe_pair();
+        // Attach the write end.
+        let attach = run_with_fds(
+            &registry,
+            &mut conn,
+            &build_attach_host_fd_request(host_fd_direction::WRITE),
+            vec![w],
+        );
+        assert_eq!(attach.frame.status, StatusCode::Ok);
+        let handle_id = u64::from_le_bytes(attach.frame.body[..8].try_into().unwrap());
+
+        // WritePipe RPC against the host-fd handle.
+        let write = run(
+            &registry,
+            &mut conn,
+            &build_write_pipe_request(handle_id, b"pong"),
+        );
+        assert_eq!(write.frame.opcode, Opcode::WritePipeResponse);
+        assert_eq!(write.frame.status, StatusCode::Ok);
+
+        // The reader end is still in test-process hands; verify it
+        // sees the bytes.
+        // SAFETY: r is unique here.
+        let mut reader = unsafe { std::fs::File::from_raw_fd(r.into_raw_fd()) };
+        let mut buf = [0u8; 64];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"pong");
+    }
+
+    #[test]
+    fn attach_host_fd_read_only_rejects_write_pipe() {
+        use litebox_common_linux::fd_token_protocol::{
+            build_attach_host_fd_request, build_write_pipe_request, host_fd_direction,
+        };
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let (r, _w) = make_host_pipe_pair();
+        let attach = run_with_fds(
+            &registry,
+            &mut conn,
+            &build_attach_host_fd_request(host_fd_direction::READ),
+            vec![r],
+        );
+        let handle_id = u64::from_le_bytes(attach.frame.body[..8].try_into().unwrap());
+        let write = run(
+            &registry,
+            &mut conn,
+            &build_write_pipe_request(handle_id, b"x"),
+        );
+        assert_eq!(write.frame.opcode, Opcode::WritePipeResponse);
+        assert_eq!(write.frame.status, StatusCode::SubsystemMismatch);
+    }
+
+    #[test]
+    fn attach_host_fd_write_only_rejects_read_pipe() {
+        use litebox_common_linux::fd_token_protocol::{
+            build_attach_host_fd_request, build_read_pipe_request, host_fd_direction,
+        };
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let (_r, w) = make_host_pipe_pair();
+        let attach = run_with_fds(
+            &registry,
+            &mut conn,
+            &build_attach_host_fd_request(host_fd_direction::WRITE),
+            vec![w],
+        );
+        let handle_id = u64::from_le_bytes(attach.frame.body[..8].try_into().unwrap());
+        let read = run(
+            &registry,
+            &mut conn,
+            &build_read_pipe_request(handle_id, 64),
+        );
+        assert_eq!(read.frame.opcode, Opcode::ReadPipeResponse);
+        assert_eq!(read.frame.status, StatusCode::SubsystemMismatch);
+    }
+
+    #[test]
+    fn release_host_fd_handle_drops_from_registry() {
+        use litebox_common_linux::fd_token_protocol::{
+            build_attach_host_fd_request, host_fd_direction,
+        };
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let (r, _w) = make_host_pipe_pair();
+        let attach = run_with_fds(
+            &registry,
+            &mut conn,
+            &build_attach_host_fd_request(host_fd_direction::READ),
+            vec![r],
+        );
+        let handle_id = u64::from_le_bytes(attach.frame.body[..8].try_into().unwrap());
+        assert_eq!(registry.live_handle_count(), 1);
+        let release = run(
+            &registry,
+            &mut conn,
+            &litebox_common_linux::fd_token_protocol::build_release_request(handle_id),
+        );
+        assert_eq!(release.frame.status, StatusCode::Ok);
+        assert_eq!(registry.live_handle_count(), 0);
+    }
+
+    // ====================================================================
+    // Legacy-pipes Phase 3 (D3): RegisterOfd / CloneOfd handler tests.
+    //
+    // The end-to-end OFD-sharing behaviour is covered by the
+    // `ofd_registry` unit tests (the registry has its own
+    // shared-position round-trip with a real tempfile). These tests
+    // validate the wire dispatch + error-path mapping that this
+    // handler is responsible for:
+    //   - unpaired connection → SubsystemMismatch
+    //   - unknown fid / id    → UnknownHandle
+    // The happy-path round-trip (RegisterOfd → CloneOfd → worker
+    // writes through new fid → shared offset visible to parent)
+    // gets coverage at the harness level once the shim/runner
+    // client lands (D3 step 2d).
+    // ====================================================================
+
+    #[test]
+    fn register_ofd_without_nine_p_server_is_subsystem_mismatch() {
+        use litebox_common_linux::fd_token_protocol::build_register_ofd_request;
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let result = run(&registry, &mut conn, &build_register_ofd_request(7));
+        assert_eq!(result.frame.opcode, Opcode::RegisterOfdResponse);
+        assert_eq!(result.frame.status, StatusCode::SubsystemMismatch);
+    }
+
+    #[test]
+    fn clone_ofd_without_nine_p_server_is_subsystem_mismatch() {
+        use litebox_common_linux::fd_token_protocol::build_clone_ofd_request;
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let result = run(&registry, &mut conn, &build_clone_ofd_request(0xCAFE, 9));
+        assert_eq!(result.frame.opcode, Opcode::CloneOfdResponse);
+        assert_eq!(result.frame.status, StatusCode::SubsystemMismatch);
+    }
+
+    fn make_test_server() -> Arc<crate::nine_p::server::Server> {
+        use crate::nine_p::server::Server;
+        use crate::ofd_registry::OfdRegistry;
+        use crate::policy::AllowAllPolicy;
+        let inotify_dispatcher = Arc::new(InotifyDispatcher::new());
+        let mut server = Server::new(
+            std::env::temp_dir(),
+            Arc::new(AllowAllPolicy),
+            false,
+            inotify_dispatcher,
+        );
+        server.set_ofd_registry(Arc::new(OfdRegistry::new()));
+        Arc::new(server)
+    }
+
+    #[test]
+    fn register_ofd_unknown_fid_returns_unknown_handle() {
+        use litebox_common_linux::fd_token_protocol::build_register_ofd_request;
+        let server = make_test_server();
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        conn.set_nine_p_server(server);
+        let result = run(&registry, &mut conn, &build_register_ofd_request(42));
+        assert_eq!(result.frame.opcode, Opcode::RegisterOfdResponse);
+        assert_eq!(result.frame.status, StatusCode::UnknownHandle);
+    }
+
+    #[test]
+    fn clone_ofd_unknown_id_returns_unknown_handle() {
+        use litebox_common_linux::fd_token_protocol::build_clone_ofd_request;
+        let server = make_test_server();
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        conn.set_nine_p_server(server);
+        let result = run(
+            &registry,
+            &mut conn,
+            &build_clone_ofd_request(0xDEADBEEF, 5),
+        );
+        assert_eq!(result.frame.opcode, Opcode::CloneOfdResponse);
+        assert_eq!(result.frame.status, StatusCode::UnknownHandle);
+    }
+
+    /// Malformed `RegisterOfd` body (wrong length) returns a
+    /// protocol error frame.
+    #[test]
+    fn register_ofd_malformed_body_is_protocol_error() {
+        let request = OwnedFrame {
+            opcode: Opcode::RegisterOfd,
+            status: StatusCode::Ok,
+            caller_pid: 0,
+            body: vec![0u8; 4], // should be 8 bytes
+        };
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let result = run(&registry, &mut conn, &request);
+        assert_eq!(result.frame.opcode, Opcode::RegisterOfdResponse);
+        assert_eq!(result.frame.status, StatusCode::Protocol);
+    }
+
+    /// Malformed `CloneOfd` body (wrong length) returns a protocol
+    /// error frame.
+    #[test]
+    fn clone_ofd_malformed_body_is_protocol_error() {
+        let request = OwnedFrame {
+            opcode: Opcode::CloneOfd,
+            status: StatusCode::Ok,
+            caller_pid: 0,
+            body: vec![0u8; 12], // should be 16 bytes
+        };
+        let registry = BrokerStateRegistry::new();
+        let mut conn = ConnState::new();
+        let result = run(&registry, &mut conn, &request);
+        assert_eq!(result.frame.opcode, Opcode::CloneOfdResponse);
+        assert_eq!(result.frame.status, StatusCode::Protocol);
     }
 }

@@ -260,7 +260,11 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
 
     match endpoint {
         NinePBrokerEndpoint::IpcPath(path) => {
-            let (ring_writer, ring_reader) = connect_nine_p_channel(&path)?;
+            let (ring_writer, ring_reader, _nine_p_conn_id) = connect_nine_p_channel(&path)?;
+            // Note: BindNinePSession plumbing for the Windows runner is
+            // not yet wired (the windows runner doesn't currently use
+            // an fd-token-socket); the conn_id is read for protocol
+            // parity with the Linux runner.
             let shim = shim_builder.build();
             let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             let net_worker = start_network_worker(&shim, &shutdown);
@@ -384,6 +388,7 @@ fn connect_nine_p_channel(
 ) -> Result<(
     litebox_common_windows::shmem_ring::RingWriter,
     litebox_common_windows::shmem_ring::RingReader,
+    u64,
 )> {
     let mut attempts = 0;
     loop {
@@ -420,6 +425,7 @@ fn upgrade_ipc_stream_to_nine_p_ring(
 ) -> Result<(
     litebox_common_windows::shmem_ring::RingWriter,
     litebox_common_windows::shmem_ring::RingReader,
+    u64,
 )> {
     use std::io::{Read as _, Write as _};
 
@@ -439,7 +445,7 @@ fn upgrade_ipc_stream_to_nine_p_ring(
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .ok();
-    let mut ack = [0u8; 1];
+    let mut ack = [0u8; 9];
     stream
         .read_exact(&mut ack)
         .map_err(|e| anyhow!("Windows 9P ring handshake ACK failed: {e}"))?;
@@ -447,8 +453,12 @@ fn upgrade_ipc_stream_to_nine_p_ring(
     if ack[0] != b'K' {
         anyhow::bail!("Windows 9P ring handshake: broker did not ACK shared-memory metadata");
     }
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&ack[1..9]);
+    let nine_p_conn_id = u64::from_le_bytes(id_bytes);
 
-    Ok(pair.into_parts())
+    let (writer, reader) = pair.into_parts();
+    Ok((writer, reader, nine_p_conn_id))
 }
 
 /// Run the loaded program and exit with its return code.

@@ -546,7 +546,8 @@ fn update_tracker_from_response(
         | Opcode::InetListenerCreate
         | Opcode::InetTcpConnCreate
         | Opcode::InetDgramCreate
-        | Opcode::InetRawCreate => {
+        | Opcode::InetRawCreate
+        | Opcode::AttachHostFd => {
             if let Ok(id) = parse_handle_body(&response.body, response.opcode) {
                 tracker.record_state(caller_scope, id);
             }
@@ -1395,6 +1396,7 @@ fn handle_control_connection_inner(
                     | Opcode::CreatePipe
                     | Opcode::ReadPipe
                     | Opcode::WritePipe
+                    | Opcode::AttachHostFd
                     | Opcode::CreateSocketPair
                     | Opcode::ReadSocketPair
                     | Opcode::WriteSocketPair
@@ -1408,7 +1410,10 @@ fn handle_control_connection_inner(
                     | Opcode::WriteTcpConn
                     | Opcode::ShutdownTcpConn
                     | Opcode::PollTcpConnEvents
-                    | Opcode::DupHandle => {
+                    | Opcode::DupHandle
+                    | Opcode::BindNinePSession
+                    | Opcode::RegisterOfd
+                    | Opcode::CloneOfd => {
                         // State-object opcodes: route to state_service on the fd-state registry.
                         let state_result = state_handle_request(
                             state_registry,
@@ -2077,5 +2082,103 @@ mod tests {
         };
         assert_eq!(n, 1);
         assert_eq!(state_registry.live_handle_count(), 0);
+    }
+
+    // ---------- D2.3: client-side attach_host_fd integration tests --------
+
+    #[test]
+    fn attach_host_fd_round_trip_read() {
+        use litebox_common_linux::fd_token_protocol::host_fd_direction;
+
+        let (_dir, path, _fd_reg, state, _proc) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        // Pipe pair: hand the READ end to the broker via SCM_RIGHTS;
+        // worker writes into the WRITE end out-of-band and then
+        // `read_pipe`s through the broker.
+        let (r, w) = pipe_pair();
+        let handle = client
+            .attach_host_fd(r, host_fd_direction::READ)
+            .expect("attach READ");
+        assert!(handle > 0);
+        assert_eq!(state.live_handle_count(), 1);
+
+        let mut writer = std::fs::File::from(w);
+        writer.write_all(b"hello-attach").expect("host write");
+        drop(writer); // closes WRITE end → EOF on broker side eventually
+
+        // Drain by repeated read_pipe (returns up to max_len; EOF
+        // surfaces as Ok(empty Vec) per HostFdState semantics).
+        let mut got = Vec::new();
+        for _ in 0..50 {
+            match client.read_pipe(handle, 1024) {
+                Ok(chunk) if chunk.is_empty() => break,
+                Ok(chunk) => got.extend_from_slice(&chunk),
+                Err(ClientError::WouldBlock) => {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("unexpected error reading attached host fd: {e:?}"),
+            }
+        }
+        assert_eq!(&got, b"hello-attach");
+
+        client.release(handle).expect("release");
+        assert_eq!(state.live_handle_count(), 0);
+    }
+
+    #[test]
+    fn attach_host_fd_round_trip_write() {
+        use litebox_common_linux::fd_token_protocol::host_fd_direction;
+
+        let (_dir, path, _fd_reg, state, _proc) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        // Hand the WRITE end to the broker; out-of-band reader on R.
+        let (r, w) = pipe_pair();
+        let handle = client
+            .attach_host_fd(w, host_fd_direction::WRITE)
+            .expect("attach WRITE");
+        assert_eq!(state.live_handle_count(), 1);
+
+        let n = client.write_pipe(handle, b"abcde").expect("write_pipe");
+        assert_eq!(n, 5);
+
+        let mut reader = std::fs::File::from(r);
+        let mut buf = [0u8; 16];
+        let got = reader.read(&mut buf).expect("host read");
+        assert_eq!(&buf[..got], b"abcde");
+
+        client.release(handle).expect("release");
+        assert_eq!(state.live_handle_count(), 0);
+    }
+
+    #[test]
+    fn attach_host_fd_direction_enforcement() {
+        use litebox_common_linux::fd_token_protocol::host_fd_direction;
+
+        let (_dir, path, _fd_reg, _state, _proc) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        // READ-only attach rejects write_pipe.
+        let (r, _w) = pipe_pair();
+        let handle = client
+            .attach_host_fd(r, host_fd_direction::READ)
+            .expect("attach READ");
+        match client.write_pipe(handle, b"nope") {
+            Err(_) => {} // any error is acceptable; broker maps SubsystemMismatch
+            Ok(n) => panic!("write_pipe should fail on READ-only attached host fd, got n={n}"),
+        }
+        client.release(handle).expect("release");
+
+        // WRITE-only attach rejects read_pipe.
+        let (_r, w) = pipe_pair();
+        let handle = client
+            .attach_host_fd(w, host_fd_direction::WRITE)
+            .expect("attach WRITE");
+        match client.read_pipe(handle, 16) {
+            Err(_) => {}
+            Ok(b) => panic!("read_pipe should fail on WRITE-only attached host fd, got {b:?}"),
+        }
+        client.release(handle).expect("release");
     }
 }

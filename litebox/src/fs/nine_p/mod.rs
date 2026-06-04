@@ -1175,6 +1175,51 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         true
     }
 
+    fn allocate_fid_number(&self) -> Result<u32, super::errors::OpenError> {
+        self.client
+            .allocate_fid()
+            .map_err(super::errors::OpenError::from)
+    }
+
+    fn free_fid_number(&self, fid: u32) {
+        self.client.free_fid(fid);
+    }
+
+    fn clunk_fid_number(&self, fid: u32) {
+        self.client.clunk_async(fid);
+    }
+
+    fn wrap_existing_fid(
+        &self,
+        remote_fid: u32,
+        path: &str,
+        status_flags: super::OFlags,
+    ) -> Result<FileFd<Platform, W>, super::errors::OpenError> {
+        use fcall::GetattrMask;
+
+        let attr = self
+            .client
+            .getattr(remote_fid, GetattrMask::BASIC)
+            .map_err(super::errors::OpenError::from)?;
+
+        let descriptor = Descriptor {
+            fid: remote_fid,
+            offset: AtomicUsize::new(0),
+            qid: attr.qid,
+            path: alloc::string::String::from(path),
+            direct_write: status_flags.intersects(OFlags::SYNC | OFlags::DSYNC | OFlags::APPEND),
+        };
+
+        let fd = self.litebox.descriptor_table_mut().insert(descriptor);
+        Ok(fd)
+    }
+
+    fn descriptor_backend_fid(&self, fd: &FileFd<Platform, W>) -> Option<u32> {
+        self.litebox
+            .descriptor_table()
+            .with_entry(fd, |desc| desc.entry.fid)
+    }
+
     #[allow(clippy::similar_names)]
     fn open(
         &self,

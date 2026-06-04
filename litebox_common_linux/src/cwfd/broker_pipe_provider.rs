@@ -58,4 +58,25 @@ pub trait BrokerPipeProvider: BrokerSubscribable {
     /// than `bytes.len()` for non-atomic writes). `handle` MUST be a
     /// write-end handle.
     fn write_pipe(&self, handle: u64, bytes: &[u8]) -> Result<usize, BrokerOpError>;
+
+    /// Attaches a host fd to the broker, returning a handle that the
+    /// shim can treat as a `BrokerPipe` end (consumes `read_pipe` /
+    /// `write_pipe` calls according to `direction`). The broker takes
+    /// ownership of the fd (closes it when the handle's refcount
+    /// drops to zero).
+    ///
+    /// `raw_fd` is a Linux fd integer; the caller MUST NOT close it
+    /// after this returns `Ok(_)` (broker owns it). On `Err(_)` the
+    /// fd is still owned by the caller.
+    ///
+    /// `direction` is one of
+    /// `crate::cwfd::fd_token_protocol::host_fd_direction::{READ, WRITE, READ_WRITE}`.
+    ///
+    /// Default returns `BrokerOpError::ProtocolNotSupported` —
+    /// providers that don't talk to a broker (e.g. test mocks) can
+    /// leave it unimplemented. The production `RunnerBrokerPipeProvider`
+    /// overrides this.
+    fn attach_host_fd(&self, _raw_fd: i32, _direction: u8) -> Result<u64, BrokerOpError> {
+        Err(BrokerOpError::ProtocolNotSupported)
+    }
 }

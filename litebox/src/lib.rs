@@ -22,7 +22,6 @@ pub mod fs;
 pub mod mm;
 pub mod net;
 pub mod path;
-pub mod pipes;
 pub mod platform;
 pub mod process;
 pub mod shim;

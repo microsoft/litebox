@@ -144,6 +144,13 @@ pub enum SubsystemTag {
     InetDgram,
     /// Broker-hosted raw IPv4 socket. Wire value `13`. Phase D.
     InetRaw,
+    /// Broker-hosted attached host fd. Wire value `16`. Phase 3:
+    /// the worker (or parent) SCM_RIGHTS-passes a host fd into the
+    /// broker; the broker owns it thereafter and exposes a
+    /// pipe-shaped read/write surface for it. Used by the
+    /// legacy-pipes phase-3 migration to retire the mux relay's
+    /// `--pipe-bridge` (host-fd-passthrough) topology.
+    HostFd,
     /// Tag that this receiver doesn't recognise. Carries the raw u8
     /// value so the receiver can log diagnostics; callers should reject
     /// the specific fd while continuing to deliver the rest of the
@@ -170,6 +177,7 @@ impl SubsystemTag {
             SubsystemTag::InetRaw => 13,
             SubsystemTag::PipeRead => 14,
             SubsystemTag::PipeWrite => 15,
+            SubsystemTag::HostFd => 16,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -194,6 +202,7 @@ impl SubsystemTag {
             13 => SubsystemTag::InetRaw,
             14 => SubsystemTag::PipeRead,
             15 => SubsystemTag::PipeWrite,
+            16 => SubsystemTag::HostFd,
             other => SubsystemTag::Unknown(other),
         }
     }
@@ -871,7 +880,8 @@ mod tests {
                 | SubsystemTag::Pty
                 | SubsystemTag::InetListener
                 | SubsystemTag::InetDgram
-                | SubsystemTag::InetRaw => panic!("expected Unknown({raw:#x}), got {tag:?}"),
+                | SubsystemTag::InetRaw
+                | SubsystemTag::HostFd => panic!("expected Unknown({raw:#x}), got {tag:?}"),
             }
         }
     }
@@ -888,6 +898,7 @@ mod tests {
         assert_eq!(SubsystemTag::Pipe.as_u8(), 9);
         assert_eq!(SubsystemTag::PipeRead.as_u8(), 14);
         assert_eq!(SubsystemTag::PipeWrite.as_u8(), 15);
+        assert_eq!(SubsystemTag::HostFd.as_u8(), 16);
         for tag in [
             SubsystemTag::Eventfd,
             SubsystemTag::TcpSocket,

@@ -148,6 +148,35 @@ pub enum Opcode {
     CreatePipe = 0x50,
     ReadPipe = 0x51,
     WritePipe = 0x52,
+    /// Legacy-pipes Phase 3 (D2): SCM_RIGHTS-pass a host fd to the
+    /// broker, which takes ownership and exposes it as a
+    /// BrokerPipe-shaped state handle. Body: `(direction: u8,
+    /// _reserved: [u8; 7])` — 8 bytes. Direction values: 0=Read,
+    /// 1=Write, 2=ReadWrite. The host fd itself rides in the
+    /// SCM_RIGHTS cmsg (exactly one fd; protocol error otherwise).
+    AttachHostFd = 0x53,
+    /// Legacy-pipes Phase 3 (D3): register an open 9P fid in the
+    /// broker-global OFD registry so the worker can later clone the
+    /// underlying open file description with shared POSIX position.
+    /// Body: `(fid: u32, _reserved: [u8; 4])` — 8 bytes. Issued on
+    /// the **parent's** fd-token-socket; the handler resolves `fid`
+    /// against the **parent's own** 9P `Server::fids` map.
+    RegisterOfd = 0x54,
+    /// Legacy-pipes Phase 3 (D3): clone a previously-registered
+    /// open file description into a fresh 9P fid on the worker's
+    /// own 9P server. Body: `(open_file_id: u64, new_fid: u32,
+    /// _reserved: [u8; 4])` — 16 bytes. Issued on the **worker's**
+    /// fd-token-socket.
+    CloneOfd = 0x55,
+    /// Legacy-pipes Phase 3 (D3 step 2d.2): pair this fd-token-socket
+    /// connection with a 9P session by its broker-assigned conn_id.
+    /// The runner receives its 9P conn_id in the bootstrap ACK from
+    /// `connect_nine_p_channel` and issues this op early on the
+    /// fd-token-socket so subsequent `RegisterOfd` / `CloneOfd` ops
+    /// can resolve fids against the paired 9P `Server`. Body:
+    /// `(nine_p_conn_id: u64)` — 8 bytes. Empty response on success;
+    /// returns `UnknownNinePSession` on unknown conn_id.
+    BindNinePSession = 0x56,
     CreateSocketPair = 0x30,
     ReadSocketPair = 0x31,
     WriteSocketPair = 0x32,
@@ -252,6 +281,16 @@ pub enum Opcode {
     CreatePipeResponse = 0xD0,
     ReadPipeResponse = 0xD1,
     WritePipeResponse = 0xD2,
+    /// Response for [`Opcode::AttachHostFd`]. Body on success:
+    /// `(handle_id: u64)` — 8 bytes.
+    AttachHostFdResponse = 0xD3,
+    /// Response for [`Opcode::RegisterOfd`]. Body on success:
+    /// `(open_file_id: u64)` — 8 bytes.
+    RegisterOfdResponse = 0xD4,
+    /// Response for [`Opcode::CloneOfd`]. Empty body on success.
+    CloneOfdResponse = 0xD5,
+    /// Response for [`Opcode::BindNinePSession`]. Empty body on success.
+    BindNinePSessionResponse = 0xD6,
     CreateSocketPairResponse = 0xB0,
     ReadSocketPairResponse = 0xB1,
     WriteSocketPairResponse = 0xB2,
@@ -445,6 +484,10 @@ impl Opcode {
             Opcode::CreatePipe => Some(Opcode::CreatePipeResponse),
             Opcode::ReadPipe => Some(Opcode::ReadPipeResponse),
             Opcode::WritePipe => Some(Opcode::WritePipeResponse),
+            Opcode::AttachHostFd => Some(Opcode::AttachHostFdResponse),
+            Opcode::RegisterOfd => Some(Opcode::RegisterOfdResponse),
+            Opcode::CloneOfd => Some(Opcode::CloneOfdResponse),
+            Opcode::BindNinePSession => Some(Opcode::BindNinePSessionResponse),
             Opcode::CreateSocketPair => Some(Opcode::CreateSocketPairResponse),
             Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
             Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
@@ -534,6 +577,10 @@ impl Opcode {
                 | Opcode::CreatePipe
                 | Opcode::ReadPipe
                 | Opcode::WritePipe
+                | Opcode::AttachHostFd
+                | Opcode::RegisterOfd
+                | Opcode::CloneOfd
+                | Opcode::BindNinePSession
                 | Opcode::CreateSocketPair
                 | Opcode::ReadSocketPair
                 | Opcode::WriteSocketPair
@@ -636,6 +683,10 @@ impl TryFrom<u8> for Opcode {
             0x50 => Ok(Opcode::CreatePipe),
             0x51 => Ok(Opcode::ReadPipe),
             0x52 => Ok(Opcode::WritePipe),
+            0x53 => Ok(Opcode::AttachHostFd),
+            0x54 => Ok(Opcode::RegisterOfd),
+            0x55 => Ok(Opcode::CloneOfd),
+            0x56 => Ok(Opcode::BindNinePSession),
             0x30 => Ok(Opcode::CreateSocketPair),
             0x31 => Ok(Opcode::ReadSocketPair),
             0x32 => Ok(Opcode::WriteSocketPair),
@@ -715,6 +766,10 @@ impl TryFrom<u8> for Opcode {
             0xD0 => Ok(Opcode::CreatePipeResponse),
             0xD1 => Ok(Opcode::ReadPipeResponse),
             0xD2 => Ok(Opcode::WritePipeResponse),
+            0xD3 => Ok(Opcode::AttachHostFdResponse),
+            0xD4 => Ok(Opcode::RegisterOfdResponse),
+            0xD5 => Ok(Opcode::CloneOfdResponse),
+            0xD6 => Ok(Opcode::BindNinePSessionResponse),
             0xB0 => Ok(Opcode::CreateSocketPairResponse),
             0xB1 => Ok(Opcode::ReadSocketPairResponse),
             0xB2 => Ok(Opcode::WriteSocketPairResponse),
@@ -812,6 +867,10 @@ pub enum StatusCode {
     Protocol = 0x10,
     /// Generic broker-internal error.
     Internal = 0x11,
+    /// Legacy-pipes Phase 3 (D3 step 2d.2): `BindNinePSession` was
+    /// issued with a 9P conn_id that the broker doesn't know about
+    /// (either never opened, or already torn down).
+    UnknownNinePSession = 0x12,
 }
 
 impl TryFrom<u8> for StatusCode {
@@ -834,6 +893,7 @@ impl TryFrom<u8> for StatusCode {
             0x0C => Ok(StatusCode::Io),
             0x10 => Ok(StatusCode::Protocol),
             0x11 => Ok(StatusCode::Internal),
+            0x12 => Ok(StatusCode::UnknownNinePSession),
             other => Err(ProtocolError::UnknownStatus { status: other }),
         }
     }
@@ -2661,6 +2721,299 @@ pub fn build_write_pipe_response_ok(written: u64) -> OwnedFrame {
 
 pub fn parse_write_pipe_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
     parse_handle_body(body, Opcode::WritePipeResponse)
+}
+
+// =====================================================================
+// AttachHostFd wire format. Legacy-pipes Phase 3 (D2).
+//
+// SCM_RIGHTS-pass a host fd to the broker, which takes ownership and
+// exposes it as a BrokerPipe-shaped state handle. The host fd itself
+// rides in the cmsg attached to the request frame; the body carries
+// only the direction byte (so subsequent ReadPipe/WritePipe RPCs
+// against the returned handle can be validated against the original
+// direction).
+// =====================================================================
+
+/// Direction wire codes for `Opcode::AttachHostFd`. Allocated separately
+/// from `BrokerPipeEnd` to keep the wire surface stable independent of
+/// the shim-side type evolution.
+pub mod host_fd_direction {
+    /// Worker may only `ReadPipe` against the returned handle.
+    pub const READ: u8 = 0;
+    /// Worker may only `WritePipe` against the returned handle.
+    pub const WRITE: u8 = 1;
+    /// Worker may both `ReadPipe` and `WritePipe` (full duplex, e.g.
+    /// for an attached socket).
+    pub const READ_WRITE: u8 = 2;
+}
+
+/// Body for [`Opcode::AttachHostFd`]: `(direction: u8, _reserved: [u8; 7])` —
+/// 8 bytes, 8-byte-aligned. The host fd rides in the SCM_RIGHTS cmsg
+/// (caller must include exactly one fd).
+pub fn build_attach_host_fd_request(direction: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.push(direction);
+    body.extend_from_slice(&[0u8; 7]);
+    OwnedFrame {
+        opcode: Opcode::AttachHostFd,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_attach_host_fd_body(body: &[u8]) -> Result<u8, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::AttachHostFd,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    // Reserved bytes are tolerated but must be zero for forward
+    // compatibility.
+    if body[1..].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::AttachHostFd,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    Ok(body[0])
+}
+
+/// Body for [`Opcode::AttachHostFdResponse`] on success: `(handle_id: u64)`.
+pub fn build_attach_host_fd_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::AttachHostFdResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_attach_host_fd_response_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::AttachHostFdResponse)
+}
+
+// =====================================================================
+// RegisterOfd / CloneOfd wire format. Legacy-pipes Phase 3 (D3).
+//
+// RegisterOfd is issued on the parent shim's fd-token-socket; the
+// broker handler resolves `fid` against the parent's own 9P
+// `Server::fids` map, calls `try_clone()` on the underlying host
+// file, stashes the dup in the broker-global `OfdRegistry`, and
+// returns a fresh `OpenFileId` the caller can later ship to the
+// worker (via the existing `--broker-fd-bridge` CLI mechanism).
+//
+// CloneOfd is issued on the worker shim's fd-token-socket; the
+// broker handler looks up `open_file_id` in the registry, calls
+// `try_clone()` on the stashed file (= `dup(2)` → shares the
+// kernel OFD with the parent's original fid), and installs a
+// freshly-constructed `FidState` at `new_fid` on the worker's
+// own 9P `Server::fids` map. Subsequent worker-side 9P reads
+// and writes against `new_fid` go through the worker's 9P
+// connection as normal — there is no per-RPC broker hop.
+// =====================================================================
+
+/// Body for [`Opcode::RegisterOfd`]: `(fid: u32, _reserved: [u8; 4])` — 8 bytes.
+#[must_use]
+pub fn build_register_ofd_request(fid: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    body.extend_from_slice(&fid.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::RegisterOfd,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+/// Parse the body of an [`Opcode::RegisterOfd`] request into the requested fid.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::WrongBodyLen`] if `body.len() != 8` or
+/// the reserved trailing bytes are non-zero.
+pub fn parse_register_ofd_body(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::RegisterOfd,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    if body[4..].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::RegisterOfd,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let mut fid_bytes = [0u8; 4];
+    fid_bytes.copy_from_slice(&body[0..4]);
+    Ok(u32::from_le_bytes(fid_bytes))
+}
+
+/// Body for [`Opcode::RegisterOfdResponse`] on success: `(open_file_id: u64)`.
+#[must_use]
+pub fn build_register_ofd_response_ok(open_file_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::RegisterOfdResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: open_file_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Parse the body of an [`Opcode::RegisterOfdResponse`] success frame.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::WrongBodyLen`] if `body.len() != 8`.
+pub fn parse_register_ofd_response_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::RegisterOfdResponse)
+}
+
+/// Body for [`Opcode::CloneOfd`]:
+/// `(open_file_id: u64, new_fid: u32, _reserved: [u8; 4])` — 16 bytes.
+#[must_use]
+pub fn build_clone_ofd_request(open_file_id: u64, new_fid: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&open_file_id.to_le_bytes());
+    body.extend_from_slice(&new_fid.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    OwnedFrame {
+        opcode: Opcode::CloneOfd,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+/// Parse the body of an [`Opcode::CloneOfd`] request into
+/// `(open_file_id, new_fid)`.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::WrongBodyLen`] if `body.len() != 16` or
+/// the reserved trailing bytes are non-zero.
+pub fn parse_clone_ofd_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CloneOfd,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    if body[12..].iter().any(|&b| b != 0) {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CloneOfd,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let mut ofid_bytes = [0u8; 8];
+    ofid_bytes.copy_from_slice(&body[0..8]);
+    let mut fid_bytes = [0u8; 4];
+    fid_bytes.copy_from_slice(&body[8..12]);
+    Ok((
+        u64::from_le_bytes(ofid_bytes),
+        u32::from_le_bytes(fid_bytes),
+    ))
+}
+
+/// Body for [`Opcode::CloneOfdResponse`] on success: empty.
+#[must_use]
+pub fn build_clone_ofd_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CloneOfdResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+/// Verify a [`Opcode::CloneOfdResponse`] success frame body is empty.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::WrongBodyLen`] if `body.len() != 0`.
+pub fn parse_clone_ofd_response_body(body: &[u8]) -> Result<(), ProtocolError> {
+    if !body.is_empty() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CloneOfdResponse,
+            got: body.len(),
+            want: 0,
+        });
+    }
+    Ok(())
+}
+
+// =====================================================================
+// BindNinePSession wire format. Legacy-pipes Phase 3 (D3 step 2d.2).
+//
+// Pairs an fd-token-socket connection with a 9P session by its
+// broker-assigned conn_id (obtained from the bootstrap ACK of
+// `connect_nine_p_channel`). Must be issued before any RegisterOfd /
+// CloneOfd op against the same fd-token-socket connection.
+// =====================================================================
+
+/// Body for [`Opcode::BindNinePSession`]: `(nine_p_conn_id: u64)` — 8 bytes.
+#[must_use]
+pub fn build_bind_nine_p_session_request(nine_p_conn_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::BindNinePSession,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: nine_p_conn_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Parse the body of an [`Opcode::BindNinePSession`] request.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::WrongBodyLen`] if `body.len() != 8`.
+pub fn parse_bind_nine_p_session_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::BindNinePSession,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&body[..8]);
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Build a successful [`Opcode::BindNinePSessionResponse`] frame.
+#[must_use]
+pub fn build_bind_nine_p_session_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::BindNinePSessionResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+/// Verify a [`Opcode::BindNinePSessionResponse`] success frame body is empty.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::WrongBodyLen`] if `body.len() != 0`.
+pub fn parse_bind_nine_p_session_response_body(body: &[u8]) -> Result<(), ProtocolError> {
+    if !body.is_empty() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::BindNinePSessionResponse,
+            got: body.len(),
+            want: 0,
+        });
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -5010,9 +5363,10 @@ mod tests {
     #[test]
     fn decode_unknown_opcode() {
         let mut buf = build_register_request().encode().unwrap();
-        buf[6] = 0x55;
+        // 0x0D is unallocated. Update if 0x0D ever gets allocated.
+        buf[6] = 0x0D;
         match decode(&buf) {
-            Err(ProtocolError::UnknownOpcode { opcode: 0x55 }) => {}
+            Err(ProtocolError::UnknownOpcode { opcode: 0x0D }) => {}
             other => panic!("expected UnknownOpcode, got {other:?}"),
         }
     }
@@ -5206,6 +5560,223 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// Legacy-pipes Phase 3 (D2): `AttachHostFd` wire format
+    /// round-trip. Request body shape: 1 direction byte + 7 reserved
+    /// bytes (8-byte-aligned). Response body shape: 8-byte handle id.
+    #[test]
+    fn attach_host_fd_request_round_trip() {
+        for &dir in &[
+            host_fd_direction::READ,
+            host_fd_direction::WRITE,
+            host_fd_direction::READ_WRITE,
+        ] {
+            let frame = build_attach_host_fd_request(dir);
+            let encoded = frame.encode().expect("encode");
+            let decoded = decode(&encoded).expect("decode");
+            assert_eq!(decoded.opcode, Opcode::AttachHostFd);
+            let parsed = parse_attach_host_fd_body(decoded.body).expect("parse body");
+            assert_eq!(parsed, dir);
+        }
+    }
+
+    /// `parse_attach_host_fd_body` rejects wrong body length.
+    #[test]
+    fn attach_host_fd_request_rejects_wrong_body_len() {
+        assert!(parse_attach_host_fd_body(&[]).is_err());
+        assert!(parse_attach_host_fd_body(&[0u8; 4]).is_err());
+        assert!(parse_attach_host_fd_body(&[0u8; 7]).is_err());
+        assert!(parse_attach_host_fd_body(&[0u8; 9]).is_err());
+    }
+
+    /// `parse_attach_host_fd_body` rejects non-zero reserved bytes
+    /// (forward-compat reservation).
+    #[test]
+    fn attach_host_fd_request_rejects_nonzero_reserved() {
+        let mut body = alloc::vec![0u8; 8];
+        body[0] = host_fd_direction::READ;
+        body[3] = 0xFF; // non-zero reserved byte
+        assert!(parse_attach_host_fd_body(&body).is_err());
+    }
+
+    /// `AttachHostFdResponse` round-trip with a representative handle id.
+    #[test]
+    fn attach_host_fd_response_round_trip() {
+        let handle_id = 0xDEAD_BEEF_CAFE_BABE_u64;
+        let frame = build_attach_host_fd_response_ok(handle_id);
+        let encoded = frame.encode().expect("encode");
+        let decoded = decode(&encoded).expect("decode");
+        assert_eq!(decoded.opcode, Opcode::AttachHostFdResponse);
+        let parsed = parse_attach_host_fd_response_body(decoded.body).expect("parse body");
+        assert_eq!(parsed, handle_id);
+    }
+
+    /// `Opcode::AttachHostFd` is classified as a request and its
+    /// response pairing is correct.
+    #[test]
+    fn attach_host_fd_opcode_classification() {
+        assert!(Opcode::AttachHostFd.is_request());
+        assert_eq!(
+            Opcode::AttachHostFd.response_for(),
+            Some(Opcode::AttachHostFdResponse)
+        );
+        assert_eq!(Opcode::try_from(0x53u8).unwrap(), Opcode::AttachHostFd);
+        assert_eq!(
+            Opcode::try_from(0xD3u8).unwrap(),
+            Opcode::AttachHostFdResponse
+        );
+    }
+
+    /// Legacy-pipes Phase 3 (D3): `RegisterOfd` request body shape
+    /// `(fid: u32, _reserved: [u8; 4])` round-trips for varied fid
+    /// values.
+    #[test]
+    fn register_ofd_request_round_trip() {
+        for &fid in &[0u32, 1, 7, 0x100, u32::MAX] {
+            let frame = build_register_ofd_request(fid);
+            let encoded = frame.encode().expect("encode");
+            let decoded = decode(&encoded).expect("decode");
+            assert_eq!(decoded.opcode, Opcode::RegisterOfd);
+            let parsed = parse_register_ofd_body(decoded.body).expect("parse body");
+            assert_eq!(parsed, fid);
+        }
+    }
+
+    /// `parse_register_ofd_body` rejects wrong body length and
+    /// non-zero reserved bytes.
+    #[test]
+    fn register_ofd_request_rejects_malformed() {
+        assert!(parse_register_ofd_body(&[]).is_err());
+        assert!(parse_register_ofd_body(&[0u8; 4]).is_err());
+        assert!(parse_register_ofd_body(&[0u8; 7]).is_err());
+        assert!(parse_register_ofd_body(&[0u8; 9]).is_err());
+        let mut body = alloc::vec![0u8; 8];
+        body[5] = 0xFF; // non-zero reserved byte
+        assert!(parse_register_ofd_body(&body).is_err());
+    }
+
+    /// `RegisterOfdResponse` round-trip with a representative id.
+    #[test]
+    fn register_ofd_response_round_trip() {
+        let open_file_id = 0xABCD_1234_5678_9ABC_u64;
+        let frame = build_register_ofd_response_ok(open_file_id);
+        let encoded = frame.encode().expect("encode");
+        let decoded = decode(&encoded).expect("decode");
+        assert_eq!(decoded.opcode, Opcode::RegisterOfdResponse);
+        let parsed = parse_register_ofd_response_body(decoded.body).expect("parse body");
+        assert_eq!(parsed, open_file_id);
+    }
+
+    /// `CloneOfd` request body shape `(open_file_id: u64, new_fid:
+    /// u32, _reserved: [u8; 4])` round-trips.
+    #[test]
+    fn clone_ofd_request_round_trip() {
+        for &(ofid, fid) in &[
+            (0u64, 0u32),
+            (1, 1),
+            (0xDEAD_BEEF_u64, 42),
+            (u64::MAX, u32::MAX),
+        ] {
+            let frame = build_clone_ofd_request(ofid, fid);
+            let encoded = frame.encode().expect("encode");
+            let decoded = decode(&encoded).expect("decode");
+            assert_eq!(decoded.opcode, Opcode::CloneOfd);
+            let parsed = parse_clone_ofd_body(decoded.body).expect("parse body");
+            assert_eq!(parsed, (ofid, fid));
+        }
+    }
+
+    /// `parse_clone_ofd_body` rejects wrong body length and
+    /// non-zero reserved bytes.
+    #[test]
+    fn clone_ofd_request_rejects_malformed() {
+        assert!(parse_clone_ofd_body(&[]).is_err());
+        assert!(parse_clone_ofd_body(&[0u8; 8]).is_err());
+        assert!(parse_clone_ofd_body(&[0u8; 15]).is_err());
+        assert!(parse_clone_ofd_body(&[0u8; 17]).is_err());
+        let mut body = alloc::vec![0u8; 16];
+        body[13] = 0xFF; // non-zero reserved byte
+        assert!(parse_clone_ofd_body(&body).is_err());
+    }
+
+    /// `CloneOfdResponse` Ok body is empty and round-trips.
+    #[test]
+    fn clone_ofd_response_round_trip() {
+        let frame = build_clone_ofd_response_ok();
+        let encoded = frame.encode().expect("encode");
+        let decoded = decode(&encoded).expect("decode");
+        assert_eq!(decoded.opcode, Opcode::CloneOfdResponse);
+        assert!(decoded.body.is_empty());
+        parse_clone_ofd_response_body(decoded.body).expect("parse body");
+    }
+
+    /// D3 opcodes classify as requests and pair to their responses.
+    #[test]
+    fn register_clone_ofd_opcode_classification() {
+        assert!(Opcode::RegisterOfd.is_request());
+        assert!(Opcode::CloneOfd.is_request());
+        assert_eq!(
+            Opcode::RegisterOfd.response_for(),
+            Some(Opcode::RegisterOfdResponse)
+        );
+        assert_eq!(
+            Opcode::CloneOfd.response_for(),
+            Some(Opcode::CloneOfdResponse)
+        );
+        assert_eq!(Opcode::try_from(0x54u8).unwrap(), Opcode::RegisterOfd);
+        assert_eq!(Opcode::try_from(0x55u8).unwrap(), Opcode::CloneOfd);
+        assert_eq!(
+            Opcode::try_from(0xD4u8).unwrap(),
+            Opcode::RegisterOfdResponse
+        );
+        assert_eq!(Opcode::try_from(0xD5u8).unwrap(), Opcode::CloneOfdResponse);
+    }
+
+    /// Legacy-pipes Phase 3 (D3 step 2d.2): `BindNinePSession` is an
+    /// 8-byte request body carrying the broker-assigned 9P conn_id,
+    /// and the response is an empty Ok or `UnknownNinePSession`.
+    #[test]
+    fn bind_nine_p_session_round_trip() {
+        let frame = build_bind_nine_p_session_request(0x1234_5678_9ABC_DEF0);
+        let bytes = frame.encode().expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.opcode, Opcode::BindNinePSession);
+        assert_eq!(decoded.status, StatusCode::Ok);
+        let id = parse_bind_nine_p_session_body(decoded.body).expect("parse body");
+        assert_eq!(id, 0x1234_5678_9ABC_DEF0);
+
+        let resp = build_bind_nine_p_session_response_ok();
+        let resp_bytes = resp.encode().expect("encode resp");
+        let decoded_resp = decode(&resp_bytes).expect("decode resp");
+        assert_eq!(decoded_resp.opcode, Opcode::BindNinePSessionResponse);
+        parse_bind_nine_p_session_response_body(decoded_resp.body).expect("parse resp body");
+    }
+
+    #[test]
+    fn bind_nine_p_session_body_rejects_wrong_length() {
+        assert!(parse_bind_nine_p_session_body(&[]).is_err());
+        assert!(parse_bind_nine_p_session_body(&[0u8; 7]).is_err());
+        assert!(parse_bind_nine_p_session_body(&[0u8; 9]).is_err());
+    }
+
+    #[test]
+    fn bind_nine_p_session_opcode_classification() {
+        assert!(Opcode::BindNinePSession.is_request());
+        assert_eq!(
+            Opcode::BindNinePSession.response_for(),
+            Some(Opcode::BindNinePSessionResponse)
+        );
+        assert_eq!(Opcode::try_from(0x56u8).unwrap(), Opcode::BindNinePSession);
+        assert_eq!(
+            Opcode::try_from(0xD6u8).unwrap(),
+            Opcode::BindNinePSessionResponse
+        );
+        // `UnknownNinePSession` status round-trips.
+        assert_eq!(
+            StatusCode::try_from(0x12u8).unwrap(),
+            StatusCode::UnknownNinePSession
+        );
     }
 
     /// Phase F: socketpair wire format mirrors the pipe ops. Verifies

@@ -27,6 +27,7 @@
 
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
+    build_attach_host_fd_request, build_bind_nine_p_session_request, build_clone_ofd_request,
     build_create_eventfd_request, build_create_pidfd_request, build_create_pipe_request,
     build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
     build_deliver_signal_inbox_request, build_inet_listener_accept_request,
@@ -45,14 +46,16 @@ use crate::fd_token_protocol::{
     build_pty_ioctl_request, build_pty_read_request, build_pty_write_request,
     build_push_siginfo_request, build_read_eventfd_request, build_read_pipe_request,
     build_read_siginfo_request, build_read_socketpair_request, build_read_tcp_conn_request,
-    build_register_notification_ring_request, build_register_process_request,
-    build_register_request, build_release_request, build_set_pgid_request, build_set_sid_request,
-    build_shutdown_socketpair_write_request, build_shutdown_tcp_conn_request,
-    build_subscribe_eventfd_request, build_subscribe_process_exit_request,
-    build_subscribe_pty_request, build_subscribe_signal_inbox_request, build_unsubscribe_request,
+    build_register_notification_ring_request, build_register_ofd_request,
+    build_register_process_request, build_register_request, build_release_request,
+    build_set_pgid_request, build_set_sid_request, build_shutdown_socketpair_write_request,
+    build_shutdown_tcp_conn_request, build_subscribe_eventfd_request,
+    build_subscribe_process_exit_request, build_subscribe_pty_request,
+    build_subscribe_signal_inbox_request, build_unsubscribe_request,
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
     build_write_socketpair_request, build_write_tcp_conn_request, decode,
-    parse_create_pidfd_response_ok, parse_create_pty_response_ok,
+    parse_attach_host_fd_response_body, parse_bind_nine_p_session_response_body,
+    parse_clone_ofd_response_body, parse_create_pidfd_response_ok, parse_create_pty_response_ok,
     parse_create_socketpair_response_body, parse_handle_body,
     parse_inet_listener_accept_response_ok, parse_inet_listener_bind_response_ok,
     parse_inet_listener_create_response_ok, parse_inet_listener_getsockname_response_ok,
@@ -67,9 +70,9 @@ use crate::fd_token_protocol::{
     parse_pty_ioctl_response_body, parse_pty_read_response_body, parse_pty_write_response_ok,
     parse_read_pipe_response_body, parse_read_siginfo_response_body,
     parse_read_socketpair_response_body, parse_read_tcp_conn_response_body,
-    parse_set_sid_response_ok, parse_subscribe_process_exit_response_ok,
-    parse_write_pipe_response_ok, parse_write_socketpair_response_ok,
-    parse_write_tcp_conn_response_ok,
+    parse_register_ofd_response_body, parse_set_sid_response_ok,
+    parse_subscribe_process_exit_response_ok, parse_write_pipe_response_ok,
+    parse_write_socketpair_response_ok, parse_write_tcp_conn_response_ok,
 };
 use std::format;
 use std::io;
@@ -1269,6 +1272,139 @@ impl FdTokenClient {
         match resp.status {
             StatusCode::Ok => crate::fd_token_protocol::parse_create_pipe_response_body(resp.body)
                 .map_err(ClientError::Protocol),
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    /// Attaches a host fd to the broker as a `BrokerPipe`-shaped
+    /// handle. The `direction` argument (one of
+    /// `proto::host_fd_direction::{READ, WRITE, READ_WRITE}`) declares
+    /// which of `read_pipe`/`write_pipe` the worker may invoke against
+    /// the returned handle. The host fd is consumed (passed via
+    /// SCM_RIGHTS; broker takes ownership thereafter).
+    ///
+    /// Phase 3 (legacy-pipes retirement) entry point: this replaces
+    /// the parent dispatcher's host-fd relay. The worker installs the
+    /// returned handle as a regular `BrokerPipeFd`, with all data
+    /// flow routed through the broker's host-fd state machine.
+    pub fn attach_host_fd(&self, fd: OwnedFd, direction: u8) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_attach_host_fd_request(direction), Some(&fd))?;
+        drop(fd);
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::AttachHostFdResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_attach_host_fd_response_body(resp.body).map_err(ClientError::Protocol)
+            }
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    /// Legacy-pipes Phase 3 (D3): register an already-open 9P fid
+    /// for cross-connection sharing.
+    ///
+    /// Issued by the **parent** shim on its fd-token-socket. The
+    /// broker walks its (paired) `nine_p::Server`'s fid table
+    /// for `fid`, requires it to be open with a host `fs::File`,
+    /// dups the host fd via `try_clone()` (kernel OFD sharing), and
+    /// inserts the clone into the broker-global OFD registry under
+    /// a fresh `OpenFileId`. The returned id is broker-scoped and
+    /// the shim ships it to the worker shim via
+    /// `--broker-fd-bridge fs_fid:<id>:...` for the worker's
+    /// `clone_ofd` call.
+    ///
+    /// POSIX inherited-fd semantics (shared kernel position) are
+    /// preserved automatically by the underlying `dup(2)`.
+    pub fn register_ofd(&self, fid: u32) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_register_ofd_request(fid), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::RegisterOfdResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_register_ofd_response_body(resp.body).map_err(ClientError::Protocol)
+            }
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    /// Legacy-pipes Phase 3 (D3): clone a previously-registered
+    /// OFD into a new 9P fid on the worker's connection.
+    ///
+    /// Issued by the **worker** shim on its fd-token-socket. The
+    /// broker looks up `open_file_id` in the global registry,
+    /// increments its refcount, dups the underlying host fd via
+    /// `try_clone()`, synthesises a fresh `FidState` (open,
+    /// canonical, carrying the same path and OFD id so its
+    /// eventual `Tclunk` releases the registry refcount), and
+    /// installs it in the worker's (paired) `nine_p::Server`'s
+    /// fid table at `new_fid`.
+    ///
+    /// After this returns Ok, the worker can issue regular 9P
+    /// `Twrite`/`Tread` against `new_fid` and the operations
+    /// share the kernel OFD with the parent's original fid.
+    pub fn clone_ofd(&self, open_file_id: u64, new_fid: u32) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_clone_ofd_request(open_file_id, new_fid),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::CloneOfdResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_clone_ofd_response_body(resp.body).map_err(ClientError::Protocol)
+            }
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    /// Legacy-pipes Phase 3 (D3 step 2d.2): pair this
+    /// fd-token-socket with a 9P session by its broker-assigned
+    /// `conn_id` (obtained from the bootstrap ACK of
+    /// `connect_nine_p_channel`). Must be called once early on the
+    /// fd-token-socket — before any `RegisterOfd` / `CloneOfd`
+    /// op — so subsequent op handlers find a paired
+    /// `nine_p::Server` in their `ConnState`.
+    pub fn bind_nine_p_session(&self, nine_p_conn_id: u64) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_bind_nine_p_session_request(nine_p_conn_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::BindNinePSessionResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_bind_nine_p_session_response_body(resp.body).map_err(ClientError::Protocol)
+            }
             s => Err(map_status_no_handle(resp.opcode, s)),
         }
     }

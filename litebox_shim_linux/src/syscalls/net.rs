@@ -2925,7 +2925,6 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::Fs(_) => Err(Errno::ENOTSOCK),
             #[cfg(feature = "worker_local_inet")]
             crate::RawFdRef::Net(fd) => self.global.shutdown(fd, read, write),
-            crate::RawFdRef::Pipes(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Eventfd(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Epoll(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Unix(fd) => {
@@ -3291,10 +3290,6 @@ impl<FS: ShimFS> Task<FS> {
                         #[cfg(feature = "worker_local_inet")]
                         crate::RawFdRef::Net(_) => {
                             // Network descriptors are kernel-backed and transfer as PassedFd.
-                            Ok(false)
-                        }
-                        crate::RawFdRef::Pipes(_) => {
-                            // Pipes are kernel-backed and transfer as PassedFd.
                             Ok(false)
                         }
                         crate::RawFdRef::Eventfd(typed) => {
@@ -4220,6 +4215,7 @@ impl<FS: ShimFS> Task<FS> {
                             | SubsystemTag::InetListener
                             | SubsystemTag::InetDgram
                             | SubsystemTag::InetRaw
+                            | SubsystemTag::HostFd
                             | SubsystemTag::Unknown(_) => unreachable!(),
                         };
                         let pipe = super::broker_pipe::BrokerPipeFd::<Platform>::new(
@@ -4262,7 +4258,8 @@ impl<FS: ShimFS> Task<FS> {
                     | SubsystemTag::Inotify
                     | SubsystemTag::Pipe
                     | SubsystemTag::Pty
-                    | SubsystemTag::InetRaw => {
+                    | SubsystemTag::InetRaw
+                    | SubsystemTag::HostFd => {
                         // Reserved for P2.A/B/C and later phases.
                         // Until those subphases land, the receive
                         // path drops the fd cleanly rather than
