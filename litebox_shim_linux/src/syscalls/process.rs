@@ -5777,6 +5777,14 @@ impl<FS: ShimFS> Task<FS> {
                 let mut orphan_stream_ids: Vec<(u32, Vec<u8>)> = Vec::new();
                 let mut broker_migrated_streams: Vec<Option<(u64, BrokerReleaser, char)>> =
                     (0..child_pipe_bridges.len()).map(|_| None).collect();
+                let mut d5_pty_bridge_handles: alloc::vec::Vec<(
+                    usize,
+                    u64,
+                    u32,
+                    alloc::sync::Arc<
+                        dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                    >,
+                )> = alloc::vec::Vec::new();
 
                 for (i, &(guest_fd, child_os_fd, direction)) in
                     child_pipe_bridges.iter().enumerate()
@@ -5891,6 +5899,7 @@ impl<FS: ShimFS> Task<FS> {
 
                     let is_host_backed = bridge_host_fd.get(i).is_some_and(|&hf| hf >= 0);
                     let is_virtual_pipe = !is_host_backed && type_byte == b'p';
+                    let is_pty_stream = type_byte == b't';
 
                     // Track whether this stream is handled as a local pipe
                     // (orphan with drained data). If so, skip adding to
@@ -6065,6 +6074,119 @@ impl<FS: ShimFS> Task<FS> {
                                     }
                                     releaser.release(read_handle);
                                     releaser.release(write_handle);
+                                }
+                            }
+                        }
+                    }
+
+                    if is_pty_stream && !is_host_backed && super::new_mux_enabled() {
+                        let pty_parent_fds: alloc::vec::Vec<usize> = bridge_parent_info
+                            .get(i)
+                            .map(|parents| {
+                                parents
+                                    .iter()
+                                    .filter_map(|&(parent_fd, _, subsystem)| {
+                                        if subsystem == crate::ReplacedSubsystem::Pty {
+                                            Some(parent_fd)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !pty_parent_fds.is_empty()
+                            && let Some(provider) = super::broker_pty::broker_pty_provider()
+                        {
+                            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                            match provider.create_pty() {
+                                Ok(pair) => {
+                                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                                        alloc::sync::Arc::clone(&provider) as _;
+                                    for (parent_idx, &parent_fd) in
+                                        pty_parent_fds.iter().enumerate()
+                                    {
+                                        let master_ref_acquired = if parent_idx == 0 {
+                                            true
+                                        } else {
+                                            match releaser.dup_handle(pair.master_handle) {
+                                                Ok(()) => true,
+                                                Err(_) => {
+                                                    releaser.release(pair.slave_handle);
+                                                    put_fc_back(self, fc);
+                                                    return Err(Errno::EIO);
+                                                }
+                                            }
+                                        };
+                                        let anchor_handle =
+                                            match releaser.dup_handle(pair.slave_handle) {
+                                                Ok(()) => Some(pair.slave_handle),
+                                                Err(_) => {
+                                                    if master_ref_acquired {
+                                                        releaser.release(pair.master_handle);
+                                                    }
+                                                    releaser.release(pair.slave_handle);
+                                                    put_fc_back(self, fc);
+                                                    return Err(Errno::EIO);
+                                                }
+                                            };
+                                        if self
+                                            .install_d5_mux_master_pty_fd(
+                                                parent_fd,
+                                                alloc::sync::Arc::clone(&provider),
+                                                pair.master_handle,
+                                                pair.pty_id,
+                                                anchor_handle,
+                                            )
+                                            .is_err()
+                                        {
+                                            if master_ref_acquired {
+                                                releaser.release(pair.master_handle);
+                                            }
+                                            if let Some(anchor) = anchor_handle {
+                                                releaser.release(anchor);
+                                            }
+                                            releaser.release(pair.slave_handle);
+                                            put_fc_back(self, fc);
+                                            return Err(Errno::EIO);
+                                        }
+                                    }
+                                    self.global.platform.close_host_fd(child_os_fd);
+                                    broker_fd_bridge_specs.push(alloc::format!(
+                                        "{guest_fd}:pty:{}:s:{}",
+                                        pair.slave_handle,
+                                        pair.pty_id
+                                    ));
+                                    broker_fd_bridge_transit_release.push((
+                                        alloc::sync::Arc::clone(&releaser),
+                                        pair.slave_handle,
+                                    ));
+                                    d5_pty_bridge_handles.push((
+                                        i,
+                                        pair.slave_handle,
+                                        pair.pty_id,
+                                        releaser,
+                                    ));
+                                    handled_as_broker_bridge = true;
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: stream={} PTY migrated to broker pty_id={} master_handle={} slave_handle={}",
+                                        self.pid,
+                                        stream_id,
+                                        pair.pty_id,
+                                        pair.master_handle,
+                                        pair.slave_handle,
+                                    );
+                                }
+                                Err(_) => {
+                                    #[cfg(feature = "trace_syscalls")]
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[DELAYED-FORK] pid={}: stream={} create_pty failed; falling back to mux",
+                                        self.pid,
+                                        stream_id,
+                                    );
                                 }
                             }
                         }
@@ -6448,6 +6570,23 @@ impl<FS: ShimFS> Task<FS> {
                         broker_fd_bridge_specs.push(alloc::format!(
                             "{alias_fd}:unix_socket:{handle_id}:{endpoint_char}:{alias_nonblock_flag}"
                         ));
+                        continue;
+                    }
+                    // D5-vpty: alias references a primary that was
+                    // migrated to a BrokerPty; dup the slave handle
+                    // and emit a broker_fd_bridge spec.
+                    if let Some(&(_, slave_handle, pty_id, ref releaser)) = d5_pty_bridge_handles
+                        .iter()
+                        .find(|&&(idx, _, _, _)| idx == primary_idx)
+                    {
+                        if releaser.dup_handle(slave_handle).is_err() {
+                            put_fc_back(self, fc);
+                            return Err(Errno::EIO);
+                        }
+                        broker_fd_bridge_specs
+                            .push(alloc::format!("{alias_fd}:pty:{slave_handle}:s:{pty_id}"));
+                        broker_fd_bridge_transit_release
+                            .push((alloc::sync::Arc::clone(releaser), slave_handle));
                         continue;
                     }
 
@@ -8361,6 +8500,103 @@ impl<FS: ShimFS> Task<FS> {
         {
             let mut inner = self.thread.process.inner.lock();
             inner.is_forking = false;
+        }
+    }
+
+    fn install_d5_mux_master_pty_fd(
+        &self,
+        guest_fd: usize,
+        provider: alloc::sync::Arc<
+            dyn litebox_common_linux::broker_pty_provider::BrokerPtyProvider,
+        >,
+        master_handle: u64,
+        pty_id: u32,
+        slave_anchor_handle: Option<u64>,
+    ) -> Result<(), Errno> {
+        let pty_fd = super::broker_pty::BrokerPtyFd::<crate::Platform>::new(
+            provider,
+            master_handle,
+            pty_id,
+            true,
+            slave_anchor_handle,
+            litebox::fs::OFlags::empty(),
+        );
+        pty_fd.ensure_subscribed_eager();
+        let typed: litebox::fd::TypedFd<super::broker_pty::BrokerPtySubsystem> =
+            self.global.litebox.descriptor_table_mut().insert(pty_fd);
+
+        let files = self.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+        if let Ok(old_pipe) =
+            rds.fd_consume_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(guest_fd)
+        {
+            drop(rds);
+            let _ = self.global.pipes.close(&old_pipe);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+            drop(rds);
+            let _ = files.fs.close(&old_fs);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_unix) =
+            rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(guest_fd)
+        {
+            drop(rds);
+            let _ = self.global.litebox.descriptor_table_mut().remove(&old_unix);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_external) =
+            rds.fd_consume_raw_integer::<super::external_fd::ExternalFdSubsystem>(guest_fd)
+        {
+            drop(rds);
+            if let Some(entry) = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_external)
+            {
+                let host_fd = entry.take_fd();
+                if host_fd >= 0 {
+                    self.global.platform.close_host_fd(host_fd);
+                }
+            }
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_broker_pipe) =
+            rds.fd_consume_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(guest_fd)
+        {
+            drop(rds);
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_broker_pipe);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_broker_socketpair) =
+            rds.fd_consume_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(
+                guest_fd,
+            )
+        {
+            drop(rds);
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_broker_socketpair);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_broker_pty) =
+            rds.fd_consume_raw_integer::<super::broker_pty::BrokerPtySubsystem>(guest_fd)
+        {
+            drop(rds);
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_broker_pty);
+            rds = files.raw_descriptor_store.write();
+        }
+
+        if rds.fd_into_specific_raw_integer(typed, guest_fd) {
+            Ok(())
+        } else {
+            Err(Errno::ENOMEM)
         }
     }
 }
