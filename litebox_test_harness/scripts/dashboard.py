@@ -2384,7 +2384,7 @@ def cmd_auto(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGUSR1, _drain_handler)
 
-    _write_pidfile(pidfile, supervisor_pid=os.getpid())
+    _write_pidfile_from_state(pidfile, os.getpid(), _supervisor_state)
 
     # Initial render before the first cycle starts. Re-renders the
     # summary with whatever's already in the store, so a freshly
