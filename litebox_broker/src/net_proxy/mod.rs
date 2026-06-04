@@ -755,7 +755,7 @@ mod tests {
         let mut local_services = LocalServiceRegistry::new();
         local_services.register_ring(
             5640,
-            Arc::new(move |_writer, _reader| {
+            Arc::new(move |_writer, _reader, _conn_id| {
                 invoked_flag.store(true, Ordering::SeqCst);
                 std::thread::spawn(|| {})
             }),
@@ -778,9 +778,9 @@ mod tests {
                 .write_all(&metadata)
                 .expect("send ring metadata payload");
 
-            let mut ack = [0u8; 1];
+            let mut ack = [0u8; 9];
             stream.read_exact(&mut ack).expect("read ring ACK");
-            assert_eq!(ack, [LB9P_RING_ACK], "broker should ACK ring metadata");
+            assert_eq!(ack[0], LB9P_RING_ACK, "broker should ACK ring metadata");
         });
 
         let accepted = accept_ipc_client(
@@ -821,7 +821,7 @@ mod tests {
         let mut local_services = LocalServiceRegistry::new();
         local_services.register_ring(
             5640,
-            Arc::new(move |_writer, _reader| {
+            Arc::new(move |_writer, _reader, _conn_id| {
                 invocation_count_flag.fetch_add(1, Ordering::SeqCst);
                 std::thread::spawn(|| {})
             }),
@@ -892,9 +892,9 @@ mod tests {
                 .write_all(&metadata)
                 .expect("send ring metadata payload");
 
-            let mut ack = [0u8; 1];
+            let mut ack = [0u8; 9];
             stream.read_exact(&mut ack).expect("read ring ACK");
-            assert_eq!(ack, [LB9P_RING_ACK], "broker should ACK ring metadata");
+            assert_eq!(ack[0], LB9P_RING_ACK, "broker should ACK ring metadata");
         });
 
         let second = accept_ipc_client(

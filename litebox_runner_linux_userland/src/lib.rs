@@ -1252,7 +1252,8 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     // IPC mode: --nine-p-broker points to a Unix socket path.
     // Open a dedicated 9P channel using shared-memory ring buffers.
     if !is_tcp {
-        let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
+        let (ring_writer, ring_reader, nine_p_conn_id) = connect_nine_p_channel(broker_addr)?;
+        bind_nine_p_session_for_broker(nine_p_conn_id);
         litebox_timing::emit("runner_broker_connected_ns");
 
         let shim = shim_builder.build();
@@ -1759,7 +1760,8 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             anyhow::bail!("fork-restore does not support TCP 9P brokers");
         }
 
-        let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
+        let (ring_writer, ring_reader, nine_p_conn_id) = connect_nine_p_channel(broker_addr)?;
+        bind_nine_p_session_for_broker(nine_p_conn_id);
 
         let shim = shim_builder.build();
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -3004,6 +3006,7 @@ fn connect_nine_p_channel(
 ) -> Result<(
     litebox_common_linux::shmem_ring::RingWriter,
     litebox_common_linux::shmem_ring::RingReader,
+    u64,
 )> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -3072,26 +3075,31 @@ fn connect_nine_p_channel(
     // Send the two ring-buffer fds to the broker via SCM_RIGHTS.
     send_ring_fds(&fd, &tx_fd, &rx_fd)?;
 
-    // Wait for a 1-byte ACK from the broker confirming the ring pair was
-    // opened successfully.  This keeps the Unix socket alive long enough for
-    // the broker (which reads with non-blocking I/O in an event loop) to
-    // receive the magic bytes and SCM_RIGHTS message.
-    let mut ack = [0u8; 1];
-    // SAFETY: `fd` is a valid connected socket, `ack` is 1 byte.
+    // Wait for a 9-byte ACK from the broker confirming the ring pair was
+    // opened successfully and carrying the broker-assigned 9P
+    // `conn_id` (LE u64).  The conn_id pairs this 9P session with a
+    // sibling fd-token-socket via `FdTokenClient::bind_nine_p_session`
+    // — see `litebox_broker/src/nine_p_session_registry.rs`.
+    let mut ack = [0u8; 9];
+    // SAFETY: `fd` is a valid connected socket, `ack` is 9 bytes.
     let ret = unsafe {
         libc::recv(
             fd.as_raw_fd(),
             ack.as_mut_ptr().cast::<libc::c_void>(),
-            1,
-            0, // blocking
+            9,
+            libc::MSG_WAITALL,
         )
     };
-    if ret != 1 || ack[0] != b'K' {
+    if ret != 9 || ack[0] != b'K' {
         anyhow::bail!("9P shared-memory handshake: broker did not ACK ring fds");
     }
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&ack[1..9]);
+    let nine_p_conn_id = u64::from_le_bytes(id_bytes);
 
     // The Unix socket can now be dropped — all 9P I/O uses the ring buffers.
-    Ok(pair.into_parts())
+    let (writer, reader) = pair.into_parts();
+    Ok((writer, reader, nine_p_conn_id))
 }
 
 /// Send two file descriptors over a Unix socket using `SCM_RIGHTS`.
@@ -3489,6 +3497,46 @@ fn broker_tcp_conn_accept_or_outbound_enabled() -> bool {
     env_flag_enabled("LITEBOX_BROKER_TCP_CONN") || broker_inet_tcp_enabled()
 }
 
+/// Process-global storage for the runner's `FdTokenClient`, set by
+/// [`setup_broker_eventfd_provider`]. Used by callers that need to
+/// issue control-plane RPCs against the broker outside the
+/// shim/provider call paths — currently
+/// [`bind_nine_p_session_for_broker`] (legacy-pipes Phase 3 D3
+/// step 2d.2).
+fn runner_fd_token_client_storage() -> &'static std::sync::OnceLock<
+    std::sync::Arc<litebox_common_linux::fd_token_client::FdTokenClient>,
+> {
+    use std::sync::OnceLock;
+    static STORAGE: OnceLock<std::sync::Arc<litebox_common_linux::fd_token_client::FdTokenClient>> =
+        OnceLock::new();
+    &STORAGE
+}
+
+fn set_runner_fd_token_client(
+    client: std::sync::Arc<litebox_common_linux::fd_token_client::FdTokenClient>,
+) {
+    let _ = runner_fd_token_client_storage().set(client);
+}
+
+/// Legacy-pipes Phase 3 (D3 step 2d.2): bind the runner's
+/// fd-token-socket connection to the 9P session whose conn_id was
+/// returned by [`connect_nine_p_channel`]. Best-effort: if the
+/// fd-token-socket was never set up (no `--fd-token-broker` arg)
+/// this is a no-op. Errors are logged but not fatal — the legacy
+/// (non-fd-inherit) install paths still work.
+fn bind_nine_p_session_for_broker(conn_id: u64) {
+    let Some(client) = runner_fd_token_client_storage().get().cloned() else {
+        return;
+    };
+    if let Err(e) = client.bind_nine_p_session(conn_id) {
+        tracing::warn!(
+            error = %e,
+            conn_id,
+            "BindNinePSession failed; D3 fd-inherit ops will be unavailable on this session",
+        );
+    }
+}
+
 fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     use litebox_common_linux::broker_eventfd::NotificationDispatcher;
     use litebox_common_linux::fd_token_client::FdTokenClient;
@@ -3497,6 +3545,7 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     use std::sync::Arc;
     let path = std::path::Path::new(broker_path);
     let client = Arc::new(FdTokenClient::connect(path).map_err(|e| anyhow!("connect: {e}"))?);
+    set_runner_fd_token_client(Arc::clone(&client));
     let (pair, tx_fd, rx_fd) = ShmemRingPair::create().map_err(|e| anyhow!("ring: {e:?}"))?;
     let (_unused, worker_reader) = pair.into_parts();
     client

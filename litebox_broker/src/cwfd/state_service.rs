@@ -332,6 +332,7 @@ fn dispatch_request(
         Opcode::AttachHostFd => handle_attach_host_fd(registry, request, in_fds),
         Opcode::RegisterOfd => handle_register_ofd(conn, request),
         Opcode::CloneOfd => handle_clone_ofd(conn, request),
+        Opcode::BindNinePSession => handle_bind_nine_p_session(conn, request),
         Opcode::CreateSocketPair => handle_create_socketpair(registry, request, in_fds),
         Opcode::ReadSocketPair => handle_read_socketpair(registry, request, in_fds),
         Opcode::WriteSocketPair => handle_write_socketpair(registry, request, in_fds),
@@ -1010,6 +1011,53 @@ fn handle_clone_ofd(conn: &ConnState, request: &Frame<'_>) -> HandlerResult {
         },
         Err(errno) => HandlerResult {
             frame: build_error_response(Opcode::CloneOfdResponse, errno_to_status(errno)),
+            out_fd: None,
+        },
+    }
+}
+
+/// Legacy-pipes Phase 3 (D3 step 2d.2): pair this fd-token-socket
+/// connection with a 9P session by its broker-assigned conn_id.
+/// The shim issues this op early on the fd-token-socket so the
+/// subsequent `RegisterOfd` / `CloneOfd` handlers can resolve fids
+/// against `ConnState::nine_p_server`.
+fn handle_bind_nine_p_session(conn: &mut ConnState, request: &Frame<'_>) -> HandlerResult {
+    use litebox_common_linux::fd_token_protocol::{
+        build_bind_nine_p_session_response_ok, parse_bind_nine_p_session_body,
+    };
+
+    let nine_p_conn_id = match parse_bind_nine_p_session_body(request.body) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::BindNinePSessionResponse),
+    };
+    let registry = match crate::nine_p_session_registry::global_registry() {
+        Some(r) => r,
+        None => {
+            // Broker isn't running with a session registry (e.g.
+            // unit-test contexts that bypass main). Treat as
+            // unknown so callers see a deterministic failure.
+            return HandlerResult {
+                frame: build_error_response(
+                    Opcode::BindNinePSessionResponse,
+                    StatusCode::UnknownNinePSession,
+                ),
+                out_fd: None,
+            };
+        }
+    };
+    match registry.get(nine_p_conn_id) {
+        Some(server) => {
+            conn.set_nine_p_server(server);
+            HandlerResult {
+                frame: build_bind_nine_p_session_response_ok(),
+                out_fd: None,
+            }
+        }
+        None => HandlerResult {
+            frame: build_error_response(
+                Opcode::BindNinePSessionResponse,
+                StatusCode::UnknownNinePSession,
+            ),
             out_fd: None,
         },
     }

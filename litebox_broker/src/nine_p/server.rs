@@ -121,6 +121,16 @@ pub struct Server {
     /// exercise OFD inheritance); production wiring in
     /// `litebox_broker/src/main.rs` always supplies a real registry.
     ofd_registry: Option<Arc<crate::ofd_registry::OfdRegistry>>,
+    /// Legacy-pipes Phase 3 (D3 step 2d.2): monotone broker-assigned
+    /// per-9P-connection identifier. Mirrors fd-token-socket's
+    /// `ConnState::conn_id` family. Used as the lookup key in the
+    /// broker-global `nine_p_session_registry` so that an
+    /// fd-token-socket connection can issue
+    /// `BindNinePSession(this_conn_id)` to pair its
+    /// `ConnState::nine_p_server` slot with this Server. Default `0`
+    /// for test fixtures that don't go through the production
+    /// accept-loop wiring.
+    conn_id: u64,
 }
 
 impl Server {
@@ -172,7 +182,22 @@ impl Server {
             audit_log: None,
             inotify_dispatcher,
             ofd_registry: None,
+            conn_id: 0,
         }
+    }
+
+    /// Set the broker-assigned 9P connection id. Called once by the
+    /// accept loop in `main.rs` after `with_elf_cache` returns,
+    /// before the per-conn `serve` thread starts. Tests can leave
+    /// the default `0`.
+    pub fn set_conn_id(&mut self, conn_id: u64) {
+        self.conn_id = conn_id;
+    }
+
+    /// Returns the broker-assigned 9P connection id (0 for tests
+    /// that didn't call `set_conn_id`).
+    pub fn conn_id(&self) -> u64 {
+        self.conn_id
     }
 
     /// Set the broker-global OFD registry handle for legacy-pipes

@@ -12,14 +12,23 @@ use super::LocalServiceRegistry;
 
 /// Factory that spawns a service handler on a shared-memory ring buffer pair.
 ///
+/// Spawner type for handling direct 9P connections over a shared-memory ring.
+///
 /// Used for direct IPC connections (LB9P handshake) where the runner upgrades
 /// the control stream to a platform-specific shared-memory transport. The
 /// handler runs in a separate thread.
+///
+/// `conn_id` is the broker-assigned 9P session id allocated by the
+/// LB9P handshake (returned to the runner in the bootstrap ACK) so
+/// the spawned `nine_p::Server` can stamp itself with the same id
+/// and register in the `NinePSessionRegistry` for later
+/// `BindNinePSession` lookup. See `nine_p_session_registry.rs`.
 #[cfg(any(unix, windows))]
 pub type RingServiceSpawner = std::sync::Arc<
     dyn Fn(
             crate::nine_p::transport::ShmemRingWriter,
             crate::nine_p::transport::ShmemRingReader,
+            u64,
         ) -> std::thread::JoinHandle<()>
         + Send
         + Sync,
@@ -375,10 +384,17 @@ fn recv_ring_connection_info(
 }
 
 #[cfg(any(unix, windows))]
-fn ack_ring_connection(stream: &mut IpcStream) {
+fn ack_ring_connection(stream: &mut IpcStream, conn_id: u64) {
     stream.set_nonblocking(false).ok();
     use std::io::Write as _;
-    let _ = stream.write_all(&[LB9P_RING_ACK]);
+    // 9-byte ACK: status byte (LB9P_RING_ACK) + LE u64 conn_id.
+    // Legacy-pipes Phase 3 (D3 step 2d.2): the conn_id pairs this
+    // 9P session with a sibling fd-token-socket via
+    // `BindNinePSession`. Runner reads all 9 bytes.
+    let mut ack = [0u8; 9];
+    ack[0] = LB9P_RING_ACK;
+    ack[1..9].copy_from_slice(&conn_id.to_le_bytes());
+    let _ = stream.write_all(&ack);
 }
 
 #[cfg(unix)]
@@ -387,9 +403,10 @@ fn handle_shared_memory_lb9p_connection(stream: &mut IpcStream, ring_spawner: Ri
         Ok((tx_fd, rx_fd)) => {
             match litebox_common_linux::shmem_ring::ShmemRingPair::open(tx_fd, rx_fd) {
                 Ok((writer, reader)) => {
-                    ack_ring_connection(stream);
-                    ring_spawner(writer, reader);
-                    info!("direct 9P channel connected (shared memory)");
+                    let conn_id = crate::nine_p_session_registry::next_conn_id();
+                    ack_ring_connection(stream, conn_id);
+                    ring_spawner(writer, reader, conn_id);
+                    info!(conn_id, "direct 9P channel connected (shared memory)");
                 }
                 Err(e) => {
                     warn!("failed to open ring pair: {e}");
@@ -407,9 +424,10 @@ fn handle_shared_memory_lb9p_connection(stream: &mut IpcStream, ring_spawner: Ri
     match recv_ring_connection_info(stream) {
         Ok(info) => match litebox_common_windows::shmem_ring::ShmemRingPair::open(&info) {
             Ok((writer, reader)) => {
-                ack_ring_connection(stream);
-                ring_spawner(writer, reader);
-                info!("direct 9P channel connected (shared memory)");
+                let conn_id = crate::nine_p_session_registry::next_conn_id();
+                ack_ring_connection(stream, conn_id);
+                ring_spawner(writer, reader, conn_id);
+                info!(conn_id, "direct 9P channel connected (shared memory)");
             }
             Err(e) => {
                 warn!("failed to open Windows ring pair: {e}");

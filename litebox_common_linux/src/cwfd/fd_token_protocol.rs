@@ -168,6 +168,15 @@ pub enum Opcode {
     /// _reserved: [u8; 4])` — 16 bytes. Issued on the **worker's**
     /// fd-token-socket.
     CloneOfd = 0x55,
+    /// Legacy-pipes Phase 3 (D3 step 2d.2): pair this fd-token-socket
+    /// connection with a 9P session by its broker-assigned conn_id.
+    /// The runner receives its 9P conn_id in the bootstrap ACK from
+    /// `connect_nine_p_channel` and issues this op early on the
+    /// fd-token-socket so subsequent `RegisterOfd` / `CloneOfd` ops
+    /// can resolve fids against the paired 9P `Server`. Body:
+    /// `(nine_p_conn_id: u64)` — 8 bytes. Empty response on success;
+    /// returns `UnknownNinePSession` on unknown conn_id.
+    BindNinePSession = 0x56,
     CreateSocketPair = 0x30,
     ReadSocketPair = 0x31,
     WriteSocketPair = 0x32,
@@ -280,6 +289,8 @@ pub enum Opcode {
     RegisterOfdResponse = 0xD4,
     /// Response for [`Opcode::CloneOfd`]. Empty body on success.
     CloneOfdResponse = 0xD5,
+    /// Response for [`Opcode::BindNinePSession`]. Empty body on success.
+    BindNinePSessionResponse = 0xD6,
     CreateSocketPairResponse = 0xB0,
     ReadSocketPairResponse = 0xB1,
     WriteSocketPairResponse = 0xB2,
@@ -476,6 +487,7 @@ impl Opcode {
             Opcode::AttachHostFd => Some(Opcode::AttachHostFdResponse),
             Opcode::RegisterOfd => Some(Opcode::RegisterOfdResponse),
             Opcode::CloneOfd => Some(Opcode::CloneOfdResponse),
+            Opcode::BindNinePSession => Some(Opcode::BindNinePSessionResponse),
             Opcode::CreateSocketPair => Some(Opcode::CreateSocketPairResponse),
             Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
             Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
@@ -568,6 +580,7 @@ impl Opcode {
                 | Opcode::AttachHostFd
                 | Opcode::RegisterOfd
                 | Opcode::CloneOfd
+                | Opcode::BindNinePSession
                 | Opcode::CreateSocketPair
                 | Opcode::ReadSocketPair
                 | Opcode::WriteSocketPair
@@ -673,6 +686,7 @@ impl TryFrom<u8> for Opcode {
             0x53 => Ok(Opcode::AttachHostFd),
             0x54 => Ok(Opcode::RegisterOfd),
             0x55 => Ok(Opcode::CloneOfd),
+            0x56 => Ok(Opcode::BindNinePSession),
             0x30 => Ok(Opcode::CreateSocketPair),
             0x31 => Ok(Opcode::ReadSocketPair),
             0x32 => Ok(Opcode::WriteSocketPair),
@@ -755,6 +769,7 @@ impl TryFrom<u8> for Opcode {
             0xD3 => Ok(Opcode::AttachHostFdResponse),
             0xD4 => Ok(Opcode::RegisterOfdResponse),
             0xD5 => Ok(Opcode::CloneOfdResponse),
+            0xD6 => Ok(Opcode::BindNinePSessionResponse),
             0xB0 => Ok(Opcode::CreateSocketPairResponse),
             0xB1 => Ok(Opcode::ReadSocketPairResponse),
             0xB2 => Ok(Opcode::WriteSocketPairResponse),
@@ -852,6 +867,10 @@ pub enum StatusCode {
     Protocol = 0x10,
     /// Generic broker-internal error.
     Internal = 0x11,
+    /// Legacy-pipes Phase 3 (D3 step 2d.2): `BindNinePSession` was
+    /// issued with a 9P conn_id that the broker doesn't know about
+    /// (either never opened, or already torn down).
+    UnknownNinePSession = 0x12,
 }
 
 impl TryFrom<u8> for StatusCode {
@@ -874,6 +893,7 @@ impl TryFrom<u8> for StatusCode {
             0x0C => Ok(StatusCode::Io),
             0x10 => Ok(StatusCode::Protocol),
             0x11 => Ok(StatusCode::Internal),
+            0x12 => Ok(StatusCode::UnknownNinePSession),
             other => Err(ProtocolError::UnknownStatus { status: other }),
         }
     }
@@ -2924,6 +2944,71 @@ pub fn parse_clone_ofd_response_body(body: &[u8]) -> Result<(), ProtocolError> {
     if !body.is_empty() {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::CloneOfdResponse,
+            got: body.len(),
+            want: 0,
+        });
+    }
+    Ok(())
+}
+
+// =====================================================================
+// BindNinePSession wire format. Legacy-pipes Phase 3 (D3 step 2d.2).
+//
+// Pairs an fd-token-socket connection with a 9P session by its
+// broker-assigned conn_id (obtained from the bootstrap ACK of
+// `connect_nine_p_channel`). Must be issued before any RegisterOfd /
+// CloneOfd op against the same fd-token-socket connection.
+// =====================================================================
+
+/// Body for [`Opcode::BindNinePSession`]: `(nine_p_conn_id: u64)` — 8 bytes.
+#[must_use]
+pub fn build_bind_nine_p_session_request(nine_p_conn_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::BindNinePSession,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: nine_p_conn_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Parse the body of an [`Opcode::BindNinePSession`] request.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::WrongBodyLen`] if `body.len() != 8`.
+pub fn parse_bind_nine_p_session_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    if body.len() != 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::BindNinePSession,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&body[..8]);
+    Ok(u64::from_le_bytes(buf))
+}
+
+/// Build a successful [`Opcode::BindNinePSessionResponse`] frame.
+#[must_use]
+pub fn build_bind_nine_p_session_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::BindNinePSessionResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+/// Verify a [`Opcode::BindNinePSessionResponse`] success frame body is empty.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::WrongBodyLen`] if `body.len() != 0`.
+pub fn parse_bind_nine_p_session_response_body(body: &[u8]) -> Result<(), ProtocolError> {
+    if !body.is_empty() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::BindNinePSessionResponse,
             got: body.len(),
             want: 0,
         });
@@ -5646,6 +5731,52 @@ mod tests {
             Opcode::RegisterOfdResponse
         );
         assert_eq!(Opcode::try_from(0xD5u8).unwrap(), Opcode::CloneOfdResponse);
+    }
+
+    /// Legacy-pipes Phase 3 (D3 step 2d.2): `BindNinePSession` is an
+    /// 8-byte request body carrying the broker-assigned 9P conn_id,
+    /// and the response is an empty Ok or `UnknownNinePSession`.
+    #[test]
+    fn bind_nine_p_session_round_trip() {
+        let frame = build_bind_nine_p_session_request(0x1234_5678_9ABC_DEF0);
+        let bytes = frame.encode().expect("encode");
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.opcode, Opcode::BindNinePSession);
+        assert_eq!(decoded.status, StatusCode::Ok);
+        let id = parse_bind_nine_p_session_body(decoded.body).expect("parse body");
+        assert_eq!(id, 0x1234_5678_9ABC_DEF0);
+
+        let resp = build_bind_nine_p_session_response_ok();
+        let resp_bytes = resp.encode().expect("encode resp");
+        let decoded_resp = decode(&resp_bytes).expect("decode resp");
+        assert_eq!(decoded_resp.opcode, Opcode::BindNinePSessionResponse);
+        parse_bind_nine_p_session_response_body(decoded_resp.body).expect("parse resp body");
+    }
+
+    #[test]
+    fn bind_nine_p_session_body_rejects_wrong_length() {
+        assert!(parse_bind_nine_p_session_body(&[]).is_err());
+        assert!(parse_bind_nine_p_session_body(&[0u8; 7]).is_err());
+        assert!(parse_bind_nine_p_session_body(&[0u8; 9]).is_err());
+    }
+
+    #[test]
+    fn bind_nine_p_session_opcode_classification() {
+        assert!(Opcode::BindNinePSession.is_request());
+        assert_eq!(
+            Opcode::BindNinePSession.response_for(),
+            Some(Opcode::BindNinePSessionResponse)
+        );
+        assert_eq!(Opcode::try_from(0x56u8).unwrap(), Opcode::BindNinePSession);
+        assert_eq!(
+            Opcode::try_from(0xD6u8).unwrap(),
+            Opcode::BindNinePSessionResponse
+        );
+        // `UnknownNinePSession` status round-trips.
+        assert_eq!(
+            StatusCode::try_from(0x12u8).unwrap(),
+            StatusCode::UnknownNinePSession
+        );
     }
 
     /// Phase F: socketpair wire format mirrors the pipe ops. Verifies

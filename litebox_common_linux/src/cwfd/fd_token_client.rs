@@ -27,9 +27,9 @@
 
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
-    build_attach_host_fd_request, build_clone_ofd_request, build_create_eventfd_request,
-    build_create_pidfd_request, build_create_pipe_request, build_create_pty_request,
-    build_create_signalfd_request, build_create_socketpair_request,
+    build_attach_host_fd_request, build_bind_nine_p_session_request, build_clone_ofd_request,
+    build_create_eventfd_request, build_create_pidfd_request, build_create_pipe_request,
+    build_create_pty_request, build_create_signalfd_request, build_create_socketpair_request,
     build_deliver_signal_inbox_request, build_inet_listener_accept_request,
     build_inet_listener_bind_request, build_inet_listener_create_request,
     build_inet_listener_getsockname_request, build_inet_listener_getsockopt_request,
@@ -54,8 +54,8 @@ use crate::fd_token_protocol::{
     build_subscribe_signal_inbox_request, build_unsubscribe_request,
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
     build_write_socketpair_request, build_write_tcp_conn_request, decode,
-    parse_attach_host_fd_response_body, parse_clone_ofd_response_body,
-    parse_create_pidfd_response_ok, parse_create_pty_response_ok,
+    parse_attach_host_fd_response_body, parse_bind_nine_p_session_response_body,
+    parse_clone_ofd_response_body, parse_create_pidfd_response_ok, parse_create_pty_response_ok,
     parse_create_socketpair_response_body, parse_handle_body,
     parse_inet_listener_accept_response_ok, parse_inet_listener_bind_response_ok,
     parse_inet_listener_create_response_ok, parse_inet_listener_getsockname_response_ok,
@@ -1374,6 +1374,36 @@ impl FdTokenClient {
         match resp.status {
             StatusCode::Ok => {
                 parse_clone_ofd_response_body(resp.body).map_err(ClientError::Protocol)
+            }
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    /// Legacy-pipes Phase 3 (D3 step 2d.2): pair this
+    /// fd-token-socket with a 9P session by its broker-assigned
+    /// `conn_id` (obtained from the bootstrap ACK of
+    /// `connect_nine_p_channel`). Must be called once early on the
+    /// fd-token-socket — before any `RegisterOfd` / `CloneOfd`
+    /// op — so subsequent op handlers find a paired
+    /// `nine_p::Server` in their `ConnState`.
+    pub fn bind_nine_p_session(&self, nine_p_conn_id: u64) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_bind_nine_p_session_request(nine_p_conn_id),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::BindNinePSessionResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_bind_nine_p_session_response_body(resp.body).map_err(ClientError::Protocol)
             }
             s => Err(map_status_no_handle(resp.opcode, s)),
         }
