@@ -5685,7 +5685,6 @@ impl<FS: ShimFS> Task<FS> {
             // layer by reopening the path in the child, so route child writes back
             // through the parent's original open file description.
             {
-                use super::external_fd::ExternalFdDirection;
                 use super::fork_snapshot::FdClass;
 
                 for entry in &fd_table.entries {
@@ -5718,7 +5717,7 @@ impl<FS: ShimFS> Task<FS> {
                     // is idempotent and only mints a broker-side
                     // `Arc<File>` clone — the parent keeps using its
                     // fid normally.
-                    if super::new_mux_enabled() {
+                    {
                         let parent_info: Option<(u32, alloc::string::String)> = {
                             let files = self.files.borrow();
                             files
@@ -5766,7 +5765,7 @@ impl<FS: ShimFS> Task<FS> {
                                     #[cfg(feature = "trace_syscalls")]
                                     litebox::log_println!(
                                         self.global.platform,
-                                        "[DELAYED-FORK] pid={}: fs fd={} parent_fid={} register_ofd failed: {:?}; falling back to mux relay",
+                                        "[DELAYED-FORK] pid={}: fs fd={} parent_fid={} register_ofd failed: {:?}",
                                         self.pid,
                                         entry.fd,
                                         parent_fid,
@@ -5776,21 +5775,6 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
                     }
-
-                    let (read_fd, write_fd) = match self.global.platform.create_external_fd() {
-                        Ok(pair) => pair,
-                        Err(_) => continue,
-                    };
-
-                    child_pipe_bridges.push((entry.fd, write_fd, ExternalFdDirection::Write));
-                    bridge_drained.push(Vec::new());
-                    bridge_host_fd.push(-1);
-                    bridge_parent_info.push(alloc::vec![(
-                        entry.fd,
-                        ExternalFdDirection::Read,
-                        crate::ReplacedSubsystem::Filesystem,
-                    )]);
-                    self.global.platform.close_host_fd(read_fd);
                 }
             }
 
@@ -5984,7 +5968,7 @@ impl<FS: ShimFS> Task<FS> {
                     // must not also be emitted as legacy --mux-stream specs.
                     let mut handled_as_broker_bridge = false;
 
-                    if is_virtual_pipe && super::new_mux_enabled() {
+                    if is_virtual_pipe {
                         let drained = bridge_drained.get(i).cloned().unwrap_or_default();
                         let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
                         if let Some(provider) = super::broker_pipe::broker_pipe_provider() {
@@ -6152,7 +6136,7 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     }
 
-                    if is_pty_stream && !is_host_backed && super::new_mux_enabled() {
+                    if is_pty_stream && !is_host_backed {
                         let pty_parent_fds: alloc::vec::Vec<usize> = bridge_parent_info
                             .get(i)
                             .map(|parents| {
@@ -6265,7 +6249,7 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     }
 
-                    if is_host_backed && super::new_mux_enabled() {
+                    if is_host_backed {
                         let host_fd = bridge_host_fd[i];
                         // Try to migrate this host-backed stream onto a
                         // direct broker handle, eliminating its need for
@@ -6337,30 +6321,10 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     }
 
-                    if is_host_backed && !handled_as_broker_bridge {
-                        // Host-backed pipe: parent mux dispatcher relays to
-                        // the existing host OS fd.  The child worker gets a
-                        // virtual pipe via the mux stream instead.
-                        let parent_dir = match direction {
-                            ExternalFdDirection::Read => ExternalFdDirection::Write,
-                            ExternalFdDirection::Write => ExternalFdDirection::Read,
-                            ExternalFdDirection::ReadWrite => {
-                                unreachable!("bidi sockets use passthrough")
-                            }
-                        };
-                        mux_parent_streams.push(crate::MuxParentStream {
-                            stream_id,
-                            guest_fd,
-                            direction: parent_dir,
-                            subsystem: crate::ReplacedSubsystem::Pipe,
-                            drained_data: Vec::new(),
-                            external_fd_fd: bridge_host_fd[i],
-                            use_existing_pipe: false,
-                        });
-                    } else if !is_host_backed && !handled_as_broker_bridge {
+                    if !is_host_backed && !handled_as_broker_bridge {
                         // Virtual pipe/socket bridge: close the child-side OS
-                        // pipe fd (the mux creates a virtual pipe on the worker
-                        // side instead).
+                        // pipe fd. D5 migrations install broker-backed
+                        // replacements; nothing else is needed here.
                         self.global.platform.close_host_fd(child_os_fd);
 
                         let drained = bridge_drained.get(i).cloned().unwrap_or_default();
@@ -6368,7 +6332,7 @@ impl<FS: ShimFS> Task<FS> {
                         // Build a MuxParentStream for each parent counterpart.
                         let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
 
-                        if type_byte == b's' && super::new_mux_enabled() {
+                        if type_byte == b's' {
                             let child_nonblock = {
                                 let files = self.files.borrow();
                                 let rds = files.raw_descriptor_store.read();
@@ -6480,103 +6444,8 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
 
-                        // Check if the pipe's writer is already closed.
-                        // When a Read-direction child pipe has a closed writer
-                        // and there's drained data, no more data can arrive.
-                        // Treat this like an orphan — use a local pipe on the
-                        // worker.  This avoids setting up a mux relay that
-                        // would consume restored ring-buffer data from the
-                        // parent's pipe after vfork CoW pipe position restore.
-                        let writer_closed = if direction == ExternalFdDirection::Read {
-                            let files = self.files.borrow();
-                            let rds = files.raw_descriptor_store.read();
-                            if let Ok(typed) = rds
-                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                    guest_fd,
-                                )
-                            {
-                                drop(rds);
-                                self.global.pipes.is_writer_closed(&typed)
-                            } else {
-                                drop(rds);
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if handled_as_broker_bridge {
-                            // The virtual socket stream was replaced by direct broker
-                            // socketpair handles above. Keep the legacy mux parent
-                            // structures untouched for this stream.
-                        } else if parents.is_empty()
-                            || (writer_closed && direction == ExternalFdDirection::Read)
-                        {
-                            #[cfg(feature = "trace_syscalls")]
-                            if writer_closed && !parents.is_empty() {
-                                litebox::log_println!(
-                                    self.global.platform,
-                                    "[DELAYED-FORK] pid={}: fd={} writer closed, treating as orphan (skipping mux relay)",
-                                    self.pid,
-                                    guest_fd,
-                                );
-                            }
-                            {
-                                // No parent counterpart — the write end of this
-                                // pipe was closed before migration.  Use a local
-                                // pipe on the worker (like child-only pipes): the
-                                // worker creates a connected pair, pre-fills the
-                                // drained data, and closes the write end.  The
-                                // guest reads the data and then gets EOF.
-                                //
-                                // This avoids the mux path entirely for orphans,
-                                // sidestepping the pollee.wait hang that affects
-                                // mux relay writes on fork-restore workers.
-                                if direction == ExternalFdDirection::Read && !drained.is_empty() {
-                                    local_pipe_pairs.push((
-                                        usize::MAX, // write_fd sentinel: close immediately
-                                        guest_fd,   // read_fd: guest reads here
-                                        drained,
-                                        0, // write flags
-                                        0, // read flags
-                                    ));
-                                    handled_as_local_pipe = true;
-                                } else {
-                                    // No data or Write direction — send RESET via mux.
-                                    orphan_stream_ids.push((stream_id, drained));
-                                }
-                            }
-                        } else {
-                            for (j, &(parent_fd, parent_dir, subsystem)) in
-                                parents.iter().enumerate()
-                            {
-                                mux_parent_streams.push(crate::MuxParentStream {
-                                    stream_id,
-                                    guest_fd: parent_fd,
-                                    direction: parent_dir,
-                                    subsystem,
-                                    drained_data: if j == 0 { drained.clone() } else { Vec::new() },
-                                    external_fd_fd: -1,
-                                    use_existing_pipe: !parent_replacements
-                                        .iter()
-                                        .any(|pr| pr.guest_fd == parent_fd),
-                                });
-                            }
-                        }
-                    }
-
-                    // Push to mux_stream_specs only if not handled as a
-                    // local pipe (orphan read-end with drained data) and
-                    // not migrated to a direct broker handle
-                    // (Phase 3 D5).
-                    if !handled_as_local_pipe && !handled_as_broker_bridge {
-                        mux_stream_specs.push((
-                            stream_id,
-                            guest_fd,
-                            dir_byte,
-                            type_byte,
-                            initial_eof,
-                        ));
+                        let _ = drained;
+                        let _ = parents;
                     }
                 }
 
