@@ -5299,10 +5299,6 @@ struct ForkContext {
     parent_process_id: litebox::process::ProcessId,
     /// Parent controlling PTY before the vfork child borrowed ProcessState.
     parent_controlling_pty: Option<u32>,
-    /// Snapshot of the parent's pipe FDs at fork time: (guest_fd, direction, pipe_pair_id).
-    /// Used by `commit_delayed_fork` to find the parent's counterpart pipe endpoints
-    /// so both sides can be replaced with real OS pipes.
-    parent_pipe_fds: Vec<(usize, syscalls::external_fd::ExternalFdDirection, usize)>,
     /// Snapshot of the parent's Unix socket FDs at fork time:
     /// (guest_fd, socket_pair_id, object_id).
     /// Used by `commit_delayed_fork` to find the parent's peer socket endpoints
@@ -5311,12 +5307,6 @@ struct ForkContext {
     /// Broker PTY raw fds that belonged to the parent at fork time. A vfork child
     /// closing one of these must not invalidate the parent's descriptor slot.
     pub(crate) parent_broker_pty_fds: Vec<usize>,
-    /// Pipe pair_ids of virtual pipes created by prior siblings' mux
-    /// dispatchers or fd-replacement relays.  Inherited from the parent's
-    /// `mux_pipe_pair_ids`.  Used by `commit_delayed_fork` to exclude
-    /// these infrastructure pipes from child_pipes, preventing nested
-    /// mux-over-mux bridging.
-    parent_mux_pipe_pair_ids: Vec<usize>,
     /// True if the parent is itself a delayed-fork child (nested vfork).
     /// When true, `commit_delayed_fork` must not replace the parent's
     /// pipe fds because the parent shares the grandparent's fd table.
@@ -5434,10 +5424,8 @@ struct Task<FS: ShimFS> {
     /// the host thread belongs to the parent runtime and must remain alive).
     local_task_terminated: Cell<bool>,
     /// Pipe pair_ids of virtual pipes created by the mux dispatcher or fd
-    /// replacement relay setup.  These are infrastructure pipes that should
-    /// NOT be bridged again when a subsequent child forks.  Tracked so that
-    /// `ForkContext.parent_pipe_fds` can exclude them, preventing nested
-    /// mux-over-mux bridging that destroys the first mux's endpoints.
+    /// replacement relay setup. Legacy field — retained for potential
+    /// future cleanup but no longer actively populated.
     mux_pipe_pair_ids: RefCell<Vec<usize>>,
 
     /// Active netlink sockets, keyed by guest fd number.

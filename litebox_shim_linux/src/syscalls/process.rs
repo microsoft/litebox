@@ -43,7 +43,6 @@ use litebox_platform_multiplex::Platform;
 /// `exec_on_remote_host` so it can set up ExternalFd replacements.
 type ExecVforkInfo = (
     Arc<crate::VforkDone>,
-    Vec<(usize, super::external_fd::ExternalFdDirection, usize)>,
     // parent_unix_socket_fds: (fd, pair_id, object_id)
     Vec<(usize, usize, u64)>,
 );
@@ -2594,7 +2593,6 @@ impl<FS: ShimFS> Task<FS> {
                 exit_signal: i32::try_from(args.exit_signal).unwrap_or(0),
                 parent_process_id: self.process_id,
                 parent_controlling_pty: *self.process_state.borrow().controlling_pty.lock(),
-                parent_pipe_fds: Vec::new(),
                 parent_unix_socket_fds: {
                     let files = self.files.borrow();
                     let rds = files.raw_descriptor_store.read();
@@ -2640,7 +2638,6 @@ impl<FS: ShimFS> Task<FS> {
                         })
                         .collect()
                 },
-                parent_mux_pipe_pair_ids: self.mux_pipe_pair_ids.borrow().clone(),
                 parent_is_delayed_fork: self.delayed_fork_pending.get() || nested_delayed_fork,
                 fork_snapshot_broker_transit: Vec::new(),
                 fork_snapshot_pidfd_process_transit: Vec::new(),
@@ -3451,8 +3448,6 @@ impl<FS: ShimFS> Task<FS> {
             let files = self.files.borrow();
             let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
 
-            // Gather child's pipe FDs with their directions and pair IDs.
-            let mut child_pipes: Vec<(usize, ExternalFdDirection, usize)> = Vec::new();
             // Gather child's external fd TypedFds (from prior delayed-fork bridges).
             let mut child_external_fd_fds: Vec<(
                 usize,
@@ -3492,43 +3487,6 @@ impl<FS: ShimFS> Task<FS> {
             // sibling's mux dispatcher or fd-replacement relay.  Bridging
             // them would create nested mux-over-mux, destroying the first
             // mux's data flow.
-            if !fc.parent_mux_pipe_pair_ids.is_empty() {
-                let _before = child_pipes.len();
-                child_pipes.retain(|&(_raw_fd, _, pair_id)| {
-                    let is_mux = fc.parent_mux_pipe_pair_ids.contains(&pair_id);
-                    #[cfg(feature = "trace_syscalls")]
-                    if is_mux {
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[DELAYED-FORK] pid={}: filtering inherited mux pipe fd={} pair_id={:#x}",
-                            self.pid,
-                            _raw_fd,
-                            pair_id,
-                        );
-                    }
-                    !is_mux
-                });
-                #[cfg(feature = "trace_syscalls")]
-                if child_pipes.len() < _before {
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[DELAYED-FORK] pid={}: filtered {} mux-managed pipes from child_pipes ({} → {})",
-                        self.pid,
-                        _before - child_pipes.len(),
-                        _before,
-                        child_pipes.len(),
-                    );
-                }
-            }
-
-            #[cfg(feature = "trace_syscalls")]
-            litebox::log_println!(
-                self.global.platform,
-                "[DELAYED-FORK] pid={}: found {} child_pipes, {} external_fd_fds",
-                self.pid,
-                child_pipes.len(),
-                child_external_fd_fds.len(),
-            );
 
             // Extract OS fd + direction from collected external-fd TypedFds.
             // Done after dropping rds to maintain dt→rds lock ordering.
@@ -3548,323 +3506,9 @@ impl<FS: ShimFS> Task<FS> {
 
             let mut parent_replacements: Vec<crate::FdReplacement> = Vec::new();
 
-            // Log parent_pipe_fds for debugging counterpart matching.
-            #[cfg(feature = "trace_syscalls")]
-            for &(fd, dir, pair_id) in &fc.parent_pipe_fds {
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: parent_pipe_fd: fd={} dir={:?} pair_id={:#x}",
-                    self.pid,
-                    fd,
-                    dir,
-                    pair_id,
-                );
-            }
-
-            #[cfg(feature = "trace_syscalls")]
-            litebox::log_println!(
-                self.global.platform,
-                "[DELAYED-FORK] pid={}: starting OS pipe creation for {} pipes",
-                self.pid,
-                child_pipes.len(),
-            );
-
-            // Track parent fds already claimed by a bridge so that a
-            // pair_id match on one stream doesn't collide with an
-            // fd-number fallback on another stream.
-            let mut claimed_parent_fds: Vec<usize> = Vec::new();
-
-            // Track (pair_id, direction) → bridge index for dedup.
             // If two child fds share the same pipe end (e.g. after
             // dup2), only the first gets a real OS pipe bridge; the
             // second reuses the same OS pipe fd via dup.
-            let mut pipe_dedup: Vec<(usize, super::external_fd::ExternalFdDirection, usize)> =
-                Vec::new(); // (pair_id, dir, bridge_index)
-
-            for &(child_fd, child_dir, child_pair_id) in &child_pipes {
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: child_pipe: fd={} dir={:?} pair_id={:#x}",
-                    self.pid,
-                    child_fd,
-                    child_dir,
-                    child_pair_id,
-                );
-                // Dedup: if another child fd with the same (pair_id,
-                // direction) was already bridged, DON'T create a
-                // separate bridge/stream.  Instead, record as an
-                // alias — the worker will dup the primary stream's
-                // pipe end to this fd.  This ensures aliases share
-                // one mux stream and one parent counterpart.
-                if let Some(&(_, _, existing_idx)) = pipe_dedup
-                    .iter()
-                    .find(|&&(pid, dir, _)| pid == child_pair_id && dir == child_dir)
-                {
-                    mux_aliases.push((child_fd, existing_idx));
-                    continue;
-                }
-
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: creating OS pipe for child_fd={} dir={:?}",
-                    self.pid,
-                    child_fd,
-                    child_dir,
-                );
-                // Create a real OS pipe pair.
-                let (os_read, os_write) = match self.global.platform.create_external_fd() {
-                    Ok(pair) => pair,
-                    Err(_e) => {
-                        #[cfg(feature = "trace_syscalls")]
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[DELAYED-FORK] pid={}: create_external_fd failed: {}",
-                            self.pid,
-                            _e,
-                        );
-                        // Close any already-created OS pipes.
-                        for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                            let is_host_owned =
-                                bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
-                            if !is_host_owned {
-                                self.global.platform.close_host_fd(os_fd);
-                            }
-                        }
-                        for pr in &parent_replacements {
-                            self.global.platform.close_host_fd(pr.host_fd);
-                        }
-                        put_fc_back(self, fc);
-                        return Err(Errno::ENOMEM);
-                    }
-                };
-
-                // Child direction determines which OS pipe end goes where.
-                let (child_os_fd, parent_os_fd) = match child_dir {
-                    ExternalFdDirection::Read => (os_read, os_write),
-                    ExternalFdDirection::Write => (os_write, os_read),
-                    ExternalFdDirection::ReadWrite => unreachable!("bidi sockets use passthrough"),
-                };
-
-                // For Read-direction children: drain any data already buffered
-                // in the virtual pipe into the OS pipe.
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: OS pipe created for fd={}, starting drain check",
-                    self.pid,
-                    child_fd,
-                );
-                // where a builtin (e.g. `echo`) wrote to the virtual pipe
-                // without triggering delayed fork, then the reader (e.g. `cat`)
-                // commits and needs that data in the OS pipe.
-                let mut this_drained: Vec<u8> = Vec::new();
-                if child_dir == ExternalFdDirection::Read {
-                    #[cfg(feature = "trace_syscalls")]
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[DELAYED-FORK] pid={}: drain: borrowing files for fd={}",
-                        self.pid,
-                        child_fd,
-                    );
-                    let files = self.files.borrow();
-                    let rds = files.raw_descriptor_store.read();
-                    #[cfg(feature = "trace_syscalls")]
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[DELAYED-FORK] pid={}: drain: got rds lock for fd={}",
-                        self.pid,
-                        child_fd,
-                    );
-                    drop(rds);
-                    drop(files);
-                }
-
-                child_pipe_bridges.push((child_fd, child_os_fd, child_dir));
-                bridge_drained.push(this_drained);
-                bridge_host_fd.push(-1);
-
-                // Record for dedup so aliases reuse this bridge.
-                pipe_dedup.push((child_pair_id, child_dir, child_pipe_bridges.len() - 1));
-
-                // Find the parent's counterpart(s) for this pipe.
-                //
-                // Strategy (in priority order):
-                // 1. pair_id + opposite direction — the parent has the other
-                //    end of the SAME pipe pair.  Handles dup2'd pipes where
-                //    the child moved the pipe to a different fd number.
-                // 2. Same fd number — the parent has a pipe at the same fd
-                //    slot.  Handles inherited pipes (same or different pair)
-                //    and post-fork pipe() at previously-occupied slots.
-                // 3. Neither — orphan (broken pipe / child-only pipe).
-                //
-                // Both strategies skip parent fds already claimed by a
-                // previous bridge to prevent two streams from replacing
-                // the same parent fd.
-                let parent_counterparts: Vec<(usize, ExternalFdDirection)> = fc
-                    .parent_pipe_fds
-                    .iter()
-                    .filter(|&&(fd, dir, pair_id)| {
-                        pair_id == child_pair_id
-                            && dir != child_dir
-                            && !claimed_parent_fds.contains(&fd)
-                    })
-                    .map(|&(fd, dir, _)| (fd, dir))
-                    .collect();
-
-                // Fallback: match by fd number if pair_id matching found
-                // nothing.  The parent and child may have different pipes at
-                // the same fd slot (e.g. child did close+pipe after fork),
-                // but bridging to the parent's pipe preserves the slot
-                // semantics that the parent expects.
-                //
-                // The direction is always set to the OPPOSITE of the child's
-                // direction (representing the data flow from the parent's
-                // perspective: child-Write → parent-Read, child-Read →
-                // parent-Write).  For pair_id matches this is naturally
-                // correct; for fd-number fallback the parent's pipe half
-                // type may differ from the data flow direction.
-                let flow_dir = match child_dir {
-                    ExternalFdDirection::Read => ExternalFdDirection::Write,
-                    ExternalFdDirection::Write => ExternalFdDirection::Read,
-                    ExternalFdDirection::ReadWrite => unreachable!("bidi sockets use passthrough"),
-                };
-                // Strategy 1.5: pair_id + SAME direction.  Handles
-                // inherited/dup2'd pipe ends where the child got a copy of the
-                // parent's own end (same pair_id, same direction) and the
-                // sender/receiver lives in a different process.  The parent
-                // only holds one end of the pipe so this is never a first-fork
-                // scenario — we set matched_by_pair_id=false so is_first_fork
-                // uses the fd-number fallback which correctly returns false.
-                let parent_same_dir: Vec<(usize, ExternalFdDirection)> = fc
-                    .parent_pipe_fds
-                    .iter()
-                    .filter(|&&(fd, dir, pair_id)| {
-                        pair_id == child_pair_id
-                            && dir == child_dir
-                            && !claimed_parent_fds.contains(&fd)
-                    })
-                    .map(|&(fd, _, _)| (fd, flow_dir))
-                    .collect();
-
-                let (counterparts, matched_by_pair_id) = if !parent_counterparts.is_empty() {
-                    (parent_counterparts, true)
-                } else if !parent_same_dir.is_empty() {
-                    // Same-direction pair_id match — treat like fd-number
-                    // fallback for is_first_fork purposes (parent only has
-                    // one end, never first fork).
-                    (parent_same_dir, false)
-                } else if let Some(&(parent_fd, _, _)) = fc
-                    .parent_pipe_fds
-                    .iter()
-                    .find(|&&(fd, _, _)| fd == child_fd && !claimed_parent_fds.contains(&fd))
-                {
-                    (alloc::vec![(parent_fd, flow_dir)], false)
-                } else {
-                    (Vec::new(), false)
-                };
-
-                #[cfg(feature = "trace_syscalls")]
-                litebox::log_println!(
-                    self.global.platform,
-                    "[DELAYED-FORK] pid={}: counterpart child_fd={} child_pair_id={:#x} child_dir={:?} → {} match(es), by_pair_id={}, counterparts={:?}",
-                    self.pid,
-                    child_fd,
-                    child_pair_id,
-                    child_dir,
-                    counterparts.len(),
-                    matched_by_pair_id,
-                    counterparts,
-                );
-
-                // Mark all matched parent fds as claimed.
-                for &(fd, _) in &counterparts {
-                    claimed_parent_fds.push(fd);
-                }
-
-                if counterparts.is_empty() {
-                    // No counterpart in parent — the parent may have already
-                    // closed this end (broken pipe). Close the unused OS end.
-                    self.global.platform.close_host_fd(parent_os_fd);
-                    bridge_parent_info.push(Vec::new());
-                } else {
-                    // First-fork check: the parent holds an fd on the same
-                    // pipe pair with the OPPOSITE direction from the
-                    // counterpart (i.e. both ends live in the parent's fd
-                    // table).  For pair_id matches this means the parent
-                    // also has child_dir; for fd-number fallback, use the
-                    // parent's ACTUAL direction at the matched fd (not the
-                    // synthetic flow_dir) to avoid self-matching.
-                    let is_first_fork = if matched_by_pair_id {
-                        fc.parent_pipe_fds
-                            .iter()
-                            .any(|&(_, dir, pair_id)| pair_id == child_pair_id && dir == child_dir)
-                    } else {
-                        let matched_fd = counterparts[0].0;
-                        // Look up the parent's actual direction and pair_id
-                        // at the matched fd.
-                        let matched_entry = fc
-                            .parent_pipe_fds
-                            .iter()
-                            .find(|&&(fd, _, _)| fd == matched_fd);
-                        matched_entry.is_some_and(|&(_, actual_dir, pid)| {
-                            // First fork requires a SECOND fd on the same
-                            // pair with the opposite direction.  Using
-                            // actual_dir (not flow_dir) prevents the matched
-                            // fd from satisfying its own predicate.
-                            fc.parent_pipe_fds.iter().any(|&(fd, dir, pair_id)| {
-                                pair_id == pid && dir != actual_dir && fd != matched_fd
-                            })
-                        })
-                    };
-
-                    #[cfg(feature = "trace_syscalls")]
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[DELAYED-FORK] pid={}: child_fd={} is_first_fork={} matched_by_pair_id={}",
-                        self.pid,
-                        child_fd,
-                        is_first_fork,
-                        matched_by_pair_id,
-                    );
-
-                    if is_first_fork {
-                        // First fork: parent has both ends.  The relay
-                        // replaces the parent's counterpart fd(s) with
-                        // new virtual pipe(s).
-                        let mut first = true;
-                        for &(parent_fd, parent_dir) in &counterparts {
-                            let host_fd = if first {
-                                first = false;
-                                parent_os_fd
-                            } else {
-                                match self.global.platform.dup_host_fd(parent_os_fd) {
-                                    Ok(fd) => fd,
-                                    Err(_) => continue,
-                                }
-                            };
-                            parent_replacements.push(crate::FdReplacement {
-                                guest_fd: parent_fd,
-                                host_fd,
-                                direction: parent_dir,
-                                subsystem: crate::ReplacedSubsystem::Pipe,
-                                direct: false,
-                            });
-                        }
-                    } else {
-                        // Nested fork: close the unused OS pipe end — the
-                        // mux relays directly to the parent's existing pipe.
-                        self.global.platform.close_host_fd(parent_os_fd);
-                    }
-                    bridge_parent_info.push(
-                        counterparts
-                            .iter()
-                            .map(|&(fd, dir)| (fd, dir, crate::ReplacedSubsystem::Pipe))
-                            .collect(),
-                    );
-                }
-            }
 
             // Host-backed pipes (from prior delayed-fork bridges) are already
             // backed by real OS fds.  With the mux, these go through the
@@ -8425,7 +8069,7 @@ impl<FS: ShimFS> Task<FS> {
         // Helper: signal VforkDone (if present) so the parent is never left
         // blocked on error.
         let signal_on_error = |vfork_info: &Option<ExecVforkInfo>| {
-            if let Some((vd, _, _)) = vfork_info {
+            if let Some((vd, _)) = vfork_info {
                 vd.signal();
             }
         };
@@ -8444,21 +8088,7 @@ impl<FS: ShimFS> Task<FS> {
         let stdio_pipe_info: Vec<(i32, usize, super::external_fd::ExternalFdDirection)> =
             Vec::new();
 
-        let use_direct_stdio = if let Some((_, parent_pipe_fds, _)) = &vfork_info {
-            !stdio_pipe_info.is_empty()
-                && stdio_pipe_info
-                    .iter()
-                    .all(|(_, child_pair_id, child_direction)| {
-                        parent_pipe_fds
-                            .iter()
-                            .any(|&(_, parent_direction, parent_pair_id)| {
-                                parent_pair_id == *child_pair_id
-                                    && parent_direction != *child_direction
-                            })
-                    })
-        } else {
-            false
-        };
+        let use_direct_stdio = false;
 
         // Non-stdio broker-backed pipe/socketpair fds are transferred to the
         // remote worker via --broker-fd-bridge specs below. Legacy local
@@ -9148,31 +8778,11 @@ impl<FS: ShimFS> Task<FS> {
             );
         }
 
-        if let Some((vd, parent_pipe_fds, _parent_socket_fds)) = &vfork_info {
+        if let Some((vd, _parent_socket_fds)) = &vfork_info {
+            // direct_pipes is always empty since use_direct_stdio is
+            // always false (pipe subsystem removed).
             for direct in spawn_result.direct_pipes {
-                let mut stored = false;
-                if let Some((_, child_pair_id, child_direction)) = stdio_pipe_info
-                    .iter()
-                    .find(|(fd, _, _)| *fd == direct.child_stdio_fd)
-                {
-                    for &(parent_fd, parent_direction, parent_pair_id) in parent_pipe_fds {
-                        if parent_pair_id == *child_pair_id && parent_direction != *child_direction
-                        {
-                            vd.fd_replacements.lock().push(crate::FdReplacement {
-                                guest_fd: parent_fd,
-                                host_fd: direct.parent_os_fd,
-                                direction: parent_direction,
-                                subsystem: crate::ReplacedSubsystem::Pipe,
-                                direct: true,
-                            });
-                            stored = true;
-                            break;
-                        }
-                    }
-                }
-                if !stored {
-                    self.global.platform.close_host_fd(direct.parent_os_fd);
-                }
+                self.global.platform.close_host_fd(direct.parent_os_fd);
             }
 
             vd.signal();
@@ -9531,8 +9141,7 @@ impl<FS: ShimFS> Task<FS> {
                 // Don't signal VforkDone here — exec_on_remote_host will signal
                 // it after spawning the worker and setting up pipe replacements
                 // so the parent can use direct ExternalFd I/O.
-                vfork_info_for_exec =
-                    Some((fc.vfork_done, fc.parent_pipe_fds, fc.parent_unix_socket_fds));
+                vfork_info_for_exec = Some((fc.vfork_done, fc.parent_unix_socket_fds));
                 detached_from_shared_fork = true;
             }
             let remote_interp_image = remote_interp_image
