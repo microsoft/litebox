@@ -21,6 +21,7 @@ pub mod eventfd_state;
 pub mod fd_token_service;
 pub mod fd_token_socket;
 pub mod fd_tokens;
+pub mod host_fd_state;
 pub mod inet_dgram_state;
 pub mod inet_listener_state;
 pub mod inet_raw_state;

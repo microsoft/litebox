@@ -5355,7 +5355,10 @@ mod tests {
             Some(Opcode::AttachHostFdResponse)
         );
         assert_eq!(Opcode::try_from(0x53u8).unwrap(), Opcode::AttachHostFd);
-        assert_eq!(Opcode::try_from(0xD3u8).unwrap(), Opcode::AttachHostFdResponse);
+        assert_eq!(
+            Opcode::try_from(0xD3u8).unwrap(),
+            Opcode::AttachHostFdResponse
+        );
     }
 
     /// Phase F: socketpair wire format mirrors the pipe ops. Verifies

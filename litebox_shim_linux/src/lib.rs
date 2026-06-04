@@ -486,10 +486,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     alloc::sync::Arc::clone(&provider) as _;
                 let _ = releaser.dup_handle(handle_id);
                 let bp_fd = syscalls::broker_pipe::BrokerPipeFd::<Platform>::new(
-                    provider,
-                    handle_id,
-                    direction,
-                    pipe_flags,
+                    provider, handle_id, direction, pipe_flags,
                     1, // creation_site: install_broker_bridge_fd
                 );
                 let typed: litebox::fd::TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem> = self

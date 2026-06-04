@@ -1240,9 +1240,7 @@ fn subcmd_nonblock_fork(args: &[String]) -> i32 {
         let mut buf = [0u8; 16];
         if r_nb {
             // Safety: rfd is a valid fd, buf is a valid mutable slice.
-            let n = unsafe {
-                libc::read(rfd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
-            };
+            let n = unsafe { libc::read(rfd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
             if n != -1 || (errno() != libc::EAGAIN && errno() != libc::EWOULDBLOCK) {
                 println!("PFLG_NB_FAIL:read_should_eagain:n={n},errno={}", errno());
                 std::process::exit(3);
@@ -1252,15 +1250,13 @@ fn subcmd_nonblock_fork(args: &[String]) -> i32 {
         // Round-trip a byte to confirm the pipe is wired up correctly.
         let msg = b"X";
         // Safety: wfd is valid, msg is valid initialised memory.
-        let wn =
-            unsafe { libc::write(wfd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
+        let wn = unsafe { libc::write(wfd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
         if wn != 1 {
             println!("PFLG_NB_FAIL:roundtrip_write:n={wn},errno={}", errno());
             std::process::exit(4);
         }
         // Safety: rfd is valid, buf has room for one byte.
-        let rn =
-            unsafe { libc::read(rfd, buf.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        let rn = unsafe { libc::read(rfd, buf.as_mut_ptr().cast::<libc::c_void>(), 1) };
         if rn != 1 || buf[0] != b'X' {
             println!("PFLG_NB_FAIL:roundtrip_read:n={rn},b0={}", buf[0]);
             std::process::exit(4);
