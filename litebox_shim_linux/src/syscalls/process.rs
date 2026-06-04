@@ -5828,10 +5828,23 @@ impl<FS: ShimFS> Task<FS> {
                                     ));
                                     broker_fd_bridge_transit_release.push((releaser, handle_id));
                                     handled_as_broker_bridge = true;
+                                    // Close the parent's reference to the host fd so the
+                                    // broker's SCM_RIGHTS-received dup is the sole holder
+                                    // of the OFD's reader/writer refcount. Without this
+                                    // close, dir='w' streams hang because the downstream
+                                    // reader never sees EOF when the worker exits — the
+                                    // parent's lingering fd keeps the writer-side OFD
+                                    // refcount above zero. Mirrors the legacy mux relay's
+                                    // close at the end of the relay loop
+                                    // (process.rs:3531-3543, 3562-3574). Skip stdio
+                                    // (fds 0/1/2) per the relay policy.
+                                    if host_fd > 2 {
+                                        self.global.platform.close_host_fd(host_fd);
+                                    }
                                     #[cfg(feature = "trace_syscalls")]
                                     litebox::log_println!(
                                         self.global.platform,
-                                        "[DELAYED-FORK] pid={}: stream={} host_fd={} (dup'd) migrated to broker handle {} (dir={})",
+                                        "[DELAYED-FORK] pid={}: stream={} host_fd={} (dup'd, original closed) migrated to broker handle {} (dir={})",
                                         self.pid,
                                         stream_id,
                                         host_fd,
