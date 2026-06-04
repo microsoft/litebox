@@ -971,7 +971,8 @@ exception:
 
 | Env var                      | Default                       | Effect                                                          |
 |------------------------------|-------------------------------|-----------------------------------------------------------------|
-| `LITEBOX_TEST_JOBS`          | `clamp(num_cpus / 1.5, 2, 10)`| Max concurrent `docker run` invocations (the real test parallelism cap). |
+| `LITEBOX_TEST_JOBS`          | `clamp(num_cpus / 1.5, 2, 20)`| Per-process upper bound on concurrent `docker run` invocations. **Do not set this to an arbitrary number** (e.g. `1`, `4`, `$(nproc)`). The lease coordinator (`tests/common/lease.rs`) already divides the host-wide budget (`LITEBOX_GLOBAL_JOBS`, default `nproc * 2/3`) fairly across all live `cargo test` runners on the box — agents that set `LITEBOX_TEST_JOBS=4` are self-throttling below their fair share; agents that set `LITEBOX_TEST_JOBS=$(nproc)` are no-ops (the lease still clamps them). The harness prints a `[integration] advisory: …` line at startup whenever an explicit `LITEBOX_TEST_JOBS` differs from the lease share, so you'll see it in your own log. Only set this for single-runner stress tests when no other harnesses are live on the host. |
+| `LITEBOX_GLOBAL_JOBS`        | `(num_cpus * 2) / 3`          | Host-wide budget the lease coordinator divides across live harnesses. Override only if you've measured docker-daemon contention on this specific host. |
 | `LITEBOX_DRAIN_BACKLOG`      | `4 * LITEBOX_TEST_JOBS`       | Max in-flight post-result drain threads.                        |
 | `LITEBOX_TEST_MEMORY`        | `8g`                          | Per-container `--memory` and `--memory-swap` (safety bound — OOM-kill on excess; no swap thrash). |
 | `LITEBOX_TEST_PIDS`          | `8192`                        | Per-container `--pids-limit` (safety bound).                    |
