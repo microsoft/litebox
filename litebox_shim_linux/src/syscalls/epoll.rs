@@ -62,7 +62,7 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
     #[cfg(feature = "worker_local_inet")]
     Socket(Arc<super::net::SocketFd>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
-    ExternalFd(Arc<TypedFd<super::external_fd::ExternalFdSubsystem>>),
+    HostPassthroughFd(Arc<TypedFd<super::host_passthrough_fd::HostPassthroughFd>>),
     BrokerPipe(Arc<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
     BrokerPty(Arc<TypedFd<super::broker_pty::BrokerPtySubsystem>>),
     BrokerSocketPair(Arc<TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>),
@@ -90,7 +90,9 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 Ok(EpollDescriptor::Epoll(handle))
             }
             crate::RawFdRef::Unix(fd) => Ok(EpollDescriptor::Unix(Arc::clone(fd))),
-            crate::RawFdRef::ExternalFd(fd) => Ok(EpollDescriptor::ExternalFd(Arc::clone(fd))),
+            crate::RawFdRef::HostPassthroughFd(fd) => {
+                Ok(EpollDescriptor::HostPassthroughFd(Arc::clone(fd)))
+            }
             crate::RawFdRef::BrokerPipe(fd) => Ok(EpollDescriptor::BrokerPipe(Arc::clone(fd))),
             crate::RawFdRef::BrokerSocketPair(fd) => {
                 Ok(EpollDescriptor::BrokerSocketPair(Arc::clone(fd)))
@@ -126,7 +128,7 @@ enum DescriptorRef<FS: ShimFS> {
     #[cfg(feature = "worker_local_inet")]
     Socket(Weak<super::net::SocketFd>),
     Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
-    ExternalFd(Weak<TypedFd<super::external_fd::ExternalFdSubsystem>>),
+    HostPassthroughFd(Weak<TypedFd<super::host_passthrough_fd::HostPassthroughFd>>),
     BrokerPipe(Weak<TypedFd<super::broker_pipe::BrokerPipeSubsystem>>),
     BrokerPty(Weak<TypedFd<super::broker_pty::BrokerPtySubsystem>>),
     BrokerSocketPair(Weak<TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>),
@@ -149,7 +151,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
             EpollDescriptor::Unix(unix) => Self::Unix(Arc::downgrade(unix)),
-            EpollDescriptor::ExternalFd(hp) => Self::ExternalFd(Arc::downgrade(hp)),
+            EpollDescriptor::HostPassthroughFd(hp) => Self::HostPassthroughFd(Arc::downgrade(hp)),
             EpollDescriptor::BrokerPipe(bp) => Self::BrokerPipe(Arc::downgrade(bp)),
             EpollDescriptor::BrokerPty(pty) => Self::BrokerPty(Arc::downgrade(pty)),
             EpollDescriptor::BrokerSocketPair(sp) => Self::BrokerSocketPair(Arc::downgrade(sp)),
@@ -174,7 +176,9 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             #[cfg(feature = "worker_local_inet")]
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
             DescriptorRef::Unix(unix) => unix.upgrade().map(EpollDescriptor::Unix),
-            DescriptorRef::ExternalFd(hp) => hp.upgrade().map(EpollDescriptor::ExternalFd),
+            DescriptorRef::HostPassthroughFd(hp) => {
+                hp.upgrade().map(EpollDescriptor::HostPassthroughFd)
+            }
             DescriptorRef::BrokerPipe(bp) => bp.upgrade().map(EpollDescriptor::BrokerPipe),
             DescriptorRef::BrokerPty(pty) => pty.upgrade().map(EpollDescriptor::BrokerPty),
             DescriptorRef::BrokerSocketPair(sp) => {
@@ -197,7 +201,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             #[cfg(feature = "worker_local_inet")]
             DescriptorRef::Socket(_) => "Socket",
             DescriptorRef::Unix(_) => "Unix",
-            DescriptorRef::ExternalFd(_) => "ExternalFd",
+            DescriptorRef::HostPassthroughFd(_) => "HostPassthroughFd",
             DescriptorRef::BrokerPipe(_) => "BrokerPipe",
             DescriptorRef::BrokerPty(_) => "BrokerPty",
             DescriptorRef::BrokerSocketPair(_) => "BrokerSocketPair",
@@ -219,7 +223,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             | DescriptorRef::Epoll(_)
             | DescriptorRef::File(_)
             | DescriptorRef::Unix(_)
-            | DescriptorRef::ExternalFd(_)
+            | DescriptorRef::HostPassthroughFd(_)
             | DescriptorRef::BrokerPipe(_)
             | DescriptorRef::BrokerPty(_)
             | DescriptorRef::BrokerSocketPair(_) => false,
@@ -300,7 +304,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
-            EpollDescriptor::ExternalFd(fd) => {
+            EpollDescriptor::HostPassthroughFd(fd) => {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
@@ -345,7 +349,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             EpollDescriptor::File(file) => fs
                 .get_io_pollable(file)
                 .is_some_and(|p| p.needs_host_poll()),
-            EpollDescriptor::ExternalFd(_) => true,
+            EpollDescriptor::HostPassthroughFd(_) => true,
             EpollDescriptor::BrokerPipe(_) => false,
             EpollDescriptor::BrokerPty(_) => false,
             EpollDescriptor::BrokerSocketPair(_) => false,
@@ -887,7 +891,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                 #[cfg(feature = "worker_local_inet")]
                 EpollDescriptor::Socket(_) => "Socket",
                 EpollDescriptor::Unix(_) => "Unix",
-                EpollDescriptor::ExternalFd(_) => "ExternalFd",
+                EpollDescriptor::HostPassthroughFd(_) => "HostPassthroughFd",
                 EpollDescriptor::BrokerPipe(_) => "BrokerPipe",
                 EpollDescriptor::BrokerPty(_) => "BrokerPty",
                 EpollDescriptor::BrokerSocketPair(_) => "BrokerSocketPair",
@@ -983,7 +987,7 @@ impl EpollEntryKey {
             #[cfg(feature = "worker_local_inet")]
             EpollDescriptor::Socket(socket_fd) => socket_fd.object_id(),
             EpollDescriptor::Unix(unix) => unix.object_id(),
-            EpollDescriptor::ExternalFd(hp) => hp.object_id(),
+            EpollDescriptor::HostPassthroughFd(hp) => hp.object_id(),
             EpollDescriptor::BrokerPipe(bp) => bp.object_id(),
             EpollDescriptor::BrokerPty(pty) => pty.object_id(),
             EpollDescriptor::BrokerSocketPair(sp) => sp.object_id(),

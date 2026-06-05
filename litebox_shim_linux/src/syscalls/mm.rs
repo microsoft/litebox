@@ -244,7 +244,7 @@ impl<FS: ShimFS> Task<FS> {
             crate::RawFdRef::Eventfd(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::Epoll(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::Unix(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
-            crate::RawFdRef::ExternalFd(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
+            crate::RawFdRef::HostPassthroughFd(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::BrokerSocketPair(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
             crate::RawFdRef::BrokerTcpConn(_) => Err(Errno::ENODEV), // real Linux: ENODEV for mmap on non-mmapable fd
@@ -273,7 +273,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Eventfd(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::Epoll(_) => None,   // non-FS descriptor has no filesystem path
                 crate::RawFdRef::Unix(_) => None,    // non-FS descriptor has no filesystem path
-                crate::RawFdRef::ExternalFd(_) => None, // non-FS descriptor has no filesystem path
+                crate::RawFdRef::HostPassthroughFd(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::BrokerPipe(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::BrokerSocketPair(_) => None, // non-FS descriptor has no filesystem path
                 crate::RawFdRef::BrokerTcpConn(_) => None, // non-FS descriptor has no filesystem path
@@ -938,7 +938,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Eventfd(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::Epoll(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::Unix(_) => None,  // CoW fast path only supports FS static backing
-                crate::RawFdRef::ExternalFd(_) => None, // CoW fast path only supports FS static backing
+                crate::RawFdRef::HostPassthroughFd(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::BrokerPipe(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::BrokerSocketPair(_) => None, // CoW fast path only supports FS static backing
                 crate::RawFdRef::BrokerTcpConn(_) => None, // CoW fast path only supports FS static backing

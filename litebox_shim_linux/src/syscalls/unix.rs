@@ -986,6 +986,9 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 if !msg.passed_tokens.is_empty() {
                     received_tokens.append(&mut msg.passed_tokens);
                 }
+                if !msg.passed_tokens.is_empty() {
+                    received_tokens.append(&mut msg.passed_tokens);
+                }
                 if buf.len() >= msg.data.len() {
                     buf[..msg.data.len()].copy_from_slice(&msg.data);
                     Ok((true, msg.data.len()))
@@ -1673,6 +1676,7 @@ struct DatagramMessage {
     data: Vec<u8>,
     /// File descriptors passed via `SCM_RIGHTS` ancillary data.
     passed_fds: Vec<PassedFd>,
+    passed_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     source: UnixSocketAddr,
 }
 
@@ -1730,6 +1734,7 @@ impl ReadEnd<DatagramMessage> {
         mut buf: &mut [u8],
         source_addr: Option<&mut Option<UnixSocketAddr>>,
         received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, TryOpError<Errno>> {
         let mut src = None;
         let mut total_read = 0;
@@ -1746,6 +1751,9 @@ impl ReadEnd<DatagramMessage> {
                 // Extract any passed fds from the first message.
                 if !msg.passed_fds.is_empty() {
                     received_fds.append(&mut msg.passed_fds);
+                }
+                if !msg.passed_tokens.is_empty() {
+                    received_tokens.append(&mut msg.passed_tokens);
                 }
                 if buf.len() >= msg.data.len() {
                     buf[..msg.data.len()].copy_from_slice(&msg.data);
@@ -1933,6 +1941,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
         received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -1947,7 +1956,12 @@ impl<FS: ShimFS> UnixDatagram<FS> {
                     let Some(recv_channel) = &guard.recv_channel else {
                         return Err(TryOpError::Other(Errno::ENOTCONN));
                     };
-                    recv_channel.try_read(buf, source_addr.as_deref_mut(), received_fds)
+                    recv_channel.try_read(
+                        buf,
+                        source_addr.as_deref_mut(),
+                        received_fds,
+                        received_tokens,
+                    )
                 },
             )
             .map_err(Errno::from)
@@ -1965,6 +1979,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
         passed_fds: Vec<PassedFd>,
+        passed_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         let source = self.get_local_addr();
         let send_channel = if let Some(addr) = addr {
@@ -1980,6 +1995,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
             DatagramMessage {
                 data: buf.to_vec(),
                 passed_fds,
+                passed_tokens,
                 source,
             },
             is_nonblocking,
@@ -2246,9 +2262,15 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 passed_fds,
                 passed_tokens,
             ),
-            UnixSocketInner::Datagram(datagram) => {
-                datagram.sendto(task, timeout, buf, is_nonblocking, addr, passed_fds)
-            }
+            UnixSocketInner::Datagram(datagram) => datagram.sendto(
+                task,
+                timeout,
+                buf,
+                is_nonblocking,
+                addr,
+                passed_fds,
+                passed_tokens,
+            ),
         }
     }
 
@@ -2305,10 +2327,15 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 received_fds,
                 received_tokens,
             ),
-            UnixSocketInner::Datagram(datagram) => {
-                let _ = received_tokens;
-                datagram.recvfrom(cx, timeout, buf, is_nonblocking, source_addr, received_fds)
-            }
+            UnixSocketInner::Datagram(datagram) => datagram.recvfrom(
+                cx,
+                timeout,
+                buf,
+                is_nonblocking,
+                source_addr,
+                received_fds,
+                received_tokens,
+            ),
         };
         match ret {
             Err(Errno::ESHUTDOWN) => Ok(0),

@@ -5,15 +5,16 @@
 //!
 //! This state intentionally models the kernel-visible datagram resource in the
 //! broker instead of the worker shim so dup/fork/restore share one receive queue,
-//! bind table entry, and connected-peer setting. Ancillary data is not supported
-//! yet: `SCM_RIGHTS` and `SCM_CREDENTIALS` require extending the fd-token wire
-//! protocol to carry descriptor tokens and credentials per datagram.
+//! bind table entry, and connected-peer setting. `SCM_RIGHTS` is carried as
+//! broker handle tokens alongside each datagram. `SCM_CREDENTIALS` remains
+//! deferred because credential fabrication/verification has auth implications.
 
 use core::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use litebox_common_linux::cwfd::fd_transfer_frame::PassedToken;
 use litebox_common_linux::fd_token_protocol::INET_DGRAM_RECV_FLAG_TRUNC;
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_frame::{
@@ -55,6 +56,7 @@ pub enum SocketDgramError {
 struct Datagram {
     source: SocketDgramAddr,
     payload: Vec<u8>,
+    tokens: Vec<PassedToken>,
 }
 
 #[derive(Debug, Default)]
@@ -132,6 +134,7 @@ impl SocketDgramState {
         &self,
         addr: Option<SocketDgramAddr>,
         payload: &[u8],
+        tokens: &[PassedToken],
     ) -> Result<usize, SocketDgramError> {
         let (peer_addr, source) = {
             let inner = self.inner.lock().expect("SocketDgramState poisoned");
@@ -160,6 +163,7 @@ impl SocketDgramState {
             peer_inner.queue.push_back(Datagram {
                 source,
                 payload: payload.to_vec(),
+                tokens: tokens.to_vec(),
             });
         }
         peer.notify_current();
@@ -169,10 +173,10 @@ impl SocketDgramState {
     pub fn recvfrom(
         &self,
         max_len: usize,
-    ) -> Result<(SocketDgramAddr, Vec<u8>, u32), SocketDgramError> {
+    ) -> Result<(SocketDgramAddr, Vec<u8>, u32, Vec<PassedToken>), SocketDgramError> {
         let mut inner = self.inner.lock().expect("SocketDgramState poisoned");
         if inner.read_shutdown {
-            return Ok((SocketDgramAddr::Unnamed, Vec::new(), 0));
+            return Ok((SocketDgramAddr::Unnamed, Vec::new(), 0, Vec::new()));
         }
         let Some(mut dgram) = inner.queue.pop_front() else {
             return Err(SocketDgramError::WouldBlock);
@@ -184,7 +188,7 @@ impl SocketDgramState {
         }
         drop(inner);
         self.notify_current();
-        Ok((dgram.source, dgram.payload, flags))
+        Ok((dgram.source, dgram.payload, flags, dgram.tokens))
     }
 
     pub fn shutdown(&self, how: u8) -> Result<(), SocketDgramError> {

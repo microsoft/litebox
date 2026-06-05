@@ -5,9 +5,9 @@
 //!
 //! Foundation support covers bind, sendto/recvfrom with source addresses,
 //! datagram truncation, connect, nonblocking waits, shutdown, and fork-restore
-//! inheritance. Ancillary data is deferred: sendmsg/recvmsg with SCM_RIGHTS or
-//! SCM_CREDENTIALS returns `EOPNOTSUPP` on this broker-backed path until the
-//! control protocol can carry per-datagram fd tokens and credentials.
+//! inheritance. `SCM_RIGHTS` is supported for broker-token-backed descriptors
+//! (files, pipes, and broker AF_UNIX datagram sockets). `SCM_CREDENTIALS` is
+//! still deferred because credential passing has authentication implications.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -146,6 +146,7 @@ impl BrokerSocketDgramFd<Platform> {
         cx: &WaitContext<'_, Platform>,
         addr: Option<UnixSocketAddr>,
         payload: &[u8],
+        tokens: &[litebox_common_linux::cwfd::fd_transfer_frame::PassedToken],
     ) -> Result<usize, Errno> {
         if self.write_shutdown.load(Ordering::Acquire) {
             return Err(Errno::EPIPE);
@@ -157,7 +158,7 @@ impl BrokerSocketDgramFd<Platform> {
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::OUT, || {
-                match self.provider.sendto(self.handle(), &raw, payload) {
+                match self.provider.sendto(self.handle(), &raw, payload, tokens) {
                     Ok(n) => Ok(n),
                     Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
                     Err(e) => Err(TryOpError::Other(broker_err_to_errno(e))),
@@ -170,17 +171,30 @@ impl BrokerSocketDgramFd<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         max_len: u32,
-    ) -> Result<(UnixSocketAddr, alloc::vec::Vec<u8>, u32), Errno> {
+    ) -> Result<
+        (
+            UnixSocketAddr,
+            alloc::vec::Vec<u8>,
+            u32,
+            alloc::vec::Vec<litebox_common_linux::cwfd::fd_transfer_frame::PassedToken>,
+        ),
+        Errno,
+    > {
         if self.read_shutdown.load(Ordering::Acquire) {
-            return Ok((UnixSocketAddr::Unnamed, alloc::vec::Vec::new(), 0));
+            return Ok((
+                UnixSocketAddr::Unnamed,
+                alloc::vec::Vec::new(),
+                0,
+                alloc::vec::Vec::new(),
+            ));
         }
         self.common.ensure_subscribed(&self.pollee);
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
         self.pollee
             .wait(cx, nonblock, Events::IN, || {
                 match self.provider.recvfrom(self.handle(), max_len) {
-                    Ok((raw, payload, flags)) => decode_unix_addr(&raw)
-                        .map(|addr| (addr, payload, flags))
+                    Ok((raw, payload, flags, tokens)) => decode_unix_addr(&raw)
+                        .map(|addr| (addr, payload, flags, tokens))
                         .map_err(TryOpError::Other),
                     Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
                     Err(e) => Err(TryOpError::Other(broker_err_to_errno(e))),

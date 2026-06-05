@@ -23,6 +23,7 @@ pub(super) struct LeafOut {
 }
 
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 pub fn run(sub: &str) -> i32 {
@@ -69,6 +70,10 @@ pub fn run(sub: &str) -> i32 {
         "seqpacket-msg-trunc" => test_seqpacket_msg_trunc(),
         "seqpacket-shutdown" => test_seqpacket_shutdown(),
         "seqpacket-fork-restore-inherit" => test_seqpacket_fork_restore_inherit(),
+        "dgram-scm-pipe-pair" => test_dgram_scm_pipe_pair(),
+        "dgram-scm-file" => test_dgram_scm_file(),
+        "dgram-scm-msg-ctrunc" => test_dgram_scm_msg_ctrunc(),
+        "dgram-scm-fork-restore" => test_dgram_scm_fork_restore(),
         "pidfd-inherit-child" => pidfd_inherit_child(),
         other => {
             eprintln!("unknown: {other}");
@@ -1730,6 +1735,62 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
             });
     }
 
+    let dgram_scm_tests: &[(&str, &str, &str)] = &[
+        (
+            "pipe_pair_across_dgram",
+            "dgram-scm-pipe-pair",
+            "UDS_DGRAM_SCM_PIPE_PAIR_OK",
+        ),
+        (
+            "file_across_dgram",
+            "dgram-scm-file",
+            "UDS_DGRAM_SCM_FILE_OK",
+        ),
+        (
+            "msg_ctrunc",
+            "dgram-scm-msg-ctrunc",
+            "UDS_DGRAM_SCM_CTRUNC_OK",
+        ),
+        (
+            "fork_restore_inherit",
+            "dgram-scm-fork-restore",
+            "UDS_DGRAM_SCM_FORK_RESTORE_OK",
+        ),
+    ];
+    for &(name, sub, expected) in dgram_scm_tests {
+        let id = format!("UDS_DGRAM_SCM.{name}");
+        let sub = sub.to_string();
+        let expected = expected.to_string();
+        reg.test("xworker", "unix_socket", id)
+            .timeout(60)
+            .build(move |cx| {
+                let a = cx.require(AgentName::Dpg1);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(crate::BinaryType::PieGlibc, &self_exe);
+                        let resp = run
+                            .send_named_typed(
+                                &a,
+                                &EXEC_BIN,
+                                ExecBinArgs {
+                                    argv: vec![target, "unix-socket-test".into(), sub.clone()],
+                                    timeout_ms: Some(10 * 1000),
+                                    stdin: None,
+                                    env: vec![(
+                                        "LITEBOX_EAGER_BROKER_SOCKETDGRAM".into(),
+                                        "1".into(),
+                                    )],
+                                },
+                            )
+                            .await;
+                        let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains(&*expected));
+                        crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                })
+            });
+    }
+
     for &(name, sub, expected) in simple_tests {
         for &bt in crate::BinaryType::ALL {
             let id = format!("{name}.{}", bt.label());
@@ -2297,5 +2358,368 @@ fn test_seqpacket_fork_restore_inherit() -> i32 {
     } else {
         println!("UDS_SEQPACKET_FORK_RESTORE_INHERIT_FAIL:n={n},errno={send_errno},code={code}");
         1
+    }
+}
+
+fn unique_dgram_path(label: &str) -> String {
+    format!("/run/litebox-uds-dgram-scm-{}-{label}", std::process::id())
+}
+
+fn make_dgram_pair(label: &str) -> Result<(i32, i32, String, String), String> {
+    let left_path = unique_dgram_path(&format!("{label}-left"));
+    let right_path = unique_dgram_path(&format!("{label}-right"));
+    let _ = std::fs::remove_file(&left_path);
+    let _ = std::fs::remove_file(&right_path);
+    // SAFETY: socket is called with valid constants and returns an owned fd on success.
+    let left = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+    if left < 0 {
+        return Err(format!("socket left: {}", errno()));
+    }
+    // SAFETY: socket is called with valid constants and returns an owned fd on success.
+    let right = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+    if right < 0 {
+        // SAFETY: left is a live fd from socket above.
+        unsafe { libc::close(left) };
+        return Err(format!("socket right: {}", errno()));
+    }
+    bind_unix_dgram(left, &left_path)?;
+    bind_unix_dgram(right, &right_path)?;
+    Ok((left, right, left_path, right_path))
+}
+
+fn bind_unix_dgram(fd: i32, path: &str) -> Result<(), String> {
+    let cpath = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
+    // SAFETY: zeroed sockaddr_un is immediately initialised below before use.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = cpath.as_bytes_with_nul();
+    if bytes.len() > addr.sun_path.len() {
+        return Err("sockaddr path too long".into());
+    }
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes.iter().copied()) {
+        *dst = src as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len()) as libc::socklen_t;
+    // SAFETY: addr points to a valid sockaddr_un with length covering sun_family and path.
+    let rc = unsafe { libc::bind(fd, std::ptr::addr_of!(addr).cast(), len) };
+    if rc != 0 {
+        return Err(format!("bind {path}: {}", errno()));
+    }
+    Ok(())
+}
+
+fn send_fd_dgram(
+    sock: i32,
+    dest_path: &str,
+    fd_to_send: i32,
+    payload: &[u8],
+) -> Result<isize, String> {
+    let cpath = std::ffi::CString::new(dest_path).map_err(|e| e.to_string())?;
+    // SAFETY: zeroed sockaddr_un is immediately initialised below before use.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let path_bytes = cpath.as_bytes_with_nul();
+    for (dst, src) in addr.sun_path.iter_mut().zip(path_bytes.iter().copied()) {
+        *dst = src as libc::c_char;
+    }
+    let addr_len = (std::mem::size_of::<libc::sa_family_t>() + path_bytes.len()) as libc::socklen_t;
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr().cast_mut().cast(),
+        iov_len: payload.len(),
+    };
+    let mut control =
+        vec![0u8; unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize];
+    // SAFETY: zeroed msghdr is filled with valid iov, name, and control pointers before sendmsg.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = std::ptr::addr_of_mut!(addr).cast();
+    msg.msg_namelen = addr_len;
+    msg.msg_iov = std::ptr::addr_of_mut!(iov);
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len().try_into().unwrap();
+    // SAFETY: msg_control points to a buffer of CMSG_SPACE(sizeof(i32)); CMSG_FIRSTHDR returns
+    // a header within it, and the fd payload write targets exactly one i32 in that buffer.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32)
+            .try_into()
+            .unwrap();
+        std::ptr::write(libc::CMSG_DATA(cmsg).cast::<i32>(), fd_to_send);
+        let n = libc::sendmsg(sock, std::ptr::addr_of!(msg), 0);
+        if n < 0 {
+            Err(format!("sendmsg: {}", errno()))
+        } else {
+            Ok(n)
+        }
+    }
+}
+
+fn recv_fds_dgram(sock: i32, control_len: usize) -> Result<(Vec<i32>, i32, Vec<u8>), String> {
+    let mut buf = [0u8; 64];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut control = vec![0u8; control_len];
+    // SAFETY: zeroed msghdr is filled with valid writable iov/control buffers before recvmsg.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = std::ptr::addr_of_mut!(iov);
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len().try_into().unwrap();
+    // SAFETY: msg points at valid writable buffers; recvmsg initialises msg fields and payload.
+    let n = unsafe { libc::recvmsg(sock, std::ptr::addr_of_mut!(msg), 0) };
+    if n < 0 {
+        return Err(format!("recvmsg: {}", errno()));
+    }
+    let mut fds = Vec::new();
+    // SAFETY: recvmsg populated msg_control/msg_controllen. The CMSG_* iteration macros stay
+    // within that kernel-reported ancillary-data range.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data_len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let count = data_len / std::mem::size_of::<i32>();
+                let data = libc::CMSG_DATA(cmsg).cast::<i32>();
+                for i in 0..count {
+                    fds.push(std::ptr::read(data.add(i)));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    Ok((fds, msg.msg_flags, buf[..n as usize].to_vec()))
+}
+
+fn test_dgram_scm_pipe_pair() -> i32 {
+    match (|| -> Result<(), String> {
+        let (left, right, left_path, right_path) = make_dgram_pair("pipe")?;
+        let mut pipefd = [0; 2];
+        // SAFETY: pipefd points to two writable i32 slots.
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return Err(format!("pipe: {}", errno()));
+        }
+        send_fd_dgram(left, &right_path, pipefd[1], b"pipe")?;
+        let (fds, _, _) = recv_fds_dgram(right, unsafe { libc::CMSG_SPACE(4) } as usize)?;
+        if fds.len() != 1 {
+            return Err(format!("fd count {}", fds.len()));
+        }
+        let byte = [b'Z'];
+        // SAFETY: fds[0] is the received pipe write end; byte points to one readable byte.
+        if unsafe { libc::write(fds[0], byte.as_ptr().cast(), 1) } != 1 {
+            return Err(format!("write: {}", errno()));
+        }
+        let mut out = [0u8; 1];
+        // SAFETY: pipefd[0] is the read end; out points to one writable byte.
+        if unsafe { libc::read(pipefd[0], out.as_mut_ptr().cast(), 1) } != 1 || out[0] != b'Z' {
+            return Err("pipe read mismatch".into());
+        }
+        for fd in [left, right, pipefd[0], pipefd[1], fds[0]] {
+            unsafe { libc::close(fd) };
+        }
+        let _ = std::fs::remove_file(left_path);
+        let _ = std::fs::remove_file(right_path);
+        Ok(())
+    })() {
+        Ok(()) => {
+            println!("UDS_DGRAM_SCM_PIPE_PAIR_OK");
+            0
+        }
+        Err(e) => {
+            println!("UDS_DGRAM_SCM_PIPE_PAIR_FAIL:{e}");
+            1
+        }
+    }
+}
+
+fn test_dgram_scm_file() -> i32 {
+    match (|| -> Result<(), String> {
+        let (left, right, left_path, right_path) = make_dgram_pair("file")?;
+        let file_path = format!("/shared/litebox-uds-dgram-scm-file-{}", std::process::id());
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .map_err(|e| e.to_string())?;
+        send_fd_dgram(left, &right_path, file.as_raw_fd(), b"file")?;
+        let (fds, _, _) = recv_fds_dgram(right, unsafe { libc::CMSG_SPACE(4) } as usize)?;
+        if fds.len() != 1 {
+            return Err(format!("fd count {}", fds.len()));
+        }
+        let data = b"abc";
+        // SAFETY: fds[0] is a received writable file descriptor; data is readable.
+        if unsafe { libc::write(fds[0], data.as_ptr().cast(), data.len()) } != data.len() as isize {
+            return Err(format!("file write: {}", errno()));
+        }
+        // SAFETY: file fd is valid; lseek sets offset to start for verification.
+        unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET) };
+        let mut s = String::new();
+        std::io::Read::take(file, 3)
+            .read_to_string(&mut s)
+            .map_err(|e| e.to_string())?;
+        if s != "abc" {
+            return Err(format!("file contents {s:?}"));
+        }
+        for fd in [left, right, fds[0]] {
+            unsafe { libc::close(fd) };
+        }
+        let _ = std::fs::remove_file(left_path);
+        let _ = std::fs::remove_file(right_path);
+        let _ = std::fs::remove_file(file_path);
+        Ok(())
+    })() {
+        Ok(()) => {
+            println!("UDS_DGRAM_SCM_FILE_OK");
+            0
+        }
+        Err(e) => {
+            println!("UDS_DGRAM_SCM_FILE_FAIL:{e}");
+            1
+        }
+    }
+}
+
+fn test_dgram_scm_msg_ctrunc() -> i32 {
+    match (|| -> Result<(), String> {
+        let (left, right, left_path, right_path) = make_dgram_pair("ctrunc")?;
+        let mut p1 = [0; 2];
+        let mut p2 = [0; 2];
+        // SAFETY: p1/p2 point to writable pipe fd arrays.
+        if unsafe { libc::pipe(p1.as_mut_ptr()) } != 0
+            || unsafe { libc::pipe(p2.as_mut_ptr()) } != 0
+        {
+            return Err(format!("pipe: {}", errno()));
+        }
+        send_two_fds_dgram(left, &right_path, p1[1], p2[1])?;
+        let (fds, flags, _) = recv_fds_dgram(right, unsafe { libc::CMSG_LEN(0) } as usize)?;
+        if flags & libc::MSG_CTRUNC == 0 {
+            return Err(format!("missing MSG_CTRUNC flags={flags}"));
+        }
+        if !fds.is_empty() {
+            return Err(format!("fd count {}", fds.len()));
+        }
+        for fd in [left, right, p1[0], p1[1], p2[0], p2[1]] {
+            unsafe { libc::close(fd) };
+        }
+        let _ = std::fs::remove_file(left_path);
+        let _ = std::fs::remove_file(right_path);
+        Ok(())
+    })() {
+        Ok(()) => {
+            println!("UDS_DGRAM_SCM_CTRUNC_OK");
+            0
+        }
+        Err(e) => {
+            println!("UDS_DGRAM_SCM_CTRUNC_FAIL:{e}");
+            1
+        }
+    }
+}
+
+fn send_two_fds_dgram(sock: i32, dest_path: &str, fd1: i32, fd2: i32) -> Result<(), String> {
+    let cpath = std::ffi::CString::new(dest_path).map_err(|e| e.to_string())?;
+    // SAFETY: zeroed sockaddr_un is immediately initialised below before use.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let path_bytes = cpath.as_bytes_with_nul();
+    for (dst, src) in addr.sun_path.iter_mut().zip(path_bytes.iter().copied()) {
+        *dst = src as libc::c_char;
+    }
+    let addr_len = (std::mem::size_of::<libc::sa_family_t>() + path_bytes.len()) as libc::socklen_t;
+    let payload = b"xx";
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr().cast_mut().cast(),
+        iov_len: payload.len(),
+    };
+    let mut control =
+        vec![0u8; unsafe { libc::CMSG_SPACE((2 * std::mem::size_of::<i32>()) as u32) } as usize];
+    // SAFETY: zeroed msghdr is filled with valid iov/name/control pointers before sendmsg.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = std::ptr::addr_of_mut!(addr).cast();
+    msg.msg_namelen = addr_len;
+    msg.msg_iov = std::ptr::addr_of_mut!(iov);
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len().try_into().unwrap();
+    // SAFETY: control buffer is sized for two i32 fds; writes stay within CMSG_DATA payload.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN((2 * std::mem::size_of::<i32>()) as u32)
+            .try_into()
+            .unwrap();
+        let data = libc::CMSG_DATA(cmsg).cast::<i32>();
+        std::ptr::write(data, fd1);
+        std::ptr::write(data.add(1), fd2);
+        if libc::sendmsg(sock, std::ptr::addr_of!(msg), 0) < 0 {
+            return Err(format!("sendmsg2: {}", errno()));
+        }
+    }
+    Ok(())
+}
+
+fn test_dgram_scm_fork_restore() -> i32 {
+    match (|| -> Result<(), String> {
+        let (left, right, left_path, right_path) = make_dgram_pair("fork")?;
+        let mut pipefd = [0; 2];
+        // SAFETY: pipefd points to two writable i32 slots.
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return Err(format!("pipe: {}", errno()));
+        }
+        send_fd_dgram(left, &right_path, pipefd[1], b"fork")?;
+        let (fds, _, _) = recv_fds_dgram(right, unsafe { libc::CMSG_SPACE(4) } as usize)?;
+        if fds.len() != 1 {
+            return Err(format!("received fd count {}", fds.len()));
+        }
+        // SAFETY: fork creates a child inheriting the SCM_RIGHTS-received fd.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!("fork: {}", errno()));
+        }
+        if pid == 0 {
+            let b = [b'F'];
+            // SAFETY: fds[0] is the inherited pipe write end; b is one readable byte.
+            let ok = unsafe { libc::write(fds[0], b.as_ptr().cast(), 1) } == 1;
+            // SAFETY: child exits immediately without running parent destructors.
+            unsafe { libc::_exit(if ok { 0 } else { 2 }) };
+        }
+        let mut out = [0u8; 1];
+        // SAFETY: pipefd[0] is the read end and out points to one writable byte.
+        if unsafe { libc::read(pipefd[0], out.as_mut_ptr().cast(), 1) } != 1 || out[0] != b'F' {
+            return Err("fork pipe read mismatch".into());
+        }
+        let mut status = 0;
+        // SAFETY: pid is the live child pid returned by fork.
+        unsafe { libc::waitpid(pid, std::ptr::addr_of_mut!(status), 0) };
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
+        if code != 0 {
+            return Err(format!("child exit {code}"));
+        }
+        for fd in [left, right, pipefd[0], pipefd[1], fds[0]] {
+            // SAFETY: all fds in this list are live parent-owned descriptors.
+            unsafe { libc::close(fd) };
+        }
+        let _ = std::fs::remove_file(left_path);
+        let _ = std::fs::remove_file(right_path);
+        Ok(())
+    })() {
+        Ok(()) => {
+            println!("UDS_DGRAM_SCM_FORK_RESTORE_OK");
+            0
+        }
+        Err(e) => {
+            println!("UDS_DGRAM_SCM_FORK_RESTORE_FAIL:{e}");
+            1
+        }
     }
 }

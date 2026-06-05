@@ -51,8 +51,8 @@ pub enum SubsystemKind {
     Epoll,
     /// Unix-domain socket descriptors.
     Unix,
-    /// Host external fd descriptors.
-    ExternalFd,
+    /// Host passthrough fd descriptors.
+    HostPassthroughFd,
     /// Broker pipe descriptors.
     BrokerPipe,
     /// Broker socketpair descriptors.

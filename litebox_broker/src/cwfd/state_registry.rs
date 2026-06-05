@@ -41,7 +41,7 @@
 //! host kernel fd (e.g. a real eventfd2 fd, a real socket, a real
 //! pipe). The `OwnedFd` is the canonical resource, and the broker
 //! becomes its anchor. That registry stays in place — it's still the
-//! right tool for the external-fd-bridge case in `commit_delayed_fork`
+//! right tool for the host-passthrough-fd-bridge case in `commit_delayed_fork`
 //! and for any subsystem where the kernel itself is willing to be
 //! the cross-process state owner.
 //!

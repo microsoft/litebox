@@ -25,6 +25,7 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 // StatusCode pass-through arms deliberately preserve broker statuses; converting every RPC remains incremental.
 
+use crate::cwfd::fd_transfer_frame::PassedToken;
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, PtyIoctlOp, StatusCode,
     build_attach_host_fd_request, build_bind_nine_p_session_request, build_clone_ofd_request,
@@ -49,9 +50,9 @@ use crate::fd_token_protocol::{
     build_register_notification_ring_request, build_register_ofd_request,
     build_register_process_request, build_register_request, build_release_request,
     build_set_pgid_request, build_set_sid_request, build_shutdown_socketpair_write_request,
-    build_shutdown_tcp_conn_request, build_subscribe_eventfd_request,
-    build_subscribe_process_exit_request, build_subscribe_pty_request,
-    build_subscribe_signal_inbox_request, build_unsubscribe_request,
+    build_shutdown_tcp_conn_request, build_socket_dgram_sendto_request_with_tokens,
+    build_subscribe_eventfd_request, build_subscribe_process_exit_request,
+    build_subscribe_pty_request, build_subscribe_signal_inbox_request, build_unsubscribe_request,
     build_unsubscribe_signal_inbox_request, build_write_eventfd_request, build_write_pipe_request,
     build_write_socketpair_request, build_write_tcp_conn_request, decode,
     parse_attach_host_fd_response_body, parse_bind_nine_p_session_response_body,
@@ -1623,11 +1624,12 @@ impl FdTokenClient {
         handle_id: u64,
         addr: &[u8],
         payload: &[u8],
+        tokens: &[PassedToken],
     ) -> Result<usize, ClientError> {
         let stream = self.lock();
         send_frame(
             &stream,
-            &proto::build_socket_dgram_sendto_request(handle_id, addr, payload),
+            &build_socket_dgram_sendto_request_with_tokens(handle_id, addr, payload, tokens),
             None,
         )?;
         let (resp_bytes, attached) = recv_frame(&stream)?;
@@ -1653,7 +1655,7 @@ impl FdTokenClient {
         &self,
         handle_id: u64,
         max_len: u32,
-    ) -> Result<(Vec<u8>, Vec<u8>, u32), ClientError> {
+    ) -> Result<(Vec<u8>, Vec<u8>, u32, Vec<PassedToken>), ClientError> {
         let stream = self.lock();
         send_frame(
             &stream,

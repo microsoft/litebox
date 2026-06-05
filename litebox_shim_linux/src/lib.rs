@@ -272,20 +272,24 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         }
     }
 
-    /// Install a external fd FD into the restored child's descriptor table.
+    /// Install a host-passthrough fd into the restored child's descriptor table.
     ///
-    /// Called by the runner after `restore_process` to replace virtual pipe
-    /// endpoints with real OS pipe FDs for cross-host-process communication.
-    /// This replaces any existing pipe endpoint at the given guest FD number.
-    pub fn install_external_fd(
+    /// INVARIANT: callers must pass a literal host fd whose semantics cannot be
+    /// represented by a broker-held descriptor at this boundary. Today this is
+    /// used for explicit Unix-socket passthroughs handed to a fork-restored
+    /// worker; the parent and worker share/pass the host socket fd itself, and a
+    /// future cross-binary-type fork path must replace this with a broker handle
+    /// or fd-token handoff before relying on it to survive another worker hop.
+    /// This replaces any existing endpoint at the given guest FD number.
+    pub fn install_host_passthrough_fd(
         &self,
         guest_fd: usize,
         host_fd: i32,
-        direction: syscalls::external_fd::ExternalFdDirection,
+        direction: syscalls::host_passthrough_fd::HostPassthroughFdDirection,
     ) {
-        let entry = syscalls::external_fd::ExternalFd::new(host_fd, direction);
+        let entry = syscalls::host_passthrough_fd::HostPassthroughFdEntry::new(host_fd, direction);
         let mut dt = self.task.global.litebox.descriptor_table_mut();
-        let typed_fd: litebox::fd::TypedFd<syscalls::external_fd::ExternalFdSubsystem> =
+        let typed_fd: litebox::fd::TypedFd<syscalls::host_passthrough_fd::HostPassthroughFd> =
             dt.insert(entry);
         drop(dt);
 
@@ -325,7 +329,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                 .remove(&old_broker_pipe);
             rds = files.raw_descriptor_store.write();
         } else if let Ok(old_host) =
-            rds.fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
+            rds.fd_consume_raw_integer::<syscalls::host_passthrough_fd::HostPassthroughFd>(guest_fd)
         {
             drop(rds);
             let entry = self
@@ -343,9 +347,12 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             rds = files.raw_descriptor_store.write();
         }
 
-        // Install the ExternalFd FD at the same guest fd number.
+        // Install the HostPassthroughFdEntry FD at the same guest fd number.
         let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
-        debug_assert!(ok, "install_external_fd: slot {guest_fd} still occupied");
+        debug_assert!(
+            ok,
+            "install_host_passthrough_fd: slot {guest_fd} still occupied"
+        );
     }
 
     fn dup_broker_bridge_handle(
@@ -428,7 +435,7 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             drop(rds);
             self.remove_typed_fd(&old_dgram);
         } else if let Ok(old_host) =
-            rds.fd_consume_raw_integer::<syscalls::external_fd::ExternalFdSubsystem>(guest_fd)
+            rds.fd_consume_raw_integer::<syscalls::host_passthrough_fd::HostPassthroughFd>(guest_fd)
         {
             drop(rds);
             if let Some(entry) = self
@@ -1871,7 +1878,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
         // Recreate unconnected Unix sockets. Connected/socketpair descriptors
         // are also seeded here so any bridge fd installation below has an fd
-        // table entry to replace with the cross-process external fd.
+        // table entry to replace with the cross-process host passthrough fd.
         {
             use litebox_common_linux::{SockFlags, SockType};
             use syscalls::fork_snapshot::{BrokerHandleKind, FdClass};
@@ -2112,10 +2119,12 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }
         }
 
-        // Restore host-fd tokens for ExternalFd entries. Snapshot capture
-        // registered a duplicated host fd with the broker fd-token registry;
-        // this worker materializes a fresh fd and then releases the token's
-        // transient registry reference.
+        // Restore host-fd tokens for HostPassthroughFdEntry entries.
+        // INVARIANT: the aliased resource is a raw host fd that was already
+        // registered with the fd-token broker during snapshot, not a broker-held
+        // descriptor with durable per-fd state. The token is the explicit
+        // cross-binary-type fork handoff; without it, HostPassthroughFd entries
+        // must be treated as non-migratable across another worker hop.
         {
             use syscalls::fork_snapshot::FdClass;
             for entry in &fd_table.entries {
@@ -2125,7 +2134,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 let Some(token) = entry.metadata.broker_fd_token else {
                     continue;
                 };
-                let Some(direction) = token.external_fd_direction else {
+                let Some(direction) = token.host_passthrough_fd_direction else {
                     continue;
                 };
                 let Some(client) = litebox_common_linux::fd_token_client::global_client() else {
@@ -2136,12 +2145,13 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     continue;
                 };
                 let _ = client.release(token.token_id);
-                let host_entry = syscalls::external_fd::ExternalFd::new(raw_fd, direction);
+                let host_entry =
+                    syscalls::host_passthrough_fd::HostPassthroughFdEntry::new(raw_fd, direction);
                 let typed = self
                     .global
                     .litebox
                     .descriptor_table_mut()
-                    .insert::<syscalls::external_fd::ExternalFdSubsystem>(host_entry);
+                    .insert::<syscalls::host_passthrough_fd::HostPassthroughFd>(host_entry);
                 let mut rds = child_files.raw_descriptor_store.write();
                 if entry.fd <= 2 {
                     let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
@@ -2855,9 +2865,9 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     /// `BrokerSocketpairSubsystem`) adds a new closure parameter,
     /// which is a compile-time forcing function for every call site
     /// to make an explicit decision about the new kind. Historically
-    /// this dispatcher was 6-arm and `ExternalFdSubsystem` /
+    /// this dispatcher was 6-arm and `HostPassthroughFd` /
     /// `BrokerPipeSubsystem` were handled via per-syscall
-    /// `try_external_fd_fd` / `try_broker_pipe_fd` early-return fast
+    /// `try_host_passthrough_fd_fd` / `try_broker_pipe_fd` early-return fast
     /// paths; several syscalls forgot the broker-pipe fast path,
     /// silently returning EBADF on broker-pipe fds. The 8-arm shape
     /// makes that class of bug a compile error.
@@ -2908,7 +2918,7 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
-            return Ok(f(RawFdRef::ExternalFd(&fd)));
+            return Ok(f(RawFdRef::HostPassthroughFd(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
@@ -2963,7 +2973,7 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     Eventfd(&'a Arc<TypedFd<syscalls::eventfd::EventfdSubsystem>>),
     Epoll(&'a Arc<TypedFd<syscalls::epoll::EpollSubsystem<FS>>>),
     Unix(&'a Arc<TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>>),
-    ExternalFd(&'a Arc<TypedFd<syscalls::external_fd::ExternalFdSubsystem>>),
+    HostPassthroughFd(&'a Arc<TypedFd<syscalls::host_passthrough_fd::HostPassthroughFd>>),
     BrokerPipe(&'a Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>),
     BrokerSocketPair(&'a Arc<TypedFd<syscalls::broker_socketpair::BrokerSocketPairSubsystem>>),
     BrokerTcpConn(&'a Arc<TypedFd<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>>),
@@ -3048,7 +3058,7 @@ impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
             RawFdRef::Unix(_fd) => WorkerExecBridgeDecision::NotNeeded(
                 WorkerExecNoBridgeReason::NotWorkerExecBridgeable,
             ),
-            RawFdRef::ExternalFd(_fd) => {
+            RawFdRef::HostPassthroughFd(_fd) => {
                 WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::KernelFdInherited)
             }
             RawFdRef::BrokerPipe(_fd) => {
@@ -3317,7 +3327,9 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Eventfd(_fd) => alloc::format!("raw={raw_fd} eventfd"),
                 crate::RawFdRef::Epoll(_fd) => alloc::format!("raw={raw_fd} epoll"),
                 crate::RawFdRef::Unix(_fd) => alloc::format!("raw={raw_fd} unix"),
-                crate::RawFdRef::ExternalFd(_fd) => alloc::format!("raw={raw_fd} external_fd"),
+                crate::RawFdRef::HostPassthroughFd(_fd) => {
+                    alloc::format!("raw={raw_fd} host_passthrough_fd")
+                }
                 crate::RawFdRef::BrokerPipe(_fd) => alloc::format!("raw={raw_fd} broker_pipe"),
                 RawFdRef::BrokerSocketPair(_fd) => {
                     alloc::format!("raw={raw_fd} broker_socketpair")
@@ -5157,7 +5169,7 @@ struct FdReplacement {
     /// The raw host OS file descriptor for the parent's end of the pipe.
     host_fd: i32,
     /// Whether this endpoint is a read or write end.
-    direction: syscalls::external_fd::ExternalFdDirection,
+    direction: syscalls::host_passthrough_fd::HostPassthroughFdDirection,
     /// The virtual subsystem that owned the original fd.
     #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
     subsystem: ReplacedSubsystem,

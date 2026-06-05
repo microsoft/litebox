@@ -70,6 +70,7 @@
 //! is 24 bytes (Subscribe), so this is comfortably generous; the
 //! cap exists primarily to bound memory on a malformed peer.
 
+use crate::cwfd::fd_transfer_frame::PassedToken;
 #[cfg(debug_assertions)]
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -3296,9 +3297,22 @@ pub fn build_socket_dgram_sendto_request(
     addr: &[u8],
     payload: &[u8],
 ) -> OwnedFrame {
-    let mut body = Vec::with_capacity(16 + addr.len() + payload.len());
+    build_socket_dgram_sendto_request_with_tokens(handle_id, addr, payload, &[])
+}
+
+pub fn build_socket_dgram_sendto_request_with_tokens(
+    handle_id: u64,
+    addr: &[u8],
+    payload: &[u8],
+    tokens: &[PassedToken],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(20 + addr.len() + payload.len() + 8 * tokens.len());
     body.extend_from_slice(&handle_id.to_le_bytes());
     push_len_bytes(&mut body, addr);
+    body.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    for token in tokens {
+        body.extend_from_slice(&token.raw().to_le_bytes());
+    }
     push_len_bytes(&mut body, payload);
     OwnedFrame {
         opcode: Opcode::SocketDgramSendTo,
@@ -3310,7 +3324,7 @@ pub fn build_socket_dgram_sendto_request(
 
 pub fn parse_socket_dgram_sendto_body(
     body: &[u8],
-) -> Result<(u64, Vec<u8>, Vec<u8>), ProtocolError> {
+) -> Result<(u64, Vec<u8>, Vec<PassedToken>, Vec<u8>), ProtocolError> {
     if body.len() < 16 {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::SocketDgramSendTo,
@@ -3321,6 +3335,36 @@ pub fn parse_socket_dgram_sendto_body(
     let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
     let mut off = 8;
     let addr = parse_len_bytes(body, &mut off, Opcode::SocketDgramSendTo)?.to_vec();
+    if off + 4 > body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramSendTo,
+            got: body.len(),
+            want: off + 4,
+        });
+    }
+    let token_count = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    let token_bytes = token_count
+        .checked_mul(8)
+        .ok_or(ProtocolError::BodyTooLarge {
+            body_len: u32::MAX,
+            max: BODY_MAX,
+        })?;
+    if off + token_bytes > body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramSendTo,
+            got: body.len(),
+            want: off + token_bytes,
+        });
+    }
+    let mut tokens = Vec::with_capacity(token_count);
+    for i in 0..token_count {
+        let start = off + 8 * i;
+        tokens.push(PassedToken::from_raw(u64::from_le_bytes(
+            body[start..start + 8].try_into().unwrap(),
+        )));
+    }
+    off += token_bytes;
     let payload = parse_len_bytes(body, &mut off, Opcode::SocketDgramSendTo)?.to_vec();
     if off != body.len() {
         return Err(ProtocolError::WrongBodyLen {
@@ -3329,7 +3373,7 @@ pub fn parse_socket_dgram_sendto_body(
             want: off,
         });
     }
-    Ok((handle, addr, payload))
+    Ok((handle, addr, tokens, payload))
 }
 
 pub fn build_socket_dgram_sendto_response_ok(written: u64) -> OwnedFrame {
@@ -3381,9 +3425,22 @@ pub fn build_socket_dgram_recvfrom_response_ok(
     payload: &[u8],
     flags: u32,
 ) -> OwnedFrame {
-    let mut body = Vec::with_capacity(12 + addr.len() + payload.len());
+    build_socket_dgram_recvfrom_response_ok_with_tokens(addr, payload, flags, &[])
+}
+
+pub fn build_socket_dgram_recvfrom_response_ok_with_tokens(
+    addr: &[u8],
+    payload: &[u8],
+    flags: u32,
+    tokens: &[PassedToken],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + addr.len() + payload.len() + 8 * tokens.len());
     body.extend_from_slice(&flags.to_le_bytes());
     push_len_bytes(&mut body, addr);
+    body.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    for token in tokens {
+        body.extend_from_slice(&token.raw().to_le_bytes());
+    }
     push_len_bytes(&mut body, payload);
     OwnedFrame {
         opcode: Opcode::SocketDgramRecvFromResponse,
@@ -3395,7 +3452,7 @@ pub fn build_socket_dgram_recvfrom_response_ok(
 
 pub fn parse_socket_dgram_recvfrom_response_ok(
     body: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>, u32), ProtocolError> {
+) -> Result<(Vec<u8>, Vec<u8>, u32, Vec<PassedToken>), ProtocolError> {
     if body.len() < 12 {
         return Err(ProtocolError::WrongBodyLen {
             opcode: Opcode::SocketDgramRecvFromResponse,
@@ -3406,6 +3463,36 @@ pub fn parse_socket_dgram_recvfrom_response_ok(
     let flags = u32::from_le_bytes(body[0..4].try_into().unwrap());
     let mut off = 4;
     let addr = parse_len_bytes(body, &mut off, Opcode::SocketDgramRecvFromResponse)?.to_vec();
+    if off + 4 > body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramRecvFromResponse,
+            got: body.len(),
+            want: off + 4,
+        });
+    }
+    let token_count = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    let token_bytes = token_count
+        .checked_mul(8)
+        .ok_or(ProtocolError::BodyTooLarge {
+            body_len: u32::MAX,
+            max: BODY_MAX,
+        })?;
+    if off + token_bytes > body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramRecvFromResponse,
+            got: body.len(),
+            want: off + token_bytes,
+        });
+    }
+    let mut tokens = Vec::with_capacity(token_count);
+    for i in 0..token_count {
+        let start = off + 8 * i;
+        tokens.push(PassedToken::from_raw(u64::from_le_bytes(
+            body[start..start + 8].try_into().unwrap(),
+        )));
+    }
+    off += token_bytes;
     let payload = parse_len_bytes(body, &mut off, Opcode::SocketDgramRecvFromResponse)?.to_vec();
     if off != body.len() {
         return Err(ProtocolError::WrongBodyLen {
@@ -3414,7 +3501,7 @@ pub fn parse_socket_dgram_recvfrom_response_ok(
             want: off,
         });
     }
-    Ok((addr, payload, flags))
+    Ok((addr, payload, flags, tokens))
 }
 
 pub fn build_socket_dgram_shutdown_request(handle_id: u64, how: u8) -> OwnedFrame {

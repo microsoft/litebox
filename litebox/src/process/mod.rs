@@ -115,7 +115,7 @@ pub struct ProcessContext {
 /// Blocking byte-stream reader for worker-exec stdio bridging.
 ///
 /// Implementations are called in a loop from a bridge thread to transfer data
-/// from a guest byte stream (e.g., a unix socket) to a external fd.
+/// from a guest byte stream (e.g., a unix socket) to a host passthrough fd.
 #[allow(clippy::result_unit_err)]
 pub trait WorkerExecStreamReader: Send + Sync + 'static {
     /// Read up to `buf.len()` bytes, blocking until data is available.
@@ -126,7 +126,7 @@ pub trait WorkerExecStreamReader: Send + Sync + 'static {
 /// Blocking byte-stream writer for worker-exec stdio bridging.
 ///
 /// Implementations are called in a loop from a bridge thread to transfer data
-/// from a external fd into a guest byte stream (e.g., a unix socket).
+/// from a host passthrough fd into a guest byte stream (e.g., a unix socket).
 #[allow(clippy::result_unit_err)]
 pub trait WorkerExecStreamWriter: Send + Sync + 'static {
     /// Write `buf`, blocking until space is available.
@@ -146,8 +146,8 @@ pub enum WorkerExecInputBinding<FS: crate::fs::FileSystem + Send + Sync + 'stati
     Inherit,
     /// Duplicate one of the parent host stdio fds onto worker stdin.
     HostStdio { fd: i32 },
-    /// Duplicate a external fd bridge fd onto worker stdin.
-    ExternalFd { fd: i32 },
+    /// Duplicate a host passthrough fd bridge fd onto worker stdin.
+    HostPassthroughFd { fd: i32 },
     /// Explicitly close the worker stdin stream before exec.
     Close,
     /// Proxy worker stdin reads from an existing guest filesystem descriptor.
@@ -165,8 +165,8 @@ pub enum WorkerExecOutputBinding<FS: crate::fs::FileSystem + Send + Sync + 'stat
     Inherit,
     /// Duplicate one of the parent host stdio fds onto this worker stream.
     HostStdio { fd: i32 },
-    /// Duplicate a external fd bridge fd onto this worker stream.
-    ExternalFd { fd: i32 },
+    /// Duplicate a host passthrough fd bridge fd onto this worker stream.
+    HostPassthroughFd { fd: i32 },
     /// Explicitly close the worker stream before exec.
     Close,
     /// Proxy the worker stream into an existing guest filesystem descriptor.
@@ -1105,6 +1105,38 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             })
             .map(|entry| entry.context.id)
             .collect()
+    }
+
+    /// Returns whether a process group is orphaned using POSIX job-control rules.
+    ///
+    /// A process group is orphaned if every running member's parent is either
+    /// outside the member's session or inside the same process group.
+    pub fn is_process_group_orphaned(&self, pgid: ProcessGroupId) -> Option<bool> {
+        let table = self.table.read();
+        let sid = table
+            .values()
+            .find(|entry| {
+                entry.context.pgid == pgid && matches!(entry.context.state, ProcessState::Running)
+            })?
+            .context
+            .sid;
+
+        for member in table.values().filter(|entry| {
+            entry.context.pgid == pgid
+                && entry.context.sid == sid
+                && matches!(entry.context.state, ProcessState::Running)
+        }) {
+            let Some(parent) = member.context.parent.and_then(|pid| table.get(&pid)) else {
+                continue;
+            };
+            if parent.context.sid == sid
+                && parent.context.pgid != pgid
+                && matches!(parent.context.state, ProcessState::Running)
+            {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     /// Returns the process IDs of all running processes except `exclude`.
