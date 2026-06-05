@@ -1487,7 +1487,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
     // the inherited endpoint. When <bt> differs from the parent's
     // binary type (Dpg1), commit_delayed_fork must bridge both
     // endpoints across host workers. Today the bridge replaces the
-    // unix socket with a external fd; the basic byte round-trip survives
+    // unix socket with a host passthrough fd; the basic byte round-trip survives
     // but AF_UNIX semantics (SCM_RIGHTS, SO_PEERCRED, abstract names)
     // are lost — the BSF.<bt> test pins the SCM-loss subset.
     for &bt in crate::BinaryType::ALL {

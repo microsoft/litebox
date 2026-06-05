@@ -1,12 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Runner-mediated external file descriptors.
+//! Runner-mediated host-passthrough file descriptors.
 //!
-//! `ExternalFd` is the narrow bridge for file descriptors that originate
-//! outside Litebox's broker-hosted fd model: initial runner-owned stdio and
-//! explicit host/guest pipe bridges. Internal fork/exec migration channels use
-//! broker-backed pipe, socketpair, and PTY descriptors instead.
+//! `HostPassthroughFd` is the subsystem for descriptors whose authoritative
+//! object is a literal host fd owned by this worker, not state held by a broker.
+//! A broker-held fd can be re-materialized in another worker by duplicating a
+//! broker handle; a host-passthrough fd has no broker-side state to duplicate.
+//! Parent and worker therefore share or pass the literal host fd, and these
+//! descriptors do not survive cross-binary-type fork unless the specific caller
+//! arranges an fd-token or explicit passthrough handoff and documents why that is
+//! sound.
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
@@ -18,46 +22,46 @@ use litebox::{
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
 
-/// Marker type for the external-fd FD subsystem.
-pub(crate) struct ExternalFdSubsystem;
+/// Marker type for the host-passthrough-fd FD subsystem.
+pub(crate) struct HostPassthroughFd;
 
-impl FdEnabledSubsystem for ExternalFdSubsystem {
-    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::ExternalFd;
+impl FdEnabledSubsystem for HostPassthroughFd {
+    const KIND: litebox::fd::SubsystemKind = litebox::fd::SubsystemKind::HostPassthroughFd;
 
-    type Entry = ExternalFd;
+    type Entry = HostPassthroughFdEntry;
 }
 
 /// Whether this endpoint is for reading or writing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExternalFdDirection {
+pub enum HostPassthroughFdDirection {
     Read,
     Write,
-    /// Bidirectional external handles, such as explicit host socket bridges.
+    /// Bidirectional host handles, such as explicit Unix-socket passthroughs.
     ReadWrite,
 }
 
-/// A file descriptor entry backed by a real host OS pipe.
+/// A file descriptor entry backed by a real host OS fd.
 ///
 /// Holds a raw host file descriptor and a direction.  The shim's `sys_read` /
-/// `sys_write` dispatch to `read_external_fd` / `write_external_fd`, which call
-/// the platform's host I/O methods.
-pub(crate) struct ExternalFd {
+/// `sys_write` dispatch to `read_host_passthrough_fd` /
+/// `write_host_passthrough_fd`, which call the platform's host I/O methods.
+pub(crate) struct HostPassthroughFdEntry {
     /// Raw host OS file descriptor.  Owned by this entry; closed on drop via
     /// the platform.
     host_fd: AtomicI32,
     /// Whether this endpoint is a read or write end.
-    pub(crate) direction: ExternalFdDirection,
+    pub(crate) direction: HostPassthroughFdDirection,
     /// Guest-visible open status flags for fcntl(F_GETFL/F_SETFL).
     status: AtomicU32,
 }
 
-impl ExternalFd {
-    /// Create a new external-fd entry.
-    pub(crate) fn new(host_fd: i32, direction: ExternalFdDirection) -> Self {
+impl HostPassthroughFdEntry {
+    /// Create a new host-passthrough-fd entry.
+    pub(crate) fn new(host_fd: i32, direction: HostPassthroughFdDirection) -> Self {
         let access = match direction {
-            ExternalFdDirection::Read => OFlags::RDONLY,
-            ExternalFdDirection::Write => OFlags::WRONLY,
-            ExternalFdDirection::ReadWrite => OFlags::RDWR,
+            HostPassthroughFdDirection::Read => OFlags::RDONLY,
+            HostPassthroughFdDirection::Write => OFlags::WRONLY,
+            HostPassthroughFdDirection::ReadWrite => OFlags::RDWR,
         };
         Self {
             host_fd: AtomicI32::new(host_fd),
@@ -92,7 +96,7 @@ impl ExternalFd {
     }
 }
 
-impl FdEnabledSubsystemEntry for ExternalFd {
+impl FdEnabledSubsystemEntry for HostPassthroughFdEntry {
     // No ref counting needed — each FD entry owns its host fd.
     // on_dup/on_close use defaults (no-op).
 }
@@ -100,13 +104,13 @@ impl FdEnabledSubsystemEntry for ExternalFd {
 // SAFETY: The host_fd is an integer handle, safe to share across threads.
 // The AtomicI32 provides the necessary synchronization.
 
-impl IOPollable for ExternalFd {
+impl IOPollable for HostPassthroughFdEntry {
     fn register_observer(
         &self,
         _observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
         _mask: Events,
     ) {
-        // External-fd FDs do not support asynchronous observer notifications.
+        // Host-passthrough fds do not support asynchronous observer notifications.
         // Callers should use periodic polling via needs_host_poll().
     }
 
@@ -160,15 +164,15 @@ impl IOPollable for ExternalFd {
     }
 }
 
-/// Read from a external-fd FD into the guest buffer.
+/// Read from a host-passthrough-fd FD into the guest buffer.
 ///
 /// Returns the number of bytes read, or an errno.
-pub(crate) fn read_external_fd(
+pub(crate) fn read_host_passthrough_fd(
     platform: &'static Platform,
-    fd: &ExternalFd,
+    fd: &HostPassthroughFdEntry,
     buf: &mut [u8],
 ) -> Result<usize, Errno> {
-    if fd.direction == ExternalFdDirection::Write {
+    if fd.direction == HostPassthroughFdDirection::Write {
         return Err(Errno::EBADF);
     }
     let raw = fd.raw_fd();
@@ -181,15 +185,15 @@ pub(crate) fn read_external_fd(
     platform.read_host_fd(raw, buf)
 }
 
-/// Write from the guest buffer to a external-fd FD.
+/// Write from the guest buffer to a host-passthrough-fd FD.
 ///
 /// Returns the number of bytes written, or an errno.
-pub(crate) fn write_external_fd(
+pub(crate) fn write_host_passthrough_fd(
     platform: &'static Platform,
-    fd: &ExternalFd,
+    fd: &HostPassthroughFdEntry,
     buf: &[u8],
 ) -> Result<usize, Errno> {
-    if fd.direction == ExternalFdDirection::Read {
+    if fd.direction == HostPassthroughFdDirection::Read {
         return Err(Errno::EBADF);
     }
     let raw = fd.raw_fd();

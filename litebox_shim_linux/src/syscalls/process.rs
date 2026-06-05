@@ -40,7 +40,7 @@ use litebox_common_linux::{
 use litebox_platform_multiplex::Platform;
 
 /// Type alias for the VforkDone + parent pipe FD info passed through to
-/// `exec_on_remote_host` so it can set up ExternalFd replacements.
+/// `exec_on_remote_host` so it can set up HostPassthroughFdEntry replacements.
 type ExecVforkInfo = (
     Arc<crate::VforkDone>,
     // parent_unix_socket_fds: (fd, pair_id, object_id)
@@ -3200,7 +3200,7 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             // Apply fd replacements deposited by commit_delayed_fork.
-            // Instead of replacing with ExternalFd (which has a no-op
+            // Instead of replacing with HostPassthroughFdEntry (which has a no-op
             // register_observer and therefore breaks epoll), create a
             // virtual pipe pair and spawn a relay thread that bridges
             // the real OS pipe to the virtual pipe.  Virtual pipes
@@ -3209,7 +3209,7 @@ impl<FS: ShimFS> Task<FS> {
             let replacements: Vec<crate::FdReplacement> =
                 vd.fd_replacements.lock().drain(..).collect();
             if !replacements.is_empty() {
-                use super::external_fd::ExternalFdDirection;
+                use super::host_passthrough_fd::HostPassthroughFdDirection;
 
                 #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
@@ -3231,17 +3231,23 @@ impl<FS: ShimFS> Task<FS> {
                         repl.direction,
                     );
 
-                    // Bidirectional sockets always go via ExternalFd. Pipe-kind
-                    // replacements were removed with the local pipe subsystem;
-                    // no unidirectional replacement is installed here.
-                    if repl.direction == ExternalFdDirection::ReadWrite {
+                    // INVARIANT: this aliases a bidirectional host Unix-socket
+                    // fd produced for an explicit passthrough replacement. It is
+                    // not broker-held because the compatibility path preserves
+                    // the literal socket fd across this restore boundary; if the
+                    // descriptor must survive a later cross-binary-type fork,
+                    // snapshot must carry it via fd-token or a broker socket
+                    // handle instead. Pipe-kind replacements were removed with
+                    // the local pipe subsystem; no unidirectional replacement is
+                    // installed here.
+                    if repl.direction == HostPassthroughFdDirection::ReadWrite {
                         // Skip duplicate FdReplacement entries: a previous
-                        // iteration may already have installed a ExternalFd at
+                        // iteration may already have installed a HostPassthroughFdEntry at
                         // this slot. Close our extra host_fd and continue.
                         {
                             let rds_check = files.raw_descriptor_store.read();
                             let already_hostpipe = rds_check
-                                .fd_from_raw_integer::<super::external_fd::ExternalFdSubsystem>(
+                                .fd_from_raw_integer::<super::host_passthrough_fd::HostPassthroughFd>(
                                     repl.guest_fd,
                                 )
                                 .is_ok();
@@ -3251,10 +3257,12 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
 
-                        let entry =
-                            super::external_fd::ExternalFd::new(repl.host_fd, repl.direction);
+                        let entry = super::host_passthrough_fd::HostPassthroughFdEntry::new(
+                            repl.host_fd,
+                            repl.direction,
+                        );
                         let typed_fd: litebox::fd::TypedFd<
-                            super::external_fd::ExternalFdSubsystem,
+                            super::host_passthrough_fd::HostPassthroughFd,
                         > = self.global.litebox.descriptor_table_mut().insert(entry);
 
                         let mut rds = files.raw_descriptor_store.write();
@@ -3642,11 +3650,14 @@ impl<FS: ShimFS> Task<FS> {
         //
         // child_pipe_bridges: (guest_fd, child_os_fd, direction)
         // parent_fd_replacements: stored in VforkDone for the parent to apply.
-        let mut child_pipe_bridges: Vec<(usize, i32, super::external_fd::ExternalFdDirection)> =
-            Vec::new();
+        let mut child_pipe_bridges: Vec<(
+            usize,
+            i32,
+            super::host_passthrough_fd::HostPassthroughFdDirection,
+        )> = Vec::new();
         type ForkBridgeParentInfo = Vec<(
             usize,
-            super::external_fd::ExternalFdDirection,
+            super::host_passthrough_fd::HostPassthroughFdDirection,
             crate::ReplacedSubsystem,
         )>;
         struct ForkBridgeAccum {
@@ -3695,20 +3706,25 @@ impl<FS: ShimFS> Task<FS> {
         // Dup'd pipe aliases: (alias_fd, primary_bridge_index).
         // The worker dups the primary stream's pipe end to alias_fd.
         let mut mux_aliases: Vec<(usize, usize)> = Vec::new();
-        // Bidirectional unix sockets bypass the mux — they use a direct OS
-        // socketpair passthrough with a relay thread.
+        // INVARIANT: bidirectional Unix sockets that remain on the legacy
+        // passthrough path alias a literal host socketpair endpoint. They are
+        // not broker-held because this compatibility bridge relays the concrete
+        // socket fd between parent and worker; if the fd must cross another
+        // binary-type fork, it needs fd-token or broker socket migration first.
         // Collect (guest_fd, child_os_fd, parent_os_fd) here.
         let mut bidi_passthrough: Vec<(usize, i32, i32)> = Vec::new();
         {
-            use super::external_fd::ExternalFdDirection;
+            use super::host_passthrough_fd::HostPassthroughFdDirection;
 
             let files = self.files.borrow();
             let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
 
-            // Gather child's external fd TypedFds (from prior delayed-fork bridges).
-            let mut child_external_fd_fds: Vec<(
+            // Gather child's host passthrough fd TypedFds (from prior delayed-fork bridges).
+            let mut child_host_passthrough_fd_fds: Vec<(
                 usize,
-                alloc::sync::Arc<litebox::fd::TypedFd<super::external_fd::ExternalFdSubsystem>>,
+                alloc::sync::Arc<
+                    litebox::fd::TypedFd<super::host_passthrough_fd::HostPassthroughFd>,
+                >,
             )> = Vec::new();
             for raw_fd in alive_fds {
                 let _ = files.run_on_raw_fd(raw_fd, |raw_fd_ref| {
@@ -3729,10 +3745,10 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::BrokerInetListener(_)
                         | crate::RawFdRef::BrokerInetDgram(_)
                         | crate::RawFdRef::BrokerInetRaw(_) => {}
-                        crate::RawFdRef::ExternalFd(typed) => {
+                        crate::RawFdRef::HostPassthroughFd(typed) => {
                             // Already host-backed — collect for later extraction
                             // (need descriptor_table lock which we acquire after rds).
-                            child_external_fd_fds.push((raw_fd, Arc::clone(typed)));
+                            child_host_passthrough_fd_fds.push((raw_fd, Arc::clone(typed)));
                         }
                     }
                 });
@@ -3745,18 +3761,20 @@ impl<FS: ShimFS> Task<FS> {
             // them would create nested mux-over-mux, destroying the first
             // mux's data flow.
 
-            // Extract OS fd + direction from collected external-fd TypedFds.
+            // Extract OS fd + direction from collected host-passthrough-fd TypedFds.
             // Done after dropping rds to maintain dt→rds lock ordering.
-            let mut child_external_fds: Vec<(usize, i32, ExternalFdDirection)> = Vec::new();
+            let mut child_host_passthrough_fds: Vec<(usize, i32, HostPassthroughFdDirection)> =
+                Vec::new();
             {
                 let dt = self.global.litebox.descriptor_table();
-                for (raw_fd, typed) in &child_external_fd_fds {
-                    if let Some((host_fd, direction)) = dt
-                        .with_entry(typed, |e: &super::external_fd::ExternalFd| {
+                for (raw_fd, typed) in &child_host_passthrough_fd_fds {
+                    if let Some((host_fd, direction)) = dt.with_entry(
+                        typed,
+                        |e: &super::host_passthrough_fd::HostPassthroughFdEntry| {
                             (e.raw_fd(), e.direction)
-                        })
-                    {
-                        child_external_fds.push((*raw_fd, host_fd, direction));
+                        },
+                    ) {
+                        child_host_passthrough_fds.push((*raw_fd, host_fd, direction));
                     }
                 }
             }
@@ -3772,7 +3790,7 @@ impl<FS: ShimFS> Task<FS> {
             // multiplexer too: the child worker gets a virtual pipe (via mux
             // stream), and the parent's mux dispatcher relays between the mux
             // and the existing host OS fd.
-            for &(guest_fd, host_fd, direction) in &child_external_fds {
+            for &(guest_fd, host_fd, direction) in &child_host_passthrough_fds {
                 child_pipe_bridges.push((guest_fd, host_fd, direction));
                 fork_bridge_accum.push(ForkBridgeAccum {
                     drained: Vec::new(),
@@ -3789,7 +3807,7 @@ impl<FS: ShimFS> Task<FS> {
                 // Collect child unix socket fds on any slot.
                 struct ChildSocketInfo<S: litebox::fd::FdEnabledSubsystem> {
                     child_fd: usize,
-                    direction: super::external_fd::ExternalFdDirection,
+                    direction: super::host_passthrough_fd::HostPassthroughFdDirection,
                     pair_id: usize,
                     object_id: u64,
                     typed: alloc::sync::Arc<litebox::fd::TypedFd<S>>,
@@ -3827,13 +3845,13 @@ impl<FS: ShimFS> Task<FS> {
                             .flatten();
                         if let Some(pair_id) = pair_id {
                             let direction = if *raw_fd == 0 {
-                                ExternalFdDirection::Read
+                                HostPassthroughFdDirection::Read
                             } else if *raw_fd <= 2 {
-                                ExternalFdDirection::Write
+                                HostPassthroughFdDirection::Write
                             } else {
                                 // Non-stdio unix sockets need bidirectional
                                 // bridging (e.g. Node.js IPC on fd 3).
-                                ExternalFdDirection::ReadWrite
+                                HostPassthroughFdDirection::ReadWrite
                             };
                             child_sockets.push(ChildSocketInfo {
                                 child_fd: *raw_fd,
@@ -3883,14 +3901,18 @@ impl<FS: ShimFS> Task<FS> {
 
                 // Track already-bridged object IDs to dedup dup'd sockets.
                 // (object_id, direction, bridge_index)
-                let mut bridged_objects: Vec<(u64, ExternalFdDirection, usize)> = Vec::new();
+                let mut bridged_objects: Vec<(u64, HostPassthroughFdDirection, usize)> = Vec::new();
 
                 for info in &child_sockets {
-                    // Bidirectional sockets: create OS socketpair, pass
-                    // child end as a passthrough fd (bypasses mux).
+                    // INVARIANT: bidirectional sockets create a host
+                    // socketpair and pass the child end as a host-passthrough
+                    // fd because the legacy relay operates on the concrete OS
+                    // socket. This is not broker-held and must be replaced by
+                    // fd-token or broker socket migration before another
+                    // cross-binary-type fork boundary.
                     // Find the parent's peer fd using fc.parent_unix_socket_fds
                     // (captured at fork time, before the child closed any fds).
-                    if info.direction == ExternalFdDirection::ReadWrite {
+                    if info.direction == HostPassthroughFdDirection::ReadWrite {
                         match self.global.platform.create_host_socketpair() {
                             Ok((child_end, parent_end)) => {
                                 bidi_passthrough.push((info.child_fd, child_end, parent_end));
@@ -3905,7 +3927,7 @@ impl<FS: ShimFS> Task<FS> {
                                         parent_replacements.push(crate::FdReplacement {
                                             guest_fd: parent_fd,
                                             host_fd: parent_end,
-                                            direction: ExternalFdDirection::ReadWrite,
+                                            direction: HostPassthroughFdDirection::ReadWrite,
                                             subsystem: crate::ReplacedSubsystem::UnixSocket,
                                         });
                                     }
@@ -3937,13 +3959,17 @@ impl<FS: ShimFS> Task<FS> {
                     }
 
                     // Create OS pipe pair for unidirectional bridges.
-                    let (os_read, os_write) = match self.global.platform.create_external_fd() {
+                    let (os_read, os_write) = match self
+                        .global
+                        .platform
+                        .create_host_passthrough_fd()
+                    {
                         Ok(pair) => pair,
                         Err(_e) => {
                             #[cfg(feature = "trace_syscalls")]
                             litebox::log_println!(
                                 self.global.platform,
-                                "[DELAYED-FORK] pid={}: create_external_fd failed for socket bridge: {}",
+                                "[DELAYED-FORK] pid={}: create_host_passthrough_fd failed for socket bridge: {}",
                                 self.pid,
                                 _e,
                             );
@@ -3964,14 +3990,14 @@ impl<FS: ShimFS> Task<FS> {
                     };
 
                     let (child_os_fd, parent_os_fd) = match info.direction {
-                        ExternalFdDirection::Read => (os_read, os_write),
-                        ExternalFdDirection::Write => (os_write, os_read),
-                        ExternalFdDirection::ReadWrite => unreachable!("handled above"),
+                        HostPassthroughFdDirection::Read => (os_read, os_write),
+                        HostPassthroughFdDirection::Write => (os_write, os_read),
+                        HostPassthroughFdDirection::ReadWrite => unreachable!("handled above"),
                     };
 
                     // G4: Drain recv_channel into OS pipe for Read direction.
                     let mut this_socket_drained: Vec<u8> = Vec::new();
-                    if info.direction == ExternalFdDirection::Read {
+                    if info.direction == HostPassthroughFdDirection::Read {
                         let dt = self.global.litebox.descriptor_table();
                         let msgs: Vec<super::unix::Message> = dt
                             .with_entry(&info.typed, |sock: &super::unix::UnixSocket<FS>| {
@@ -4090,14 +4116,14 @@ impl<FS: ShimFS> Task<FS> {
                     child_pipe_bridges.push((info.child_fd, child_os_fd, info.direction));
                     // Find ALL parent peers (same pair_id, different object_id).
                     let parent_dir = match info.direction {
-                        ExternalFdDirection::Read => ExternalFdDirection::Write,
-                        ExternalFdDirection::Write => ExternalFdDirection::Read,
-                        ExternalFdDirection::ReadWrite => unreachable!("handled above"),
+                        HostPassthroughFdDirection::Read => HostPassthroughFdDirection::Write,
+                        HostPassthroughFdDirection::Write => HostPassthroughFdDirection::Read,
+                        HostPassthroughFdDirection::ReadWrite => unreachable!("handled above"),
                     };
 
                     let mut this_parent_info: Vec<(
                         usize,
-                        ExternalFdDirection,
+                        HostPassthroughFdDirection,
                         crate::ReplacedSubsystem,
                     )> = Vec::new();
                     let mut found_parent = false;
@@ -4165,6 +4191,11 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             // --- Host stdio bridging (Pass 4) ---
+            // INVARIANT: host stdio and /dev/tty aliases refer to the runner's
+            // literal terminal/stdin/stdout/stderr fds. They cannot be
+            // represented as broker-held resources today because posix_spawn
+            // stdio setup and terminal semantics require concrete host fds; a
+            // later cross-binary-type fork must re-tokenize or brokerize them.
             // For each fd in the child's snapshot that is backed by a host
             // stdio descriptor (stdin/stdout/stderr), create an OS pipe pair
             // and register a host-backed mux stream.  The parent's relay
@@ -4174,7 +4205,7 @@ impl<FS: ShimFS> Task<FS> {
             // instead of multiple workers writing directly to the host
             // terminal (which causes garbled output in TUI mode).
             {
-                use super::external_fd::ExternalFdDirection;
+                use super::host_passthrough_fd::HostPassthroughFdDirection;
 
                 for entry in &fd_table.entries {
                     // Only bridge fds that have host stdio backing.
@@ -4218,19 +4249,23 @@ impl<FS: ShimFS> Task<FS> {
                     // We use source_fd (not entry.fd) because the guest fd number
                     // may differ from the host stdio fd if it was dup'd.
                     let direction = if source_fd == 0 {
-                        ExternalFdDirection::Read
+                        HostPassthroughFdDirection::Read
                     } else {
-                        ExternalFdDirection::Write
+                        HostPassthroughFdDirection::Write
                     };
 
                     // Create an OS pipe pair for the child side.
-                    let (read_fd, write_fd) = match self.global.platform.create_external_fd() {
+                    let (read_fd, write_fd) = match self
+                        .global
+                        .platform
+                        .create_host_passthrough_fd()
+                    {
                         Ok(pair) => pair,
                         Err(_e) => {
                             #[cfg(feature = "trace_syscalls")]
                             litebox::log_println!(
                                 self.global.platform,
-                                "[DELAYED-FORK] pid={}: host stdio bridge create_external_fd failed for fd={}: {}",
+                                "[DELAYED-FORK] pid={}: host stdio bridge create_host_passthrough_fd failed for fd={}: {}",
                                 self.pid,
                                 entry.fd,
                                 _e,
@@ -4240,14 +4275,14 @@ impl<FS: ShimFS> Task<FS> {
                     };
 
                     let (child_os_fd, parent_os_fd) = match direction {
-                        ExternalFdDirection::Read => (read_fd, write_fd),
-                        ExternalFdDirection::Write => (write_fd, read_fd),
-                        ExternalFdDirection::ReadWrite => {
+                        HostPassthroughFdDirection::Read => (read_fd, write_fd),
+                        HostPassthroughFdDirection::Write => (write_fd, read_fd),
+                        HostPassthroughFdDirection::ReadWrite => {
                             unreachable!("bidi sockets use passthrough")
                         }
                     };
 
-                    // Close the parent OS fd — the mux external_fd_fd relay
+                    // Close the parent OS fd — the mux host_passthrough_fd_fd relay
                     // uses the real host stdio fd directly, not this pipe end.
                     self.global.platform.close_host_fd(parent_os_fd);
 
@@ -4391,11 +4426,11 @@ impl<FS: ShimFS> Task<FS> {
                 }
             } else {
                 // Store any bidirectional (ReadWrite) replacements in
-                // fd_replacements — these get direct external-fd installation
+                // fd_replacements — these get direct host-passthrough-fd installation
                 // on the parent side.
                 let bidi_repls: Vec<crate::FdReplacement> = parent_replacements
                     .iter()
-                    .filter(|r| r.direction == ExternalFdDirection::ReadWrite)
+                    .filter(|r| r.direction == HostPassthroughFdDirection::ReadWrite)
                     .cloned()
                     .collect();
                 if !bidi_repls.is_empty() {
@@ -4418,11 +4453,11 @@ impl<FS: ShimFS> Task<FS> {
                 {
                     let stream_id = u32::try_from(i).unwrap_or(0);
                     let dir_byte = match direction {
-                        ExternalFdDirection::Read => b'r',
-                        ExternalFdDirection::Write => b'w',
-                        ExternalFdDirection::ReadWrite => {
+                        HostPassthroughFdDirection::Read => b'r',
+                        HostPassthroughFdDirection::Write => b'w',
+                        HostPassthroughFdDirection::ReadWrite => {
                             // Bidi sockets are supposed to bypass mux —
-                            // they get ExternalFd installed directly. If
+                            // they get HostPassthroughFdEntry installed directly. If
                             // one shows up here it leaked through earlier
                             // filtering. Skip rather than crash so the
                             // remainder of the test suite can proceed
@@ -4470,7 +4505,7 @@ impl<FS: ShimFS> Task<FS> {
                         .is_some_and(|bridge| !bridge.drained.is_empty());
                     let initial_eof = if has_drained_data {
                         false
-                    } else if direction == ExternalFdDirection::Read {
+                    } else if direction == HostPassthroughFdDirection::Read {
                         // The parent's counterpart (Write direction) might
                         // already have its sender shut down.  Check via
                         // the OS pipe: the parent_os_fd is the write end.
@@ -4549,19 +4584,19 @@ impl<FS: ShimFS> Task<FS> {
                             {
                                 let (worker_handle, parent_handle, worker_end, parent_end) =
                                     match direction {
-                                        ExternalFdDirection::Read => (
+                                        HostPassthroughFdDirection::Read => (
                                             read_handle,
                                             write_handle,
                                             BrokerPipeEnd::Read,
                                             BrokerPipeEnd::Write,
                                         ),
-                                        ExternalFdDirection::Write => (
+                                        HostPassthroughFdDirection::Write => (
                                             write_handle,
                                             read_handle,
                                             BrokerPipeEnd::Write,
                                             BrokerPipeEnd::Read,
                                         ),
-                                        ExternalFdDirection::ReadWrite => {
+                                        HostPassthroughFdDirection::ReadWrite => {
                                             unreachable!("bidi sockets use passthrough")
                                         }
                                     };
@@ -4931,7 +4966,8 @@ impl<FS: ShimFS> Task<FS> {
                                     provider.create_socketpair(SP_CAPACITY, SP_ATOMIC)
                                 {
                                     let mut drained_ok = true;
-                                    if direction == ExternalFdDirection::Read && !drained.is_empty()
+                                    if direction == HostPassthroughFdDirection::Read
+                                        && !drained.is_empty()
                                     {
                                         let mut off = 0;
                                         while off < drained.len() {
@@ -5018,7 +5054,7 @@ impl<FS: ShimFS> Task<FS> {
                 // Skip bidirectional (ReadWrite) fds — those are stored in
                 // fd_replacements and will be used by the parent after VforkDone.
                 for pr in &parent_replacements {
-                    if pr.direction != ExternalFdDirection::ReadWrite {
+                    if pr.direction != HostPassthroughFdDirection::ReadWrite {
                         self.global.platform.close_host_fd(pr.host_fd);
                     }
                 }
@@ -5161,7 +5197,7 @@ impl<FS: ShimFS> Task<FS> {
                 // Clean up OS pipe FDs created during pipe bridging.
                 for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
                     // Close newly-created pipe fds, but NOT fds
-                    // that are owned by the external fd system (where
+                    // that are owned by the host passthrough fd system (where
                     // os_fd == fork_bridge_accum[i].host_fd).
                     let is_host_owned = fork_bridge_accum
                         .get(i)
@@ -5947,7 +5983,7 @@ impl<FS: ShimFS> Task<FS> {
                                 .flatten();
                             (FdClass::UnixSocket, Some(fd.object_id()), None, pair_id)
                         }
-                        crate::RawFdRef::ExternalFd(fd) => {
+                        crate::RawFdRef::HostPassthroughFd(fd) => {
                             // Host-backed pipe (from a prior delayed-fork bridge).
                             (FdClass::Pipe, Some(fd.object_id()), None, None)
                         }
@@ -6311,7 +6347,7 @@ impl<FS: ShimFS> Task<FS> {
             } else if class == FdClass::Pipe {
                 // Phase C.3: emit a broker-Pipe handle snapshot when the fd
                 // is a `BrokerPipeSubsystem` entry. Local `Pipes<Platform>`
-                // and `ExternalFdSubsystem` pipes don't have broker identity
+                // and `HostPassthroughFd` pipes don't have broker identity
                 // and fall through to `None`.
                 if let Ok(typed) =
                     rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
@@ -6588,12 +6624,16 @@ impl<FS: ShimFS> Task<FS> {
             };
 
             let broker_fd_token_meta: Option<BrokerFdTokenSnapshot> = if let Ok(typed) =
-                rds.fd_from_raw_integer::<super::external_fd::ExternalFdSubsystem>(raw_fd)
+                rds.fd_from_raw_integer::<super::host_passthrough_fd::HostPassthroughFd>(raw_fd)
             {
-                let direction =
-                    dt.with_entry(&typed, |hp: &super::external_fd::ExternalFd| hp.direction);
-                let raw_host_fd =
-                    dt.with_entry(&typed, |hp: &super::external_fd::ExternalFd| hp.raw_fd());
+                let direction = dt.with_entry(
+                    &typed,
+                    |hp: &super::host_passthrough_fd::HostPassthroughFdEntry| hp.direction,
+                );
+                let raw_host_fd = dt.with_entry(
+                    &typed,
+                    |hp: &super::host_passthrough_fd::HostPassthroughFdEntry| hp.raw_fd(),
+                );
                 match (
                     direction,
                     raw_host_fd,
@@ -6606,7 +6646,7 @@ impl<FS: ShimFS> Task<FS> {
                                     .push(ForkSnapshotFdTokenTransit { client, token_id });
                                 Some(BrokerFdTokenSnapshot {
                                     token_id,
-                                    external_fd_direction: Some(direction),
+                                    host_passthrough_fd_direction: Some(direction),
                                 })
                             }
                             Err(_) => None,
@@ -7069,7 +7109,7 @@ impl<FS: ShimFS> Task<FS> {
             let _ = self.global.litebox.descriptor_table_mut().remove(&old_unix);
             rds = files.raw_descriptor_store.write();
         } else if let Ok(old_external) =
-            rds.fd_consume_raw_integer::<super::external_fd::ExternalFdSubsystem>(guest_fd)
+            rds.fd_consume_raw_integer::<super::host_passthrough_fd::HostPassthroughFd>(guest_fd)
         {
             drop(rds);
             if let Some(entry) = self
@@ -8468,8 +8508,11 @@ impl<FS: ShimFS> Task<FS> {
             signal_on_error(&vfork_info);
         })?;
         let placeholder_stdio_bridge_fds = worker_exec_stdio_bridge_fds(&worker_stdio);
-        let stdio_pipe_info: Vec<(i32, usize, super::external_fd::ExternalFdDirection)> =
-            Vec::new();
+        let stdio_pipe_info: Vec<(
+            i32,
+            usize,
+            super::host_passthrough_fd::HostPassthroughFdDirection,
+        )> = Vec::new();
 
         let use_direct_stdio = false;
 
@@ -9626,7 +9669,7 @@ impl<FS: ShimFS> Task<FS> {
 
                 // Don't signal VforkDone here — exec_on_remote_host will signal
                 // it after spawning the worker and setting up pipe replacements
-                // so the parent can use direct ExternalFd I/O.
+                // so the parent can use direct HostPassthroughFdEntry I/O.
                 vfork_info_for_exec = Some((fc.vfork_done, fc.parent_unix_socket_fds));
                 detached_from_shared_fork = true;
             }
@@ -10236,10 +10279,10 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 false
             },
 
-                // ExternalFd: pipe bridge fds from a prior delayed fork.  They
+                // HostPassthroughFdEntry: pipe bridge fds from a prior delayed fork.  They
                 // already wrap a host OS fd, so the worker can inherit them
                 // directly via posix_spawn dup2 — always supported.
-                crate::RawFdRef::ExternalFd(_external_fd) => false,
+                crate::RawFdRef::HostPassthroughFd(_host_passthrough_fd) => false,
 
                 // Broker-backed fds are supported here; exec binding handles
                 // the actual inherited/closed stdio behavior later.
@@ -10386,17 +10429,20 @@ fn worker_exec_input_binding<FS: ShimFS>(
                 WorkerExecInputBinding::Close
             }
 
-            // ExternalFd: the worker needs this fd dup2'd onto its stdio slot.
-            // The Unix-socket passthrough mechanism (--unix-socket-passthrough)
-            // only applies to fork-restore, not exec. For exec, we use
-            // posix_spawn file actions to dup2 the host fd onto the target stdio slot.
-            crate::RawFdRef::ExternalFd(hp_fd) => {
+            // INVARIANT: this stdio binding aliases the existing literal host
+            // fd already wrapped by HostPassthroughFdEntry. It cannot be
+            // broker-held here because posix_spawn must dup2 that concrete fd
+            // onto the worker's stdin before exec; a future cross-binary-type
+            // fork of this worker must re-tokenize or brokerize the fd rather
+            // than assuming the raw fd remains meaningful in another process.
+            crate::RawFdRef::HostPassthroughFd(hp_fd) => {
                 let dt = global.litebox.descriptor_table();
-                if let Some(host_fd) =
-                    dt.with_entry(hp_fd, |e: &super::external_fd::ExternalFd| e.raw_fd())
-                    && host_fd >= 0
+                if let Some(host_fd) = dt.with_entry(
+                    hp_fd,
+                    |e: &super::host_passthrough_fd::HostPassthroughFdEntry| e.raw_fd(),
+                ) && host_fd >= 0
                 {
-                    return WorkerExecInputBinding::ExternalFd { fd: host_fd };
+                    return WorkerExecInputBinding::HostPassthroughFd { fd: host_fd };
                 }
                 WorkerExecInputBinding::Close
             }
@@ -10539,14 +10585,19 @@ fn worker_exec_output_binding<FS: ShimFS>(
                 WorkerExecOutputBinding::Close
             }
 
-            // ExternalFd: dup2 onto the target stdio slot via posix_spawn.
-            crate::RawFdRef::ExternalFd(hp_fd) => {
+            // INVARIANT: this stdio binding aliases the existing literal host
+            // fd already wrapped by HostPassthroughFdEntry. It cannot be
+            // broker-held here because posix_spawn must dup2 that concrete fd
+            // onto stdout/stderr before exec; a future cross-binary-type fork
+            // must re-tokenize or brokerize it before another worker hop.
+            crate::RawFdRef::HostPassthroughFd(hp_fd) => {
                 let dt = global.litebox.descriptor_table();
-                if let Some(host_fd) =
-                    dt.with_entry(hp_fd, |e: &super::external_fd::ExternalFd| e.raw_fd())
-                    && host_fd >= 0
+                if let Some(host_fd) = dt.with_entry(
+                    hp_fd,
+                    |e: &super::host_passthrough_fd::HostPassthroughFdEntry| e.raw_fd(),
+                ) && host_fd >= 0
                 {
-                    return WorkerExecOutputBinding::ExternalFd { fd: host_fd };
+                    return WorkerExecOutputBinding::HostPassthroughFd { fd: host_fd };
                 }
                 WorkerExecOutputBinding::Close
             }
@@ -12200,8 +12251,8 @@ mod tests {
             WorkerExecOutputBinding::Stream(_) => {
                 panic!("stderr alias should not be proxied through a guest byte stream")
             }
-            WorkerExecOutputBinding::ExternalFd { .. } => {
-                panic!("stderr alias should not be proxied through a external fd")
+            WorkerExecOutputBinding::HostPassthroughFd { .. } => {
+                panic!("stderr alias should not be proxied through a host passthrough fd")
             }
         }
     }

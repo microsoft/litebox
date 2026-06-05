@@ -64,9 +64,9 @@ pub use inotify::{broker_inotify_provider, set_broker_inotify_provider};
 pub use signalfd::broker_signalfd_provider;
 pub use signalfd::set_broker_signalfd_provider;
 
-pub mod external_fd;
 pub mod file;
 pub mod fork_snapshot;
+pub mod host_passthrough_fd;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
