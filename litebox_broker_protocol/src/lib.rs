@@ -58,3 +58,6 @@ impl ProtocolVersion {
         self.major == supported.major && self.minor <= supported.minor
     }
 }
+
+/// Initial broker protocol version implemented by the split-broker POC.
+pub const INITIAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 1);

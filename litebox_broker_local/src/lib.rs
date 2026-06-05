@@ -16,13 +16,14 @@ mod error;
 mod event;
 
 use litebox_broker_protocol::{
-    BrokerRequest, BrokerResponse, LocalControlChannel, ProtocolVersion, ReceivedBrokerResponse,
+    BrokerRequest, BrokerResponse, INITIAL_PROTOCOL_VERSION, LocalControlChannel, ProtocolVersion,
+    ReceivedBrokerResponse,
 };
 
 pub use error::{BrokerLocalError, Result};
 
 /// Protocol version this broker-local implementation requests by default.
-pub const LOCAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 2);
+pub const LOCAL_PROTOCOL_VERSION: ProtocolVersion = INITIAL_PROTOCOL_VERSION;
 
 /// Typed broker-local control adapter for broker operations.
 pub struct BrokerLocal<T> {
@@ -179,17 +180,14 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_version_sends_requested_version_and_activates_local_connection() {
-        let requested = ProtocolVersion::new(
-            LOCAL_PROTOCOL_VERSION.major,
-            LOCAL_PROTOCOL_VERSION.minor - 1,
-        );
+    fn negotiate_sends_default_version_and_activates_local_connection() {
+        let requested = LOCAL_PROTOCOL_VERSION;
         let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
             broker_protocol_version: LOCAL_PROTOCOL_VERSION,
         }));
         let mut local = BrokerLocal::new(channel);
 
-        assert_eq!(local.negotiate_version(requested).unwrap(), requested);
+        assert_eq!(local.negotiate().unwrap(), requested);
         assert_eq!(
             local.channel.sent_request,
             Some(BrokerRequest::Negotiate {
