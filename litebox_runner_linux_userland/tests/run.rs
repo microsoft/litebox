@@ -263,11 +263,18 @@ fn unique_test_socket_path(name: &str) -> PathBuf {
 struct TestBroker {
     thread: Option<std::thread::JoinHandle<()>>,
     done_rx: std::sync::mpsc::Receiver<()>,
+    event_request_count_rx: std::sync::mpsc::Receiver<usize>,
     socket_path: PathBuf,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 impl TestBroker {
+    fn next_event_request_count(&self) -> usize {
+        self.event_request_count_rx
+            .recv_timeout(BROKER_HELPER_TIMEOUT)
+            .expect("broker test host did not report event request count")
+    }
+
     fn join(mut self) {
         self.done_rx
             .recv_timeout(BROKER_HELPER_TIMEOUT)
@@ -298,6 +305,7 @@ fn spawn_test_broker(
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (event_request_count_tx, event_request_count_rx) = std::sync::mpsc::channel();
     let server_socket_path = socket_path.to_path_buf();
     let cleanup_socket_path = socket_path.to_path_buf();
     let broker_thread = std::thread::spawn(move || {
@@ -318,14 +326,18 @@ fn spawn_test_broker(
                 stream
                     .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test write timeout");
-                let mut channel =
-                    litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(stream);
+                let mut channel = CountingHostControlChannel::new(
+                    litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(stream),
+                );
                 let termination = litebox_broker_host::serve_connection(&mut core, &mut channel)
                     .expect("broker host failed");
                 assert_eq!(
                     termination,
                     litebox_broker_host::ConnectionTermination::PeerClosed
                 );
+                event_request_count_tx
+                    .send(channel.event_request_count())
+                    .expect("failed to report broker event request count");
             }
         }));
         let _ = std::fs::remove_file(&server_socket_path);
@@ -341,7 +353,64 @@ fn spawn_test_broker(
     TestBroker {
         thread: Some(broker_thread),
         done_rx,
+        event_request_count_rx,
         socket_path: cleanup_socket_path,
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+struct CountingHostControlChannel<T> {
+    inner: T,
+    event_request_count: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl<T> CountingHostControlChannel<T> {
+    const fn new(inner: T) -> Self {
+        Self {
+            inner,
+            event_request_count: 0,
+        }
+    }
+
+    const fn event_request_count(&self) -> usize {
+        self.event_request_count
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl<T> litebox_broker_protocol::HostControlChannel for CountingHostControlChannel<T>
+where
+    T: litebox_broker_protocol::HostControlChannel,
+{
+    type Error = T::Error;
+
+    fn peer_credential(&self) -> Result<litebox_broker_protocol::PeerCredential, Self::Error> {
+        self.inner.peer_credential()
+    }
+
+    fn recv_request(
+        &mut self,
+    ) -> Result<Option<litebox_broker_protocol::ReceivedBrokerRequest>, Self::Error> {
+        let received = self.inner.recv_request()?;
+        if matches!(
+            received,
+            Some(litebox_broker_protocol::ReceivedBrokerRequest::Request(
+                litebox_broker_protocol::BrokerRequest::Core(
+                    litebox_broker_protocol::CoreRequest::Event(_)
+                )
+            ))
+        ) {
+            self.event_request_count += 1;
+        }
+        Ok(received)
+    }
+
+    fn send_response(
+        &mut self,
+        response: &litebox_broker_protocol::BrokerResponse,
+    ) -> Result<(), Self::Error> {
+        self.inner.send_response(response)
     }
 }
 
@@ -360,10 +429,12 @@ fn test_runner_broker_integration_with_rewriter() {
     Runner::new(&true_path, "broker_true_rewriter")
         .broker_socket(&socket_path)
         .run();
+    assert_eq!(broker_thread.next_event_request_count(), 0);
 
     Runner::new(&target, "broker_eventfd_rewriter")
         .broker_socket(&socket_path)
         .run();
+    assert!(broker_thread.next_event_request_count() > 0);
 
     broker_thread.join();
 }
