@@ -8,7 +8,10 @@ use litebox_common_linux::cwfd::{
     broker_socket_dgram_provider::{BrokerEventCallback, BrokerOpError, BrokerSocketDgramProvider},
     broker_subscribable::BrokerSubscribable,
 };
-use litebox_common_linux::fd_token_client::{ClientError, FdTokenClient};
+use litebox_common_linux::{
+    cwfd::fd_transfer_frame::PassedToken,
+    fd_token_client::{ClientError, FdTokenClient},
+};
 use std::sync::Arc;
 
 pub struct RunnerBrokerSocketDgramProvider {
@@ -86,9 +89,15 @@ impl BrokerSocketDgramProvider for RunnerBrokerSocketDgramProvider {
             .map_err(client_err_to_broker_err)
     }
 
-    fn sendto(&self, handle: u64, addr: &[u8], payload: &[u8]) -> Result<usize, BrokerOpError> {
+    fn sendto(
+        &self,
+        handle: u64,
+        addr: &[u8],
+        payload: &[u8],
+        tokens: &[PassedToken],
+    ) -> Result<usize, BrokerOpError> {
         self.client
-            .socket_dgram_sendto(handle, addr, payload)
+            .socket_dgram_sendto(handle, addr, payload, tokens)
             .map_err(client_err_to_broker_err)
     }
 
@@ -96,7 +105,7 @@ impl BrokerSocketDgramProvider for RunnerBrokerSocketDgramProvider {
         &self,
         handle: u64,
         max_len: u32,
-    ) -> Result<(Vec<u8>, Vec<u8>, u32), BrokerOpError> {
+    ) -> Result<(Vec<u8>, Vec<u8>, u32, Vec<PassedToken>), BrokerOpError> {
         self.client
             .socket_dgram_recvfrom(handle, max_len)
             .map_err(client_err_to_broker_err)

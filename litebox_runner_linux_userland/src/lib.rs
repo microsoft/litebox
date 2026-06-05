@@ -848,7 +848,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
     }
 
-    // Broker AF_UNIX SOCK_DGRAM remains opt-in while the probe matrix lands.
+    // Broker AF_UNIX SOCK_DGRAM remains opt-in while broader external-fd
+    // fallback coverage is completed. Set LITEBOX_EAGER_BROKER_SOCKETDGRAM=1
+    // to force the broker path.
     {
         let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETDGRAM")
             .ok()

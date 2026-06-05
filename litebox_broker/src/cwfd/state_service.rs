@@ -1455,10 +1455,11 @@ fn handle_socket_dgram_sendto(
     if !in_fds.is_empty() {
         return protocol_err(Opcode::SocketDgramSendToResponse);
     }
-    let (handle_id, raw_addr, payload) = match proto::parse_socket_dgram_sendto_body(request.body) {
-        Ok(v) => v,
-        Err(_) => return protocol_err(Opcode::SocketDgramSendToResponse),
-    };
+    let (handle_id, raw_addr, tokens, payload) =
+        match proto::parse_socket_dgram_sendto_body(request.body) {
+            Ok(v) => v,
+            Err(_) => return protocol_err(Opcode::SocketDgramSendToResponse),
+        };
     let state = match resolve_socket_dgram(registry, handle_id) {
         Ok(s) => s,
         Err(status) => return status_err(Opcode::SocketDgramSendToResponse, status),
@@ -1473,7 +1474,7 @@ fn handle_socket_dgram_sendto(
             }
         }
     };
-    match state.sendto(addr, &payload) {
+    match state.sendto(addr, &payload, &tokens) {
         Ok(n) => HandlerResult {
             frame: proto::build_socket_dgram_sendto_response_ok(n as u64),
             out_fd: None,
@@ -1499,11 +1500,12 @@ fn handle_socket_dgram_recvfrom(
         Err(status) => return status_err(Opcode::SocketDgramRecvFromResponse, status),
     };
     match state.recvfrom(max_len as usize) {
-        Ok((addr, payload, flags)) => HandlerResult {
-            frame: proto::build_socket_dgram_recvfrom_response_ok(
+        Ok((addr, payload, flags, tokens)) => HandlerResult {
+            frame: proto::build_socket_dgram_recvfrom_response_ok_with_tokens(
                 &encode_socket_dgram_addr(&addr),
                 &payload,
                 flags,
+                &tokens,
             ),
             out_fd: None,
         },
