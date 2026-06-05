@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 #include <errno.h>
+#include <poll.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/eventfd.h>
@@ -27,6 +28,22 @@ static int read_value(int fd, uint64_t expected) {
         return 1;
     }
     return value == expected ? 0 : 2;
+}
+
+static int expect_poll_events(int fd, short expected) {
+    struct pollfd poll_fd = {
+        .fd = fd,
+        .events = POLLIN | POLLOUT,
+    };
+    errno = 0;
+    int ready = poll(&poll_fd, 1, 0);
+    if (ready < 0) {
+        return 1;
+    }
+    if ((poll_fd.revents & (POLLIN | POLLOUT)) != expected) {
+        return 2;
+    }
+    return 0;
 }
 
 static int writev_values(int fd, uint64_t first, uint64_t second) {
@@ -75,72 +92,116 @@ static int expect_einval_split_writev(int fd) {
     return errno == EINVAL ? 0 : 2;
 }
 
+static int expect_eagain_write(int fd, uint64_t value) {
+    errno = 0;
+    if (write(fd, &value, sizeof(value)) != -1) {
+        return 1;
+    }
+    return errno == EAGAIN ? 0 : 2;
+}
+
 int main(void) {
     int fd = eventfd(0, EFD_NONBLOCK);
     if (fd < 0) {
         return 10;
     }
-    if (expect_eagain_read(fd) != 0) {
+    if (expect_poll_events(fd, POLLOUT) != 0) {
         return 11;
     }
-    if (write_value(fd, 3) != 0) {
+    if (expect_eagain_read(fd) != 0) {
         return 12;
     }
-    if (read_value(fd, 3) != 0) {
+    if (write_value(fd, 3) != 0) {
         return 13;
     }
-    if (writev_values(fd, 2, 5) != 0) {
+    if (expect_poll_events(fd, POLLIN | POLLOUT) != 0) {
         return 14;
     }
-    if (read_value(fd, 7) != 0) {
+    if (read_value(fd, 3) != 0) {
         return 15;
     }
-    if (write_value(fd, 9) != 0) {
+    if (expect_poll_events(fd, POLLOUT) != 0) {
         return 16;
     }
-    if (readv_split_value(fd, 9) != 0) {
+    if (writev_values(fd, 2, 5) != 0) {
         return 17;
     }
-    if (expect_einval_split_writev(fd) != 0) {
+    if (read_value(fd, 7) != 0) {
         return 18;
     }
-    if (write_value(fd, 11) != 0) {
+    if (write_value(fd, 9) != 0) {
         return 19;
     }
-    if (expect_einval_short_readv(fd) != 0) {
+    if (readv_split_value(fd, 9) != 0) {
         return 20;
     }
-    if (read_value(fd, 11) != 0) {
+    if (expect_einval_split_writev(fd) != 0) {
         return 21;
     }
-    if (expect_eagain_read(fd) != 0) {
+    if (write_value(fd, 11) != 0) {
         return 22;
+    }
+    if (expect_einval_short_readv(fd) != 0) {
+        return 23;
+    }
+    if (read_value(fd, 11) != 0) {
+        return 24;
+    }
+    if (expect_eagain_read(fd) != 0) {
+        return 25;
     }
     uint64_t invalid = UINT64_MAX;
     errno = 0;
     if (write(fd, &invalid, sizeof(invalid)) != -1 || errno != EINVAL) {
-        return 23;
+        return 26;
+    }
+    if (write_value(fd, UINT64_MAX - 1) != 0) {
+        return 27;
+    }
+    if (expect_poll_events(fd, POLLIN) != 0) {
+        return 28;
+    }
+    if (expect_eagain_write(fd, 1) != 0) {
+        return 29;
+    }
+    if (read_value(fd, UINT64_MAX - 1) != 0) {
+        return 30;
+    }
+    if (expect_poll_events(fd, POLLOUT) != 0) {
+        return 31;
     }
     close(fd);
 
     int semaphore_fd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
     if (semaphore_fd < 0) {
-        return 30;
+        return 40;
+    }
+    if (expect_poll_events(semaphore_fd, POLLOUT) != 0) {
+        return 41;
     }
     if (write_value(semaphore_fd, 3) != 0) {
-        return 31;
+        return 42;
+    }
+    if (expect_poll_events(semaphore_fd, POLLIN | POLLOUT) != 0) {
+        return 43;
     }
     if (read_value(semaphore_fd, 1) != 0) {
-        return 32;
+        return 44;
+    }
+    if (expect_poll_events(semaphore_fd, POLLIN | POLLOUT) != 0) {
+        return 45;
     }
     if (read_value(semaphore_fd, 1) != 0) {
-        return 33;
+        return 46;
     }
     if (read_value(semaphore_fd, 1) != 0) {
-        return 34;
+        return 47;
+    }
+    if (expect_poll_events(semaphore_fd, POLLOUT) != 0) {
+        return 48;
     }
     if (expect_eagain_read(semaphore_fd) != 0) {
-        return 35;
+        return 49;
     }
     close(semaphore_fd);
 
