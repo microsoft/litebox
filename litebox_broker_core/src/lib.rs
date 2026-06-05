@@ -113,47 +113,28 @@ impl BrokerCore {
 pub(crate) mod test_support {
     use alloc::collections::BTreeMap;
     use core::ops::{Deref, DerefMut};
-    use std::sync::{Mutex, MutexGuard};
 
     use crate::{BrokerCore, BrokerCoreLimits, PolicyEngine};
 
-    static BROKER_CORE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_broker_core() -> MutexGuard<'static, ()> {
-        BROKER_CORE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// Repeatable broker core wrapper for tests.
     ///
-    /// This bypasses the production one-shot constructor while serializing test
-    /// cores in the current process. Production code must use
-    /// [`BrokerCore::new`] or [`BrokerCore::new_with_limits`].
+    /// This bypasses the production one-shot constructor. Production code must
+    /// use [`BrokerCore::new`] or [`BrokerCore::new_with_limits`].
     pub struct TestBrokerCore {
         core: BrokerCore,
-        _guard: MutexGuard<'static, ()>,
     }
 
     impl TestBrokerCore {
         /// Creates a repeatable test broker core with the provided policy.
         pub fn new(policy: PolicyEngine) -> Self {
-            let guard = lock_broker_core();
             let core = new_test_core(policy, BrokerCoreLimits::DEFAULT);
-            Self {
-                core,
-                _guard: guard,
-            }
+            Self { core }
         }
 
         /// Creates a repeatable test broker core with explicit limits.
         pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Self {
-            let guard = lock_broker_core();
             let core = new_test_core(policy, limits);
-            Self {
-                core,
-                _guard: guard,
-            }
+            Self { core }
         }
     }
 
