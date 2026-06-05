@@ -70,7 +70,7 @@ flowchart TD
 
     %% pidfd + signals
     PIDFD_OPEN[pidfd_open + waitid P_PIDFD]:::landed
-    PIDFD_SEND[pidfd_send_signal + WIFSIGNALED encoding]:::blocked
+    PIDFD_SEND[pidfd_send_signal + WIFSIGNALED encoding]:::landed
     PIDFD_OPEN --> GB
     PIDFD_SEND --> GB
 
@@ -102,8 +102,6 @@ flowchart TD
     CLI_NODE --> GB
 
     %% open todos at edge
-    WAIT_ENC[broker-waitstatus-wifsignaled todo]:::inflight
-    WAIT_ENC --> PIDFD_SEND
     HYPB[HypB notification-coalescing 30/60 remaining]:::inflight
     HYPB --> FORK_LATENCY
 ```
@@ -120,7 +118,8 @@ flowchart TD
 | Pipeline shapes (cat-pipe-head, node-spawn-bash-drain) | ✅ | `dropbear_bash.*` 24/24, `CL3.mux_pipe.*` | Phase H red gate closed; e1aa42d0 D5 work generalized. |
 | TUI `find_head` (Copilot shell-tool) | 🟡 | `copilot::tui.find_head`, `copilot::pminus.*` | 802afcd2 to re-verify against current amalgamation; Phase 3 may have transitively resolved. |
 | pidfd_open + waitid(P_PIDFD) | ✅ | `PIDFD.open_and_waitid` | Session 15 round 3 (`goal2-pidfd`, commit `3552f8ad`). |
-| pidfd_send_signal + WIFSIGNALED encoding | 🔴 | `PIDFD.send_signal` fails | Blocked on `broker-waitstatus-wifsignaled` todo: broker `wait_worker_host` always encodes WIFEXITED even when worker was signal-killed. |
+| pidfd_send_signal + WIFSIGNALED encoding | ✅ | `PIDFD.send_signal`, `KILL_WAIT.signal_kill_propagation.*` 3+3 | Session 16 round 5. WIFSIGNALED substrate landed `goal3-pidfd-wait` commit `e9373c76` (worker raw `wait_status` plumbed end-to-end via `worker_raw_wait_status_to_registry_status`; WCOREDUMP preserved). pidfd delivery landed `goal3-pidfd-signal` commit `c8ea23ca` (pidfd → guest pid → `sys_kill`; `is_running` extended to consult `fork_child_host_pids`). |
+| broker wait-status WIFSIGNALED preservation | ✅ | `KILL_WAIT.signal_kill_propagation.*` 3+3 | Substrate for pidfd_send_signal. Session 16 round 5 commit `e9373c76`. Replaces previous `(exit_code - 256) + 128` lossy encoding at 4 sites in `process.rs`. |
 | UDS_STREAM broker-held (Phase U.1) | ✅ | `UDS_STREAM.*` 48/48 | Session 15 round 3 (`goal2-stream-flip`, `LITEBOX_EAGER_BROKER_SOCKETPAIR=1` default). |
 | UDS_SEQPACKET broker-held (Phase U.3) | ✅ | `UDS_SEQPACKET.*` 10/10 | Session 15 round 3 (`goal2-seqpacket`, default-on). |
 | UDS_DGRAM with SCM_RIGHTS | ✅ | `UDS_DGRAM_SCM.*` 8/8 | Session 16 round 4 (`goal3-scm-rights`, commit `b1c5b479`). file/pipe/dgram supported; MSG_CTRUNC handled. |
@@ -137,15 +136,14 @@ flowchart TD
 Cross-checked against current open todos in active session
 `e1aa42d0` plan.md tail:
 
-- `broker-waitstatus-wifsignaled` (🟡 in flight, next wave) → unblocks `pidfd_send_signal`.
-- `pidfd-send-signal` (🔴 blocked on above).
 - TUI `find_head` w8/w10 (🟡 re-verification pending in 802afcd2).
 - `ha-probe` (parked HypB probe — not actively pursued).
 - HypB notification-coalescing (🟡 30/60 remaining failures, deferred until a specific consumer needs it).
 
 The map's leaf-status flips for Goal A would be: TUI w8/w10 → ✅
-(probably; pending verification). For Goal B: `pidfd_send_signal`
-→ ✅ (waits on `broker-waitstatus-wifsignaled`).
+(probably; pending verification). Goal B's capability nodes are
+all ✅ as of round 5 (Session 16); remaining gap is end-to-end
+validation.
 
 After those flip, the remaining gap to declaring each goal "done"
 is *end-to-end validation* — actually running the Copilot CLI TUI
