@@ -224,7 +224,7 @@ pub struct CliArgs {
     ///
     /// Each value has the format `guest_fd:host_fd`. The host fd must refer
     /// to the worker-side endpoint of a Unix socketpair that should be
-    /// installed as a read/write external fd in the guest fd table.
+    /// installed as a read/write host passthrough fd in the guest fd table.
     #[arg(long = "unix-socket-passthrough", hide = true)]
     pub unix_socket_passthrough: Vec<String>,
 
@@ -1393,7 +1393,11 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         )?;
         litebox_timing::emit("runner_program_loaded_ns");
 
-        // Install bidirectional Unix-socket passthroughs for inherited non-stdio fds.
+        // INVARIANT: --unix-socket-passthrough aliases inherited non-stdio
+        // host Unix-socket fds into the restored worker. This compatibility
+        // path hands off the literal socket fd rather than a broker-held
+        // resource; another cross-binary-type fork must use fd-token or broker
+        // socket migration.
         let unix_socket_passthroughs =
             parse_unix_socket_passthrough_specs(&cli_args.unix_socket_passthrough)?;
         if !unix_socket_passthroughs.is_empty() {
@@ -1411,6 +1415,11 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                     unix_socket_passthroughs.len()
                 );
             }
+            // INVARIANT: --unix-socket-passthrough aliases inherited host
+            // Unix-socket fds into the restored worker for the 9P transport.
+            // These are not broker-held because this compatibility path hands
+            // off the literal socket fd; another cross-binary-type fork must use
+            // fd-token or broker socket migration instead of assuming it lives.
             for bridge in &unix_socket_passthroughs {
                 let fd_valid = unsafe { libc::fcntl(bridge.host_fd, libc::F_GETFD) } >= 0;
                 if let Some(f) = diag.as_mut() {
@@ -1420,10 +1429,10 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
                         bridge.guest_fd, bridge.host_fd, fd_valid
                     );
                 }
-                program.entrypoints.install_external_fd(
+                program.entrypoints.install_host_passthrough_fd(
                     bridge.guest_fd,
                     bridge.host_fd,
-                    litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
+                    litebox_shim_linux::syscalls::host_passthrough_fd::HostPassthroughFdDirection::ReadWrite,
                 );
             }
         }
@@ -1511,14 +1520,17 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         cli_args.working_directory.clone(),
     )?;
 
-    // Install bidirectional Unix-socket passthroughs for inherited non-stdio fds.
+    // INVARIANT: --unix-socket-passthrough aliases inherited non-stdio host
+    // Unix-socket fds into the guest. This cannot be broker-held on this
+    // compatibility path because callers expect the literal socket fd; another
+    // cross-binary-type fork must use fd-token or broker socket migration.
     let unix_socket_passthroughs_tcp =
         parse_unix_socket_passthrough_specs(&cli_args.unix_socket_passthrough)?;
     for bridge in &unix_socket_passthroughs_tcp {
-        program.entrypoints.install_external_fd(
+        program.entrypoints.install_host_passthrough_fd(
             bridge.guest_fd,
             bridge.host_fd,
-            litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
+            litebox_shim_linux::syscalls::host_passthrough_fd::HostPassthroughFdDirection::ReadWrite,
         );
     }
 
@@ -1985,7 +1997,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
 /// `--unix-socket-passthrough` CLI arg.
 ///
 /// Phase 3 moved host/vpipe/vsocket/vpty/fs streams to direct broker handles;
-/// the only remaining external-fd passthrough is the delayed-fork Unix
+/// the only remaining host-passthrough-fd passthrough is the delayed-fork Unix
 /// socketpair case. Specs are therefore `guest_fd:host_fd`, and the installed
 /// direction is always read/write.
 #[derive(Debug)]
@@ -2057,7 +2069,7 @@ fn parse_local_pipe_specs(specs: &[String]) -> Result<Vec<LocalPipeSpec>> {
 
 /// Restore a child process from a fork snapshot and write the ack status to the parent.
 ///
-/// Installs external-fd passthrough fds and local broker pipe pairs, then
+/// Installs host-passthrough-fd passthrough fds and local broker pipe pairs, then
 /// acks the parent over `ack_fd`.
 fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     shim: &litebox_shim_linux::LinuxShim<FS>,
@@ -2072,12 +2084,15 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
 
     match shim.restore_process(snapshot, fs) {
         Ok(program) => {
-            // Install ExternalFd entries for bidirectional Unix-socket passthroughs.
+            // INVARIANT: fork-restore Unix-socket passthrough aliases literal
+            // host socket fds into the child worker. This is not broker-held on
+            // this compatibility path; a later cross-binary-type fork must use
+            // fd-token or broker socket migration before the fd crosses again.
             for bridge in unix_socket_passthroughs {
-                program.entrypoints.install_external_fd(
+                program.entrypoints.install_host_passthrough_fd(
                     bridge.guest_fd,
                     bridge.host_fd,
-                    litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
+                    litebox_shim_linux::syscalls::host_passthrough_fd::HostPassthroughFdDirection::ReadWrite,
                 );
             }
 
@@ -2458,14 +2473,17 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             cli_args.working_directory.clone(),
         )?;
 
-        // Install bidirectional Unix-socket passthroughs for inherited non-stdio fds.
+        // INVARIANT: --unix-socket-passthrough aliases inherited non-stdio
+        // host Unix-socket fds into the guest. This compatibility path uses
+        // the literal socket fd, not a broker-held resource; another
+        // cross-binary-type fork must use fd-token or broker socket migration.
         let unix_socket_passthroughs =
             parse_unix_socket_passthrough_specs(&cli_args.unix_socket_passthrough)?;
         for bridge in &unix_socket_passthroughs {
-            program.entrypoints.install_external_fd(
+            program.entrypoints.install_host_passthrough_fd(
                 bridge.guest_fd,
                 bridge.host_fd,
-                litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
+                litebox_shim_linux::syscalls::host_passthrough_fd::HostPassthroughFdDirection::ReadWrite,
             );
         }
 

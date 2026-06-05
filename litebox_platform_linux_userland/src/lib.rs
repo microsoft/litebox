@@ -177,8 +177,13 @@ struct WorkerHostProcess {
 }
 
 /// Describes a pipe-backed stdio fd that was set up with direct OS pipe I/O
-/// (no bridge thread). The parent should install a `ExternalFd` wrapping
+/// (no bridge thread). The parent should install a `HostPassthroughFdEntry` wrapping
 /// `parent_os_fd` at the appropriate guest fd number.
+///
+/// INVARIANT: this is a literal OS pipe endpoint used only for direct worker
+/// stdio plumbing. It is not broker-held because posix_spawn needs the concrete
+/// fd for stdio setup; if the descriptor later has to cross a binary-type fork
+/// boundary, the shim must replace it with an fd-token or broker-backed bridge.
 pub struct ExecPipeDirectIo {
     /// The child worker's stdio fd number (0, 1, or 2).
     pub child_stdio_fd: i32,
@@ -194,7 +199,7 @@ pub struct WorkerExecSpawnResult {
     pub host_pid: i32,
     /// Pipe-backed stdio fds that use direct OS pipe I/O instead of bridge
     /// threads. Non-empty only when `direct_pipe_io` was requested. The caller
-    /// is responsible for installing `ExternalFd` entries for these and closing
+    /// is responsible for installing `HostPassthroughFdEntry` entries for these and closing
     /// them on error.
     pub direct_pipes: Vec<ExecPipeDirectIo>,
 }
@@ -1503,8 +1508,12 @@ impl LinuxUserland {
                     return Err(-1_i32);
                 }
             }
-            WorkerExecInputBinding::ExternalFd { fd } => {
-                // dup2 the external fd fd onto stdin in the child.
+            WorkerExecInputBinding::HostPassthroughFd { fd } => {
+                // INVARIANT: stdin is a literal host fd that the worker must
+                // receive via posix_spawn dup2 before exec. There is no
+                // broker-side descriptor state here; if this worker later forks
+                // across binary types, the shim must re-tokenize or brokerize
+                // the fd rather than depending on this raw host number.
                 // The fd has O_CLOEXEC but posix_spawn file actions run
                 // before exec, so dup2 succeeds and fd 0 survives exec.
                 if unsafe { libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, 0) } != 0
@@ -1556,7 +1565,12 @@ impl LinuxUserland {
                         return Err(-1_i32);
                     }
                 }
-                WorkerExecOutputBinding::ExternalFd { fd } => {
+                WorkerExecOutputBinding::HostPassthroughFd { fd } => {
+                    // INVARIANT: stdout/stderr is a literal host fd that the
+                    // worker must receive via posix_spawn dup2 before exec.
+                    // There is no broker-side descriptor state here; a later
+                    // cross-binary-type fork needs an explicit fd-token or
+                    // broker-backed replacement.
                     if unsafe {
                         libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, fd_num)
                     } != 0
@@ -1706,7 +1720,7 @@ impl LinuxUserland {
 
     /// Read from an arbitrary host file descriptor.
     ///
-    /// Used by `ExternalFd` entries to do I/O on real OS pipe FDs that bridge
+    /// Used by `HostPassthroughFdEntry` entries to do I/O on real OS pipe FDs that bridge
     /// fork children across host processes.
     pub fn read_host_fd(
         &self,
@@ -1715,7 +1729,7 @@ impl LinuxUserland {
     ) -> Result<usize, litebox_common_linux::errno::Errno> {
         use litebox_common_linux::errno::Errno;
         loop {
-            // Safety: fd is a valid host FD obtained from create_external_fd.
+            // Safety: fd is a valid host FD obtained from create_host_passthrough_fd.
             let result = unsafe {
                 syscalls::syscall4(
                     syscalls::Sysno::read,
@@ -1738,7 +1752,7 @@ impl LinuxUserland {
 
     /// Write to an arbitrary host file descriptor.
     ///
-    /// Used by `ExternalFd` entries to do I/O on real OS pipe FDs that bridge
+    /// Used by `HostPassthroughFdEntry` entries to do I/O on real OS pipe FDs that bridge
     /// fork children across host processes.
     pub fn write_host_fd(
         &self,
@@ -1747,7 +1761,7 @@ impl LinuxUserland {
     ) -> Result<usize, litebox_common_linux::errno::Errno> {
         use litebox_common_linux::errno::Errno;
         loop {
-            // Safety: fd is a valid host FD obtained from create_external_fd.
+            // Safety: fd is a valid host FD obtained from create_host_passthrough_fd.
             let result = unsafe {
                 syscalls::syscall4(
                     syscalls::Sysno::write,
@@ -1771,7 +1785,7 @@ impl LinuxUserland {
 
     /// Close a host file descriptor.
     pub fn close_host_fd(&self, fd: i32) {
-        // Safety: fd is a valid host FD obtained from create_external_fd.
+        // Safety: fd is a valid host FD obtained from create_host_passthrough_fd.
         unsafe {
             let _ = syscalls::syscall2(
                 syscalls::Sysno::close,
@@ -1798,7 +1812,9 @@ impl LinuxUserland {
     ///
     /// Returns `(read_fd, write_fd)` as raw file descriptor numbers.
     /// Both FDs have `O_CLOEXEC` set.
-    pub fn create_external_fd(&self) -> Result<(i32, i32), litebox_common_linux::errno::Errno> {
+    pub fn create_host_passthrough_fd(
+        &self,
+    ) -> Result<(i32, i32), litebox_common_linux::errno::Errno> {
         let mut fds = [0i32; 2];
         let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
         if ret != 0 {
@@ -1833,7 +1849,7 @@ impl LinuxUserland {
         Ok((fds[0], fds[1]))
     }
 
-    /// Try to enlarge a external fd's capacity to at least `size` bytes.
+    /// Try to enlarge a host passthrough fd's capacity to at least `size` bytes.
     ///
     /// Best-effort: silently ignores errors (e.g. unprivileged processes
     /// cannot exceed `/proc/sys/fs/pipe-max-size`).
@@ -2045,7 +2061,12 @@ impl LinuxUserland {
                     return Err(-1_i32);
                 }
             }
-            WorkerExecInputBinding::ExternalFd { fd } => {
+            WorkerExecInputBinding::HostPassthroughFd { fd } => {
+                // INVARIANT: stdin is a literal host fd that the worker must
+                // receive via posix_spawn dup2 before exec. There is no
+                // broker-side descriptor state here; if this worker later forks
+                // across binary types, the shim must re-tokenize or brokerize
+                // the fd rather than depending on this raw host number.
                 if unsafe { libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, 0) } != 0
                 {
                     return Err(-1_i32);
@@ -2094,7 +2115,12 @@ impl LinuxUserland {
                         return Err(-1_i32);
                     }
                 }
-                WorkerExecOutputBinding::ExternalFd { fd } => {
+                WorkerExecOutputBinding::HostPassthroughFd { fd } => {
+                    // INVARIANT: stdout/stderr is a literal host fd that the
+                    // worker must receive via posix_spawn dup2 before exec.
+                    // There is no broker-side descriptor state here; a later
+                    // cross-binary-type fork needs an explicit fd-token or
+                    // broker-backed replacement.
                     if unsafe {
                         libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, fd_num)
                     } != 0
@@ -2672,7 +2698,7 @@ fn update_fd_nonblocking(fd: &std::os::fd::OwnedFd, nonblocking: bool) -> std::i
     Ok(())
 }
 
-fn external_fd_capacity_granularity() -> usize {
+fn host_passthrough_fd_capacity_granularity() -> usize {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(page_size)
         .ok()
@@ -2681,7 +2707,7 @@ fn external_fd_capacity_granularity() -> usize {
 }
 
 fn supports_bridge_pipe_capacity(capacity: usize) -> bool {
-    capacity >= external_fd_capacity_granularity()
+    capacity >= host_passthrough_fd_capacity_granularity()
 }
 
 fn set_pipe_capacity(fd: &std::os::fd::OwnedFd, capacity: usize) -> std::io::Result<usize> {
@@ -2696,11 +2722,11 @@ fn set_pipe_capacity(fd: &std::os::fd::OwnedFd, capacity: usize) -> std::io::Res
         return Err(std::io::Error::last_os_error());
     }
     usize::try_from(actual)
-        .map_err(|_| std::io::Error::other("external fd capacity did not fit in usize"))
+        .map_err(|_| std::io::Error::other("host passthrough fd capacity did not fit in usize"))
 }
 
 fn set_pipe_capacity_at_most(fd: &std::os::fd::OwnedFd, limit: usize) -> std::io::Result<()> {
-    let granularity = external_fd_capacity_granularity();
+    let granularity = host_passthrough_fd_capacity_granularity();
     let mut requested = limit / granularity * granularity;
 
     while requested >= granularity {
@@ -2712,7 +2738,7 @@ fn set_pipe_capacity_at_most(fd: &std::os::fd::OwnedFd, limit: usize) -> std::io
     }
 
     Err(std::io::Error::other(
-        "external fd capacity cannot be constrained to the guest writable space",
+        "host passthrough fd capacity cannot be constrained to the guest writable space",
     ))
 }
 
@@ -2753,7 +2779,7 @@ where
         }
         WorkerExecInputBinding::Inherit
         | WorkerExecInputBinding::HostStdio { .. }
-        | WorkerExecInputBinding::ExternalFd { .. }
+        | WorkerExecInputBinding::HostPassthroughFd { .. }
         | WorkerExecInputBinding::Close => None,
     }
 }
@@ -2780,7 +2806,7 @@ where
             ),
             WorkerExecOutputBinding::Inherit
             | WorkerExecOutputBinding::HostStdio { .. }
-            | WorkerExecOutputBinding::ExternalFd { .. }
+            | WorkerExecOutputBinding::HostPassthroughFd { .. }
             | WorkerExecOutputBinding::Close => continue,
         };
         if let Some(existing) = groups.iter_mut().find(|group| group.key == key) {

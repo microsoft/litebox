@@ -1181,7 +1181,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
     //
     // Matrix axes:
     //   - parent binary type (5 values) → exercises Path A
-    //     (external-fd-bridge fork-restore migration of the listen fd
+    //     (host-passthrough-fd-bridge fork-restore migration of the listen fd
     //     to the child worker host process). When parent and child
     //     are different binary types, the child runs in a separate
     //     worker process via delayed-fork migration.

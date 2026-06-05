@@ -146,7 +146,7 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
                     // them BEFORE entering with_socket.
                     //
                     // For genuinely-not-a-socket subsystems (regular
-                    // file, pipe, eventfd, signalfd, epoll, external-fd),
+                    // file, pipe, eventfd, signalfd, epoll, host-passthrough-fd),
                     // ENOTSOCK is the correct errno per POSIX.
                     //
                     // assert_socket_like_handled() panics if the fd's
@@ -2783,52 +2783,12 @@ impl<FS: ShimFS> Task<FS> {
                 ))?;
                 return tcp_handle.with_entry(|entry| entry.connect(&self.wait_cx(), &raw));
             }
-            const SOCK_CLOEXEC: usize = 0o2000000;
-            let host_fd = unsafe {
-                syscalls::syscall3(
-                    syscalls::Sysno::socket,
-                    AddressFamily::INET as usize,
-                    SockType::Stream as usize | SOCK_CLOEXEC,
-                    IPProtocol::TCP as usize,
-                )
-            }
-            .map_err(|_| Errno::EIO)? as i32;
-            let mut host_addr = [0u8; 16];
-            host_addr[0..2].copy_from_slice(&(AddressFamily::INET as u16).to_ne_bytes());
-            host_addr[2..4].copy_from_slice(&addr.port().to_be_bytes());
-            host_addr[4..8].copy_from_slice(&addr.ip().octets());
-            let connect_result = unsafe {
-                syscalls::syscall3(
-                    syscalls::Sysno::connect,
-                    host_fd as usize,
-                    host_addr.as_ptr() as usize,
-                    host_addr.len(),
-                )
-            };
-            if connect_result.is_err() {
-                let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, host_fd as usize) };
-                return Err(Errno::ECONNREFUSED);
-            }
-            let external = super::external_fd::ExternalFd::new(
-                host_fd,
-                super::external_fd::ExternalFdDirection::ReadWrite,
-            );
-            let typed_external = self
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .insert::<super::external_fd::ExternalFdSubsystem>(external);
-            {
-                let files = self.files.borrow();
-                let mut rds = files.raw_descriptor_store.write();
-                let _old_fd = rds
-                    .fd_consume_raw_integer::<
-                        super::broker_inet_listener::BrokerInetListenerSubsystem,
-                    >(raw_fd)
-                    .map_err(|_| Errno::EBADF)?;
-                assert!(rds.fd_into_specific_raw_integer(typed_external, raw_fd));
-            }
-            Ok(())
+            // Broker-held outbound TCP is mandatory in the linux_userland runner
+            // (`broker_inet_tcp_enabled()` is always true), so do not resurrect
+            // the old raw host-socket passthrough fallback. A host socket here
+            // would have no broker state to duplicate across cross-binary-type
+            // fork; missing provider setup is a runner configuration error.
+            Err(Errno::ENODEV)
         }) {
             return result;
         }
@@ -3219,7 +3179,7 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(())
                 })
             }
-            crate::RawFdRef::ExternalFd(_) => Err(Errno::ENOTSOCK),
+            crate::RawFdRef::HostPassthroughFd(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::BrokerPipe(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::BrokerSocketPair(fd) => {
                 let handle = self.broker_sp_handle(fd)?;
@@ -3637,8 +3597,8 @@ impl<FS: ShimFS> Task<FS> {
                             // Unix sockets are kernel-backed and transfer as PassedFd.
                             Ok(false)
                         }
-                        crate::RawFdRef::ExternalFd(_) => {
-                            // External fds are sealed host fds and transfer as PassedFd.
+                        crate::RawFdRef::HostPassthroughFd(_) => {
+                            // Host-passthrough fds are sealed host fds and transfer as PassedFd.
                             Ok(false)
                         }
                         crate::RawFdRef::BrokerPipe(typed) => {
