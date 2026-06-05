@@ -1113,7 +1113,6 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             },
@@ -2296,7 +2295,6 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             },
@@ -5076,7 +5074,6 @@ pub(crate) struct VforkParking {
 /// Which virtual subsystem the replaced fd belonged to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplacedSubsystem {
-    Pipe,
     UnixSocket,
     Pty,
     Filesystem,
@@ -5097,25 +5094,6 @@ struct FdReplacement {
     /// The virtual subsystem that owned the original fd.
     #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
     subsystem: ReplacedSubsystem,
-    /// Whether this replacement comes from `spawn_result.direct_pipes`
-    /// (true: stdin/stdout for non-PIE worker, where the host_fd IS the
-    /// other end of a host OS pipe directly connected to the worker
-    /// child's stdio fd) vs `parent_pipe_replacements` (false: bridged
-    /// via a relay thread that copies between an OS pipe and the
-    /// parent's existing virtual pipe).
-    ///
-    /// When `direct: true`, the parent's guest fd MUST be installed as
-    /// a ExternalFd over `host_fd` (consume the old slot, install the
-    /// new ExternalFd), so reads/writes flow directly to the OS pipe
-    /// connected to the worker.
-    ///
-    /// When `direct: false`, the bridge thread already handles the data
-    /// flow via the parent's existing virtual pipe; the FdReplacement
-    /// here installs the ExternalFd at a slot that's NOT the parent's
-    /// virtual pipe (different guest fd), or no installation is
-    /// necessary. Consuming the parent's virtual pipe at the slot
-    /// would orphan the bridge thread.
-    direct: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5365,11 +5343,6 @@ struct Task<FS: ShimFS> {
     /// thread's `ThreadRemote` as exiting (for remote exec handoff paths where
     /// the host thread belongs to the parent runtime and must remain alive).
     local_task_terminated: Cell<bool>,
-    /// Pipe pair_ids of virtual pipes created by the mux dispatcher or fd
-    /// replacement relay setup. Legacy field — retained for potential
-    /// future cleanup but no longer actively populated.
-    mux_pipe_pair_ids: RefCell<Vec<usize>>,
-
     /// Active netlink sockets, keyed by guest fd number.
     /// Used to intercept sendto/recvmsg/bind for AF_NETLINK fds.
     netlink_sockets:
@@ -5428,7 +5401,6 @@ mod test_utils {
                 recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
                 process_state: self.process_state.into(),
@@ -5468,7 +5440,6 @@ mod test_utils {
                 recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             };
@@ -5507,6 +5478,22 @@ mod tests {
     };
 
     const DUP_FAIL_HANDLE: u64 = 0xd0_fa_11;
+
+    #[test]
+    fn replaced_subsystem_has_no_pipe_kind() {
+        for subsystem in [
+            ReplacedSubsystem::UnixSocket,
+            ReplacedSubsystem::Pty,
+            ReplacedSubsystem::Filesystem,
+        ] {
+            let kind = match subsystem {
+                ReplacedSubsystem::UnixSocket => "unix_socket",
+                ReplacedSubsystem::Pty => "pty",
+                ReplacedSubsystem::Filesystem => "filesystem",
+            };
+            assert_ne!(kind, "pipe");
+        }
+    }
 
     struct TestBrokerPipeProvider;
 

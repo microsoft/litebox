@@ -2170,7 +2170,6 @@ impl<FS: ShimFS> Task<FS> {
                         recent_delayed_fork_resume: core::cell::Cell::new(false),
                         migrated_to_remote: core::cell::Cell::new(false),
                         local_task_terminated: core::cell::Cell::new(false),
-                        mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
                         ),
@@ -2860,7 +2859,6 @@ impl<FS: ShimFS> Task<FS> {
                         recent_delayed_fork_resume: core::cell::Cell::new(false),
                         migrated_to_remote: core::cell::Cell::new(false),
                         local_task_terminated: core::cell::Cell::new(false),
-                        mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
                         ),
@@ -2971,17 +2969,10 @@ impl<FS: ShimFS> Task<FS> {
                         repl.direction,
                     );
 
-                    // Bidirectional sockets always go via ExternalFd. For
-                    // Read+Pipe, only direct_pipes-derived replacements (e.g.
-                    // worker child stdout for non-PIE exec) consume+install at
-                    // the parent's slot; bridged Read+Pipe replacements (e.g.
-                    // stderr) keep the parent's virtual pipe so the bridge
-                    // thread continues to deliver data through it.
-                    if repl.direction == ExternalFdDirection::ReadWrite
-                        || (repl.direct
-                            && repl.direction == ExternalFdDirection::Read
-                            && repl.subsystem == crate::ReplacedSubsystem::Pipe)
-                    {
+                    // Bidirectional sockets always go via ExternalFd. Pipe-kind
+                    // replacements were removed with the local pipe subsystem;
+                    // no unidirectional replacement is installed here.
+                    if repl.direction == ExternalFdDirection::ReadWrite {
                         // Skip duplicate FdReplacement entries: a previous
                         // iteration may already have installed a ExternalFd at
                         // this slot. Close our extra host_fd and continue.
@@ -3647,7 +3638,6 @@ impl<FS: ShimFS> Task<FS> {
                                             host_fd: parent_end,
                                             direction: ExternalFdDirection::ReadWrite,
                                             subsystem: crate::ReplacedSubsystem::UnixSocket,
-                                            direct: false,
                                         });
                                     }
                                 }
@@ -3885,7 +3875,6 @@ impl<FS: ShimFS> Task<FS> {
                                 host_fd: parent_host_fd,
                                 direction: parent_dir,
                                 subsystem: crate::ReplacedSubsystem::UnixSocket,
-                                direct: false,
                             });
                             this_parent_info.push((
                                 parent_fd,
@@ -4178,7 +4167,6 @@ impl<FS: ShimFS> Task<FS> {
                     let type_byte = bridge_parent_info.get(i).and_then(|v| v.first()).map_or(
                         b'p',
                         |&(_, _, sub)| match sub {
-                            crate::ReplacedSubsystem::Pipe => b'p',
                             crate::ReplacedSubsystem::UnixSocket => b's',
                             crate::ReplacedSubsystem::Pty => b't',
                             crate::ReplacedSubsystem::Filesystem => b'f',
