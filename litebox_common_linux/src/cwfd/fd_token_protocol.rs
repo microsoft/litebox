@@ -177,6 +177,14 @@ pub enum Opcode {
     /// `(nine_p_conn_id: u64)` — 8 bytes. Empty response on success;
     /// returns `UnknownNinePSession` on unknown conn_id.
     BindNinePSession = 0x56,
+    CreateSocketDgram = 0x57,
+    SocketDgramBind = 0x58,
+    SocketDgramConnect = 0x59,
+    SocketDgramSendTo = 0x5A,
+    SocketDgramRecvFrom = 0x5B,
+    SocketDgramShutdown = 0x5C,
+    SocketDgramGetSockName = 0x5D,
+    SocketDgramGetPeerName = 0x5E,
     CreateSocketPair = 0x30,
     ReadSocketPair = 0x31,
     WriteSocketPair = 0x32,
@@ -291,6 +299,14 @@ pub enum Opcode {
     CloneOfdResponse = 0xD5,
     /// Response for [`Opcode::BindNinePSession`]. Empty body on success.
     BindNinePSessionResponse = 0xD6,
+    CreateSocketDgramResponse = 0xD7,
+    SocketDgramBindResponse = 0xD8,
+    SocketDgramConnectResponse = 0xD9,
+    SocketDgramSendToResponse = 0xDA,
+    SocketDgramRecvFromResponse = 0xDB,
+    SocketDgramShutdownResponse = 0xDC,
+    SocketDgramGetSockNameResponse = 0xDD,
+    SocketDgramGetPeerNameResponse = 0xDE,
     CreateSocketPairResponse = 0xB0,
     ReadSocketPairResponse = 0xB1,
     WriteSocketPairResponse = 0xB2,
@@ -488,6 +504,14 @@ impl Opcode {
             Opcode::RegisterOfd => Some(Opcode::RegisterOfdResponse),
             Opcode::CloneOfd => Some(Opcode::CloneOfdResponse),
             Opcode::BindNinePSession => Some(Opcode::BindNinePSessionResponse),
+            Opcode::CreateSocketDgram => Some(Opcode::CreateSocketDgramResponse),
+            Opcode::SocketDgramBind => Some(Opcode::SocketDgramBindResponse),
+            Opcode::SocketDgramConnect => Some(Opcode::SocketDgramConnectResponse),
+            Opcode::SocketDgramSendTo => Some(Opcode::SocketDgramSendToResponse),
+            Opcode::SocketDgramRecvFrom => Some(Opcode::SocketDgramRecvFromResponse),
+            Opcode::SocketDgramShutdown => Some(Opcode::SocketDgramShutdownResponse),
+            Opcode::SocketDgramGetSockName => Some(Opcode::SocketDgramGetSockNameResponse),
+            Opcode::SocketDgramGetPeerName => Some(Opcode::SocketDgramGetPeerNameResponse),
             Opcode::CreateSocketPair => Some(Opcode::CreateSocketPairResponse),
             Opcode::ReadSocketPair => Some(Opcode::ReadSocketPairResponse),
             Opcode::WriteSocketPair => Some(Opcode::WriteSocketPairResponse),
@@ -687,6 +711,14 @@ impl TryFrom<u8> for Opcode {
             0x54 => Ok(Opcode::RegisterOfd),
             0x55 => Ok(Opcode::CloneOfd),
             0x56 => Ok(Opcode::BindNinePSession),
+            0x57 => Ok(Opcode::CreateSocketDgram),
+            0x58 => Ok(Opcode::SocketDgramBind),
+            0x59 => Ok(Opcode::SocketDgramConnect),
+            0x5A => Ok(Opcode::SocketDgramSendTo),
+            0x5B => Ok(Opcode::SocketDgramRecvFrom),
+            0x5C => Ok(Opcode::SocketDgramShutdown),
+            0x5D => Ok(Opcode::SocketDgramGetSockName),
+            0x5E => Ok(Opcode::SocketDgramGetPeerName),
             0x30 => Ok(Opcode::CreateSocketPair),
             0x31 => Ok(Opcode::ReadSocketPair),
             0x32 => Ok(Opcode::WriteSocketPair),
@@ -770,6 +802,14 @@ impl TryFrom<u8> for Opcode {
             0xD4 => Ok(Opcode::RegisterOfdResponse),
             0xD5 => Ok(Opcode::CloneOfdResponse),
             0xD6 => Ok(Opcode::BindNinePSessionResponse),
+            0xD7 => Ok(Opcode::CreateSocketDgramResponse),
+            0xD8 => Ok(Opcode::SocketDgramBindResponse),
+            0xD9 => Ok(Opcode::SocketDgramConnectResponse),
+            0xDA => Ok(Opcode::SocketDgramSendToResponse),
+            0xDB => Ok(Opcode::SocketDgramRecvFromResponse),
+            0xDC => Ok(Opcode::SocketDgramShutdownResponse),
+            0xDD => Ok(Opcode::SocketDgramGetSockNameResponse),
+            0xDE => Ok(Opcode::SocketDgramGetPeerNameResponse),
             0xB0 => Ok(Opcode::CreateSocketPairResponse),
             0xB1 => Ok(Opcode::ReadSocketPairResponse),
             0xB2 => Ok(Opcode::WriteSocketPairResponse),
@@ -3014,6 +3054,409 @@ pub fn parse_bind_nine_p_session_response_body(body: &[u8]) -> Result<(), Protoc
         });
     }
     Ok(())
+}
+
+// =====================================================================
+// SocketDgram (AF_UNIX SOCK_DGRAM) wire format.
+//
+// Unix addresses are encoded by the broker/shim as:
+//   kind: u8 (0=unnamed, 1=filesystem path bytes, 2=abstract bytes),
+//   len: u32 little-endian, then `len` bytes.
+// Empty address vectors in SendTo mean "use connected peer".
+// =====================================================================
+
+pub const SOCKET_DGRAM_RECV_FLAG_TRUNC: u32 = INET_DGRAM_RECV_FLAG_TRUNC;
+
+pub fn build_create_socket_dgram_request() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreateSocketDgram,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn parse_create_socket_dgram_body(body: &[u8]) -> Result<(), ProtocolError> {
+    if !body.is_empty() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreateSocketDgram,
+            got: body.len(),
+            want: 0,
+        });
+    }
+    Ok(())
+}
+
+pub fn build_create_socket_dgram_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreateSocketDgramResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_create_socket_dgram_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::CreateSocketDgramResponse)
+}
+
+fn push_len_bytes(body: &mut Vec<u8>, bytes: &[u8]) {
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(bytes);
+}
+
+fn parse_len_bytes<'a>(
+    body: &'a [u8],
+    offset: &mut usize,
+    opcode: Opcode,
+) -> Result<&'a [u8], ProtocolError> {
+    if body.len() < *offset + 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            got: body.len(),
+            want: *offset + 4,
+        });
+    }
+    let len = u32::from_le_bytes(body[*offset..*offset + 4].try_into().unwrap()) as usize;
+    *offset += 4;
+    if body.len() < *offset + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            got: body.len(),
+            want: *offset + len,
+        });
+    }
+    let out = &body[*offset..*offset + len];
+    *offset += len;
+    Ok(out)
+}
+
+pub fn build_socket_dgram_bind_request(handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + addr.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::SocketDgramBind,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_socket_dgram_bind_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramBind,
+            got: body.len(),
+            want: 12,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut off = 8;
+    let addr = parse_len_bytes(body, &mut off, Opcode::SocketDgramBind)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramBind,
+            got: body.len(),
+            want: off,
+        });
+    }
+    Ok((handle, addr))
+}
+
+pub fn build_socket_dgram_bind_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(4 + addr.len());
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::SocketDgramBindResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_socket_dgram_bind_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr = parse_len_bytes(body, &mut off, Opcode::SocketDgramBindResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramBindResponse,
+            got: body.len(),
+            want: off,
+        });
+    }
+    Ok(addr)
+}
+
+pub fn build_socket_dgram_connect_request(handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + addr.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::SocketDgramConnect,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_socket_dgram_connect_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramConnect,
+            got: body.len(),
+            want: 12,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut off = 8;
+    let addr = parse_len_bytes(body, &mut off, Opcode::SocketDgramConnect)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramConnect,
+            got: body.len(),
+            want: off,
+        });
+    }
+    Ok((handle, addr))
+}
+
+pub fn build_socket_dgram_connect_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SocketDgramConnectResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_socket_dgram_sendto_request(
+    handle_id: u64,
+    addr: &[u8],
+    payload: &[u8],
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16 + addr.len() + payload.len());
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    push_len_bytes(&mut body, addr);
+    push_len_bytes(&mut body, payload);
+    OwnedFrame {
+        opcode: Opcode::SocketDgramSendTo,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_socket_dgram_sendto_body(
+    body: &[u8],
+) -> Result<(u64, Vec<u8>, Vec<u8>), ProtocolError> {
+    if body.len() < 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramSendTo,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let handle = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut off = 8;
+    let addr = parse_len_bytes(body, &mut off, Opcode::SocketDgramSendTo)?.to_vec();
+    let payload = parse_len_bytes(body, &mut off, Opcode::SocketDgramSendTo)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramSendTo,
+            got: body.len(),
+            want: off,
+        });
+    }
+    Ok((handle, addr, payload))
+}
+
+pub fn build_socket_dgram_sendto_response_ok(written: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SocketDgramSendToResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: written.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn parse_socket_dgram_sendto_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::SocketDgramSendToResponse)
+}
+
+pub fn build_socket_dgram_recvfrom_request(handle_id: u64, max_len: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.extend_from_slice(&max_len.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::SocketDgramRecvFrom,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_socket_dgram_recvfrom_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramRecvFrom,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let reserved = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
+}
+
+pub fn build_socket_dgram_recvfrom_response_ok(
+    addr: &[u8],
+    payload: &[u8],
+    flags: u32,
+) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + addr.len() + payload.len());
+    body.extend_from_slice(&flags.to_le_bytes());
+    push_len_bytes(&mut body, addr);
+    push_len_bytes(&mut body, payload);
+    OwnedFrame {
+        opcode: Opcode::SocketDgramRecvFromResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_socket_dgram_recvfrom_response_ok(
+    body: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>, u32), ProtocolError> {
+    if body.len() < 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramRecvFromResponse,
+            got: body.len(),
+            want: 12,
+        });
+    }
+    let flags = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let mut off = 4;
+    let addr = parse_len_bytes(body, &mut off, Opcode::SocketDgramRecvFromResponse)?.to_vec();
+    let payload = parse_len_bytes(body, &mut off, Opcode::SocketDgramRecvFromResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramRecvFromResponse,
+            got: body.len(),
+            want: off,
+        });
+    }
+    Ok((addr, payload, flags))
+}
+
+pub fn build_socket_dgram_shutdown_request(handle_id: u64, how: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&handle_id.to_le_bytes());
+    body.push(how);
+    body.extend_from_slice(&[0; 7]);
+    OwnedFrame {
+        opcode: Opcode::SocketDgramShutdown,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_socket_dgram_shutdown_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramShutdown,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    if body[9..16].iter().any(|b| *b != 0) {
+        return Err(ProtocolError::NonZeroReserved { reserved: 1 });
+    }
+    Ok((u64::from_le_bytes(body[0..8].try_into().unwrap()), body[8]))
+}
+
+pub fn build_socket_dgram_shutdown_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SocketDgramShutdownResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+
+pub fn build_socket_dgram_getsockname_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SocketDgramGetSockName,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn build_socket_dgram_getpeername_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SocketDgramGetPeerName,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+pub fn build_socket_dgram_getsockname_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(4 + addr.len());
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::SocketDgramGetSockNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn build_socket_dgram_getpeername_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(4 + addr.len());
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::SocketDgramGetPeerNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn parse_socket_dgram_getsockname_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr = parse_len_bytes(body, &mut off, Opcode::SocketDgramGetSockNameResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramGetSockNameResponse,
+            got: body.len(),
+            want: off,
+        });
+    }
+    Ok(addr)
+}
+
+pub fn parse_socket_dgram_getpeername_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr = parse_len_bytes(body, &mut off, Opcode::SocketDgramGetPeerNameResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketDgramGetPeerNameResponse,
+            got: body.len(),
+            want: off,
+        });
+    }
+    Ok(addr)
 }
 
 // =====================================================================

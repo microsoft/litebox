@@ -570,6 +570,28 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(sp_fd);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "unix_socket")
             }
+            BrokerHandleKind::SocketDgram => {
+                let provider =
+                    syscalls::broker_socket_dgram::broker_socket_dgram_provider().ok_or(())?;
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                Self::dup_broker_bridge_handle(releaser, handle_id)?;
+                let dgram = syscalls::broker_socket_dgram::BrokerSocketDgramFd::<Platform>::new(
+                    provider,
+                    handle_id,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<
+                    syscalls::broker_socket_dgram::BrokerSocketDgramSubsystem,
+                > = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(dgram);
+                self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "socket_dgram")
+            }
             BrokerHandleKind::TcpConn => {
                 let provider = syscalls::broker_tcp_conn::broker_tcp_conn_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -2030,6 +2052,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         BrokerHandleKind::TcpConn => None,
                         BrokerHandleKind::InetListener => None,
                         BrokerHandleKind::InetDgram => None,
+                        BrokerHandleKind::SocketDgram => None,
                         // `Signalfd` is restored by its dedicated FdClass branch below.
                         BrokerHandleKind::Signalfd => todo!(
                             "fork-snapshot restore for BrokerHandleKind::Signalfd \
@@ -3267,7 +3290,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Unix(_fd) => alloc::format!("raw={raw_fd} unix"),
                 crate::RawFdRef::ExternalFd(_fd) => alloc::format!("raw={raw_fd} external_fd"),
                 crate::RawFdRef::BrokerPipe(_fd) => alloc::format!("raw={raw_fd} broker_pipe"),
-                crate::RawFdRef::BrokerSocketPair(_fd) => {
+                RawFdRef::BrokerSocketPair(_fd) => {
                     alloc::format!("raw={raw_fd} broker_socketpair")
                 }
                 crate::RawFdRef::BrokerTcpConn(_fd) => {

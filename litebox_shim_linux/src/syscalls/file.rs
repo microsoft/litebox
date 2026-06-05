@@ -80,6 +80,10 @@ impl<FS: ShimFS> Task<FS> {
                 TypeId::of::<super::broker_socketpair::BrokerSocketPairFd<Platform>>(),
                 core::any::type_name::<super::broker_socketpair::BrokerSocketPairFd<Platform>>(),
             ),
+            litebox::fd::SubsystemKind::BrokerSocketDgram => (
+                TypeId::of::<super::broker_socket_dgram::BrokerSocketDgramFd<Platform>>(),
+                core::any::type_name::<super::broker_socket_dgram::BrokerSocketDgramFd<Platform>>(),
+            ),
             litebox::fd::SubsystemKind::BrokerPty => (
                 TypeId::of::<super::broker_pty::BrokerPtyFd<Platform>>(),
                 core::any::type_name::<super::broker_pty::BrokerPtyFd<Platform>>(),
@@ -3421,6 +3425,14 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) = rds
             .fd_consume_raw_integer::<super::broker_socketpair::BrokerSocketPairSubsystem>(raw_fd)
+        {
+            drop(rds);
+            let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
+            drop(entry);
+            return Ok(());
+        }
+        if let Ok(fd) = rds
+            .fd_consume_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(raw_fd)
         {
             drop(rds);
             let entry = self.global.litebox.descriptor_table_mut().remove(&fd);

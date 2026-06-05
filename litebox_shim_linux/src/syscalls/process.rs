@@ -5898,6 +5898,11 @@ impl<FS: ShimFS> Task<FS> {
                                         .as_ref()
                                         .map(|p| alloc::sync::Arc::clone(p) as _)
                                 }
+                                BrokerHandleKind::SocketDgram => {
+                                    super::broker_socket_dgram::broker_socket_dgram_provider()
+                                        .as_ref()
+                                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                                }
                                 BrokerHandleKind::TcpConn => {
                                     super::broker_tcp_conn::broker_tcp_conn_provider()
                                         .as_ref()
@@ -6168,6 +6173,50 @@ impl<FS: ShimFS> Task<FS> {
                                             handle_id,
                                             pipe_direction: None,
                                             socketpair_endpoint: Some(endpoint),
+                                            pty_role: None,
+                                            pty_id: None,
+                                        })
+                                    }
+                                    Err(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                } else if let Ok(typed) = rds
+                    .fd_from_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(
+                        raw_fd,
+                    )
+                {
+                    let provider = super::broker_socket_dgram::broker_socket_dgram_provider();
+                    let entry_result = dt.with_entry(
+                        &typed,
+                        |dgram_fd: &super::broker_socket_dgram::BrokerSocketDgramFd<
+                            crate::Platform,
+                        >| { dgram_fd.fork_snapshot_handle() },
+                    );
+                    match entry_result {
+                        Some((kind, handle_id)) => {
+                            let releaser_opt: Option<
+                                alloc::sync::Arc<
+                                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                                >,
+                            > = provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
+                            if let Some(releaser) = releaser_opt {
+                                match releaser.dup_handle(handle_id) {
+                                    Ok(()) => {
+                                        broker_transit.push(ForkSnapshotBrokerTransit {
+                                            releaser,
+                                            handle_id,
+                                            kind,
+                                        });
+                                        Some(BrokerHandleSnapshot {
+                                            kind,
+                                            handle_id,
+                                            pipe_direction: None,
+                                            socketpair_endpoint: None,
                                             pty_role: None,
                                             pty_id: None,
                                         })
@@ -8211,6 +8260,7 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Pty => "pty",
                         BrokerHandleKind::Pipe => "pipe",
                         BrokerHandleKind::UnixSocket => "unix_socket",
+                        BrokerHandleKind::SocketDgram => "socket_dgram",
                         BrokerHandleKind::TcpConn => "tcp_conn",
                         BrokerHandleKind::InetListener => "inet_listener",
                         BrokerHandleKind::InetDgram => "inet_dgram",
@@ -8235,6 +8285,11 @@ impl<FS: ShimFS> Task<FS> {
                             .map(|p| alloc::sync::Arc::clone(p) as _),
                         BrokerHandleKind::UnixSocket => {
                             super::broker_socketpair::broker_socketpair_provider()
+                                .as_ref()
+                                .map(|p| alloc::sync::Arc::clone(p) as _)
+                        }
+                        BrokerHandleKind::SocketDgram => {
+                            super::broker_socket_dgram::broker_socket_dgram_provider()
                                 .as_ref()
                                 .map(|p| alloc::sync::Arc::clone(p) as _)
                         }
@@ -8459,6 +8514,50 @@ impl<FS: ShimFS> Task<FS> {
                     broker_eventfd_specs.push(alloc::format!(
                         "{raw_fd}:unix_socket:{handle_id}:{endpoint_char}"
                     ));
+                }
+            }
+
+            let broker_socket_dgram_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<
+                    litebox::fd::TypedFd<super::broker_socket_dgram::BrokerSocketDgramSubsystem>,
+                >,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) = rds
+                        .fd_from_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(
+                            raw_fd,
+                        )
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in broker_socket_dgram_fds {
+                let provider = super::broker_socket_dgram::broker_socket_dgram_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let handle_id = dt_local.with_entry(
+                    &typed,
+                    |fd: &super::broker_socket_dgram::BrokerSocketDgramFd<crate::Platform>| {
+                        fd.handle()
+                    },
+                );
+                drop(dt_local);
+                if let (Some(provider), Some(handle_id)) = (provider, handle_id) {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
+                    broker_eventfd_specs.push(alloc::format!("{raw_fd}:socket_dgram:{handle_id}"));
                 }
             }
 
