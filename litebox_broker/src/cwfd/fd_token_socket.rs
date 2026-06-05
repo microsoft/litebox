@@ -1405,6 +1405,16 @@ fn handle_control_connection_inner(
                     | Opcode::SocketDgramShutdown
                     | Opcode::SocketDgramGetSockName
                     | Opcode::SocketDgramGetPeerName
+                    | Opcode::CreateSocketSeqPacket
+                    | Opcode::SocketSeqPacketBind
+                    | Opcode::SocketSeqPacketListen
+                    | Opcode::SocketSeqPacketAccept
+                    | Opcode::SocketSeqPacketConnect
+                    | Opcode::SocketSeqPacketSend
+                    | Opcode::SocketSeqPacketRecv
+                    | Opcode::SocketSeqPacketShutdown
+                    | Opcode::SocketSeqPacketGetSockName
+                    | Opcode::SocketSeqPacketGetPeerName
                     | Opcode::CreateSocketPair
                     | Opcode::ReadSocketPair
                     | Opcode::WriteSocketPair

@@ -313,6 +313,8 @@ pub enum BrokerHandleKind {
     InetDgram = 9,
     /// Broker-hosted AF_UNIX SOCK_DGRAM socket.
     SocketDgram = 10,
+    /// Broker-hosted AF_UNIX SOCK_SEQPACKET socket.
+    SocketSeqPacket = 11,
 }
 
 impl BrokerHandleKind {
@@ -335,6 +337,7 @@ impl BrokerHandleKind {
             8 => Self::InetListener,
             9 => Self::InetDgram,
             10 => Self::SocketDgram,
+            11 => Self::SocketSeqPacket,
             _ => return None,
         })
     }
@@ -2213,6 +2216,7 @@ mod tests {
                 BrokerHandleKind::InetListener,
                 BrokerHandleKind::InetDgram,
                 BrokerHandleKind::SocketDgram,
+                BrokerHandleKind::SocketSeqPacket,
             ];
             for k in &kinds {
                 match k {
@@ -2225,7 +2229,8 @@ mod tests {
                     | BrokerHandleKind::TcpConn
                     | BrokerHandleKind::InetListener
                     | BrokerHandleKind::InetDgram
-                    | BrokerHandleKind::SocketDgram => {}
+                    | BrokerHandleKind::SocketDgram
+                    | BrokerHandleKind::SocketSeqPacket => {}
                 }
             }
             kinds
