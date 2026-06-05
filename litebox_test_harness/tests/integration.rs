@@ -2960,6 +2960,151 @@ mod copilot {
                 }
             }
         }
+
+        for pass in ["native", "litebox"] {
+            let name = format!("{pass}::copilot::tui_noLLM.startup_then_exit");
+            let pass_owned = pass.to_string();
+            trials.push(Trial::test(name, move || {
+                run_tui_no_llm_scenario(&pass_owned, "startup_then_exit")
+            }));
+        }
+    }
+
+    fn run_tui_no_llm_scenario(pass: &str, scenario_id: &str) -> Result<(), Failed> {
+        let github_token = token().map_err(|e| {
+            Failed::from(format!(
+                "GitHub token not available: {e}. Set \
+                 COPILOT_GITHUB_TOKEN or GH_TOKEN, or run \
+                 `gh auth login`."
+            ))
+        })?;
+
+        if scenario_id != "startup_then_exit" {
+            return Err(Failed::from(format!(
+                "unknown tui_noLLM scenario {scenario_id}"
+            )));
+        }
+
+        let _permit = CopilotPermit::acquire();
+        let fixture_dir = super::fixture_dir(pass, "tui_noLLM", scenario_id);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir)
+            .map_err(|e| format!("create fixture dir {}: {e}", fixture_dir.display()))?;
+        super::ensure_copilot_image(&super::workspace_root());
+
+        let token_env_path = fixture_dir.join(".copilot-env");
+        super::write_token_env(&token_env_path, github_token)?;
+
+        let pass_static: &'static str = match pass {
+            "native" => "native",
+            "litebox" => "litebox",
+            _ => "unknown",
+        };
+        let test_id = format!("copilot::tui_noLLM.{scenario_id}");
+        let spec = build_copilot_spec(pass, &fixture_dir, false);
+        let pass_owned = pass.to_string();
+        let scenario_id_owned = scenario_id.to_string();
+
+        super::framework::run_trial(
+            pass_static,
+            &test_id,
+            "copilot_cli",
+            "tui_noLLM",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!(
+                            "container {} did not publish port 22",
+                            container.name
+                        )),
+                        t_docker_start_ms: 0,
+                        t_useful_ms: 0,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                };
+                if let Err(e) = wait_for_sshd(port, Duration::from_secs(30)) {
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!("wait_for_sshd port {port}: {e}")),
+                        t_docker_start_ms: t_dispatch.elapsed().as_millis(),
+                        t_useful_ms: 0,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let response = match drive_tui_startup_then_exit(port, 45) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return super::framework::DriveResult {
+                            verdict: "FAIL",
+                            detail: Some(format!("drive: {e}")),
+                            t_docker_start_ms,
+                            t_useful_ms: t_useful_start.elapsed().as_millis(),
+                            sub_phases: super::SubPhaseMs::default(),
+                            t_docker_spawn_ms: None,
+                            t_litebox_init_ms: None,
+                            t_harness_load_ms: None,
+                        };
+                    }
+                };
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("copilot-{pass_owned}-tui_noLLM-{scenario_id_owned}");
+                let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &response);
+                let stripped = strip_ansi(&response);
+                let _ = std::fs::write(log_dir.join(format!("{safe}.stripped.log")), &stripped);
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.prompt.txt")),
+                    "No prompt submitted; startup probe exits with /exit after input-ready markers.\n",
+                );
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+
+                let ok = stripped.contains("startup_reached_input_ready=true")
+                    && stripped.contains("startup_exit_clean=true")
+                    && (stripped.contains("/ commands")
+                        || stripped.contains("@ files")
+                        || stripped.contains("? help"));
+                if !ok {
+                    let preview: String = stripped.chars().take(800).collect();
+                    return super::framework::DriveResult {
+                        verdict: "FAIL",
+                        detail: Some(format!(
+                            "copilot::tui_noLLM.{scenario_id_owned} startup check failed.\n\
+                             transcript: {}\n\
+                             first 800 chars of response (ANSI-stripped):\n{preview}",
+                            log_dir.join(format!("{safe}.stripped.log")).display(),
+                        )),
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+                super::framework::DriveResult {
+                    verdict: "pass",
+                    detail: None,
+                    t_docker_start_ms,
+                    t_useful_ms,
+                    sub_phases: super::SubPhaseMs::default(),
+                    t_docker_spawn_ms: None,
+                    t_litebox_init_ms: None,
+                    t_harness_load_ms: None,
+                }
+            },
+        )
     }
 
     fn run_scenario(pass: &str, mode: &str, scenario_id: &str) -> Result<(), Failed> {
@@ -3464,6 +3609,149 @@ mod copilot {
             "--- [drive_tui screen before /exit] ---\n{visible}\n\
              --- [drive_tui screen after /exit] ---\n{final_visible}"
         ))
+    }
+
+    fn drive_tui_startup_then_exit(port: u16, timeout_secs: u64) -> Result<String, String> {
+        let first = drive_tui_startup_then_exit_once(port, timeout_secs)?;
+        if first.contains("kex_exchange_identification") {
+            std::thread::sleep(Duration::from_secs(7));
+            return drive_tui_startup_then_exit_once(port, timeout_secs);
+        }
+        Ok(first)
+    }
+
+    fn drive_tui_startup_then_exit_once(port: u16, timeout_secs: u64) -> Result<String, String> {
+        let pty = Pty::open()?;
+        let _ = pty.resize(30, 100);
+        let mut argv = ssh_argv_base(port);
+        argv.push(
+            "set -a; . /workspace/.copilot-env; set +a; \
+             stty rows 30 cols 100 2>/dev/null; \
+             exec env TERM=xterm-256color COLORTERM=truecolor copilot --allow-all"
+                .to_string(),
+        );
+        let pid = pty.fork_exec(&argv, /* ctrl_tty = */ true)?;
+
+        let mut emu = term_emu::Emulator::new();
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut trust_seen = false;
+        let mut trust_answered = false;
+        let mut reached_input_ready = false;
+        let mut idle_since: Option<Instant> = None;
+        const POLL_TICK: Duration = Duration::from_millis(50);
+        const READY_QUIET: Duration = Duration::from_millis(800);
+
+        while Instant::now() < deadline {
+            let mut activity = false;
+            let mut eof = false;
+            loop {
+                match pty.try_read_now(8192) {
+                    Ok(Some(buf)) if buf.is_empty() => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(Some(buf)) => {
+                        emu.feed(&buf);
+                        activity = true;
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(format!("pty read: {e}")),
+                }
+            }
+            for reply in emu.take_pty_writes() {
+                let _ = pty.write_all(&reply);
+            }
+
+            let screen = emu.screen_text();
+            if screen.contains("Do you trust") {
+                trust_seen = true;
+                if !trust_answered {
+                    pty.write_all(b"\r")?;
+                    trust_answered = true;
+                    idle_since = None;
+                }
+                std::thread::sleep(POLL_TICK);
+                continue;
+            }
+
+            let input_ready = screen.contains("/ commands")
+                || screen.contains("@ files")
+                || screen.contains("? help");
+            if input_ready {
+                reached_input_ready = true;
+                let elapsed_idle = idle_since.map(|t| t.elapsed()).unwrap_or_default();
+                if !activity && elapsed_idle >= READY_QUIET {
+                    break;
+                }
+            }
+
+            if eof {
+                break;
+            } else if activity {
+                idle_since = Some(Instant::now());
+            } else if idle_since.is_none() {
+                idle_since = Some(Instant::now());
+            }
+            std::thread::sleep(POLL_TICK);
+        }
+
+        let visible = emu.screen_text();
+        let _ = pty.write_all(b"/exit\r");
+        let drain_until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < drain_until {
+            match pty.try_read_now(8192) {
+                Ok(Some(buf)) if buf.is_empty() => break,
+                Ok(Some(buf)) => emu.feed(&buf),
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+            for reply in emu.take_pty_writes() {
+                let _ = pty.write_all(&reply);
+            }
+        }
+        let final_visible = emu.screen_text();
+        let startup_exit_clean = wait_pid_exited(pid, Duration::from_secs(5))?;
+        if !startup_exit_clean {
+            let _ = pty.write_all(b"\x03");
+            let _ = wait_pid_exited(pid, Duration::from_secs(2));
+        }
+
+        Ok(format!(
+            "--- [drive_tui_startup_then_exit summary] ---\n\
+             startup_trust_seen={trust_seen}\n\
+             startup_trust_answered={trust_answered}\n\
+             startup_reached_input_ready={reached_input_ready}\n\
+             startup_exit_clean={startup_exit_clean}\n\
+             --- [drive_tui_startup_then_exit screen before /exit] ---\n{visible}\n\
+             --- [drive_tui_startup_then_exit screen after /exit] ---\n{final_visible}"
+        ))
+    }
+
+    fn wait_pid_exited(pid: libc::pid_t, timeout: Duration) -> Result<bool, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut status: libc::c_int = 0;
+            // SAFETY: `pid` is the child process returned by `fork_exec`; `status`
+            // points to valid writable memory for this `waitpid` call.
+            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if r == pid {
+                return Ok(true);
+            }
+            if r < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                if err.raw_os_error() == Some(libc::ECHILD) {
+                    return Ok(true);
+                }
+                return Err(format!("waitpid({pid}): {err}"));
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// POSIX shell single-quote escaping: wrap in '...' and replace
