@@ -718,6 +718,10 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
+/// `c_lflag` bit that makes background process-group writes to a controlling
+/// terminal generate `SIGTTOU`.
+pub const TOSTOP: tcflag_t = 0x0000_0100;
+
 /// Extended termios used by `TCGETS2`/`TCSETS2`. Layout matches
 /// the kernel `struct termios2`: same prefix as [`Termios`], with
 /// `c_ispeed` and `c_ospeed` (arbitrary baud rates, BOTHER mode)

@@ -1107,6 +1107,38 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             .collect()
     }
 
+    /// Returns whether a process group is orphaned using POSIX job-control rules.
+    ///
+    /// A process group is orphaned if every running member's parent is either
+    /// outside the member's session or inside the same process group.
+    pub fn is_process_group_orphaned(&self, pgid: ProcessGroupId) -> Option<bool> {
+        let table = self.table.read();
+        let sid = table
+            .values()
+            .find(|entry| {
+                entry.context.pgid == pgid && matches!(entry.context.state, ProcessState::Running)
+            })?
+            .context
+            .sid;
+
+        for member in table.values().filter(|entry| {
+            entry.context.pgid == pgid
+                && entry.context.sid == sid
+                && matches!(entry.context.state, ProcessState::Running)
+        }) {
+            let Some(parent) = member.context.parent.and_then(|pid| table.get(&pid)) else {
+                continue;
+            };
+            if parent.context.sid == sid
+                && parent.context.pgid != pgid
+                && matches!(parent.context.state, ProcessState::Running)
+            {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
     /// Returns the process IDs of all running processes except `exclude`.
     pub fn all_running_except(&self, exclude: ProcessId) -> alloc::vec::Vec<ProcessId> {
         let table = self.table.read();
