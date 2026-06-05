@@ -857,12 +857,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_eager_broker_socket_dgram_enabled(enabled);
     }
 
-    // Broker AF_UNIX SOCK_SEQPACKET remains opt-in while the probe matrix lands.
+    // Phase U.3: eager broker-backed AF_UNIX SOCK_SEQPACKET is default-on
+    // for consistency with U.1 (SOCK_STREAM). Required for the
+    // UDS_SEQPACKET.* harness suite to exercise BrokerSocketSeqPacket
+    // rather than falling back to in-shim UnixSocket (which lacks
+    // message-boundary semantics).
+    //
+    // Set `LITEBOX_EAGER_BROKER_SOCKETSEQPACKET=0` to opt out.
     {
         let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETSEQPACKET")
             .ok()
             .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+            .unwrap_or(true);
         litebox_shim_linux::syscalls::set_eager_broker_socket_seqpacket_enabled(enabled);
     }
 
