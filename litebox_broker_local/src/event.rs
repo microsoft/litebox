@@ -8,7 +8,7 @@ use litebox_broker_protocol::{
     WaitOutcome,
 };
 
-use crate::{ClientError, ControlClient, Result};
+use crate::{BrokerLocalError, ControlClient, Result};
 
 const EVENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 2);
 
@@ -30,7 +30,7 @@ impl<T: ClientControlChannel> ControlClient<T> {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(response))) => {
                 Ok(response.handle)
             }
-            response => Err(ClientError::UnexpectedResponse(response)),
+            response => Err(BrokerLocalError::UnexpectedResponse(response)),
         }
     }
 
@@ -43,7 +43,7 @@ impl<T: ClientControlChannel> ControlClient<T> {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(response))) => {
                 Ok(response.outcome)
             }
-            response => Err(ClientError::UnexpectedResponse(response)),
+            response => Err(BrokerLocalError::UnexpectedResponse(response)),
         }
     }
 
@@ -60,7 +60,7 @@ impl<T: ClientControlChannel> ControlClient<T> {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(response))) => {
                 Ok(response.readiness)
             }
-            response => Err(ClientError::UnexpectedResponse(response)),
+            response => Err(BrokerLocalError::UnexpectedResponse(response)),
         }
     }
 
@@ -77,7 +77,7 @@ impl<T: ClientControlChannel> ControlClient<T> {
             BrokerResponse::Core(CoreResponse::Event(EventResponse::Consume(response))) => {
                 Ok(response)
             }
-            response => Err(ClientError::UnexpectedResponse(response)),
+            response => Err(BrokerLocalError::UnexpectedResponse(response)),
         }
     }
 }
@@ -92,7 +92,7 @@ impl<T: ClientControlChannel> ControlClient<T> {
         if EVENT_PROTOCOL_VERSION.is_supported_by(negotiated) {
             Ok(())
         } else {
-            Err(ClientError::UnsupportedNegotiatedVersion {
+            Err(BrokerLocalError::UnsupportedNegotiatedVersion {
                 required: EVENT_PROTOCOL_VERSION,
                 negotiated_protocol_version: negotiated,
             })

@@ -5,33 +5,33 @@ use core::fmt;
 
 use litebox_broker_protocol::{BrokerResponse, ErrorCode, ProtocolVersion};
 
-/// Errors returned by the control client adapter.
+/// Errors returned by the broker-local control adapter.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum ClientError<E> {
+pub enum BrokerLocalError<E> {
     /// The control channel failed.
     Channel(E),
     /// An operation requiring an active broker session was called before negotiation.
     NotNegotiated,
-    /// Negotiation was requested after the client was already active.
+    /// Negotiation was requested after the local adapter was already active.
     AlreadyNegotiated,
     /// The broker closed the channel before returning a response.
     ChannelClosed,
-    /// The broker returned a response this client does not understand.
+    /// The broker returned a response this local adapter does not understand.
     UnknownResponse,
     /// The broker accepted negotiation with a version that cannot serve the request.
     IncompatibleNegotiation {
-        /// Protocol version requested by this client.
+        /// Protocol version requested by this local adapter.
         requested: ProtocolVersion,
         /// Protocol version advertised by the broker.
         broker_protocol_version: ProtocolVersion,
     },
-    /// This client cannot speak the requested protocol version.
-    UnsupportedClientVersion {
+    /// This local adapter cannot speak the requested protocol version.
+    UnsupportedLocalVersion {
         /// Protocol version requested by the caller.
         requested: ProtocolVersion,
-        /// Protocol version supported by this client implementation.
-        client_protocol_version: ProtocolVersion,
+        /// Protocol version supported by this local implementation.
+        local_protocol_version: ProtocolVersion,
     },
     /// The active broker session cannot serve an operation requiring a newer version.
     UnsupportedNegotiatedVersion {
@@ -42,7 +42,7 @@ pub enum ClientError<E> {
     },
     /// The broker does not support the requested protocol version.
     UnsupportedVersion {
-        /// Protocol version requested by this client.
+        /// Protocol version requested by this local adapter.
         requested: ProtocolVersion,
         /// Protocol version advertised by the broker.
         broker_protocol_version: ProtocolVersion,
@@ -53,12 +53,17 @@ pub enum ClientError<E> {
     UnexpectedResponse(BrokerResponse),
 }
 
-impl<E: fmt::Display> fmt::Display for ClientError<E> {
+impl<E: fmt::Display> fmt::Display for BrokerLocalError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Channel(error) => write!(f, "broker channel failed: {error}"),
-            Self::NotNegotiated => write!(f, "control client has not negotiated protocol version"),
-            Self::AlreadyNegotiated => f.write_str("control client already negotiated"),
+            Self::NotNegotiated => {
+                write!(
+                    f,
+                    "broker local adapter has not negotiated protocol version"
+                )
+            }
+            Self::AlreadyNegotiated => f.write_str("broker local adapter already negotiated"),
             Self::ChannelClosed => write!(f, "broker closed the channel"),
             Self::UnknownResponse => f.write_str("unknown broker response"),
             Self::IncompatibleNegotiation {
@@ -68,12 +73,12 @@ impl<E: fmt::Display> fmt::Display for ClientError<E> {
                 f,
                 "broker accepted incompatible protocol negotiation: requested {requested:?}, broker supports {broker_protocol_version:?}"
             ),
-            Self::UnsupportedClientVersion {
+            Self::UnsupportedLocalVersion {
                 requested,
-                client_protocol_version,
+                local_protocol_version,
             } => write!(
                 f,
-                "control client cannot request protocol version {requested:?}; client supports {client_protocol_version:?}"
+                "broker local adapter cannot request protocol version {requested:?}; local adapter supports {local_protocol_version:?}"
             ),
             Self::UnsupportedNegotiatedVersion {
                 required,
@@ -97,7 +102,7 @@ impl<E: fmt::Display> fmt::Display for ClientError<E> {
     }
 }
 
-impl<E> core::error::Error for ClientError<E>
+impl<E> core::error::Error for BrokerLocalError<E>
 where
     E: core::error::Error + 'static,
 {
@@ -110,7 +115,7 @@ where
             | Self::ChannelClosed
             | Self::UnknownResponse
             | Self::IncompatibleNegotiation { .. }
-            | Self::UnsupportedClientVersion { .. }
+            | Self::UnsupportedLocalVersion { .. }
             | Self::UnsupportedNegotiatedVersion { .. }
             | Self::UnsupportedVersion { .. }
             | Self::UnexpectedResponse(_) => None,
@@ -118,5 +123,5 @@ where
     }
 }
 
-/// Control client result type.
-pub type Result<T, E> = core::result::Result<T, ClientError<E>>;
+/// Broker-local control adapter result type.
+pub type Result<T, E> = core::result::Result<T, BrokerLocalError<E>>;

@@ -22,7 +22,7 @@ use litebox_broker_protocol::{
     BrokerRequest, BrokerResponse, ClientControlChannel, ProtocolVersion, ReceivedBrokerResponse,
 };
 
-pub use error::{ClientError, Result};
+pub use error::{BrokerLocalError, Result};
 #[cfg(feature = "std")]
 pub use worker::{ControlClientWorker, ControlClientWorkerError};
 
@@ -74,7 +74,7 @@ impl<T: ClientControlChannel> ControlClient<T> {
 
     pub(crate) fn ensure_negotiated(&self) -> Result<ProtocolVersion, T::Error> {
         match self.state {
-            ConnectionState::AwaitingNegotiation => Err(ClientError::NotNegotiated),
+            ConnectionState::AwaitingNegotiation => Err(BrokerLocalError::NotNegotiated),
             ConnectionState::Active {
                 negotiated_protocol_version,
             } => Ok(negotiated_protocol_version),
@@ -83,7 +83,7 @@ impl<T: ClientControlChannel> ControlClient<T> {
 
     pub(crate) fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
         match self.raw_request(request)? {
-            BrokerResponse::Error(error) => Err(ClientError::Broker(error)),
+            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => Ok(response),
         }
     }
@@ -91,15 +91,15 @@ impl<T: ClientControlChannel> ControlClient<T> {
     fn raw_request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, T::Error> {
         self.channel
             .send_request(&request)
-            .map_err(ClientError::Channel)?;
+            .map_err(BrokerLocalError::Channel)?;
         match self
             .channel
             .recv_response()
-            .map_err(ClientError::Channel)?
-            .ok_or(ClientError::ChannelClosed)?
+            .map_err(BrokerLocalError::Channel)?
+            .ok_or(BrokerLocalError::ChannelClosed)?
         {
             ReceivedBrokerResponse::Response(response) => Ok(response),
-            _ => Err(ClientError::UnknownResponse),
+            _ => Err(BrokerLocalError::UnknownResponse),
         }
     }
 
@@ -127,7 +127,7 @@ mod tests {
 
         assert!(matches!(
             client.create_event(),
-            Err(ClientError::NotNegotiated)
+            Err(BrokerLocalError::NotNegotiated)
         ));
         assert_eq!(client.channel.sent_request, None);
     }
@@ -143,7 +143,7 @@ mod tests {
 
         assert!(matches!(
             client.create_event(),
-            Err(ClientError::UnsupportedNegotiatedVersion {
+            Err(BrokerLocalError::UnsupportedNegotiatedVersion {
                 required,
                 negotiated_protocol_version
             }) if required == CLIENT_PROTOCOL_VERSION
@@ -184,7 +184,7 @@ mod tests {
 
         assert!(matches!(
             client.negotiate_version(requested),
-            Err(ClientError::IncompatibleNegotiation {
+            Err(BrokerLocalError::IncompatibleNegotiation {
                 requested: actual_requested,
                 broker_protocol_version
             }) if actual_requested == requested && broker_protocol_version == broker_version
@@ -205,10 +205,10 @@ mod tests {
 
         assert!(matches!(
             client.negotiate_version(too_new),
-            Err(ClientError::UnsupportedClientVersion {
+            Err(BrokerLocalError::UnsupportedLocalVersion {
                 requested,
-                client_protocol_version
-            }) if requested == too_new && client_protocol_version == CLIENT_PROTOCOL_VERSION
+                local_protocol_version
+            }) if requested == too_new && local_protocol_version == CLIENT_PROTOCOL_VERSION
         ));
         assert_eq!(client.negotiated_protocol_version(), None);
         assert_eq!(client.channel.sent_request, None);
@@ -228,7 +228,7 @@ mod tests {
 
         assert!(matches!(
             client.negotiate_version(requested),
-            Err(ClientError::UnsupportedVersion {
+            Err(BrokerLocalError::UnsupportedVersion {
                 requested: actual_requested,
                 broker_protocol_version
             }) if actual_requested == requested && broker_protocol_version == fallback

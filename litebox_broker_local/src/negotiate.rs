@@ -5,7 +5,7 @@ use litebox_broker_protocol::{
     BrokerRequest, BrokerResponse, ClientControlChannel, ProtocolVersion,
 };
 
-use crate::{CLIENT_PROTOCOL_VERSION, ClientError, ControlClient, Result};
+use crate::{BrokerLocalError, CLIENT_PROTOCOL_VERSION, ControlClient, Result};
 
 impl<T: ClientControlChannel> ControlClient<T> {
     /// Negotiates the default client protocol version.
@@ -25,12 +25,12 @@ impl<T: ClientControlChannel> ControlClient<T> {
         protocol_version: ProtocolVersion,
     ) -> Result<ProtocolVersion, T::Error> {
         if self.state != crate::ConnectionState::AwaitingNegotiation {
-            return Err(ClientError::AlreadyNegotiated);
+            return Err(BrokerLocalError::AlreadyNegotiated);
         }
         if !protocol_version.is_supported_by(CLIENT_PROTOCOL_VERSION) {
-            return Err(ClientError::UnsupportedClientVersion {
+            return Err(BrokerLocalError::UnsupportedLocalVersion {
                 requested: protocol_version,
-                client_protocol_version: CLIENT_PROTOCOL_VERSION,
+                local_protocol_version: CLIENT_PROTOCOL_VERSION,
             });
         }
 
@@ -40,7 +40,7 @@ impl<T: ClientControlChannel> ControlClient<T> {
                 broker_protocol_version,
             } => {
                 if !protocol_version.is_supported_by(broker_protocol_version) {
-                    return Err(ClientError::IncompatibleNegotiation {
+                    return Err(BrokerLocalError::IncompatibleNegotiation {
                         requested: protocol_version,
                         broker_protocol_version,
                     });
@@ -52,11 +52,11 @@ impl<T: ClientControlChannel> ControlClient<T> {
             }
             BrokerResponse::VersionMismatch {
                 broker_protocol_version,
-            } => Err(ClientError::UnsupportedVersion {
+            } => Err(BrokerLocalError::UnsupportedVersion {
                 requested: protocol_version,
                 broker_protocol_version,
             }),
-            response => Err(ClientError::UnexpectedResponse(response)),
+            response => Err(BrokerLocalError::UnexpectedResponse(response)),
         }
     }
 }

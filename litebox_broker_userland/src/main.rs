@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, PolicyEngine};
-use litebox_broker_host::{BrokerServeError, serve_connection};
+use litebox_broker_host::{BrokerHostError, serve_connection};
 use litebox_broker_transport::unix_socket::UnixStreamServerControlChannel;
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -77,10 +77,10 @@ impl Drop for SocketPathCleanup {
     }
 }
 
-fn broker_error(error: BrokerServeError<io::Error>) -> io::Error {
+fn broker_error(error: BrokerHostError<io::Error>) -> io::Error {
     match error {
-        BrokerServeError::AssociationSetup => io::Error::other("broker association setup failed"),
-        BrokerServeError::Channel(error) => error,
+        BrokerHostError::AssociationSetup => io::Error::other("broker association setup failed"),
+        BrokerHostError::Channel(error) => error,
         error => io::Error::other(error.to_string()),
     }
 }

@@ -15,7 +15,7 @@ use std::{
 
 use litebox_broker_protocol::{BrokerRequest, BrokerResponse, ClientControlChannel};
 
-use crate::{ClientError, ControlClient};
+use crate::{BrokerLocalError, ControlClient};
 
 const PHASE_IDLE: u8 = 0;
 const PHASE_RESERVED: u8 = 1;
@@ -29,7 +29,7 @@ const DEFAULT_SHUTDOWN_WAIT: Duration = Duration::from_millis(100);
 #[non_exhaustive]
 pub enum ControlClientWorkerError<E> {
     /// The wrapped control client returned an error.
-    Client(ClientError<E>),
+    Client(BrokerLocalError<E>),
     /// The worker is shutting down or has already shut down.
     Shutdown,
 }
@@ -539,7 +539,7 @@ mod tests {
         assert!(matches!(
             requester.join().unwrap(),
             Err(ControlClientWorkerError::Shutdown
-                | ControlClientWorkerError::Client(ClientError::Channel(_)))
+                | ControlClientWorkerError::Client(BrokerLocalError::Channel(_)))
         ));
     }
 
@@ -611,7 +611,7 @@ mod tests {
         assert!(*lock.lock().unwrap(), "shutdown hook was not invoked");
         match requester.join().unwrap() {
             Err(ControlClientWorkerError::Shutdown) => {}
-            Err(ControlClientWorkerError::Client(ClientError::Channel(error)))
+            Err(ControlClientWorkerError::Client(BrokerLocalError::Channel(error)))
                 if error.kind() == io::ErrorKind::Interrupted => {}
             result => panic!("unexpected requester result: {result:?}"),
         }

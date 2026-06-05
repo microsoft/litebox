@@ -12,9 +12,10 @@
 #[cfg(test)]
 extern crate std;
 
+mod error;
 mod server;
 
+pub use error::{BrokerHostError, Result};
 pub use server::{
-    BrokerServeError, CloseReason, ConnectionTermination, SUPPORTED_PROTOCOL_VERSION,
-    serve_connection,
+    CloseReason, ConnectionTermination, SUPPORTED_PROTOCOL_VERSION, serve_connection,
 };

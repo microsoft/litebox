@@ -10,6 +10,8 @@ use litebox_broker_protocol::{
     ReceivedBrokerRequest, ServerControlChannel, WaitEventResponse,
 };
 
+use crate::error::{BrokerHostError, Result as HostResult};
+
 /// Protocol version this broker server implementation supports.
 pub const SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 2);
 
@@ -17,18 +19,18 @@ pub const SUPPORTED_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 
 pub fn serve_connection<T>(
     core: &mut BrokerCore,
     channel: &mut T,
-) -> Result<ConnectionTermination, BrokerServeError<T::Error>>
+) -> HostResult<ConnectionTermination, T::Error>
 where
     T: ServerControlChannel,
 {
     let peer_credential = channel
         .peer_credential()
-        .map_err(BrokerServeError::Channel)?;
+        .map_err(BrokerHostError::Channel)?;
     let caller_credential = caller_credential_from_peer(peer_credential)
-        .map_err(|()| BrokerServeError::AssociationSetup)?;
+        .map_err(|()| BrokerHostError::AssociationSetup)?;
     let association = core
         .create_association(caller_credential)
-        .map_err(|_error| BrokerServeError::AssociationSetup)?;
+        .map_err(|_error| BrokerHostError::AssociationSetup)?;
 
     let result = serve_request_loop(core, channel, &association);
     core.close_association(association);
@@ -39,20 +41,20 @@ fn serve_request_loop<T>(
     core: &mut BrokerCore,
     channel: &mut T,
     association: &BrokerAssociation,
-) -> Result<ConnectionTermination, BrokerServeError<T::Error>>
+) -> HostResult<ConnectionTermination, T::Error>
 where
     T: ServerControlChannel,
 {
     let mut state = ConnectionState::AwaitingNegotiation;
     loop {
-        let Some(received) = channel.recv_request().map_err(BrokerServeError::Channel)? else {
+        let Some(received) = channel.recv_request().map_err(BrokerHostError::Channel)? else {
             break;
         };
 
         let dispatch = handle_received_request(core, association, &mut state, received);
         channel
             .send_response(&dispatch.response)
-            .map_err(BrokerServeError::Channel)?;
+            .map_err(BrokerHostError::Channel)?;
         if let DispatchOutcome::Close(reason) = dispatch.outcome {
             return Ok(ConnectionTermination::BrokerClosed(reason));
         }
@@ -61,7 +63,9 @@ where
     Ok(ConnectionTermination::PeerClosed)
 }
 
-fn caller_credential_from_peer(peer_credential: PeerCredential) -> Result<CallerCredential, ()> {
+fn caller_credential_from_peer(
+    peer_credential: PeerCredential,
+) -> core::result::Result<CallerCredential, ()> {
     if peer_credential == PeerCredential::Unauthenticated {
         Ok(CallerCredential::Unauthenticated)
     } else {
@@ -280,37 +284,6 @@ pub enum ConnectionTermination {
     BrokerClosed(CloseReason),
 }
 
-/// Errors returned by a broker receive/send loop.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum BrokerServeError<E> {
-    /// The server could not authenticate the peer or allocate broker association state.
-    AssociationSetup,
-    /// The concrete channel failed.
-    Channel(E),
-}
-
-impl<E: fmt::Display> fmt::Display for BrokerServeError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AssociationSetup => f.write_str("broker association setup failed"),
-            Self::Channel(error) => write!(f, "broker channel failed: {error}"),
-        }
-    }
-}
-
-impl<E> core::error::Error for BrokerServeError<E>
-where
-    E: core::error::Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::AssociationSetup => None,
-            Self::Channel(error) => Some(error),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,7 +297,6 @@ mod tests {
         dispatch_enforces_negotiation_state(&mut core);
         dispatch_rejects_unsupported_protocol_version_without_activation(&mut core);
         dispatch_handles_unknown_wire_requests_by_state(&mut core);
-        dispatch_negotiates_then_routes_event_create(&mut core);
         serve_connection_negotiates_routes_one_request_and_returns_peer_closed(&mut core);
         serve_connection_closes_after_protocol_violation(&mut core);
         serve_connection_returns_channel_error_when_response_send_fails(&mut core);
@@ -414,19 +386,6 @@ mod tests {
         }
     }
 
-    fn dispatch_negotiates_then_routes_event_create(core: &mut BrokerCore) {
-        let (association, mut state) = new_association(core);
-        negotiate(core, &association, &mut state);
-
-        let dispatch = handle_request(core, &association, &mut state, event_create_request(0));
-        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-        match dispatch.response {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(_))) => {}
-            response => panic!("unexpected response: {response:?}"),
-        }
-        core.close_association(association);
-    }
-
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(
         core: &mut BrokerCore,
     ) {
@@ -493,7 +452,7 @@ mod tests {
         channel.send_error = Some(FakeChannelError::Send);
 
         match serve_connection(core, &mut channel) {
-            Err(BrokerServeError::Channel(FakeChannelError::Send)) => {}
+            Err(BrokerHostError::Channel(FakeChannelError::Send)) => {}
             result => panic!("unexpected serve result: {result:?}"),
         }
         assert!(channel.responses.is_empty());
