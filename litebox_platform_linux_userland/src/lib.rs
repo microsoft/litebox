@@ -1441,12 +1441,12 @@ impl LinuxUserland {
             spawn_argv.push(CString::new("--env").unwrap());
             spawn_argv.push(env_entry.clone());
         }
-        // Add --pipe-bridge for extra inherited fds (e.g. socketpair IPC).
+        // Add --unix-socket-passthrough for extra inherited fds (e.g. socketpair IPC).
         // Must be BEFORE the -- separator so they're parsed as runner args.
         for &(guest_fd, host_fd) in safe_extra_fds.iter() {
             let _ = self.clear_cloexec(host_fd);
-            spawn_argv.push(CString::new("--pipe-bridge").unwrap());
-            spawn_argv.push(CString::new(format!("{guest_fd}:b:{guest_fd}")).map_err(|_| -1_i32)?);
+            spawn_argv.push(CString::new("--unix-socket-passthrough").unwrap());
+            spawn_argv.push(CString::new(format!("{guest_fd}:{guest_fd}")).map_err(|_| -1_i32)?);
         }
 
         // Phase C.3: add --broker-fd-bridge for inherited broker-backed
@@ -1623,9 +1623,9 @@ impl LinuxUserland {
 
         // Map extra fds (socketpair bridges) to their guest fd numbers
         // at the kernel level via dup2 file actions. The runner's
-        // --pipe-bridge specs use the guest fd as the host fd, so close the
-        // high staging fd in the spawned worker after dup2; otherwise that
-        // duplicate keeps the peer open and pipe readers never observe EOF.
+        // --unix-socket-passthrough specs use the guest fd as the host fd.
+        // Close the high staging fd in the spawned worker after dup2; otherwise
+        // that duplicate keeps the peer open and pipe readers never observe EOF.
         for &(guest_fd, host_fd) in safe_extra_fds.iter() {
             if unsafe {
                 libc::posix_spawn_file_actions_adddup2(file_actions_ptr, host_fd, guest_fd as i32)
@@ -1897,8 +1897,8 @@ impl LinuxUserland {
     /// child to report restore success/failure, and launches a new host process
     /// via `posix_spawn`.
     ///
-    /// Host-pipe fds from prior bridges are passed via `passthrough_fds`
-    /// and inherit directly.
+    /// Bidirectional Unix-socket fds from delayed-fork bridges are passed via
+    /// `passthrough_fds` and inherit directly.
     ///
     /// Returns `Ok(host_pid)` if the child was spawned and reported successful
     /// restore via the ack pipe.  Returns `Err(errno)` on failure.
@@ -1914,7 +1914,7 @@ impl LinuxUserland {
         &'static self,
         snapshot_bytes: &[u8],
         stdio: WorkerExecStdioBindings<FS>,
-        passthrough_fds: &[(usize, i32, u8)],
+        passthrough_fds: &[(usize, i32)],
         // Phase 3 (legacy-pipes retirement): broker-fd-bridge specs for
         // streams migrated directly to broker handles. Each entry is
         // forwarded to the worker as `--broker-fd-bridge <spec>` and
@@ -1987,18 +1987,11 @@ impl LinuxUserland {
             }
         }
 
-        // Add --pipe-bridge for external-fd passthrough fds (from prior bridges).
-        for &(guest_fd, host_fd, dir) in passthrough_fds {
+        // Add --unix-socket-passthrough for delayed-fork Unix socketpair fds.
+        for &(guest_fd, host_fd) in passthrough_fds {
             let _ = self.clear_cloexec(host_fd);
-            let dir_char = match dir {
-                b'r' => 'r',
-                b'b' => 'b',
-                _ => 'w',
-            };
-            spawn_argv.push(CString::new("--pipe-bridge").unwrap());
-            spawn_argv.push(
-                CString::new(format!("{guest_fd}:{dir_char}:{host_fd}")).map_err(|_| -1_i32)?,
-            );
+            spawn_argv.push(CString::new("--unix-socket-passthrough").unwrap());
+            spawn_argv.push(CString::new(format!("{guest_fd}:{host_fd}")).map_err(|_| -1_i32)?);
         }
 
         // Phase 3 (legacy-pipes retirement): forward broker-fd-bridge
@@ -2167,9 +2160,9 @@ impl LinuxUserland {
         drop(result_write_fd);
         drop(snapshot_fd);
 
-        // Close child-side passthrough pipe bridge FDs (child inherited them
+        // Close child-side Unix-socket passthrough FDs (child inherited them
         // via posix_spawn since we cleared CLOEXEC).
-        for &(_, host_fd, _) in passthrough_fds {
+        for &(_, host_fd) in passthrough_fds {
             self.close_host_fd(host_fd);
         }
 

@@ -4905,9 +4905,9 @@ impl<FS: ShimFS> Task<FS> {
 
         // Spawn the child worker host.
         // Build passthrough fds for bidirectional unix socket bridges.
-        let bidi_pt: Vec<(usize, i32, u8)> = bidi_passthrough
+        let bidi_pt: Vec<(usize, i32)> = bidi_passthrough
             .iter()
-            .map(|&(guest_fd, child_fd, _)| (guest_fd, child_fd, b'b'))
+            .map(|&(guest_fd, child_fd, _)| (guest_fd, child_fd))
             .collect();
         let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
             &snapshot_bytes,
@@ -9901,9 +9901,9 @@ fn worker_exec_input_binding<FS: ShimFS>(
             }
 
             // ExternalFd: the worker needs this fd dup2'd onto its stdio slot.
-            // The pipe bridge mechanism (--pipe-bridge) only applies to
-            // fork-restore, not exec.  For exec, we use posix_spawn file actions
-            // to dup2 the host fd onto the target stdio slot.
+            // The Unix-socket passthrough mechanism (--unix-socket-passthrough)
+            // only applies to fork-restore, not exec. For exec, we use
+            // posix_spawn file actions to dup2 the host fd onto the target stdio slot.
             crate::RawFdRef::ExternalFd(hp_fd) => {
                 let dt = global.litebox.descriptor_table();
                 if let Some(host_fd) =
