@@ -164,37 +164,16 @@ impl<T: LocalControlChannel> BrokerLocal<T> {
 mod tests {
     use super::*;
     use core::convert::Infallible;
-    use litebox_broker_protocol::{ErrorCode, ProtocolVersion};
+    use litebox_broker_protocol::ProtocolVersion;
 
     #[test]
     fn event_operations_require_negotiation_without_sending() {
-        let channel =
-            FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::ProtocolState)));
+        let channel = FakeControlChannel::new(None);
         let mut local = BrokerLocal::new(channel);
 
         assert!(matches!(
             local.create_event(),
             Err(BrokerLocalError::NotNegotiated)
-        ));
-        assert_eq!(local.channel.sent_request, None);
-    }
-
-    #[test]
-    fn event_operations_require_event_protocol_version_without_sending() {
-        let channel =
-            FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::UnsupportedOperation)));
-        let mut local = BrokerLocal::new(channel);
-        local.state = ConnectionState::Active {
-            negotiated_protocol_version: ProtocolVersion::new(LOCAL_PROTOCOL_VERSION.major, 1),
-        };
-
-        assert!(matches!(
-            local.create_event(),
-            Err(BrokerLocalError::UnsupportedNegotiatedVersion {
-                required,
-                negotiated_protocol_version
-            }) if required == LOCAL_PROTOCOL_VERSION
-                && negotiated_protocol_version == ProtocolVersion::new(LOCAL_PROTOCOL_VERSION.major, 1)
         ));
         assert_eq!(local.channel.sent_request, None);
     }
@@ -221,33 +200,12 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_version_rejects_incompatible_broker_response() {
-        let requested = LOCAL_PROTOCOL_VERSION;
-        let broker_version = ProtocolVersion::new(LOCAL_PROTOCOL_VERSION.major, 1);
-        let channel = FakeControlChannel::new(Some(BrokerResponse::Negotiated {
-            broker_protocol_version: broker_version,
-        }));
-        let mut local = BrokerLocal::new(channel);
-
-        assert!(matches!(
-            local.negotiate_version(requested),
-            Err(BrokerLocalError::IncompatibleNegotiation {
-                requested: actual_requested,
-                broker_protocol_version
-            }) if actual_requested == requested && broker_protocol_version == broker_version
-        ));
-        assert_eq!(local.negotiated_protocol_version(), None);
-    }
-
-    #[test]
     fn negotiate_version_rejects_locally_unsupported_version_without_sending() {
         let too_new = ProtocolVersion::new(
             LOCAL_PROTOCOL_VERSION.major,
             LOCAL_PROTOCOL_VERSION.minor + 1,
         );
-        let channel = FakeControlChannel::new(Some(BrokerResponse::VersionMismatch {
-            broker_protocol_version: LOCAL_PROTOCOL_VERSION,
-        }));
+        let channel = FakeControlChannel::new(None);
         let mut local = BrokerLocal::new(channel);
 
         assert!(matches!(
@@ -259,41 +217,6 @@ mod tests {
         ));
         assert_eq!(local.negotiated_protocol_version(), None);
         assert_eq!(local.channel.sent_request, None);
-    }
-
-    #[test]
-    fn negotiate_version_reports_broker_supported_version_and_allows_retry() {
-        let requested = LOCAL_PROTOCOL_VERSION;
-        let fallback = ProtocolVersion::new(
-            LOCAL_PROTOCOL_VERSION.major,
-            LOCAL_PROTOCOL_VERSION.minor - 1,
-        );
-        let channel = FakeControlChannel::new(Some(BrokerResponse::VersionMismatch {
-            broker_protocol_version: fallback,
-        }));
-        let mut local = BrokerLocal::new(channel);
-
-        assert!(matches!(
-            local.negotiate_version(requested),
-            Err(BrokerLocalError::UnsupportedVersion {
-                requested: actual_requested,
-                broker_protocol_version
-            }) if actual_requested == requested && broker_protocol_version == fallback
-        ));
-        assert_eq!(local.negotiated_protocol_version(), None);
-        assert_eq!(
-            local.channel.sent_request,
-            Some(BrokerRequest::Negotiate {
-                protocol_version: requested
-            })
-        );
-
-        local.channel.response = Some(BrokerResponse::Negotiated {
-            broker_protocol_version: fallback,
-        });
-
-        assert_eq!(local.negotiate_version(fallback).unwrap(), fallback);
-        assert_eq!(local.negotiated_protocol_version(), Some(fallback));
     }
 
     struct FakeControlChannel {

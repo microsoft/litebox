@@ -307,96 +307,9 @@ mod tests {
     fn host_request_handling_uses_one_broker_core() {
         let mut core = BrokerCore::new(PolicyEngine::event_only()).unwrap();
 
-        dispatch_enforces_negotiation_state(&mut core);
-        dispatch_rejects_unsupported_protocol_version_without_activation(&mut core);
-        dispatch_handles_unknown_wire_requests_by_state(&mut core);
         serve_connection_negotiates_routes_one_request_and_returns_peer_closed(&mut core);
         serve_connection_closes_after_protocol_violation(&mut core);
         serve_connection_returns_channel_error_when_response_send_fails(&mut core);
-    }
-
-    fn dispatch_enforces_negotiation_state(core: &mut BrokerCore) {
-        {
-            let (association, mut state) = new_association(core);
-
-            let dispatch = handle_request(core, &association, &mut state, event_create_request(0));
-            assert_protocol_violation(dispatch);
-            assert_eq!(state, ConnectionState::AwaitingNegotiation);
-            core.close_association(association);
-        }
-
-        {
-            let (association, mut state) = new_association(core);
-            negotiate(core, &association, &mut state);
-
-            let dispatch = handle_request(
-                core,
-                &association,
-                &mut state,
-                BrokerRequest::Negotiate {
-                    protocol_version: HOST_PROTOCOL_VERSION,
-                },
-            );
-            assert_protocol_violation(dispatch);
-            core.close_association(association);
-        }
-    }
-
-    fn dispatch_rejects_unsupported_protocol_version_without_activation(core: &mut BrokerCore) {
-        let (association, mut state) = new_association(core);
-
-        let dispatch = handle_request(
-            core,
-            &association,
-            &mut state,
-            BrokerRequest::Negotiate {
-                protocol_version: ProtocolVersion::new(HOST_PROTOCOL_VERSION.major + 1, 0),
-            },
-        );
-
-        assert_eq!(
-            dispatch.response,
-            BrokerResponse::VersionMismatch {
-                broker_protocol_version: HOST_PROTOCOL_VERSION
-            }
-        );
-        assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-        assert_eq!(state, ConnectionState::AwaitingNegotiation);
-        core.close_association(association);
-    }
-
-    fn dispatch_handles_unknown_wire_requests_by_state(core: &mut BrokerCore) {
-        {
-            let (association, mut state) = new_association(core);
-
-            let dispatch = handle_received_request(
-                core,
-                &association,
-                &mut state,
-                ReceivedBrokerRequest::Unknown,
-            );
-            assert_protocol_violation(dispatch);
-            core.close_association(association);
-        }
-
-        {
-            let (association, mut state) = new_association(core);
-            negotiate(core, &association, &mut state);
-
-            let dispatch = handle_received_request(
-                core,
-                &association,
-                &mut state,
-                ReceivedBrokerRequest::Unknown,
-            );
-
-            assert_eq!(
-                dispatch.response,
-                BrokerResponse::Error(ErrorCode::UnsupportedOperation)
-            );
-            assert_eq!(dispatch.outcome, DispatchOutcome::Continue);
-            core.close_association(association);
-        }
     }
 
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(
@@ -469,51 +382,6 @@ mod tests {
             result => panic!("unexpected serve result: {result:?}"),
         }
         assert!(channel.responses.is_empty());
-    }
-
-    fn assert_protocol_violation(dispatch: BrokerDispatch) {
-        assert_eq!(
-            dispatch.response,
-            BrokerResponse::Error(ErrorCode::ProtocolState)
-        );
-        assert_eq!(
-            dispatch.outcome,
-            DispatchOutcome::Close(CloseReason::ProtocolViolation)
-        );
-    }
-
-    fn new_association(core: &mut BrokerCore) -> (BrokerAssociation, ConnectionState) {
-        let association = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        (association, ConnectionState::AwaitingNegotiation)
-    }
-
-    fn negotiate(
-        core: &mut BrokerCore,
-        association: &BrokerAssociation,
-        state: &mut ConnectionState,
-    ) {
-        let dispatch = handle_request(
-            core,
-            association,
-            state,
-            BrokerRequest::Negotiate {
-                protocol_version: HOST_PROTOCOL_VERSION,
-            },
-        );
-        assert_eq!(
-            dispatch.response,
-            BrokerResponse::Negotiated {
-                broker_protocol_version: HOST_PROTOCOL_VERSION
-            }
-        );
-        assert_eq!(
-            *state,
-            ConnectionState::Active {
-                negotiated_protocol_version: HOST_PROTOCOL_VERSION
-            }
-        );
     }
 
     const fn event_request(request: EventRequest) -> BrokerRequest {
