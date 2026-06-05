@@ -41,6 +41,7 @@ enum ScenarioKind {
     Tiocgpgrp,
     Tiocspgrp,
     Tiocsctty,
+    ControllingTtyTostopSigttou,
     Resize,
     WinsizeCrossWorker,
     SetpgidCrossWorker,
@@ -190,6 +191,11 @@ const PTY_SCENARIOS: &[ScenarioDef] = &[
         per_binary_type: true,
     },
     ScenarioDef {
+        name: "controlling_tty.tostop_sigttou",
+        kind: ScenarioKind::ControllingTtyTostopSigttou,
+        per_binary_type: true,
+    },
+    ScenarioDef {
         name: "resize",
         kind: ScenarioKind::Resize,
         per_binary_type: true,
@@ -305,6 +311,8 @@ const EXEC_ECHO: HandlerToken<(), PtyOut> = HandlerToken::new("pty.exec_echo");
 const TIOCGPGRP: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.tiocgpgrp");
 const TIOCSPGRP: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.tiocspgrp");
 const TIOCSCTTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.tiocsctty");
+const CONTROLLING_TTY_TOSTOP_SIGTTOU: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.controlling_tty.tostop_sigttou");
 const RESIZE: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("pty.resize");
 const WINSIZE_CROSS_WORKER: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.winsize_cross_worker");
@@ -1186,6 +1194,22 @@ async fn handle_controlling_tty_tiocsctty_sigttin(
     Ok(PtyOut { detail })
 }
 
+async fn handle_controlling_tty_tostop_sigttou(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-tostop-sigttou".into()], true)?;
+    let status = wait_child_or_stopped_timeout(pid, Duration::from_secs(10))?;
+    let data = pty.read(None)?;
+    if status != 0 {
+        return Err(format!("expected child exit 0, got {status}; output={data:?}").into());
+    }
+    let detail = exact(&data, "SIGTTOU_OK\r\n")?;
+    Ok(PtyOut { detail })
+}
+
 async fn handle_line_discipline_cr_to_nl(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -1269,6 +1293,10 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(TIOCGPGRP, handle_tiocgpgrp);
     register_handler!(TIOCSPGRP, handle_tiocspgrp);
     register_handler!(TIOCSCTTY, handle_tiocsctty);
+    register_handler!(
+        CONTROLLING_TTY_TOSTOP_SIGTTOU,
+        handle_controlling_tty_tostop_sigttou
+    );
     register_handler!(RESIZE, handle_resize);
     register_handler!(WINSIZE_CROSS_WORKER, handle_winsize_cross_worker);
     register_handler!(SETPGID_CROSS_WORKER, handle_setpgid_cross_worker);
@@ -1323,6 +1351,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!("pty-tiocgpgrp", leaf_subcmd::subcmd_pty_tiocgpgrp);
     crate::register_leaf_subcommand!("pty-tiocspgrp", leaf_subcmd::subcmd_pty_tiocspgrp);
     crate::register_leaf_subcommand!("pty-tiocsctty", leaf_subcmd::subcmd_pty_tiocsctty);
+    crate::register_leaf_subcommand!("pty-tostop-sigttou", leaf_subcmd::subcmd_pty_tostop_sigttou);
     crate::register_leaf_subcommand!("pty-resize", leaf_subcmd::subcmd_pty_resize);
     crate::register_leaf_subcommand!(
         "pty-winsize-cross-worker",
@@ -1710,6 +1739,10 @@ async fn drive_target(
         ScenarioKind::Tiocgpgrp => run.send_named_typed(handle, &TIOCGPGRP, args).await?,
         ScenarioKind::Tiocspgrp => run.send_named_typed(handle, &TIOCSPGRP, args).await?,
         ScenarioKind::Tiocsctty => run.send_named_typed(handle, &TIOCSCTTY, args).await?,
+        ScenarioKind::ControllingTtyTostopSigttou => {
+            run.send_named_typed(handle, &CONTROLLING_TTY_TOSTOP_SIGTTOU, args)
+                .await?
+        }
         ScenarioKind::Resize => run.send_named_typed(handle, &RESIZE, args).await?,
         ScenarioKind::WinsizeCrossWorker => {
             run.send_named_typed(handle, &WINSIZE_CROSS_WORKER, args)
@@ -2408,6 +2441,123 @@ mod leaf_subcmd {
         );
         let _ = std::io::stdout().flush();
         if count == 1 { 0 } else { 1 }
+    }
+
+    pub(super) fn subcmd_pty_tostop_sigttou(_args: &[String]) -> i32 {
+        // SAFETY: getpgrp has no preconditions.
+        let mut fg = unsafe { libc::getpgrp() };
+        // SAFETY: TIOCSPGRP reads a pid_t from the provided pointer for fd 1.
+        if unsafe { libc::ioctl(1, libc::TIOCSPGRP, &mut fg) } != 0 {
+            eprintln!(
+                "initial TIOCSPGRP failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        // SAFETY: zeroed is a valid starting representation for termios before tcgetattr fills it.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: tcgetattr writes termios for the controlling tty fd 1.
+        if unsafe { libc::tcgetattr(1, &mut termios) } != 0 {
+            eprintln!("tcgetattr failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        termios.c_lflag |= libc::TOSTOP;
+        // SAFETY: tcsetattr reads a valid termios for fd 1.
+        if unsafe { libc::tcsetattr(1, libc::TCSANOW, &termios) } != 0 {
+            eprintln!(
+                "tcsetattr TOSTOP failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+
+        let mut pipe_fds = [0i32; 2];
+        // SAFETY: pipe2 initializes a two-fd array owned by this process.
+        if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            eprintln!("pipe2 failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        // SAFETY: fork creates a child that will become a background pgrp member.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // SAFETY: child-only signal setup, process-group setup, and pipe notification.
+            unsafe {
+                libc::close(pipe_fds[0]);
+                PTY_LDISC_SIGNAL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = pty_ldisc_signal_handler as *const () as usize;
+                libc::sigemptyset(&mut action.sa_mask);
+                action.sa_flags = 0;
+                if libc::sigaction(libc::SIGTTOU, &action, std::ptr::null_mut()) != 0 {
+                    libc::_exit(2);
+                }
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(3);
+                }
+
+                let write_rc = libc::write(1, b"W".as_ptr().cast(), 1);
+                let write_signaled = write_rc < 0
+                    && PTY_LDISC_SIGNAL_COUNT.load(std::sync::atomic::Ordering::SeqCst) > 0;
+
+                PTY_LDISC_SIGNAL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+                let mut set = fg;
+                let ioctl_rc = libc::ioctl(1, libc::TIOCSPGRP, &mut set);
+                let ioctl_signaled = ioctl_rc < 0
+                    && PTY_LDISC_SIGNAL_COUNT.load(std::sync::atomic::Ordering::SeqCst) > 0;
+
+                if write_signaled && (ioctl_signaled || ioctl_rc == 0) {
+                    let _ = libc::write(pipe_fds[1], b"S".as_ptr().cast(), 1);
+                    libc::_exit(0);
+                }
+                libc::_exit(if write_signaled { 5 } else { 4 });
+            }
+        }
+        // SAFETY: parent no longer writes to the notification pipe.
+        unsafe { libc::close(pipe_fds[1]) };
+        if child < 0 {
+            // SAFETY: close read end on fork failure.
+            unsafe { libc::close(pipe_fds[0]) };
+            eprintln!("fork failed: {}", std::io::Error::last_os_error());
+            return 1;
+        }
+        let mut pfd = libc::pollfd {
+            fd: pipe_fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd points to one live pipe read end.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 2000) };
+        let mut status = 0;
+        if ready > 0 && pfd.revents & libc::POLLIN != 0 {
+            let mut byte = [0u8; 1];
+            // SAFETY: byte is writable and pipe_fds[0] is readable.
+            let n = unsafe { libc::read(pipe_fds[0], byte.as_mut_ptr().cast(), 1) };
+            // SAFETY: reap the child that reported SIGTTOU delivery.
+            unsafe { libc::waitpid(child, &mut status, 0) };
+            // SAFETY: close read end after use.
+            unsafe { libc::close(pipe_fds[0]) };
+            if n == 1
+                && byte[0] == b'S'
+                && libc::WIFEXITED(status)
+                && libc::WEXITSTATUS(status) == 0
+            {
+                println!("SIGTTOU_OK");
+                let _ = std::io::stdout().flush();
+                return 0;
+            }
+            println!("SIGTTOU_BAD_STATUS status={status:#x}");
+            let _ = std::io::stdout().flush();
+            return 1;
+        }
+        // SAFETY: child did not report SIGTTOU; terminate and reap it before failing.
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, &mut status, 0);
+            libc::close(pipe_fds[0]);
+        }
+        println!("SIGTTOU_MISSING background write/ioctl was not interrupted");
+        let _ = std::io::stdout().flush();
+        1
     }
 
     pub(super) fn subcmd_pty_tiocsctty_sigttin(_args: &[String]) -> i32 {

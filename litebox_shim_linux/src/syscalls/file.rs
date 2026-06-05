@@ -1916,6 +1916,59 @@ impl<FS: ShimFS> Task<FS> {
         Err(Errno::EINTR)
     }
 
+    fn broker_pty_background_sigttou(
+        &self,
+        entry: &super::broker_pty::BrokerPtyFd<Platform>,
+        require_tostop: bool,
+    ) -> Result<(), Errno> {
+        if entry.is_master()
+            || *self.process_state.borrow().controlling_pty.lock() != Some(entry.pty_id())
+        {
+            return Ok(());
+        }
+        if require_tostop {
+            let payload = entry.ioctl(PtyIoctlOp::Tcgets, &[])?;
+            let Some(bytes) = payload.get(12..16) else {
+                return Err(Errno::EIO);
+            };
+            let c_lflag = u32::from_le_bytes(bytes.try_into().map_err(|_| Errno::EIO)?);
+            if c_lflag & litebox_common_linux::TOSTOP == 0 {
+                return Ok(());
+            }
+        }
+
+        let caller_pgid = i32::try_from(self.sys_getpgid(0)?).map_err(|_| Errno::EINVAL)?;
+        let payload = entry.ioctl(PtyIoctlOp::Tiocgpgrp, &[])?;
+        let Some(bytes) = payload.get(..4) else {
+            return Err(Errno::EIO);
+        };
+        let foreground_pgrp = i32::from_le_bytes(bytes.try_into().map_err(|_| Errno::EIO)?);
+        if foreground_pgrp == caller_pgid
+            || self.is_signal_blocked_or_ignored(litebox_common_linux::signal::Signal::SIGTTOU)
+        {
+            return Ok(());
+        }
+
+        let pgid = litebox::process::ProcessGroupId(
+            u32::try_from(caller_pgid).map_err(|_| Errno::EINVAL)?,
+        );
+        if self
+            .global
+            .litebox
+            .process_registry()
+            .is_process_group_orphaned(pgid)
+            .ok_or(Errno::ESRCH)?
+        {
+            return Ok(());
+        }
+
+        self.global.deliver_signal_to_process_group(
+            caller_pgid,
+            litebox_common_linux::signal::Signal::SIGTTOU,
+        )?;
+        Err(Errno::EINTR)
+    }
+
     /// Handle syscall `read`
     ///
     /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
@@ -2280,7 +2333,12 @@ impl<FS: ShimFS> Task<FS> {
                 .descriptor_table()
                 .entry_handle(&ptyfd)
                 .ok_or(Errno::EBADF)?;
-            let res = handle.with_entry(|entry| entry.write(&self.wait_cx(), buf));
+            let res = handle.with_entry(|entry| {
+                if !buf.is_empty() {
+                    self.broker_pty_background_sigttou(entry, true)?;
+                }
+                entry.write(&self.wait_cx(), buf)
+            });
             if let Err(Errno::EPIPE) = res {
                 self.send_signal(
                     litebox_common_linux::signal::Signal::SIGPIPE,
@@ -2434,7 +2492,12 @@ impl<FS: ShimFS> Task<FS> {
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
-                    handle.with_entry(|entry| entry.write(&self.wait_cx(), buf))
+                    handle.with_entry(|entry| {
+                        if !buf.is_empty() {
+                            self.broker_pty_background_sigttou(entry, true)?;
+                        }
+                        entry.write(&self.wait_cx(), buf)
+                    })
                 }
                 crate::RawFdRef::Signalfd(_)
                 | crate::RawFdRef::Inotify(_)
@@ -4340,6 +4403,9 @@ impl<FS: ShimFS> Task<FS> {
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
                     handle.with_entry(|entry| {
+                        if total_writev_len(iovs)? > 0 {
+                            self.broker_pty_background_sigttou(entry, true)?;
+                        }
                         write_once_from_iovecs(iovs, |buf| entry.write(&self.wait_cx(), buf))
                     })
                 }
@@ -6917,6 +6983,7 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCSPGRP(pgrp_ptr) => {
+                self.broker_pty_background_sigttou(entry, false)?;
                 let pgrp: i32 = pgrp_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 entry.ioctl(PtyIoctlOp::Tiocspgrp, &pgrp.to_le_bytes())?;
                 if let Ok(pgid) = u32::try_from(pgrp) {
@@ -7014,7 +7081,14 @@ impl<FS: ShimFS> Task<FS> {
             };
         }
 
-        if desc <= 2 {
+        let files = self.files.borrow();
+        let ptyfd_opt = {
+            let rds = files.raw_descriptor_store.read();
+            rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(desc)
+                .ok()
+        };
+
+        if desc <= 2 && ptyfd_opt.is_none() {
             // reason: unsupported variants intentionally share this fallback path.
             #[allow(clippy::wildcard_enum_match_arm)]
             match &arg {
@@ -7033,13 +7107,6 @@ impl<FS: ShimFS> Task<FS> {
                 _ => {}
             }
         }
-
-        let files = self.files.borrow();
-        let ptyfd_opt = {
-            let rds = files.raw_descriptor_store.read();
-            rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(desc)
-                .ok()
-        };
         if let Some(ptyfd) = ptyfd_opt {
             // reason: unsupported variants intentionally share this fallback path.
             #[allow(clippy::wildcard_enum_match_arm)]
