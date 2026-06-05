@@ -151,6 +151,10 @@ pub enum SubsystemTag {
     /// legacy-pipes phase-3 migration to retire the mux relay's
     /// `--pipe-bridge` (host-fd-passthrough) topology.
     HostFd,
+    /// Broker OFD-registry file token. Wire value `17`. Used by broker-backed
+    /// AF_UNIX datagram SCM_RIGHTS to reconstruct a 9P file fid that shares the
+    /// sender's open file description.
+    File,
     /// Tag that this receiver doesn't recognise. Carries the raw u8
     /// value so the receiver can log diagnostics; callers should reject
     /// the specific fd while continuing to deliver the rest of the
@@ -178,6 +182,7 @@ impl SubsystemTag {
             SubsystemTag::PipeRead => 14,
             SubsystemTag::PipeWrite => 15,
             SubsystemTag::HostFd => 16,
+            SubsystemTag::File => 17,
             SubsystemTag::Unknown(v) => v,
         }
     }
@@ -203,6 +208,7 @@ impl SubsystemTag {
             14 => SubsystemTag::PipeRead,
             15 => SubsystemTag::PipeWrite,
             16 => SubsystemTag::HostFd,
+            17 => SubsystemTag::File,
             other => SubsystemTag::Unknown(other),
         }
     }
