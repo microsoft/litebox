@@ -74,6 +74,49 @@ pub(crate) struct ThreadState {
 // TODO: remove once we figure out how to handle Send/Sync for raw pointers.
 unsafe impl Send for ThreadState {}
 
+fn raw_wait_status_exit_code(raw_wait_status: i32) -> i32 {
+    (raw_wait_status >> 8) & 0xff
+}
+
+fn raw_wait_status_term_signal(raw_wait_status: i32) -> i32 {
+    raw_wait_status & 0x7f
+}
+
+fn raw_wait_status_exited(raw_wait_status: i32) -> bool {
+    raw_wait_status_term_signal(raw_wait_status) == 0
+}
+
+fn raw_wait_status_signaled(raw_wait_status: i32) -> bool {
+    let term_signal = raw_wait_status_term_signal(raw_wait_status);
+    term_signal != 0 && term_signal != 0x7f
+}
+
+fn worker_raw_wait_status_to_registry_status(raw_wait_status: i32) -> i32 {
+    if raw_wait_status_exited(raw_wait_status) {
+        raw_wait_status_exit_code(raw_wait_status)
+    } else if raw_wait_status_signaled(raw_wait_status) {
+        let core_dump = raw_wait_status & 0x80;
+        128 + raw_wait_status_term_signal(raw_wait_status) + core_dump
+    } else {
+        127
+    }
+}
+
+fn worker_raw_wait_status_to_exit_status(raw_wait_status: i32) -> ExitStatus {
+    if raw_wait_status_signaled(raw_wait_status) {
+        match litebox_common_linux::signal::Signal::try_from(raw_wait_status_term_signal(
+            raw_wait_status,
+        )) {
+            Ok(signal) => ExitStatus::Signal(signal),
+            Err(_) => ExitStatus::Exit(127_i32.truncate()),
+        }
+    } else if raw_wait_status_exited(raw_wait_status) {
+        ExitStatus::Exit(raw_wait_status_exit_code(raw_wait_status).truncate())
+    } else {
+        ExitStatus::Exit(127_i32.truncate())
+    }
+}
+
 impl ThreadState {
     pub fn new_process(pid: i32) -> Self {
         let remote = Arc::new(ThreadRemote::new());
@@ -5349,13 +5392,8 @@ impl<FS: ShimFS> Task<FS> {
             let global = self.global.clone();
             let child_proc_id = self.process_id;
             self.global.platform.spawn_background_task(move || {
-                let exit_code = global.platform.wait_worker_host(host_pid);
-
-                let exit_status = if exit_code > 255 {
-                    (exit_code - 256) + 128
-                } else {
-                    exit_code
-                };
+                let raw_wait_status = global.platform.wait_worker_host(host_pid);
+                let exit_status = worker_raw_wait_status_to_registry_status(raw_wait_status);
 
                 global.fork_child_host_pids.write().remove(&child_proc_id.0);
 
@@ -5630,17 +5668,8 @@ impl<FS: ShimFS> Task<FS> {
             let global = self.global.clone();
             let child_proc_id = child_process_id;
             self.global.platform.spawn_background_task(move || {
-                let exit_code = global.platform.wait_worker_host(host_pid);
-
-                // Convert exit_code to the process registry's status format.
-                // wait_worker_host returns 0–255 for normal exit, 256+N for signal N.
-                // The registry stores: exit_code for normal exit, signal+128 for signals
-                // (matching the shell convention where signal death = 128 + signum).
-                let exit_status = if exit_code > 255 {
-                    (exit_code - 256) + 128
-                } else {
-                    exit_code
-                };
+                let raw_wait_status = global.platform.wait_worker_host(host_pid);
+                let exit_status = worker_raw_wait_status_to_registry_status(raw_wait_status);
 
                 // Remove the fork child host PID mapping first to prevent
                 // kill() from forwarding signals to a potentially-reused PID.
@@ -9355,7 +9384,7 @@ impl<FS: ShimFS> Task<FS> {
             host_pid,
         );
 
-        let exit_code = self.global.platform.wait_worker_host(host_pid);
+        let raw_wait_status = self.global.platform.wait_worker_host(host_pid);
         self.global
             .fork_child_host_pids
             .write()
@@ -9364,11 +9393,7 @@ impl<FS: ShimFS> Task<FS> {
             .remote_signalfd_targets
             .write()
             .remove(&self.process_id.0);
-        let broker_exit_status = if exit_code > 255 {
-            (exit_code - 256) + 128
-        } else {
-            exit_code
-        };
+        let broker_exit_status = worker_raw_wait_status_to_registry_status(raw_wait_status);
         super::guest_pid::try_mark_broker_process_exited(self.process_id.0, broker_exit_status);
 
         // Phase F.9: now that worker B has exited, release the pipe
@@ -9397,27 +9422,21 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
-            "[EXEC-REMOTE] pid={} worker exited with code {}",
+            "[EXEC-REMOTE] pid={} worker exited with wait status {}",
             self.pid,
-            exit_code,
+            raw_wait_status,
         );
 
         if vfork_info.is_some() {
-            let status = if exit_code > 255 {
-                match litebox_common_linux::signal::Signal::try_from(exit_code - 256) {
-                    Ok(signal) => ExitStatus::Signal(signal),
-                    Err(_) => ExitStatus::Exit(127_i32.truncate()),
-                }
-            } else {
-                ExitStatus::Exit(exit_code.truncate())
-            };
+            let status = worker_raw_wait_status_to_exit_status(raw_wait_status);
             self.thread.process.inner.lock().exit_status = status;
             self.local_task_terminated.set(true);
-        } else if exit_code > 255 {
-            // Signal exit: use 128 + signal as the exit code (shell convention).
-            self.exit_thread((exit_code - 256).truncate());
+        } else if raw_wait_status_signaled(raw_wait_status) {
+            self.exit_thread(raw_wait_status_term_signal(raw_wait_status).truncate());
+        } else if raw_wait_status_exited(raw_wait_status) {
+            self.exit_thread(raw_wait_status_exit_code(raw_wait_status).truncate());
         } else {
-            self.exit_thread(exit_code.truncate());
+            self.exit_thread(127_i32.truncate());
         }
 
         // The remote worker completed; stop the local placeholder before it can

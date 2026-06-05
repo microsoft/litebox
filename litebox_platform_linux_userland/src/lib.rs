@@ -2220,9 +2220,10 @@ impl LinuxUserland {
         Ok(pid)
     }
 
-    /// Wait for a worker host process to exit and return the exit status.
+    /// Wait for a worker host process to exit and return the raw wait status.
     ///
-    /// Returns the exit code (0–255) on normal exit, or 256+signal on signal death.
+    /// Returns the status word reported by `waitpid(2)`, preserving both normal
+    /// exit and signal-death encoding.
     ///
     /// # Panics
     ///
@@ -2257,13 +2258,7 @@ impl LinuxUserland {
                 t0.elapsed().as_millis()
             ));
         }
-        let fallback_status = if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else if libc::WIFSIGNALED(status) {
-            256 + libc::WTERMSIG(status)
-        } else {
-            127
-        };
+        let fallback_status = status;
         let worker = self.worker_processes.lock().unwrap().remove(&host_pid);
         if let Some(worker) = worker {
             let WorkerHostProcess {

@@ -735,6 +735,56 @@ mod leaf_subcmd {
         0
     }
 
+    pub(super) fn subcmd_signal_kill_propagation(_args: &[String]) -> i32 {
+        // SAFETY: fork takes no arguments and creates a child process.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            eprintln!("[KILL_WAIT] fork failed: {}", super::errno());
+            return 1;
+        }
+        if pid == 0 {
+            loop {
+                // SAFETY: pause has no preconditions; default SIGTERM terminates the child.
+                unsafe { libc::pause() };
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // SAFETY: pid is the live child returned by fork.
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            eprintln!("[KILL_WAIT] kill failed: {}", super::errno());
+            return 2;
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut status = 0i32;
+        loop {
+            // SAFETY: waitpid is called with our child pid and writable status storage.
+            let ret = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+            if ret == pid {
+                if libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM {
+                    println!("KILL_WAIT_SIGNAL_OK status={status}");
+                    return 0;
+                }
+                eprintln!("[KILL_WAIT] unexpected wait status: {status}");
+                return 3;
+            }
+            if ret < 0 {
+                eprintln!("[KILL_WAIT] waitpid failed: {}", super::errno());
+                return 4;
+            }
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: best-effort cleanup of the child on timeout.
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                // SAFETY: reap the child after timeout cleanup.
+                let _ = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+                eprintln!("[KILL_WAIT] timeout waiting for child");
+                return 5;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// `fork-exec-pie` — drives the FWE test family.
     ///
     /// Stays as an argv subcommand because the test specifically exercises
@@ -1171,6 +1221,100 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
         "pidfd-inherit-child",
         leaf_subcmd::subcmd_pidfd_inherit_child
     );
+    register_leaf_subcommand!(
+        "signal-kill-propagation",
+        leaf_subcmd::subcmd_signal_kill_propagation
+    );
+
+    // KILL_WAIT: waitpid must preserve signal-killed child status.
+    reg.test(
+        "fork",
+        "fork_matrix",
+        "KILL_WAIT.signal_kill_propagation.plain",
+    )
+    .timeout(30)
+    .build(move |cx| {
+        let handle = cx.require(AgentName::Dpg1);
+        Box::new(move |run| {
+            let handle = handle.clone();
+            Box::pin(async move {
+                let self_exe = run.self_exe().to_string();
+                let resp = dispatch_exec_bin(
+                    run,
+                    &handle,
+                    vec![self_exe, "signal-kill-propagation".into()],
+                    Some(10),
+                )
+                .await;
+                let pass = matches!(
+                    &resp,
+                    Response::ExecResult { exit_code: 0, stdout, .. }
+                        if stdout.contains("KILL_WAIT_SIGNAL_OK")
+                );
+                super::TestOutcome::new("A", pass, format!("{resp:?}"))
+            })
+        })
+    });
+
+    reg.test(
+        "fork",
+        "fork_matrix",
+        "KILL_WAIT.signal_kill_propagation.delayed_mmap",
+    )
+    .timeout(30)
+    .build(move |cx| {
+        let handle = cx.require(AgentName::Dpg1);
+        Box::new(move |run| {
+            let handle = handle.clone();
+            Box::pin(async move {
+                let result = run
+                    .send_named_typed(
+                        &handle,
+                        &TRIGGER_DELAYED_FORK,
+                        TriggerDelayedForkArgs {
+                            cmd: run.self_exe().to_string(),
+                            args: vec!["signal-kill-propagation".into()],
+                        },
+                    )
+                    .await;
+                let pass = matches!(
+                    &result,
+                    Ok(out) if out.detail.contains("KILL_WAIT_SIGNAL_OK")
+                );
+                super::TestOutcome::new("A", pass, format!("{result:?}"))
+            })
+        })
+    });
+
+    reg.test(
+        "fork",
+        "fork_matrix",
+        "KILL_WAIT.signal_kill_propagation.delayed_thread",
+    )
+    .timeout(30)
+    .build(move |cx| {
+        let handle = cx.require(AgentName::Dpg1);
+        Box::new(move |run| {
+            let handle = handle.clone();
+            Box::pin(async move {
+                let result = run
+                    .send_named_typed(
+                        &handle,
+                        &TRIGGER_DELAYED_FORK_THREAD,
+                        TriggerDelayedForkArgs {
+                            cmd: run.self_exe().to_string(),
+                            args: vec!["signal-kill-propagation".into()],
+                        },
+                    )
+                    .await;
+                let pass = matches!(
+                    &result,
+                    Ok(out) if out.detail.contains("KILL_WAIT_SIGNAL_OK")
+                );
+                super::TestOutcome::new("A", pass, format!("{result:?}"))
+            })
+        })
+    });
 
     // Shell patterns x depth
     for &agent in DEPTH_AGENTS {
