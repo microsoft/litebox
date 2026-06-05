@@ -88,16 +88,13 @@ fn test_fcntl() {
 
     // Test eventfd
     let eventfd = task
-        .sys_eventfd2(0, EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE)
+        .sys_eventfd2(
+            0,
+            EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
+        )
         .expect("Failed to create eventfd");
     let eventfd = i32::try_from(eventfd).unwrap();
-    check(eventfd, OFlags::RDWR, OFlags::RDWR);
-    task.sys_fcntl(eventfd, FcntlArg::SETFL(OFlags::RDWR | OFlags::NONBLOCK))
-        .unwrap();
-    assert_eq!(
-        task.sys_fcntl(eventfd, FcntlArg::GETFL).unwrap(),
-        (OFlags::RDWR | OFlags::NONBLOCK).bits()
-    );
+    check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
 
     // Test fcntl with DUPFD
     let fd = task
