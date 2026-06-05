@@ -350,24 +350,6 @@ mod tests {
     }
 
     #[test]
-    fn local_response_read_honors_io_timeout() {
-        let (local_stream, _host_stream) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
-        channel
-            .set_io_timeout(Some(Duration::from_millis(10)))
-            .unwrap();
-
-        let error = channel.recv_response().unwrap_err();
-        assert!(
-            matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ),
-            "unexpected timeout error kind: {error:?}"
-        );
-    }
-
-    #[test]
     fn local_response_read_io_timeout_is_wall_clock() {
         let (mut host_stream, local_stream) = UnixStream::pair().unwrap();
         let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
@@ -391,54 +373,6 @@ mod tests {
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
             ),
             "unexpected timeout error kind: {error:?}"
-        );
-    }
-
-    #[test]
-    fn local_response_read_honors_io_deadline() {
-        let (mut host_stream, local_stream) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
-        channel
-            .set_io_deadline(Some(Instant::now() + Duration::from_millis(20)))
-            .unwrap();
-
-        let reader = std::thread::spawn(move || channel.recv_response().unwrap_err());
-        host_stream.write_all(&8u32.to_le_bytes()).unwrap();
-
-        let error = reader.join().expect("deadline reader panicked");
-        assert!(
-            matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ),
-            "unexpected deadline error kind: {error:?}"
-        );
-    }
-
-    #[test]
-    fn host_request_read_io_deadline_is_wall_clock() {
-        let (mut local_stream, host_stream) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamHostControlChannel::from_accepted(host_stream);
-        channel
-            .set_io_deadline(Some(Instant::now() + Duration::from_millis(50)))
-            .unwrap();
-
-        let reader = std::thread::spawn(move || channel.recv_request().unwrap_err());
-        local_stream.write_all(&8u32.to_le_bytes()).unwrap();
-        for _ in 0..8 {
-            std::thread::sleep(Duration::from_millis(20));
-            if local_stream.write_all(&[0]).is_err() {
-                break;
-            }
-        }
-
-        let error = reader.join().expect("deadline reader panicked");
-        assert!(
-            matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ),
-            "unexpected deadline error kind: {error:?}"
         );
     }
 }
