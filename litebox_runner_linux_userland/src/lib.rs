@@ -1693,6 +1693,14 @@ fn read_worker_exec_image(fd: i32) -> Result<alloc::borrow::Cow<'static, [u8]>> 
     Ok(data.into())
 }
 
+fn guest_wait_status_to_raw_wait_status(wait_status: i32) -> i32 {
+    if wait_status > 255 {
+        wait_status - 256
+    } else {
+        (wait_status & 0xff) << 8
+    }
+}
+
 fn write_worker_result(wait_status: i32, fd: i32) {
     use std::io::Write as _;
     use std::os::fd::FromRawFd as _;
@@ -1700,8 +1708,9 @@ fn write_worker_result(wait_status: i32, fd: i32) {
     if fd < 0 {
         return;
     }
+    let raw_wait_status = guest_wait_status_to_raw_wait_status(wait_status);
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let _ = file.write_all(&wait_status.to_le_bytes());
+    let _ = file.write_all(&raw_wait_status.to_le_bytes());
 }
 
 fn set_fd_cloexec(fd: i32) -> Result<()> {
