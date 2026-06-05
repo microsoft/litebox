@@ -7028,6 +7028,15 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPTN(ptn) => {
+                // TIOCGPTN is a `/dev/ptmx`-only ioctl: native Linux
+                // returns -ENOTTY when called on a PTY slave fd, and
+                // many TUI apps (e.g., GitHub Copilot CLI's startup
+                // probe) rely on that errno to distinguish master
+                // from slave. Mirror that strictness so we don't
+                // mis-classify slaves as masters.
+                if !entry.is_master() {
+                    return Err(Errno::ENOTTY);
+                }
                 ptn.write_at_offset(0, entry.pty_id())
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
