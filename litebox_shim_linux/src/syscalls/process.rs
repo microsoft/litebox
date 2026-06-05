@@ -3391,19 +3391,23 @@ impl<FS: ShimFS> Task<FS> {
         // parent_fd_replacements: stored in VforkDone for the parent to apply.
         let mut child_pipe_bridges: Vec<(usize, i32, super::external_fd::ExternalFdDirection)> =
             Vec::new();
-        // Parallel tracking for the multiplexer:
-        // - drained data captured from virtual pipe/socket before migration
-        let mut bridge_drained: Vec<Vec<u8>> = Vec::new();
-        // - parent fd info per bridge: [(parent_guest_fd, parent_dir, subsystem)]
-        let mut bridge_parent_info: Vec<
-            Vec<(
-                usize,
-                super::external_fd::ExternalFdDirection,
-                crate::ReplacedSubsystem,
-            )>,
-        > = Vec::new();
-        // - host OS fd for external fds (-1 for new OS pipe bridges)
-        let mut bridge_host_fd: Vec<i32> = Vec::new();
+        type ForkBridgeParentInfo = Vec<(
+            usize,
+            super::external_fd::ExternalFdDirection,
+            crate::ReplacedSubsystem,
+        )>;
+        struct ForkBridgeAccum {
+            drained: Vec<u8>,
+            /// Host OS fd for host-backed bridges; -1 for virtual unix-socket/PTY bridges.
+            host_fd: i32,
+            parent_info: ForkBridgeParentInfo,
+        }
+
+        // One entry per child_pipe_bridges entry. Keeping the drained bytes,
+        // host fd, and parent fd metadata in one struct preserves the original
+        // lockstep invariant structurally: fork_bridge_accum[i] describes the
+        // same logical fork bridge as child_pipe_bridges[i].
+        let mut fork_bridge_accum: Vec<ForkBridgeAccum> = Vec::new();
         // Phase 3 D5: broker-fd-bridge specs for mux streams migrated
         // out of the mux relay onto direct broker handles. Each entry
         // is shipped to the worker as `--broker-fd-bridge <spec>` and
@@ -3517,9 +3521,11 @@ impl<FS: ShimFS> Task<FS> {
             // and the existing host OS fd.
             for &(guest_fd, host_fd, direction) in &child_external_fds {
                 child_pipe_bridges.push((guest_fd, host_fd, direction));
-                bridge_drained.push(Vec::new());
-                bridge_host_fd.push(host_fd);
-                bridge_parent_info.push(Vec::new());
+                fork_bridge_accum.push(ForkBridgeAccum {
+                    drained: Vec::new(),
+                    host_fd,
+                    parent_info: Vec::new(),
+                });
             }
 
             // --- Unix socket bridging ---
@@ -3604,8 +3610,9 @@ impl<FS: ShimFS> Task<FS> {
                             );
                             // Clean up any already-created OS pipe fds.
                             for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                                let is_host_owned =
-                                    bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                let is_host_owned = fork_bridge_accum
+                                    .get(i)
+                                    .is_some_and(|bridge| bridge.host_fd == os_fd);
                                 if !is_host_owned {
                                     self.global.platform.close_host_fd(os_fd);
                                 }
@@ -3689,8 +3696,9 @@ impl<FS: ShimFS> Task<FS> {
                                 _e,
                             );
                             for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                                let is_host_owned =
-                                    bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                let is_host_owned = fork_bridge_accum
+                                    .get(i)
+                                    .is_some_and(|bridge| bridge.host_fd == os_fd);
                                 if !is_host_owned {
                                     self.global.platform.close_host_fd(os_fd);
                                 }
@@ -3738,8 +3746,9 @@ impl<FS: ShimFS> Task<FS> {
                                 self.global.platform.close_host_fd(child_os_fd);
                                 self.global.platform.close_host_fd(parent_os_fd);
                                 for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                                    let is_host_owned =
-                                        bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                    let is_host_owned = fork_bridge_accum
+                                        .get(i)
+                                        .is_some_and(|bridge| bridge.host_fd == os_fd);
                                     if !is_host_owned {
                                         self.global.platform.close_host_fd(os_fd);
                                     }
@@ -3803,9 +3812,9 @@ impl<FS: ShimFS> Task<FS> {
                                         for (i, &(_, os_fd, _)) in
                                             child_pipe_bridges.iter().enumerate()
                                         {
-                                            let is_host_owned = bridge_host_fd
+                                            let is_host_owned = fork_bridge_accum
                                                 .get(i)
-                                                .is_some_and(|&hf| hf == os_fd);
+                                                .is_some_and(|bridge| bridge.host_fd == os_fd);
                                             if !is_host_owned {
                                                 self.global.platform.close_host_fd(os_fd);
                                             }
@@ -3827,9 +3836,6 @@ impl<FS: ShimFS> Task<FS> {
                         child_pipe_bridges.len(),
                     ));
                     child_pipe_bridges.push((info.child_fd, child_os_fd, info.direction));
-                    bridge_drained.push(this_socket_drained);
-                    bridge_host_fd.push(-1);
-
                     // Find ALL parent peers (same pair_id, different object_id).
                     let parent_dir = match info.direction {
                         ExternalFdDirection::Read => ExternalFdDirection::Write,
@@ -3862,9 +3868,9 @@ impl<FS: ShimFS> Task<FS> {
                                         for (i, &(_, os_fd, _)) in
                                             child_pipe_bridges.iter().enumerate()
                                         {
-                                            let is_host_owned = bridge_host_fd
+                                            let is_host_owned = fork_bridge_accum
                                                 .get(i)
-                                                .is_some_and(|&hf| hf == os_fd);
+                                                .is_some_and(|bridge| bridge.host_fd == os_fd);
                                             if !is_host_owned {
                                                 self.global.platform.close_host_fd(os_fd);
                                             }
@@ -3895,7 +3901,11 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     }
 
-                    bridge_parent_info.push(this_parent_info);
+                    fork_bridge_accum.push(ForkBridgeAccum {
+                        drained: this_socket_drained,
+                        host_fd: -1,
+                        parent_info: this_parent_info,
+                    });
 
                     if !found_parent {
                         self.global.platform.close_host_fd(parent_os_fd);
@@ -4002,13 +4012,12 @@ impl<FS: ShimFS> Task<FS> {
                     );
 
                     child_pipe_bridges.push((entry.fd, child_os_fd, direction));
-                    bridge_drained.push(Vec::new());
-                    // Set bridge_host_fd to the real host stdio fd number.
-                    // This tells the mux parent dispatcher to spawn a relay
-                    // thread that bridges between the virtual pipe and the
-                    // real host terminal fd.
-                    bridge_host_fd.push(source_fd);
-                    bridge_parent_info.push(Vec::new());
+                    // Set host_fd to the real host stdio fd number for broker migration.
+                    fork_bridge_accum.push(ForkBridgeAccum {
+                        drained: Vec::new(),
+                        host_fd: source_fd,
+                        parent_info: Vec::new(),
+                    });
                 }
             }
 
@@ -4111,6 +4120,12 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            debug_assert_eq!(
+                fork_bridge_accum.len(),
+                child_pipe_bridges.len(),
+                "fork bridge metadata must stay in lockstep with child pipe bridges"
+            );
+
             // --- D5 broker-bridge setup ---
             // Migrate each child pipe bridge directly onto a broker handle
             // (BrokerPipe / BrokerSocketPair / BrokerPty / HostFd-attached
@@ -4175,15 +4190,15 @@ impl<FS: ShimFS> Task<FS> {
                             continue;
                         }
                     };
-                    let type_byte = bridge_parent_info.get(i).and_then(|v| v.first()).map_or(
-                        b'p',
-                        |&(_, _, sub)| match sub {
+                    let type_byte = fork_bridge_accum
+                        .get(i)
+                        .and_then(|bridge| bridge.parent_info.first())
+                        .map_or(b'p', |&(_, _, sub)| match sub {
                             crate::ReplacedSubsystem::Pipe => b'p',
                             crate::ReplacedSubsystem::UnixSocket => b's',
                             crate::ReplacedSubsystem::Pty => b't',
                             crate::ReplacedSubsystem::Filesystem => b'f',
-                        },
-                    );
+                        });
 
                     // For Read-direction child pipes (child reads,
                     // parent writes): check if the parent's pipe is
@@ -4200,7 +4215,9 @@ impl<FS: ShimFS> Task<FS> {
                     // initial_eof would cause the worker to pre-close the
                     // relay sender before the drained data arrives,
                     // silently dropping it.
-                    let has_drained_data = bridge_drained.get(i).is_some_and(|d| !d.is_empty());
+                    let has_drained_data = fork_bridge_accum
+                        .get(i)
+                        .is_some_and(|bridge| !bridge.drained.is_empty());
                     let initial_eof = if has_drained_data {
                         false
                     } else if direction == ExternalFdDirection::Read {
@@ -4212,13 +4229,16 @@ impl<FS: ShimFS> Task<FS> {
                         //
                         // Guard against empty parent_info (vacuous .all()
                         // would return true and falsely signal EOF).
-                        bridge_parent_info.get(i).is_some_and(|parents| {
-                            !parents.is_empty()
-                                && parents.iter().all(|&(parent_fd, parent_dir, _)| {
-                                    let _ = parent_fd;
-                                    let _ = parent_dir;
-                                    false
-                                })
+                        fork_bridge_accum.get(i).is_some_and(|bridge| {
+                            !bridge.parent_info.is_empty()
+                                && bridge
+                                    .parent_info
+                                    .iter()
+                                    .all(|&(parent_fd, parent_dir, _)| {
+                                        let _ = parent_fd;
+                                        let _ = parent_dir;
+                                        false
+                                    })
                         })
                     } else {
                         false
@@ -4242,7 +4262,9 @@ impl<FS: ShimFS> Task<FS> {
                         );
                     }
 
-                    let is_host_backed = bridge_host_fd.get(i).is_some_and(|&hf| hf >= 0);
+                    let is_host_backed = fork_bridge_accum
+                        .get(i)
+                        .is_some_and(|bridge| bridge.host_fd >= 0);
                     let is_virtual_pipe = !is_host_backed && type_byte == b'p';
                     let is_pty_stream = type_byte == b't';
 
@@ -4257,8 +4279,14 @@ impl<FS: ShimFS> Task<FS> {
                     let mut handled_as_broker_bridge = false;
 
                     if is_virtual_pipe {
-                        let drained = bridge_drained.get(i).cloned().unwrap_or_default();
-                        let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
+                        let drained = fork_bridge_accum
+                            .get(i)
+                            .map(|bridge| bridge.drained.clone())
+                            .unwrap_or_default();
+                        let parents = fork_bridge_accum
+                            .get(i)
+                            .map(|bridge| bridge.parent_info.clone())
+                            .unwrap_or_default();
                         if let Some(provider) = super::broker_pipe::broker_pipe_provider() {
                             use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
                             use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -4417,10 +4445,11 @@ impl<FS: ShimFS> Task<FS> {
                     }
 
                     if is_pty_stream && !is_host_backed {
-                        let pty_parent_fds: alloc::vec::Vec<usize> = bridge_parent_info
+                        let pty_parent_fds: alloc::vec::Vec<usize> = fork_bridge_accum
                             .get(i)
-                            .map(|parents| {
-                                parents
+                            .map(|bridge| {
+                                bridge
+                                    .parent_info
                                     .iter()
                                     .filter_map(|&(parent_fd, _, subsystem)| {
                                         if subsystem == crate::ReplacedSubsystem::Pty {
@@ -4530,7 +4559,7 @@ impl<FS: ShimFS> Task<FS> {
                     }
 
                     if is_host_backed {
-                        let host_fd = bridge_host_fd[i];
+                        let host_fd = fork_bridge_accum[i].host_fd;
                         // Try to migrate this host-backed stream onto a
                         // direct broker handle, eliminating its need for
                         // the mux relay. Falls back to the mux path on
@@ -4607,10 +4636,16 @@ impl<FS: ShimFS> Task<FS> {
                         // replacements; nothing else is needed here.
                         self.global.platform.close_host_fd(child_os_fd);
 
-                        let drained = bridge_drained.get(i).cloned().unwrap_or_default();
+                        let drained = fork_bridge_accum
+                            .get(i)
+                            .map(|bridge| bridge.drained.clone())
+                            .unwrap_or_default();
 
                         // Build a MuxParentStream for each parent counterpart.
-                        let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
+                        let parents = fork_bridge_accum
+                            .get(i)
+                            .map(|bridge| bridge.parent_info.clone())
+                            .unwrap_or_default();
 
                         if type_byte == b's' {
                             let child_nonblock = {
@@ -4877,8 +4912,10 @@ impl<FS: ShimFS> Task<FS> {
                 for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
                     // Close newly-created pipe fds, but NOT fds
                     // that are owned by the external fd system (where
-                    // os_fd == bridge_host_fd[i]).
-                    let is_host_owned = bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                    // os_fd == fork_bridge_accum[i].host_fd).
+                    let is_host_owned = fork_bridge_accum
+                        .get(i)
+                        .is_some_and(|bridge| bridge.host_fd == os_fd);
                     if !is_host_owned {
                         self.global.platform.close_host_fd(os_fd);
                     }
