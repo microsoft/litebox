@@ -3907,6 +3907,12 @@ impl<FS: ShimFS> Task<FS> {
                 options,
             } => self.sys_waitid(idtype, id, infop, options),
             SyscallRequest::PidfdOpen { pid, flags } => syscall!(sys_pidfd_open(pid, flags)),
+            SyscallRequest::PidfdSendSignal {
+                pidfd,
+                sig,
+                info,
+                flags,
+            } => syscall!(sys_pidfd_send_signal(pidfd, sig, info, flags)),
             SyscallRequest::Execve {
                 pathname,
                 argv,
