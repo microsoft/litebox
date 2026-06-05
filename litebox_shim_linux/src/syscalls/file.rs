@@ -1072,16 +1072,21 @@ impl<FS: ShimFS> Task<FS> {
         proc_cmdline_from_argv(&[], &exe)
     }
 
-    /// Generate synthetic `/proc/<pid>/status` content.
-    fn synthetic_proc_status(&self, pid: i32) -> alloc::string::String {
+    fn proc_comm(&self) -> alloc::string::String {
         let comm_bytes = self.comm.get();
-        let comm = core::str::from_utf8(
+        core::str::from_utf8(
             &comm_bytes[..comm_bytes
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(comm_bytes.len())],
         )
-        .unwrap_or("litebox");
+        .unwrap_or("litebox")
+        .into()
+    }
+
+    /// Generate synthetic `/proc/<pid>/status` content.
+    fn synthetic_proc_status(&self, pid: i32) -> alloc::string::String {
+        let comm = self.proc_comm();
         alloc::format!(
             "Name:\t{comm}\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{euid}\t{uid}\t{euid}\nGid:\t{gid}\t{egid}\t{gid}\t{egid}\n",
             comm = comm,
@@ -1092,6 +1097,11 @@ impl<FS: ShimFS> Task<FS> {
             gid = self.credentials.gid,
             egid = self.credentials.egid,
         )
+    }
+
+    /// Generate synthetic `/proc/<pid>/comm` content.
+    fn synthetic_proc_comm(&self) -> alloc::string::String {
+        alloc::format!("{}\n", self.proc_comm())
     }
 
     /// Resolve an executable path to a canonical absolute path for /proc/self/exe.
@@ -1348,6 +1358,9 @@ impl<FS: ShimFS> Task<FS> {
                         let text = alloc::string::String::from_utf8_lossy(&data).into_owned();
                         return self.open_synthetic_proc_text(flags, text);
                     }
+                    "/comm" => {
+                        return self.open_synthetic_proc_text(flags, self.synthetic_proc_comm());
+                    }
                     "" => {
                         // open("/proc/<N>") as directory — return EISDIR
                         return Err(Errno::EISDIR);
@@ -1361,8 +1374,28 @@ impl<FS: ShimFS> Task<FS> {
             path
         };
 
-        if path.to_str().ok() == Some("/proc/self/maps") {
-            return self.open_synthetic_proc_text(flags, self.proc_self_maps_contents());
+        // Do not fall through to the host `/proc/self/*` for identity
+        // files: that reports the broker/runner process, not the guest.
+        // PROC_SELF.* harness tests cover these diagnostics-facing paths.
+        match path.to_str().ok() {
+            Some("/proc/self/maps") => {
+                return self.open_synthetic_proc_text(flags, self.proc_self_maps_contents());
+            }
+            Some("/proc/self/stat") => {
+                return self.open_synthetic_proc_text(flags, self.synthetic_proc_stat(self.pid));
+            }
+            Some("/proc/self/status") => {
+                return self.open_synthetic_proc_text(flags, self.synthetic_proc_status(self.pid));
+            }
+            Some("/proc/self/cmdline") => {
+                let data = self.synthetic_proc_cmdline(self.pid);
+                let text = alloc::string::String::from_utf8_lossy(&data).into_owned();
+                return self.open_synthetic_proc_text(flags, text);
+            }
+            Some("/proc/self/comm") => {
+                return self.open_synthetic_proc_text(flags, self.synthetic_proc_comm());
+            }
+            _ => {}
         }
         // /dev/fd/N and /proc/self/fd/N — open is equivalent to dup(N).
         // Used by bash process substitution: cat <(echo hello) passes
