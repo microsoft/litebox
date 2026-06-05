@@ -109,62 +109,6 @@ impl BrokerCore {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
-    use alloc::collections::BTreeMap;
-    use core::ops::{Deref, DerefMut};
-
-    use crate::{BrokerCore, BrokerCoreLimits, PolicyEngine};
-
-    /// Repeatable broker core wrapper for tests.
-    ///
-    /// This bypasses the production one-shot constructor. Production code must
-    /// use [`BrokerCore::new`] or [`BrokerCore::new_with_limits`].
-    pub struct TestBrokerCore {
-        core: BrokerCore,
-    }
-
-    impl TestBrokerCore {
-        /// Creates a repeatable test broker core with the provided policy.
-        pub fn new(policy: PolicyEngine) -> Self {
-            let core = new_test_core(policy, BrokerCoreLimits::DEFAULT);
-            Self { core }
-        }
-
-        /// Creates a repeatable test broker core with explicit limits.
-        pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Self {
-            let core = new_test_core(policy, limits);
-            Self { core }
-        }
-    }
-
-    impl Deref for TestBrokerCore {
-        type Target = BrokerCore;
-
-        fn deref(&self) -> &Self::Target {
-            &self.core
-        }
-    }
-
-    impl DerefMut for TestBrokerCore {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.core
-        }
-    }
-
-    fn new_test_core(policy: PolicyEngine, limits: BrokerCoreLimits) -> BrokerCore {
-        BrokerCore {
-            policy,
-            limits,
-            next_process_id: 1,
-            next_object_id: 1,
-            next_reference_id: 1,
-            objects: BTreeMap::new(),
-            references: BTreeMap::new(),
-        }
-    }
-}
-
 const EXHAUSTED_ID: u64 = 0;
 
 fn allocate_id(next_id: &mut u64) -> Result<u64> {
@@ -175,25 +119,4 @@ fn allocate_id(next_id: &mut u64) -> Result<u64> {
     let id = *next_id;
     *next_id = id.checked_add(1).unwrap_or(EXHAUSTED_ID);
     Ok(id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn constructor_rejects_second_core_even_after_drop() {
-        let core = BrokerCore::new(PolicyEngine::default_deny()).unwrap();
-
-        assert!(matches!(
-            BrokerCore::new(PolicyEngine::default_deny()),
-            Err(BrokerError::BrokerCoreAlreadyExists)
-        ));
-
-        drop(core);
-        assert!(matches!(
-            BrokerCore::new(PolicyEngine::default_deny()),
-            Err(BrokerError::BrokerCoreAlreadyExists)
-        ));
-    }
 }

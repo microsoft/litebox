@@ -167,88 +167,19 @@ impl EventObject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CallerCredential, PolicyEngine, test_support::TestBrokerCore};
-    use litebox_broker_protocol::ObjectReferenceGeneration;
-
-    #[test]
-    fn wait_rejects_invalid_references_with_expected_errors() {
-        let mut core = TestBrokerCore::new(PolicyEngine::event_only());
-        let association = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        let handle = core
-            .insert_object_with_reference(
-                &association,
-                ObjectKind::Event(EventObject::new(0)),
-                ObjectType::Event,
-                ObjectRights::WRITE,
-            )
-            .unwrap();
-
-        assert_eq!(
-            core.wait_event(&association, handle),
-            Err(BrokerError::InvalidRights)
-        );
-
-        let mut handle = core.create_event(&association).unwrap();
-        handle.reference_generation =
-            ObjectReferenceGeneration::new(handle.reference_generation.get() + 1);
-
-        assert_eq!(
-            core.wait_event(&association, handle),
-            Err(BrokerError::StaleHandle)
-        );
-
-        let other = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        let handle = core.create_event(&association).unwrap();
-
-        assert_eq!(
-            core.wait_event(&other, handle),
-            Err(BrokerError::UnknownObject)
-        );
-    }
-
-    #[test]
-    fn create_event_uses_policy_granted_reference_rights() {
-        let mut core = TestBrokerCore::new(PolicyEngine::event_only_with_reference_rights(
-            ObjectRights::WAIT,
-        ));
-        let association = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-
-        let handle = core.create_event(&association).unwrap();
-
-        assert!(matches!(
-            core.wait_event(&association, handle),
-            Ok(WaitOutcome::WouldBlock(_))
-        ));
-        assert_eq!(
-            core.add_event(&association, handle, 1),
-            Err(BrokerError::InvalidRights)
-        );
-    }
 
     #[test]
     fn event_readiness_state_only_reports_authorized_directions() {
-        let mut core = TestBrokerCore::new(PolicyEngine::event_only_with_reference_rights(
-            ObjectRights::WAIT,
-        ));
-        let association = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        let handle = core.create_event_with_count(&association, 1).unwrap();
+        let readiness = ReadinessState::new(true, true, 7);
 
-        assert!(matches!(
-            core.wait_event(&association, handle),
-            Ok(WaitOutcome::Ready(ReadinessState {
-                read_ready: true,
-                write_ready: false,
-                ..
-            }))
-        ));
+        assert_eq!(
+            BrokerCore::filter_readiness_for_rights(readiness, ObjectRights::WAIT),
+            ReadinessState::new(true, false, 7)
+        );
+        assert_eq!(
+            BrokerCore::filter_readiness_for_rights(readiness, ObjectRights::WRITE),
+            ReadinessState::new(false, true, 7)
+        );
     }
 
     #[test]

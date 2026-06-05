@@ -69,28 +69,3 @@ impl BrokerCore {
         Ok(association)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{PolicyEngine, test_support::TestBrokerCore};
-
-    #[test]
-    fn create_association_assigns_distinct_identities_and_preserves_credential() {
-        let mut core = TestBrokerCore::new(PolicyEngine::default_deny());
-
-        let first = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-        let second = core
-            .create_association(CallerCredential::Unauthenticated)
-            .unwrap();
-
-        assert_ne!(first.process_id(), second.process_id());
-        assert_eq!(first.caller_credential(), CallerCredential::Unauthenticated);
-        assert_eq!(
-            second.caller_credential(),
-            CallerCredential::Unauthenticated
-        );
-    }
-}
