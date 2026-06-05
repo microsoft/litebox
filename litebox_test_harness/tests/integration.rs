@@ -964,6 +964,13 @@ fn build_standard_docker_args(pass: &str, test_id: &str, bins: &BinaryPaths) -> 
         v.push("--security-opt".into());
         v.push("seccomp=unconfined".into());
     }
+    if test_id.starts_with("UDS_STREAM.eager_on.") {
+        v.push("-e".into());
+        v.push("LITEBOX_EAGER_BROKER_SOCKETPAIR=1".into());
+    } else if test_id.starts_with("UDS_STREAM.eager_off.") {
+        v.push("-e".into());
+        v.push("LITEBOX_EAGER_BROKER_SOCKETPAIR=0".into());
+    }
     let mounts = [
         (&bins.pie_glibc, "/opt/litebox"),
         (&bins.nonpie_glibc, "/opt/nonpie"),

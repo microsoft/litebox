@@ -853,12 +853,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_eager_broker_socket_dgram_enabled(enabled);
     }
 
-    // Phase F: equivalent runtime gate for eager broker-backed
-    // socketpair. `LITEBOX_EAGER_BROKER_SOCKETPAIR=1` (or 'true' /
-    // 'yes', case-insensitive) flips `sys_socketpair` to allocate
-    // broker-backed AF_UNIX SOCK_STREAM pairs instead of in-shim
-    // UnixSocket. Required for cross-worker fork+exec inheritance
-    // of socketpair fds.
+    // Phase U.1: eager broker-backed AF_UNIX SOCK_STREAM socketpair
+    // is default-on so fork+exec inheritance uses broker-held pairs
+    // instead of in-shim UnixSocket state. Required for cross-worker
+    // fork+exec inheritance of socketpair fds.
     //
     // **F.8 flip retry (2026-05-17, PE.10 done)**: setting default
     // ON. The earlier F.8 attempt regressed PB.c2p 20/20 → 11/20.

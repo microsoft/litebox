@@ -3465,7 +3465,9 @@ impl<FS: ShimFS> Task<FS> {
             return Ok(());
         }
         if let Ok(fd) = rds
-            .fd_consume_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(raw_fd)
+            .fd_consume_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(
+                raw_fd,
+            )
         {
             drop(rds);
             let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
