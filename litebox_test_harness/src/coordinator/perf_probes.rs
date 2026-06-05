@@ -237,6 +237,16 @@ async fn handle_fork_exec_true(
 /// litebox per-iter measurement plus the per-phase log lines tell
 /// you both *whether* spawn_worker_host_for_fork_restore is the
 /// dominant cost and *which sub-phase* dominates within it.
+///
+/// Measured baselines:
+///   - Pre-Phase-3 (commit 7e212bcd, parent 5865c9a0):
+///       litebox per-iter ≈ 8.9 ms, max ≈ 13 ms; native ≈ 0.92 ms.
+///   - Post-Phase-3 (re-measured at 56d212c2):
+///       litebox per-iter ≈ 8.84 ms, p50 8.55 ms, p95 11.75 ms, max 14.15 ms;
+///       native per-iter ≈ 1.49 ms, p95 5.07 ms, max 7.22 ms.
+///   No material change from the mux-relay deletion — this probe was
+///   already on the no-pipe path, so D5 didn't affect it. Keep as a
+///   regression guard against future spawn_worker_host changes.
 async fn handle_fork_only_exit(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
@@ -317,6 +327,17 @@ async fn handle_fork_only_exit(
 ///   - fork_only_exit       — no pipes; isolates spawn-worker-host cost.
 ///   - fork_with_inherited_pipe — adds 1 pipe-pair; isolates the
 ///     incremental cost of pipe bridging per snapshot.
+///
+/// Measured baselines:
+///   - Pre-Phase-3 (commit 8ad43560, parent 5865c9a0):
+///       litebox per-iter ≈ 14.6 ms, max ≈ 24 ms; native ≈ 1.5 ms.
+///   - Post-Phase-3 (re-measured at 56d212c2):
+///       litebox per-iter ≈ 12.35 ms, p50 10.85 ms, p95 14.5 ms, max 14.5 ms;
+///       native per-iter ≈ 1.47 ms, p95 3.61 ms, max 3.61 ms.
+///   Mean ≈ 15% better and max nearly halved (24 → 14.5 ms) after the
+///   mux-relay deletion / D5 broker migration; the 2.2 s spike never
+///   reproduced even pre-Phase-3, so this probe is now confirmed only
+///   as a regression guard, not a diagnostic for an open bug.
 async fn handle_fork_with_inherited_pipe(
     _args: (),
     _ctx: &mut HandlerCtx<'_>,
