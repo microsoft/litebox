@@ -363,6 +363,8 @@ const CONTROLLING_TTY_TIOCSCTTY_SIGTTIN: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.controlling_tty.tiocsctty_sigttin");
 const LINE_DISCIPLINE_CR_TO_NL: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.line_discipline.cr_to_nl");
+const IOCTL_TIOCGPTN_ONLY_ON_MASTER: HandlerToken<(), PtyOut> =
+    HandlerToken::new("pty.ioctl.tiocgptn_only_on_master");
 
 // ─── Handlers ────────────────────────────────────────────────────────
 
@@ -1230,6 +1232,96 @@ async fn handle_line_discipline_cr_to_nl(
     Ok(PtyOut { detail })
 }
 
+/// `ioctl(slave_fd, TIOCGPTN)` must return `-ENOTTY` (per Linux kernel
+/// behavior: `TIOCGPTN` is a ptmx-only ioctl). Under litebox at
+/// amalgamation tip `295b26d1`, the shim handler in
+/// `litebox_shim_linux/src/syscalls/file.rs:7030-7034` returns
+/// `entry.pty_id()` unconditionally for any PTY entry, master or
+/// slave — so `TIOCGPTN` on a slave returns `0` instead of `-ENOTTY`.
+///
+/// Real-world impact: GitHub Copilot CLI (and any TUI app using the
+/// same PTY-detection pattern) calls `ioctl(stdin, TIOCGPTN)` at
+/// startup to decide whether stdin is a master or slave. Native
+/// returns `-ENOTTY` → "must be a slave" → falls back to
+/// `readlink("/proc/self/fd/0")` to find `/dev/pts/N` and proceeds.
+/// Under litebox the ioctl returns `0` → the app mis-classifies the
+/// fd → opens `/dev/null` as the fallback → TUI rendering goes
+/// nowhere → screen stays empty and `copilot::tui.*` trials hang.
+///
+/// Surfaced by Goal A validation session 7c1fc95d (2026-06-05),
+/// strace divergence sub-investigation.
+async fn handle_ioctl_tiocgptn_only_on_master(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    let master_fd = pty.as_raw_fd();
+    let slave_path = std::ffi::CString::new(pty.slave_path())
+        .map_err(|e| HandlerError::from(format!("slave path NUL: {e}")))?;
+
+    // Open the slave WITHOUT making it our controlling tty; we only
+    // care about the ioctl shape, not session semantics.
+    // SAFETY: slave_path is a valid NUL-terminated C string from ptsname.
+    let slave_fd = unsafe { libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    if slave_fd < 0 {
+        return Err(HandlerError::from(format!(
+            "open({}) failed: {}",
+            pty.slave_path(),
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let mut slave_n: i32 = 0;
+    // SAFETY: slave_fd is a live PTY slave fd; slave_n is a valid &mut i32 sink.
+    let slave_rc =
+        unsafe { libc::ioctl(slave_fd, libc::TIOCGPTN, &mut slave_n as *mut i32) };
+    let slave_errno = std::io::Error::last_os_error().raw_os_error();
+
+    let mut master_n: i32 = -1;
+    // SAFETY: master_fd is a live PTY master fd; master_n is a valid &mut i32 sink.
+    let master_rc =
+        unsafe { libc::ioctl(master_fd, libc::TIOCGPTN, &mut master_n as *mut i32) };
+    let master_errno = std::io::Error::last_os_error().raw_os_error();
+
+    // SAFETY: slave_fd is owned by us; close exactly once.
+    unsafe { libc::close(slave_fd) };
+
+    // Master TIOCGPTN must succeed (sanity — every Linux PTY master
+    // supports this since 2.6.21).
+    if master_rc != 0 {
+        return Err(HandlerError::from(format!(
+            "ioctl(master, TIOCGPTN) failed: rc={master_rc} errno={master_errno:?}; \
+             this is a separate bug, not the TIOCGPTN-on-slave divergence we're probing for"
+        )));
+    }
+
+    // Slave TIOCGPTN must fail with ENOTTY. Anything else is the bug.
+    if slave_rc == 0 {
+        return Err(HandlerError::from(format!(
+            "ioctl(slave, TIOCGPTN) succeeded (returned slave_n={slave_n}); expected -1/ENOTTY. \
+             This is the TIOCGPTN-on-slave divergence: native Linux returns -ENOTTY because \
+             TIOCGPTN is only valid on /dev/ptmx, but the litebox shim handler at \
+             litebox_shim_linux/src/syscalls/file.rs:7030 returns pty_id() for any PTY entry. \
+             master ptn = {master_n}, slave ptn = {slave_n} (they {} match — under the buggy \
+             shim, both fds resolve to the same `pty_id`).",
+            if slave_n == master_n { "DO" } else { "do NOT" }
+        )));
+    }
+
+    let want = libc::ENOTTY;
+    if slave_errno != Some(want) {
+        return Err(HandlerError::from(format!(
+            "ioctl(slave, TIOCGPTN) returned -1 with errno={slave_errno:?}, expected ENOTTY({want})"
+        )));
+    }
+
+    Ok(PtyOut {
+        detail: format!(
+            "master TIOCGPTN ok (ptn={master_n}); slave TIOCGPTN returned -1/ENOTTY as native does"
+        ),
+    })
+}
+
 async fn handle_parent_exit_then_child_io(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -1293,6 +1385,10 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_handler!(TIOCGPGRP, handle_tiocgpgrp);
     register_handler!(TIOCSPGRP, handle_tiocspgrp);
     register_handler!(TIOCSCTTY, handle_tiocsctty);
+    register_handler!(
+        IOCTL_TIOCGPTN_ONLY_ON_MASTER,
+        handle_ioctl_tiocgptn_only_on_master
+    );
     register_handler!(
         CONTROLLING_TTY_TOSTOP_SIGTTOU,
         handle_controlling_tty_tostop_sigttou
@@ -1419,6 +1515,19 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_pty_stdio_lockstep(reg);
     register_parent_exit_then_child_io(reg);
     register_slave_write_after_master_close(reg);
+
+    // TIOCGPTN-on-slave-must-return-ENOTTY probe. Single-agent
+    // because the bug is in the shim's ioctl handler, not in any
+    // fork/exec topology — one agent is sufficient and avoids
+    // multiplying trial count.
+    reg.single_agent_handler_test(
+        "vscode",
+        "pty",
+        "PTY.ioctl.tiocgptn_only_on_master.pie-glibc.dpg1",
+        AgentName::Dpg1,
+        &IOCTL_TIOCGPTN_ONLY_ON_MASTER,
+        |out| Ok(out.detail.clone()),
+    );
 
     for &agent in PTY_AGENTS {
         for def in PTY_SCENARIOS {
