@@ -910,9 +910,8 @@ fn map_mkdir_error(error: MkdirError) -> NtStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{TestFS, TestPlatform};
+    use crate::tests::{TestFS, TestPlatform, const_ptr, mut_ptr, null_mut_ptr};
     use litebox::fs::FileSystem as _;
-    use zerocopy::{FromBytes, IntoBytes};
 
     extern crate std;
 
@@ -931,18 +930,6 @@ mod tests {
     const FILE_OPEN: u32 = 2;
     const FILE_CREATE: u32 = 1;
     const FILE_OVERWRITE: u32 = 4;
-
-    fn const_ptr<T: FromBytes>(value: &T) -> ConstPtr<TestPlatform, T> {
-        ConstPtr::<TestPlatform, T>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
-    }
-
-    fn mut_ptr<T: FromBytes + IntoBytes>(value: &mut T) -> MutPtr<TestPlatform, T> {
-        MutPtr::<TestPlatform, T>::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
-    }
-
-    fn null_mut_ptr<T: FromBytes + IntoBytes>() -> MutPtr<TestPlatform, T> {
-        MutPtr::<TestPlatform, T>::from_usize(0)
-    }
 
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
         let _ = crate::tests::test_platform();

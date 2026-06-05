@@ -171,6 +171,7 @@ impl NtStatus {
             0xC00000AD => "STATUS_INVALID_PIPE_STATE: Invalid pipe state",
             0xC00000AE => "STATUS_PIPE_BUSY: Pipe busy",
             0xC00000B0 => "STATUS_PIPE_DISCONNECTED: Pipe disconnected",
+            0xC00000BB => "STATUS_NOT_SUPPORTED: The request is not supported",
             0xC00000E6 => "STATUS_GENERIC_NOT_MAPPED: Generic not mapped",
             0xC00000EF => "STATUS_INVALID_PARAMETER_1: Invalid parameter 1",
             0xC00000FD => "STATUS_STACK_OVERFLOW: Stack overflow",
@@ -471,6 +472,9 @@ impl NtStatus {
 
     /// STATUS_PIPE_DISCONNECTED
     pub const PIPE_DISCONNECTED: Self = Self::from_raw(0xC00000B0);
+
+    /// STATUS_NOT_SUPPORTED
+    pub const NOT_SUPPORTED: Self = Self::from_raw(0xC00000BB);
 
     /// STATUS_GENERIC_NOT_MAPPED
     pub const GENERIC_NOT_MAPPED: Self = Self::from_raw(0xC00000E6);

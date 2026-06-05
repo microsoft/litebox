@@ -549,9 +549,9 @@ fn map_nls_read_error(error: ReadError) -> NtStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::mut_ptr;
     use alloc::vec;
     use litebox::platform::RawPointerProvider;
-    use zerocopy::{FromBytes, IntoBytes};
 
     extern crate std;
 
@@ -578,10 +578,6 @@ mod tests {
         fn NtQueryDefaultUILanguage(default_ui_language: *mut u16) -> i32;
 
         fn NtQueryInstallUILanguage(install_ui_language: *mut u16) -> i32;
-    }
-
-    fn mut_ptr<T: FromBytes + IntoBytes>(value: &mut T) -> MutPtr<TestPlatform, T> {
-        MutPtr::<TestPlatform, T>::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

@@ -10,10 +10,11 @@ use core::sync::atomic::{AtomicI32, AtomicU32};
 use litebox::LiteBox;
 use litebox::fd::RawDescriptorStorage;
 use litebox::fs::{FileSystem as _, Mode, OFlags};
+use litebox::platform::RawConstPointer as _;
 
 use crate::{
-    DefaultFS, GlobalState, Process, Task, WindowsHandleStore, WindowsNlsSectionMappings,
-    WindowsPageManager,
+    ConstPtr, DefaultFS, GlobalState, MutPtr, Process, Task, WindowsHandleStore,
+    WindowsNlsSectionMappings, WindowsPageManager,
 };
 
 #[cfg(target_os = "linux")]
@@ -21,6 +22,29 @@ pub(crate) type TestPlatform = litebox_platform_linux_userland::LinuxUserland;
 #[cfg(target_os = "windows")]
 pub(crate) type TestPlatform = litebox_platform_windows_userland::WindowsUserland;
 pub(crate) type TestFS = DefaultFS<TestPlatform>;
+
+pub(crate) fn const_ptr<T: zerocopy::FromBytes>(value: &T) -> ConstPtr<TestPlatform, T> {
+    ConstPtr::<TestPlatform, T>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+}
+
+pub(crate) fn mut_ptr<T: zerocopy::FromBytes + zerocopy::IntoBytes>(
+    value: &mut T,
+) -> MutPtr<TestPlatform, T> {
+    MutPtr::<TestPlatform, T>::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
+}
+
+pub(crate) fn mut_byte_ptr<T>(value: &mut T) -> MutPtr<TestPlatform, u8> {
+    MutPtr::<TestPlatform, u8>::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
+}
+
+pub(crate) fn null_const_ptr<T: zerocopy::FromBytes>() -> ConstPtr<TestPlatform, T> {
+    ConstPtr::<TestPlatform, T>::from_usize(0)
+}
+
+pub(crate) fn null_mut_ptr<T: zerocopy::FromBytes + zerocopy::IntoBytes>() -> MutPtr<TestPlatform, T>
+{
+    MutPtr::<TestPlatform, T>::from_usize(0)
+}
 
 pub(crate) fn test_platform() -> &'static TestPlatform {
     static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
@@ -89,6 +113,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         global: Arc::new(GlobalState {
             platform,
             registry: crate::syscalls::registry::RegistryStore::new(&litebox),
+            qpc_boot_instant: litebox::platform::TimeProvider::now(platform),
             litebox,
             page_manager,
             _fs: PhantomData,

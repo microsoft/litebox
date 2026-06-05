@@ -4,6 +4,7 @@
 pub(crate) mod file;
 pub(crate) mod nls;
 pub(crate) mod registry;
+pub(crate) mod sysinfo;
 
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
@@ -153,6 +154,16 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtQueryInstallUILanguage {
         install_ui_language: Platform::RawMutPointer<u16>,
     },
+    NtQueryPerformanceCounter {
+        performance_counter: Platform::RawMutPointer<i64>,
+        performance_frequency: Option<Platform::RawMutPointer<i64>>,
+    },
+    NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
+        flag: u32,
+        source: Platform::RawConstPointer<u64>,
+        destination: Platform::RawMutPointer<u64>,
+        conversion_error: Option<Platform::RawMutPointer<u64>>,
+    },
     NtAllocateVirtualMemory {
         process_handle: ProcessHandle,
         base_address: Platform::RawMutPointer<usize>,
@@ -254,6 +265,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtQueryInstallUILanguage => Some(sys_req!(NtQueryInstallUILanguage {
                 install_ui_language:*,
             })),
+            NtSysno::NtQueryPerformanceCounter => Some(sys_req!(NtQueryPerformanceCounter {
+                performance_counter:*,
+                performance_frequency:*,
+            })),
+            NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(
+                sys_req!(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
+                    flag,
+                    source:*,
+                    destination:*,
+                    conversion_error:*,
+                }),
+            ),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },
                 base_address:*,

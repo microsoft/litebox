@@ -839,12 +839,11 @@ fn map_read_error(error: ReadError) -> NtStatus {
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{TestFS, TestPlatform, test_platform};
+    use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_platform};
 
     use super::*;
     use core::mem::size_of;
     use litebox::LiteBox;
-    use zerocopy::{FromBytes, IntoBytes};
 
     extern crate std;
 
@@ -904,18 +903,6 @@ mod tests {
         ) -> i32;
         fn RegCloseKey(hKey: *mut core::ffi::c_void) -> i32;
         fn RegDeleteTreeW(hKey: *mut core::ffi::c_void, lpSubKey: *const u16) -> i32;
-    }
-
-    fn const_ptr<T: FromBytes>(value: &T) -> ConstPtr<TestPlatform, T> {
-        ConstPtr::<TestPlatform, T>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
-    }
-
-    fn mut_ptr<T: FromBytes + IntoBytes>(value: &mut T) -> MutPtr<TestPlatform, T> {
-        MutPtr::<TestPlatform, T>::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
-    }
-
-    fn mut_byte_ptr<T>(value: &mut T) -> MutPtr<TestPlatform, u8> {
-        MutPtr::<TestPlatform, u8>::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
     }
 
     fn unicode_string(value: &[u16]) -> UnicodeString {

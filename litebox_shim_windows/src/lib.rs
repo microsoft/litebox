@@ -23,7 +23,7 @@ use litebox::mm::PageManager;
 use litebox::platform::{
     CrngProvider, PageManagementProvider, PunchthroughProvider, PunchthroughToken,
     RawConstPointer as _, RawMutPointer as _, RawPointerProvider, StdioProvider,
-    SystemInfoProvider,
+    SystemInfoProvider, TimeProvider,
 };
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::RawSyncPrimitivesProvider;
@@ -49,6 +49,7 @@ pub trait ShimPlatform:
     + RawPointerProvider
     + PageManagementProvider<PAGE_SIZE>
     + SystemInfoProvider
+    + TimeProvider
     + 'static
 {
 }
@@ -58,6 +59,7 @@ impl<T> ShimPlatform for T where
         + RawPointerProvider
         + PageManagementProvider<PAGE_SIZE>
         + SystemInfoProvider
+        + TimeProvider
         + 'static
 {
 }
@@ -269,6 +271,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
             platform: self.platform,
             page_manager: PageManager::new(&self.litebox),
             registry: syscalls::registry::RegistryStore::new(&self.litebox),
+            qpc_boot_instant: TimeProvider::now(self.platform),
             litebox: self.litebox,
             _fs: PhantomData,
         });
@@ -324,6 +327,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     platform: &'static Platform,
     page_manager: WindowsPageManager<Platform>,
     registry: syscalls::registry::RegistryStore<Platform>,
+    qpc_boot_instant: <Platform as TimeProvider>::Instant,
     litebox: LiteBox<Platform>,
     _fs: PhantomData<FS>,
 }
@@ -540,6 +544,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 install_ui_language,
             } => {
                 let status = self.sys_nt_query_install_ui_language(install_ui_language);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryPerformanceCounter {
+                performance_counter,
+                performance_frequency,
+            } => {
+                let status = self
+                    .sys_nt_query_performance_counter(performance_counter, performance_frequency);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
+                flag,
+                source,
+                destination,
+                conversion_error,
+            } => {
+                let status = Self::sys_nt_convert_between_auxiliary_counter_and_performance_counter(
+                    flag,
+                    source,
+                    destination,
+                    conversion_error,
+                );
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtAllocateVirtualMemory {
