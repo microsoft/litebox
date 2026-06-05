@@ -22,6 +22,7 @@ pub mod broker_pidfd_provider;
 pub mod broker_pipe_provider;
 pub mod broker_pty_provider;
 pub mod broker_signalfd_provider;
+pub mod broker_socket_dgram_provider;
 pub mod broker_socketpair_provider;
 pub mod broker_tcp_conn_provider;
 pub mod guest_pid_provider;
@@ -320,6 +321,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         "pty" => BrokerHandleKind::Pty,
         "pipe" => BrokerHandleKind::Pipe,
         "unix_socket" => BrokerHandleKind::UnixSocket,
+        "socket_dgram" | "dgram" => BrokerHandleKind::SocketDgram,
         "tcp_conn" => BrokerHandleKind::TcpConn,
         "inet_listener" => BrokerHandleKind::InetListener,
         "inet_dgram" => BrokerHandleKind::InetDgram,
@@ -366,6 +368,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Eventfd, Some(extra))
         | (BrokerHandleKind::Pidfd, Some(extra))
         | (BrokerHandleKind::Signalfd, Some(extra))
+        | (BrokerHandleKind::SocketDgram, Some(extra))
         | (BrokerHandleKind::TcpConn, Some(extra))
         | (BrokerHandleKind::InetListener, Some(extra))
         | (BrokerHandleKind::InetDgram, Some(extra)) => {
@@ -377,6 +380,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Eventfd, None)
         | (BrokerHandleKind::Pidfd, None)
         | (BrokerHandleKind::Signalfd, None)
+        | (BrokerHandleKind::SocketDgram, None)
         | (BrokerHandleKind::TcpConn, None)
         | (BrokerHandleKind::InetListener, None)
         | (BrokerHandleKind::InetDgram, None) => (None, None, None),
@@ -836,6 +840,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         } else {
             litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
         }
+    }
+
+    // Broker AF_UNIX SOCK_DGRAM remains opt-in while the probe matrix lands.
+    {
+        let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETDGRAM")
+            .ok()
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        litebox_shim_linux::syscalls::set_eager_broker_socket_dgram_enabled(enabled);
     }
 
     // Phase F: equivalent runtime gate for eager broker-backed
@@ -3243,6 +3256,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_socketpair_provider(socketpair_provider)
         .map_err(|_| anyhow!("socketpair provider already set"))?;
+
+    let socket_dgram_provider = Arc::new(
+        crate::broker_socket_dgram_provider::RunnerBrokerSocketDgramProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_socket_dgram_provider(socket_dgram_provider)
+        .map_err(|_| anyhow!("socket dgram provider already set"))?;
 
     litebox_shim_linux::syscalls::set_broker_inet_dgram_enabled(broker_inet_udp_enabled());
 
