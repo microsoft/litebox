@@ -116,7 +116,7 @@ flowchart TD
 | fork + pipe inheritance + CLOEXEC | ✅ | `FORK.pipe_fd_inheritance`, `PFLG.nonblock_fork.*` | Phase 2 (legacy local pipes → BrokerPipe). w11 CLOEXEC regression subsumed by Phase 3. |
 | fork-restore latency | 🟡 | `PERF.fork_only_exit`, `PERF.fork_with_inherited_pipe` | ~9x native fork-only, ~8x fork+pipe post-Phase-3. PERF probes are regression guards. Further improvement = future work (not blocking either goal). |
 | Pipeline shapes (cat-pipe-head, node-spawn-bash-drain) | ✅ | `dropbear_bash.*` 24/24, `CL3.mux_pipe.*` | Phase H red gate closed; e1aa42d0 D5 work generalized. |
-| TUI `find_head` (Copilot shell-tool) | 🟡 | `copilot::tui.find_head`, `copilot::pminus.*` | 802afcd2 to re-verify against current amalgamation; Phase 3 may have transitively resolved. |
+| TUI `find_head` (Copilot shell-tool) | 🟡 | `copilot::tui.*`, `copilot::pminus.*` | **Verified against amalgamation tip `898af46a` (dashboard `run_id=30281`, 2026-06-05):** Phase 3 did **not** transitively resolve. Native 21/22 pass (`pminus.build` is a test/env bug — separate follow-up). Litebox **4/22 pass**: only `pminus.simple_math`, `pminus.simple_bash`, `pminus.read_file`, `pminus.find_head_ls`. **All 11 `tui.*` litebox trials FAIL**, including the no-pipe baselines `tui.simple_math` and `tui.simple_bash` — gap is broader than just the `find_head` pipe shape and indicates a TUI-mode issue under litebox independent of the shell-tool pipeline. 7 of 8 `find_head` shape variants still FAIL on `pminus`; `find_head_ls` passes (shell-glob path differs from `find` invocation). Per-trial transcripts at `target/test-logs/copilot-litebox-*.stripped.log`. Next step is a self-contained harness test that isolates the TUI startup capability (vs the existing pipeline shape tests in `dropbear_bash.*`, which all pass). |
 | pidfd_open + waitid(P_PIDFD) | ✅ | `PIDFD.open_and_waitid` | Session 15 round 3 (`goal2-pidfd`, commit `3552f8ad`). |
 | pidfd_send_signal + WIFSIGNALED encoding | ✅ | `PIDFD.send_signal`, `KILL_WAIT.signal_kill_propagation.*` 3+3 | Session 16 round 5. WIFSIGNALED substrate landed `goal3-pidfd-wait` commit `e9373c76` (worker raw `wait_status` plumbed end-to-end via `worker_raw_wait_status_to_registry_status`; WCOREDUMP preserved). pidfd delivery landed `goal3-pidfd-signal` commit `c8ea23ca` (pidfd → guest pid → `sys_kill`; `is_running` extended to consult `fork_child_host_pids`). |
 | broker wait-status WIFSIGNALED preservation | ✅ | `KILL_WAIT.signal_kill_propagation.*` 3+3 | Substrate for pidfd_send_signal. Session 16 round 5 commit `e9373c76`. Replaces previous `(exit_code - 256) + 128` lossy encoding at 4 sites in `process.rs`. |
@@ -136,14 +136,19 @@ flowchart TD
 Cross-checked against current open todos in active session
 `e1aa42d0` plan.md tail:
 
-- TUI `find_head` w8/w10 (🟡 re-verification pending in 802afcd2).
+- TUI `find_head` w8/w10 (🟡 — re-verified against `898af46a` in
+  dashboard `run_id=30281`; Phase 3 did **not** transitively resolve,
+  and the gap is broader than `find_head` itself: every `copilot::tui.*`
+  litebox trial fails, including the no-pipe `tui.simple_math`).
 - `ha-probe` (parked HypB probe — not actively pursued).
 - HypB notification-coalescing (🟡 30/60 remaining failures, deferred until a specific consumer needs it).
 
 The map's leaf-status flips for Goal A would be: TUI w8/w10 → ✅
-(probably; pending verification). Goal B's capability nodes are
-all ✅ as of round 5 (Session 16); remaining gap is end-to-end
-validation.
+**(blocked — the 2026-06-05 validation against `898af46a` showed
+all `copilot::tui.*` litebox trials still fail; flip remains
+pending real work, not just re-verification)**. Goal B's
+capability nodes are all ✅ as of round 5 (Session 16); remaining
+gap is end-to-end validation.
 
 After those flip, the remaining gap to declaring each goal "done"
 is *end-to-end validation* — actually running the Copilot CLI TUI
