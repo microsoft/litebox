@@ -1279,14 +1279,21 @@ cargo test -p litebox_test_harness --test integration -- \
 cargo test -p litebox_test_harness --test integration -- \
   'copilot::pminus'
 
-# Full Copilot suite:
-LITEBOX_COPILOT_JOBS=1 cargo test -p litebox_test_harness --test integration -- \
+# Full Copilot suite (defaults to LITEBOX_COPILOT_JOBS=1 — serial,
+# safest for API quota / model-output stability):
+cargo test -p litebox_test_harness --test integration -- \
   'copilot::'
 
 # Full Copilot suite without an explicit positional filter (now the
 # default — copilot trials register unconditionally):
-LITEBOX_COPILOT_JOBS=1 \
-  cargo test -p litebox_test_harness --test integration
+cargo test -p litebox_test_harness --test integration
+
+# One-shot validation: trade GitHub API quota for wall time by
+# raising the cap. ~4 is a reasonable starting point; cargo's own
+# `--test-threads` still bounds the worker pool.
+LITEBOX_COPILOT_JOBS=4 \
+  cargo test -p litebox_test_harness --test integration -- \
+  'copilot::'
 ```
 
 **Token requirement (graceful per-trial fail):** the trials need a
@@ -1300,8 +1307,15 @@ appear in any host-visible argv (passed into the container via a
 exec'ing copilot).
 
 **Concurrency cap:** `LITEBOX_COPILOT_JOBS` (default `1`),
-independent of `LITEBOX_TEST_JOBS`. Avoids GitHub API throttling
-and reduces model-output flakiness.
+independent of `LITEBOX_TEST_JOBS`. The serial default protects
+shared CI / autonomous-driver runs from GitHub API throttling and
+reduces model-output flakiness — but **do not copy
+`LITEBOX_COPILOT_JOBS=1` into one-shot validation runs**. For a
+single agent session that just wants the suite to finish quickly,
+raise the cap (e.g. `LITEBOX_COPILOT_JOBS=4`) and burn parallel
+API quota; nothing in-tree forces serialization. The autonomous
+driver and shared dashboard supervisor leave the default alone on
+purpose.
 
 **Registration is unconditional** — copilot trials are always part
 of the trial set so the dashboard universe stays consistent and
