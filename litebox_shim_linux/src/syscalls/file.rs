@@ -7,6 +7,7 @@ use alloc::{
     ffi::CString,
     string::{String, ToString as _},
     vec,
+    vec::Vec,
 };
 use litebox::{
     event::{Events, wait::WaitError},
@@ -25,7 +26,7 @@ use litebox_common_linux::{
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
-use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task, syscalls::signal};
+use crate::{ConstPtr, GlobalState, MAX_KERNEL_BUF_SIZE, MutPtr, ShimFS, Task, syscalls::signal};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
@@ -901,8 +902,23 @@ impl<FS: ShimFS> Task<FS> {
                 .run_on_raw_fd(
                     raw_fd,
                     |_fd| Ok(None),
-                    |_fd| Ok(None),
-                    |_fd| Ok(None),
+                    |fd| {
+                        let mut kernel_buffer = vec![0u8; read_iovec_buffer_len(iovs)?];
+                        read_once_into_iovec(iovs, &mut kernel_buffer, |buf| {
+                            self.global.receive(
+                                &self.wait_cx(),
+                                fd,
+                                buf,
+                                litebox_common_linux::ReceiveFlags::empty(),
+                                None,
+                            )
+                        })
+                        .map(Some)
+                    },
+                    |fd| {
+                        read_linux_pipe_into_iovec(&self.global, &self.wait_cx(), fd, iovs)
+                            .map(Some)
+                    },
                     |fd| {
                         let total_len =
                             eventfd_iovec_total_len(iovs.iter().map(|iov| iov.iov_len))?;
@@ -918,12 +934,32 @@ impl<FS: ShimFS> Task<FS> {
                             .ok_or(Errno::EBADF)?;
                         handle.with_entry(|file| {
                             let value = file.read(&self.wait_cx())?;
-                            copy_eventfd_value_to_iovec(iovs, value)?;
+                            read_eventfd_value_to_iovec(iovs, value)?;
                             Ok(Some(8))
                         })
                     },
                     |_fd| Ok(None),
-                    |_fd| Ok(None),
+                    |fd| {
+                        let handle = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .entry_handle(fd)
+                            .ok_or(Errno::EBADF)?;
+                        handle
+                            .with_entry(|file| {
+                                let mut kernel_buffer = vec![0u8; read_iovec_buffer_len(iovs)?];
+                                read_once_into_iovec(iovs, &mut kernel_buffer, |buf| {
+                                    file.recvfrom(
+                                        &self.wait_cx(),
+                                        buf,
+                                        litebox_common_linux::ReceiveFlags::empty(),
+                                        None,
+                                    )
+                                })
+                            })
+                            .map(Some)
+                    },
                 )
                 .flatten()?
             {
@@ -972,6 +1008,10 @@ fn check_iovcnt(iovcnt: usize) -> Result<(), Errno> {
 }
 
 fn check_iov_lens(iov_lens: impl IntoIterator<Item = usize>) -> Result<(), Errno> {
+    iovec_total_len(iov_lens).map(|_| ())
+}
+
+fn iovec_total_len(iov_lens: impl IntoIterator<Item = usize>) -> Result<usize, Errno> {
     let mut total = 0usize;
     for iov_len in iov_lens {
         total = total.checked_add(iov_len).ok_or(Errno::EINVAL)?;
@@ -979,18 +1019,11 @@ fn check_iov_lens(iov_lens: impl IntoIterator<Item = usize>) -> Result<(), Errno
             return Err(Errno::EINVAL);
         }
     }
-    Ok(())
+    Ok(total)
 }
 
 fn eventfd_iovec_total_len(iov_lens: impl IntoIterator<Item = usize>) -> Result<usize, Errno> {
-    let mut total_len = 0usize;
-    for iov_len in iov_lens {
-        total_len = total_len.checked_add(iov_len).ok_or(Errno::EINVAL)?;
-        if total_len > SSIZE_MAX {
-            return Err(Errno::EINVAL);
-        }
-    }
-    Ok(total_len)
+    iovec_total_len(iov_lens)
 }
 
 fn validate_eventfd_iovec_len(total_len: usize) -> Result<(), Errno> {
@@ -1000,7 +1033,7 @@ fn validate_eventfd_iovec_len(total_len: usize) -> Result<(), Errno> {
     Ok(())
 }
 
-fn copy_eventfd_value_to_iovec(iovs: &[IoReadVec<MutPtr<u8>>], value: u64) -> Result<(), Errno> {
+fn read_eventfd_value_to_iovec(iovs: &[IoReadVec<MutPtr<u8>>], value: u64) -> Result<(), Errno> {
     validate_eventfd_iovec_len(eventfd_iovec_total_len(iovs.iter().map(|iov| iov.iov_len))?)?;
 
     let bytes = value.to_ne_bytes();
@@ -1021,7 +1054,7 @@ fn copy_eventfd_value_to_iovec(iovs: &[IoReadVec<MutPtr<u8>>], value: u64) -> Re
     Err(Errno::EINVAL)
 }
 
-fn write_eventfd_iovec<F>(
+fn write_eventfd_from_iovec<F>(
     iovs: &[IoWriteVec<ConstPtr<u8>>],
     mut write_value: F,
 ) -> Result<usize, Errno>
@@ -1112,6 +1145,82 @@ where
     Ok(total_read)
 }
 
+/// Performs one backend read and scatters the returned bytes into user iovecs.
+fn read_once_into_iovec<P, F>(
+    iovs: &[IoReadVec<P>],
+    kernel_buffer: &mut [u8],
+    mut read_fn: F,
+) -> Result<usize, Errno>
+where
+    P: RawMutPointer<u8>,
+    F: FnMut(&mut [u8]) -> Result<usize, Errno>,
+{
+    let total_len = iovec_total_len(iovs.iter().map(|iov| iov.iov_len))?;
+    if total_len == 0 {
+        return Ok(0);
+    }
+
+    let read_len = total_len.min(kernel_buffer.len());
+    let size = read_fn(&mut kernel_buffer[..read_len])?.min(read_len);
+    scatter_buffer_to_iovec(iovs, &kernel_buffer[..size])
+}
+
+fn scatter_buffer_to_iovec<P>(iovs: &[IoReadVec<P>], data: &[u8]) -> Result<usize, Errno>
+where
+    P: RawMutPointer<u8>,
+{
+    let mut copied = 0;
+    for iov in iovs {
+        if copied == data.len() {
+            return Ok(copied);
+        }
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let size = (data.len() - copied).min(iov.iov_len);
+        if iov
+            .iov_base
+            .copy_from_slice(0, &data[copied..copied + size])
+            .is_none()
+        {
+            return if copied > 0 {
+                Ok(copied)
+            } else {
+                Err(Errno::EFAULT)
+            };
+        }
+        copied += size;
+    }
+    if copied == data.len() || copied > 0 {
+        Ok(copied)
+    } else {
+        Err(Errno::EFAULT)
+    }
+}
+
+fn read_iovec_buffer_len<P>(iovs: &[IoReadVec<P>]) -> Result<usize, Errno>
+where
+    P: RawMutPointer<u8>,
+{
+    Ok(iovec_total_len(iovs.iter().map(|iov| iov.iov_len))?.min(MAX_KERNEL_BUF_SIZE))
+}
+
+fn read_linux_pipe_into_iovec<P, FS>(
+    global: &GlobalState<FS>,
+    cx: &litebox::event::wait::WaitContext<'_, Platform>,
+    fd: &TypedFd<litebox::pipes::Pipes<Platform>>,
+    iovs: &[IoReadVec<P>],
+) -> Result<usize, Errno>
+where
+    P: RawMutPointer<u8>,
+    FS: ShimFS,
+{
+    let mut kernel_buffer = vec![0u8; read_iovec_buffer_len(iovs)?];
+    read_once_into_iovec(iovs, &mut kernel_buffer, |buf| {
+        global.read_linux_pipe(cx, fd, buf)
+    })
+}
+
 /// Drain writes from a sequence of user iovecs.
 ///
 /// `write_fn` receives the contents of each iovec along with the total number of
@@ -1162,6 +1271,46 @@ where
     Ok(total_written)
 }
 
+fn write_linux_pipe_from_iovec<P, FS>(
+    global: &GlobalState<FS>,
+    cx: &litebox::event::wait::WaitContext<'_, Platform>,
+    fd: &TypedFd<litebox::pipes::Pipes<Platform>>,
+    iovs: &[IoWriteVec<P>],
+) -> Result<usize, Errno>
+where
+    P: RawConstPointer<u8>,
+    FS: ShimFS,
+{
+    let total_len = iovec_total_len(iovs.iter().map(|iov| iov.iov_len))?;
+    if total_len == 0 {
+        return Ok(0);
+    }
+    if total_len <= super::pipe::LINUX_PIPE_BUF {
+        let buffer = gather_iovec_to_buffer(iovs, total_len)?;
+        return global.write_linux_pipe(cx, fd, &buffer);
+    }
+
+    write_to_iovec(iovs, |buf, _total| global.write_linux_pipe(cx, fd, buf))
+}
+
+fn gather_iovec_to_buffer<P>(iovs: &[IoWriteVec<P>], total_len: usize) -> Result<Vec<u8>, Errno>
+where
+    P: RawConstPointer<u8>,
+{
+    let mut buffer = Vec::with_capacity(total_len);
+    for iov in iovs {
+        if iov.iov_len == 0 {
+            continue;
+        }
+        let Some(slice) = iov.iov_base.to_owned_slice(iov.iov_len) else {
+            return Err(Errno::EFAULT);
+        };
+        buffer.extend_from_slice(slice.as_ref());
+    }
+    debug_assert_eq!(buffer.len(), total_len);
+    Ok(buffer)
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `writev`
     pub(crate) fn sys_writev(
@@ -1185,7 +1334,10 @@ impl<FS: ShimFS> Task<FS> {
                     raw_fd,
                     |_fd| Ok(None),
                     |_fd| Ok(None),
-                    |_fd| Ok(None),
+                    |fd| {
+                        write_linux_pipe_from_iovec(&self.global, &self.wait_cx(), fd, iovs)
+                            .map(Some)
+                    },
                     |fd| {
                         let handle = self
                             .global
@@ -1193,7 +1345,7 @@ impl<FS: ShimFS> Task<FS> {
                             .descriptor_table()
                             .entry_handle(fd)
                             .ok_or(Errno::EBADF)?;
-                        write_eventfd_iovec(iovs, |value| {
+                        write_eventfd_from_iovec(iovs, |value| {
                             handle.with_entry(|file| file.write(&self.wait_cx(), value))
                         })
                         .map(Some)
@@ -2771,6 +2923,105 @@ mod tests {
             Ok(output.len())
         );
         assert_eq!(&output, b"hello pipe");
+    }
+
+    #[test]
+    fn small_nonblocking_pipe_writev_is_atomic() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (read_fd, write_fd) = task.sys_pipe2(OFlags::NONBLOCK).unwrap();
+        let read_fd = i32::try_from(read_fd).unwrap();
+        let write_fd = i32::try_from(write_fd).unwrap();
+        let fill = vec![0xaa; 8192];
+
+        loop {
+            match task.sys_write(write_fd, &fill, None) {
+                Ok(0) => panic!("pipe write made no progress"),
+                Ok(_written) => {}
+                Err(Errno::EAGAIN) => break,
+                Err(error) => panic!("unexpected pipe fill error: {error:?}"),
+            }
+        }
+
+        let mut slack = [0; 3];
+        assert_eq!(task.sys_read(read_fd, &mut slack, None), Ok(slack.len()));
+
+        let first = b"ab";
+        let second = b"cd";
+        let iovs = [
+            IoWriteVec {
+                iov_base: ConstPtr::from_ptr(first.as_ptr()),
+                iov_len: first.len(),
+            },
+            IoWriteVec {
+                iov_base: ConstPtr::from_ptr(second.as_ptr()),
+                iov_len: second.len(),
+            },
+        ];
+
+        assert_eq!(
+            task.sys_writev(write_fd, ConstPtr::from_ptr(iovs.as_ptr()), iovs.len()),
+            Err(Errno::EAGAIN)
+        );
+    }
+
+    #[test]
+    fn read_once_into_iovec_stops_after_one_backend_read() {
+        let mut first = [0u8; 4];
+        let mut second = [0u8; 4];
+        let iovs = [
+            IoReadVec {
+                iov_base: MutPtr::from_usize(first.as_mut_ptr().expose_provenance()),
+                iov_len: first.len(),
+            },
+            IoReadVec {
+                iov_base: MutPtr::from_usize(second.as_mut_ptr().expose_provenance()),
+                iov_len: second.len(),
+            },
+        ];
+        let mut kernel_buffer = [0u8; 8];
+        let calls = Cell::new(0);
+
+        let result = read_once_into_iovec(&iovs, &mut kernel_buffer, |buf| {
+            calls.set(calls.get() + 1);
+            buf[..6].copy_from_slice(b"abcdef");
+            Ok(6)
+        });
+
+        assert_eq!(result, Ok(6));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(&first, b"abcd");
+        assert_eq!(&second, b"ef\0\0");
+    }
+
+    #[test]
+    fn pipe_readv_can_return_more_than_one_page_without_second_backend_read() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (read_fd, write_fd) = task.sys_pipe2(OFlags::NONBLOCK).unwrap();
+        let read_fd = i32::try_from(read_fd).unwrap();
+        let write_fd = i32::try_from(write_fd).unwrap();
+        let input = vec![0x5a; PAGE_SIZE * 2];
+
+        assert_eq!(task.sys_write(write_fd, &input, None), Ok(input.len()));
+
+        let mut first = vec![0u8; PAGE_SIZE];
+        let mut second = vec![0u8; PAGE_SIZE];
+        let iovs = [
+            IoReadVec {
+                iov_base: MutPtr::from_usize(first.as_mut_ptr().expose_provenance()),
+                iov_len: first.len(),
+            },
+            IoReadVec {
+                iov_base: MutPtr::from_usize(second.as_mut_ptr().expose_provenance()),
+                iov_len: second.len(),
+            },
+        ];
+
+        assert_eq!(
+            task.sys_readv(read_fd, ConstPtr::from_ptr(iovs.as_ptr()), iovs.len()),
+            Ok(input.len())
+        );
+        assert_eq!(first, vec![0x5a; PAGE_SIZE]);
+        assert_eq!(second, vec![0x5a; PAGE_SIZE]);
     }
 
     #[test]

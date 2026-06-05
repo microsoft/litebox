@@ -19,6 +19,7 @@ use litebox_common_linux::{FileDescriptorFlags, InodeType, errno::Errno};
 
 use crate::{GlobalState, Platform, ShimFS};
 
+pub(crate) const LINUX_PIPE_BUF: usize = 4096;
 const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
 
 /// Status flags for Linux pipe file descriptions.
@@ -56,8 +57,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         let (writer, reader) = self.pipes.create_pipe(
             DEFAULT_PIPE_BUF_SIZE,
             pipe_flags,
-            // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
-            NonZero::new(4096),
+            // See `man 7 pipe` for `PIPE_BUF`.
+            NonZero::new(LINUX_PIPE_BUF),
         );
 
         let initial_status = OFlags::from(pipe_flags);

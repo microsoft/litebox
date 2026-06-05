@@ -30,9 +30,10 @@ impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 
 /// Backing counter for a Linux eventfd file description.
 ///
-/// Blocking eventfd still uses the shim-local implementation because the
-/// local-core event counter does not support blocking operations yet. Once it
-/// does, this split can collapse to the local-core counter.
+/// New blocking eventfds still use the shim-local implementation to keep the
+/// initial broker-backed scope narrow. Broker-backed nonblocking eventfds can
+/// still be switched to blocking mode because the local-core counter can block
+/// through LiteBox-local readiness notifications.
 enum EventFileCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     ShimLocal {
         count: Mutex<Platform, u64>,

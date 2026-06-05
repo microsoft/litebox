@@ -2,10 +2,12 @@
 // Licensed under the MIT license.
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -100,6 +102,19 @@ static int expect_eagain_write(int fd, uint64_t value) {
     return errno == EAGAIN ? 0 : 2;
 }
 
+static int clear_nonblock_with_fcntl(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) {
+        return 1;
+    }
+    return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0 ? 0 : 2;
+}
+
+static int clear_nonblock_with_ioctl(int fd) {
+    int nonblock = 0;
+    return ioctl(fd, FIONBIO, &nonblock) == 0 ? 0 : 1;
+}
+
 int main(void) {
     int fd = eventfd(0, EFD_NONBLOCK);
     if (fd < 0) {
@@ -171,6 +186,30 @@ int main(void) {
         return 31;
     }
     close(fd);
+
+    int fcntl_toggle_fd = eventfd(1, EFD_NONBLOCK);
+    if (fcntl_toggle_fd < 0) {
+        return 32;
+    }
+    if (clear_nonblock_with_fcntl(fcntl_toggle_fd) != 0) {
+        return 33;
+    }
+    if (read_value(fcntl_toggle_fd, 1) != 0) {
+        return 34;
+    }
+    close(fcntl_toggle_fd);
+
+    int ioctl_toggle_fd = eventfd(1, EFD_NONBLOCK);
+    if (ioctl_toggle_fd < 0) {
+        return 35;
+    }
+    if (clear_nonblock_with_ioctl(ioctl_toggle_fd) != 0) {
+        return 36;
+    }
+    if (read_value(ioctl_toggle_fd, 1) != 0) {
+        return 37;
+    }
+    close(ioctl_toggle_fd);
 
     int semaphore_fd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
     if (semaphore_fd < 0) {

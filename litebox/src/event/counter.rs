@@ -73,7 +73,7 @@ where
             broker,
             handle: response.handle,
             pollee: Pollee::new(),
-            blocking_operations_supported: false,
+            blocking_operations_supported: true,
         })
     }
 
@@ -85,32 +85,36 @@ where
     /// Reads the event counter.
     pub fn read(
         &self,
-        _cx: &WaitContext<'_, Platform>,
-        _nonblock: bool,
+        cx: &WaitContext<'_, Platform>,
+        nonblock: bool,
         mode: EventCounterReadMode,
     ) -> Result<u64, TryOpError<EventCounterError>> {
-        let response = map_broker_object_result(self.consume(mode))?;
-        if response.readiness.write_ready {
-            self.pollee.notify_observers(Events::OUT);
-        }
-        Ok(response.value)
+        self.pollee.wait(cx, nonblock, Events::IN, || {
+            let response = map_broker_object_result(self.consume(mode))?;
+            if response.readiness.write_ready {
+                self.pollee.notify_observers(Events::OUT);
+            }
+            Ok(response.value)
+        })
     }
 
     /// Writes readiness credits to the event counter.
     pub fn write(
         &self,
-        _cx: &WaitContext<'_, Platform>,
-        _nonblock: bool,
+        cx: &WaitContext<'_, Platform>,
+        nonblock: bool,
         value: u64,
     ) -> Result<usize, TryOpError<EventCounterError>> {
         if value == u64::MAX {
             return Err(TryOpError::Other(EventCounterError::InvalidInput));
         }
-        let readiness = map_broker_object_result(self.add(value))?;
-        if value != 0 && readiness.read_ready {
-            self.pollee.notify_observers(Events::IN);
-        }
-        Ok(core::mem::size_of::<u64>())
+        self.pollee.wait(cx, nonblock, Events::OUT, || {
+            let readiness = map_broker_object_result(self.add(value))?;
+            if value != 0 && readiness.read_ready {
+                self.pollee.notify_observers(Events::IN);
+            }
+            Ok(core::mem::size_of::<u64>())
+        })
     }
 
     fn consume(
