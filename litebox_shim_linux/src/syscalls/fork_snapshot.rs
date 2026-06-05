@@ -2301,8 +2301,8 @@ mod tests {
                 }
             }
         }
-        // 8 kinds × 3 dir options × 3 endpoint options × 8 ids = 576 cases.
-        assert_eq!(total_cases, 576, "expected to cover 576 combinations");
+        // 9 kinds × 3 dir options × 3 endpoint options × 8 ids = 648 cases.
+        assert_eq!(total_cases, 648, "expected to cover 648 combinations");
     }
 
     #[test]
