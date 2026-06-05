@@ -2382,6 +2382,15 @@ pub(crate) struct HostTtyAlias;
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
 
 /// Marks a pipe created directly by the guest via pipe/pipe2.
+///
+/// Read site: the `BrokerPipe` `F_SETFL` arm in `syscalls/file.rs` checks this
+/// marker before arming `PipeNonblockEagainOnce` after a delayed-fork resume.
+/// That one-shot EAGAIN preserves native fork timing for a parent that creates a
+/// pipe, forks, then sets the read end nonblocking while the child may have
+/// already written and closed during delayed-fork migration. Broker pipes
+/// installed from outside the guest (`install_broker_bridge_fd`, SCM_RIGHTS, or
+/// D5 virtual-pipe restore) intentionally do not get that timing shim: their
+/// ready/EOF state is externally owned and must be reported as-is.
 #[derive(Clone, Copy)]
 pub(crate) struct GuestCreatedPipe;
 
@@ -5743,6 +5752,64 @@ mod tests {
 
         assert!(Arc::ptr_eq(&cow, &lower));
         assert_eq!(found_perms, perms);
+    }
+
+    fn pipe_eagain_once_enabled(task: &Task<DefaultFS>, fd: i32) -> bool {
+        let files = task.files.borrow();
+        let typed = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(
+                usize::try_from(fd).expect("raw fd should be non-negative"),
+            )
+            .expect("raw fd should be a broker pipe");
+        task.global
+            .litebox
+            .descriptor_table()
+            .with_metadata(&typed, |PipeNonblockEagainOnce(enabled)| *enabled)
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn guest_created_pipe_marker_limits_delayed_fork_setfl_eagain_shim() {
+        install_test_broker_providers();
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let (read_fd, _write_fd) = task
+            .sys_pipe2(OFlags::empty())
+            .expect("pipe2 should succeed");
+        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
+        task.recent_delayed_fork_resume.set(true);
+        task.sys_fcntl(read_fd, FcntlArg::SETFL(OFlags::NONBLOCK))
+            .expect("F_SETFL on guest-created broker pipe should succeed");
+        assert!(
+            pipe_eagain_once_enabled(&task, read_fd),
+            "guest-created read pipe should arm the delayed-fork EAGAIN shim"
+        );
+
+        let entrypoints = test_entrypoints();
+        let inherited_fd = 93i32;
+        entrypoints
+            .install_broker_bridge_fd(
+                usize::try_from(inherited_fd).expect("inherited fd should fit usize"),
+                syscalls::fork_snapshot::BrokerHandleKind::Pipe,
+                1234,
+                Some(BrokerPipeEnd::Read),
+                None,
+                None,
+                None,
+                OFlags::empty(),
+            )
+            .expect("installing inherited broker pipe should succeed");
+        entrypoints.task.recent_delayed_fork_resume.set(true);
+        entrypoints
+            .task
+            .sys_fcntl(inherited_fd, FcntlArg::SETFL(OFlags::NONBLOCK))
+            .expect("F_SETFL on inherited broker pipe should succeed");
+        assert!(
+            !pipe_eagain_once_enabled(&entrypoints.task, inherited_fd),
+            "inherited broker pipe must report externally-owned readiness as-is"
+        );
     }
 
     #[test]
