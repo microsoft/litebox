@@ -2619,8 +2619,6 @@ def _drive_ref(
         cargo_args.append(f"--fill={args.batch_size}")
     else:
         cargo_args.append(f"--fill={args.cycle_budget_secs}s")
-    if args.jobs:
-        env["LITEBOX_TEST_JOBS"] = str(args.jobs)
     # Communicate the tracked ref to the producer so it can record
     # something more informative than "HEAD" (the detached-state
     # sentinel) in `runs.branch`. See dashboard_store::insert_run_row.
@@ -2964,8 +2962,6 @@ def _drive_agent_worktree(
         "--test", "integration", "--",
         f"--fill={fill_budget}s",
     ]
-    if args.jobs:
-        env["LITEBOX_TEST_JOBS"] = str(args.jobs)
     deadline = time.monotonic() + (fill_budget * 2 + 600)
     proc = subprocess.Popen(
         cargo_args, cwd=str(shadow), env=env,
@@ -3504,11 +3500,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="override: hard count of trials per cycle. Mutually "
              "exclusive with the time-budget mode; sets "
              "`--fill=N` instead. Default None (use --cycle-budget-secs).",
-    )
-    p_auto.add_argument(
-        "--jobs", type=int, default=None,
-        help="set LITEBOX_TEST_JOBS for cargo (default: use whatever "
-             "the harness derives from num_cpus).",
     )
     p_auto.add_argument("--once", action="store_true",
                         help="run one pass and exit")

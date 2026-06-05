@@ -671,19 +671,20 @@ static DRAIN_BACKLOG: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new(
 static JOBS_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static GLOBAL_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// Dockerd serializes container creation past ~20 concurrent
+/// creates regardless of available CPU. This is the per-process
+/// safety cap on top of the global lease-divided budget.
+const DOCKERD_SAFE_MAX: usize = 20;
+
 fn default_jobs() -> usize {
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8);
-    // Roughly num_cpus / 1.5, clamped to a reasonable range.
-    //
-    // The upper bound was 10 historically — phase-2 measurement on
-    // a smaller dev box found that past jobs=10 dockerd serialized
-    // container creation badly enough that further parallelism gave
-    // diminishing returns. Bumped to 20 in 2026-05 for 32+ core
-    // boxes where the dockerd serialization point is higher. Tune
-    // via LITEBOX_TEST_JOBS env var on a case-by-case basis.
-    ((cpus as f32 / 1.5) as usize).clamp(2, 20)
+    // Derive from the host-wide budget so we have one source of
+    // truth for "how much parallelism is healthy on this box," with
+    // `DOCKERD_SAFE_MAX` clamping the per-process upper bound. The
+    // historical `clamp(nproc/1.5, 2, 20)` formula was numerically
+    // ~identical to `(nproc*2/3).min(20)` (= global_cap.min(20)),
+    // so this preserves behavior while removing the duplicate
+    // nproc-based formula.
+    global_cap().min(DOCKERD_SAFE_MAX).max(2)
 }
 
 fn current_jobs_cap() -> usize {
