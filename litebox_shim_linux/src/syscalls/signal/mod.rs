@@ -1718,16 +1718,14 @@ impl<FS: ShimFS> Task<FS> {
         self.send_shared_signal(signal, siginfo_kill(signal));
     }
 
-    /// Returns whether the given signal is currently being ignored.
-    fn is_signal_ignored(&self, signal: Signal) -> bool {
-        // SIGKILL and SIGSTOP can never be ignored.
+    /// Returns whether the given signal is currently blocked or ignored.
+    pub(crate) fn is_signal_blocked_or_ignored(&self, signal: Signal) -> bool {
+        // SIGKILL and SIGSTOP can never be blocked or ignored.
         if signal == Signal::SIGKILL || signal == Signal::SIGSTOP {
             return false;
         }
-        // Blocked signals are never ignored, since the signal handler may
-        // change by the time it is unblocked.
         if self.signals.blocked.get().contains(signal) {
-            return false;
+            return true;
         }
         let handlers = self.signals.handlers.borrow();
         let inner = handlers.inner.lock();
@@ -1736,6 +1734,16 @@ impl<FS: ShimFS> Task<FS> {
             SIG_DFL => matches!(signal.default_disposition(), SignalDisposition::Ignore),
             _ => false,
         }
+    }
+
+    /// Returns whether the given signal is currently being ignored.
+    fn is_signal_ignored(&self, signal: Signal) -> bool {
+        // Blocked signals are never ignored, since the signal handler may
+        // change by the time it is unblocked.
+        if self.signals.blocked.get().contains(signal) {
+            return false;
+        }
+        self.is_signal_blocked_or_ignored(signal)
     }
 
     fn try_deliver_remote_signalfd(
