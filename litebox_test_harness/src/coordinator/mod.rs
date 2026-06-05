@@ -31,6 +31,7 @@ pub(crate) mod pidfd_inherit;
 pub(crate) mod pidfd_tests;
 pub(crate) mod pipe_bridge;
 pub(crate) mod port_router;
+pub(crate) mod proc_self;
 pub(crate) mod process_exit;
 pub(crate) mod pty;
 pub(crate) mod pxeof;
@@ -1052,6 +1053,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     tcp_state::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     tcp_state::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
     special_cases::register_proc_filesystem_tests(&mut registry::Registry::new(&mut tests));
+    proc_self::register_proc_self_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_subtree_kill_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_fork_matrix(&mut registry::Registry::new(&mut tests));
     special_cases::register_unix_socket(&mut registry::Registry::new(&mut tests));
