@@ -481,6 +481,75 @@ impl LinuxUserland {
                     .unwrap(),
                 ],
             ),
+            // Broker control-channel I/O runs through a host Unix socket in the
+            // current POC. The transport refreshes read/write timeouts around
+            // each request.
+            (
+                libc::SYS_setsockopt,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            1,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::SOL_SOCKET as u64,
+                        )
+                        .unwrap(),
+                        SeccompCondition::new(
+                            2,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::SO_RCVTIMEO as u64,
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            1,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::SOL_SOCKET as u64,
+                        )
+                        .unwrap(),
+                        SeccompCondition::new(
+                            2,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::SO_SNDTIMEO as u64,
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
+            // Connected UnixStream I/O may use sendto/recvfrom rather than raw
+            // read/write. Limit these rules to connected-socket calls that do
+            // not name a peer address.
+            (
+                libc::SYS_sendto,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(4, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                            .unwrap(),
+                        SeccompCondition::new(5, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                            .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
+            (
+                libc::SYS_recvfrom,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(4, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                            .unwrap(),
+                        SeccompCondition::new(5, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                            .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
             (libc::SYS_close, vec![]),
         ];
         let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =

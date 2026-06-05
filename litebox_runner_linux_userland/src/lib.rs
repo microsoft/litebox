@@ -437,9 +437,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         net_worker.join().unwrap();
     }
     let exit_status = program.process.wait();
-    if let Some(broker_connection) = broker_connection {
-        broker_connection.shutdown();
-    }
+    drop(broker_connection);
     std::process::exit(exit_status)
 }
 

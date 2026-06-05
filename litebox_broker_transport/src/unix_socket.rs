@@ -65,11 +65,6 @@ impl UnixStreamClientControlChannel {
         }
     }
 
-    /// Clones the underlying stream so another owner can interrupt blocking I/O.
-    pub fn try_clone_stream(&self) -> io::Result<UnixStream> {
-        self.stream.try_clone()
-    }
-
     fn set_stream_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(timeout)?;
         self.stream.set_write_timeout(timeout)
