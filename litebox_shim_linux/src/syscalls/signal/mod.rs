@@ -441,7 +441,12 @@ impl PendingSignals {
         self.queue.remove(pos).unwrap()
     }
 
-    fn push(&mut self, rlimits: &super::process::ResourceLimits, signal: Signal, siginfo: Siginfo) {
+    pub(crate) fn push(
+        &mut self,
+        rlimits: &super::process::ResourceLimits,
+        signal: Signal,
+        siginfo: Siginfo,
+    ) {
         assert_eq!(signal.as_i32(), siginfo.signo);
 
         // Don't queue duplicates for standard signals.
@@ -936,7 +941,7 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         mask_ptr: crate::ConstPtr<SigSet>,
         sigsetsize: usize,
-        _ctx: &mut litebox_common_linux::ExecutionContext,
+        ctx: &mut litebox_common_linux::ExecutionContext,
     ) -> Result<usize, Errno> {
         if sigsetsize != core::mem::size_of::<SigSet>() {
             return Err(Errno::EINVAL);
@@ -960,8 +965,9 @@ impl<FS: ShimFS> Task<FS> {
         // a 10ms wait per call adds up to tens of seconds.
         self.drain_thread_signals();
         self.drain_cross_process_signals();
+        self.process_signals(ctx);
 
-        // sigsuspend always returns EINTR.
+        // sigsuspend always returns EINTR unless signal delivery terminates the task.
         Err(Errno::EINTR)
     }
 
