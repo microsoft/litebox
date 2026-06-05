@@ -3,6 +3,30 @@
 This repository is a Rust-based, security-focused sandboxing library OS. General
 contribution guidelines live in `CONTRIBUTING.md` and the per-crate docs.
 
+## Product goal map
+
+For the cross-session view of which capabilities are landed / in-flight /
+blocked relative to the two top-level product goals (interactive Copilot CLI
+TUI inside Litebox, VS Code Remote Server inside Litebox), see
+**`docs/product-goal-map.md`**. That file is the canonical product-facing
+overview; per-session `plan.md` files describe the granular "how" of each
+work stream.
+
+When **starting a new work stream**, fetch `origin/wportnoy/vscode-server-in-litebox`
+and read `docs/product-goal-map.md` to see which capability nodes are 🟡 or
+⚪ before claiming one — this avoids silent duplication across concurrent
+sessions.
+
+When **landing a work stream** via `--no-ff` merge into the amalgamation
+branch, the same merge commit updates `docs/product-goal-map.md`. Two
+kinds of update are expected: (a) **status flips** on diagram capability
+nodes (typically 🟡 → ✅) and (b) **detail-row refinements** in the
+Capability detail table (newly-discovered validating test families,
+measured numbers, edge cases, renames as understanding evolves, new rows
+for capabilities the work uncovered). Doc-only refinement merges are
+also permitted for small updates not bundled with a capability landing.
+See that file's "Maintenance" section for the full policy.
+
 ## Debugging VS Code server / Node.js / sshd failures
 
 For **any** issue surfaced by running VS Code remote server, Node.js, or sshd
