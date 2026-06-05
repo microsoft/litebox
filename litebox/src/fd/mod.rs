@@ -59,6 +59,8 @@ pub enum SubsystemKind {
     BrokerSocketPair,
     /// Broker AF_UNIX datagram socket descriptors.
     BrokerSocketDgram,
+    /// Broker AF_UNIX seqpacket socket descriptors.
+    BrokerSocketSeqPacket,
     /// Broker pty descriptors.
     BrokerPty,
     /// Signalfd descriptors.

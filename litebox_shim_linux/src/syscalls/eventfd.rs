@@ -352,6 +352,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         }
     }
 
+    pub(crate) fn pidfd_target(&self) -> Option<(litebox::process::ProcessId, Option<u32>)> {
+        // reason: non-pidfd event files intentionally share this fallback path.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match &*self.inner.lock() {
+            EventFileInner::Pidfd {
+                target_pid,
+                host_pid,
+                ..
+            } => Some((*target_pid, *host_pid)),
+            _ => None,
+        }
+    }
+
     /// Phase 2.F fork-snapshot bridge: extract or mint a broker
     /// handle so the child worker can reattach to the same shared
     /// state across the cross-binary-type fork boundary.

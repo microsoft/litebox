@@ -538,6 +538,7 @@ fn docker_run_base_args() -> Vec<String> {
     // invocations can flip runtime gates without a rebuild.
     for var in [
         "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+        "LITEBOX_EAGER_BROKER_SOCKETSEQPACKET",
         "LITEBOX_BROKER_TCP_CONN",
         "LITEBOX_BROKER_INET_RAW",
         "LITEBOX_BROKER_INET_DELAY_NS",
@@ -963,6 +964,13 @@ fn build_standard_docker_args(pass: &str, test_id: &str, bins: &BinaryPaths) -> 
         // family is meant to test.
         v.push("--security-opt".into());
         v.push("seccomp=unconfined".into());
+    }
+    if test_id.starts_with("UDS_STREAM.eager_on.") {
+        v.push("-e".into());
+        v.push("LITEBOX_EAGER_BROKER_SOCKETPAIR=1".into());
+    } else if test_id.starts_with("UDS_STREAM.eager_off.") {
+        v.push("-e".into());
+        v.push("LITEBOX_EAGER_BROKER_SOCKETPAIR=0".into());
     }
     let mounts = [
         (&bins.pie_glibc, "/opt/litebox"),
@@ -3156,6 +3164,7 @@ mod copilot {
         ];
         for var in [
             "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+            "LITEBOX_EAGER_BROKER_SOCKETSEQPACKET",
             "LITEBOX_BROKER_TCP_CONN",
             "LITEBOX_BROKER_INET_RAW",
             "LITEBOX_BROKER_INET_DELAY_NS",
@@ -4069,6 +4078,7 @@ process.exit(0);\n",
         ];
         for var in [
             "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+            "LITEBOX_EAGER_BROKER_SOCKETSEQPACKET",
             "LITEBOX_BROKER_TCP_CONN",
             "LITEBOX_PE10_DIAG",
             "LITEBOX_PE5_DIAG",

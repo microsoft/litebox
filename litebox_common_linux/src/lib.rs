@@ -33,8 +33,9 @@ pub use cwfd::{
     broker_eventfd_provider, broker_fs_provider, broker_inet_listener_provider,
     broker_inet_raw_provider, broker_inotify_provider, broker_pgrp_signal_provider,
     broker_pidfd_provider, broker_pipe_provider, broker_pty_provider, broker_signalfd_provider,
-    broker_socket_dgram_provider, broker_socketpair_provider, broker_tcp_conn_provider,
-    fd_token_protocol, fd_transfer_frame, guest_pid_provider, notification_frame,
+    broker_socket_dgram_provider, broker_socket_seqpacket_provider, broker_socketpair_provider,
+    broker_tcp_conn_provider, fd_token_protocol, fd_transfer_frame, guest_pid_provider,
+    notification_frame,
 };
 
 #[cfg(feature = "std")]
@@ -2976,6 +2977,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         pid: i32,
         flags: u32,
     },
+    PidfdSendSignal {
+        pidfd: i32,
+        sig: i32,
+        info: Option<Platform::RawConstPointer<u8>>,
+        flags: u32,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -3060,6 +3067,20 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             (@[$id:ident] [ ] [ $($ns:literal),* ] [ $($tail:tt)* ]) => {
                 SyscallRequest::$id { $($tail)* }
             };
+        }
+
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            const __NR_PIDFD_SEND_SIGNAL: usize = 424;
+
+            if syscall_number == __NR_PIDFD_SEND_SIGNAL {
+                return Ok(SyscallRequest::PidfdSendSignal {
+                    pidfd: ctx.sys_req_arg(0),
+                    sig: ctx.sys_req_arg(1),
+                    info: ctx.sys_req_ptr(2),
+                    flags: ctx.sys_req_arg(3),
+                });
+            }
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -3286,6 +3307,8 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options, rusage:* }),
             Sysno::waitid => sys_req!(Waitid { idtype, id, infop:*, options }),
+            #[cfg(target_arch = "aarch64")]
+            Sysno::pidfd_send_signal => sys_req!(PidfdSendSignal { pidfd, sig, info:*, flags }),
             Sysno::process_vm_readv => sys_req!(ProcessVmReadv {
                 pid,
                 local_iov:*,

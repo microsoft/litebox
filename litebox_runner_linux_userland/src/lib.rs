@@ -23,6 +23,7 @@ pub mod broker_pipe_provider;
 pub mod broker_pty_provider;
 pub mod broker_signalfd_provider;
 pub mod broker_socket_dgram_provider;
+pub mod broker_socket_seqpacket_provider;
 pub mod broker_socketpair_provider;
 pub mod broker_tcp_conn_provider;
 pub mod guest_pid_provider;
@@ -324,6 +325,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         "pipe" => BrokerHandleKind::Pipe,
         "unix_socket" => BrokerHandleKind::UnixSocket,
         "socket_dgram" | "dgram" => BrokerHandleKind::SocketDgram,
+        "socket_seqpacket" | "seqpacket" => BrokerHandleKind::SocketSeqPacket,
         "tcp_conn" => BrokerHandleKind::TcpConn,
         "inet_listener" => BrokerHandleKind::InetListener,
         "inet_dgram" => BrokerHandleKind::InetDgram,
@@ -371,6 +373,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         | (BrokerHandleKind::Pidfd, Some(extra))
         | (BrokerHandleKind::Signalfd, Some(extra))
         | (BrokerHandleKind::SocketDgram, Some(extra))
+        | (BrokerHandleKind::SocketSeqPacket, Some(extra))
         | (BrokerHandleKind::TcpConn, Some(extra))
         | (BrokerHandleKind::InetListener, Some(extra))
         | (BrokerHandleKind::InetDgram, Some(extra)) => {
@@ -383,6 +386,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         | (BrokerHandleKind::Pidfd, None)
         | (BrokerHandleKind::Signalfd, None)
         | (BrokerHandleKind::SocketDgram, None)
+        | (BrokerHandleKind::SocketSeqPacket, None)
         | (BrokerHandleKind::TcpConn, None)
         | (BrokerHandleKind::InetListener, None)
         | (BrokerHandleKind::InetDgram, None) => (None, None, None),
@@ -853,12 +857,25 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::syscalls::set_eager_broker_socket_dgram_enabled(enabled);
     }
 
-    // Phase F: equivalent runtime gate for eager broker-backed
-    // socketpair. `LITEBOX_EAGER_BROKER_SOCKETPAIR=1` (or 'true' /
-    // 'yes', case-insensitive) flips `sys_socketpair` to allocate
-    // broker-backed AF_UNIX SOCK_STREAM pairs instead of in-shim
-    // UnixSocket. Required for cross-worker fork+exec inheritance
-    // of socketpair fds.
+    // Phase U.3: eager broker-backed AF_UNIX SOCK_SEQPACKET is default-on
+    // for consistency with U.1 (SOCK_STREAM). Required for the
+    // UDS_SEQPACKET.* harness suite to exercise BrokerSocketSeqPacket
+    // rather than falling back to in-shim UnixSocket (which lacks
+    // message-boundary semantics).
+    //
+    // Set `LITEBOX_EAGER_BROKER_SOCKETSEQPACKET=0` to opt out.
+    {
+        let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETSEQPACKET")
+            .ok()
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(true);
+        litebox_shim_linux::syscalls::set_eager_broker_socket_seqpacket_enabled(enabled);
+    }
+
+    // Phase U.1: eager broker-backed AF_UNIX SOCK_STREAM socketpair
+    // is default-on so fork+exec inheritance uses broker-held pairs
+    // instead of in-shim UnixSocket state. Required for cross-worker
+    // fork+exec inheritance of socketpair fds.
     //
     // **F.8 flip retry (2026-05-17, PE.10 done)**: setting default
     // ON. The earlier F.8 attempt regressed PB.c2p 20/20 → 11/20.
@@ -3249,6 +3266,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     );
     litebox_shim_linux::syscalls::set_broker_socket_dgram_provider(socket_dgram_provider)
         .map_err(|_| anyhow!("socket dgram provider already set"))?;
+
+    let socket_seqpacket_provider = Arc::new(
+        crate::broker_socket_seqpacket_provider::RunnerBrokerSocketSeqPacketProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_socket_seqpacket_provider(socket_seqpacket_provider)
+        .map_err(|_| anyhow!("socket seqpacket provider already set"))?;
 
     litebox_shim_linux::syscalls::set_broker_inet_dgram_enabled(broker_inet_udp_enabled());
 

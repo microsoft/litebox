@@ -809,6 +809,15 @@ pub fn build_audit_event(
             ev.int(u64::from(*flags));
             ev
         }
+        SyscallRequest::PidfdSendSignal {
+            pidfd, sig, flags, ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*pidfd as u64);
+            ev.int(*sig as u64);
+            ev.int(u64::from(*flags));
+            ev
+        }
         SyscallRequest::Setpgid { pid, pgid } => {
             let mut ev = AuditEvent::new(name);
             ev.int(*pid as u64);
@@ -1436,6 +1445,7 @@ pub fn syscall_canonical_name(
         S::Waitid { .. } => "waitid",
         S::ProcessVmReadv { .. } => "process_vm_readv",
         S::PidfdOpen { .. } => "pidfd_open",
+        S::PidfdSendSignal { .. } => "pidfd_send_signal",
         // `SyscallRequest` is `#[non_exhaustive]`, so the compiler requires a
         // wildcard. Any newly added variant should add an explicit arm above
         // before the variant is wired through the dispatcher; until then it

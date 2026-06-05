@@ -30,6 +30,7 @@ pub mod broker_pipe_provider;
 pub mod broker_pty_provider;
 pub mod broker_signalfd_provider;
 pub mod broker_socket_dgram_provider;
+pub mod broker_socket_seqpacket_provider;
 pub mod broker_socketpair_provider;
 pub mod broker_subscribable;
 pub mod broker_tcp_conn_provider;

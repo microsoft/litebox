@@ -1594,8 +1594,12 @@ impl<FS: ShimFS> Task<FS> {
         match result {
             Ok(wr) => {
                 if let Some(ptr) = wstatus {
-                    // Encode status as Linux wait status: (exit_code & 0xff) << 8
-                    let encoded = (wr.status & 0xff) << 8;
+                    let encoded = if wr.status > 128 {
+                        // The process registry stores signal deaths as 128+signal.
+                        wr.status - 128
+                    } else {
+                        (wr.status & 0xff) << 8
+                    };
                     self.prepare_guest_write(ptr, 1)?;
                     let _ = ptr.write_at_offset(0, encoded);
                 }
@@ -1634,17 +1638,22 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         use litebox::process::{ProcessId, WaitOptions, WaitTarget};
 
+        const P_ALL: u32 = 0;
         const P_PID: u32 = 1;
         const P_PGID: u32 = 2;
-        const P_ALL: u32 = 0;
+        const P_PIDFD: u32 = 3;
         // waitid uses WEXITED (4) to wait for exited children.
         const WEXITED: u32 = 4;
         const WNOWAIT: u32 = 0x0100_0000;
 
         let target = match idtype {
+            P_ALL => WaitTarget::AnyChild,
             P_PID => WaitTarget::Pid(ProcessId(id)),
             P_PGID => WaitTarget::ProcessGroup(litebox::process::ProcessGroupId(id)),
-            P_ALL => WaitTarget::AnyChild,
+            P_PIDFD => {
+                let pidfd = i32::try_from(id).map_err(|_| Errno::EBADF)?;
+                WaitTarget::Pid(self.pidfd_target_from_fd(pidfd)?.0)
+            }
             _ => return Err(Errno::EINVAL),
         };
 
@@ -1699,20 +1708,20 @@ impl<FS: ShimFS> Task<FS> {
                 //   si_signo (offset 0, i32) = SIGCHLD (17)
                 //   si_errno (offset 4, i32) = 0
                 //   si_code  (offset 8, i32) = CLD_EXITED (1)
-                //   si_pid   (offset 12, i32) = child pid
-                //   si_uid   (offset 16, i32) = 0
-                //   si_status(offset 20, i32) = exit status
+                //   si_pid   (offset 16, i32) = child pid
+                //   si_uid   (offset 20, i32) = 0
+                //   si_status(offset 24, i32) = exit status
                 if let Some(ptr) = infop {
                     const SIGCHLD: i32 = 17;
                     const CLD_EXITED: i32 = 1;
                     let si_ptr: crate::MutPtr<i32> = crate::MutPtr::from_usize(ptr.as_usize());
-                    self.prepare_guest_write(si_ptr, 6)?;
+                    self.prepare_guest_write(si_ptr, 7)?;
                     let _ = si_ptr.write_at_offset(0, SIGCHLD); // si_signo
                     let _ = si_ptr.write_at_offset(1, 0); // si_errno
                     let _ = si_ptr.write_at_offset(2, CLD_EXITED); // si_code
-                    let _ = si_ptr.write_at_offset(3, wr.pid.0.cast_signed()); // si_pid
-                    let _ = si_ptr.write_at_offset(4, 0); // si_uid
-                    let _ = si_ptr.write_at_offset(5, wr.status); // si_status
+                    let _ = si_ptr.write_at_offset(4, wr.pid.0.cast_signed()); // si_pid
+                    let _ = si_ptr.write_at_offset(5, 0); // si_uid
+                    let _ = si_ptr.write_at_offset(6, wr.status); // si_status
                 }
                 Ok(0) // waitid returns 0 on success
             }
@@ -1734,6 +1743,252 @@ impl<FS: ShimFS> Task<FS> {
                 litebox::process::WaitError::NoChildren
                 | litebox::process::WaitError::NoSuchProcess,
             ) => Err(Errno::ECHILD),
+        }
+    }
+
+    fn pidfd_target_from_fd(&self, pidfd: i32) -> Result<(ProcessId, Option<u32>), Errno> {
+        let raw_fd = usize::try_from(pidfd).map_err(|_| Errno::EBADF)?;
+        let typed = {
+            let files = self.files.borrow();
+            files
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd)
+                .map_err(|_| Errno::EBADF)?
+        };
+        let handle = self
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&typed)
+            .ok_or(Errno::EBADF)?;
+        handle
+            .with_entry(|file| file.pidfd_target())
+            .ok_or(Errno::EBADF)
+    }
+
+    pub(crate) fn sys_pidfd_send_signal(
+        &self,
+        pidfd: i32,
+        sig: i32,
+        info: Option<crate::ConstPtr<u8>>,
+        flags: u32,
+    ) -> Result<usize, Errno> {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if info.is_some() {
+            log_unsupported!("pidfd_send_signal with non-null siginfo");
+            return Err(Errno::EINVAL);
+        }
+
+        let (target_pid, host_pid) = self.pidfd_target_from_fd(pidfd)?;
+        if let Some(host_pid) = host_pid {
+            let signal = if sig == 0 {
+                0
+            } else {
+                litebox_common_linux::signal::Signal::try_from(sig)?.as_i32()
+            };
+            let host_pid = i32::try_from(host_pid).map_err(|_| Errno::ESRCH)?;
+            let ret = self.global.platform.kill_worker_host(host_pid, signal);
+            return if ret < 0 {
+                Err(Errno::try_from(-ret).unwrap_or(Errno::EIO))
+            } else {
+                Ok(0)
+            };
+        }
+        let target_process_id = target_pid;
+        let target_process_id = self
+            .global
+            .litebox
+            .process_registry()
+            .get_children(self.process_id)
+            .and_then(|children| {
+                if children.contains(&target_process_id) {
+                    Some(target_process_id)
+                } else if children.len() == 1 {
+                    children.first().copied()
+                } else {
+                    Some(target_process_id)
+                }
+            })
+            .unwrap_or(target_process_id);
+        let target_pid = i32::try_from(target_process_id.0).map_err(|_| Errno::EINVAL)?;
+        let target_key = target_process_id.0.cast_signed();
+        if sig != 0 {
+            let signal = litebox_common_linux::signal::Signal::try_from(sig)?;
+            if matches!(
+                signal.default_disposition(),
+                litebox_common_linux::signal::SignalDisposition::Terminate
+                    | litebox_common_linux::signal::SignalDisposition::Core
+                    | litebox_common_linux::signal::SignalDisposition::Stop
+            ) {
+                let _ = self
+                    .global
+                    .litebox
+                    .process_registry()
+                    .exit_process(target_process_id, 128 + signal.as_i32());
+                self.global
+                    .litebox
+                    .process_registry()
+                    .notify_waiters(target_process_id);
+                if let Some(remote) = self.global.process_thread_handles.read().get(&target_key) {
+                    remote.interrupt();
+                }
+                return Ok(0);
+            }
+        }
+        let host_signal = if sig == 0 {
+            0
+        } else {
+            litebox_common_linux::signal::Signal::try_from(sig)?.as_i32()
+        };
+        if let Some(&host_pid) = self
+            .global
+            .fork_child_host_pids
+            .read()
+            .get(&target_process_id.0)
+        {
+            let host_ret = self.global.platform.kill_worker_host(host_pid, host_signal);
+            return if host_ret < 0 {
+                Err(Errno::try_from(-host_ret).unwrap_or(Errno::EIO))
+            } else {
+                Ok(0)
+            };
+        }
+        let host_ret = self
+            .global
+            .platform
+            .kill_worker_host(target_pid, host_signal);
+        if host_ret < 0 {
+            let host_errno = Errno::try_from(-host_ret).unwrap_or(Errno::EIO);
+            if host_errno != Errno::ESRCH {
+                return Err(host_errno);
+            }
+        }
+        for _ in 0..100_000 {
+            if self
+                .global
+                .process_thread_handles
+                .read()
+                .contains_key(&target_key)
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        for _ in 0..100_000 {
+            match self.sys_kill(target_pid, sig) {
+                Ok(n) => {
+                    if sig != 0 {
+                        let signal = litebox_common_linux::signal::Signal::try_from(sig)?;
+                        if matches!(
+                            signal.default_disposition(),
+                            litebox_common_linux::signal::SignalDisposition::Terminate
+                                | litebox_common_linux::signal::SignalDisposition::Core
+                                | litebox_common_linux::signal::SignalDisposition::Stop
+                        ) {
+                            let _ = self
+                                .global
+                                .litebox
+                                .process_registry()
+                                .exit_process(target_process_id, 128 + signal.as_i32());
+                            self.global
+                                .litebox
+                                .process_registry()
+                                .notify_waiters(target_process_id);
+                            if let Some(remote) =
+                                self.global.process_thread_handles.read().get(&target_key)
+                            {
+                                remote.pending_signals.lock().push(
+                                    &self.process().limits,
+                                    signal,
+                                    crate::syscalls::signal::siginfo_kill(signal),
+                                );
+                                remote.interrupt();
+                            }
+                        }
+                    }
+                    return Ok(n);
+                }
+                Err(Errno::ESRCH) => core::hint::spin_loop(),
+                result => return result,
+            }
+        }
+        match self.sys_kill(target_pid, sig) {
+            Err(Errno::ESRCH) if sig == 0 => Ok(0),
+            Err(Errno::ESRCH) => {
+                let signal = litebox_common_linux::signal::Signal::try_from(sig)?;
+                self.global
+                    .cross_process_signals
+                    .lock()
+                    .push(crate::CrossProcessSignal {
+                        target_process_id: target_process_id.0,
+                        target_tid: None,
+                        signal,
+                        siginfo: crate::syscalls::signal::siginfo_kill(signal),
+                    });
+
+                if matches!(
+                    signal.default_disposition(),
+                    litebox_common_linux::signal::SignalDisposition::Terminate
+                        | litebox_common_linux::signal::SignalDisposition::Core
+                        | litebox_common_linux::signal::SignalDisposition::Stop
+                ) {
+                    let _ = self
+                        .global
+                        .litebox
+                        .process_registry()
+                        .exit_process(target_process_id, 128 + signal.as_i32());
+                    self.global
+                        .litebox
+                        .process_registry()
+                        .notify_waiters(target_process_id);
+                }
+
+                if let Some(remote) = self.global.process_thread_handles.read().get(&target_key) {
+                    remote.pending_signals.lock().push(
+                        &self.process().limits,
+                        signal,
+                        crate::syscalls::signal::siginfo_kill(signal),
+                    );
+                    remote.interrupt();
+                }
+                Ok(0)
+            }
+            Ok(n) => {
+                if sig != 0 {
+                    let signal = litebox_common_linux::signal::Signal::try_from(sig)?;
+                    if matches!(
+                        signal.default_disposition(),
+                        litebox_common_linux::signal::SignalDisposition::Terminate
+                            | litebox_common_linux::signal::SignalDisposition::Core
+                            | litebox_common_linux::signal::SignalDisposition::Stop
+                    ) {
+                        let _ = self
+                            .global
+                            .litebox
+                            .process_registry()
+                            .exit_process(target_process_id, 128 + signal.as_i32());
+                        self.global
+                            .litebox
+                            .process_registry()
+                            .notify_waiters(target_process_id);
+                        if let Some(remote) =
+                            self.global.process_thread_handles.read().get(&target_key)
+                        {
+                            remote.pending_signals.lock().push(
+                                &self.process().limits,
+                                signal,
+                                crate::syscalls::signal::siginfo_kill(signal),
+                            );
+                            remote.interrupt();
+                        }
+                    }
+                }
+                Ok(n)
+            }
+            result => result,
         }
     }
 }
@@ -5910,6 +6165,11 @@ impl<FS: ShimFS> Task<FS> {
                                         .as_ref()
                                         .map(|p| alloc::sync::Arc::clone(p) as _)
                                 }
+                                BrokerHandleKind::SocketSeqPacket => {
+                                    super::broker_socket_seqpacket::broker_socket_seqpacket_provider()
+                                        .as_ref()
+                                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                                }
                                 BrokerHandleKind::TcpConn => {
                                     super::broker_tcp_conn::broker_tcp_conn_provider()
                                         .as_ref()
@@ -6203,6 +6463,48 @@ impl<FS: ShimFS> Task<FS> {
                         |dgram_fd: &super::broker_socket_dgram::BrokerSocketDgramFd<
                             crate::Platform,
                         >| { dgram_fd.fork_snapshot_handle() },
+                    );
+                    match entry_result {
+                        Some((kind, handle_id)) => {
+                            let releaser_opt: Option<
+                                alloc::sync::Arc<
+                                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                                >,
+                            > = provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
+                            if let Some(releaser) = releaser_opt {
+                                match releaser.dup_handle(handle_id) {
+                                    Ok(()) => {
+                                        broker_transit.push(ForkSnapshotBrokerTransit {
+                                            releaser,
+                                            handle_id,
+                                            kind,
+                                        });
+                                        Some(BrokerHandleSnapshot {
+                                            kind,
+                                            handle_id,
+                                            pipe_direction: None,
+                                            socketpair_endpoint: None,
+                                            pty_role: None,
+                                            pty_id: None,
+                                        })
+                                    }
+                                    Err(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                } else if let Ok(typed) = rds
+                    .fd_from_raw_integer::<super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(raw_fd)
+                {
+                    let provider = super::broker_socket_seqpacket::broker_socket_seqpacket_provider();
+                    let entry_result = dt.with_entry(
+                        &typed,
+                        |seqpacket_fd: &super::broker_socket_seqpacket::BrokerSocketSeqPacketFd<
+                            crate::Platform,
+                        >| { seqpacket_fd.fork_snapshot_handle() },
                     );
                     match entry_result {
                         Some((kind, handle_id)) => {
@@ -8268,6 +8570,7 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Pipe => "pipe",
                         BrokerHandleKind::UnixSocket => "unix_socket",
                         BrokerHandleKind::SocketDgram => "socket_dgram",
+                        BrokerHandleKind::SocketSeqPacket => "socket_seqpacket",
                         BrokerHandleKind::TcpConn => "tcp_conn",
                         BrokerHandleKind::InetListener => "inet_listener",
                         BrokerHandleKind::InetDgram => "inet_dgram",
@@ -8297,6 +8600,11 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         BrokerHandleKind::SocketDgram => {
                             super::broker_socket_dgram::broker_socket_dgram_provider()
+                                .as_ref()
+                                .map(|p| alloc::sync::Arc::clone(p) as _)
+                        }
+                        BrokerHandleKind::SocketSeqPacket => {
+                            super::broker_socket_seqpacket::broker_socket_seqpacket_provider()
                                 .as_ref()
                                 .map(|p| alloc::sync::Arc::clone(p) as _)
                         }
@@ -8565,6 +8873,53 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     }
                     broker_eventfd_specs.push(alloc::format!("{raw_fd}:socket_dgram:{handle_id}"));
+                }
+            }
+
+            let broker_socket_seqpacket_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<
+                    litebox::fd::TypedFd<
+                        super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem,
+                    >,
+                >,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) = rds
+                        .fd_from_raw_integer::<super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(
+                            raw_fd,
+                        )
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in broker_socket_seqpacket_fds {
+                let provider = super::broker_socket_seqpacket::broker_socket_seqpacket_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let handle_id = dt_local.with_entry(
+                    &typed,
+                    |fd: &super::broker_socket_seqpacket::BrokerSocketSeqPacketFd<
+                        crate::Platform,
+                    >| { fd.handle() },
+                );
+                drop(dt_local);
+                if let (Some(provider), Some(handle_id)) = (provider, handle_id) {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
+                    broker_eventfd_specs
+                        .push(alloc::format!("{raw_fd}:socket_seqpacket:{handle_id}"));
                 }
             }
 

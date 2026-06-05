@@ -200,6 +200,16 @@ pub enum Opcode {
     InetTcpConnGetPeerName = 0x38,
     CreatePty = 0x60,
     OpenPtySlave = 0x65,
+    CreateSocketSeqPacket = 0x66,
+    SocketSeqPacketBind = 0x67,
+    SocketSeqPacketListen = 0x68,
+    SocketSeqPacketAccept = 0x69,
+    SocketSeqPacketConnect = 0x6A,
+    SocketSeqPacketSend = 0x6B,
+    SocketSeqPacketRecv = 0x6C,
+    SocketSeqPacketShutdown = 0x6D,
+    SocketSeqPacketGetSockName = 0x6E,
+    SocketSeqPacketGetPeerName = 0x6F,
     PtyRead = 0x61,
     PtyWrite = 0x62,
     SubscribePty = 0x63,
@@ -322,6 +332,16 @@ pub enum Opcode {
     InetTcpConnGetPeerNameResponse = 0xB8,
     CreatePtyResponse = 0xE0,
     OpenPtySlaveResponse = 0xE5,
+    CreateSocketSeqPacketResponse = 0xE6,
+    SocketSeqPacketBindResponse = 0xE7,
+    SocketSeqPacketListenResponse = 0xE8,
+    SocketSeqPacketAcceptResponse = 0xE9,
+    SocketSeqPacketConnectResponse = 0xEA,
+    SocketSeqPacketSendResponse = 0xEB,
+    SocketSeqPacketRecvResponse = 0xEC,
+    SocketSeqPacketShutdownResponse = 0xED,
+    SocketSeqPacketGetSockNameResponse = 0xEE,
+    SocketSeqPacketGetPeerNameResponse = 0xEF,
     PtyReadResponse = 0xE1,
     PtyWriteResponse = 0xE2,
     SubscribePtyResponse = 0xE3,
@@ -527,6 +547,16 @@ impl Opcode {
             Opcode::InetTcpConnGetPeerName => Some(Opcode::InetTcpConnGetPeerNameResponse),
             Opcode::CreatePty => Some(Opcode::CreatePtyResponse),
             Opcode::OpenPtySlave => Some(Opcode::OpenPtySlaveResponse),
+            Opcode::CreateSocketSeqPacket => Some(Opcode::CreateSocketSeqPacketResponse),
+            Opcode::SocketSeqPacketBind => Some(Opcode::SocketSeqPacketBindResponse),
+            Opcode::SocketSeqPacketListen => Some(Opcode::SocketSeqPacketListenResponse),
+            Opcode::SocketSeqPacketAccept => Some(Opcode::SocketSeqPacketAcceptResponse),
+            Opcode::SocketSeqPacketConnect => Some(Opcode::SocketSeqPacketConnectResponse),
+            Opcode::SocketSeqPacketSend => Some(Opcode::SocketSeqPacketSendResponse),
+            Opcode::SocketSeqPacketRecv => Some(Opcode::SocketSeqPacketRecvResponse),
+            Opcode::SocketSeqPacketShutdown => Some(Opcode::SocketSeqPacketShutdownResponse),
+            Opcode::SocketSeqPacketGetSockName => Some(Opcode::SocketSeqPacketGetSockNameResponse),
+            Opcode::SocketSeqPacketGetPeerName => Some(Opcode::SocketSeqPacketGetPeerNameResponse),
             Opcode::PtyRead => Some(Opcode::PtyReadResponse),
             Opcode::PtyWrite => Some(Opcode::PtyWriteResponse),
             Opcode::SubscribePty => Some(Opcode::SubscribePtyResponse),
@@ -620,6 +650,16 @@ impl Opcode {
                 | Opcode::InetTcpConnGetPeerName
                 | Opcode::CreatePty
                 | Opcode::OpenPtySlave
+                | Opcode::CreateSocketSeqPacket
+                | Opcode::SocketSeqPacketBind
+                | Opcode::SocketSeqPacketListen
+                | Opcode::SocketSeqPacketAccept
+                | Opcode::SocketSeqPacketConnect
+                | Opcode::SocketSeqPacketSend
+                | Opcode::SocketSeqPacketRecv
+                | Opcode::SocketSeqPacketShutdown
+                | Opcode::SocketSeqPacketGetSockName
+                | Opcode::SocketSeqPacketGetPeerName
                 | Opcode::PtyRead
                 | Opcode::PtyWrite
                 | Opcode::SubscribePty
@@ -734,6 +774,16 @@ impl TryFrom<u8> for Opcode {
             0x38 => Ok(Opcode::InetTcpConnGetPeerName),
             0x60 => Ok(Opcode::CreatePty),
             0x65 => Ok(Opcode::OpenPtySlave),
+            0x66 => Ok(Opcode::CreateSocketSeqPacket),
+            0x67 => Ok(Opcode::SocketSeqPacketBind),
+            0x68 => Ok(Opcode::SocketSeqPacketListen),
+            0x69 => Ok(Opcode::SocketSeqPacketAccept),
+            0x6A => Ok(Opcode::SocketSeqPacketConnect),
+            0x6B => Ok(Opcode::SocketSeqPacketSend),
+            0x6C => Ok(Opcode::SocketSeqPacketRecv),
+            0x6D => Ok(Opcode::SocketSeqPacketShutdown),
+            0x6E => Ok(Opcode::SocketSeqPacketGetSockName),
+            0x6F => Ok(Opcode::SocketSeqPacketGetPeerName),
             0x61 => Ok(Opcode::PtyRead),
             0x62 => Ok(Opcode::PtyWrite),
             0x63 => Ok(Opcode::SubscribePty),
@@ -825,6 +875,16 @@ impl TryFrom<u8> for Opcode {
             0xB8 => Ok(Opcode::InetTcpConnGetPeerNameResponse),
             0xE0 => Ok(Opcode::CreatePtyResponse),
             0xE5 => Ok(Opcode::OpenPtySlaveResponse),
+            0xE6 => Ok(Opcode::CreateSocketSeqPacketResponse),
+            0xE7 => Ok(Opcode::SocketSeqPacketBindResponse),
+            0xE8 => Ok(Opcode::SocketSeqPacketListenResponse),
+            0xE9 => Ok(Opcode::SocketSeqPacketAcceptResponse),
+            0xEA => Ok(Opcode::SocketSeqPacketConnectResponse),
+            0xEB => Ok(Opcode::SocketSeqPacketSendResponse),
+            0xEC => Ok(Opcode::SocketSeqPacketRecvResponse),
+            0xED => Ok(Opcode::SocketSeqPacketShutdownResponse),
+            0xEE => Ok(Opcode::SocketSeqPacketGetSockNameResponse),
+            0xEF => Ok(Opcode::SocketSeqPacketGetPeerNameResponse),
             0xE1 => Ok(Opcode::PtyReadResponse),
             0xE2 => Ok(Opcode::PtyWriteResponse),
             0xE3 => Ok(Opcode::SubscribePtyResponse),
@@ -6328,4 +6388,391 @@ mod tests {
         bad[0] = 4; // claims 4 bytes payload, but body has only 8 bytes (header) and 0 payload
         assert!(parse_read_socketpair_response_body(&bad).is_err());
     }
+}
+
+// SocketSeqPacket (AF_UNIX SOCK_SEQPACKET) wire format.
+// Ancillary data and abstract namespace addresses are intentionally deferred.
+pub const SOCKET_SEQPACKET_RECV_FLAG_TRUNC: u32 = INET_DGRAM_RECV_FLAG_TRUNC;
+
+fn put_u64(body: &mut Vec<u8>, value: u64) {
+    body.extend_from_slice(&value.to_le_bytes());
+}
+
+fn build_handle_request(opcode: Opcode, handle_id: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    put_u64(&mut body, handle_id);
+    OwnedFrame {
+        opcode,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+fn build_handle_response(opcode: Opcode, handle_id: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8);
+    put_u64(&mut body, handle_id);
+    OwnedFrame {
+        opcode,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+
+pub fn build_create_socket_seqpacket_request() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreateSocketSeqPacket,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+pub fn build_create_socket_seqpacket_pair_request() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreateSocketSeqPacket,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::from([1]),
+    }
+}
+pub fn parse_create_socket_seqpacket_body(body: &[u8]) -> Result<bool, ProtocolError> {
+    match body {
+        [] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreateSocketSeqPacket,
+            want: 0,
+            got: body.len(),
+        }),
+    }
+}
+pub fn build_create_socket_seqpacket_response_ok(handle_id: u64) -> OwnedFrame {
+    build_handle_response(Opcode::CreateSocketSeqPacketResponse, handle_id)
+}
+pub fn parse_create_socket_seqpacket_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::CreateSocketSeqPacketResponse)
+}
+pub fn build_create_socket_seqpacket_pair_response_ok(a: u64, b: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    put_u64(&mut body, a);
+    put_u64(&mut body, b);
+    OwnedFrame {
+        opcode: Opcode::CreateSocketSeqPacketResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_create_socket_seqpacket_pair_response_ok(
+    body: &[u8],
+) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreateSocketSeqPacketResponse,
+            want: 16,
+            got: body.len(),
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u64::from_le_bytes(body[8..16].try_into().unwrap()),
+    ))
+}
+
+fn build_seqpacket_addr_request(opcode: Opcode, handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + addr.len());
+    put_u64(&mut body, handle_id);
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+fn parse_seqpacket_addr_body(body: &[u8], opcode: Opcode) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    let handle_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut off = 8;
+    let addr = parse_len_bytes(body, &mut off, opcode)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok((handle_id, addr))
+}
+pub fn build_socket_seqpacket_bind_request(handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    build_seqpacket_addr_request(Opcode::SocketSeqPacketBind, handle_id, addr)
+}
+pub fn parse_socket_seqpacket_bind_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    parse_seqpacket_addr_body(body, Opcode::SocketSeqPacketBind)
+}
+pub fn build_socket_seqpacket_bind_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::new();
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketBindResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_socket_seqpacket_bind_response_ok(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr = parse_len_bytes(body, &mut off, Opcode::SocketSeqPacketBindResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketBindResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(addr)
+}
+pub fn build_socket_seqpacket_listen_request(handle_id: u64, backlog: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12);
+    put_u64(&mut body, handle_id);
+    body.extend_from_slice(&backlog.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketListen,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_socket_seqpacket_listen_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketListen,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
+}
+pub fn build_socket_seqpacket_listen_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketListenResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+pub fn build_socket_seqpacket_accept_request(handle_id: u64) -> OwnedFrame {
+    build_handle_request(Opcode::SocketSeqPacketAccept, handle_id)
+}
+pub fn parse_socket_seqpacket_accept_body(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::SocketSeqPacketAccept)
+}
+pub fn build_socket_seqpacket_accept_response_ok(handle_id: u64) -> OwnedFrame {
+    build_handle_response(Opcode::SocketSeqPacketAcceptResponse, handle_id)
+}
+pub fn parse_socket_seqpacket_accept_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::SocketSeqPacketAcceptResponse)
+}
+pub fn build_socket_seqpacket_connect_request(handle_id: u64, addr: &[u8]) -> OwnedFrame {
+    build_seqpacket_addr_request(Opcode::SocketSeqPacketConnect, handle_id, addr)
+}
+pub fn parse_socket_seqpacket_connect_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    parse_seqpacket_addr_body(body, Opcode::SocketSeqPacketConnect)
+}
+pub fn build_socket_seqpacket_connect_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketConnectResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+pub fn build_socket_seqpacket_send_request(handle_id: u64, payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12 + payload.len());
+    put_u64(&mut body, handle_id);
+    push_len_bytes(&mut body, payload);
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketSend,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_socket_seqpacket_send_body(body: &[u8]) -> Result<(u64, Vec<u8>), ProtocolError> {
+    if body.len() < 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketSend,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    let handle_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let mut off = 8;
+    let payload = parse_len_bytes(body, &mut off, Opcode::SocketSeqPacketSend)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketSend,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok((handle_id, payload))
+}
+pub fn build_socket_seqpacket_send_response_ok(written: u64) -> OwnedFrame {
+    build_handle_response(Opcode::SocketSeqPacketSendResponse, written)
+}
+pub fn parse_socket_seqpacket_send_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::SocketSeqPacketSendResponse)
+}
+pub fn build_socket_seqpacket_recv_request(handle_id: u64, max_len: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(12);
+    put_u64(&mut body, handle_id);
+    body.extend_from_slice(&max_len.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketRecv,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_socket_seqpacket_recv_body(body: &[u8]) -> Result<(u64, u32), ProtocolError> {
+    if body.len() != 12 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketRecv,
+            want: 12,
+            got: body.len(),
+        });
+    }
+    Ok((
+        u64::from_le_bytes(body[0..8].try_into().unwrap()),
+        u32::from_le_bytes(body[8..12].try_into().unwrap()),
+    ))
+}
+pub fn build_socket_seqpacket_recv_response_ok(payload: &[u8], flags: u32) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + payload.len());
+    body.extend_from_slice(&flags.to_le_bytes());
+    push_len_bytes(&mut body, payload);
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketRecvResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_socket_seqpacket_recv_response_ok(
+    body: &[u8],
+) -> Result<(Vec<u8>, u32), ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketRecvResponse,
+            want: 8,
+            got: body.len(),
+        });
+    }
+    let flags = u32::from_le_bytes(body[0..4].try_into().unwrap());
+    let mut off = 4;
+    let payload = parse_len_bytes(body, &mut off, Opcode::SocketSeqPacketRecvResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketRecvResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok((payload, flags))
+}
+pub fn build_socket_seqpacket_shutdown_request(handle_id: u64, how: u8) -> OwnedFrame {
+    let mut body = Vec::with_capacity(9);
+    put_u64(&mut body, handle_id);
+    body.push(how);
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketShutdown,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_socket_seqpacket_shutdown_body(body: &[u8]) -> Result<(u64, u8), ProtocolError> {
+    if body.len() != 9 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketShutdown,
+            want: 9,
+            got: body.len(),
+        });
+    }
+    Ok((u64::from_le_bytes(body[0..8].try_into().unwrap()), body[8]))
+}
+pub fn build_socket_seqpacket_shutdown_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketShutdownResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body: Vec::new(),
+    }
+}
+pub fn build_socket_seqpacket_getsockname_request(handle_id: u64) -> OwnedFrame {
+    build_handle_request(Opcode::SocketSeqPacketGetSockName, handle_id)
+}
+pub fn build_socket_seqpacket_getpeername_request(handle_id: u64) -> OwnedFrame {
+    build_handle_request(Opcode::SocketSeqPacketGetPeerName, handle_id)
+}
+pub fn build_socket_seqpacket_getsockname_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::new();
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketGetSockNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn build_socket_seqpacket_getpeername_response_ok(addr: &[u8]) -> OwnedFrame {
+    let mut body = Vec::new();
+    push_len_bytes(&mut body, addr);
+    OwnedFrame {
+        opcode: Opcode::SocketSeqPacketGetPeerNameResponse,
+        status: StatusCode::Ok,
+        caller_pid: 0,
+        body,
+    }
+}
+pub fn parse_socket_seqpacket_getsockname_response_ok(
+    body: &[u8],
+) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr =
+        parse_len_bytes(body, &mut off, Opcode::SocketSeqPacketGetSockNameResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketGetSockNameResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(addr)
+}
+pub fn parse_socket_seqpacket_getpeername_response_ok(
+    body: &[u8],
+) -> Result<Vec<u8>, ProtocolError> {
+    let mut off = 0;
+    let addr =
+        parse_len_bytes(body, &mut off, Opcode::SocketSeqPacketGetPeerNameResponse)?.to_vec();
+    if off != body.len() {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::SocketSeqPacketGetPeerNameResponse,
+            want: off,
+            got: body.len(),
+        });
+    }
+    Ok(addr)
 }

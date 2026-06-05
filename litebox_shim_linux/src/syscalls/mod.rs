@@ -11,6 +11,7 @@ pub(crate) mod broker_inet_raw;
 pub(crate) mod broker_pipe;
 pub(crate) mod broker_pty;
 pub(crate) mod broker_socket_dgram;
+pub(crate) mod broker_socket_seqpacket;
 pub(crate) mod broker_socketpair;
 pub(crate) mod broker_tcp_conn;
 pub(crate) mod epoll;
@@ -34,6 +35,10 @@ pub use broker_pty::{broker_pty_provider, set_broker_pty_provider};
 pub use broker_socket_dgram::{
     broker_socket_dgram_provider, eager_broker_socket_dgram_enabled,
     set_broker_socket_dgram_provider, set_eager_broker_socket_dgram_enabled,
+};
+pub use broker_socket_seqpacket::{
+    broker_socket_seqpacket_provider, eager_broker_socket_seqpacket_enabled,
+    set_broker_socket_seqpacket_provider, set_eager_broker_socket_seqpacket_enabled,
 };
 pub use broker_socketpair::{
     broker_socketpair_provider, eager_broker_socketpair_enabled, set_broker_socketpair_provider,

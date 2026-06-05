@@ -84,6 +84,12 @@ impl<FS: ShimFS> Task<FS> {
                 TypeId::of::<super::broker_socket_dgram::BrokerSocketDgramFd<Platform>>(),
                 core::any::type_name::<super::broker_socket_dgram::BrokerSocketDgramFd<Platform>>(),
             ),
+            litebox::fd::SubsystemKind::BrokerSocketSeqPacket => (
+                TypeId::of::<super::broker_socket_seqpacket::BrokerSocketSeqPacketFd<Platform>>(),
+                core::any::type_name::<
+                    super::broker_socket_seqpacket::BrokerSocketSeqPacketFd<Platform>,
+                >(),
+            ),
             litebox::fd::SubsystemKind::BrokerPty => (
                 TypeId::of::<super::broker_pty::BrokerPtyFd<Platform>>(),
                 core::any::type_name::<super::broker_pty::BrokerPtyFd<Platform>>(),
@@ -1883,6 +1889,33 @@ impl<FS: ShimFS> Task<FS> {
         Ok(())
     }
 
+    fn broker_pty_background_read_sigttin(
+        &self,
+        entry: &super::broker_pty::BrokerPtyFd<Platform>,
+    ) -> Result<(), Errno> {
+        if entry.is_master()
+            || *self.process_state.borrow().controlling_pty.lock() != Some(entry.pty_id())
+        {
+            return Ok(());
+        }
+        let caller_pgid = i32::try_from(self.sys_getpgid(0)?).map_err(|_| Errno::EINVAL)?;
+        let payload = entry.ioctl(PtyIoctlOp::Tiocgpgrp, &[])?;
+        let Some(bytes) = payload.get(..4) else {
+            return Err(Errno::EIO);
+        };
+        let foreground_pgrp = i32::from_le_bytes(bytes.try_into().map_err(|_| Errno::EIO)?);
+        if foreground_pgrp == caller_pgid
+            || self.is_signal_blocked_or_ignored(litebox_common_linux::signal::Signal::SIGTTIN)
+        {
+            return Ok(());
+        }
+        self.global.deliver_signal_to_process_group(
+            caller_pgid,
+            litebox_common_linux::signal::Signal::SIGTTIN,
+        )?;
+        Err(Errno::EINTR)
+    }
+
     /// Handle syscall `read`
     ///
     /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
@@ -1942,7 +1975,10 @@ impl<FS: ShimFS> Task<FS> {
                 .entry_handle(&ptyfd)
                 .ok_or(Errno::EBADF)?;
             loop {
-                match handle.with_entry(|entry| entry.read(&self.wait_cx(), buf)) {
+                match handle.with_entry(|entry| {
+                    self.broker_pty_background_read_sigttin(entry)?;
+                    entry.read(&self.wait_cx(), buf)
+                }) {
                     Err(Errno::EINTR) if self.pending_signals_all_ignored() => {
                         self.drain_ignored_pending();
                     }
@@ -2202,7 +2238,10 @@ impl<FS: ShimFS> Task<FS> {
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
-                    handle.with_entry(|entry| entry.read(&self.wait_cx(), &mut buf.borrow_mut()))
+                    handle.with_entry(|entry| {
+                        self.broker_pty_background_read_sigttin(entry)?;
+                        entry.read(&self.wait_cx(), &mut buf.borrow_mut())
+                    })
                 }
                 crate::RawFdRef::Signalfd(fd) => {
                     let handle = self
@@ -3465,7 +3504,17 @@ impl<FS: ShimFS> Task<FS> {
             return Ok(());
         }
         if let Ok(fd) = rds
-            .fd_consume_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(raw_fd)
+            .fd_consume_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(
+                raw_fd,
+            )
+        {
+            drop(rds);
+            let entry = self.global.litebox.descriptor_table_mut().remove(&fd);
+            drop(entry);
+            return Ok(());
+        }
+        if let Ok(fd) = rds
+            .fd_consume_raw_integer::<super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(raw_fd)
         {
             drop(rds);
             let entry = self.global.litebox.descriptor_table_mut().remove(&fd);

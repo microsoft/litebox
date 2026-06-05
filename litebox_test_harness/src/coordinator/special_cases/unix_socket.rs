@@ -65,6 +65,10 @@ pub fn run(sub: &str) -> i32 {
         // cross-binary-type) child that waitid's on the inherited
         // pidfd. Companion to p1-pidfd-inherit TODO.
         "pidfd-inherit-fork" => test_pidfd_inherit_fork(),
+        "seqpacket-socketpair-boundary" => test_seqpacket_socketpair_boundary(),
+        "seqpacket-msg-trunc" => test_seqpacket_msg_trunc(),
+        "seqpacket-shutdown" => test_seqpacket_shutdown(),
+        "seqpacket-fork-restore-inherit" => test_seqpacket_fork_restore_inherit(),
         "pidfd-inherit-child" => pidfd_inherit_child(),
         other => {
             eprintln!("unknown: {other}");
@@ -1668,6 +1672,64 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         ("US5.abstract_unix", "abstract", "US5_ABSTRACT_OK"),
         ("VS1.socket_race", "race", "VS1_RACE_OK"),
     ];
+    let seqpacket_tests: &[(&str, &str, &str)] = &[
+        (
+            "socketpair_boundary",
+            "seqpacket-socketpair-boundary",
+            "UDS_SEQPACKET_SOCKETPAIR_BOUNDARY_OK",
+        ),
+        (
+            "multiple_messages",
+            "seqpacket-socketpair-boundary",
+            "UDS_SEQPACKET_SOCKETPAIR_BOUNDARY_OK",
+        ),
+        (
+            "msg_trunc",
+            "seqpacket-msg-trunc",
+            "UDS_SEQPACKET_MSG_TRUNC_OK",
+        ),
+        (
+            "shutdown",
+            "seqpacket-shutdown",
+            "UDS_SEQPACKET_SHUTDOWN_OK",
+        ),
+        (
+            "fork_restore_inherit",
+            "seqpacket-fork-restore-inherit",
+            "UDS_SEQPACKET_FORK_RESTORE_INHERIT_OK",
+        ),
+    ];
+    for &(name, sub, expected) in seqpacket_tests {
+        let id = format!("UDS_SEQPACKET.{name}");
+        let sub = sub.to_string();
+        let expected = expected.to_string();
+        reg.test("xworker", "unix_socket", id)
+            .timeout(60)
+            .build(move |cx| {
+                let a = cx.require(AgentName::Dpg1);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(crate::BinaryType::PieGlibc, &self_exe);
+                        let resp = run
+                            .send_named_typed(
+                                &a,
+                                &EXEC_BIN,
+                                ExecBinArgs {
+                                    argv: vec![target, "unix-socket-test".into(), sub.clone()],
+                                    timeout_ms: Some(10 * 1000),
+                                    stdin: None,
+                                    env: vec![],
+                                },
+                            )
+                            .await;
+                        let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains(&*expected));
+                        crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                })
+            });
+    }
+
     for &(name, sub, expected) in simple_tests {
         for &bt in crate::BinaryType::ALL {
             let id = format!("{name}.{}", bt.label());
@@ -2078,5 +2140,162 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                 }
             );
         }
+    }
+}
+
+fn test_seqpacket_socketpair_boundary() -> i32 {
+    let mut sv = [-1; 2];
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        println!("UDS_SEQPACKET_SOCKETPAIR_FAIL:errno={}", errno());
+        return 1;
+    }
+    let a = sv[0];
+    let b = sv[1];
+    let _ = unsafe { libc::send(a, b"abc".as_ptr().cast(), 3, 0) };
+    let _ = unsafe { libc::send(a, b"defgh".as_ptr().cast(), 5, 0) };
+    let mut buf = [0u8; 16];
+    let n1 = unsafe { libc::recv(b, buf.as_mut_ptr().cast(), buf.len(), 0) };
+    let first = buf[..n1.max(0) as usize].to_vec();
+    let n2 = unsafe { libc::recv(b, buf.as_mut_ptr().cast(), buf.len(), 0) };
+    let second = buf[..n2.max(0) as usize].to_vec();
+    unsafe {
+        libc::close(a);
+        libc::close(b);
+    }
+    if n1 == 3 && first == b"abc" && n2 == 5 && second == b"defgh" {
+        println!("UDS_SEQPACKET_SOCKETPAIR_BOUNDARY_OK");
+        0
+    } else {
+        println!("UDS_SEQPACKET_SOCKETPAIR_BOUNDARY_FAIL:n1={n1},n2={n2}");
+        1
+    }
+}
+
+fn test_seqpacket_msg_trunc() -> i32 {
+    let mut sv = [-1; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } != 0
+    {
+        println!("UDS_SEQPACKET_TRUNC_SOCKETPAIR_FAIL:{}", errno());
+        return 1;
+    }
+    let a = sv[0];
+    let b = sv[1];
+    let _ = unsafe { libc::send(a, b"abcdef".as_ptr().cast(), 6, 0) };
+    let mut buf = [0u8; 3];
+    let n = unsafe { libc::recv(b, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_TRUNC) };
+    unsafe {
+        libc::close(a);
+        libc::close(b);
+    }
+    if n == 6 && &buf == b"abc" {
+        println!("UDS_SEQPACKET_MSG_TRUNC_OK");
+        0
+    } else {
+        println!("UDS_SEQPACKET_MSG_TRUNC_FAIL:n={n},buf={buf:?}");
+        1
+    }
+}
+
+fn test_seqpacket_shutdown() -> i32 {
+    let mut sv = [-1; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } != 0
+    {
+        println!("UDS_SEQPACKET_SHUTDOWN_SOCKETPAIR_FAIL:{}", errno());
+        return 1;
+    }
+    let a = sv[0];
+    let b = sv[1];
+    let rc = unsafe { libc::shutdown(a, libc::SHUT_WR) };
+    let n = unsafe { libc::send(a, b"x".as_ptr().cast(), 1, libc::MSG_NOSIGNAL) };
+    let e = errno();
+    unsafe {
+        libc::close(a);
+        libc::close(b);
+    }
+    if rc == 0 && n < 0 && e == libc::EPIPE {
+        println!("UDS_SEQPACKET_SHUTDOWN_OK");
+        0
+    } else {
+        println!("UDS_SEQPACKET_SHUTDOWN_FAIL:rc={rc},n={n},errno={e}");
+        1
+    }
+}
+
+fn test_seqpacket_fork_restore_inherit() -> i32 {
+    let mut sv = [-1; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } != 0
+    {
+        println!("UDS_SEQPACKET_FORK_SOCKETPAIR_FAIL:{}", errno());
+        return 1;
+    }
+    let a = sv[0];
+    let b = sv[1];
+    let n = unsafe { libc::send(a, b"ping".as_ptr().cast(), 4, 0) };
+    let send_errno = errno();
+    if n != 4 {
+        println!("UDS_SEQPACKET_FORK_RESTORE_INHERIT_SEND_FAIL:n={n},errno={send_errno}");
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+        return 1;
+    }
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("UDS_SEQPACKET_FORK_FAIL:{}", errno());
+        return 1;
+    }
+    if pid == 0 {
+        let mut buf = [0u8; 16];
+        let n = unsafe { libc::recv(b, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        unsafe {
+            libc::_exit(if n == 4 && &buf[..4] == b"ping" { 0 } else { 2 });
+        }
+    }
+    let mut status = 0;
+    unsafe {
+        libc::waitpid(pid, &raw mut status, 0);
+        libc::close(a);
+    }
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        99
+    };
+    if n == 4 && code == 0 {
+        println!("UDS_SEQPACKET_FORK_RESTORE_INHERIT_OK");
+        0
+    } else {
+        println!("UDS_SEQPACKET_FORK_RESTORE_INHERIT_FAIL:n={n},errno={send_errno},code={code}");
+        1
     }
 }
