@@ -3906,6 +3906,66 @@ console.log(\"END_TOTAL=\", JSON.stringify(total));\n\
 process.exit(0);\n",
                 )],
             },
+            // Goal A validation session 7c1fc95d (2026-06-05) found
+            // copilot::tui.* trials hang at startup under litebox:
+            // the transcript shows zero output and the kernel still
+            // line-discipline-echoes /exit (proving copilot never
+            // reached setRawMode). The existing dropbear_bash probes
+            // cover node *as a child* of bash; these new probes cover
+            // node *as the foreground controlling-tty process*, which
+            // is the position copilot occupies via `sh -c "... exec
+            // copilot --allow-all"`. They escalate one capability per
+            // step so a single FAIL pinpoints the missing primitive.
+            Scenario {
+                // Minimal node startup as the controlling-tty
+                // process. If FAIL: node itself hangs at startup
+                // when foreground on a litebox-served PTY (covers
+                // module load, libuv init, signalfd setup,
+                // io_uring probe). dropbear_bash.node_spawn_bash_*
+                // pass because there node is a child of bash, not
+                // the controlling-tty leader — different fd shape
+                // and different ctty relationship.
+                id: "node_pty_stdout_write",
+                command: "node -e \"process.stdout.write('NODE_ALIVE\\n')\"",
+                expected: &["NODE_ALIVE"],
+                fixtures: &[],
+            },
+            Scenario {
+                // Node + isatty on stdout. If FAIL but
+                // node_pty_stdout_write PASSES: bug is in
+                // isatty(fd)/TIOCGWINSZ probe on the PTY slave.
+                id: "node_pty_istty",
+                command: "node -e \"process.stdout.write('ISTTY='+process.stdout.isTTY+'\\n')\"",
+                expected: &["ISTTY=true"],
+                fixtures: &[],
+            },
+            Scenario {
+                // Node + tty.setRawMode (= tcsetattr with TCSANOW
+                // disabling ICANON+ECHO+ISIG). If FAIL but
+                // node_pty_istty PASSES: setRawMode/tcsetattr on the
+                // litebox PTY blocks or errors. This is the exact
+                // primitive copilot needs in early TUI init.
+                id: "node_pty_setrawmode",
+                command: "node -e \"process.stdout.write('BEFORE_RAW\\n');process.stdin.setRawMode(true);process.stdout.write('AFTER_RAW\\n');process.exit(0)\"",
+                expected: &["BEFORE_RAW", "AFTER_RAW"],
+                fixtures: &[],
+            },
+            Scenario {
+                // copilot --version run as the controlling-tty
+                // process. Just prints the version string and exits.
+                // No TUI render loop, no auth, no prompt. If FAIL but
+                // node_pty_setrawmode PASSES: copilot's own startup
+                // (module load / capability detection) hangs even in
+                // the trivial --version code path; the bug is inside
+                // the copilot bundle, not in node-under-PTY itself.
+                // If FAIL identically to node_pty_setrawmode: copilot
+                // hits the same primitive node hits — fix one fixes
+                // both.
+                id: "copilot_version_via_pty",
+                command: "copilot --version",
+                expected: &["GitHub Copilot CLI"],
+                fixtures: &[],
+            },
         ]
     }
 
