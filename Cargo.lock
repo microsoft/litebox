@@ -1460,6 +1460,7 @@ dependencies = [
  "buddy_system_allocator",
  "either",
  "hashbrown",
+ "litebox_broker_local",
  "litebox_broker_protocol",
  "litebox_util_log",
  "rangemap",
@@ -1512,6 +1513,7 @@ dependencies = [
 name = "litebox_broker_userland"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "litebox_broker_core",
  "litebox_broker_host",
  "litebox_broker_local",

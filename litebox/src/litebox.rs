@@ -5,8 +5,11 @@
 
 use alloc::sync::Arc;
 
+use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::LocalControlChannel;
+
 use crate::{
-    broker::{BrokerControl, BrokerState},
+    broker::{self, BrokerControl, BrokerState},
     fd::Descriptors,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -40,6 +43,20 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         broker_control: Arc<dyn BrokerControl>,
     ) -> Self {
         Self::new_inner(platform, Some(broker_control))
+    }
+
+    /// Create a new [`LiteBox`] instance with a negotiated broker-local control adapter installed.
+    pub fn new_with_broker_local<T>(
+        platform: &'static Platform,
+        broker_local: BrokerLocal<T>,
+    ) -> Self
+    where
+        T: LocalControlChannel + Send + 'static,
+    {
+        Self::new_inner(
+            platform,
+            Some(broker::control_from_local::<Platform, T>(broker_local)),
+        )
     }
 
     fn new_inner(

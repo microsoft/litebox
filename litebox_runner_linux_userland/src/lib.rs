@@ -214,11 +214,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     litebox_platform_multiplex::set_platform(platform);
     let broker_connection = broker::connect(cli_args.broker_socket.as_deref())?;
 
-    let shim_builder = if let Some(broker_connection) = &broker_connection {
+    let shim_builder = if let Some(broker_connection) = broker_connection {
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(
-            litebox::LiteBox::new_with_broker_control(
+            litebox::LiteBox::new_with_broker_local(
                 litebox_platform_multiplex::platform(),
-                broker_connection.control(),
+                broker_connection.into_local(),
             ),
         )
     } else {
@@ -436,9 +436,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
-    let exit_status = program.process.wait();
-    drop(broker_connection);
-    std::process::exit(exit_status)
+    std::process::exit(program.process.wait())
 }
 
 /// Pin the current thread to a specific CPU core

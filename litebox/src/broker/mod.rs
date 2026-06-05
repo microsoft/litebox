@@ -3,9 +3,10 @@
 
 use alloc::sync::Arc;
 
-use litebox_broker_protocol::{CoreRequest, CoreResponse};
+use litebox_broker_local::{BrokerLocal, BrokerLocalError};
+use litebox_broker_protocol::{CoreRequest, CoreResponse, LocalControlChannel};
 
-use crate::sync::RawSyncPrimitivesProvider;
+use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 pub(crate) mod error;
 pub use error::BrokerControlError;
@@ -21,6 +22,53 @@ pub trait BrokerControl: Send + Sync {
         &self,
         request: CoreRequest,
     ) -> core::result::Result<CoreResponse, BrokerControlError>;
+}
+
+struct BrokerLocalControl<Platform: RawSyncPrimitivesProvider, T> {
+    local: Mutex<Platform, BrokerLocal<T>>,
+}
+
+impl<Platform, T> BrokerLocalControl<Platform, T>
+where
+    Platform: RawSyncPrimitivesProvider,
+{
+    const fn new(local: BrokerLocal<T>) -> Self {
+        Self {
+            local: Mutex::new(local),
+        }
+    }
+}
+
+impl<Platform, T> BrokerControl for BrokerLocalControl<Platform, T>
+where
+    Platform: RawSyncPrimitivesProvider,
+    T: LocalControlChannel + Send,
+{
+    fn request(
+        &self,
+        request: CoreRequest,
+    ) -> core::result::Result<CoreResponse, BrokerControlError> {
+        self.local
+            .lock()
+            .active_core_request(request)
+            .map_err(broker_control_error)
+    }
+}
+
+fn broker_control_error<E>(error: BrokerLocalError<E>) -> BrokerControlError {
+    match error {
+        BrokerLocalError::Broker(error) => BrokerControlError::Broker(error),
+        BrokerLocalError::UnexpectedResponse(_) => BrokerControlError::UnexpectedResponse,
+        _ => BrokerControlError::Transport,
+    }
+}
+
+pub(crate) fn control_from_local<Platform, T>(local: BrokerLocal<T>) -> Arc<dyn BrokerControl>
+where
+    Platform: RawSyncPrimitivesProvider,
+    T: LocalControlChannel + Send + 'static,
+{
+    Arc::new(BrokerLocalControl::<Platform, T>::new(local))
 }
 
 pub(crate) struct BrokerState<Platform: RawSyncPrimitivesProvider> {
