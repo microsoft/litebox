@@ -70,6 +70,9 @@ struct ExtraPipeMultiArgs {
 struct ExtraSocketpairArgs {}
 
 #[derive(Serialize, Deserialize)]
+struct ExtraStdioSocketpairArgs {}
+
+#[derive(Serialize, Deserialize)]
 struct EpollPipeBridgeArgs {
     delay_ms: u64,
 }
@@ -83,6 +86,8 @@ const EXTRA_PIPE_MULTI: HandlerToken<ExtraPipeMultiArgs, PipeBridgeOut> =
     HandlerToken::new("pipe_bridge.extra_pipe_multi");
 const EXTRA_SOCKETPAIR: HandlerToken<ExtraSocketpairArgs, PipeBridgeOut> =
     HandlerToken::new("pipe_bridge.extra_socketpair");
+const EXTRA_STDIO_SOCKETPAIR: HandlerToken<ExtraStdioSocketpairArgs, PipeBridgeOut> =
+    HandlerToken::new("pipe_bridge.extra_stdio_socketpair");
 /// Phase F bisection: socketpair + fork + parent↔child data, NO exec.
 /// Isolates "fork-snapshot restore of broker socketpair endpoint" from
 /// "exec_on_remote_host bridge-spec install of broker socketpair endpoint".
@@ -250,6 +255,16 @@ async fn handle_extra_socketpair(
     let exe = current_exe_string()?;
     Ok(PipeBridgeOut {
         detail: test_extra_socketpair(&exe),
+    })
+}
+
+async fn handle_extra_stdio_socketpair(
+    _args: ExtraStdioSocketpairArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PipeBridgeOut, HandlerError> {
+    let exe = current_exe_string()?;
+    Ok(PipeBridgeOut {
+        detail: test_extra_stdio_socketpair(&exe),
     })
 }
 
@@ -585,6 +600,94 @@ fn test_extra_socketpair(exe: &str) -> String {
         format!("PB_SP_FAIL:no_data,exit={exit_code}")
     } else {
         format!("PB_SP_FAIL:exit={exit_code},data={text}")
+    }
+}
+
+fn test_extra_stdio_socketpair(exe: &str) -> String {
+    let mut stdin_pair = [0i32; 2];
+    let mut stdout_pair = [0i32; 2];
+    let mut stderr_pair = [0i32; 2];
+    for (name, pair) in [
+        ("stdin", &mut stdin_pair),
+        ("stdout", &mut stdout_pair),
+        ("stderr", &mut stderr_pair),
+    ] {
+        // Safety: pair points to two valid i32 slots for socketpair to fill.
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) } != 0
+        {
+            return format!("PB_STDIO_SP_SOCKETPAIR_FAIL:{name}:{}", errno());
+        }
+    }
+
+    // Safety: this test process is single-threaded for this fork/exec probe.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return format!("PB_STDIO_SP_FORK_FAIL:{}", errno());
+    }
+
+    if pid == 0 {
+        // Safety: close parent ends, dup child ends onto stdio, then exec.
+        unsafe {
+            libc::close(stdin_pair[0]);
+            libc::close(stdout_pair[0]);
+            libc::close(stderr_pair[0]);
+            if libc::dup2(stdin_pair[1], 0) < 0
+                || libc::dup2(stdout_pair[1], 1) < 0
+                || libc::dup2(stderr_pair[1], 2) < 0
+            {
+                libc::_exit(126);
+            }
+            for fd in [stdin_pair[1], stdout_pair[1], stderr_pair[1]] {
+                if fd > 2 {
+                    libc::close(fd);
+                }
+            }
+        }
+        do_execv(exe, &["pipe-test", "stdio-echo"]);
+    }
+
+    // Safety: parent owns the fd 0 ends after fork.
+    unsafe {
+        libc::close(stdin_pair[1]);
+        libc::close(stdout_pair[1]);
+        libc::close(stderr_pair[1]);
+    }
+
+    let input = b"PB_STDIO_SOCKETPAIR_IN";
+    // Safety: stdin_pair[0] is live and input is initialized.
+    let written = unsafe {
+        libc::write(
+            stdin_pair[0],
+            input.as_ptr().cast::<libc::c_void>(),
+            input.len(),
+        )
+    };
+    // Safety: shutting down writes on the parent end lets the child see EOF after input.
+    unsafe { libc::shutdown(stdin_pair[0], libc::SHUT_WR) };
+    if written != input.len() as isize {
+        return format!("PB_STDIO_SP_WRITE_FAIL:n={written},errno={}", errno());
+    }
+
+    let (stdout_data, _) = read_with_poll_timeout(stdout_pair[0], 15);
+    let (stderr_data, _) = read_with_poll_timeout(stderr_pair[0], 15);
+    // Safety: parent is done with its socket ends.
+    unsafe {
+        libc::close(stdin_pair[0]);
+        libc::close(stdout_pair[0]);
+        libc::close(stderr_pair[0]);
+    }
+    let exit_code = wait_child(pid);
+    let stdout_text = String::from_utf8_lossy(&stdout_data);
+    let stderr_text = String::from_utf8_lossy(&stderr_data);
+    if exit_code == 0
+        && stdout_text.contains("PB_STDIO_SOCKETPAIR_OUT:PB_STDIO_SOCKETPAIR_IN")
+        && stderr_text.contains("PB_STDIO_SOCKETPAIR_ERR")
+    {
+        "PB_STDIO_SOCKETPAIR_OK".to_string()
+    } else {
+        format!(
+            "PB_STDIO_SOCKETPAIR_FAIL:exit={exit_code},stdout={stdout_text:?},stderr={stderr_text:?}"
+        )
     }
 }
 
@@ -981,6 +1084,7 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
     register_handler!(BASH, handle_bash);
     register_handler!(EXTRA_PIPE_MULTI, handle_extra_pipe_multi);
     register_handler!(EXTRA_SOCKETPAIR, handle_extra_socketpair);
+    register_handler!(EXTRA_STDIO_SOCKETPAIR, handle_extra_stdio_socketpair);
     register_handler!(FORK_NO_EXEC_SOCKETPAIR, handle_fork_no_exec_socketpair);
     register_handler!(EPOLL_PIPE_BRIDGE, handle_epoll_pipe_bridge);
     register_handler!(EPOLL_SOCKETPAIR_BRIDGE, handle_epoll_socketpair_bridge);
@@ -998,6 +1102,33 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
         let out = test_bidirectional();
         println!("{out}");
         if out == "US3_BIDI_OK" { 0 } else { 1 }
+    });
+
+    reg.test(
+        "xworker",
+        "pipe_bridge",
+        "PB.stdio_sp_lockstep.nonpie-glibc.dpg1",
+    )
+    .timeout(90)
+    .build(|cx| {
+        let leaf = cx.declare_ephemeral(
+            AgentName::Dpg1,
+            "Pb_stdio_sp_lockstep_nonpie",
+            SpawnKind::Fork {
+                binary: "nonpie",
+                inherit_listen_ports: vec![],
+            },
+        );
+        Box::new(move |run| {
+            Box::pin(async move {
+                let detail = run
+                    .run_leaf(&leaf, &EXTRA_STDIO_SOCKETPAIR, ExtraStdioSocketpairArgs {})
+                    .await
+                    .map(|out| out.detail);
+                let pass = matches!(&detail, Ok(s) if s == "PB_STDIO_SOCKETPAIR_OK");
+                super::TestOutcome::new("dpg1", pass, format!("{detail:?}"))
+            })
+        })
     });
 
     for scenario in [
@@ -1365,6 +1496,7 @@ fn subcmd_pipe_test(args: &[String]) -> i32 {
         "write-on-fd" => subcmd_write_on_fd(args),
         "read-on-fd" => subcmd_read_on_fd(args),
         "echo-on-fd" => subcmd_echo_on_fd(args),
+        "stdio-echo" => subcmd_stdio_echo(),
         "delayed-write-on-fd" => subcmd_delayed_write_on_fd(args),
         "nonblock-fork" => subcmd_nonblock_fork(args),
         other => {
@@ -1771,6 +1903,35 @@ fn subcmd_echo_on_fd(args: &[String]) -> i32 {
     // Safety: fd is an inherited test fd that this helper owns.
     unsafe { libc::close(fd) };
     i32::from(w < 0)
+}
+
+fn subcmd_stdio_echo() -> i32 {
+    let mut buf = [0u8; 256];
+    // Safety: fd 0 is the inherited stdin socket for this leaf helper.
+    let n = unsafe { libc::read(0, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    if n <= 0 {
+        return 1;
+    }
+    let input = String::from_utf8_lossy(&buf[..n as usize]);
+    let stdout_msg = format!("PB_STDIO_SOCKETPAIR_OUT:{input}\n");
+    let stderr_msg = b"PB_STDIO_SOCKETPAIR_ERR\n";
+    // Safety: fds 1 and 2 are the inherited stdout/stderr sockets.
+    let out = unsafe {
+        libc::write(
+            1,
+            stdout_msg.as_ptr().cast::<libc::c_void>(),
+            stdout_msg.len(),
+        )
+    };
+    // Safety: fd 2 is the inherited stderr socket.
+    let err = unsafe {
+        libc::write(
+            2,
+            stderr_msg.as_ptr().cast::<libc::c_void>(),
+            stderr_msg.len(),
+        )
+    };
+    i32::from(out < 0 || err < 0)
 }
 
 fn subcmd_delayed_write_on_fd(args: &[String]) -> i32 {
