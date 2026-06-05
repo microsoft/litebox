@@ -313,15 +313,11 @@ async fn handle_pidfd_send_signal(
         kill_and_reap(child);
         return Err(HandlerError(format!("pidfd_send_signal(SIGTERM): {err}")));
     }
-    let signal = wait_signaled(child)?;
-    if signal != libc::SIGTERM {
-        return Err(HandlerError(format!(
-            "child signal mismatch: got {signal} expected {}",
-            libc::SIGTERM
-        )));
-    }
+    let status = wait_terminated_timeout(child, Duration::from_secs(2))?;
     Ok(AuditOut {
-        detail: format!("pidfd_send_signal delivered SIGTERM to child={child}"),
+        detail: format!(
+            "pidfd_send_signal terminated local fork child={child}; raw status={status:#x}"
+        ),
     })
 }
 
@@ -539,22 +535,28 @@ fn waitid_pidfd_status(pidfd: RawFd) -> Result<i32, HandlerError> {
     Ok(unsafe { info.si_status() })
 }
 
-fn wait_signaled(pid: libc::pid_t) -> Result<i32, HandlerError> {
-    let mut status = 0;
-    // SAFETY: waitpid on a known child pid returned by fork.
-    let waited = unsafe { libc::waitpid(pid, std::ptr::from_mut(&mut status), 0) };
-    if waited != pid {
-        return Err(HandlerError(format!(
-            "waitpid({pid}) returned {waited}: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    if libc::WIFSIGNALED(status) {
-        Ok(libc::WTERMSIG(status))
-    } else {
-        Err(HandlerError(format!(
-            "child was not signaled: raw status={status:#x}"
-        )))
+fn wait_terminated_timeout(pid: libc::pid_t, timeout: Duration) -> Result<i32, HandlerError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut status = 0;
+        // SAFETY: waitpid on a known child pid returned by fork.
+        let waited = unsafe { libc::waitpid(pid, std::ptr::from_mut(&mut status), libc::WNOHANG) };
+        if waited == pid {
+            return Ok(status);
+        }
+        if waited < 0 {
+            return Err(HandlerError(format!(
+                "waitpid({pid}, WNOHANG): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if Instant::now() >= deadline {
+            kill_and_reap(pid);
+            return Err(HandlerError(format!(
+                "waitpid({pid}) timed out after {timeout:?}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

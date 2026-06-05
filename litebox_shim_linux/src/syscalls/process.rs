@@ -74,6 +74,49 @@ pub(crate) struct ThreadState {
 // TODO: remove once we figure out how to handle Send/Sync for raw pointers.
 unsafe impl Send for ThreadState {}
 
+fn raw_wait_status_exit_code(raw_wait_status: i32) -> i32 {
+    (raw_wait_status >> 8) & 0xff
+}
+
+fn raw_wait_status_term_signal(raw_wait_status: i32) -> i32 {
+    raw_wait_status & 0x7f
+}
+
+fn raw_wait_status_exited(raw_wait_status: i32) -> bool {
+    raw_wait_status_term_signal(raw_wait_status) == 0
+}
+
+fn raw_wait_status_signaled(raw_wait_status: i32) -> bool {
+    let term_signal = raw_wait_status_term_signal(raw_wait_status);
+    term_signal != 0 && term_signal != 0x7f
+}
+
+fn worker_raw_wait_status_to_registry_status(raw_wait_status: i32) -> i32 {
+    if raw_wait_status_exited(raw_wait_status) {
+        raw_wait_status_exit_code(raw_wait_status)
+    } else if raw_wait_status_signaled(raw_wait_status) {
+        let core_dump = raw_wait_status & 0x80;
+        128 + raw_wait_status_term_signal(raw_wait_status) + core_dump
+    } else {
+        127
+    }
+}
+
+fn worker_raw_wait_status_to_exit_status(raw_wait_status: i32) -> ExitStatus {
+    if raw_wait_status_signaled(raw_wait_status) {
+        match litebox_common_linux::signal::Signal::try_from(raw_wait_status_term_signal(
+            raw_wait_status,
+        )) {
+            Ok(signal) => ExitStatus::Signal(signal),
+            Err(_) => ExitStatus::Exit(127_i32.truncate()),
+        }
+    } else if raw_wait_status_exited(raw_wait_status) {
+        ExitStatus::Exit(raw_wait_status_exit_code(raw_wait_status).truncate())
+    } else {
+        ExitStatus::Exit(127_i32.truncate())
+    }
+}
+
 impl ThreadState {
     pub fn new_process(pid: i32) -> Self {
         let remote = Arc::new(ThreadRemote::new());
@@ -1782,214 +1825,9 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        let (target_pid, host_pid) = self.pidfd_target_from_fd(pidfd)?;
-        if let Some(host_pid) = host_pid {
-            let signal = if sig == 0 {
-                0
-            } else {
-                litebox_common_linux::signal::Signal::try_from(sig)?.as_i32()
-            };
-            let host_pid = i32::try_from(host_pid).map_err(|_| Errno::ESRCH)?;
-            let ret = self.global.platform.kill_worker_host(host_pid, signal);
-            return if ret < 0 {
-                Err(Errno::try_from(-ret).unwrap_or(Errno::EIO))
-            } else {
-                Ok(0)
-            };
-        }
-        let target_process_id = target_pid;
-        let target_process_id = self
-            .global
-            .litebox
-            .process_registry()
-            .get_children(self.process_id)
-            .and_then(|children| {
-                if children.contains(&target_process_id) {
-                    Some(target_process_id)
-                } else if children.len() == 1 {
-                    children.first().copied()
-                } else {
-                    Some(target_process_id)
-                }
-            })
-            .unwrap_or(target_process_id);
-        let target_pid = i32::try_from(target_process_id.0).map_err(|_| Errno::EINVAL)?;
-        let target_key = target_process_id.0.cast_signed();
-        if sig != 0 {
-            let signal = litebox_common_linux::signal::Signal::try_from(sig)?;
-            if matches!(
-                signal.default_disposition(),
-                litebox_common_linux::signal::SignalDisposition::Terminate
-                    | litebox_common_linux::signal::SignalDisposition::Core
-                    | litebox_common_linux::signal::SignalDisposition::Stop
-            ) {
-                let _ = self
-                    .global
-                    .litebox
-                    .process_registry()
-                    .exit_process(target_process_id, 128 + signal.as_i32());
-                self.global
-                    .litebox
-                    .process_registry()
-                    .notify_waiters(target_process_id);
-                if let Some(remote) = self.global.process_thread_handles.read().get(&target_key) {
-                    remote.interrupt();
-                }
-                return Ok(0);
-            }
-        }
-        let host_signal = if sig == 0 {
-            0
-        } else {
-            litebox_common_linux::signal::Signal::try_from(sig)?.as_i32()
-        };
-        if let Some(&host_pid) = self
-            .global
-            .fork_child_host_pids
-            .read()
-            .get(&target_process_id.0)
-        {
-            let host_ret = self.global.platform.kill_worker_host(host_pid, host_signal);
-            return if host_ret < 0 {
-                Err(Errno::try_from(-host_ret).unwrap_or(Errno::EIO))
-            } else {
-                Ok(0)
-            };
-        }
-        let host_ret = self
-            .global
-            .platform
-            .kill_worker_host(target_pid, host_signal);
-        if host_ret < 0 {
-            let host_errno = Errno::try_from(-host_ret).unwrap_or(Errno::EIO);
-            if host_errno != Errno::ESRCH {
-                return Err(host_errno);
-            }
-        }
-        for _ in 0..100_000 {
-            if self
-                .global
-                .process_thread_handles
-                .read()
-                .contains_key(&target_key)
-            {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        for _ in 0..100_000 {
-            match self.sys_kill(target_pid, sig) {
-                Ok(n) => {
-                    if sig != 0 {
-                        let signal = litebox_common_linux::signal::Signal::try_from(sig)?;
-                        if matches!(
-                            signal.default_disposition(),
-                            litebox_common_linux::signal::SignalDisposition::Terminate
-                                | litebox_common_linux::signal::SignalDisposition::Core
-                                | litebox_common_linux::signal::SignalDisposition::Stop
-                        ) {
-                            let _ = self
-                                .global
-                                .litebox
-                                .process_registry()
-                                .exit_process(target_process_id, 128 + signal.as_i32());
-                            self.global
-                                .litebox
-                                .process_registry()
-                                .notify_waiters(target_process_id);
-                            if let Some(remote) =
-                                self.global.process_thread_handles.read().get(&target_key)
-                            {
-                                remote.pending_signals.lock().push(
-                                    &self.process().limits,
-                                    signal,
-                                    crate::syscalls::signal::siginfo_kill(signal),
-                                );
-                                remote.interrupt();
-                            }
-                        }
-                    }
-                    return Ok(n);
-                }
-                Err(Errno::ESRCH) => core::hint::spin_loop(),
-                result => return result,
-            }
-        }
-        match self.sys_kill(target_pid, sig) {
-            Err(Errno::ESRCH) if sig == 0 => Ok(0),
-            Err(Errno::ESRCH) => {
-                let signal = litebox_common_linux::signal::Signal::try_from(sig)?;
-                self.global
-                    .cross_process_signals
-                    .lock()
-                    .push(crate::CrossProcessSignal {
-                        target_process_id: target_process_id.0,
-                        target_tid: None,
-                        signal,
-                        siginfo: crate::syscalls::signal::siginfo_kill(signal),
-                    });
-
-                if matches!(
-                    signal.default_disposition(),
-                    litebox_common_linux::signal::SignalDisposition::Terminate
-                        | litebox_common_linux::signal::SignalDisposition::Core
-                        | litebox_common_linux::signal::SignalDisposition::Stop
-                ) {
-                    let _ = self
-                        .global
-                        .litebox
-                        .process_registry()
-                        .exit_process(target_process_id, 128 + signal.as_i32());
-                    self.global
-                        .litebox
-                        .process_registry()
-                        .notify_waiters(target_process_id);
-                }
-
-                if let Some(remote) = self.global.process_thread_handles.read().get(&target_key) {
-                    remote.pending_signals.lock().push(
-                        &self.process().limits,
-                        signal,
-                        crate::syscalls::signal::siginfo_kill(signal),
-                    );
-                    remote.interrupt();
-                }
-                Ok(0)
-            }
-            Ok(n) => {
-                if sig != 0 {
-                    let signal = litebox_common_linux::signal::Signal::try_from(sig)?;
-                    if matches!(
-                        signal.default_disposition(),
-                        litebox_common_linux::signal::SignalDisposition::Terminate
-                            | litebox_common_linux::signal::SignalDisposition::Core
-                            | litebox_common_linux::signal::SignalDisposition::Stop
-                    ) {
-                        let _ = self
-                            .global
-                            .litebox
-                            .process_registry()
-                            .exit_process(target_process_id, 128 + signal.as_i32());
-                        self.global
-                            .litebox
-                            .process_registry()
-                            .notify_waiters(target_process_id);
-                        if let Some(remote) =
-                            self.global.process_thread_handles.read().get(&target_key)
-                        {
-                            remote.pending_signals.lock().push(
-                                &self.process().limits,
-                                signal,
-                                crate::syscalls::signal::siginfo_kill(signal),
-                            );
-                            remote.interrupt();
-                        }
-                    }
-                }
-                Ok(n)
-            }
-            result => result,
-        }
+        let (target_pid, _host_pid) = self.pidfd_target_from_fd(pidfd)?;
+        let target_pid = i32::try_from(target_pid.0).map_err(|_| Errno::EINVAL)?;
+        self.sys_kill(target_pid, sig)
     }
 }
 
@@ -5349,13 +5187,8 @@ impl<FS: ShimFS> Task<FS> {
             let global = self.global.clone();
             let child_proc_id = self.process_id;
             self.global.platform.spawn_background_task(move || {
-                let exit_code = global.platform.wait_worker_host(host_pid);
-
-                let exit_status = if exit_code > 255 {
-                    (exit_code - 256) + 128
-                } else {
-                    exit_code
-                };
+                let raw_wait_status = global.platform.wait_worker_host(host_pid);
+                let exit_status = worker_raw_wait_status_to_registry_status(raw_wait_status);
 
                 global.fork_child_host_pids.write().remove(&child_proc_id.0);
 
@@ -5630,17 +5463,8 @@ impl<FS: ShimFS> Task<FS> {
             let global = self.global.clone();
             let child_proc_id = child_process_id;
             self.global.platform.spawn_background_task(move || {
-                let exit_code = global.platform.wait_worker_host(host_pid);
-
-                // Convert exit_code to the process registry's status format.
-                // wait_worker_host returns 0–255 for normal exit, 256+N for signal N.
-                // The registry stores: exit_code for normal exit, signal+128 for signals
-                // (matching the shell convention where signal death = 128 + signum).
-                let exit_status = if exit_code > 255 {
-                    (exit_code - 256) + 128
-                } else {
-                    exit_code
-                };
+                let raw_wait_status = global.platform.wait_worker_host(host_pid);
+                let exit_status = worker_raw_wait_status_to_registry_status(raw_wait_status);
 
                 // Remove the fork child host PID mapping first to prevent
                 // kill() from forwarding signals to a potentially-reused PID.
@@ -9355,7 +9179,7 @@ impl<FS: ShimFS> Task<FS> {
             host_pid,
         );
 
-        let exit_code = self.global.platform.wait_worker_host(host_pid);
+        let raw_wait_status = self.global.platform.wait_worker_host(host_pid);
         self.global
             .fork_child_host_pids
             .write()
@@ -9364,11 +9188,7 @@ impl<FS: ShimFS> Task<FS> {
             .remote_signalfd_targets
             .write()
             .remove(&self.process_id.0);
-        let broker_exit_status = if exit_code > 255 {
-            (exit_code - 256) + 128
-        } else {
-            exit_code
-        };
+        let broker_exit_status = worker_raw_wait_status_to_registry_status(raw_wait_status);
         super::guest_pid::try_mark_broker_process_exited(self.process_id.0, broker_exit_status);
 
         // Phase F.9: now that worker B has exited, release the pipe
@@ -9397,27 +9217,21 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
-            "[EXEC-REMOTE] pid={} worker exited with code {}",
+            "[EXEC-REMOTE] pid={} worker exited with wait status {}",
             self.pid,
-            exit_code,
+            raw_wait_status,
         );
 
         if vfork_info.is_some() {
-            let status = if exit_code > 255 {
-                match litebox_common_linux::signal::Signal::try_from(exit_code - 256) {
-                    Ok(signal) => ExitStatus::Signal(signal),
-                    Err(_) => ExitStatus::Exit(127_i32.truncate()),
-                }
-            } else {
-                ExitStatus::Exit(exit_code.truncate())
-            };
+            let status = worker_raw_wait_status_to_exit_status(raw_wait_status);
             self.thread.process.inner.lock().exit_status = status;
             self.local_task_terminated.set(true);
-        } else if exit_code > 255 {
-            // Signal exit: use 128 + signal as the exit code (shell convention).
-            self.exit_thread((exit_code - 256).truncate());
+        } else if raw_wait_status_signaled(raw_wait_status) {
+            self.exit_thread(raw_wait_status_term_signal(raw_wait_status).truncate());
+        } else if raw_wait_status_exited(raw_wait_status) {
+            self.exit_thread(raw_wait_status_exit_code(raw_wait_status).truncate());
         } else {
-            self.exit_thread(exit_code.truncate());
+            self.exit_thread(127_i32.truncate());
         }
 
         // The remote worker completed; stop the local placeholder before it can
