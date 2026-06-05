@@ -1105,7 +1105,24 @@ impl<FS: ShimFS> Task<FS> {
                 .control_plane
                 .owner_of_running_process(target)
                 .is_some();
-        let is_running = is_local || is_remote || (signal == 0 && pid > 0);
+        let is_fork_child = !is_local
+            && !is_remote
+            && self
+                .global
+                .fork_child_host_pids
+                .read()
+                .contains_key(&target.0);
+        let is_child = !is_local
+            && !is_remote
+            && !is_fork_child
+            && self
+                .global
+                .litebox
+                .process_registry()
+                .get_children(self.process_id)
+                .is_some_and(|children| children.contains(&target));
+        let is_running =
+            is_local || is_remote || is_fork_child || is_child || (signal == 0 && pid > 0);
         if !is_running {
             return Err(Errno::ESRCH);
         }
