@@ -2294,8 +2294,11 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
 // build is deferred to the per-trial `ensure_copilot_image` call,
 // so token-less runs incur zero docker cost.
 //
-// Concurrency cap `LITEBOX_COPILOT_JOBS` (default 1) bounds
+// Concurrency cap `LITEBOX_COPILOT_JOBS` (default 1, serial) bounds
 // concurrent Copilot trials independently of `LITEBOX_TEST_JOBS`.
+// The serial default protects shared/autonomous runs from GitHub
+// API throttling; one-shot validation runs should raise it (e.g.
+// `LITEBOX_COPILOT_JOBS=4`) — nothing in-tree forces serialization.
 //
 // Three scenarios (`pipeline_wc`, `find_head`, `build`) are expected
 // to FAIL on the litebox pass on `wportnoy/vscode-server-in-litebox`
@@ -2474,7 +2477,11 @@ mod copilot {
     }
 
     /// Concurrency cap. Independent of `LITEBOX_TEST_JOBS` — the
-    /// Copilot scenarios call the GitHub API, so default to serial.
+    /// Copilot scenarios call the GitHub API, so default to serial
+    /// to protect shared/autonomous runs from rate-limiting. One-
+    /// shot validation runs should raise this (`LITEBOX_COPILOT_JOBS=4`
+    /// is a reasonable starting point) — nothing in-tree forces serial
+    /// execution; the cap is purely an external-service safety knob.
     fn jobs_cap() -> usize {
         std::env::var("LITEBOX_COPILOT_JOBS")
             .ok()
