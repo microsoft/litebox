@@ -570,6 +570,28 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(sp_fd);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "unix_socket")
             }
+            BrokerHandleKind::SocketDgram => {
+                let provider =
+                    syscalls::broker_socket_dgram::broker_socket_dgram_provider().ok_or(())?;
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                Self::dup_broker_bridge_handle(releaser, handle_id)?;
+                let dgram = syscalls::broker_socket_dgram::BrokerSocketDgramFd::<Platform>::new(
+                    provider,
+                    handle_id,
+                    litebox::fs::OFlags::empty(),
+                );
+                let typed: litebox::fd::TypedFd<
+                    syscalls::broker_socket_dgram::BrokerSocketDgramSubsystem,
+                > = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(dgram);
+                self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "socket_dgram")
+            }
             BrokerHandleKind::TcpConn => {
                 let provider = syscalls::broker_tcp_conn::broker_tcp_conn_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -1113,7 +1135,6 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             },
@@ -2031,6 +2052,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         BrokerHandleKind::TcpConn => None,
                         BrokerHandleKind::InetListener => None,
                         BrokerHandleKind::InetDgram => None,
+                        BrokerHandleKind::SocketDgram => None,
                         // `Signalfd` is restored by its dedicated FdClass branch below.
                         BrokerHandleKind::Signalfd => todo!(
                             "fork-snapshot restore for BrokerHandleKind::Signalfd \
@@ -2296,7 +2318,6 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             },
@@ -2382,6 +2403,15 @@ pub(crate) struct HostTtyAlias;
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
 
 /// Marks a pipe created directly by the guest via pipe/pipe2.
+///
+/// Read site: the `BrokerPipe` `F_SETFL` arm in `syscalls/file.rs` checks this
+/// marker before arming `PipeNonblockEagainOnce` after a delayed-fork resume.
+/// That one-shot EAGAIN preserves native fork timing for a parent that creates a
+/// pipe, forks, then sets the read end nonblocking while the child may have
+/// already written and closed during delayed-fork migration. Broker pipes
+/// installed from outside the guest (`install_broker_bridge_fd`, SCM_RIGHTS, or
+/// D5 virtual-pipe restore) intentionally do not get that timing shim: their
+/// ready/EOF state is externally owned and must be reported as-is.
 #[derive(Clone, Copy)]
 pub(crate) struct GuestCreatedPipe;
 
@@ -3260,7 +3290,7 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::Unix(_fd) => alloc::format!("raw={raw_fd} unix"),
                 crate::RawFdRef::ExternalFd(_fd) => alloc::format!("raw={raw_fd} external_fd"),
                 crate::RawFdRef::BrokerPipe(_fd) => alloc::format!("raw={raw_fd} broker_pipe"),
-                crate::RawFdRef::BrokerSocketPair(_fd) => {
+                RawFdRef::BrokerSocketPair(_fd) => {
                     alloc::format!("raw={raw_fd} broker_socketpair")
                 }
                 crate::RawFdRef::BrokerTcpConn(_fd) => {
@@ -5076,7 +5106,6 @@ pub(crate) struct VforkParking {
 /// Which virtual subsystem the replaced fd belonged to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplacedSubsystem {
-    Pipe,
     UnixSocket,
     Pty,
     Filesystem,
@@ -5097,25 +5126,6 @@ struct FdReplacement {
     /// The virtual subsystem that owned the original fd.
     #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
     subsystem: ReplacedSubsystem,
-    /// Whether this replacement comes from `spawn_result.direct_pipes`
-    /// (true: stdin/stdout for non-PIE worker, where the host_fd IS the
-    /// other end of a host OS pipe directly connected to the worker
-    /// child's stdio fd) vs `parent_pipe_replacements` (false: bridged
-    /// via a relay thread that copies between an OS pipe and the
-    /// parent's existing virtual pipe).
-    ///
-    /// When `direct: true`, the parent's guest fd MUST be installed as
-    /// a ExternalFd over `host_fd` (consume the old slot, install the
-    /// new ExternalFd), so reads/writes flow directly to the OS pipe
-    /// connected to the worker.
-    ///
-    /// When `direct: false`, the bridge thread already handles the data
-    /// flow via the parent's existing virtual pipe; the FdReplacement
-    /// here installs the ExternalFd at a slot that's NOT the parent's
-    /// virtual pipe (different guest fd), or no installation is
-    /// necessary. Consuming the parent's virtual pipe at the slot
-    /// would orphan the bridge thread.
-    direct: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5365,11 +5375,6 @@ struct Task<FS: ShimFS> {
     /// thread's `ThreadRemote` as exiting (for remote exec handoff paths where
     /// the host thread belongs to the parent runtime and must remain alive).
     local_task_terminated: Cell<bool>,
-    /// Pipe pair_ids of virtual pipes created by the mux dispatcher or fd
-    /// replacement relay setup. Legacy field — retained for potential
-    /// future cleanup but no longer actively populated.
-    mux_pipe_pair_ids: RefCell<Vec<usize>>,
-
     /// Active netlink sockets, keyed by guest fd number.
     /// Used to intercept sendto/recvmsg/bind for AF_NETLINK fds.
     netlink_sockets:
@@ -5428,7 +5433,6 @@ mod test_utils {
                 recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
                 process_state: self.process_state.into(),
@@ -5468,7 +5472,6 @@ mod test_utils {
                 recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
-                mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             };
@@ -5507,6 +5510,22 @@ mod tests {
     };
 
     const DUP_FAIL_HANDLE: u64 = 0xd0_fa_11;
+
+    #[test]
+    fn replaced_subsystem_has_no_pipe_kind() {
+        for subsystem in [
+            ReplacedSubsystem::UnixSocket,
+            ReplacedSubsystem::Pty,
+            ReplacedSubsystem::Filesystem,
+        ] {
+            let kind = match subsystem {
+                ReplacedSubsystem::UnixSocket => "unix_socket",
+                ReplacedSubsystem::Pty => "pty",
+                ReplacedSubsystem::Filesystem => "filesystem",
+            };
+            assert_ne!(kind, "pipe");
+        }
+    }
 
     struct TestBrokerPipeProvider;
 
@@ -5743,6 +5762,64 @@ mod tests {
 
         assert!(Arc::ptr_eq(&cow, &lower));
         assert_eq!(found_perms, perms);
+    }
+
+    fn pipe_eagain_once_enabled(task: &Task<DefaultFS>, fd: i32) -> bool {
+        let files = task.files.borrow();
+        let typed = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(
+                usize::try_from(fd).expect("raw fd should be non-negative"),
+            )
+            .expect("raw fd should be a broker pipe");
+        task.global
+            .litebox
+            .descriptor_table()
+            .with_metadata(&typed, |PipeNonblockEagainOnce(enabled)| *enabled)
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn guest_created_pipe_marker_limits_delayed_fork_setfl_eagain_shim() {
+        install_test_broker_providers();
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let (read_fd, _write_fd) = task
+            .sys_pipe2(OFlags::empty())
+            .expect("pipe2 should succeed");
+        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
+        task.recent_delayed_fork_resume.set(true);
+        task.sys_fcntl(read_fd, FcntlArg::SETFL(OFlags::NONBLOCK))
+            .expect("F_SETFL on guest-created broker pipe should succeed");
+        assert!(
+            pipe_eagain_once_enabled(&task, read_fd),
+            "guest-created read pipe should arm the delayed-fork EAGAIN shim"
+        );
+
+        let entrypoints = test_entrypoints();
+        let inherited_fd = 93i32;
+        entrypoints
+            .install_broker_bridge_fd(
+                usize::try_from(inherited_fd).expect("inherited fd should fit usize"),
+                syscalls::fork_snapshot::BrokerHandleKind::Pipe,
+                1234,
+                Some(BrokerPipeEnd::Read),
+                None,
+                None,
+                None,
+                OFlags::empty(),
+            )
+            .expect("installing inherited broker pipe should succeed");
+        entrypoints.task.recent_delayed_fork_resume.set(true);
+        entrypoints
+            .task
+            .sys_fcntl(inherited_fd, FcntlArg::SETFL(OFlags::NONBLOCK))
+            .expect("F_SETFL on inherited broker pipe should succeed");
+        assert!(
+            !pipe_eagain_once_enabled(&entrypoints.task, inherited_fd),
+            "inherited broker pipe must report externally-owned readiness as-is"
+        );
     }
 
     #[test]

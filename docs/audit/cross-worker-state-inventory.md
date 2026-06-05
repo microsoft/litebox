@@ -462,8 +462,8 @@ Status: 🟢 OK · 🔴 BROKEN · ⚪ UNTESTED · ⛔ GAP. VSCS:
 - **XW mechanism**: shm region + atomic indices; broker mediates
   setup (handshake via fd-token).
 - **Status**: 🟢 OK at the basic level (covered by `PB.*`,
-  `BPipe.*`, `nonpie_pipe_chain` families). `pipe-bridge` and
-  `pipe_nonblock` recently fixed.
+  `BPipe.*`, `nonpie_pipe_chain` families). The remaining
+  Unix-socket passthrough path and `pipe_nonblock` were recently fixed.
 - **VSCS**: 🔥 HOT. pipe2 (`syscall-unique.txt`) + the large
   `read`/`write` syscall counts presumably include pipe traffic
   between sshd, VS Code Server, and the extension host.

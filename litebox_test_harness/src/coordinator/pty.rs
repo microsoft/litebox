@@ -341,6 +341,8 @@ const PTYR_POLL_LOOP_POST_SLEEP_WITH_INERTS: HandlerToken<TargetArgs, PtyOut> =
 const PTYR_WRITE_THEN_EXEC_THEN_WRITE: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("ptyr.write_then_exec_then_write");
 const PTYR_ISATTY: HandlerToken<TargetArgs, PtyOut> = HandlerToken::new("ptyr.isatty");
+const PTYR_STDIO_LOCKSTEP: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("ptyr.stdio_lockstep");
 const PARENT_EXIT_THEN_CHILD_IO: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.parent_exit_then_child_io");
 const TERMIOS_ICANON_ECHO: HandlerToken<TargetArgs, PtyOut> =
@@ -1090,6 +1092,27 @@ async fn handle_ptyr_isatty(
     Ok(PtyOut { detail })
 }
 
+async fn handle_ptyr_stdio_lockstep(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let pid = pty.fork_exec(&[args.target, "pty-stdio-lockstep".into()], true)?;
+    pty.write_all(b"PTY_STDIN_LOCKSTEP\n")?;
+    expect_exit_zero(pid)?;
+    let data = pty.read(None)?;
+    if data.contains("PTY_STDOUT_LOCKSTEP:PTY_STDIN_LOCKSTEP\r\n")
+        && data.contains("PTY_STDERR_LOCKSTEP\r\n")
+    {
+        Ok(PtyOut {
+            detail: "PTY_STDIO_LOCKSTEP_OK".into(),
+        })
+    } else {
+        Err(format!("PTY stdio lockstep markers missing from {data:?}").into())
+    }
+}
+
 async fn handle_termios_icanon_echo(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -1284,6 +1307,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         handle_ptyr_write_then_exec_then_write
     );
     register_handler!(PTYR_ISATTY, handle_ptyr_isatty);
+    register_handler!(PTYR_STDIO_LOCKSTEP, handle_ptyr_stdio_lockstep);
     register_handler!(PARENT_EXIT_THEN_CHILD_IO, handle_parent_exit_then_child_io);
     register_handler!(TERMIOS_ICANON_ECHO, handle_termios_icanon_echo);
     register_handler!(
@@ -1336,6 +1360,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         leaf_subcmd::subcmd_pty_write_post_exec
     );
     crate::register_leaf_subcommand!("pty-isatty-check", leaf_subcmd::subcmd_pty_isatty_check);
+    crate::register_leaf_subcommand!("pty-stdio-lockstep", leaf_subcmd::subcmd_pty_stdio_lockstep);
     crate::register_leaf_subcommand!(
         "pty-parent-exit-driver",
         leaf_subcmd::subcmd_pty_parent_exit_driver
@@ -1366,6 +1391,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     );
 
     register_pty_semantics_tests(reg);
+    register_pty_stdio_lockstep(reg);
     register_parent_exit_then_child_io(reg);
     register_slave_write_after_master_close(reg);
 
@@ -1414,6 +1440,33 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
             }
         }
     }
+}
+
+fn register_pty_stdio_lockstep(reg: &mut Registry<'_>) {
+    let agent = AgentName::Dpg1;
+    let label = agent.to_string();
+    reg.test("vscode", "pty", "PTY.stdio_lockstep.nonpie-glibc.dpg1")
+        .timeout(60)
+        .build(move |cx| {
+            let handle = cx.require(agent);
+            let label = label.clone();
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let target = crate::binary_path(crate::BinaryType::NonPieGlibc, run.self_exe());
+                    let result = run
+                        .send_named_typed(&handle, &PTYR_STDIO_LOCKSTEP, TargetArgs { target })
+                        .await;
+                    match result {
+                        Ok(out) => TestOutcome::new(
+                            &label,
+                            out.detail == "PTY_STDIO_LOCKSTEP_OK",
+                            out.detail,
+                        ),
+                        Err(detail) => TestOutcome::new(&label, false, detail),
+                    }
+                })
+            })
+        });
 }
 
 fn register_pty_semantics_tests(reg: &mut Registry<'_>) {
@@ -2248,6 +2301,19 @@ mod leaf_subcmd {
         println!("isatty: 0={} 1={} 2={}", label(0), label(1), label(2));
         let _ = std::io::stdout().flush();
         0
+    }
+
+    pub(super) fn subcmd_pty_stdio_lockstep(_args: &[String]) -> i32 {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return 1;
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        println!("PTY_STDOUT_LOCKSTEP:{line}");
+        eprintln!("PTY_STDERR_LOCKSTEP");
+        let stdout_ok = std::io::stdout().flush().is_ok();
+        let stderr_ok = std::io::stderr().flush().is_ok();
+        i32::from(!stdout_ok || !stderr_ok)
     }
 
     pub(super) fn subcmd_pty_termios_icanon_echo(_args: &[String]) -> i32 {

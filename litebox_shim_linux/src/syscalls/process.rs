@@ -1774,6 +1774,13 @@ impl<FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<FS> {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// Open a broker-tracked pidfd for process-exit observation.
+    ///
+    /// Audit note: `pidfd_send_signal(2)` is not decoded into a
+    /// `SyscallRequest` today, so the raw syscall returns the generic
+    /// unsupported-syscall error under Litebox. The harness test
+    /// `PIDFD.send_signal` records that product gap without changing
+    /// the working `pidfd_open`/poll path.
     pub(crate) fn sys_pidfd_open(&self, pid: i32, flags: u32) -> Result<usize, Errno> {
         const PIDFD_NONBLOCK: u32 = OFlags::NONBLOCK.bits();
 
@@ -2170,7 +2177,6 @@ impl<FS: ShimFS> Task<FS> {
                         recent_delayed_fork_resume: core::cell::Cell::new(false),
                         migrated_to_remote: core::cell::Cell::new(false),
                         local_task_terminated: core::cell::Cell::new(false),
-                        mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
                         ),
@@ -2860,7 +2866,6 @@ impl<FS: ShimFS> Task<FS> {
                         recent_delayed_fork_resume: core::cell::Cell::new(false),
                         migrated_to_remote: core::cell::Cell::new(false),
                         local_task_terminated: core::cell::Cell::new(false),
-                        mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
                         ),
@@ -2971,17 +2976,10 @@ impl<FS: ShimFS> Task<FS> {
                         repl.direction,
                     );
 
-                    // Bidirectional sockets always go via ExternalFd. For
-                    // Read+Pipe, only direct_pipes-derived replacements (e.g.
-                    // worker child stdout for non-PIE exec) consume+install at
-                    // the parent's slot; bridged Read+Pipe replacements (e.g.
-                    // stderr) keep the parent's virtual pipe so the bridge
-                    // thread continues to deliver data through it.
-                    if repl.direction == ExternalFdDirection::ReadWrite
-                        || (repl.direct
-                            && repl.direction == ExternalFdDirection::Read
-                            && repl.subsystem == crate::ReplacedSubsystem::Pipe)
-                    {
+                    // Bidirectional sockets always go via ExternalFd. Pipe-kind
+                    // replacements were removed with the local pipe subsystem;
+                    // no unidirectional replacement is installed here.
+                    if repl.direction == ExternalFdDirection::ReadWrite {
                         // Skip duplicate FdReplacement entries: a previous
                         // iteration may already have installed a ExternalFd at
                         // this slot. Close our extra host_fd and continue.
@@ -3391,19 +3389,23 @@ impl<FS: ShimFS> Task<FS> {
         // parent_fd_replacements: stored in VforkDone for the parent to apply.
         let mut child_pipe_bridges: Vec<(usize, i32, super::external_fd::ExternalFdDirection)> =
             Vec::new();
-        // Parallel tracking for the multiplexer:
-        // - drained data captured from virtual pipe/socket before migration
-        let mut bridge_drained: Vec<Vec<u8>> = Vec::new();
-        // - parent fd info per bridge: [(parent_guest_fd, parent_dir, subsystem)]
-        let mut bridge_parent_info: Vec<
-            Vec<(
-                usize,
-                super::external_fd::ExternalFdDirection,
-                crate::ReplacedSubsystem,
-            )>,
-        > = Vec::new();
-        // - host OS fd for external fds (-1 for new OS pipe bridges)
-        let mut bridge_host_fd: Vec<i32> = Vec::new();
+        type ForkBridgeParentInfo = Vec<(
+            usize,
+            super::external_fd::ExternalFdDirection,
+            crate::ReplacedSubsystem,
+        )>;
+        struct ForkBridgeAccum {
+            drained: Vec<u8>,
+            /// Host OS fd for host-backed bridges; -1 for virtual unix-socket/PTY bridges.
+            host_fd: i32,
+            parent_info: ForkBridgeParentInfo,
+        }
+
+        // One entry per child_pipe_bridges entry. Keeping the drained bytes,
+        // host fd, and parent fd metadata in one struct preserves the original
+        // lockstep invariant structurally: fork_bridge_accum[i] describes the
+        // same logical fork bridge as child_pipe_bridges[i].
+        let mut fork_bridge_accum: Vec<ForkBridgeAccum> = Vec::new();
         // Phase 3 D5: broker-fd-bridge specs for mux streams migrated
         // out of the mux relay onto direct broker handles. Each entry
         // is shipped to the worker as `--broker-fd-bridge <spec>` and
@@ -3517,9 +3519,11 @@ impl<FS: ShimFS> Task<FS> {
             // and the existing host OS fd.
             for &(guest_fd, host_fd, direction) in &child_external_fds {
                 child_pipe_bridges.push((guest_fd, host_fd, direction));
-                bridge_drained.push(Vec::new());
-                bridge_host_fd.push(host_fd);
-                bridge_parent_info.push(Vec::new());
+                fork_bridge_accum.push(ForkBridgeAccum {
+                    drained: Vec::new(),
+                    host_fd,
+                    parent_info: Vec::new(),
+                });
             }
 
             // --- Unix socket bridging ---
@@ -3604,8 +3608,9 @@ impl<FS: ShimFS> Task<FS> {
                             );
                             // Clean up any already-created OS pipe fds.
                             for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                                let is_host_owned =
-                                    bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                let is_host_owned = fork_bridge_accum
+                                    .get(i)
+                                    .is_some_and(|bridge| bridge.host_fd == os_fd);
                                 if !is_host_owned {
                                     self.global.platform.close_host_fd(os_fd);
                                 }
@@ -3647,7 +3652,6 @@ impl<FS: ShimFS> Task<FS> {
                                             host_fd: parent_end,
                                             direction: ExternalFdDirection::ReadWrite,
                                             subsystem: crate::ReplacedSubsystem::UnixSocket,
-                                            direct: false,
                                         });
                                     }
                                 }
@@ -3689,8 +3693,9 @@ impl<FS: ShimFS> Task<FS> {
                                 _e,
                             );
                             for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                                let is_host_owned =
-                                    bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                let is_host_owned = fork_bridge_accum
+                                    .get(i)
+                                    .is_some_and(|bridge| bridge.host_fd == os_fd);
                                 if !is_host_owned {
                                     self.global.platform.close_host_fd(os_fd);
                                 }
@@ -3738,8 +3743,9 @@ impl<FS: ShimFS> Task<FS> {
                                 self.global.platform.close_host_fd(child_os_fd);
                                 self.global.platform.close_host_fd(parent_os_fd);
                                 for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                                    let is_host_owned =
-                                        bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                    let is_host_owned = fork_bridge_accum
+                                        .get(i)
+                                        .is_some_and(|bridge| bridge.host_fd == os_fd);
                                     if !is_host_owned {
                                         self.global.platform.close_host_fd(os_fd);
                                     }
@@ -3803,9 +3809,9 @@ impl<FS: ShimFS> Task<FS> {
                                         for (i, &(_, os_fd, _)) in
                                             child_pipe_bridges.iter().enumerate()
                                         {
-                                            let is_host_owned = bridge_host_fd
+                                            let is_host_owned = fork_bridge_accum
                                                 .get(i)
-                                                .is_some_and(|&hf| hf == os_fd);
+                                                .is_some_and(|bridge| bridge.host_fd == os_fd);
                                             if !is_host_owned {
                                                 self.global.platform.close_host_fd(os_fd);
                                             }
@@ -3827,9 +3833,6 @@ impl<FS: ShimFS> Task<FS> {
                         child_pipe_bridges.len(),
                     ));
                     child_pipe_bridges.push((info.child_fd, child_os_fd, info.direction));
-                    bridge_drained.push(this_socket_drained);
-                    bridge_host_fd.push(-1);
-
                     // Find ALL parent peers (same pair_id, different object_id).
                     let parent_dir = match info.direction {
                         ExternalFdDirection::Read => ExternalFdDirection::Write,
@@ -3862,9 +3865,9 @@ impl<FS: ShimFS> Task<FS> {
                                         for (i, &(_, os_fd, _)) in
                                             child_pipe_bridges.iter().enumerate()
                                         {
-                                            let is_host_owned = bridge_host_fd
+                                            let is_host_owned = fork_bridge_accum
                                                 .get(i)
-                                                .is_some_and(|&hf| hf == os_fd);
+                                                .is_some_and(|bridge| bridge.host_fd == os_fd);
                                             if !is_host_owned {
                                                 self.global.platform.close_host_fd(os_fd);
                                             }
@@ -3885,7 +3888,6 @@ impl<FS: ShimFS> Task<FS> {
                                 host_fd: parent_host_fd,
                                 direction: parent_dir,
                                 subsystem: crate::ReplacedSubsystem::UnixSocket,
-                                direct: false,
                             });
                             this_parent_info.push((
                                 parent_fd,
@@ -3895,7 +3897,11 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     }
 
-                    bridge_parent_info.push(this_parent_info);
+                    fork_bridge_accum.push(ForkBridgeAccum {
+                        drained: this_socket_drained,
+                        host_fd: -1,
+                        parent_info: this_parent_info,
+                    });
 
                     if !found_parent {
                         self.global.platform.close_host_fd(parent_os_fd);
@@ -4002,13 +4008,12 @@ impl<FS: ShimFS> Task<FS> {
                     );
 
                     child_pipe_bridges.push((entry.fd, child_os_fd, direction));
-                    bridge_drained.push(Vec::new());
-                    // Set bridge_host_fd to the real host stdio fd number.
-                    // This tells the mux parent dispatcher to spawn a relay
-                    // thread that bridges between the virtual pipe and the
-                    // real host terminal fd.
-                    bridge_host_fd.push(source_fd);
-                    bridge_parent_info.push(Vec::new());
+                    // Set host_fd to the real host stdio fd number for broker migration.
+                    fork_bridge_accum.push(ForkBridgeAccum {
+                        drained: Vec::new(),
+                        host_fd: source_fd,
+                        parent_info: Vec::new(),
+                    });
                 }
             }
 
@@ -4111,6 +4116,12 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            debug_assert_eq!(
+                fork_bridge_accum.len(),
+                child_pipe_bridges.len(),
+                "fork bridge metadata must stay in lockstep with child pipe bridges"
+            );
+
             // --- D5 broker-bridge setup ---
             // Migrate each child pipe bridge directly onto a broker handle
             // (BrokerPipe / BrokerSocketPair / BrokerPty / HostFd-attached
@@ -4175,15 +4186,14 @@ impl<FS: ShimFS> Task<FS> {
                             continue;
                         }
                     };
-                    let type_byte = bridge_parent_info.get(i).and_then(|v| v.first()).map_or(
-                        b'p',
-                        |&(_, _, sub)| match sub {
-                            crate::ReplacedSubsystem::Pipe => b'p',
+                    let type_byte = fork_bridge_accum
+                        .get(i)
+                        .and_then(|bridge| bridge.parent_info.first())
+                        .map_or(b'p', |&(_, _, sub)| match sub {
                             crate::ReplacedSubsystem::UnixSocket => b's',
                             crate::ReplacedSubsystem::Pty => b't',
                             crate::ReplacedSubsystem::Filesystem => b'f',
-                        },
-                    );
+                        });
 
                     // For Read-direction child pipes (child reads,
                     // parent writes): check if the parent's pipe is
@@ -4200,7 +4210,9 @@ impl<FS: ShimFS> Task<FS> {
                     // initial_eof would cause the worker to pre-close the
                     // relay sender before the drained data arrives,
                     // silently dropping it.
-                    let has_drained_data = bridge_drained.get(i).is_some_and(|d| !d.is_empty());
+                    let has_drained_data = fork_bridge_accum
+                        .get(i)
+                        .is_some_and(|bridge| !bridge.drained.is_empty());
                     let initial_eof = if has_drained_data {
                         false
                     } else if direction == ExternalFdDirection::Read {
@@ -4212,13 +4224,16 @@ impl<FS: ShimFS> Task<FS> {
                         //
                         // Guard against empty parent_info (vacuous .all()
                         // would return true and falsely signal EOF).
-                        bridge_parent_info.get(i).is_some_and(|parents| {
-                            !parents.is_empty()
-                                && parents.iter().all(|&(parent_fd, parent_dir, _)| {
-                                    let _ = parent_fd;
-                                    let _ = parent_dir;
-                                    false
-                                })
+                        fork_bridge_accum.get(i).is_some_and(|bridge| {
+                            !bridge.parent_info.is_empty()
+                                && bridge
+                                    .parent_info
+                                    .iter()
+                                    .all(|&(parent_fd, parent_dir, _)| {
+                                        let _ = parent_fd;
+                                        let _ = parent_dir;
+                                        false
+                                    })
                         })
                     } else {
                         false
@@ -4242,7 +4257,9 @@ impl<FS: ShimFS> Task<FS> {
                         );
                     }
 
-                    let is_host_backed = bridge_host_fd.get(i).is_some_and(|&hf| hf >= 0);
+                    let is_host_backed = fork_bridge_accum
+                        .get(i)
+                        .is_some_and(|bridge| bridge.host_fd >= 0);
                     let is_virtual_pipe = !is_host_backed && type_byte == b'p';
                     let is_pty_stream = type_byte == b't';
 
@@ -4257,8 +4274,14 @@ impl<FS: ShimFS> Task<FS> {
                     let mut handled_as_broker_bridge = false;
 
                     if is_virtual_pipe {
-                        let drained = bridge_drained.get(i).cloned().unwrap_or_default();
-                        let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
+                        let drained = fork_bridge_accum
+                            .get(i)
+                            .map(|bridge| bridge.drained.clone())
+                            .unwrap_or_default();
+                        let parents = fork_bridge_accum
+                            .get(i)
+                            .map(|bridge| bridge.parent_info.clone())
+                            .unwrap_or_default();
                         if let Some(provider) = super::broker_pipe::broker_pipe_provider() {
                             use litebox_common_linux::broker_pipe_provider::BrokerPipeEnd;
                             use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -4417,10 +4440,11 @@ impl<FS: ShimFS> Task<FS> {
                     }
 
                     if is_pty_stream && !is_host_backed {
-                        let pty_parent_fds: alloc::vec::Vec<usize> = bridge_parent_info
+                        let pty_parent_fds: alloc::vec::Vec<usize> = fork_bridge_accum
                             .get(i)
-                            .map(|parents| {
-                                parents
+                            .map(|bridge| {
+                                bridge
+                                    .parent_info
                                     .iter()
                                     .filter_map(|&(parent_fd, _, subsystem)| {
                                         if subsystem == crate::ReplacedSubsystem::Pty {
@@ -4530,7 +4554,7 @@ impl<FS: ShimFS> Task<FS> {
                     }
 
                     if is_host_backed {
-                        let host_fd = bridge_host_fd[i];
+                        let host_fd = fork_bridge_accum[i].host_fd;
                         // Try to migrate this host-backed stream onto a
                         // direct broker handle, eliminating its need for
                         // the mux relay. Falls back to the mux path on
@@ -4607,10 +4631,16 @@ impl<FS: ShimFS> Task<FS> {
                         // replacements; nothing else is needed here.
                         self.global.platform.close_host_fd(child_os_fd);
 
-                        let drained = bridge_drained.get(i).cloned().unwrap_or_default();
+                        let drained = fork_bridge_accum
+                            .get(i)
+                            .map(|bridge| bridge.drained.clone())
+                            .unwrap_or_default();
 
                         // Build a MuxParentStream for each parent counterpart.
-                        let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
+                        let parents = fork_bridge_accum
+                            .get(i)
+                            .map(|bridge| bridge.parent_info.clone())
+                            .unwrap_or_default();
 
                         if type_byte == b's' {
                             let child_nonblock = {
@@ -4877,8 +4907,10 @@ impl<FS: ShimFS> Task<FS> {
                 for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
                     // Close newly-created pipe fds, but NOT fds
                     // that are owned by the external fd system (where
-                    // os_fd == bridge_host_fd[i]).
-                    let is_host_owned = bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                    // os_fd == fork_bridge_accum[i].host_fd).
+                    let is_host_owned = fork_bridge_accum
+                        .get(i)
+                        .is_some_and(|bridge| bridge.host_fd == os_fd);
                     if !is_host_owned {
                         self.global.platform.close_host_fd(os_fd);
                     }
@@ -4905,9 +4937,9 @@ impl<FS: ShimFS> Task<FS> {
 
         // Spawn the child worker host.
         // Build passthrough fds for bidirectional unix socket bridges.
-        let bidi_pt: Vec<(usize, i32, u8)> = bidi_passthrough
+        let bidi_pt: Vec<(usize, i32)> = bidi_passthrough
             .iter()
-            .map(|&(guest_fd, child_fd, _)| (guest_fd, child_fd, b'b'))
+            .map(|&(guest_fd, child_fd, _)| (guest_fd, child_fd))
             .collect();
         let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
             &snapshot_bytes,
@@ -5873,6 +5905,11 @@ impl<FS: ShimFS> Task<FS> {
                                         .as_ref()
                                         .map(|p| alloc::sync::Arc::clone(p) as _)
                                 }
+                                BrokerHandleKind::SocketDgram => {
+                                    super::broker_socket_dgram::broker_socket_dgram_provider()
+                                        .as_ref()
+                                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                                }
                                 BrokerHandleKind::TcpConn => {
                                     super::broker_tcp_conn::broker_tcp_conn_provider()
                                         .as_ref()
@@ -6143,6 +6180,50 @@ impl<FS: ShimFS> Task<FS> {
                                             handle_id,
                                             pipe_direction: None,
                                             socketpair_endpoint: Some(endpoint),
+                                            pty_role: None,
+                                            pty_id: None,
+                                        })
+                                    }
+                                    Err(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                } else if let Ok(typed) = rds
+                    .fd_from_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(
+                        raw_fd,
+                    )
+                {
+                    let provider = super::broker_socket_dgram::broker_socket_dgram_provider();
+                    let entry_result = dt.with_entry(
+                        &typed,
+                        |dgram_fd: &super::broker_socket_dgram::BrokerSocketDgramFd<
+                            crate::Platform,
+                        >| { dgram_fd.fork_snapshot_handle() },
+                    );
+                    match entry_result {
+                        Some((kind, handle_id)) => {
+                            let releaser_opt: Option<
+                                alloc::sync::Arc<
+                                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                                >,
+                            > = provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
+                            if let Some(releaser) = releaser_opt {
+                                match releaser.dup_handle(handle_id) {
+                                    Ok(()) => {
+                                        broker_transit.push(ForkSnapshotBrokerTransit {
+                                            releaser,
+                                            handle_id,
+                                            kind,
+                                        });
+                                        Some(BrokerHandleSnapshot {
+                                            kind,
+                                            handle_id,
+                                            pipe_direction: None,
+                                            socketpair_endpoint: None,
                                             pty_role: None,
                                             pty_id: None,
                                         })
@@ -8186,6 +8267,7 @@ impl<FS: ShimFS> Task<FS> {
                         BrokerHandleKind::Pty => "pty",
                         BrokerHandleKind::Pipe => "pipe",
                         BrokerHandleKind::UnixSocket => "unix_socket",
+                        BrokerHandleKind::SocketDgram => "socket_dgram",
                         BrokerHandleKind::TcpConn => "tcp_conn",
                         BrokerHandleKind::InetListener => "inet_listener",
                         BrokerHandleKind::InetDgram => "inet_dgram",
@@ -8210,6 +8292,11 @@ impl<FS: ShimFS> Task<FS> {
                             .map(|p| alloc::sync::Arc::clone(p) as _),
                         BrokerHandleKind::UnixSocket => {
                             super::broker_socketpair::broker_socketpair_provider()
+                                .as_ref()
+                                .map(|p| alloc::sync::Arc::clone(p) as _)
+                        }
+                        BrokerHandleKind::SocketDgram => {
+                            super::broker_socket_dgram::broker_socket_dgram_provider()
                                 .as_ref()
                                 .map(|p| alloc::sync::Arc::clone(p) as _)
                         }
@@ -8434,6 +8521,50 @@ impl<FS: ShimFS> Task<FS> {
                     broker_eventfd_specs.push(alloc::format!(
                         "{raw_fd}:unix_socket:{handle_id}:{endpoint_char}"
                     ));
+                }
+            }
+
+            let broker_socket_dgram_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<
+                    litebox::fd::TypedFd<super::broker_socket_dgram::BrokerSocketDgramSubsystem>,
+                >,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) = rds
+                        .fd_from_raw_integer::<super::broker_socket_dgram::BrokerSocketDgramSubsystem>(
+                            raw_fd,
+                        )
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in broker_socket_dgram_fds {
+                let provider = super::broker_socket_dgram::broker_socket_dgram_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let handle_id = dt_local.with_entry(
+                    &typed,
+                    |fd: &super::broker_socket_dgram::BrokerSocketDgramFd<crate::Platform>| {
+                        fd.handle()
+                    },
+                );
+                drop(dt_local);
+                if let (Some(provider), Some(handle_id)) = (provider, handle_id) {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
+                    broker_eventfd_specs.push(alloc::format!("{raw_fd}:socket_dgram:{handle_id}"));
                 }
             }
 
@@ -9901,9 +10032,9 @@ fn worker_exec_input_binding<FS: ShimFS>(
             }
 
             // ExternalFd: the worker needs this fd dup2'd onto its stdio slot.
-            // The pipe bridge mechanism (--pipe-bridge) only applies to
-            // fork-restore, not exec.  For exec, we use posix_spawn file actions
-            // to dup2 the host fd onto the target stdio slot.
+            // The Unix-socket passthrough mechanism (--unix-socket-passthrough)
+            // only applies to fork-restore, not exec. For exec, we use
+            // posix_spawn file actions to dup2 the host fd onto the target stdio slot.
             crate::RawFdRef::ExternalFd(hp_fd) => {
                 let dt = global.litebox.descriptor_table();
                 if let Some(host_fd) =

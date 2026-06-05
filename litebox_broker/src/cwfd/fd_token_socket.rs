@@ -1397,6 +1397,14 @@ fn handle_control_connection_inner(
                     | Opcode::ReadPipe
                     | Opcode::WritePipe
                     | Opcode::AttachHostFd
+                    | Opcode::CreateSocketDgram
+                    | Opcode::SocketDgramBind
+                    | Opcode::SocketDgramConnect
+                    | Opcode::SocketDgramSendTo
+                    | Opcode::SocketDgramRecvFrom
+                    | Opcode::SocketDgramShutdown
+                    | Opcode::SocketDgramGetSockName
+                    | Opcode::SocketDgramGetPeerName
                     | Opcode::CreateSocketPair
                     | Opcode::ReadSocketPair
                     | Opcode::WriteSocketPair
