@@ -365,8 +365,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     ///   no-op that exports the target ProcessId as the child restore token.
     /// - legacy `Pidfd` without a broker subscription: returns `Ok(None)`.
     /// - `Timerfd`: returns `Ok(None)` — timerfd state is not
-    ///   currently broker-backed; the child loses timer state
-    ///   across fork (acceptable since timerfd-across-fork is rare).
+    ///   currently broker-backed. The non-PIE worker-exec bridge has
+    ///   a best-effort timerfd reconstruction path, but the true
+    ///   fork-snapshot broker-handle path still cannot preserve the
+    ///   exact kernel timer object or accumulated expiration count.
     ///
     /// For handle-backed kinds, the caller MUST `dup_handle` the returned
     /// handle and arrange rollback `release`. For Phase B.2 pidfds, the

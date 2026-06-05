@@ -1774,6 +1774,13 @@ impl<FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<FS> {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// Open a broker-tracked pidfd for process-exit observation.
+    ///
+    /// Audit note: `pidfd_send_signal(2)` is not decoded into a
+    /// `SyscallRequest` today, so the raw syscall returns the generic
+    /// unsupported-syscall error under Litebox. The harness test
+    /// `PIDFD.send_signal` records that product gap without changing
+    /// the working `pidfd_open`/poll path.
     pub(crate) fn sys_pidfd_open(&self, pid: i32, flags: u32) -> Result<usize, Errno> {
         const PIDFD_NONBLOCK: u32 = OFlags::NONBLOCK.bits();
 
