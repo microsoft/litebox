@@ -2,42 +2,41 @@
 // Licensed under the MIT license.
 
 //! Reusable byte codec for broker request/response control-channel messages.
+//!
+//! The wire codec mirrors the protocol DTO hierarchy:
+//! - this module owns public encode/decode entry points and top-level broker
+//!   envelope tags;
+//! - `core_message` owns `CoreRequest`/`CoreResponse` family tags;
+//! - object-family modules such as `event` own their operation and nested value
+//!   tags;
+//! - `primitive` owns shared scalar/value encoders.
+//!
+//! New object families should add a core family tag and a private family codec
+//! module instead of adding flat helpers here. Existing payloads are positional;
+//! changing fields is an ABI change, so prefer a new operation tag or explicit
+//! negotiated-version gate for payload evolution.
 
 use core::fmt;
 
 use alloc::vec::Vec;
 
 use crate::{
-    AddEventRequest, AddEventResponse, BrokerRequest, BrokerResponse, ConsumeEventRequest,
-    ConsumeEventResponse, CoreRequest, CoreResponse, CreateEventRequest, CreateEventResponse,
-    ErrorCode, EventConsumeMode, EventRequest, EventResponse, ObjectHandle,
-    ObjectReferenceGeneration, ObjectReferenceId, ProtocolVersion, ReadinessState,
-    ReceivedBrokerRequest, ReceivedBrokerResponse, WaitEventRequest, WaitEventResponse,
-    WaitOutcome,
+    BrokerRequest, BrokerResponse, ErrorCode, ReceivedBrokerRequest, ReceivedBrokerResponse,
 };
+
+use primitive::{Decoder, Encoder};
+
+mod core_message;
+mod event;
+mod primitive;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_CORE: u8 = 1;
-const CORE_REQUEST_TAG_EVENT: u8 = 0;
-const EVENT_REQUEST_TAG_CREATE: u8 = 0;
-const EVENT_REQUEST_TAG_WAIT: u8 = 1;
-const EVENT_REQUEST_TAG_ADD: u8 = 2;
-const EVENT_REQUEST_TAG_CONSUME: u8 = 3;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_CORE: u8 = 1;
 const RESPONSE_TAG_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
-const CORE_RESPONSE_TAG_EVENT: u8 = 0;
-const EVENT_RESPONSE_TAG_CREATED: u8 = 0;
-const EVENT_RESPONSE_TAG_WAITED: u8 = 1;
-const EVENT_RESPONSE_TAG_ADDED: u8 = 2;
-const EVENT_RESPONSE_TAG_CONSUMED: u8 = 3;
-
-const WAIT_OUTCOME_TAG_READY: u8 = 1;
-const WAIT_OUTCOME_TAG_WOULD_BLOCK: u8 = 2;
-const EVENT_CONSUME_MODE_TAG_ALL: u8 = 1;
-const EVENT_CONSUME_MODE_TAG_ONE: u8 = 2;
 
 /// Error produced while encoding or decoding a broker wire message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,45 +74,14 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
     match request {
         BrokerRequest::Negotiate { protocol_version } => {
             encoder.u8(REQUEST_TAG_NEGOTIATE);
-            encoder.u16(protocol_version.major);
-            encoder.u16(protocol_version.minor);
+            encoder.protocol_version(protocol_version);
         }
-        BrokerRequest::Core(request) => encode_core_request(&mut encoder, request),
+        BrokerRequest::Core(request) => {
+            encoder.u8(REQUEST_TAG_CORE);
+            core_message::encode_core_request(&mut encoder, request);
+        }
     }
     encoder.finish()
-}
-
-fn encode_core_request(encoder: &mut Encoder, request: CoreRequest) {
-    encoder.u8(REQUEST_TAG_CORE);
-    match request {
-        CoreRequest::Event(request) => {
-            encoder.u8(CORE_REQUEST_TAG_EVENT);
-            encode_event_request(encoder, request);
-        }
-    }
-}
-
-fn encode_event_request(encoder: &mut Encoder, request: EventRequest) {
-    match request {
-        EventRequest::Create(request) => {
-            encoder.u8(EVENT_REQUEST_TAG_CREATE);
-            encoder.u64(request.initial_count);
-        }
-        EventRequest::Wait(request) => {
-            encoder.u8(EVENT_REQUEST_TAG_WAIT);
-            encoder.handle(request.handle);
-        }
-        EventRequest::Add(request) => {
-            encoder.u8(EVENT_REQUEST_TAG_ADD);
-            encoder.handle(request.handle);
-            encoder.u64(request.value);
-        }
-        EventRequest::Consume(request) => {
-            encoder.u8(EVENT_REQUEST_TAG_CONSUME);
-            encoder.handle(request.handle);
-            encode_event_consume_mode(encoder, request.mode);
-        }
-    }
 }
 
 /// Decodes a broker request body.
@@ -122,9 +90,9 @@ pub fn decode_request(frame: &[u8]) -> Result<ReceivedBrokerRequest, WireError> 
     let tag = decoder.u8()?;
     let request = match tag {
         REQUEST_TAG_NEGOTIATE => BrokerRequest::Negotiate {
-            protocol_version: ProtocolVersion::new(decoder.u16()?, decoder.u16()?),
+            protocol_version: decoder.protocol_version()?,
         },
-        REQUEST_TAG_CORE => match decode_core_request(&mut decoder)? {
+        REQUEST_TAG_CORE => match core_message::decode_core_request(&mut decoder)? {
             Some(request) => BrokerRequest::Core(request),
             None => return Ok(ReceivedBrokerRequest::Unknown),
         },
@@ -132,38 +100,6 @@ pub fn decode_request(frame: &[u8]) -> Result<ReceivedBrokerRequest, WireError> 
     };
     decoder.finish()?;
     Ok(ReceivedBrokerRequest::Request(request))
-}
-
-fn decode_core_request(decoder: &mut Decoder<'_>) -> Result<Option<CoreRequest>, WireError> {
-    let request = match decoder.u8()? {
-        CORE_REQUEST_TAG_EVENT => match decode_event_request(decoder)? {
-            Some(request) => CoreRequest::Event(request),
-            None => return Ok(None),
-        },
-        _ => return Ok(None),
-    };
-
-    Ok(Some(request))
-}
-
-fn decode_event_request(decoder: &mut Decoder<'_>) -> Result<Option<EventRequest>, WireError> {
-    let request = match decoder.u8()? {
-        EVENT_REQUEST_TAG_CREATE => EventRequest::Create(CreateEventRequest::new(decoder.u64()?)),
-        EVENT_REQUEST_TAG_WAIT => EventRequest::Wait(WaitEventRequest::new(decoder.handle()?)),
-        EVENT_REQUEST_TAG_ADD => {
-            EventRequest::Add(AddEventRequest::new(decoder.handle()?, decoder.u64()?))
-        }
-        EVENT_REQUEST_TAG_CONSUME => EventRequest::Consume(ConsumeEventRequest::new(
-            decoder.handle()?,
-            match decode_event_consume_mode(decoder)? {
-                Some(mode) => mode,
-                None => return Ok(None),
-            },
-        )),
-        _ => return Ok(None),
-    };
-
-    Ok(Some(request))
 }
 
 /// Encodes a broker response body.
@@ -177,17 +113,18 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             broker_protocol_version,
         } => {
             encoder.u8(RESPONSE_TAG_NEGOTIATED);
-            encoder.u16(broker_protocol_version.major);
-            encoder.u16(broker_protocol_version.minor);
+            encoder.protocol_version(broker_protocol_version);
         }
         BrokerResponse::VersionMismatch {
             broker_protocol_version,
         } => {
             encoder.u8(RESPONSE_TAG_VERSION_MISMATCH);
-            encoder.u16(broker_protocol_version.major);
-            encoder.u16(broker_protocol_version.minor);
+            encoder.protocol_version(broker_protocol_version);
         }
-        BrokerResponse::Core(response) => encode_core_response(&mut encoder, response),
+        BrokerResponse::Core(response) => {
+            encoder.u8(RESPONSE_TAG_CORE);
+            core_message::encode_core_response(&mut encoder, response);
+        }
         BrokerResponse::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.u16(error.as_raw());
@@ -196,63 +133,18 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
     encoder.finish()
 }
 
-fn encode_core_response(encoder: &mut Encoder, response: CoreResponse) {
-    encoder.u8(RESPONSE_TAG_CORE);
-    match response {
-        CoreResponse::Event(response) => {
-            encoder.u8(CORE_RESPONSE_TAG_EVENT);
-            encode_event_response(encoder, response);
-        }
-    }
-}
-
-fn encode_event_response(encoder: &mut Encoder, response: EventResponse) {
-    match response {
-        EventResponse::Create(response) => {
-            encoder.u8(EVENT_RESPONSE_TAG_CREATED);
-            encoder.handle(response.handle);
-        }
-        EventResponse::Wait(response) => {
-            encoder.u8(EVENT_RESPONSE_TAG_WAITED);
-            encode_wait_outcome(encoder, response.outcome);
-        }
-        EventResponse::Add(response) => {
-            encoder.u8(EVENT_RESPONSE_TAG_ADDED);
-            encoder.readiness(response.readiness);
-        }
-        EventResponse::Consume(response) => {
-            encoder.u8(EVENT_RESPONSE_TAG_CONSUMED);
-            encoder.u64(response.value);
-            encoder.readiness(response.readiness);
-        }
-    }
-}
-
-fn encode_wait_outcome(encoder: &mut Encoder, outcome: WaitOutcome) {
-    match outcome {
-        WaitOutcome::Ready(readiness) => {
-            encoder.u8(WAIT_OUTCOME_TAG_READY);
-            encoder.readiness(readiness);
-        }
-        WaitOutcome::WouldBlock(readiness) => {
-            encoder.u8(WAIT_OUTCOME_TAG_WOULD_BLOCK);
-            encoder.readiness(readiness);
-        }
-    }
-}
-
 /// Decodes a broker response body.
 pub fn decode_response(frame: &[u8]) -> Result<ReceivedBrokerResponse, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     let response = match tag {
         RESPONSE_TAG_NEGOTIATED => BrokerResponse::Negotiated {
-            broker_protocol_version: ProtocolVersion::new(decoder.u16()?, decoder.u16()?),
+            broker_protocol_version: decoder.protocol_version()?,
         },
         RESPONSE_TAG_VERSION_MISMATCH => BrokerResponse::VersionMismatch {
-            broker_protocol_version: ProtocolVersion::new(decoder.u16()?, decoder.u16()?),
+            broker_protocol_version: decoder.protocol_version()?,
         },
-        RESPONSE_TAG_CORE => match decode_core_response(&mut decoder)? {
+        RESPONSE_TAG_CORE => match core_message::decode_core_response(&mut decoder)? {
             Some(response) => BrokerResponse::Core(response),
             None => return Ok(ReceivedBrokerResponse::Unknown),
         },
@@ -266,178 +158,15 @@ pub fn decode_response(frame: &[u8]) -> Result<ReceivedBrokerResponse, WireError
     Ok(ReceivedBrokerResponse::Response(response))
 }
 
-fn decode_core_response(decoder: &mut Decoder<'_>) -> Result<Option<CoreResponse>, WireError> {
-    let response = match decoder.u8()? {
-        CORE_RESPONSE_TAG_EVENT => match decode_event_response(decoder)? {
-            Some(response) => CoreResponse::Event(response),
-            None => return Ok(None),
-        },
-        _ => return Ok(None),
-    };
-
-    Ok(Some(response))
-}
-
-fn decode_event_response(decoder: &mut Decoder<'_>) -> Result<Option<EventResponse>, WireError> {
-    let response = match decoder.u8()? {
-        EVENT_RESPONSE_TAG_CREATED => {
-            EventResponse::Create(CreateEventResponse::new(decoder.handle()?))
-        }
-        EVENT_RESPONSE_TAG_WAITED => EventResponse::Wait(WaitEventResponse::new(
-            match decode_wait_outcome(decoder)? {
-                Some(outcome) => outcome,
-                None => return Ok(None),
-            },
-        )),
-        EVENT_RESPONSE_TAG_ADDED => EventResponse::Add(AddEventResponse::new(decoder.readiness()?)),
-        EVENT_RESPONSE_TAG_CONSUMED => EventResponse::Consume(ConsumeEventResponse::new(
-            decoder.u64()?,
-            decoder.readiness()?,
-        )),
-        _ => return Ok(None),
-    };
-
-    Ok(Some(response))
-}
-
-fn decode_wait_outcome(decoder: &mut Decoder<'_>) -> Result<Option<WaitOutcome>, WireError> {
-    match decoder.u8()? {
-        WAIT_OUTCOME_TAG_READY => Ok(Some(WaitOutcome::Ready(decoder.readiness()?))),
-        WAIT_OUTCOME_TAG_WOULD_BLOCK => Ok(Some(WaitOutcome::WouldBlock(decoder.readiness()?))),
-        _ => Ok(None),
-    }
-}
-
-fn encode_event_consume_mode(encoder: &mut Encoder, mode: EventConsumeMode) {
-    match mode {
-        EventConsumeMode::All => {
-            encoder.u8(EVENT_CONSUME_MODE_TAG_ALL);
-        }
-        EventConsumeMode::One => {
-            encoder.u8(EVENT_CONSUME_MODE_TAG_ONE);
-        }
-    }
-}
-
-fn decode_event_consume_mode(
-    decoder: &mut Decoder<'_>,
-) -> Result<Option<EventConsumeMode>, WireError> {
-    match decoder.u8()? {
-        EVENT_CONSUME_MODE_TAG_ALL => Ok(Some(EventConsumeMode::All)),
-        EVENT_CONSUME_MODE_TAG_ONE => Ok(Some(EventConsumeMode::One)),
-        _ => Ok(None),
-    }
-}
-
-#[derive(Default)]
-struct Encoder {
-    bytes: Vec<u8>,
-}
-
-impl Encoder {
-    fn finish(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    fn bool(&mut self, value: bool) {
-        self.u8(u8::from(value));
-    }
-
-    fn u8(&mut self, value: u8) {
-        self.bytes.push(value);
-    }
-
-    fn u16(&mut self, value: u16) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn handle(&mut self, handle: ObjectHandle) {
-        self.u64(handle.reference_id.get());
-        self.u64(handle.reference_generation.get());
-    }
-
-    fn readiness(&mut self, readiness: ReadinessState) {
-        self.bool(readiness.read_ready);
-        self.bool(readiness.write_ready);
-        self.u64(readiness.generation);
-    }
-}
-
-struct Decoder<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> Decoder<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn finish(&self) -> Result<(), WireError> {
-        if self.offset == self.bytes.len() {
-            Ok(())
-        } else {
-            Err(WireError::TrailingBytes)
-        }
-    }
-
-    fn bool(&mut self) -> Result<bool, WireError> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(WireError::InvalidBoolean),
-        }
-    }
-
-    fn u8(&mut self) -> Result<u8, WireError> {
-        let bytes = self.take(1)?;
-        Ok(bytes[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, WireError> {
-        let bytes = self.take(2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-
-    fn u64(&mut self) -> Result<u64, WireError> {
-        let bytes = self.take(8)?;
-        Ok(u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
-    }
-
-    fn handle(&mut self) -> Result<ObjectHandle, WireError> {
-        let reference_id = ObjectReferenceId::new(self.u64()?);
-        let reference_generation = ObjectReferenceGeneration::new(self.u64()?);
-
-        Ok(ObjectHandle::new(reference_id, reference_generation))
-    }
-
-    fn readiness(&mut self) -> Result<ReadinessState, WireError> {
-        Ok(ReadinessState::new(self.bool()?, self.bool()?, self.u64()?))
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8], WireError> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or(WireError::OffsetOverflow)?;
-        let bytes = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or(WireError::TruncatedFrame)?;
-        self.offset = end;
-        Ok(bytes)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse, CoreRequest,
+        CoreResponse, CreateEventRequest, CreateEventResponse, EventConsumeMode, EventRequest,
+        EventResponse, ObjectHandle, ObjectReferenceGeneration, ObjectReferenceId, ProtocolVersion,
+        ReadinessState, WaitEventRequest, WaitEventResponse, WaitOutcome,
+    };
 
     #[test]
     fn request_codec_round_trips_all_variants() {
@@ -559,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_response_wire_shape_is_pinned() {
+    fn event_add_response_wire_shape_is_pinned() {
         assert_eq!(
             encode_response(event_response(EventResponse::Add(AddEventResponse::new(
                 ReadinessState::new(true, false, 0x0102_0304_0506_0708)
