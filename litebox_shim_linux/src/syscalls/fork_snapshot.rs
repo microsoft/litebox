@@ -311,6 +311,8 @@ pub enum BrokerHandleKind {
     InetListener = 8,
     /// Broker-hosted UDP datagram socket.
     InetDgram = 9,
+    /// Broker-hosted AF_UNIX SOCK_DGRAM socket.
+    SocketDgram = 10,
 }
 
 impl BrokerHandleKind {
@@ -332,6 +334,7 @@ impl BrokerHandleKind {
             7 => Self::TcpConn,
             8 => Self::InetListener,
             9 => Self::InetDgram,
+            10 => Self::SocketDgram,
             _ => return None,
         })
     }
@@ -2209,6 +2212,7 @@ mod tests {
                 BrokerHandleKind::TcpConn,
                 BrokerHandleKind::InetListener,
                 BrokerHandleKind::InetDgram,
+                BrokerHandleKind::SocketDgram,
             ];
             for k in &kinds {
                 match k {
@@ -2220,7 +2224,8 @@ mod tests {
                     | BrokerHandleKind::UnixSocket
                     | BrokerHandleKind::TcpConn
                     | BrokerHandleKind::InetListener
-                    | BrokerHandleKind::InetDgram => {}
+                    | BrokerHandleKind::InetDgram
+                    | BrokerHandleKind::SocketDgram => {}
                 }
             }
             kinds
@@ -2301,8 +2306,8 @@ mod tests {
                 }
             }
         }
-        // 8 kinds × 3 dir options × 3 endpoint options × 8 ids = 576 cases.
-        assert_eq!(total_cases, 576, "expected to cover 576 combinations");
+        // 9 kinds × 3 dir options × 3 endpoint options × 8 ids = 648 cases.
+        assert_eq!(total_cases, 648, "expected to cover 648 combinations");
     }
 
     #[test]

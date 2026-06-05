@@ -195,7 +195,7 @@ Adds the broker B1 primitive that the legacy-pipes phase-3 migration
 needs: a worker can SCM_RIGHTS-pass a host fd to the broker, which
 takes ownership and exposes it as a BrokerPipe-shaped state handle.
 Subsequent commits wire this into the parent-side mux-stream eager
-install path, retiring --pipe-bridge.
+install path, retiring the broad --pipe-bridge path.
 
 * New SubsystemTag::HostFd (wire u8 = 16).
 * New Opcode::AttachHostFd / AttachHostFdResponse (0x53 / 0xD3).

@@ -79,6 +79,7 @@ use crate::cwfd::pipe_state::{PipeReadEnd, PipeWriteEnd};
 use crate::cwfd::process_state::ProcessState;
 use crate::cwfd::pty_state::PtyState;
 use crate::cwfd::signalfd_state::SignalfdState;
+use crate::cwfd::socket_dgram_state::SocketDgramState;
 use crate::cwfd::socketpair_state::SocketPairEnd;
 use crate::cwfd::subscription_list::{SubscribeError, UnsubscribeError};
 use crate::cwfd::tcp_conn_state::TcpConnState;
@@ -192,6 +193,7 @@ pub enum StateKind {
     PipeReadEnd,
     PipeWriteEnd,
     SocketPairEnd,
+    SocketDgram,
     TcpConn,
     InetListener,
     InetDgram,
@@ -211,6 +213,7 @@ pub enum StateObjectEnum {
     PipeReadEnd(Arc<PipeReadEnd>),
     PipeWriteEnd(Arc<PipeWriteEnd>),
     SocketPairEnd(Arc<SocketPairEnd>),
+    SocketDgram(Arc<SocketDgramState>),
     TcpConn(Arc<TcpConnState>),
     InetListener(Arc<InetListenerState>),
     InetDgram(Arc<InetDgramState>),
@@ -230,6 +233,7 @@ impl StateObjectEnum {
             StateObjectEnum::PipeReadEnd(_) => StateKind::PipeReadEnd,
             StateObjectEnum::PipeWriteEnd(_) => StateKind::PipeWriteEnd,
             StateObjectEnum::SocketPairEnd(_) => StateKind::SocketPairEnd,
+            StateObjectEnum::SocketDgram(_) => StateKind::SocketDgram,
             StateObjectEnum::TcpConn(_) => StateKind::TcpConn,
             StateObjectEnum::InetListener(_) => StateKind::InetListener,
             StateObjectEnum::InetDgram(_) => StateKind::InetDgram,
@@ -249,6 +253,7 @@ impl StateObjectEnum {
             StateObjectEnum::PipeReadEnd(state) => state.subsystem_tag(),
             StateObjectEnum::PipeWriteEnd(state) => state.subsystem_tag(),
             StateObjectEnum::SocketPairEnd(state) => state.subsystem_tag(),
+            StateObjectEnum::SocketDgram(state) => state.subsystem_tag(),
             StateObjectEnum::TcpConn(state) => state.subsystem_tag(),
             StateObjectEnum::InetListener(state) => state.subsystem_tag(),
             StateObjectEnum::InetDgram(state) => state.subsystem_tag(),
@@ -279,6 +284,9 @@ impl StateObjectEnum {
                 state.subscribe(subscription_id, events_mask, sender)
             }
             StateObjectEnum::SocketPairEnd(state) => {
+                state.subscribe(subscription_id, events_mask, sender)
+            }
+            StateObjectEnum::SocketDgram(state) => {
                 state.subscribe(subscription_id, events_mask, sender)
             }
             StateObjectEnum::TcpConn(state) => {
@@ -316,6 +324,7 @@ impl StateObjectEnum {
             StateObjectEnum::PipeReadEnd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::PipeWriteEnd(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::SocketPairEnd(state) => state.unsubscribe(subscription_id),
+            StateObjectEnum::SocketDgram(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::TcpConn(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::InetListener(state) => state.unsubscribe(subscription_id),
             StateObjectEnum::InetDgram(state) => state.unsubscribe(subscription_id),
@@ -335,6 +344,7 @@ impl StateObjectEnum {
             StateObjectEnum::PipeReadEnd(state) => state.current_events(),
             StateObjectEnum::PipeWriteEnd(state) => state.current_events(),
             StateObjectEnum::SocketPairEnd(state) => state.current_events(),
+            StateObjectEnum::SocketDgram(state) => state.current_events(),
             StateObjectEnum::TcpConn(state) => state.current_events(),
             StateObjectEnum::InetListener(state) => state.current_events(),
             StateObjectEnum::InetDgram(state) => state.current_events(),
@@ -354,6 +364,7 @@ impl StateObjectEnum {
             StateObjectEnum::PipeReadEnd(state) => state.try_flush_subscriptions(),
             StateObjectEnum::PipeWriteEnd(state) => state.try_flush_subscriptions(),
             StateObjectEnum::SocketPairEnd(state) => state.try_flush_subscriptions(),
+            StateObjectEnum::SocketDgram(state) => state.try_flush_subscriptions(),
             StateObjectEnum::TcpConn(state) => state.try_flush_subscriptions(),
             StateObjectEnum::InetListener(state) => state.try_flush_subscriptions(),
             StateObjectEnum::InetDgram(state) => state.try_flush_subscriptions(),
@@ -374,6 +385,7 @@ impl StateObjectEnum {
             StateObjectEnum::PipeReadEnd(state) => state.debug_repr(),
             StateObjectEnum::PipeWriteEnd(state) => state.debug_repr(),
             StateObjectEnum::SocketPairEnd(state) => state.debug_repr(),
+            StateObjectEnum::SocketDgram(state) => state.debug_repr(),
             StateObjectEnum::TcpConn(state) => state.debug_repr(),
             StateObjectEnum::InetListener(state) => state.debug_repr(),
             StateObjectEnum::InetDgram(state) => state.debug_repr(),
@@ -445,6 +457,12 @@ impl From<Arc<PipeWriteEnd>> for StateObjectEnum {
 impl From<Arc<SocketPairEnd>> for StateObjectEnum {
     fn from(state: Arc<SocketPairEnd>) -> Self {
         StateObjectEnum::SocketPairEnd(state)
+    }
+}
+
+impl From<Arc<SocketDgramState>> for StateObjectEnum {
+    fn from(state: Arc<SocketDgramState>) -> Self {
+        StateObjectEnum::SocketDgram(state)
     }
 }
 
@@ -770,6 +788,7 @@ impl BrokerStateRegistry {
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::InetRaw(_)
@@ -832,6 +851,7 @@ impl BrokerStateRegistry {
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::InetRaw(_)

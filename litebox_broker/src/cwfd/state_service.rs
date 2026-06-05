@@ -36,6 +36,10 @@ use crate::pipe_state::{PipeError, PipeReadEnd, PipeWriteEnd};
 use crate::process_state::ProcessState;
 use crate::pty_state::{PtyError, PtyState};
 use crate::signalfd_state::SignalfdState;
+use crate::socket_dgram_state::{
+    SocketDgramError, SocketDgramState, decode_addr as decode_socket_dgram_addr,
+    encode_addr as encode_socket_dgram_addr,
+};
 use crate::socketpair_state::{SocketPairEnd, SocketPairError};
 use crate::state_registry::{
     BrokerStateRegistry, StateHandle, StateObjectEnum, StateRegistryError,
@@ -333,6 +337,18 @@ fn dispatch_request(
         Opcode::RegisterOfd => handle_register_ofd(conn, request),
         Opcode::CloneOfd => handle_clone_ofd(conn, request),
         Opcode::BindNinePSession => handle_bind_nine_p_session(conn, request),
+        Opcode::CreateSocketDgram => handle_create_socket_dgram(registry, request, in_fds),
+        Opcode::SocketDgramBind => handle_socket_dgram_bind(registry, request, in_fds),
+        Opcode::SocketDgramConnect => handle_socket_dgram_connect(registry, request, in_fds),
+        Opcode::SocketDgramSendTo => handle_socket_dgram_sendto(registry, request, in_fds),
+        Opcode::SocketDgramRecvFrom => handle_socket_dgram_recvfrom(registry, request, in_fds),
+        Opcode::SocketDgramShutdown => handle_socket_dgram_shutdown(registry, request, in_fds),
+        Opcode::SocketDgramGetSockName => {
+            handle_socket_dgram_getsockname(registry, request, in_fds)
+        }
+        Opcode::SocketDgramGetPeerName => {
+            handle_socket_dgram_getpeername(registry, request, in_fds)
+        }
         Opcode::CreateSocketPair => handle_create_socketpair(registry, request, in_fds),
         Opcode::ReadSocketPair => handle_read_socketpair(registry, request, in_fds),
         Opcode::WriteSocketPair => handle_write_socketpair(registry, request, in_fds),
@@ -1107,6 +1123,7 @@ fn resolve_pipe_read(
             StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
@@ -1140,6 +1157,7 @@ fn resolve_pipe_write(
             StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
@@ -1288,6 +1306,271 @@ fn handle_write_pipe(
     }
 }
 
+fn socket_dgram_status(err: SocketDgramError) -> StatusCode {
+    match err {
+        SocketDgramError::WouldBlock => StatusCode::WouldBlock,
+        SocketDgramError::InvalidSockaddr
+        | SocketDgramError::AlreadyBound
+        | SocketDgramError::AddrInUse
+        | SocketDgramError::NoPeer
+        | SocketDgramError::NotConnected
+        | SocketDgramError::Shutdown => StatusCode::InvalidValue,
+    }
+}
+
+fn resolve_socket_dgram(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+) -> Result<Arc<SocketDgramState>, StatusCode> {
+    match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::UnixSocket) {
+        Ok(s) => match s.as_ref() {
+            StateObjectEnum::SocketDgram(state) => Ok(Arc::clone(state)),
+            StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeReadEnd(_)
+            | StateObjectEnum::PipeWriteEnd(_)
+            | StateObjectEnum::InetListener(_)
+            | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
+            | StateObjectEnum::Pty(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::TcpConn(_)
+            | StateObjectEnum::Process(_)
+            | StateObjectEnum::HostFdAttached(_) => Err(StatusCode::SubsystemMismatch),
+        },
+        Err(StateRegistryError::UnknownHandle(_)) => Err(StatusCode::UnknownHandle),
+        Err(StateRegistryError::TagMismatch { .. }) => Err(StatusCode::SubsystemMismatch),
+        Err(_) => Err(StatusCode::Internal),
+    }
+}
+
+fn handle_create_socket_dgram(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() || proto::parse_create_socket_dgram_body(request.body).is_err() {
+        return protocol_err(Opcode::CreateSocketDgramResponse);
+    }
+    let state = SocketDgramState::new();
+    let handle = registry.register(state);
+    HandlerResult {
+        frame: proto::build_create_socket_dgram_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn handle_socket_dgram_bind(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketDgramBindResponse);
+    }
+    let (handle_id, raw_addr) = match proto::parse_socket_dgram_bind_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketDgramBindResponse),
+    };
+    let state = match resolve_socket_dgram(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::SocketDgramBindResponse, status),
+    };
+    let addr = match decode_socket_dgram_addr(&raw_addr) {
+        Ok(addr) => addr,
+        Err(err) => return status_err(Opcode::SocketDgramBindResponse, socket_dgram_status(err)),
+    };
+    match state.bind(addr) {
+        Ok(bound) => HandlerResult {
+            frame: proto::build_socket_dgram_bind_response_ok(&encode_socket_dgram_addr(&bound)),
+            out_fd: None,
+        },
+        Err(err) => status_err(Opcode::SocketDgramBindResponse, socket_dgram_status(err)),
+    }
+}
+
+fn handle_socket_dgram_connect(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketDgramConnectResponse);
+    }
+    let (handle_id, raw_addr) = match proto::parse_socket_dgram_connect_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketDgramConnectResponse),
+    };
+    let state = match resolve_socket_dgram(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::SocketDgramConnectResponse, status),
+    };
+    let addr = match decode_socket_dgram_addr(&raw_addr) {
+        Ok(addr) => addr,
+        Err(err) => {
+            return status_err(Opcode::SocketDgramConnectResponse, socket_dgram_status(err));
+        }
+    };
+    match state.connect(addr) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_socket_dgram_connect_response_ok(),
+            out_fd: None,
+        },
+        Err(err) => status_err(Opcode::SocketDgramConnectResponse, socket_dgram_status(err)),
+    }
+}
+
+fn handle_socket_dgram_sendto(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketDgramSendToResponse);
+    }
+    let (handle_id, raw_addr, payload) = match proto::parse_socket_dgram_sendto_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketDgramSendToResponse),
+    };
+    let state = match resolve_socket_dgram(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::SocketDgramSendToResponse, status),
+    };
+    let addr = if raw_addr.is_empty() {
+        None
+    } else {
+        match decode_socket_dgram_addr(&raw_addr) {
+            Ok(addr) => Some(addr),
+            Err(err) => {
+                return status_err(Opcode::SocketDgramSendToResponse, socket_dgram_status(err));
+            }
+        }
+    };
+    match state.sendto(addr, &payload) {
+        Ok(n) => HandlerResult {
+            frame: proto::build_socket_dgram_sendto_response_ok(n as u64),
+            out_fd: None,
+        },
+        Err(err) => status_err(Opcode::SocketDgramSendToResponse, socket_dgram_status(err)),
+    }
+}
+
+fn handle_socket_dgram_recvfrom(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketDgramRecvFromResponse);
+    }
+    let (handle_id, max_len) = match proto::parse_socket_dgram_recvfrom_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketDgramRecvFromResponse),
+    };
+    let state = match resolve_socket_dgram(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::SocketDgramRecvFromResponse, status),
+    };
+    match state.recvfrom(max_len as usize) {
+        Ok((addr, payload, flags)) => HandlerResult {
+            frame: proto::build_socket_dgram_recvfrom_response_ok(
+                &encode_socket_dgram_addr(&addr),
+                &payload,
+                flags,
+            ),
+            out_fd: None,
+        },
+        Err(err) => status_err(
+            Opcode::SocketDgramRecvFromResponse,
+            socket_dgram_status(err),
+        ),
+    }
+}
+
+fn handle_socket_dgram_shutdown(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketDgramShutdownResponse);
+    }
+    let (handle_id, how) = match proto::parse_socket_dgram_shutdown_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketDgramShutdownResponse),
+    };
+    let state = match resolve_socket_dgram(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::SocketDgramShutdownResponse, status),
+    };
+    match state.shutdown(how) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_socket_dgram_shutdown_response_ok(),
+            out_fd: None,
+        },
+        Err(err) => status_err(
+            Opcode::SocketDgramShutdownResponse,
+            socket_dgram_status(err),
+        ),
+    }
+}
+
+fn handle_socket_dgram_getsockname(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketDgramGetSockNameResponse);
+    }
+    let handle_id = match parse_handle_body(request.body, Opcode::SocketDgramGetSockName) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketDgramGetSockNameResponse),
+    };
+    let state = match resolve_socket_dgram(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::SocketDgramGetSockNameResponse, status),
+    };
+    HandlerResult {
+        frame: proto::build_socket_dgram_getsockname_response_ok(&encode_socket_dgram_addr(
+            &state.getsockname(),
+        )),
+        out_fd: None,
+    }
+}
+
+fn handle_socket_dgram_getpeername(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketDgramGetPeerNameResponse);
+    }
+    let handle_id = match parse_handle_body(request.body, Opcode::SocketDgramGetPeerName) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketDgramGetPeerNameResponse),
+    };
+    let state = match resolve_socket_dgram(registry, handle_id) {
+        Ok(s) => s,
+        Err(status) => return status_err(Opcode::SocketDgramGetPeerNameResponse, status),
+    };
+    match state.getpeername() {
+        Ok(addr) => HandlerResult {
+            frame: proto::build_socket_dgram_getpeername_response_ok(&encode_socket_dgram_addr(
+                &addr,
+            )),
+            out_fd: None,
+        },
+        Err(err) => status_err(
+            Opcode::SocketDgramGetPeerNameResponse,
+            socket_dgram_status(err),
+        ),
+    }
+}
+
 fn handle_create_socketpair(
     registry: &BrokerStateRegistry,
     request: &Frame<'_>,
@@ -1329,7 +1612,8 @@ fn resolve_socketpair_end(
     match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::UnixSocket) {
         Ok(s) => match s.as_ref() {
             StateObjectEnum::SocketPairEnd(end) => Ok(Arc::clone(end)),
-            StateObjectEnum::Eventfd(_)
+            StateObjectEnum::SocketDgram(_)
+            | StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::InetListener(_)
@@ -1671,6 +1955,7 @@ fn resolve_tcp_conn(
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::InetRaw(_)
@@ -2021,6 +2306,7 @@ fn resolve_inet_dgram(
         | StateObjectEnum::PipeReadEnd(_)
         | StateObjectEnum::PipeWriteEnd(_)
         | StateObjectEnum::SocketPairEnd(_)
+        | StateObjectEnum::SocketDgram(_)
         | StateObjectEnum::TcpConn(_)
         | StateObjectEnum::InetListener(_)
         | StateObjectEnum::InetRaw(_)
@@ -2988,6 +3274,7 @@ fn resolve_pty(
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::SocketDgram(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)

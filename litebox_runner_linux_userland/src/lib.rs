@@ -22,6 +22,7 @@ pub mod broker_pidfd_provider;
 pub mod broker_pipe_provider;
 pub mod broker_pty_provider;
 pub mod broker_signalfd_provider;
+pub mod broker_socket_dgram_provider;
 pub mod broker_socketpair_provider;
 pub mod broker_tcp_conn_provider;
 pub mod guest_pid_provider;
@@ -218,11 +219,13 @@ pub struct CliArgs {
     #[arg(long = "fork-restore-ack-fd", hide = true, requires = "fork_restore")]
     pub fork_restore_ack_fd: Option<i32>,
 
-    /// Internal: pipe bridge specs for fork-restore (external-fd passthrough).
-    /// Each value has the format `guest_fd:direction:host_fd` where direction
-    /// is 'r' (read) or 'w' (write).
-    #[arg(long = "pipe-bridge", hide = true)]
-    pub pipe_bridge: Vec<String>,
+    /// Internal: bidirectional Unix-socket passthrough specs for worker spawn.
+    ///
+    /// Each value has the format `guest_fd:host_fd`. The host fd must refer
+    /// to the worker-side endpoint of a Unix socketpair that should be
+    /// installed as a read/write external fd in the guest fd table.
+    #[arg(long = "unix-socket-passthrough", hide = true)]
+    pub unix_socket_passthrough: Vec<String>,
 
     /// Internal: broker-fd-bridge spec list. Each entry is
     /// `fd:kind:handle_id[:direction]`, telling the worker to install a
@@ -320,6 +323,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         "pty" => BrokerHandleKind::Pty,
         "pipe" => BrokerHandleKind::Pipe,
         "unix_socket" => BrokerHandleKind::UnixSocket,
+        "socket_dgram" | "dgram" => BrokerHandleKind::SocketDgram,
         "tcp_conn" => BrokerHandleKind::TcpConn,
         "inet_listener" => BrokerHandleKind::InetListener,
         "inet_dgram" => BrokerHandleKind::InetDgram,
@@ -366,6 +370,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Eventfd, Some(extra))
         | (BrokerHandleKind::Pidfd, Some(extra))
         | (BrokerHandleKind::Signalfd, Some(extra))
+        | (BrokerHandleKind::SocketDgram, Some(extra))
         | (BrokerHandleKind::TcpConn, Some(extra))
         | (BrokerHandleKind::InetListener, Some(extra))
         | (BrokerHandleKind::InetDgram, Some(extra)) => {
@@ -377,6 +382,7 @@ fn parse_broker_fd_bridge_spec(spec: &str) -> Result<BrokerFdBridgeParsed> {
         (BrokerHandleKind::Eventfd, None)
         | (BrokerHandleKind::Pidfd, None)
         | (BrokerHandleKind::Signalfd, None)
+        | (BrokerHandleKind::SocketDgram, None)
         | (BrokerHandleKind::TcpConn, None)
         | (BrokerHandleKind::InetListener, None)
         | (BrokerHandleKind::InetDgram, None) => (None, None, None),
@@ -836,6 +842,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         } else {
             litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
         }
+    }
+
+    // Broker AF_UNIX SOCK_DGRAM remains opt-in while the probe matrix lands.
+    {
+        let enabled = std::env::var("LITEBOX_EAGER_BROKER_SOCKETDGRAM")
+            .ok()
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        litebox_shim_linux::syscalls::set_eager_broker_socket_dgram_enabled(enabled);
     }
 
     // Phase F: equivalent runtime gate for eager broker-backed
@@ -1361,9 +1376,10 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         )?;
         litebox_timing::emit("runner_program_loaded_ns");
 
-        // Install pipe bridges for inherited non-stdio fds (e.g. socketpair IPC).
-        let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
-        if !pipe_bridges.is_empty() {
+        // Install bidirectional Unix-socket passthroughs for inherited non-stdio fds.
+        let unix_socket_passthroughs =
+            parse_unix_socket_passthrough_specs(&cli_args.unix_socket_passthrough)?;
+        if !unix_socket_passthroughs.is_empty() {
             use std::io::Write;
             let mut diag = std::fs::OpenOptions::new()
                 .create(true)
@@ -1373,30 +1389,25 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             if let Some(f) = diag.as_mut() {
                 let _ = writeln!(
                     f,
-                    "[pipe-bridge-9p] pid={} installing {} bridges",
+                    "[unix-socket-passthrough-9p] pid={} installing {} bridges",
                     std::process::id(),
-                    pipe_bridges.len()
+                    unix_socket_passthroughs.len()
                 );
             }
-            for bridge in &pipe_bridges {
+            for bridge in &unix_socket_passthroughs {
                 let fd_valid = unsafe { libc::fcntl(bridge.host_fd, libc::F_GETFD) } >= 0;
                 if let Some(f) = diag.as_mut() {
                     let _ = writeln!(
                         f,
-                        "[pipe-bridge-9p] guest_fd={} host_fd={} dir={} valid={}",
-                        bridge.guest_fd, bridge.host_fd, bridge.direction as char, fd_valid
+                        "[unix-socket-passthrough-9p] guest_fd={} host_fd={} valid={}",
+                        bridge.guest_fd, bridge.host_fd, fd_valid
                     );
                 }
-                let direction = match bridge.direction {
-                    b'r' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Read,
-                    b'b' => {
-                        litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite
-                    }
-                    _ => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Write,
-                };
-                program
-                    .entrypoints
-                    .install_external_fd(bridge.guest_fd, bridge.host_fd, direction);
+                program.entrypoints.install_external_fd(
+                    bridge.guest_fd,
+                    bridge.host_fd,
+                    litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
+                );
             }
         }
 
@@ -1483,17 +1494,15 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         cli_args.working_directory.clone(),
     )?;
 
-    // Install pipe bridges for inherited non-stdio fds.
-    let pipe_bridges_tcp = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
-    for bridge in &pipe_bridges_tcp {
-        let direction = match bridge.direction {
-            b'r' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Read,
-            b'b' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
-            _ => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Write,
-        };
-        program
-            .entrypoints
-            .install_external_fd(bridge.guest_fd, bridge.host_fd, direction);
+    // Install bidirectional Unix-socket passthroughs for inherited non-stdio fds.
+    let unix_socket_passthroughs_tcp =
+        parse_unix_socket_passthrough_specs(&cli_args.unix_socket_passthrough)?;
+    for bridge in &unix_socket_passthroughs_tcp {
+        program.entrypoints.install_external_fd(
+            bridge.guest_fd,
+            bridge.host_fd,
+            litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
+        );
     }
 
     // Install broker-backed shim fd entries for fds inherited across
@@ -1807,8 +1816,9 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         .fork_restore_ack_fd
         .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-ack-fd"))?;
 
-    // Parse pipe bridge specs (external-fd passthrough from prior bridges).
-    let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
+    // Parse bidirectional Unix-socket passthrough specs.
+    let unix_socket_passthroughs =
+        parse_unix_socket_passthrough_specs(&cli_args.unix_socket_passthrough)?;
 
     // Parse local pipe pair specs (child-only pipes).
     let local_pipes = parse_local_pipe_specs(&cli_args.local_pipe)?;
@@ -1921,7 +1931,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             snapshot,
             combined_fs,
             ack_fd,
-            &pipe_bridges,
+            &unix_socket_passthroughs,
             &local_pipes,
             &cli_args.broker_fd_bridge,
         )?;
@@ -1946,7 +1956,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             snapshot,
             initial_file_system,
             ack_fd,
-            &pipe_bridges,
+            &unix_socket_passthroughs,
             &local_pipes,
             &cli_args.broker_fd_bridge,
         )?;
@@ -1954,41 +1964,35 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     }
 }
 
-/// A parsed pipe bridge specification from the `--pipe-bridge` CLI arg.
-/// Used for external-fd passthrough fds from prior delayed-fork bridges.
-struct PipeBridgeSpec {
+/// A parsed bidirectional Unix-socket passthrough specification from the
+/// `--unix-socket-passthrough` CLI arg.
+///
+/// Phase 3 moved host/vpipe/vsocket/vpty/fs streams to direct broker handles;
+/// the only remaining external-fd passthrough is the delayed-fork Unix
+/// socketpair case. Specs are therefore `guest_fd:host_fd`, and the installed
+/// direction is always read/write.
+#[derive(Debug)]
+struct UnixSocketPassthroughSpec {
     guest_fd: usize,
     host_fd: i32,
-    /// 'r' = read, 'w' = write, 'b' = bidirectional (unix socketpair).
-    direction: u8,
 }
 
-fn parse_pipe_bridge_specs(specs: &[String]) -> Result<Vec<PipeBridgeSpec>> {
-    let mut bridges = Vec::new();
+fn parse_unix_socket_passthrough_specs(specs: &[String]) -> Result<Vec<UnixSocketPassthroughSpec>> {
+    let mut passthroughs = Vec::new();
     for spec in specs {
         let parts: Vec<&str> = spec.split(':').collect();
-        if parts.len() != 3 {
-            anyhow::bail!("invalid --pipe-bridge format: {spec}");
+        if parts.len() != 2 {
+            anyhow::bail!("invalid --unix-socket-passthrough format: {spec}");
         }
         let guest_fd: usize = parts[0]
             .parse()
-            .map_err(|_| anyhow!("bad guest_fd in --pipe-bridge: {spec}"))?;
-        let direction = match parts[1] {
-            "r" => b'r',
-            "w" => b'w',
-            "b" => b'b',
-            _ => anyhow::bail!("bad direction in --pipe-bridge: {spec}"),
-        };
-        let host_fd: i32 = parts[2]
+            .map_err(|_| anyhow!("bad guest_fd in --unix-socket-passthrough: {spec}"))?;
+        let host_fd: i32 = parts[1]
             .parse()
-            .map_err(|_| anyhow!("bad host_fd in --pipe-bridge: {spec}"))?;
-        bridges.push(PipeBridgeSpec {
-            guest_fd,
-            host_fd,
-            direction,
-        });
+            .map_err(|_| anyhow!("bad host_fd in --unix-socket-passthrough: {spec}"))?;
+        passthroughs.push(UnixSocketPassthroughSpec { guest_fd, host_fd });
     }
-    Ok(bridges)
+    Ok(passthroughs)
 }
 
 /// Parsed local-pipe specification: `(write_fd, read_fd, drained_data, w_flags, r_flags)`.
@@ -2043,7 +2047,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     snapshot: litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot,
     fs: std::sync::Arc<FS>,
     ack_fd: i32,
-    pipe_bridges: &[PipeBridgeSpec],
+    unix_socket_passthroughs: &[UnixSocketPassthroughSpec],
     local_pipes: &[LocalPipeSpec],
     broker_fd_bridge_specs: &[String],
 ) -> Result<litebox_shim_linux::LoadedProgram<FS>> {
@@ -2051,18 +2055,13 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
 
     match shim.restore_process(snapshot, fs) {
         Ok(program) => {
-            // Install ExternalFd FDs for passthrough pipe bridges.
-            for bridge in pipe_bridges {
-                let direction = match bridge.direction {
-                    b'r' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Read,
-                    b'b' => {
-                        litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite
-                    }
-                    _ => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Write,
-                };
-                program
-                    .entrypoints
-                    .install_external_fd(bridge.guest_fd, bridge.host_fd, direction);
+            // Install ExternalFd entries for bidirectional Unix-socket passthroughs.
+            for bridge in unix_socket_passthroughs {
+                program.entrypoints.install_external_fd(
+                    bridge.guest_fd,
+                    bridge.host_fd,
+                    litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
+                );
             }
 
             // Install connected pipe pairs for child-only pipes (both
@@ -2442,17 +2441,15 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             cli_args.working_directory.clone(),
         )?;
 
-        // Install pipe bridges for inherited non-stdio fds (e.g. socketpair IPC).
-        let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
-        for bridge in &pipe_bridges {
-            let direction = match bridge.direction {
-                b'r' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Read,
-                b'b' => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
-                _ => litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::Write,
-            };
-            program
-                .entrypoints
-                .install_external_fd(bridge.guest_fd, bridge.host_fd, direction);
+        // Install bidirectional Unix-socket passthroughs for inherited non-stdio fds.
+        let unix_socket_passthroughs =
+            parse_unix_socket_passthrough_specs(&cli_args.unix_socket_passthrough)?;
+        for bridge in &unix_socket_passthroughs {
+            program.entrypoints.install_external_fd(
+                bridge.guest_fd,
+                bridge.host_fd,
+                litebox_shim_linux::syscalls::external_fd::ExternalFdDirection::ReadWrite,
+            );
         }
 
         // Install broker-backed shim fd entries for fds inherited across
@@ -3244,6 +3241,15 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     litebox_shim_linux::syscalls::set_broker_socketpair_provider(socketpair_provider)
         .map_err(|_| anyhow!("socketpair provider already set"))?;
 
+    let socket_dgram_provider = Arc::new(
+        crate::broker_socket_dgram_provider::RunnerBrokerSocketDgramProvider::new(
+            Arc::clone(&client),
+            Arc::clone(&dispatcher),
+        ),
+    );
+    litebox_shim_linux::syscalls::set_broker_socket_dgram_provider(socket_dgram_provider)
+        .map_err(|_| anyhow!("socket dgram provider already set"))?;
+
     litebox_shim_linux::syscalls::set_broker_inet_dgram_enabled(broker_inet_udp_enabled());
 
     if broker_inet_udp_enabled() {
@@ -3378,6 +3384,37 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unix_socket_passthrough_parser_accepts_bidi_only_specs() {
+        let specs = vec!["7:9".to_string(), "10:11".to_string()];
+        let parsed = parse_unix_socket_passthrough_specs(&specs).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].guest_fd, 7);
+        assert_eq!(parsed[0].host_fd, 9);
+        assert_eq!(parsed[1].guest_fd, 10);
+        assert_eq!(parsed[1].host_fd, 11);
+    }
+
+    #[test]
+    fn unix_socket_passthrough_parser_rejects_legacy_direction_specs() {
+        for spec in ["7:r:9", "7:w:9", "7:b:9"] {
+            let err = parse_unix_socket_passthrough_specs(&[spec.to_string()]).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("invalid --unix-socket-passthrough format"),
+                "unexpected error for {spec}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_socket_passthrough_parser_rejects_bad_fds() {
+        for spec in ["x:9", "7:x"] {
+            assert!(parse_unix_socket_passthrough_specs(&[spec.to_string()]).is_err());
+        }
+    }
+
     fn test_cli_args(program: &str) -> CliArgs {
         CliArgs {
             program_and_arguments: vec![program.to_string()],
@@ -3409,7 +3446,7 @@ mod tests {
             fork_restore: false,
             fork_restore_fd: None,
             fork_restore_ack_fd: None,
-            pipe_bridge: Vec::new(),
+            unix_socket_passthrough: Vec::new(),
             broker_fd_bridge: Vec::new(),
             local_pipe: Vec::new(),
             #[cfg(feature = "audit_log")]
