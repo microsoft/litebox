@@ -46,6 +46,7 @@ pub(crate) mod sockopt;
 pub(crate) mod special_cases;
 pub(crate) mod tcp_state;
 pub(crate) mod tcp_stress;
+pub(crate) mod uds_stream;
 pub(crate) mod vscode_shape;
 
 #[must_use]
@@ -1047,6 +1048,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     process_exit::register_process_exit_tests(&mut registry::Registry::new(&mut tests));
     signalfd_tests::register_signalfd_tests(&mut registry::Registry::new(&mut tests));
     signal_timer::register_signal_timer_tests(&mut registry::Registry::new(&mut tests));
+    uds_stream::register_uds_stream_tests(&mut registry::Registry::new(&mut tests));
     clone3_matrix::register_clone3_matrix(&mut registry::Registry::new(&mut tests));
     scm_rights::register_scm_rights_tests(&mut registry::Registry::new(&mut tests));
     sockopt::register_sockopt_tests(&mut registry::Registry::new(&mut tests));
