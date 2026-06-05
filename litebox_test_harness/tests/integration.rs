@@ -538,6 +538,7 @@ fn docker_run_base_args() -> Vec<String> {
     // invocations can flip runtime gates without a rebuild.
     for var in [
         "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+        "LITEBOX_EAGER_BROKER_SOCKETSEQPACKET",
         "LITEBOX_BROKER_TCP_CONN",
         "LITEBOX_BROKER_INET_RAW",
         "LITEBOX_BROKER_INET_DELAY_NS",
@@ -3156,6 +3157,7 @@ mod copilot {
         ];
         for var in [
             "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+            "LITEBOX_EAGER_BROKER_SOCKETSEQPACKET",
             "LITEBOX_BROKER_TCP_CONN",
             "LITEBOX_BROKER_INET_RAW",
             "LITEBOX_BROKER_INET_DELAY_NS",
@@ -4069,6 +4071,7 @@ process.exit(0);\n",
         ];
         for var in [
             "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+            "LITEBOX_EAGER_BROKER_SOCKETSEQPACKET",
             "LITEBOX_BROKER_TCP_CONN",
             "LITEBOX_PE10_DIAG",
             "LITEBOX_PE5_DIAG",

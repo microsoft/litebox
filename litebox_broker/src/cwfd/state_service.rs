@@ -40,6 +40,10 @@ use crate::socket_dgram_state::{
     SocketDgramError, SocketDgramState, decode_addr as decode_socket_dgram_addr,
     encode_addr as encode_socket_dgram_addr,
 };
+use crate::socket_seqpacket_state::{
+    SocketSeqPacketError, SocketSeqPacketState, decode_addr as decode_socket_seqpacket_addr,
+    encode_addr as encode_socket_seqpacket_addr,
+};
 use crate::socketpair_state::{SocketPairEnd, SocketPairError};
 use crate::state_registry::{
     BrokerStateRegistry, StateHandle, StateObjectEnum, StateRegistryError,
@@ -338,6 +342,7 @@ fn dispatch_request(
         Opcode::CloneOfd => handle_clone_ofd(conn, request),
         Opcode::BindNinePSession => handle_bind_nine_p_session(conn, request),
         Opcode::CreateSocketDgram => handle_create_socket_dgram(registry, request, in_fds),
+        Opcode::CreateSocketSeqPacket => handle_create_socket_seqpacket(registry, request, in_fds),
         Opcode::SocketDgramBind => handle_socket_dgram_bind(registry, request, in_fds),
         Opcode::SocketDgramConnect => handle_socket_dgram_connect(registry, request, in_fds),
         Opcode::SocketDgramSendTo => handle_socket_dgram_sendto(registry, request, in_fds),
@@ -348,6 +353,23 @@ fn dispatch_request(
         }
         Opcode::SocketDgramGetPeerName => {
             handle_socket_dgram_getpeername(registry, request, in_fds)
+        }
+        Opcode::SocketSeqPacketBind => handle_socket_seqpacket_bind(registry, request, in_fds),
+        Opcode::SocketSeqPacketListen => handle_socket_seqpacket_listen(registry, request, in_fds),
+        Opcode::SocketSeqPacketAccept => handle_socket_seqpacket_accept(registry, request, in_fds),
+        Opcode::SocketSeqPacketConnect => {
+            handle_socket_seqpacket_connect(registry, request, in_fds)
+        }
+        Opcode::SocketSeqPacketSend => handle_socket_seqpacket_send(registry, request, in_fds),
+        Opcode::SocketSeqPacketRecv => handle_socket_seqpacket_recv(registry, request, in_fds),
+        Opcode::SocketSeqPacketShutdown => {
+            handle_socket_seqpacket_shutdown(registry, request, in_fds)
+        }
+        Opcode::SocketSeqPacketGetSockName => {
+            handle_socket_seqpacket_getsockname(registry, request, in_fds)
+        }
+        Opcode::SocketSeqPacketGetPeerName => {
+            handle_socket_seqpacket_getpeername(registry, request, in_fds)
         }
         Opcode::CreateSocketPair => handle_create_socketpair(registry, request, in_fds),
         Opcode::ReadSocketPair => handle_read_socketpair(registry, request, in_fds),
@@ -1124,6 +1146,7 @@ fn resolve_pipe_read(
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketDgram(_)
+            | StateObjectEnum::SocketSeqPacket(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
@@ -1158,6 +1181,7 @@ fn resolve_pipe_write(
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketDgram(_)
+            | StateObjectEnum::SocketSeqPacket(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
@@ -1326,6 +1350,7 @@ fn resolve_socket_dgram(
         Ok(s) => match s.as_ref() {
             StateObjectEnum::SocketDgram(state) => Ok(Arc::clone(state)),
             StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::SocketSeqPacket(_)
             | StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
@@ -1613,6 +1638,7 @@ fn resolve_socketpair_end(
         Ok(s) => match s.as_ref() {
             StateObjectEnum::SocketPairEnd(end) => Ok(Arc::clone(end)),
             StateObjectEnum::SocketDgram(_)
+            | StateObjectEnum::SocketSeqPacket(_)
             | StateObjectEnum::Eventfd(_)
             | StateObjectEnum::PipeReadEnd(_)
             | StateObjectEnum::PipeWriteEnd(_)
@@ -1956,6 +1982,7 @@ fn resolve_tcp_conn(
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketDgram(_)
+            | StateObjectEnum::SocketSeqPacket(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
             | StateObjectEnum::InetRaw(_)
@@ -2307,6 +2334,7 @@ fn resolve_inet_dgram(
         | StateObjectEnum::PipeWriteEnd(_)
         | StateObjectEnum::SocketPairEnd(_)
         | StateObjectEnum::SocketDgram(_)
+        | StateObjectEnum::SocketSeqPacket(_)
         | StateObjectEnum::TcpConn(_)
         | StateObjectEnum::InetListener(_)
         | StateObjectEnum::InetRaw(_)
@@ -3275,6 +3303,7 @@ fn resolve_pty(
             | StateObjectEnum::PipeWriteEnd(_)
             | StateObjectEnum::SocketPairEnd(_)
             | StateObjectEnum::SocketDgram(_)
+            | StateObjectEnum::SocketSeqPacket(_)
             | StateObjectEnum::TcpConn(_)
             | StateObjectEnum::InetListener(_)
             | StateObjectEnum::InetDgram(_)
@@ -4394,5 +4423,406 @@ mod tests {
         let result = run(&registry, &mut conn, &request);
         assert_eq!(result.frame.opcode, Opcode::CloneOfdResponse);
         assert_eq!(result.frame.status, StatusCode::Protocol);
+    }
+}
+
+fn socket_seqpacket_status(err: SocketSeqPacketError) -> StatusCode {
+    match err {
+        SocketSeqPacketError::WouldBlock => StatusCode::WouldBlock,
+        SocketSeqPacketError::NoPeer
+        | SocketSeqPacketError::NotConnected
+        | SocketSeqPacketError::NotListening => StatusCode::UnknownHandle,
+        SocketSeqPacketError::InvalidSockaddr
+        | SocketSeqPacketError::AlreadyBound
+        | SocketSeqPacketError::AddrInUse
+        | SocketSeqPacketError::Shutdown
+        | SocketSeqPacketError::AlreadyConnected => StatusCode::InvalidValue,
+    }
+}
+
+fn resolve_socket_seqpacket(
+    registry: &BrokerStateRegistry,
+    handle_id: u64,
+) -> Result<Arc<SocketSeqPacketState>, HandlerResult> {
+    match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::UnixSocket) {
+        Ok(state) => match state.as_ref() {
+            StateObjectEnum::SocketSeqPacket(seqpacket) => Ok(Arc::clone(seqpacket)),
+            StateObjectEnum::Eventfd(_)
+            | StateObjectEnum::PipeReadEnd(_)
+            | StateObjectEnum::PipeWriteEnd(_)
+            | StateObjectEnum::SocketPairEnd(_)
+            | StateObjectEnum::SocketDgram(_)
+            | StateObjectEnum::TcpConn(_)
+            | StateObjectEnum::InetListener(_)
+            | StateObjectEnum::InetDgram(_)
+            | StateObjectEnum::InetRaw(_)
+            | StateObjectEnum::Signalfd(_)
+            | StateObjectEnum::Inotify(_)
+            | StateObjectEnum::Pty(_)
+            | StateObjectEnum::Pidfd(_)
+            | StateObjectEnum::Process(_)
+            | StateObjectEnum::HostFdAttached(_) => Err(status_err(
+                Opcode::ReleaseResponse,
+                StatusCode::SubsystemMismatch,
+            )),
+        },
+        Err(StateRegistryError::UnknownHandle(_)) => Err(status_err(
+            Opcode::ReleaseResponse,
+            StatusCode::UnknownHandle,
+        )),
+        Err(StateRegistryError::TagMismatch { .. }) => Err(status_err(
+            Opcode::ReleaseResponse,
+            StatusCode::SubsystemMismatch,
+        )),
+        Err(_) => Err(status_err(Opcode::ReleaseResponse, StatusCode::Internal)),
+    }
+}
+
+fn handle_create_socket_seqpacket(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::CreateSocketSeqPacketResponse);
+    }
+    let pair = match proto::parse_create_socket_seqpacket_body(request.body) {
+        Ok(pair) => pair,
+        Err(_) => return protocol_err(Opcode::CreateSocketSeqPacketResponse),
+    };
+    if pair {
+        let (a, b) = SocketSeqPacketState::new_pair();
+        let ha = registry.register(a);
+        let hb = registry.register(b);
+        HandlerResult {
+            frame: proto::build_create_socket_seqpacket_pair_response_ok(ha.id(), hb.id()),
+            out_fd: None,
+        }
+    } else {
+        let handle = registry.register(SocketSeqPacketState::new());
+        HandlerResult {
+            frame: proto::build_create_socket_seqpacket_response_ok(handle.id()),
+            out_fd: None,
+        }
+    }
+}
+
+fn handle_socket_seqpacket_bind(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketSeqPacketBindResponse);
+    }
+    let (handle_id, raw_addr) = match proto::parse_socket_seqpacket_bind_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketSeqPacketBindResponse),
+    };
+    let state = match resolve_socket_seqpacket(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::SocketSeqPacketBindResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    let addr = match decode_socket_seqpacket_addr(&raw_addr) {
+        Ok(a) => a,
+        Err(e) => {
+            return status_err(
+                Opcode::SocketSeqPacketBindResponse,
+                socket_seqpacket_status(e),
+            );
+        }
+    };
+    match state.bind(addr) {
+        Ok(bound) => HandlerResult {
+            frame: proto::build_socket_seqpacket_bind_response_ok(&encode_socket_seqpacket_addr(
+                &bound,
+            )),
+            out_fd: None,
+        },
+        Err(e) => status_err(
+            Opcode::SocketSeqPacketBindResponse,
+            socket_seqpacket_status(e),
+        ),
+    }
+}
+
+fn handle_socket_seqpacket_listen(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketSeqPacketListenResponse);
+    }
+    let (handle_id, backlog) = match proto::parse_socket_seqpacket_listen_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketSeqPacketListenResponse),
+    };
+    let state = match resolve_socket_seqpacket(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::SocketSeqPacketListenResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    match state.listen(backlog) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_socket_seqpacket_listen_response_ok(),
+            out_fd: None,
+        },
+        Err(e) => status_err(
+            Opcode::SocketSeqPacketListenResponse,
+            socket_seqpacket_status(e),
+        ),
+    }
+}
+
+fn handle_socket_seqpacket_accept(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketSeqPacketAcceptResponse);
+    }
+    let handle_id = match proto::parse_socket_seqpacket_accept_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketSeqPacketAcceptResponse),
+    };
+    let state = match resolve_socket_seqpacket(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::SocketSeqPacketAcceptResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    match state.accept() {
+        Ok(accepted) => {
+            let h = registry.register(accepted);
+            HandlerResult {
+                frame: proto::build_socket_seqpacket_accept_response_ok(h.id()),
+                out_fd: None,
+            }
+        }
+        Err(e) => status_err(
+            Opcode::SocketSeqPacketAcceptResponse,
+            socket_seqpacket_status(e),
+        ),
+    }
+}
+
+fn handle_socket_seqpacket_connect(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketSeqPacketConnectResponse);
+    }
+    let (handle_id, raw_addr) = match proto::parse_socket_seqpacket_connect_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketSeqPacketConnectResponse),
+    };
+    let state = match resolve_socket_seqpacket(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::SocketSeqPacketConnectResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    let addr = match decode_socket_seqpacket_addr(&raw_addr) {
+        Ok(a) => a,
+        Err(e) => {
+            return status_err(
+                Opcode::SocketSeqPacketConnectResponse,
+                socket_seqpacket_status(e),
+            );
+        }
+    };
+    match state.connect(addr) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_socket_seqpacket_connect_response_ok(),
+            out_fd: None,
+        },
+        Err(e) => status_err(
+            Opcode::SocketSeqPacketConnectResponse,
+            socket_seqpacket_status(e),
+        ),
+    }
+}
+
+fn handle_socket_seqpacket_send(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketSeqPacketSendResponse);
+    }
+    let (handle_id, payload) = match proto::parse_socket_seqpacket_send_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketSeqPacketSendResponse),
+    };
+    let state = match resolve_socket_seqpacket(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::SocketSeqPacketSendResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    match state.send(&payload) {
+        Ok(n) => HandlerResult {
+            frame: proto::build_socket_seqpacket_send_response_ok(n as u64),
+            out_fd: None,
+        },
+        Err(e) => status_err(
+            Opcode::SocketSeqPacketSendResponse,
+            socket_seqpacket_status(e),
+        ),
+    }
+}
+
+fn handle_socket_seqpacket_recv(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketSeqPacketRecvResponse);
+    }
+    let (handle_id, max_len) = match proto::parse_socket_seqpacket_recv_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketSeqPacketRecvResponse),
+    };
+    let state = match resolve_socket_seqpacket(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::SocketSeqPacketRecvResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    match state.recv(max_len as usize) {
+        Ok((payload, flags)) => HandlerResult {
+            frame: proto::build_socket_seqpacket_recv_response_ok(&payload, flags),
+            out_fd: None,
+        },
+        Err(e) => status_err(
+            Opcode::SocketSeqPacketRecvResponse,
+            socket_seqpacket_status(e),
+        ),
+    }
+}
+
+fn handle_socket_seqpacket_shutdown(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketSeqPacketShutdownResponse);
+    }
+    let (handle_id, how) = match proto::parse_socket_seqpacket_shutdown_body(request.body) {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketSeqPacketShutdownResponse),
+    };
+    let state = match resolve_socket_seqpacket(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::SocketSeqPacketShutdownResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    match state.shutdown(how) {
+        Ok(()) => HandlerResult {
+            frame: proto::build_socket_seqpacket_shutdown_response_ok(),
+            out_fd: None,
+        },
+        Err(e) => status_err(
+            Opcode::SocketSeqPacketShutdownResponse,
+            socket_seqpacket_status(e),
+        ),
+    }
+}
+
+fn handle_socket_seqpacket_getsockname(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketSeqPacketGetSockNameResponse);
+    }
+    let handle_id = match proto::parse_handle_body(request.body, Opcode::SocketSeqPacketGetSockName)
+    {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketSeqPacketGetSockNameResponse),
+    };
+    let state = match resolve_socket_seqpacket(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::SocketSeqPacketGetSockNameResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    HandlerResult {
+        frame: proto::build_socket_seqpacket_getsockname_response_ok(
+            &encode_socket_seqpacket_addr(&state.getsockname()),
+        ),
+        out_fd: None,
+    }
+}
+
+fn handle_socket_seqpacket_getpeername(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::SocketSeqPacketGetPeerNameResponse);
+    }
+    let handle_id = match proto::parse_handle_body(request.body, Opcode::SocketSeqPacketGetPeerName)
+    {
+        Ok(v) => v,
+        Err(_) => return protocol_err(Opcode::SocketSeqPacketGetPeerNameResponse),
+    };
+    let state = match resolve_socket_seqpacket(registry, handle_id) {
+        Ok(s) => s,
+        Err(_) => {
+            return status_err(
+                Opcode::SocketSeqPacketGetPeerNameResponse,
+                StatusCode::UnknownHandle,
+            );
+        }
+    };
+    match state.getpeername() {
+        Ok(addr) => HandlerResult {
+            frame: proto::build_socket_seqpacket_getpeername_response_ok(
+                &encode_socket_seqpacket_addr(&addr),
+            ),
+            out_fd: None,
+        },
+        Err(e) => status_err(
+            Opcode::SocketSeqPacketGetPeerNameResponse,
+            socket_seqpacket_status(e),
+        ),
     }
 }

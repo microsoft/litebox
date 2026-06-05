@@ -592,6 +592,34 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
                     .insert(dgram);
                 self.install_typed_broker_bridge_fd_at_slot(typed, guest_fd, &files, "socket_dgram")
             }
+            BrokerHandleKind::SocketSeqPacket => {
+                let provider =
+                    syscalls::broker_socket_seqpacket::broker_socket_seqpacket_provider()
+                        .ok_or(())?;
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                Self::dup_broker_bridge_handle(releaser, handle_id)?;
+                let seqpacket = syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketFd::<
+                    Platform,
+                >::new(
+                    provider, handle_id, litebox::fs::OFlags::empty()
+                );
+                let typed: litebox::fd::TypedFd<
+                    syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem,
+                > = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert(seqpacket);
+                self.install_typed_broker_bridge_fd_at_slot(
+                    typed,
+                    guest_fd,
+                    &files,
+                    "socket_seqpacket",
+                )
+            }
             BrokerHandleKind::TcpConn => {
                 let provider = syscalls::broker_tcp_conn::broker_tcp_conn_provider().ok_or(())?;
                 use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
@@ -2053,6 +2081,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         BrokerHandleKind::InetListener => None,
                         BrokerHandleKind::InetDgram => None,
                         BrokerHandleKind::SocketDgram => None,
+                        BrokerHandleKind::SocketSeqPacket => None,
                         // `Signalfd` is restored by its dedicated FdClass branch below.
                         BrokerHandleKind::Signalfd => todo!(
                             "fork-snapshot restore for BrokerHandleKind::Signalfd \
