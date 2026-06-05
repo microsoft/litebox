@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, PolicyEngine};
 use litebox_broker_host::{BrokerHostError, serve_connection};
-use litebox_broker_transport::unix_socket::UnixStreamServerControlChannel;
+use litebox_broker_transport::unix_socket::UnixStreamHostControlChannel;
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -20,7 +20,7 @@ fn main() -> io::Result<()> {
     let listener = bind_listener(&args.socket_path)?;
     let _socket_cleanup = SocketPathCleanup::new(args.socket_path.clone());
     let (stream, _) = listener.accept()?;
-    let mut channel = UnixStreamServerControlChannel::from_accepted(stream);
+    let mut channel = UnixStreamHostControlChannel::from_accepted(stream);
     channel.set_io_deadline(Some(Instant::now() + SESSION_TIMEOUT))?;
     let mut broker = BrokerCore::new(PolicyEngine::event_only()).map_err(io::Error::other)?;
     serve_connection(&mut broker, &mut channel)

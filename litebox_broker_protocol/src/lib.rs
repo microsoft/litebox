@@ -20,8 +20,8 @@ pub mod object;
 pub mod wire;
 
 pub use channel::{
-    ClientControlChannel, PeerCredential, ReceivedBrokerRequest, ReceivedBrokerResponse,
-    ServerControlChannel,
+    HostControlChannel, LocalControlChannel, PeerCredential, ReceivedBrokerRequest,
+    ReceivedBrokerResponse,
 };
 pub use error::ErrorCode;
 pub use event::{

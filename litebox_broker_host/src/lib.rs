@@ -4,7 +4,7 @@
 //! Channel-neutral broker-side protocol/core adapter.
 //!
 //! This crate wires `litebox_broker_core` to any implementation of the neutral
-//! server control-channel trait. Concrete channels live in separate crates such as
+//! host-side control-channel trait. Concrete channels live in separate crates such as
 //! `litebox_broker_transport`.
 
 #![no_std]
@@ -13,9 +13,7 @@
 extern crate std;
 
 mod error;
-mod server;
+mod negotiate;
 
 pub use error::{BrokerHostError, Result};
-pub use server::{
-    CloseReason, ConnectionTermination, SUPPORTED_PROTOCOL_VERSION, serve_connection,
-};
+pub use negotiate::{CloseReason, ConnectionTermination, HOST_PROTOCOL_VERSION, serve_connection};

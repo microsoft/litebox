@@ -31,7 +31,7 @@ pub enum ErrorCode {
     ResourceExhausted,
     /// The operation would block in the current event state.
     WouldBlock,
-    /// Error code emitted by a newer broker and not understood by this client.
+    /// Error code emitted by a newer broker and not understood by this local peer.
     ///
     /// This variant is reserved for raw codes not assigned by this protocol
     /// version.

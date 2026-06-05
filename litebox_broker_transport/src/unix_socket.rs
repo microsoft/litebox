@@ -15,24 +15,23 @@ use std::time::{Duration, Instant};
 use litebox_broker_protocol::wire::{
     WireError, decode_request, decode_response, encode_request, encode_response,
 };
-use litebox_broker_protocol::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::{
-    ClientControlChannel, PeerCredential, ReceivedBrokerRequest, ReceivedBrokerResponse,
-    ServerControlChannel,
+    BrokerRequest, BrokerResponse, HostControlChannel, LocalControlChannel, PeerCredential,
+    ReceivedBrokerRequest, ReceivedBrokerResponse,
 };
 
 const MAX_FRAME_LEN: usize = 64 * 1024;
 
-/// Client-side Unix-domain-socket control channel for the hosted userland POC.
-pub struct UnixStreamClientControlChannel {
+/// Local-side Unix-domain-socket control channel for the hosted userland POC.
+pub struct UnixStreamLocalControlChannel {
     stream: UnixStream,
     io_timeout: Option<Duration>,
     io_deadline: Option<Instant>,
     active_request_deadline: Option<Instant>,
 }
 
-impl UnixStreamClientControlChannel {
-    /// Creates a client control channel from an already-connected Unix stream.
+impl UnixStreamLocalControlChannel {
+    /// Creates a local control channel from an already-connected Unix stream.
     pub const fn from_connected(stream: UnixStream) -> Self {
         Self {
             stream,
@@ -94,14 +93,14 @@ impl UnixStreamClientControlChannel {
     }
 }
 
-/// Server-side Unix-domain-socket control channel for the hosted userland POC.
-pub struct UnixStreamServerControlChannel {
+/// Host-side Unix-domain-socket control channel for the hosted userland POC.
+pub struct UnixStreamHostControlChannel {
     stream: UnixStream,
     io_deadline: Option<Instant>,
 }
 
-impl UnixStreamServerControlChannel {
-    /// Creates a server control channel from an accepted Unix stream.
+impl UnixStreamHostControlChannel {
+    /// Creates a host control channel from an accepted Unix stream.
     pub const fn from_accepted(stream: UnixStream) -> Self {
         Self {
             stream,
@@ -123,7 +122,7 @@ impl UnixStreamServerControlChannel {
     }
 }
 
-impl ClientControlChannel for UnixStreamClientControlChannel {
+impl LocalControlChannel for UnixStreamLocalControlChannel {
     type Error = io::Error;
 
     fn send_request(&mut self, request: &BrokerRequest) -> io::Result<()> {
@@ -147,7 +146,7 @@ impl ClientControlChannel for UnixStreamClientControlChannel {
     }
 }
 
-impl ServerControlChannel for UnixStreamServerControlChannel {
+impl HostControlChannel for UnixStreamHostControlChannel {
     type Error = io::Error;
 
     fn peer_credential(&self) -> io::Result<PeerCredential> {
@@ -351,9 +350,9 @@ mod tests {
     }
 
     #[test]
-    fn client_response_read_honors_io_timeout() {
-        let (client, _server) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamClientControlChannel::from_connected(client);
+    fn local_response_read_honors_io_timeout() {
+        let (local_stream, _host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
         channel
             .set_io_timeout(Some(Duration::from_millis(10)))
             .unwrap();
@@ -369,18 +368,18 @@ mod tests {
     }
 
     #[test]
-    fn client_response_read_io_timeout_is_wall_clock() {
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamClientControlChannel::from_connected(client);
+    fn local_response_read_io_timeout_is_wall_clock() {
+        let (mut host_stream, local_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
         channel
             .set_io_timeout(Some(Duration::from_millis(50)))
             .unwrap();
 
         let reader = std::thread::spawn(move || channel.recv_response().unwrap_err());
-        server.write_all(&8u32.to_le_bytes()).unwrap();
+        host_stream.write_all(&8u32.to_le_bytes()).unwrap();
         for _ in 0..8 {
             std::thread::sleep(Duration::from_millis(20));
-            if server.write_all(&[0]).is_err() {
+            if host_stream.write_all(&[0]).is_err() {
                 break;
             }
         }
@@ -396,15 +395,15 @@ mod tests {
     }
 
     #[test]
-    fn client_response_read_honors_io_deadline() {
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamClientControlChannel::from_connected(client);
+    fn local_response_read_honors_io_deadline() {
+        let (mut host_stream, local_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamLocalControlChannel::from_connected(local_stream);
         channel
             .set_io_deadline(Some(Instant::now() + Duration::from_millis(20)))
             .unwrap();
 
         let reader = std::thread::spawn(move || channel.recv_response().unwrap_err());
-        server.write_all(&8u32.to_le_bytes()).unwrap();
+        host_stream.write_all(&8u32.to_le_bytes()).unwrap();
 
         let error = reader.join().expect("deadline reader panicked");
         assert!(
@@ -417,18 +416,18 @@ mod tests {
     }
 
     #[test]
-    fn server_request_read_io_deadline_is_wall_clock() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let mut channel = UnixStreamServerControlChannel::from_accepted(server);
+    fn host_request_read_io_deadline_is_wall_clock() {
+        let (mut local_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamHostControlChannel::from_accepted(host_stream);
         channel
             .set_io_deadline(Some(Instant::now() + Duration::from_millis(50)))
             .unwrap();
 
         let reader = std::thread::spawn(move || channel.recv_request().unwrap_err());
-        client.write_all(&8u32.to_le_bytes()).unwrap();
+        local_stream.write_all(&8u32.to_le_bytes()).unwrap();
         for _ in 0..8 {
             std::thread::sleep(Duration::from_millis(20));
-            if client.write_all(&[0]).is_err() {
+            if local_stream.write_all(&[0]).is_err() {
                 break;
             }
         }

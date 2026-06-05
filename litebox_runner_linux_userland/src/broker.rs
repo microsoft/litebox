@@ -11,21 +11,21 @@ use std::{
 use alloc::sync::Arc;
 use anyhow::{Context as _, Result};
 use litebox::{BrokerControl, BrokerControlError};
-use litebox_broker_local::ControlClient;
+use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::{BrokerRequest, BrokerResponse, CoreRequest, CoreResponse};
-use litebox_broker_transport::unix_socket::UnixStreamClientControlChannel;
+use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
-type Client = ControlClient<UnixStreamClientControlChannel>;
+type Local = BrokerLocal<UnixStreamLocalControlChannel>;
 
 pub(crate) struct BrokerConnection {
-    control: Arc<BrokerControlClient>,
+    control: Arc<BrokerLocalControl>,
 }
 
-struct BrokerControlClient {
-    client: Mutex<Client>,
+struct BrokerLocalControl {
+    local: Mutex<Local>,
 }
 
 pub(crate) fn connect(socket_path: Option<&Path>) -> Result<Option<BrokerConnection>> {
@@ -41,21 +41,21 @@ impl BrokerConnection {
     }
 }
 
-impl BrokerControlClient {
-    fn new(client: Client) -> Self {
+impl BrokerLocalControl {
+    fn new(local: Local) -> Self {
         Self {
-            client: Mutex::new(client),
+            local: Mutex::new(local),
         }
     }
 }
 
-impl BrokerControl for BrokerControlClient {
+impl BrokerControl for BrokerLocalControl {
     fn request(
         &self,
         request: CoreRequest,
     ) -> core::result::Result<CoreResponse, BrokerControlError> {
         match self
-            .client
+            .local
             .lock()
             .map_err(|_| BrokerControlError::Transport)?
             .active_raw_request(BrokerRequest::Core(request))
@@ -70,27 +70,27 @@ impl BrokerControl for BrokerControlClient {
 
 fn connect_to_endpoint(socket_path: &Path) -> Result<BrokerConnection> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let mut client = connect_with_retry(socket_path, setup_deadline)
+    let mut local = connect_with_retry(socket_path, setup_deadline)
         .with_context(|| format!("failed to connect to broker at {}", socket_path.display()))?;
-    client
+    local
         .control_channel_mut()
         .set_io_timeout(Some(ACTIVE_REQUEST_TIMEOUT))
         .context("failed to configure broker active request timeout")?;
     Ok(BrokerConnection {
-        control: Arc::new(BrokerControlClient::new(client)),
+        control: Arc::new(BrokerLocalControl::new(local)),
     })
 }
 
-fn connect_with_retry(socket_path: &Path, setup_deadline: Instant) -> Result<Client> {
+fn connect_with_retry(socket_path: &Path, setup_deadline: Instant) -> Result<Local> {
     loop {
-        match UnixStreamClientControlChannel::connect(socket_path) {
+        match UnixStreamLocalControlChannel::connect(socket_path) {
             Ok(mut channel) => {
                 channel
                     .set_io_deadline(Some(setup_deadline))
                     .context("failed to configure broker setup deadline")?;
-                let mut client = ControlClient::new(channel);
-                client.negotiate().context("broker negotiation failed")?;
-                return Ok(client);
+                let mut local = BrokerLocal::new(channel);
+                local.negotiate().context("broker negotiation failed")?;
+                return Ok(local);
             }
             Err(error) => {
                 if Instant::now() >= setup_deadline {

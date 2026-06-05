@@ -271,12 +271,12 @@ impl TestBroker {
     fn join(mut self) {
         self.done_rx
             .recv_timeout(BROKER_HELPER_TIMEOUT)
-            .expect("broker test server did not finish");
+            .expect("broker test host did not finish");
         self.thread
             .take()
-            .expect("broker test server thread missing")
+            .expect("broker test host thread missing")
             .join()
-            .expect("broker test server panicked");
+            .expect("broker test host panicked");
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }
@@ -311,7 +311,7 @@ fn spawn_test_broker(
             for _ in 0..connection_count {
                 let (stream, _) = listener
                     .accept()
-                    .expect("failed to accept broker control client");
+                    .expect("failed to accept broker local control connection");
                 stream
                     .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test read timeout");
@@ -319,9 +319,9 @@ fn spawn_test_broker(
                     .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test write timeout");
                 let mut channel =
-                    litebox_broker_transport::unix_socket::UnixStreamServerControlChannel::from_accepted(stream);
+                    litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(stream);
                 let termination = litebox_broker_host::serve_connection(&mut core, &mut channel)
-                    .expect("broker server failed");
+                    .expect("broker host failed");
                 assert_eq!(
                     termination,
                     litebox_broker_host::ConnectionTermination::PeerClosed
@@ -337,7 +337,7 @@ fn spawn_test_broker(
 
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("broker test server did not start");
+        .expect("broker test host did not start");
     TestBroker {
         thread: Some(broker_thread),
         done_rx,

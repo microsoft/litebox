@@ -2,17 +2,17 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::{
-    AddEventRequest, BrokerRequest, BrokerResponse, ClientControlChannel, ConsumeEventRequest,
-    ConsumeEventResponse, CoreRequest, CoreResponse, CreateEventRequest, EventConsumeMode,
-    EventRequest, EventResponse, ObjectHandle, ProtocolVersion, ReadinessState, WaitEventRequest,
+    AddEventRequest, BrokerRequest, BrokerResponse, ConsumeEventRequest, ConsumeEventResponse,
+    CoreRequest, CoreResponse, CreateEventRequest, EventConsumeMode, EventRequest, EventResponse,
+    LocalControlChannel, ObjectHandle, ProtocolVersion, ReadinessState, WaitEventRequest,
     WaitOutcome,
 };
 
-use crate::{BrokerLocalError, ControlClient, Result};
+use crate::{BrokerLocal, BrokerLocalError, Result};
 
 const EVENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(0, 2);
 
-impl<T: ClientControlChannel> ControlClient<T> {
+impl<T: LocalControlChannel> BrokerLocal<T> {
     /// Creates a broker-owned event object.
     pub fn create_event(&mut self) -> Result<ObjectHandle, T::Error> {
         self.create_event_with_count(0)
@@ -86,7 +86,7 @@ const fn event_request(request: EventRequest) -> BrokerRequest {
     BrokerRequest::Core(CoreRequest::Event(request))
 }
 
-impl<T: ClientControlChannel> ControlClient<T> {
+impl<T: LocalControlChannel> BrokerLocal<T> {
     fn ensure_event_protocol(&self) -> Result<(), T::Error> {
         let negotiated = self.ensure_negotiated()?;
         if EVENT_PROTOCOL_VERSION.is_supported_by(negotiated) {

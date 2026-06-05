@@ -6,7 +6,7 @@ use crate::{BrokerRequest, BrokerResponse};
 /// Peer identity information supplied by the channel or host layer.
 ///
 /// The first userland proof of concept does not authenticate Unix-socket peers,
-/// but channels still return an explicit credential value so the server layer
+/// but channels still return an explicit credential value so the host layer
 /// can map authenticated peer identity into BrokerCore caller identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
@@ -14,7 +14,7 @@ pub enum PeerCredential {
     /// Explicit deployment mode for the initial unauthenticated userland POC.
     ///
     /// Channels that are expected to authenticate peers must return an error
-    /// from [`ServerControlChannel::peer_credential`] when authentication is
+    /// from [`HostControlChannel::peer_credential`] when authentication is
     /// unavailable or fails; this variant is only for deployments that
     /// deliberately choose unauthenticated operation.
     Unauthenticated,
@@ -52,8 +52,8 @@ impl From<BrokerResponse> for ReceivedBrokerResponse {
     }
 }
 
-/// Client-side control channel for broker authority calls.
-pub trait ClientControlChannel {
+/// Local-side control channel for broker authority calls.
+pub trait LocalControlChannel {
     /// Channel-specific error type.
     type Error;
 
@@ -67,8 +67,8 @@ pub trait ClientControlChannel {
     fn recv_response(&mut self) -> Result<Option<ReceivedBrokerResponse>, Self::Error>;
 }
 
-/// Server-side control channel for broker authority calls.
-pub trait ServerControlChannel {
+/// Host-side control channel for broker authority calls.
+pub trait HostControlChannel {
     /// Channel-specific error type.
     type Error;
 

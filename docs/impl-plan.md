@@ -11,7 +11,7 @@ User mode:
   Shim + local core + optional BrokerService clients
 
 Authority domain:
-  broker entry/server + litebox_broker_host + BrokerCore + optional BrokerServices + PolicyEngine + BrokerPlatform
+  broker entry/host + litebox_broker_host + BrokerCore + optional BrokerServices + PolicyEngine + BrokerPlatform
   broker-kernel user-mode support, in kernel-backed deployments
 ```
 
@@ -24,7 +24,7 @@ The baseline is the stricter durable-unicorn model: no host fd/HANDLE delegation
 - Build vertical slices, not a big-bang refactor.
 - Keep local core untrusted and broker authority explicit.
 - Keep BrokerCore shim-neutral.
-- Keep BrokerCore protocol-neutral and channel-neutral. BrokerCore exposes in-domain authority methods and domain types; broker entry/server code adapts protocol requests and channel credentials before calling it.
+- Keep BrokerCore protocol-neutral and channel-neutral. BrokerCore exposes in-domain authority methods and domain types; broker entry/host code adapts protocol requests and channel credentials before calling it.
 - Keep the broker protocol modular: the outer request/response envelope is for connection-level broker messages and coarse authority routing, while object/domain operations live in nested request/response families such as `CoreRequest::Event` and `EventResponse`.
 - Keep the control channel strictly paired request/response; broker-initiated readiness, interrupt, fault, revocation, and session-failure messages should use a separate notification channel/message family.
 - Put domain-specific authority in BrokerServices.
@@ -86,27 +86,27 @@ Initial scope:
 - control channel only;
 - major-version/minor-compatible protocol negotiation;
 - neutral blocking `no_std` control-channel traits with channel-specific error types and explicit clean-close receive semantics;
-- channel-produced peer credentials returned through the server control-channel trait and mapped by the broker server into BrokerCore caller credentials;
+- channel-produced peer credentials returned through the host control-channel trait and mapped by the broker host into BrokerCore caller credentials;
 - reusable `no_std + alloc` request/response wire codec for byte-stream channel implementations;
 - Unix-domain-socket framing as the first concrete userland channel implementation;
-- a Unix-socket executable that wires the generic channel-neutral server to the concrete Unix control-channel implementation;
-- server-owned protocol negotiation, request sequencing, unknown-tag handling, protocol/core type adaptation, and connection-close reasons;
+- a Unix-socket executable that wires the generic channel-neutral host to the concrete Unix control-channel implementation;
+- host-owned protocol negotiation, request sequencing, unknown-tag handling, protocol/core type adaptation, and connection-close reasons;
 - BrokerCore-owned caller associations, object/reference authority, policy hooks, event behavior, and association cleanup;
 - default-deny PolicyEngine;
 - fail-closed channel/session behavior.
 
 Exit criteria:
 
-- A user-side client can connect and negotiate. In the current hosted userland path, `litebox_runner_linux_userland` consumes an externally owned Unix-socket endpoint via `--broker-socket`, uses `litebox_broker_local` to negotiate, constructs the `LiteBox` local core with broker control already present, and the Linux shim reaches migrated event objects through the local-core event domain rather than through broker-specific APIs.
-- Broker binds caller identity to the authenticated channel endpoint. The first hosted executable passes the explicit unauthenticated placeholder through the same server API that later deployment-specific authentication will use.
-- Userland channel code only receives/sends decoded frames and supplies peer credentials; the generic server owns broker protocol dispatch and reports successful termination as peer-close or broker-close with a reason.
-- The Unix-socket channel adapter and hosted broker executable live in separate crates, so clients can depend on the channel without pulling in broker core/server deployment code.
+- A local-side adapter can connect and negotiate. In the current hosted userland path, `litebox_runner_linux_userland` consumes an externally owned Unix-socket endpoint via `--broker-socket`, uses `litebox_broker_local` to negotiate, constructs the `LiteBox` local core with broker control already present, and the Linux shim reaches migrated event objects through the local-core event domain rather than through broker-specific APIs.
+- Broker binds caller identity to the authenticated channel endpoint. The first hosted executable passes the explicit unauthenticated placeholder through the same host API that later deployment-specific authentication will use.
+- Userland channel code only receives/sends decoded frames and supplies peer credentials; the generic host owns broker protocol dispatch and reports successful termination as peer-close or broker-close with a reason.
+- The Unix-socket channel adapter and hosted broker executable live in separate crates, so local-side code can depend on the channel without pulling in broker core/host deployment code.
 - BrokerCore depends only on shared broker value DTOs from `litebox_broker_protocol`; it does not depend on protocol envelopes, channel traits, wire codecs, or concrete IPC crates.
-- Client code does not need to depend on the userland broker server crate to use the first Unix socket channel.
-- The generic broker server library does not depend on concrete Unix socket channel code and remains `no_std`.
+- Local-side code does not need to depend on the userland broker executable or host crate to use the first Unix socket channel.
+- The generic broker host library does not depend on concrete Unix socket channel code and remains `no_std`.
 - Malformed or unauthorized requests fail closed or return policy-denied according to explicit policy.
-- Unsupported future protocol operations return `UnsupportedOperation` without closing the connection so clients can probe optional features explicitly; newer core error categories or wait outcomes that the server adapter cannot represent return `Internal`.
-- Version-mismatch negotiation responses advertise the broker-supported version and keep the connection in negotiation state so clients can downgrade without reconnecting or guessing.
+- Unsupported future protocol operations return `UnsupportedOperation` without closing the connection so local peers can probe optional features explicitly; newer core error categories or wait outcomes that the host adapter cannot represent return `Internal`.
+- Version-mismatch negotiation responses advertise the broker-supported version and keep the connection in negotiation state so local peers can downgrade without reconnecting or guessing.
 - BrokerCore/object operations are grouped below the broker envelope instead of added as unrelated top-level `BrokerRequest` and `BrokerResponse` variants.
 - Control-channel contracts live in `litebox_broker_protocol::channel`, separate from semantic message DTO modules but in the same shared protocol crate. Future broker-initiated readiness, interrupt, fault, revocation, or session-failure traffic must use a separate notification channel/message family rather than unsolicited control-channel responses.
 
@@ -148,7 +148,7 @@ The local core owns:
 Exit criteria:
 
 - Create, wait, and signal work through BrokerCore and the separate broker process.
-- BrokerCore and the server already release association-owned references on channel disconnect, and BrokerCore has an explicit in-domain `close_object_reference` operation. Protocol-level close, duplicate, explicit readiness queries, and broader stale-handle coverage remain future work after the first end-to-end path is proven.
+- BrokerCore and the host already release association-owned references on channel disconnect, and BrokerCore has an explicit in-domain `close_object_reference` operation. Protocol-level close, duplicate, explicit readiness queries, and broader stale-handle coverage remain future work after the first end-to-end path is proven.
 
 ## Phase 5: Broker-backed fd semantics
 
@@ -372,7 +372,7 @@ The smallest useful milestone is:
 ```text
 single process
 userland broker
-typed control client
+typed broker-local adapter
 control channel only
 minimal PolicyEngine
 broker-owned event object

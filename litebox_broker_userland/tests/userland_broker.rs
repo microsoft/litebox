@@ -9,10 +9,10 @@ use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use litebox_broker_host::SUPPORTED_PROTOCOL_VERSION;
-use litebox_broker_local::ControlClient;
+use litebox_broker_host::HOST_PROTOCOL_VERSION;
+use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::{ReadinessState, WaitOutcome};
-use litebox_broker_transport::unix_socket::UnixStreamClientControlChannel;
+use litebox_broker_transport::unix_socket::UnixStreamLocalControlChannel;
 
 #[test]
 fn separate_process_broker_serves_event_object_requests() {
@@ -22,26 +22,26 @@ fn separate_process_broker_serves_event_object_requests() {
     channel
         .set_io_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let mut client = ControlClient::new(channel);
+    let mut local = BrokerLocal::new(channel);
 
-    assert_eq!(client.negotiate().unwrap(), SUPPORTED_PROTOCOL_VERSION);
+    assert_eq!(local.negotiate().unwrap(), HOST_PROTOCOL_VERSION);
 
-    let handle = client.create_event().unwrap();
+    let handle = local.create_event().unwrap();
     assert_eq!(
-        client.wait_event(handle).unwrap(),
+        local.wait_event(handle).unwrap(),
         WaitOutcome::WouldBlock(ReadinessState::new(false, true, 0))
     );
 
     assert_eq!(
-        client.add_event(handle, 1).unwrap(),
+        local.add_event(handle, 1).unwrap(),
         ReadinessState::new(true, true, 1)
     );
 
     assert_eq!(
-        client.wait_event(handle).unwrap(),
+        local.wait_event(handle).unwrap(),
         WaitOutcome::Ready(ReadinessState::new(true, true, 1))
     );
-    drop(client);
+    drop(local);
     assert!(child.wait().unwrap().success());
 }
 
@@ -109,10 +109,10 @@ impl Drop for SocketPathGuard {
     }
 }
 
-fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamClientControlChannel> {
+fn connect_with_retry(socket_path: &Path) -> io::Result<UnixStreamLocalControlChannel> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match UnixStreamClientControlChannel::connect(socket_path) {
+        match UnixStreamLocalControlChannel::connect(socket_path) {
             Ok(channel) => return Ok(channel),
             Err(error) if Instant::now() < deadline => {
                 if error.kind() != io::ErrorKind::NotFound

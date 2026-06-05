@@ -14,7 +14,7 @@ User mode:
   optional BrokerService clients
 
 Authority domain:
-  broker entry/server + litebox_broker_host + BrokerCore + optional BrokerServices + PolicyEngine + BrokerPlatform
+  broker entry/host + litebox_broker_host + BrokerCore + optional BrokerServices + PolicyEngine + BrokerPlatform
   broker-kernel user-mode support, in kernel-backed deployments
 ```
 
@@ -128,27 +128,27 @@ The broker architecture should use crate names that make the authority boundary 
 
 | Crate | Initial role |
 |---|---|
-| `litebox_broker_protocol` | Shared `no_std + alloc` protocol crate for broker-visible DTOs, transport-neutral control-channel contracts, and the current reusable byte codec under `litebox_broker_protocol::wire`: protocol version type, opaque event reference handles, event request/response messages, readiness/wait outcomes, ABI-neutral errors, known/unknown receive wrappers, peer credentials, client/server control-channel traits, and request/response message-body encoding. |
+| `litebox_broker_protocol` | Shared `no_std + alloc` protocol crate for broker-visible DTOs, transport-neutral control-channel contracts, and the current reusable byte codec under `litebox_broker_protocol::wire`: protocol version type, opaque event reference handles, event request/response messages, readiness/wait outcomes, ABI-neutral errors, known/unknown receive wrappers, peer credentials, local/host control-channel traits, and request/response message-body encoding. |
 | `litebox_broker_core` | Protocol- and channel-independent authority logic: the single broker core constructed for the broker process/kernel lifetime, broker-owned caller associations, object/reference registry, object type and rights authority, reference generations, policy hooks, wait/readiness state, association cleanup, and the first broker-owned event object. It exposes direct domain methods and domain types; it does not decode broker protocol requests or know concrete IPC. |
-| `litebox_broker_host` | Shared `no_std` broker-side protocol/core adapter for hosted and kernel broker deployments: free receive/send loop over a caller-owned `BrokerCore` and generic server control channel. It owns protocol negotiation, request sequencing, unknown-tag handling, protocol/core type conversion, peer-credential-to-caller-credential mapping, and typed broker-close reasons. |
+| `litebox_broker_host` | Shared `no_std` broker-side protocol/core adapter for hosted and kernel broker deployments: free receive/send loop over a caller-owned `BrokerCore` and generic host control channel. It owns protocol negotiation, request sequencing, unknown-tag handling, protocol/core type conversion, peer-credential-to-caller-credential mapping, and typed broker-close reasons. |
 | `litebox_broker_transport` | Hosted concrete broker transport implementations. The current implementation is a Unix-domain-socket control channel under `unix_socket`. The crate owns stream framing and channel trait adaptation; it does not assemble a broker deployment or depend on broker core/host crates. |
-| `litebox_broker_userland` | Hosted `std` broker executable. This deployment crate wires `BrokerCore`, the current policy, the generic broker server loop, and the Unix-socket transport together. |
-| `litebox_broker_local` | `no_std` channel-neutral user-side adapter linked into local-core deployments and runners: negotiate broker protocol, track client negotiation state, sequence request/response pairs, map broker errors, and expose typed broker calls. Its optional `std` worker adapter runs blocking channel I/O off guest-facing threads. |
+| `litebox_broker_userland` | Hosted `std` broker executable. This deployment crate wires `BrokerCore`, the current policy, the generic broker host loop, and the Unix-socket transport together. |
+| `litebox_broker_local` | `no_std` channel-neutral local-side adapter linked into local-core deployments and runners: negotiate broker protocol, track local negotiation state, sequence request/response pairs, map broker errors, and expose typed broker calls. |
 | `litebox` | Local core crate: guest fd table view, syscall/resource routing, local-private mechanics, broker-backed object wrappers, and compatibility-profile glue. |
 
-`litebox_broker_local` should stay narrow. It is not the syscall classifier and does not implement non-delegable syscall handling. Shim dispatch and the local core decide whether an operation is local-private, broker-delegated, or host-arbitrated; the client only carries broker-delegated operations over the selected control channel.
+`litebox_broker_local` should stay narrow. It is not the syscall classifier and does not implement non-delegable syscall handling. Shim dispatch and the local core decide whether an operation is local-private, broker-delegated, or host-arbitrated; the local adapter only carries broker-delegated operations over the selected control channel.
 
-Channel delivery must remain replaceable. `litebox_broker_protocol` and `litebox_broker_core` must not depend on Unix-domain sockets, shared-memory rings, traps, hypercalls, or any specific IPC implementation. BrokerCore may reuse shared value DTOs from `litebox_broker_protocol`, but it must not depend on protocol envelopes, channel traits, wire codecs, or concrete IPC. The broker server adapts protocol and channel concepts into direct BrokerCore domain calls. Shared control-channel traits live in `litebox_broker_protocol::channel`; concrete IPC implementations, such as `litebox_broker_transport` or a later shared-memory ring crate, live outside the broker deployment crate without changing broker object semantics.
+Channel delivery must remain replaceable. `litebox_broker_protocol` and `litebox_broker_core` must not depend on Unix-domain sockets, shared-memory rings, traps, hypercalls, or any specific IPC implementation. BrokerCore may reuse shared value DTOs from `litebox_broker_protocol`, but it must not depend on protocol envelopes, channel traits, wire codecs, or concrete IPC. The broker host adapts protocol and channel concepts into direct BrokerCore domain calls. Shared control-channel traits live in `litebox_broker_protocol::channel`; concrete IPC implementations, such as `litebox_broker_transport` or a later shared-memory ring crate, live outside the broker deployment crate without changing broker object semantics.
 
 The current control-channel contract is deliberately serial: one broker authority request is in flight on a connection, and the next request waits for the matching response. A future shared-memory ring or multiplexed transport can either keep that semantic contract behind a blocking adapter, or introduce protocol correlation IDs in a later extension if concurrent in-flight control operations become necessary.
 
 Shared broker DTOs and the current wire codec live in `litebox_broker_protocol` to avoid repeating request/response, handle/readiness, and message-body encoding shapes across protocol, core, local, transport, and host code. BrokerCore still keeps authority-domain internals private: object IDs, reference storage, rights, policy decisions, and associations remain core-only, while `litebox_broker_host` is the sanctioned mapping boundary for protocol envelopes and channel outcomes.
 
-Control-channel traits model only the paired broker authority request/response lane. Broker-initiated notifications such as readiness changes, interrupts, faults, revocations, or session failure should use a separately named notification channel/message family rather than arriving as unsolicited `BrokerResponse` values on the control channel. The notification lane should mirror the layered protocol style, for example `BrokerNotification::Core(CoreNotification::Object(...))` or a session-level notification family, but it should not reuse response enums because notifications are not replies to client requests.
+Control-channel traits model only the paired broker authority request/response lane. Broker-initiated notifications such as readiness changes, interrupts, faults, revocations, or session failure should use a separately named notification channel/message family rather than arriving as unsolicited `BrokerResponse` values on the control channel. The notification lane should mirror the layered protocol style, for example `BrokerNotification::Core(CoreNotification::Object(...))` or a session-level notification family, but it should not reuse response enums because notifications are not replies to local requests.
 
-Forward-compatible protocol probing is explicit: unknown requests decoded from the wire stay in channel-level receive wrappers rather than entering the known protocol enums, so the generic server can return `UnsupportedOperation` without closing the connection or exposing wire tag width through the channel interface. Structurally malformed frames remain channel/wire errors. BrokerCore only sees supported, already-adapted domain operations. Core errors or wait outcomes that are newer than the server adapter can represent map to the neutral protocol `Internal` error rather than being reported as unsupported operations.
+Forward-compatible protocol probing is explicit: unknown requests decoded from the wire stay in channel-level receive wrappers rather than entering the known protocol enums, so the generic host can return `UnsupportedOperation` without closing the connection or exposing wire tag width through the channel interface. Structurally malformed frames remain channel/wire errors. BrokerCore only sees supported, already-adapted domain operations. Core errors or wait outcomes that are newer than the host adapter can represent map to the neutral protocol `Internal` error rather than being reported as unsupported operations.
 
-Negotiation separates the broker's max-supported protocol version from the effective version spoken on a connection. The broker response advertises the max-supported version after accepting a compatible request, while client and server connection state retain the requested effective version; all future feature gating should use the effective negotiated version. Version mismatches report the broker-supported version without closing the connection, so clients can retry with a compatible version on expensive or credentialed channels instead of reconnecting and guessing.
+Negotiation separates the broker's max-supported protocol version from the effective version spoken on a connection. The broker response advertises the max-supported version after accepting a compatible request, while local and host connection state retain the requested effective version; all future feature gating should use the effective negotiated version. Version mismatches report the broker-supported version without closing the connection, so local peers can retry with a compatible version on expensive or credentialed channels instead of reconnecting and guessing.
 
 The known broker protocol keeps the outer envelope intentionally small. Connection-level messages such as negotiation and common errors stay at the broker layer; BrokerCore/object operations are grouped below that layer by authority domain and object family, for example `BrokerRequest::Core(CoreRequest::Event(EventRequest::Wait { .. }))`. New object families should add a nested request/response family instead of growing a flat top-level `BrokerRequest`/`BrokerResponse` operation list. The wire codec may encode those nested families as layered tags, but tag widths and unknown-tag handling remain private to the codec.
 
@@ -156,14 +156,14 @@ Kernel/trusted deployments will likely link broker-kernel user-mode support and 
 
 | Future crate/layer | Role |
 |---|---|
-| broker-kernel user-mode support | Trusted-domain support for user-mode execution, trap/upcall/channel delivery, process/thread setup, broker-channel endpoints, and the kernel support ABI used by local core. It supplies or adapts a server control channel, but `litebox_broker_host` still owns broker-side protocol/channel adaptation into BrokerCore. |
+| broker-kernel user-mode support | Trusted-domain support for user-mode execution, trap/upcall/channel delivery, process/thread setup, broker-channel endpoints, and the kernel support ABI used by local core. It supplies or adapts a host control channel, but `litebox_broker_host` still owns broker-side protocol/channel adaptation into BrokerCore. |
 | `litebox_broker_kernel` | Kernel/trusted-domain deployment wiring for `litebox_broker_core`, `litebox_broker_host`, BrokerServices, PolicyEngine, BrokerPlatform, and broker-kernel user-mode support. |
 
 These names do not require separate runtime processes. In a kernel-broker deployment, broker-kernel user-mode support, `litebox_broker_host`, BrokerCore, BrokerServices, PolicyEngine, and BrokerPlatform can be compiled into one trusted binary. The code boundary still matters: broker-kernel user-mode support carries or classifies traffic, `litebox_broker_host` decodes and sequences broker protocol requests, and BrokerCore validates domain invariants and authorizes domain operations with PolicyEngine.
 
 ## Runtime interfaces
 
-There are three logical interfaces. In a broker-kernel deployment, the local-core deployment-support interface and the broker authority interface may use the same trap instruction or kernel entry path, but they must remain separate contracts with separate authority rules. When they share a path, broker-kernel user-mode support should only classify and deliver traffic to the server control channel; `litebox_broker_host` decodes and sequences `BrokerRequest` values, while BrokerCore/BrokerServices/PolicyEngine remain responsible for domain authority.
+There are three logical interfaces. In a broker-kernel deployment, the local-core deployment-support interface and the broker authority interface may use the same trap instruction or kernel entry path, but they must remain separate contracts with separate authority rules. When they share a path, broker-kernel user-mode support should only classify and deliver traffic to the host control channel; `litebox_broker_host` decodes and sequences `BrokerRequest` values, while BrokerCore/BrokerServices/PolicyEngine remain responsible for domain authority.
 
 | Interface | Userland deployment | Kernel deployment | Purpose |
 |---|---|---|---|
@@ -199,7 +199,7 @@ External broker authority APIs:
 
 | API | Shape |
 |---|---|
-| `local core -> broker server/entry -> BrokerCore` | generic capability/resource protocol adapted into direct BrokerCore domain calls |
+| `local core -> broker host/entry -> BrokerCore` | generic capability/resource protocol adapted into direct BrokerCore domain calls |
 | `BrokerService client -> BrokerService` | service-specific protocol for an optional BrokerService |
 
 Internal broker-authority APIs:
@@ -355,7 +355,7 @@ The eventual deployment contract should fail closed:
 
 1. The runner selects a deployment profile, such as `optee-on-lvbs` or `optee-on-userland`.
 2. The runner selects a local-core profile that matches the deployment's host ABI.
-3. The user side establishes an authenticated broker channel. In userland, this can use OS IPC peer credentials; in broker-kernel deployments, this comes from the trusted entry path. The current Unix-socket channel returns an explicit unauthenticated placeholder credential through the same `ServerControlChannel` API that later authenticated channels will implement.
+3. The user side establishes an authenticated broker channel. In userland, this can use OS IPC peer credentials; in broker-kernel deployments, this comes from the trusted entry path. The current Unix-socket channel returns an explicit unauthenticated placeholder credential through the same `HostControlChannel` API that later authenticated channels will implement.
 4. The broker binds the caller identity used for dispatch to the authenticated peer credential. User mode does not choose its own authority identity.
 5. The user side sends required BrokerCore, BrokerService, PolicyEngine policy profile, broker capability, local-core profile, deployment-support, channel/ring, and host-syscall-profile versions.
 6. The broker replies with supported services and capabilities.
@@ -697,7 +697,7 @@ Future mapping:
 | platform trait surface | internal local-core deployment-support adapter, broker-kernel user-mode support, and BrokerPlatform surfaces |
 | service-specific authority | optional BrokerServices plus PolicyEngine decisions, not generic BrokerCore |
 
-The important change is that the current core API should not become the cross-boundary ABI. The local core can keep ergonomic Rust APIs, the broker boundary needs an explicit handle/capability protocol, and broker server/entry code adapts that protocol into BrokerCore domain calls.
+The important change is that the current core API should not become the cross-boundary ABI. The local core can keep ergonomic Rust APIs, the broker boundary needs an explicit handle/capability protocol, and broker host/entry code adapts that protocol into BrokerCore domain calls.
 
 ### `litebox_platform_lvbs`
 
@@ -808,9 +808,9 @@ Then proceed incrementally:
 2. Create `litebox_broker_protocol` with the shared protocol version type, opaque event reference handle format, minimal event request/response messages, readiness/wait outcomes, ABI-neutral errors, known/unknown receive wrappers, peer credentials, and neutral control-channel traits needed for the first event-object path.
 3. Create `litebox_broker_core` with broker-owned process association IDs, authority-only object type and rights metadata, caller credentials supplied by broker entry code, an event object registry plus per-association reference IDs with generation checks, a minimal object/reference registry, association cleanup, and policy hooks. BrokerCore must stay protocol-neutral and channel-neutral.
 4. Add `litebox_broker_protocol::wire` with reusable message-body encoding, create `litebox_broker_transport` with the concrete Unix-domain-socket implementation, create `litebox_broker_host` with protocol negotiation, request sequencing, unknown-tag handling, and adaptation from channel/protocol requests to direct BrokerCore domain calls, and create `litebox_broker_userland` as the hosted executable that assembles those pieces.
-5. Add startup negotiation between runner/client and broker. The current path starts with protocol negotiation over `--broker-socket`; later deployment profiles add required BrokerCore, BrokerService, PolicyEngine, broker capability, channel/ring, host syscall profile, local-core profile, and deployment-support feature negotiation.
-6. Add a broker-owned event object with the smallest end-to-end surface first: create, wait, add, and consume. BrokerCore/server cleanup releases association-owned references on disconnect; protocol-level duplicate, close, explicit readiness queries, and broader stale-handle tests follow after the initial broker path is proven.
-7. Use `litebox_broker_local` for typed end-to-end broker tests, keeping the client independent of Unix sockets so future channel implementations can implement the same neutral channel traits.
+5. Add startup negotiation between the local side and broker. The current path starts with protocol negotiation over `--broker-socket`; later deployment profiles add required BrokerCore, BrokerService, PolicyEngine, broker capability, channel/ring, host syscall profile, local-core profile, and deployment-support feature negotiation.
+6. Add a broker-owned event object with the smallest end-to-end surface first: create, wait, add, and consume. BrokerCore/host cleanup releases association-owned references on disconnect; protocol-level duplicate, close, explicit readiness queries, and broader stale-handle tests follow after the initial broker path is proven.
+7. Use `litebox_broker_local` for typed end-to-end broker tests, keeping the local adapter independent of Unix sockets so future channel implementations can implement the same neutral channel traits.
 8. Continue shaping `litebox` as the untrusted local core for syscall/resource routing, local-private operations, broker-backed object wrappers, and compatibility-profile glue.
 9. Define host syscall profiles for bootstrap, fast local mode, and strict mode.
 10. Make local-core handle tables broker-backed views for migrated object families.

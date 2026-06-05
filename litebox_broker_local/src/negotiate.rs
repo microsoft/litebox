@@ -2,17 +2,17 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::{
-    BrokerRequest, BrokerResponse, ClientControlChannel, ProtocolVersion,
+    BrokerRequest, BrokerResponse, LocalControlChannel, ProtocolVersion,
 };
 
-use crate::{BrokerLocalError, CLIENT_PROTOCOL_VERSION, ControlClient, Result};
+use crate::{BrokerLocal, BrokerLocalError, LOCAL_PROTOCOL_VERSION, Result};
 
-impl<T: ClientControlChannel> ControlClient<T> {
-    /// Negotiates the default client protocol version.
+impl<T: LocalControlChannel> BrokerLocal<T> {
+    /// Negotiates the default broker-local protocol version.
     ///
     /// Returns the effective protocol version this connection will speak.
     pub fn negotiate(&mut self) -> Result<ProtocolVersion, T::Error> {
-        self.negotiate_version(CLIENT_PROTOCOL_VERSION)
+        self.negotiate_version(LOCAL_PROTOCOL_VERSION)
     }
 
     /// Negotiates a caller-selected protocol version.
@@ -27,10 +27,10 @@ impl<T: ClientControlChannel> ControlClient<T> {
         if self.state != crate::ConnectionState::AwaitingNegotiation {
             return Err(BrokerLocalError::AlreadyNegotiated);
         }
-        if !protocol_version.is_supported_by(CLIENT_PROTOCOL_VERSION) {
+        if !protocol_version.is_supported_by(LOCAL_PROTOCOL_VERSION) {
             return Err(BrokerLocalError::UnsupportedLocalVersion {
                 requested: protocol_version,
-                local_protocol_version: CLIENT_PROTOCOL_VERSION,
+                local_protocol_version: LOCAL_PROTOCOL_VERSION,
             });
         }
 

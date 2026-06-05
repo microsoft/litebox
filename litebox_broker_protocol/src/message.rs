@@ -24,7 +24,7 @@ pub enum BrokerRequest {
     Core(CoreRequest),
 }
 
-/// Request adapted by the broker server into a BrokerCore domain call.
+/// Request adapted by the broker host into a BrokerCore domain call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CoreRequest {
@@ -65,7 +65,7 @@ pub enum BrokerResponse {
     },
     /// Negotiation failed because the requested version is unsupported.
     ///
-    /// The connection remains in negotiation state and the client may retry
+    /// The connection remains in negotiation state and the local peer may retry
     /// with a compatible version using the broker-supported version advertised
     /// here.
     VersionMismatch {
