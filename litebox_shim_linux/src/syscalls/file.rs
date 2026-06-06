@@ -4630,6 +4630,28 @@ impl<FS: ShimFS> Task<FS> {
                 let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
                 let files = self.files.borrow();
                 let rds = files.raw_descriptor_store.read();
+                // BrokerPty: synthesize /dev/pts/<pty_id> path so that
+                // ttyname()/readlink() return the actual PTY slave path
+                // even when stdio is wired to a broker-allocated PTY
+                // slave (the dropbear SSH-session case). Mirrors the
+                // non-stdio arm below; without it, the stdio path falls
+                // through to a generic "/dev/std{in,out,err}" placeholder
+                // and TUI apps (e.g., GitHub Copilot CLI) can't discover
+                // the slave path to re-open for rendering.
+                if let Ok(typed_pty) =
+                    rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
+                {
+                    let pty_id = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_entry(
+                            &typed_pty,
+                            |pty_fd: &super::broker_pty::BrokerPtyFd<Platform>| pty_fd.pty_id(),
+                        )
+                        .ok_or(Errno::EBADF)?;
+                    return Ok(alloc::format!("/dev/pts/{pty_id}"));
+                }
                 if let Ok(typed_fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
                     if let Ok(source_fd) =
                         self.global.litebox.descriptor_table().with_metadata(
