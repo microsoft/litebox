@@ -367,6 +367,10 @@ const IOCTL_TIOCGPTN_ONLY_ON_MASTER: HandlerToken<(), PtyOut> =
     HandlerToken::new("pty.ioctl.tiocgptn_only_on_master");
 const DEVPTS_DIR_OPENABLE: HandlerToken<(), PtyOut> =
     HandlerToken::new("pty.devpts.dir_openable");
+const SLAVE_REOPEN_WRITE_REACHES_MASTER: HandlerToken<(), PtyOut> =
+    HandlerToken::new("pty.slave_reopen.write_reaches_master");
+const CHILD_SLAVE_REOPEN_WRITE_REACHES_MASTER: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.child_slave_reopen.write_reaches_master");
 const READLINK_PROC_SELF_FD_STDIO_RETURNS_PTY_PATH: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.readlink.proc_self_fd_stdio_returns_pty_path");
 
@@ -1478,6 +1482,113 @@ async fn handle_readlink_proc_self_fd_stdio_returns_pty_path(
     })
 }
 
+/// Open a PTY pair in the same process, re-open the slave via its
+/// path (mimicking the openat("/dev/pts/N") pattern), write to the
+/// re-opened fd, and verify the master reads the bytes back. This
+/// isolates the broker's dup'd-slave write→master data-path
+/// correctness in the simplest (single-process) shape. Both native
+/// and litebox should pass.
+async fn handle_slave_reopen_write_reaches_master(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    let master_fd = pty.as_raw_fd();
+    let slave_path = std::ffi::CString::new(pty.slave_path())
+        .map_err(|e| HandlerError::from(format!("slave path NUL: {e}")))?;
+    // SAFETY: slave_path is a valid NUL-terminated C string from ptsname.
+    let slave_fd = unsafe { libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    if slave_fd < 0 {
+        return Err(HandlerError::from(format!(
+            "open({}) failed: {}",
+            pty.slave_path(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    const MAGIC: &[u8] = b"HELLO_FROM_REOPENED_SLAVE\n";
+    // SAFETY: slave_fd is a valid writable PTY slave fd.
+    let written = unsafe {
+        libc::write(
+            slave_fd,
+            MAGIC.as_ptr() as *const libc::c_void,
+            MAGIC.len(),
+        )
+    };
+    if written != MAGIC.len() as isize {
+        // SAFETY: slave_fd owned by us; close once.
+        unsafe { libc::close(slave_fd) };
+        return Err(HandlerError::from(format!(
+            "write to re-opened slave returned {written}, expected {}",
+            MAGIC.len()
+        )));
+    }
+    let mut buf = [0u8; 128];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut total = 0usize;
+    while std::time::Instant::now() < deadline && total < MAGIC.len() {
+        // SAFETY: master is a live fd; buf is a valid mutable region.
+        let n = unsafe {
+            libc::read(
+                master_fd,
+                buf[total..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - total,
+            )
+        };
+        if n > 0 {
+            total += n as usize;
+        } else if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EAGAIN) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            // SAFETY: slave_fd owned by us; close once.
+            unsafe { libc::close(slave_fd) };
+            return Err(HandlerError::from(format!("read from master failed: {e}")));
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    // SAFETY: slave_fd owned by us; close once.
+    unsafe { libc::close(slave_fd) };
+    let got = String::from_utf8_lossy(&buf[..total]).into_owned();
+    let expected_lf = String::from_utf8_lossy(MAGIC).into_owned();
+    let expected_crlf = expected_lf.replace('\n', "\r\n");
+    if got != expected_lf && got != expected_crlf {
+        return Err(HandlerError::from(format!(
+            "master read {got:?}, expected {expected_lf:?} or {expected_crlf:?}"
+        )));
+    }
+    Ok(PtyOut {
+        detail: format!("master read {total} bytes from re-opened slave"),
+    })
+}
+
+/// Multi-process: parent opens PTY, child has slave as ctrl_tty,
+/// child re-opens slave via readlink+openat, writes magic. Parent
+/// reads from master.
+async fn handle_child_slave_reopen_write_reaches_master(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    let pid = pty.fork_exec(
+        &[args.target, "pty-child-slave-reopen-write".into()],
+        /* ctrl_tty = */ true,
+    )?;
+    let data = read_until(&pty, "DONE\r\n")?;
+    expect_exit_zero(pid)?;
+    if !data.contains("MAGIC=PROBE_BYTES_REACHED_MASTER") {
+        return Err(HandlerError::from(format!(
+            "master did NOT receive magic the child wrote to its re-opened slave fd. \
+             transcript: {data:?}"
+        )));
+    }
+    Ok(PtyOut {
+        detail: format!("master saw magic bytes via re-opened slave write"),
+    })
+}
+
 async fn handle_parent_exit_then_child_io(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -1546,6 +1657,14 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         handle_ioctl_tiocgptn_only_on_master
     );
     register_handler!(DEVPTS_DIR_OPENABLE, handle_devpts_dir_openable);
+    register_handler!(
+        SLAVE_REOPEN_WRITE_REACHES_MASTER,
+        handle_slave_reopen_write_reaches_master
+    );
+    register_handler!(
+        CHILD_SLAVE_REOPEN_WRITE_REACHES_MASTER,
+        handle_child_slave_reopen_write_reaches_master
+    );
     register_handler!(
         READLINK_PROC_SELF_FD_STDIO_RETURNS_PTY_PATH,
         handle_readlink_proc_self_fd_stdio_returns_pty_path
@@ -1618,6 +1737,10 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!("pty-ldisc-canon", leaf_subcmd::subcmd_pty_ldisc_canon);
     crate::register_leaf_subcommand!("pty-stdout-print", leaf_subcmd::subcmd_pty_stdout_print);
     crate::register_leaf_subcommand!("pty-readlink-stdio", leaf_subcmd::subcmd_pty_readlink_stdio);
+    crate::register_leaf_subcommand!(
+        "pty-child-slave-reopen-write",
+        leaf_subcmd::subcmd_pty_child_slave_reopen_write
+    );
     crate::register_leaf_subcommand!(
         "pty-stdout-post-sleep",
         leaf_subcmd::subcmd_pty_stdout_post_sleep
@@ -1698,6 +1821,35 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         &DEVPTS_DIR_OPENABLE,
         |out| Ok(out.detail.clone()),
     );
+    reg.single_agent_handler_test(
+        "vscode",
+        "pty",
+        "PTY.slave_reopen.write_reaches_master.pie-glibc.dpg1",
+        AgentName::Dpg1,
+        &SLAVE_REOPEN_WRITE_REACHES_MASTER,
+        |out| Ok(out.detail.clone()),
+    );
+    {
+        let token = &CHILD_SLAVE_REOPEN_WRITE_REACHES_MASTER;
+        reg.test("vscode", "pty", "PTY.child_slave_reopen.write_reaches_master.pie-glibc.dpg1")
+            .timeout(30)
+            .build(move |cx| {
+                let handle = cx.require(AgentName::Dpg1);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let target =
+                            crate::binary_path(crate::BinaryType::PieGlibc, run.self_exe());
+                        let result = run
+                            .send_named_typed(&handle, token, TargetArgs { target })
+                            .await;
+                        match result {
+                            Ok(out) => TestOutcome::new("dpg1", true, out.detail),
+                            Err(detail) => TestOutcome::new("dpg1", false, detail),
+                        }
+                    })
+                })
+            });
+    }
     // PTY.readlink.proc_self_fd_stdio_returns_pty_path uses
     // TargetArgs to pass the leaf binary path to the child.
     {
@@ -2523,6 +2675,57 @@ mod leaf_subcmd {
                 }
             }
         }
+        println!("DONE");
+        let _ = std::io::stdout().flush();
+        0
+    }
+
+    /// PTY.child_slave_reopen.write_reaches_master: child's stdio
+    /// IS a PTY slave (ctrl_tty=true). Re-open the slave via
+    /// readlink("/proc/self/fd/0") + openat(path), write a magic
+    /// string to the re-opened fd, and write the DONE marker via
+    /// the inherited slave (stdio).
+    pub(super) fn subcmd_pty_child_slave_reopen_write(_args: &[String]) -> i32 {
+        let slave_path = match std::fs::read_link("/proc/self/fd/0") {
+            Ok(p) => p,
+            Err(e) => {
+                println!("REOPENED_PATH=ERR:{e}");
+                println!("DONE");
+                let _ = std::io::stdout().flush();
+                return 1;
+            }
+        };
+        println!("REOPENED_PATH={}", slave_path.display());
+        let _ = std::io::stdout().flush();
+        let cpath = match std::ffi::CString::new(slave_path.to_string_lossy().as_bytes()) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("OPEN_ERR=NUL:{e}");
+                println!("DONE");
+                let _ = std::io::stdout().flush();
+                return 1;
+            }
+        };
+        // SAFETY: cpath is a valid NUL-terminated C string.
+        let reopened = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        if reopened < 0 {
+            let e = std::io::Error::last_os_error();
+            println!("OPEN_ERR={e}");
+            println!("DONE");
+            let _ = std::io::stdout().flush();
+            return 1;
+        }
+        const MAGIC: &[u8] = b"MAGIC=PROBE_BYTES_REACHED_MASTER\n";
+        // SAFETY: reopened is a valid writable fd we just opened.
+        let _ = unsafe {
+            libc::write(
+                reopened,
+                MAGIC.as_ptr() as *const libc::c_void,
+                MAGIC.len(),
+            )
+        };
+        // SAFETY: reopened owned by us; close once.
+        unsafe { libc::close(reopened) };
         println!("DONE");
         let _ = std::io::stdout().flush();
         0
