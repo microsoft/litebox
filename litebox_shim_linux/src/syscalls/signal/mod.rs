@@ -1595,11 +1595,8 @@ impl<FS: ShimFS> Task<FS> {
                 SIG_DFL => {
                     match signal.default_disposition() {
                         SignalDisposition::Terminate
-                        | SignalDisposition::Core
-                        | SignalDisposition::Stop => {
-                            // STOP is not currently supported, so treat as
-                            // terminate. Core dumps are also not currently
-                            // supported.
+                        | SignalDisposition::Core => {
+                            // Core dumps are not currently supported.
                             //
                             // Only log full crash context for Core-disposition
                             // signals (SIGSEGV, SIGBUS, SIGABRT, etc).
@@ -1619,6 +1616,27 @@ impl<FS: ShimFS> Task<FS> {
                                 );
                             }
                             self.exit_group(ExitStatus::Signal(signal));
+                        }
+                        SignalDisposition::Stop => {
+                            // STOP is not currently supported. Previously the
+                            // shim treated Stop as Terminate, which killed
+                            // interactive TUI apps (e.g., GitHub Copilot CLI)
+                            // that send SIGTTIN to themselves as part of
+                            // job-control patterns, and killed processes in
+                            // a background pgrp that tried to read from their
+                            // controlling terminal (kernel default behavior
+                            // is to deliver SIGTTIN to the offending pgrp).
+                            //
+                            // Treating SIG_DFL Stop as a no-op (ignore) is
+                            // the closer behavioral approximation: the
+                            // process keeps running rather than being killed.
+                            // Real STOP semantics (suspend the task until
+                            // SIGCONT) require platform-level scheduler
+                            // support and are out of scope.
+                            //
+                            // Surfaced by Goal A validation session 7c1fc95d
+                            // round 5 — copilot::tui_noLLM cascade rooted
+                            // here.
                         }
                         SignalDisposition::Ignore => {}
                         SignalDisposition::Continue => {
