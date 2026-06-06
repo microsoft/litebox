@@ -367,6 +367,8 @@ const IOCTL_TIOCGPTN_ONLY_ON_MASTER: HandlerToken<(), PtyOut> =
     HandlerToken::new("pty.ioctl.tiocgptn_only_on_master");
 const DEVPTS_DIR_OPENABLE: HandlerToken<(), PtyOut> =
     HandlerToken::new("pty.devpts.dir_openable");
+const READLINK_PROC_SELF_FD_STDIO_RETURNS_PTY_PATH: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.readlink.proc_self_fd_stdio_returns_pty_path");
 
 // ─── Handlers ────────────────────────────────────────────────────────
 
@@ -1401,6 +1403,81 @@ async fn handle_devpts_dir_openable(
     })
 }
 
+/// `readlink("/proc/self/fd/0")` (and fd 1, fd 2) must return the
+/// real PTY slave device path (e.g., `"/dev/pts/0"`) when stdio is
+/// connected to a PTY slave, NOT a generic placeholder like
+/// `"/dev/stdin"` / `"/dev/stdout"` / `"/dev/stderr"`.
+///
+/// Native: `readlink("/proc/self/fd/2") = "/dev/pts/0"` (10 chars).
+/// Litebox at session-7c1fc95d tip (post the TIOCGPTN + devpts-dir
+/// fixes): returns `"/dev/stderr"` (11 chars) because the shim's
+/// readlink handler at `litebox_shim_linux/src/syscalls/file.rs:4699`
+/// falls through to the generic stdio name when the fd is a
+/// `BrokerPty` slave (the per-stdio-fd branch at lines 4628-4704
+/// has metadata checks for `HostStdioSourceFd`, `HostTtyAlias`, and
+/// `HostPtyDeviceFd` but NOT for `BrokerPtySubsystem`, which is what
+/// dropbear allocates for SSH sessions).
+///
+/// Real-world impact: GitHub Copilot CLI (and any program calling
+/// `ttyname()`, which uses this readlink as its primary discovery
+/// mechanism) needs the PTY slave path to re-open the slave for TUI
+/// rendering. Under litebox the readlink returns `/dev/stderr`,
+/// copilot cannot find a PTY slave to render through, falls back to
+/// scanning `/dev/pts/` (also empty under litebox's rootfs view),
+/// gives up, and the TUI never renders → `copilot::tui_noLLM` and
+/// `copilot::tui.*` trials hang.
+///
+/// Surfaced by Goal A validation session 7c1fc95d's third-pass
+/// audit-log + native-strace diff after the prior two shim fixes.
+async fn handle_readlink_proc_self_fd_stdio_returns_pty_path(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let pty = Pty::open()?;
+    let pid = pty.fork_exec(
+        &[args.target, "pty-readlink-stdio".into()],
+        /* ctrl_tty = */ true,
+    )?;
+    // Child writes three lines: FD0=<path>\nFD1=<path>\nFD2=<path>\nDONE\n
+    let data = read_until(&pty, "DONE\r\n")?;
+    expect_exit_zero(pid)?;
+    let mut fd0: Option<&str> = None;
+    let mut fd1: Option<&str> = None;
+    let mut fd2: Option<&str> = None;
+    for line in data.split("\r\n") {
+        if let Some(v) = line.strip_prefix("FD0=") {
+            fd0 = Some(v);
+        } else if let Some(v) = line.strip_prefix("FD1=") {
+            fd1 = Some(v);
+        } else if let Some(v) = line.strip_prefix("FD2=") {
+            fd2 = Some(v);
+        }
+    }
+    let fd0 = fd0.ok_or_else(|| HandlerError::from(format!("missing FD0= line in {data:?}")))?;
+    let fd1 = fd1.ok_or_else(|| HandlerError::from(format!("missing FD1= line in {data:?}")))?;
+    let fd2 = fd2.ok_or_else(|| HandlerError::from(format!("missing FD2= line in {data:?}")))?;
+
+    let check = |label: &str, path: &str| -> Result<(), HandlerError> {
+        if !path.starts_with("/dev/pts/") {
+            return Err(HandlerError::from(format!(
+                "readlink(\"/proc/self/{label}\") returned {path:?}; expected a path starting \
+                 with \"/dev/pts/\" (the PTY slave device path). Under the buggy shim, the \
+                 BrokerPty branch is missing from the stdio (0..=2) readlink path, so the \
+                 fallback to a generic \"/dev/std{{in,out,err}}\" path is returned instead. \
+                 See litebox_shim_linux/src/syscalls/file.rs:4699 fallback arm."
+            )));
+        }
+        Ok(())
+    };
+    check("fd/0", fd0)?;
+    check("fd/1", fd1)?;
+    check("fd/2", fd2)?;
+
+    Ok(PtyOut {
+        detail: format!("readlink stdio paths: FD0={fd0:?} FD1={fd1:?} FD2={fd2:?}"),
+    })
+}
+
 async fn handle_parent_exit_then_child_io(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -1470,6 +1547,10 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     );
     register_handler!(DEVPTS_DIR_OPENABLE, handle_devpts_dir_openable);
     register_handler!(
+        READLINK_PROC_SELF_FD_STDIO_RETURNS_PTY_PATH,
+        handle_readlink_proc_self_fd_stdio_returns_pty_path
+    );
+    register_handler!(
         CONTROLLING_TTY_TOSTOP_SIGTTOU,
         handle_controlling_tty_tostop_sigttou
     );
@@ -1536,6 +1617,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     crate::register_leaf_subcommand!("pty-ldisc-signal", leaf_subcmd::subcmd_pty_ldisc_signal);
     crate::register_leaf_subcommand!("pty-ldisc-canon", leaf_subcmd::subcmd_pty_ldisc_canon);
     crate::register_leaf_subcommand!("pty-stdout-print", leaf_subcmd::subcmd_pty_stdout_print);
+    crate::register_leaf_subcommand!("pty-readlink-stdio", leaf_subcmd::subcmd_pty_readlink_stdio);
     crate::register_leaf_subcommand!(
         "pty-stdout-post-sleep",
         leaf_subcmd::subcmd_pty_stdout_post_sleep
@@ -1616,6 +1698,29 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         &DEVPTS_DIR_OPENABLE,
         |out| Ok(out.detail.clone()),
     );
+    // PTY.readlink.proc_self_fd_stdio_returns_pty_path uses
+    // TargetArgs to pass the leaf binary path to the child.
+    {
+        let token = &READLINK_PROC_SELF_FD_STDIO_RETURNS_PTY_PATH;
+        reg.test("vscode", "pty", "PTY.readlink.proc_self_fd_stdio_returns_pty_path.pie-glibc.dpg1")
+            .timeout(30)
+            .build(move |cx| {
+                let handle = cx.require(AgentName::Dpg1);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let target =
+                            crate::binary_path(crate::BinaryType::PieGlibc, run.self_exe());
+                        let result = run
+                            .send_named_typed(&handle, token, TargetArgs { target })
+                            .await;
+                        match result {
+                            Ok(out) => TestOutcome::new("dpg1", true, out.detail),
+                            Err(detail) => TestOutcome::new("dpg1", false, detail),
+                        }
+                    })
+                })
+            });
+    }
 
     for &agent in PTY_AGENTS {
         for def in PTY_SCENARIOS {
@@ -2395,6 +2500,30 @@ mod leaf_subcmd {
     /// reach the PTY master after `exec_on_remote_host` handoff."
     pub(super) fn subcmd_pty_stdout_print(_args: &[String]) -> i32 {
         println!("PTYR_STDOUT_OK");
+        let _ = std::io::stdout().flush();
+        0
+    }
+
+    /// PTY.readlink.proc_self_fd_stdio_returns_pty_path: report
+    /// readlink results for /proc/self/fd/{0,1,2} when stdio is wired
+    /// to a PTY slave. Child runs under `Pty::fork_exec(ctrl_tty=true)`,
+    /// so all three stdio fds ARE the slave fd. Native must produce
+    /// `/dev/pts/N` paths; the litebox shim's bug under investigation
+    /// returns `/dev/std{in,out,err}` placeholders instead because the
+    /// stdio readlink branch lacks a BrokerPtySubsystem arm.
+    pub(super) fn subcmd_pty_readlink_stdio(_args: &[String]) -> i32 {
+        for fd in [0, 1, 2] {
+            let path = format!("/proc/self/fd/{fd}");
+            match std::fs::read_link(&path) {
+                Ok(target) => {
+                    println!("FD{fd}={}", target.display());
+                }
+                Err(e) => {
+                    println!("FD{fd}=ERR:{e}");
+                }
+            }
+        }
+        println!("DONE");
         let _ = std::io::stdout().flush();
         0
     }
