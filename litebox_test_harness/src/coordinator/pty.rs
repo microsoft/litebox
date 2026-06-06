@@ -371,6 +371,8 @@ const SLAVE_REOPEN_WRITE_REACHES_MASTER: HandlerToken<(), PtyOut> =
     HandlerToken::new("pty.slave_reopen.write_reaches_master");
 const CHILD_SLAVE_REOPEN_WRITE_REACHES_MASTER: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.child_slave_reopen.write_reaches_master");
+const SIGTTIN_DFL_DOES_NOT_KILL: HandlerToken<TargetArgs, PtyOut> =
+    HandlerToken::new("pty.sigttin_dfl_does_not_kill");
 const READLINK_PROC_SELF_FD_STDIO_RETURNS_PTY_PATH: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.readlink.proc_self_fd_stdio_returns_pty_path");
 
@@ -1589,6 +1591,65 @@ async fn handle_child_slave_reopen_write_reaches_master(
     })
 }
 
+/// `kill(self, SIGTTIN)` with SIG_DFL must NOT terminate the process.
+/// Native Linux semantics: default disposition of SIGTTIN is STOP
+/// (suspend the process until SIGCONT). It does NOT kill the process.
+///
+/// Litebox at session-7c1fc95d round-4 tip (pre-fix): the shim's
+/// signal-delivery code at
+/// `litebox_shim_linux/src/syscalls/signal/mod.rs:1605-1638` treated
+/// SignalDisposition::Stop as Terminate ("STOP is not currently
+/// supported, so treat as terminate"). Real-world impact: GitHub
+/// Copilot CLI's launcher sends SIGTTIN to itself as part of a
+/// job-control cleanup pattern; under the buggy shim, this killed
+/// the launcher AND any process in the same pgrp (via the cascade
+/// that follows when a foreground-pgrp process reads its controlling
+/// terminal while backgrounded — kernel default action is to send
+/// SIGTTIN to that pgrp).
+///
+/// Surfaced by Goal A validation session 7c1fc95d round 5 via wait4
+/// status diagnostic showing `status_raw=149` (= 128 + 21 = SIGTTIN)
+/// on both copilot-linux-x64 and its node child.
+async fn handle_sigttin_dfl_does_not_kill(
+    args: TargetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(&args.target)
+        .arg("pty-sigttin-self-kill")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| HandlerError::from(format!("spawn child: {e}")))?;
+    let status = child
+        .wait()
+        .map_err(|e| HandlerError::from(format!("wait child: {e}")))?;
+    // Expected: child wrote OK_AFTER_SIGTTIN to stdout and exited 0.
+    // Pre-fix: shim killed child with SIGTTIN (status reflects signal
+    // termination — not a clean exit code).
+    let mut stdout = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        use std::io::Read as _;
+        let _ = o.read_to_string(&mut stdout);
+    }
+    if !status.success() {
+        return Err(HandlerError::from(format!(
+            "child did NOT exit 0 after kill(self, SIGTTIN). status={status:?}. \
+             This is the SIGTTIN-as-Terminate shim bug: SIG_DFL Stop-disposition \
+             signals must be a no-op, not terminate. See \
+             litebox_shim_linux/src/syscalls/signal/mod.rs deliver_signal SIG_DFL arm."
+        )));
+    }
+    if !stdout.contains("OK_AFTER_SIGTTIN") {
+        return Err(HandlerError::from(format!(
+            "child exited 0 but did not print expected marker. stdout={stdout:?}"
+        )));
+    }
+    Ok(PtyOut {
+        detail: format!("kill(self, SIGTTIN) with SIG_DFL did not kill the process"),
+    })
+}
+
 async fn handle_parent_exit_then_child_io(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -1665,6 +1726,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         CHILD_SLAVE_REOPEN_WRITE_REACHES_MASTER,
         handle_child_slave_reopen_write_reaches_master
     );
+    register_handler!(SIGTTIN_DFL_DOES_NOT_KILL, handle_sigttin_dfl_does_not_kill);
     register_handler!(
         READLINK_PROC_SELF_FD_STDIO_RETURNS_PTY_PATH,
         handle_readlink_proc_self_fd_stdio_returns_pty_path
@@ -1741,6 +1803,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         "pty-child-slave-reopen-write",
         leaf_subcmd::subcmd_pty_child_slave_reopen_write
     );
+    crate::register_leaf_subcommand!("pty-sigttin-self-kill", leaf_subcmd::subcmd_pty_sigttin_self_kill);
     crate::register_leaf_subcommand!(
         "pty-stdout-post-sleep",
         leaf_subcmd::subcmd_pty_stdout_post_sleep
@@ -1833,6 +1896,27 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         let token = &CHILD_SLAVE_REOPEN_WRITE_REACHES_MASTER;
         reg.test("vscode", "pty", "PTY.child_slave_reopen.write_reaches_master.pie-glibc.dpg1")
             .timeout(30)
+            .build(move |cx| {
+                let handle = cx.require(AgentName::Dpg1);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let target =
+                            crate::binary_path(crate::BinaryType::PieGlibc, run.self_exe());
+                        let result = run
+                            .send_named_typed(&handle, token, TargetArgs { target })
+                            .await;
+                        match result {
+                            Ok(out) => TestOutcome::new("dpg1", true, out.detail),
+                            Err(detail) => TestOutcome::new("dpg1", false, detail),
+                        }
+                    })
+                })
+            });
+    }
+    {
+        let token = &SIGTTIN_DFL_DOES_NOT_KILL;
+        reg.test("vscode", "pty", "PTY.sigttin_dfl_does_not_kill.pie-glibc.dpg1")
+            .timeout(15)
             .build(move |cx| {
                 let handle = cx.require(AgentName::Dpg1);
                 Box::new(move |run| {
@@ -2727,6 +2811,39 @@ mod leaf_subcmd {
         // SAFETY: reopened owned by us; close once.
         unsafe { libc::close(reopened) };
         println!("DONE");
+        let _ = std::io::stdout().flush();
+        0
+    }
+
+    /// PTY.sigttin_dfl_does_not_kill: send SIGTTIN to self with
+    /// SIG_DFL. Native semantics: default action is STOP, not
+    /// terminate. Pre-fix litebox shim treated SIG_DFL Stop as
+    /// terminate; this probe FAILs there. Post-fix (Stop = no-op),
+    /// child prints OK and exits 0.
+    pub(super) fn subcmd_pty_sigttin_self_kill(_args: &[String]) -> i32 {
+        // Explicitly set SIGTTIN to SIG_DFL so probe targets the
+        // shim's SIG_DFL Stop-disposition handling.
+        // SAFETY: signal() is a libc API; SIG_DFL is the canonical
+        // default handler.
+        unsafe {
+            let prev = libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+            if prev == libc::SIG_ERR {
+                println!("SIGNAL_ERR");
+                let _ = std::io::stdout().flush();
+                return 2;
+            }
+        }
+        let pid = std::process::id() as libc::pid_t;
+        // SAFETY: sending a signal to our own pid.
+        let rc = unsafe { libc::kill(pid, libc::SIGTTIN) };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            println!("KILL_ERR:{e}");
+            let _ = std::io::stdout().flush();
+            return 3;
+        }
+        // If we reach here, the process was NOT killed by SIGTTIN.
+        println!("OK_AFTER_SIGTTIN pid={pid}");
         let _ = std::io::stdout().flush();
         0
     }
