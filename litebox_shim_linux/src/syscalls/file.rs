@@ -931,6 +931,15 @@ impl<FS: ShimFS> Task<FS> {
                 Some(pair.slave_handle),
             )
         } else if let Some(num) = path.strip_prefix("/dev/pts/") {
+            // Bare "/dev/pts/" (empty remainder) is a directory open
+            // for the devpts mount itself, not a slave open — fall
+            // through to the rootfs FS so applications can enumerate
+            // entries via getdents. (Copilot CLI uses this as a
+            // fallback after ioctl(TIOCGPTN) returns ENOTTY on
+            // stdin/stdout/stderr.)
+            if num.is_empty() {
+                return None;
+            }
             let Ok(pty_id) = num.parse::<u32>() else {
                 return Some(Err(Errno::ENOENT));
             };
