@@ -365,6 +365,8 @@ const LINE_DISCIPLINE_CR_TO_NL: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.line_discipline.cr_to_nl");
 const IOCTL_TIOCGPTN_ONLY_ON_MASTER: HandlerToken<(), PtyOut> =
     HandlerToken::new("pty.ioctl.tiocgptn_only_on_master");
+const DEVPTS_DIR_OPENABLE: HandlerToken<(), PtyOut> =
+    HandlerToken::new("pty.devpts.dir_openable");
 
 // ─── Handlers ────────────────────────────────────────────────────────
 
@@ -1322,6 +1324,83 @@ async fn handle_ioctl_tiocgptn_only_on_master(
     })
 }
 
+/// `openat(AT_FDCWD, "/dev/pts/", O_RDONLY|O_DIRECTORY|O_CLOEXEC)`
+/// must succeed (the path is a real devpts mount, the syscall is
+/// asking the FS to open it as a directory). Native: succeeds, fd
+/// usable with getdents to enumerate ptmx + slave entries. Litebox
+/// at amalgamation tip 36973d8a (pre-fix): the shim's
+/// `open_broker_pty_path` handler in
+/// `litebox_shim_linux/src/syscalls/file.rs:933-936` matches the
+/// `/dev/pts/` prefix with an empty remainder, fails to parse the
+/// empty string as a u32 pty_id, and returns ENOENT — short-circuiting
+/// the rootfs/9P FS that would have served the real directory.
+///
+/// Real-world impact: GitHub Copilot CLI calls
+/// `openat("/dev/pts/", O_DIRECTORY)` immediately after each
+/// `ioctl(TIOCGPTN)` returns ENOTTY, as a fallback to enumerate
+/// available slaves and find its own. Native succeeds, copilot
+/// proceeds. Litebox returns ENOENT, copilot can't find its slave
+/// path, TUI rendering stalls — `copilot::tui.*` and
+/// `copilot::tui_noLLM.startup_then_exit` trials hang with empty
+/// transcripts.
+///
+/// Surfaced by Goal A validation session 7c1fc95d's second-pass
+/// audit-log analysis after the TIOCGPTN-on-slave-returns-ENOTTY fix
+/// (commit `7858a614`) made the prior divergence visible.
+async fn handle_devpts_dir_openable(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PtyOut, HandlerError> {
+    let path = std::ffi::CString::new("/dev/pts/")
+        .map_err(|e| HandlerError::from(format!("path NUL: {e}")))?;
+    // SAFETY: path is a valid NUL-terminated C string.
+    let fd = unsafe {
+        libc::openat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(HandlerError::from(format!(
+            "openat(AT_FDCWD, \"/dev/pts/\", O_RDONLY|O_DIRECTORY|O_CLOEXEC) failed: {err}. \
+             Native should succeed — /dev/pts is a real devpts mount in the container. \
+             This is the devpts-directory-openat divergence: the shim's open_broker_pty_path \
+             at litebox_shim_linux/src/syscalls/file.rs:933 returns Errno::ENOENT when \
+             stripping \"/dev/pts/\" leaves an empty remainder, instead of falling through \
+             to the rootfs FS that owns the real directory."
+        )));
+    }
+
+    // Read a directory entry to prove the fd is usable, not just open.
+    // SAFETY: fd is a valid open directory fd.
+    let mut buf = [0u8; 1024];
+    let n = unsafe {
+        libc::syscall(
+            libc::SYS_getdents64,
+            fd,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    let getdents_err = std::io::Error::last_os_error();
+    // SAFETY: fd is owned by us; close exactly once.
+    unsafe { libc::close(fd) };
+
+    if n < 0 {
+        return Err(HandlerError::from(format!(
+            "openat succeeded but getdents64 failed: {getdents_err}"
+        )));
+    }
+
+    Ok(PtyOut {
+        detail: format!(
+            "openat(\"/dev/pts/\", O_DIRECTORY) ok; getdents64 returned {n} bytes of entries"
+        ),
+    })
+}
+
 async fn handle_parent_exit_then_child_io(
     args: TargetArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -1389,6 +1468,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         IOCTL_TIOCGPTN_ONLY_ON_MASTER,
         handle_ioctl_tiocgptn_only_on_master
     );
+    register_handler!(DEVPTS_DIR_OPENABLE, handle_devpts_dir_openable);
     register_handler!(
         CONTROLLING_TTY_TOSTOP_SIGTTOU,
         handle_controlling_tty_tostop_sigttou
@@ -1526,6 +1606,14 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         "PTY.ioctl.tiocgptn_only_on_master.pie-glibc.dpg1",
         AgentName::Dpg1,
         &IOCTL_TIOCGPTN_ONLY_ON_MASTER,
+        |out| Ok(out.detail.clone()),
+    );
+    reg.single_agent_handler_test(
+        "vscode",
+        "pty",
+        "PTY.devpts.dir_openable.pie-glibc.dpg1",
+        AgentName::Dpg1,
+        &DEVPTS_DIR_OPENABLE,
         |out| Ok(out.detail.clone()),
     );
 
