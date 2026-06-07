@@ -643,6 +643,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .sys_nt_query_performance_counter(performance_counter, performance_frequency);
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQuerySystemInformation {
+                system_information_class,
+                system_information,
+                system_information_length,
+                return_length,
+            } => {
+                let status = Self::sys_nt_query_system_information(
+                    system_information_class,
+                    system_information,
+                    system_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
                 flag,
                 source,
