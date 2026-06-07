@@ -1772,7 +1772,19 @@ impl<FS: ShimFS> Task<FS> {
         let inner = handlers.inner.lock();
         match inner[signal].action.sigaction {
             SIG_IGN => true,
-            SIG_DFL => matches!(signal.default_disposition(), SignalDisposition::Ignore),
+            SIG_DFL => matches!(
+                signal.default_disposition(),
+                // Stop-disposition signals are treated as no-op (ignore)
+                // under SIG_DFL because the shim does not implement
+                // actual STOP semantics — see deliver_signal SIG_DFL arm.
+                // Callers that gate signal delivery on this predicate
+                // (e.g., broker_pty_background_read_sigttin) must skip
+                // delivery in that case, otherwise reads end up in an
+                // EINTR loop: SIGTTIN delivered → no-op handler → read
+                // returns EINTR → caller retries → SIGTTIN delivered
+                // again → infinite spin.
+                SignalDisposition::Ignore | SignalDisposition::Stop
+            ),
             _ => false,
         }
     }
