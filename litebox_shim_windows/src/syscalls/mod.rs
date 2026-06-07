@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod mm;
 pub(crate) mod nls;
@@ -86,6 +87,43 @@ impl ProcessHandle {
 pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtClose {
         handle: Handle,
+    },
+    NtCreateEvent {
+        event_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        event_type: u32,
+        initial_state: u8,
+    },
+    NtOpenEvent {
+        event_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtSetEvent {
+        event_handle: Handle,
+        previous_state: Option<Platform::RawMutPointer<i32>>,
+    },
+    NtResetEvent {
+        event_handle: Handle,
+        previous_state: Option<Platform::RawMutPointer<i32>>,
+    },
+    NtClearEvent {
+        event_handle: Handle,
+    },
+    NtPulseEvent {
+        event_handle: Handle,
+        previous_state: Option<Platform::RawMutPointer<i32>>,
+    },
+    NtQueryEvent {
+        event_handle: Handle,
+        event_information_class: u32,
+        event_information: Platform::RawMutPointer<event::EventBasicInformation>,
+        event_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtSetEventBoostPriority {
+        event_handle: Handle,
     },
     NtOpenFile {
         file_handle: Platform::RawMutPointer<Handle>,
@@ -202,6 +240,8 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         process_handle: ProcessHandle,
         exit_status: i32,
     },
+    /// TODO: not supported yet
+    NtManageHotPatch,
 }
 
 impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
@@ -227,6 +267,43 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         match NtSysno::from_raw(pt_regs.orig_rax)? {
             NtSysno::NtClose => Some(sys_req!(NtClose {
                 handle: { Handle::from_raw },
+            })),
+            NtSysno::NtCreateEvent => Some(sys_req!(NtCreateEvent {
+                event_handle:*,
+                desired_access,
+                object_attributes:*,
+                event_type,
+                initial_state,
+            })),
+            NtSysno::NtOpenEvent => Some(sys_req!(NtOpenEvent {
+                event_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtSetEvent => Some(sys_req!(NtSetEvent {
+                event_handle:{Handle::from_raw},
+                previous_state:*,
+            })),
+            NtSysno::NtResetEvent => Some(sys_req!(NtResetEvent {
+                event_handle:{Handle::from_raw},
+                previous_state:*,
+            })),
+            NtSysno::NtClearEvent => Some(sys_req!(NtClearEvent {
+                event_handle: { Handle::from_raw },
+            })),
+            NtSysno::NtPulseEvent => Some(sys_req!(NtPulseEvent {
+                event_handle:{Handle::from_raw},
+                previous_state:*,
+            })),
+            NtSysno::NtQueryEvent => Some(sys_req!(NtQueryEvent {
+                event_handle:{Handle::from_raw},
+                event_information_class,
+                event_information:*,
+                event_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtSetEventBoostPriority => Some(sys_req!(NtSetEventBoostPriority {
+                event_handle: { Handle::from_raw },
             })),
             NtSysno::NtOpenFile => Some(sys_req!(NtOpenFile {
                 file_handle:*,
@@ -345,6 +422,7 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 process_handle: { ProcessHandle::from_raw },
                 exit_status,
             })),
+            NtSysno::NtManageHotPatch => Some(SyscallRequest::NtManageHotPatch),
             _ => None,
         }
     }

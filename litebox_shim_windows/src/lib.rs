@@ -12,7 +12,8 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::string::String;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -30,6 +31,7 @@ use litebox::sync::RawSyncPrimitivesProvider;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
+use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 use crate::syscalls::{SyscallRequest, mm};
@@ -75,6 +77,8 @@ pub(crate) type WindowsNlsSectionMappings<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
 pub(crate) type WindowsVirtualAllocations<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
+pub(crate) type WindowsEventNamespace<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<String, Weak<EventObject<Platform>>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {
@@ -309,6 +313,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             ntdll_mapping: load_info.ntdll_mapping,
             peb_address: load_info.environment.peb,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
+            event_namespace: WindowsEventNamespace::<Platform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
             virtual_allocations: load_info.virtual_allocations,
             system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
@@ -345,10 +350,11 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 /// Per-process Windows state shared by every thread in the process.
-pub struct Process<Platform: RawSyncPrimitivesProvider> {
+pub struct Process<Platform: ShimPlatform> {
     ntdll_mapping: Option<MappingInfo>,
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
+    event_namespace: WindowsEventNamespace<Platform>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
     virtual_allocations: WindowsVirtualAllocations<Platform>,
     system_lcid: AtomicU32,
@@ -357,7 +363,7 @@ pub struct Process<Platform: RawSyncPrimitivesProvider> {
     exit_code: AtomicI32,
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Process<Platform> {
+impl<Platform: ShimPlatform> Process<Platform> {
     /// Wait for the process to exit, returning its exit code.
     ///
     /// Currently a placeholder that returns a fixed exit code immediately.
@@ -425,6 +431,76 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (result, op) = match req {
             SyscallRequest::NtClose { handle } => {
                 let status = self.sys_nt_close(handle);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateEvent {
+                event_handle,
+                desired_access,
+                object_attributes,
+                event_type,
+                initial_state,
+            } => {
+                let status = self.sys_nt_create_event(
+                    event_handle,
+                    desired_access,
+                    object_attributes,
+                    event_type,
+                    initial_state,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenEvent {
+                event_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status =
+                    self.sys_nt_open_event(event_handle, desired_access, object_attributes);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetEvent {
+                event_handle,
+                previous_state,
+            } => {
+                let status = self.sys_nt_set_event(event_handle, previous_state);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtResetEvent {
+                event_handle,
+                previous_state,
+            } => {
+                let status = self.sys_nt_reset_event(event_handle, previous_state);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtClearEvent { event_handle } => {
+                let status = self.sys_nt_clear_event(event_handle);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtPulseEvent {
+                event_handle,
+                previous_state,
+            } => {
+                let status = self.sys_nt_pulse_event(event_handle, previous_state);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryEvent {
+                event_handle,
+                event_information_class,
+                event_information,
+                event_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_event(
+                    event_handle,
+                    event_information_class,
+                    event_information,
+                    event_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetEventBoostPriority { event_handle } => {
+                let status = self.sys_nt_set_event(event_handle, None);
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtOpenFile {
@@ -683,6 +759,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     (NtStatus::SUCCESS, ContinueOperation::Terminate)
                 }
             }
+            SyscallRequest::NtManageHotPatch => {
+                (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)
+            }
         };
 
         ctx.rax = result.as_raw().cast_unsigned() as usize;
@@ -717,6 +796,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, EventSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |event| visitor.event(event),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         NtStatus::INVALID_HANDLE
     }
 
@@ -736,6 +823,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     fn file(&self, file: FileObject<FS>);
 
     fn registry_key(&self, key: RegistryKeyObject<Platform>);
+
+    fn event(&self, event: EventHandleObject<Platform>);
 }
 
 struct CloseRawHandleVisitor<'task, Platform: ShimPlatform, FS: ShimFS> {
@@ -751,6 +840,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn registry_key(&self, key: RegistryKeyObject<Platform>) {
         self.task.close_registry_key(key);
+    }
+
+    fn event(&self, event: EventHandleObject<Platform>) {
+        Task::<Platform, FS>::close_event(event);
     }
 }
 
