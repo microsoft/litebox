@@ -346,6 +346,53 @@ class ChildrenRegistryTests(unittest.TestCase):
         self.assertEqual(data["children"][0]["worktree_path"], "/x")
 
 
+class PidfileConcurrentWriteTests(unittest.TestCase):
+    """Regression: concurrent `_write_pidfile_from_state` calls used
+    to share a single `auto.pidfile.tmp` path and race on `replace()`,
+    raising `FileNotFoundError` (one thread renamed the tmp while
+    another was about to). The exception then bubbled up between
+    `_register_child` and the `try`/`finally` in `_drive_*`, leaking
+    the just-registered child slot — observed as 1207 stale entries
+    in a long-running supervisor's pidfile."""
+
+    def test_concurrent_writers_do_not_raise(self):
+        import tempfile
+        import threading
+        s = dashboard._new_supervisor_state()
+        # Pre-populate the registry so each write has content.
+        for i in range(8):
+            cid = dashboard._register_child(
+                s, kind="agent-coverage", worktree_path=f"/w{i}",
+            )
+            dashboard._update_child(s, cid, cargo_pgid=1000 + i)
+        with tempfile.TemporaryDirectory() as td:
+            pf = Path(td) / "auto.pidfile"
+            errors: list[BaseException] = []
+
+            def writer():
+                try:
+                    for _ in range(50):
+                        dashboard._write_pidfile_from_state(pf, 1, s)
+                except BaseException as e:
+                    errors.append(e)
+
+            threads = [threading.Thread(target=writer) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [],
+                             f"concurrent writers raised: {errors[:3]}")
+            # Final file must be valid JSON with the expected shape.
+            data = json.loads(pf.read_text())
+            self.assertEqual(len(data["children"]), 8)
+            # No leftover .tmp files in the directory (per-thread tmp
+            # suffixes get renamed away cleanly).
+            leftovers = [p for p in Path(td).iterdir() if ".tmp" in p.name]
+            self.assertEqual(leftovers, [],
+                             f"leftover tmp files: {leftovers}")
+
+
 class PickTopNTests(unittest.TestCase):
     """The parallel orchestrator picks the top-N worktrees by the
     same scoring tuple the single-pick selector uses. These tests

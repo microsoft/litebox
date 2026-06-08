@@ -2633,21 +2633,25 @@ def _drive_ref(
         start_new_session=True,
     )
     cargo_pgid = proc.pid  # equals PGID after start_new_session
+    # Register + initial pidfile write happen inside try/finally so a
+    # failure between register and the polling loop (e.g. a transient
+    # pidfile-write error) still triggers `_unregister_child` and
+    # doesn't leak the registry slot.
     child_id: Optional[int] = None
-    if supervisor_state is not None:
-        child_id = _register_child(
-            supervisor_state, kind="tracked-ref", worktree_path=ci_worktree,
-        )
-        _update_child(supervisor_state, child_id, cargo_pgid=cargo_pgid)
-        if pidfile is not None:
-            _write_pidfile_from_state(pidfile, os.getpid(), supervisor_state)
-
-    # Discover the harness (test binary) PID as it appears under
-    # cargo. Best-effort; used as container-name salt for sweeps.
     harness_pid: Optional[int] = None
     poll_until = time.monotonic() + 30
     rc: Optional[int] = None
     try:
+        if supervisor_state is not None:
+            child_id = _register_child(
+                supervisor_state, kind="tracked-ref",
+                worktree_path=ci_worktree,
+            )
+            _update_child(supervisor_state, child_id, cargo_pgid=cargo_pgid)
+            if pidfile is not None:
+                _write_pidfile_from_state(
+                    pidfile, os.getpid(), supervisor_state,
+                )
         while True:
             rc = proc.poll()
             if rc is not None:
@@ -2968,19 +2972,25 @@ def _drive_agent_worktree(
         start_new_session=True,
     )
     cargo_pgid = proc.pid
+    # Register + initial pidfile write happen inside try/finally so a
+    # failure between register and the polling loop still triggers
+    # `_unregister_child` and doesn't leak the registry slot. See
+    # also `_drive_ref` for the same pattern + history.
     child_id: Optional[int] = None
-    if supervisor_state is not None:
-        child_id = _register_child(
-            supervisor_state, kind="agent-coverage",
-            worktree_path=str(shadow),
-        )
-        _update_child(supervisor_state, child_id, cargo_pgid=cargo_pgid)
-        if pidfile is not None:
-            _write_pidfile_from_state(pidfile, os.getpid(), supervisor_state)
     harness_pid: Optional[int] = None
     poll_until = time.monotonic() + 30
     rc: Optional[int] = None
     try:
+        if supervisor_state is not None:
+            child_id = _register_child(
+                supervisor_state, kind="agent-coverage",
+                worktree_path=str(shadow),
+            )
+            _update_child(supervisor_state, child_id, cargo_pgid=cargo_pgid)
+            if pidfile is not None:
+                _write_pidfile_from_state(
+                    pidfile, os.getpid(), supervisor_state,
+                )
         while True:
             rc = proc.poll()
             if rc is not None:
@@ -3071,8 +3081,21 @@ def _write_agent_sidecar(wt: dict, args: argparse.Namespace) -> None:
 
 
 def _write_pidfile(path: Path, **fields) -> None:
-    """Atomically (best-effort) write pidfile JSON."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    """Atomically (best-effort) write pidfile JSON.
+
+    The tmp path is salted with `(pid, thread_id, monotonic_ns)` so
+    concurrent writers don't share a tmp filename and race on the
+    `replace()` — a previous shared `.tmp` suffix produced
+    `FileNotFoundError` (one thread renamed the tmp away while
+    another was about to rename the same path), which then bubbled
+    out of `_write_pidfile_from_state` between `_register_child`
+    and the `try`/`finally` in `_drive_*`, leaking the just-
+    registered child slot. See dashboard.py git history (~2026-06).
+    """
+    tmp = path.with_suffix(
+        f"{path.suffix}.{os.getpid()}.{threading.get_ident()}."
+        f"{time.monotonic_ns()}.tmp"
+    )
     tmp.write_text(json.dumps(fields))
     tmp.replace(path)
 
