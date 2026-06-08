@@ -2578,9 +2578,49 @@ mod copilot {
             .map_err(String::as_str)
     }
 
-    /// One scenario: prompt template (canary → prompt text), how to
-    /// check the response against the canary, and per-trial timeout.
-    struct Scenario {
+    /// Mode = which copilot invocation channel is being driven.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub(super) enum Mode {
+        Pminus,
+        Tui,
+    }
+
+    impl Mode {
+        fn label(self) -> &'static str {
+            match self {
+                Mode::Pminus => "pminus",
+                Mode::Tui => "tui",
+            }
+        }
+    }
+
+    /// Driver = how the prompt is interpreted on the copilot side.
+    /// `Llm` routes the prompt through the model (current default
+    /// behavior). `Bang` types a literal `!<shell-cmd>` into the TUI
+    /// input, exercising Copilot CLI's shell-command passthrough
+    /// without an LLM round-trip and (verified) without a token.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub(super) enum Driver {
+        Llm,
+        Bang,
+    }
+
+    impl Driver {
+        fn label(self) -> &'static str {
+            match self {
+                Driver::Llm => "llm",
+                Driver::Bang => "bang",
+            }
+        }
+    }
+
+    /// LLM-only scenario: prompt template, response-check function,
+    /// per-trial timeout, fixtures. Same shape as the original
+    /// `Scenario` struct. Used for scenarios where no shell-command
+    /// equivalent exists (e.g. `simple_math`) or where the LLM-mode
+    /// behavior is the specific thing being tested (`find_head_*`
+    /// dimension bisects of an LLM-mode bug).
+    struct LlmOnlyScenario {
         id: &'static str,
         prompt: fn(&str) -> String,
         check: fn(canary: &str, response: &str) -> bool,
@@ -2589,6 +2629,31 @@ mod copilot {
         /// bash-output-hang failure mode is detected reliably.
         timeout_secs: u64,
         /// Files to plant under workspace/ (relative path -> contents).
+        fixtures: &'static [(&'static str, &'static str)],
+    }
+
+    /// Matrix scenario: supports both LLM and Bang drivers (and both
+    /// Pminus and Tui modes, except `(Pminus, Bang)` which is
+    /// structurally absent — `!` is a TUI-only primitive). The
+    /// non-Option `bang_cmd` and `bang_check` fields are how we
+    /// statically guarantee every matrix scenario actually has a
+    /// bang variant — mis-classifying a scenario fails at compile
+    /// time rather than at registration time.
+    struct MatrixScenario {
+        id: &'static str,
+        llm_prompt: fn(&str) -> String,
+        llm_check: fn(canary: &str, response: &str) -> bool,
+        /// Bang command body (no leading `!` — that's prepended by
+        /// the driver). Receives the per-trial canary string; may
+        /// ignore it if the canary lives in a fixture instead.
+        bang_cmd: fn(&str) -> String,
+        /// Check fn for bang-driver output. Often the same as
+        /// `llm_check`, but `simple_bash`-style scenarios need a
+        /// stricter check that distinguishes the input-echo
+        /// occurrence of the canary from a real shell-output
+        /// occurrence (see `simple_bash_bang_check`).
+        bang_check: fn(canary: &str, response: &str) -> bool,
+        timeout_secs: u64,
         fixtures: &'static [(&'static str, &'static str)],
     }
 
@@ -2636,6 +2701,16 @@ mod copilot {
     fn simple_bash_check(canary: &str, response: &str) -> bool {
         let r = strip_ansi(response);
         r.contains(canary)
+    }
+
+    /// Stricter check for bang-driver `simple_bash`: the canary appears
+    /// once in the input echo (`! echo <canary>`) regardless of whether
+    /// the shell command actually ran. Requiring `>=2` occurrences
+    /// ensures the bang passthrough actually executed the command and
+    /// the rendered output (`│ <canary>`) is on screen.
+    fn simple_bash_bang_check(canary: &str, response: &str) -> bool {
+        let r = strip_ansi(response);
+        r.matches(canary).count() >= 2
     }
 
     /// `pipeline_wc` canary check: response mentions either fixture
@@ -2779,58 +2854,63 @@ mod copilot {
         saw_build && no_timeout
     }
 
-    /// The 6 scenarios. Same workloads in both invocation modes.
-    fn scenarios() -> &'static [Scenario] {
+    /// 5 matrix scenarios: each registers across both drivers
+    /// (Llm, Bang) and — for Llm — both modes (Pminus, Tui). Bang
+    /// is Tui-only by axis design (`!` is a TUI primitive).
+    fn matrix_scenarios() -> &'static [MatrixScenario] {
         &[
-            Scenario {
-                id: "simple_math",
-                prompt: |_| "What is 2 plus 2? Reply with just the number.".to_string(),
-                check: simple_math_check,
-                timeout_secs: 60,
-                fixtures: &[],
-            },
-            Scenario {
+            MatrixScenario {
                 id: "simple_bash",
-                prompt: |c| {
+                llm_prompt: |c| {
                     format!("Run the shell command `echo {c}` and tell me exactly what it printed.")
                 },
-                check: simple_bash_check,
+                llm_check: simple_bash_check,
+                bang_cmd: |c| format!("echo {c}"),
+                bang_check: simple_bash_bang_check,
                 timeout_secs: 90,
                 fixtures: &[],
             },
-            Scenario {
+            MatrixScenario {
                 id: "read_file",
-                prompt: |_| {
+                llm_prompt: |_| {
                     "Run `cat /workspace/canary.txt` and tell me the entire contents of \
                      the file, including the line that starts with `CN-`."
                         .to_string()
                 },
-                check: default_check, // canary in fixture, not in prompt
+                llm_check: default_check,
+                // Canary lives in the fixture, not the command — single
+                // occurrence in screen output is sufficient.
+                bang_cmd: |_| "cat /workspace/canary.txt".to_string(),
+                bang_check: default_check,
                 timeout_secs: 90,
                 fixtures: &[("canary.txt", "__CANARY_PLACEHOLDER__\n")],
             },
-            Scenario {
+            MatrixScenario {
                 id: "pipeline_wc",
-                prompt: |_| {
+                llm_prompt: |_| {
                     "Run `wc -c /workspace/a.txt /workspace/b.txt` and tell me which file \
                      has more bytes."
                         .to_string()
                 },
-                check: pipeline_wc_check,
+                llm_check: pipeline_wc_check,
+                bang_cmd: |_| "wc -c /workspace/a.txt /workspace/b.txt".to_string(),
+                bang_check: pipeline_wc_check,
                 timeout_secs: 120,
                 fixtures: &[
                     ("a.txt", "aaa\n"),                      // 4 bytes
                     ("b.txt", "bbbbbbbbbbbbbbbbbbbbbbbb\n"), // 25 bytes
                 ],
             },
-            Scenario {
+            MatrixScenario {
                 id: "find_head",
-                prompt: |_| {
+                llm_prompt: |_| {
                     "Run `find /workspace -name '*.txt' | head -5` and list the filenames \
                      you find."
                         .to_string()
                 },
-                check: find_head_check,
+                llm_check: find_head_check,
+                bang_cmd: |_| "find /workspace -name '*.txt' | head -5".to_string(),
+                bang_check: find_head_check,
                 timeout_secs: 120,
                 fixtures: &[
                     ("one.txt", "1\n"),
@@ -2841,8 +2921,43 @@ mod copilot {
                     ("six.txt", "6\n"),
                 ],
             },
+            MatrixScenario {
+                id: "build",
+                llm_prompt: |_| {
+                    "Run `CARGO_TARGET_DIR=/tmp/copilot-build cargo build -p litebox_timing` \
+                     inside /workspace/litebox-src and report whether it succeeded or what \
+                     compile errors it reported."
+                        .to_string()
+                },
+                llm_check: build_check,
+                // Bang form composes the cd into the command directly so
+                // there's no model reasoning involved.
+                bang_cmd: |_| {
+                    "cd /workspace/litebox-src && \
+                     CARGO_TARGET_DIR=/tmp/copilot-build cargo build -p litebox_timing"
+                        .to_string()
+                },
+                bang_check: build_check,
+                timeout_secs: 300,
+                fixtures: &[],
+            },
+        ]
+    }
+
+    /// 6 LLM-only scenarios. `simple_math` has no shell equivalent;
+    /// the `find_head_*` dimension variants are targeted bisects of
+    /// an LLM-mode bug, not relevant under the bang driver.
+    fn llm_only_scenarios() -> &'static [LlmOnlyScenario] {
+        &[
+            LlmOnlyScenario {
+                id: "simple_math",
+                prompt: |_| "What is 2 plus 2? Reply with just the number.".to_string(),
+                check: simple_math_check,
+                timeout_secs: 60,
+                fixtures: &[],
+            },
             // ---- Wave 10 Track A: find_head dimension variants ----
-            Scenario {
+            LlmOnlyScenario {
                 id: "find_head_one",
                 prompt: |_| {
                     "Run `find /workspace -name '*.txt' | head -1` and list the filename \
@@ -2860,7 +2975,7 @@ mod copilot {
                     ("six.txt", "6\n"),
                 ],
             },
-            Scenario {
+            LlmOnlyScenario {
                 id: "find_head_unpiped",
                 prompt: |_| {
                     "Run `find /workspace -name '*.txt'` and list every filename it prints."
@@ -2877,14 +2992,14 @@ mod copilot {
                     ("six.txt", "6\n"),
                 ],
             },
-            Scenario {
+            LlmOnlyScenario {
                 id: "find_head_seq",
                 prompt: |_| "Run `seq 1 5` and list every number it prints.".to_string(),
                 check: find_head_seq_check,
                 timeout_secs: 120,
                 fixtures: &[],
             },
-            Scenario {
+            LlmOnlyScenario {
                 id: "find_head_cat_multi",
                 prompt: |_| {
                     "Run `cat /workspace/one.txt /workspace/two.txt /workspace/three.txt \
@@ -2901,7 +3016,7 @@ mod copilot {
                     ("five.txt", "echo\n"),
                 ],
             },
-            Scenario {
+            LlmOnlyScenario {
                 id: "find_head_ls",
                 prompt: |_| {
                     "Run `ls /workspace/*.txt | head -5` and list the filenames you find."
@@ -2918,18 +3033,6 @@ mod copilot {
                     ("six.txt", "6\n"),
                 ],
             },
-            Scenario {
-                id: "build",
-                prompt: |_| {
-                    "Run `CARGO_TARGET_DIR=/tmp/copilot-build cargo build -p litebox_timing` \
-                     inside /workspace/litebox-src and report whether it succeeded or what \
-                     compile errors it reported."
-                        .to_string()
-                },
-                check: build_check,
-                timeout_secs: 300,
-                fixtures: &[],
-            },
         ]
     }
 
@@ -2944,33 +3047,65 @@ mod copilot {
         // per-trial body — see `run_scenario`. A missing token fails
         // the individual trial cheaply (no docker spawn) with a clear
         // diagnostic, instead of panicking the whole test process at
-        // registration time.
+        // registration time. `Driver::Bang` trials skip token
+        // discovery entirely — verified token-free against the
+        // host-installed copilot.
 
-        for scn in scenarios() {
-            for mode in ["pminus", "tui"] {
+        // Matrix scenarios: every entry supports all 3 cells
+        // (Pminus,Llm), (Tui,Llm), (Tui,Bang). The loop body
+        // *is* the validity statement — no per-scenario gate field.
+        for scn in matrix_scenarios() {
+            for (mode, driver) in &[
+                (Mode::Pminus, Driver::Llm),
+                (Mode::Tui, Driver::Llm),
+                (Mode::Tui, Driver::Bang),
+            ] {
                 for pass in ["native", "litebox"] {
-                    let id = format!("copilot::{mode}.{}", scn.id);
+                    let id = format!("copilot::{}.{}.{}", mode.label(), driver.label(), scn.id);
                     let name = format!("{pass}::{id}");
                     let scn_id = scn.id;
-                    let mode_owned = mode.to_string();
+                    let mode = *mode;
+                    let driver = *driver;
                     let pass_owned = pass.to_string();
                     trials.push(Trial::test(name, move || {
-                        run_scenario(&pass_owned, &mode_owned, scn_id)
+                        run_matrix_scenario(&pass_owned, mode, driver, scn_id)
                     }));
                 }
             }
         }
 
+        // LLM-only scenarios: 2 cells per scenario, driver is always
+        // Llm. The `.llm.` segment is hard-coded in the ID to keep
+        // the 4-segment shape uniform across the whole copilot
+        // namespace.
+        for scn in llm_only_scenarios() {
+            for mode in [Mode::Pminus, Mode::Tui] {
+                for pass in ["native", "litebox"] {
+                    let id = format!("copilot::{}.llm.{}", mode.label(), scn.id);
+                    let name = format!("{pass}::{id}");
+                    let scn_id = scn.id;
+                    let pass_owned = pass.to_string();
+                    trials.push(Trial::test(name, move || {
+                        run_llm_only_scenario(&pass_owned, mode, scn_id)
+                    }));
+                }
+            }
+        }
+
+        // Startup probe: 3 segments (no prompt, so no driver
+        // segment). Renamed from copilot::tui_noLLM.startup_then_exit;
+        // bang driver subsumes the old `_noLLM` suffix elsewhere but
+        // this probe has no prompt at all and doesn't fit the matrix.
         for pass in ["native", "litebox"] {
-            let name = format!("{pass}::copilot::tui_noLLM.startup_then_exit");
+            let name = format!("{pass}::copilot::tui.startup_then_exit");
             let pass_owned = pass.to_string();
             trials.push(Trial::test(name, move || {
-                run_tui_no_llm_scenario(&pass_owned, "startup_then_exit")
+                run_startup_then_exit(&pass_owned, "startup_then_exit")
             }));
         }
     }
 
-    fn run_tui_no_llm_scenario(pass: &str, scenario_id: &str) -> Result<(), Failed> {
+    fn run_startup_then_exit(pass: &str, scenario_id: &str) -> Result<(), Failed> {
         let github_token = token().map_err(|e| {
             Failed::from(format!(
                 "GitHub token not available: {e}. Set \
@@ -2981,12 +3116,12 @@ mod copilot {
 
         if scenario_id != "startup_then_exit" {
             return Err(Failed::from(format!(
-                "unknown tui_noLLM scenario {scenario_id}"
+                "unknown startup_then_exit scenario {scenario_id}"
             )));
         }
 
         let _permit = CopilotPermit::acquire();
-        let fixture_dir = super::fixture_dir(pass, "tui_noLLM", scenario_id);
+        let fixture_dir = super::fixture_dir(pass, "tui", scenario_id);
         let _ = std::fs::remove_dir_all(&fixture_dir);
         std::fs::create_dir_all(&fixture_dir)
             .map_err(|e| format!("create fixture dir {}: {e}", fixture_dir.display()))?;
@@ -3000,7 +3135,7 @@ mod copilot {
             "litebox" => "litebox",
             _ => "unknown",
         };
-        let test_id = format!("copilot::tui_noLLM.{scenario_id}");
+        let test_id = format!("copilot::tui.{scenario_id}");
         let spec = build_copilot_spec(pass, &fixture_dir, false);
         let pass_owned = pass.to_string();
         let scenario_id_owned = scenario_id.to_string();
@@ -3009,7 +3144,7 @@ mod copilot {
             pass_static,
             &test_id,
             "copilot_cli",
-            "tui_noLLM",
+            "tui",
             spec,
             move |container| {
                 let t_dispatch = Instant::now();
@@ -3060,7 +3195,7 @@ mod copilot {
                 };
                 let log_dir = super::log_dir();
                 let _ = std::fs::create_dir_all(log_dir);
-                let safe = format!("copilot-{pass_owned}-tui_noLLM-{scenario_id_owned}");
+                let safe = format!("copilot-{pass_owned}-tui-{scenario_id_owned}");
                 let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &response);
                 let stripped = strip_ansi(&response);
                 let _ = std::fs::write(log_dir.join(format!("{safe}.stripped.log")), &stripped);
@@ -3080,7 +3215,7 @@ mod copilot {
                     return super::framework::DriveResult {
                         verdict: "FAIL",
                         detail: Some(format!(
-                            "copilot::tui_noLLM.{scenario_id_owned} startup check failed.\n\
+                            "copilot::tui.{scenario_id_owned} startup check failed.\n\
                              transcript: {}\n\
                              first 800 chars of response (ANSI-stripped):\n{preview}",
                             log_dir.join(format!("{safe}.stripped.log")).display(),
@@ -3107,12 +3242,79 @@ mod copilot {
         )
     }
 
-    fn run_scenario(pass: &str, mode: &str, scenario_id: &str) -> Result<(), Failed> {
-        // Fail-fast on missing token BEFORE acquiring the copilot
-        // permit, before touching fixtures, and before any docker
-        // work. Avoids burning the autonomous-fill budget on trials
-        // that cannot possibly run, and produces a single clean
-        // error message per trial in the dashboard.
+    /// Matrix-scenario driver: dispatches a (Mode, Driver, scenario)
+    /// cell. `Driver::Bang` skips token discovery — the bang
+    /// passthrough is local and verified token-free.
+    fn run_matrix_scenario(
+        pass: &str,
+        mode: Mode,
+        driver: Driver,
+        scenario_id: &str,
+    ) -> Result<(), Failed> {
+        let scn = matrix_scenarios()
+            .iter()
+            .find(|s| s.id == scenario_id)
+            .expect("matrix scenario lookup");
+
+        // (Pminus, Bang) is structurally absent from the registration
+        // loop; guard here too in case someone calls this directly.
+        if driver == Driver::Bang && mode != Mode::Tui {
+            return Err(Failed::from(format!(
+                "(Mode::{mode:?}, Driver::Bang) is not supported — \
+                 ! is a TUI-only primitive"
+            )));
+        }
+
+        let requires_token = driver == Driver::Llm;
+        let github_token = if requires_token {
+            Some(token().map_err(|e| {
+                Failed::from(format!(
+                    "GitHub token not available: {e}. Set \
+                     COPILOT_GITHUB_TOKEN or GH_TOKEN, or run \
+                     `gh auth login`."
+                ))
+            })?)
+        } else {
+            None
+        };
+
+        let canary = format!(
+            "CN-{}-{}-{}-{}-{}",
+            scenario_id,
+            mode.label(),
+            driver.label(),
+            pass,
+            std::process::id()
+        );
+
+        let (prompt_text, check) = match driver {
+            Driver::Llm => ((scn.llm_prompt)(&canary), scn.llm_check),
+            Driver::Bang => (format!("!{}", (scn.bang_cmd)(&canary)), scn.bang_check),
+        };
+
+        run_copilot_trial(
+            pass,
+            mode,
+            driver,
+            scenario_id,
+            &canary,
+            &prompt_text,
+            check,
+            scn.timeout_secs,
+            scn.fixtures,
+            scn.id == "build",
+            github_token,
+        )
+    }
+
+    /// LLM-only scenario driver: always Driver::Llm; reproduces the
+    /// pre-refactor behavior 1:1 (just with a renamed ID emitter).
+    fn run_llm_only_scenario(pass: &str, mode: Mode, scenario_id: &str) -> Result<(), Failed> {
+        let scn = llm_only_scenarios()
+            .iter()
+            .find(|s| s.id == scenario_id)
+            .expect("llm_only scenario lookup");
+
         let github_token = token().map_err(|e| {
             Failed::from(format!(
                 "GitHub token not available: {e}. Set \
@@ -3121,72 +3323,104 @@ mod copilot {
             ))
         })?;
 
-        let _permit = CopilotPermit::acquire();
-        let scn = scenarios()
-            .iter()
-            .find(|s| s.id == scenario_id)
-            .expect("scenario lookup");
-
-        // Per-trial canary: marker the model is asked to surface verbatim.
         let canary = format!(
-            "CN-{}-{}-{}-{}",
+            "CN-{}-{}-llm-{}-{}",
             scenario_id,
-            mode,
+            mode.label(),
             pass,
             std::process::id()
         );
+        let prompt_text = (scn.prompt)(&canary);
 
-        // Fixture tree.
-        let fixture_dir = super::fixture_dir(pass, mode, scenario_id);
+        run_copilot_trial(
+            pass,
+            mode,
+            Driver::Llm,
+            scenario_id,
+            &canary,
+            &prompt_text,
+            scn.check,
+            scn.timeout_secs,
+            scn.fixtures,
+            scn.id == "build",
+            Some(github_token),
+        )
+    }
+
+    /// Shared body for both matrix and LLM-only trials. Builds the
+    /// fixture tree, optional token env file, container spec; then
+    /// dispatches `drive_pminus` or `drive_tui` based on `mode` and
+    /// runs the check fn against the resulting transcript.
+    #[allow(clippy::too_many_arguments)]
+    fn run_copilot_trial(
+        pass: &str,
+        mode: Mode,
+        driver: Driver,
+        scenario_id: &str,
+        canary: &str,
+        prompt_text: &str,
+        check: fn(&str, &str) -> bool,
+        timeout_secs: u64,
+        fixtures: &'static [(&'static str, &'static str)],
+        mount_workspace_src: bool,
+        github_token: Option<&str>,
+    ) -> Result<(), Failed> {
+        let _permit = CopilotPermit::acquire();
+
+        // Use a fixture subdir that distinguishes drivers so parallel
+        // (tui, llm) and (tui, bang) trials don't stomp each other.
+        let fixture_kind = format!("{}-{}", mode.label(), driver.label());
+        let fixture_dir = super::fixture_dir(pass, &fixture_kind, scenario_id);
         let _ = std::fs::remove_dir_all(&fixture_dir);
         std::fs::create_dir_all(&fixture_dir)
             .map_err(|e| format!("create fixture dir {}: {e}", fixture_dir.display()))?;
-        for (rel, content) in scn.fixtures {
-            let body = content.replace("__CANARY_PLACEHOLDER__", &canary);
+        for (rel, content) in fixtures {
+            let body = content.replace("__CANARY_PLACEHOLDER__", canary);
             let path = fixture_dir.join(rel);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
             }
             std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
         }
-        // Token env file inside the bind-mounted workspace. Mode 0600.
-        // dropbear strips env vars from session children (only PATH /
-        // HOME / SHELL / USER / LOGNAME / MAIL survive), so we can't
-        // rely on `docker run --env-file` reaching copilot. The remote
-        // command sources this file before exec'ing copilot.
-        // Lazy docker image inspect/build. Eagerly run at main() in
-        // the previous gated-registration design; now per-trial so
-        // token-less runs (which return Err above) incur no docker
-        // build cost.
         super::ensure_copilot_image(&super::workspace_root());
 
+        // Token env file written even for Bang trials so the remote
+        // `sh -c '. .copilot-env; …'` invocation has *something* to
+        // source (an empty file is fine — the bang driver doesn't
+        // exercise the LLM path). Skipping the file entirely would
+        // require a separate remote-command shape; this is simpler.
         let token_env_path = fixture_dir.join(".copilot-env");
-        super::write_token_env(&token_env_path, github_token)?;
+        match github_token {
+            Some(tok) => super::write_token_env(&token_env_path, tok)?,
+            None => std::fs::write(&token_env_path, "")
+                .map_err(|e| format!("write empty .copilot-env: {e}"))?,
+        }
 
         let pass_static: &'static str = match pass {
             "native" => "native",
             "litebox" => "litebox",
             _ => "unknown",
         };
-        let test_id = format!("copilot::{mode}.{scenario_id}");
-        let mount_workspace_src = scn.id == "build";
+        // ID format mirrors the registration emitter — but the
+        // startup probe is the only 3-segment exception, and it has
+        // its own helper.
+        let test_id = format!(
+            "copilot::{}.{}.{}",
+            mode.label(),
+            driver.label(),
+            scenario_id
+        );
         let spec = build_copilot_spec(pass, &fixture_dir, mount_workspace_src);
 
-        let prompt_text = (scn.prompt)(&canary);
-        let check: fn(&str, &str) -> bool = scn.check;
-        let timeout_secs = scn.timeout_secs;
-        let canary_clone = canary.clone();
+        let prompt_text_owned = prompt_text.to_string();
+        let canary_owned = canary.to_string();
+        let canary_for_log = canary.to_string();
+        let prompt_text_for_log = prompt_text.to_string();
         let pass_owned = pass.to_string();
-        let mode_owned = mode.to_string();
         let scenario_id_owned = scenario_id.to_string();
-        let prompt_text_for_log = prompt_text.clone();
-        let canary_for_log = canary.clone();
-
-        let group_static: &'static str = match mode {
-            "pminus" => "pminus",
-            "tui" => "tui",
-            _ => "unknown",
-        };
+        let mode_label = mode.label();
+        let driver_label = driver.label();
+        let group_static: &'static str = mode.label();
 
         super::framework::run_trial(
             pass_static,
@@ -3226,10 +3460,9 @@ mod copilot {
                 let t_useful_start = Instant::now();
                 let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
 
-                let response = match mode_owned.as_str() {
-                    "pminus" => drive_pminus(port, &prompt_text, timeout_secs),
-                    "tui" => drive_tui(port, &prompt_text, timeout_secs),
-                    _ => Err(format!("unknown mode {mode_owned}")),
+                let response = match mode {
+                    Mode::Pminus => drive_pminus(port, &prompt_text_owned, timeout_secs),
+                    Mode::Tui => drive_tui(port, &prompt_text_owned, timeout_secs),
                 };
                 let response = match response {
                     Ok(r) => r,
@@ -3248,7 +3481,8 @@ mod copilot {
                 };
                 let log_dir = super::log_dir();
                 let _ = std::fs::create_dir_all(log_dir);
-                let safe = format!("copilot-{pass_owned}-{mode_owned}-{scenario_id_owned}");
+                let safe =
+                    format!("copilot-{pass_owned}-{mode_label}-{driver_label}-{scenario_id_owned}");
                 let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &response);
                 let _ = std::fs::write(
                     log_dir.join(format!("{safe}.stripped.log")),
@@ -3260,14 +3494,14 @@ mod copilot {
                 );
                 let t_useful_ms = t_useful_start.elapsed().as_millis();
 
-                let ok = check(&canary_clone, &response);
+                let ok = check(&canary_owned, &response);
                 if !ok {
                     let preview: String = strip_ansi(&response).chars().take(800).collect();
                     return super::framework::DriveResult {
                         verdict: "FAIL",
                         detail: Some(format!(
-                            "copilot::{mode_owned}.{scenario_id_owned} canary check failed.\n\
-                             canary={canary_clone}\n\
+                            "copilot::{mode_label}.{driver_label}.{scenario_id_owned} check failed.\n\
+                             canary={canary_owned}\n\
                              transcript: {}\n\
                              first 800 chars of response (ANSI-stripped):\n{preview}",
                             log_dir.join(format!("{safe}.stripped.log")).display(),
