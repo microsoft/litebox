@@ -3043,7 +3043,7 @@ mod copilot {
                 let t_useful_start = Instant::now();
                 let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
 
-                let response = match drive_tui_startup_then_exit(port, 45) {
+                let response = match drive_tui_startup_then_exit(port, 90) {
                     Ok(r) => r,
                     Err(e) => {
                         return super::framework::DriveResult {
