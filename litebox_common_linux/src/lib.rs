@@ -32,56 +32,6 @@ extern crate alloc;
 #[cfg(target_arch = "aarch64")]
 pub const AARCH64_GENERAL_REGISTER_COUNT: usize = 31;
 
-/// AArch64 PSTATE/SPSR value saved by Linux in `user_pt_regs`.
-#[cfg(target_arch = "aarch64")]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct Aarch64Pstate(usize);
-
-#[cfg(target_arch = "aarch64")]
-bitflags::bitflags! {
-    impl Aarch64Pstate: usize {
-        /// Current exception level and stack pointer selector.
-        const MODE_MASK = 0xf;
-        /// EL0 using SP_EL0.
-        const MODE_EL0T = 0x0;
-        /// EL1 using SP_EL0.
-        const MODE_EL1T = 0x4;
-        /// EL1 using SP_EL1.
-        const MODE_EL1H = 0x5;
-        /// FIQ mask bit.
-        const F = 0x40;
-        /// IRQ mask bit.
-        const I = 0x80;
-        /// SError mask bit.
-        const A = 0x100;
-        /// Debug exception mask bit.
-        const D = 0x200;
-        /// Branch target identification state mask.
-        const BTYPE_MASK = 0xc00;
-        /// Speculative store bypass safe bit.
-        const SSBS = 0x1000;
-        /// Privileged access never bit.
-        const PAN = 0x400000;
-        /// User access override bit.
-        const UAO = 0x800000;
-        /// Data independent timing bit.
-        const DIT = 0x1000000;
-        /// Tag check override bit.
-        const TCO = 0x2000000;
-        /// Overflow condition flag.
-        const V = 0x10000000;
-        /// Carry condition flag.
-        const C = 0x20000000;
-        /// Zero condition flag.
-        const Z = 0x40000000;
-        /// Negative condition flag.
-        const N = 0x80000000;
-
-        const _ = !0;
-    }
-}
-
 // TODO(jayb): Should errno::Errno be publicly re-exported?
 
 pub const STDIN_FILENO: i32 = 0;
@@ -3219,7 +3169,7 @@ pub struct PtRegs {
 ///
 /// pt_regs from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/asm/ptrace.h#L178)
 #[cfg(target_arch = "aarch64")]
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Clone, Debug, Default)]
 pub struct PtRegs {
     /// General-purpose registers x0-x30.
@@ -3229,7 +3179,14 @@ pub struct PtRegs {
     /// Program counter.
     pub pc: usize,
     /// Saved processor state (PSTATE/SPSR).
-    pub pstate: Aarch64Pstate,
+    pub pstate: u64,
+
+    pub orig_x0: usize,
+
+    // little endian
+    pub syscallno: i32,
+    pub unused2: u32,
+    /* add remaining fields if needed */
 }
 
 #[cfg(target_arch = "x86_64")]

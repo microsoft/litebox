@@ -6,9 +6,6 @@
 use crate::AARCH64_GENERAL_REGISTER_COUNT;
 use zerocopy::{FromBytes, IntoBytes};
 
-/// AArch64 PSTATE value stored in the signal context ABI.
-pub type Pstate = u64;
-
 /// sigcontext for aarch64.
 /// See: <https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/uapi/asm/sigcontext.h>
 ///
@@ -26,7 +23,7 @@ pub struct Sigcontext {
     pub regs: [u64; AARCH64_GENERAL_REGISTER_COUNT],
     pub sp: u64,
     pub pc: u64,
-    pub pstate: Pstate,
+    pub pstate: u64,
     /// Padding to align `__reserved` to a 16-byte boundary (matches the kernel's
     /// `__attribute__((__aligned__(16)))` on this field).
     pub __reserved_pad: [u8; 8],
