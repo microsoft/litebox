@@ -8,7 +8,7 @@ Command sampled:
 
 ```sh
 cd /home/wportnoy/src/litebox-audit
-LITEBOX_TEST_JOBS=1 cargo test -p litebox_test_harness --test integration -- 'litebox::FT' --nocapture
+cargo test -p litebox_test_harness --test integration -- 'litebox::FT' --nocapture
 ```
 
 Observed libtest-mimic failure output from that run:
