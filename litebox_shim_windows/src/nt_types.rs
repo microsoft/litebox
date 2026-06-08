@@ -713,5 +713,6 @@ pub struct RtlUserProcessParameters {
 
 const _: [(); 0x1878] = [(); core::mem::size_of::<ThreadEnvironmentBlock>()];
 const _: [(); 0x7d0] = [(); core::mem::size_of::<ProcessEnvironmentBlock>()];
+const _: () = assert!(offset_of!(ProcessEnvironmentBlock, api_set_map) == 0x68);
 const _: [(); 0x4d0] = [(); core::mem::size_of::<X64Context>()];
 const _: [(); 0x448] = [(); core::mem::size_of::<RtlUserProcessParameters>()];

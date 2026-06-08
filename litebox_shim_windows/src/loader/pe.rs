@@ -3,7 +3,7 @@
 
 use alloc::collections::btree_map::BTreeMap;
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::marker::PhantomData;
+use core::{marker::PhantomData, mem::size_of};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox::{
@@ -20,7 +20,7 @@ use litebox_common_windows::loader::{
 };
 use rangemap::RangeMap;
 use thiserror::Error;
-use zerocopy::{FromZeros, IntoBytes};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 use crate::ShimFS;
 use crate::nt_types::{
@@ -54,6 +54,10 @@ const WINDOWS_HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD: u64 = PAGE_SIZE as u64;
 const WINDOWS_NT_TIB_VERSION: usize = 30 << 8;
 const INITIAL_PROCESS_ID: usize = 1;
 const INITIAL_THREAD_ID: usize = 1;
+const API_SET_NAMESPACE_VERSION: u32 = 6;
+const API_SET_NAMESPACE_ENTRY_FLAGS: u32 = 1;
+const API_SET_NAMESPACE_HASH_FACTOR: u32 = 31;
+const MAX_API_SET_NAMESPACE_SIZE: usize = 16 * 1024 * 1024;
 
 pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
@@ -111,8 +115,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         let length =
             NonZeroPageSize::new(INITIAL_STACK_SIZE).ok_or(PeImageAccessError::AddressOverflow)?;
         // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` does not set
-        // `fixed_addr`, so the page manager picks an unused region — there is no overlapping-
-        // mapping precondition for the caller to uphold.
+        // `fixed_addr`, so the page manager picks an unused region and cannot replace a mapping.
         let stack_base = unsafe {
             self.page_manager
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
@@ -229,6 +232,10 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         };
         let teb_ptr = create_pages(core::mem::size_of::<ThreadEnvironmentBlock>())?;
         let peb_ptr = create_pages(core::mem::size_of::<ProcessEnvironmentBlock>())?;
+        let api_set_map = build_api_set_namespace()?;
+        let api_set_map_ptr = create_pages(api_set_map.len())?;
+        crate::write_slice::<Platform, _>(api_set_map_ptr, &api_set_map)
+            .ok_or(PeImageAccessError::MemoryAccess)?;
         let ctx_ptr = create_pages(core::mem::size_of::<X64Context>())?;
 
         let dos_image_path = dos_image_path(image_path);
@@ -319,6 +326,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             peb.bit_field = PebBitField::IS_IMAGE_DYNAMICALLY_RELOCATED.bits();
         }
         let process_heaps = initial_process_heaps_array(peb_ptr)?;
+        peb.api_set_map = api_set_map_ptr;
         peb.process_parameters = process_parameters_ptr;
         peb.number_of_processors = 1;
         peb.critical_section_timeout = WINDOWS_CRITICAL_SECTION_TIMEOUT_100NS;
@@ -423,6 +431,377 @@ impl LoadedImage {
                 .map_err(|_| PeImageAccessError::AddressOverflow)?,
         }))
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct ApiSetNamespace {
+    version: u32,
+    size: u32,
+    flags: u32,
+    count: u32,
+    entry_offset: u32,
+    hash_offset: u32,
+    hash_factor: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct ApiSetNamespaceEntry {
+    flags: u32,
+    name_offset: u32,
+    name_length: u32,
+    hashed_length: u32,
+    value_offset: u32,
+    value_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct ApiSetValueEntry {
+    flags: u32,
+    name_offset: u32,
+    name_length: u32,
+    value_offset: u32,
+    value_length: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct ApiSetHashEntry {
+    hash: u32,
+    index: u32,
+}
+
+const API_SET_MAPPINGS: &[(&str, &str)] = &[
+    ("api-ms-win-core-apiquery-l1-1-0", "ntdll.dll"),
+    ("api-ms-win-core-apiquery-l1-1-2", "ntdll.dll"),
+    ("api-ms-win-core-apiquery-l2-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-appcompat-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-appcompat-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-appinit-l1-1-0", "kernel32.dll"),
+    ("api-ms-win-core-atoms-l1-1-0", "kernel32.dll"),
+    ("api-ms-win-core-backgroundtask-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-calendar-l1-1-0", "kernel32.dll"),
+    ("api-ms-win-core-comm-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-comm-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-commandlinetoargv-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-console-ansi-l2-1-0", "kernel32.dll"),
+    ("api-ms-win-core-console-internal-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-console-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-console-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-console-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-console-l1-2-2", "kernelbase.dll"),
+    ("api-ms-win-core-console-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-console-l2-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-console-l3-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-console-l3-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-crt-l1-1-0", "ntdll.dll"),
+    ("api-ms-win-core-crt-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-datetime-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-datetime-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-datetime-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-debug-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-debug-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-debug-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-delayload-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-delayload-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-downlevel-shlwapi-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-errorhandling-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-errorhandling-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-errorhandling-l1-1-3", "kernelbase.dll"),
+    ("api-ms-win-core-fibers-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-fibers-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-fibers-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-fibers-l2-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-2-2", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-2-3", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-2-5", "kernelbase.dll"),
+    ("api-ms-win-core-file-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-file-l2-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-file-l2-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-file-l2-1-3", "kernelbase.dll"),
+    ("api-ms-win-core-file-l2-1-4", "kernelbase.dll"),
+    ("api-ms-win-core-handle-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-heap-obsolete-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-heap-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-heap-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-heap-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-interlocked-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-io-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-io-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-job-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-largeinteger-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l1-2-2", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l1-2-3", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-localization-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-localization-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-localization-l1-2-4", "kernelbase.dll"),
+    ("api-ms-win-core-localization-l2-1-0", "kernelbase.dll"),
+    (
+        "api-ms-win-core-localization-private-l1-1-0",
+        "kernelbase.dll",
+    ),
+    ("api-ms-win-core-localregistry-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-memory-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-memory-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-memory-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-memory-l1-1-9", "kernelbase.dll"),
+    ("api-ms-win-core-misc-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-namedpipe-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-namedpipe-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-namedpipe-l1-2-2", "kernelbase.dll"),
+    ("api-ms-win-core-namespace-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-normalization-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-path-l1-1-0", "kernelbase.dll"),
+    (
+        "api-ms-win-core-processenvironment-l1-1-0",
+        "kernelbase.dll",
+    ),
+    (
+        "api-ms-win-core-processenvironment-l1-1-1",
+        "kernelbase.dll",
+    ),
+    (
+        "api-ms-win-core-processenvironment-l1-2-0",
+        "kernelbase.dll",
+    ),
+    ("api-ms-win-core-processsnapshot-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-processthreads-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-processthreads-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-processthreads-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-processthreads-l1-1-3", "kernelbase.dll"),
+    ("api-ms-win-core-processthreads-l1-1-8", "kernel32.dll"),
+    ("api-ms-win-core-processtopology-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-profile-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-pcw-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-psapi-ansi-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-psapi-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-realtime-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-registry-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-rtlsupport-l1-1-0", "ntdll.dll"),
+    ("api-ms-win-core-rtlsupport-l1-1-1", "ntdll.dll"),
+    ("api-ms-win-core-rtlsupport-l1-2-2", "ntdll.dll"),
+    ("api-ms-win-core-sidebyside-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-string-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-string-l2-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-synch-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-synch-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-synch-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-synch-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-sysinfo-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-sysinfo-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-sysinfo-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-sysinfo-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-sysinfo-l1-2-3", "kernelbase.dll"),
+    ("api-ms-win-core-sysinfo-l1-2-8", "kernelbase.dll"),
+    ("api-ms-win-core-systemtopology-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-systemtopology-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-threadpool-legacy-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-threadpool-l1-2-0", "kernelbase.dll"),
+    (
+        "api-ms-win-core-threadpool-private-l1-1-0",
+        "kernelbase.dll",
+    ),
+    ("api-ms-win-core-timezone-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-util-l1-1-0", "kernelbase.dll"),
+    (
+        "api-ms-win-core-windowserrorreporting-l1-1-0",
+        "kernelbase.dll",
+    ),
+    (
+        "api-ms-win-core-windowserrorreporting-l1-1-1",
+        "kernelbase.dll",
+    ),
+    (
+        "api-ms-win-core-windowserrorreporting-l1-1-2",
+        "kernelbase.dll",
+    ),
+    (
+        "api-ms-win-core-windowserrorreporting-l1-1-3",
+        "kernelbase.dll",
+    ),
+    ("api-ms-win-core-wow64-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-wow64-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-wow64-l1-1-3", "kernelbase.dll"),
+    ("api-ms-win-core-xstate-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-xstate-l2-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-xstate-l2-1-2", "kernelbase.dll"),
+    ("api-ms-win-eventing-consumer-l1-1-0", "sechost.dll"),
+    ("api-ms-win-eventing-consumer-l1-1-1", "sechost.dll"),
+    ("api-ms-win-eventing-controller-l1-1-0", "sechost.dll"),
+    ("api-ms-win-eventing-provider-l1-1-0", "advapi32.dll"),
+    ("api-ms-win-security-audit-l1-1-0", "sechost.dll"),
+    ("api-ms-win-security-audit-l1-1-1", "sechost.dll"),
+    ("api-ms-win-security-appcontainer-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-security-base-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-security-base-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-security-base-private-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-security-lsalookup-l1-1-0", "sechost.dll"),
+    ("api-ms-win-security-sddl-l1-1-0", "sechost.dll"),
+    ("api-ms-win-service-core-l1-1-0", "sechost.dll"),
+    ("api-ms-win-service-core-l1-1-1", "sechost.dll"),
+    ("api-ms-win-service-core-l1-1-2", "sechost.dll"),
+    ("api-ms-win-service-management-l1-1-0", "sechost.dll"),
+    ("api-ms-win-service-management-l2-1-0", "sechost.dll"),
+    ("api-ms-win-service-private-l1-1-0", "sechost.dll"),
+    ("api-ms-win-service-private-l1-1-2", "sechost.dll"),
+    ("api-ms-win-service-private-l1-1-3", "sechost.dll"),
+    ("api-ms-win-service-winsvc-l1-1-0", "sechost.dll"),
+    ("ext-ms-win-appcompat-apphelp-l1-1-2", "apphelp.dll"),
+    ("ext-ms-win-authz-context-l1-1-0", "authz.dll"),
+    ("ext-ms-win-core-winrt-remote-l1-1-0", "rpcrtremote.dll"),
+    ("ext-ms-win-oobe-query-l1-1-0", "kernelbase.dll"),
+    (
+        "ext-ms-win-packagevirtualizationcontext-l1-1-0",
+        "kernelbase.dll",
+    ),
+    ("ext-ms-win-rpc-ssl-l1-1-0", "rpcrtremote.dll"),
+];
+
+fn build_api_set_namespace() -> Result<Vec<u8>, PeImageAccessError> {
+    let mut mappings = API_SET_MAPPINGS.to_vec();
+    mappings.sort_by_key(|mapping| mapping.0);
+
+    let count = mappings.len();
+    let entry_offset = size_of::<ApiSetNamespace>();
+    let value_offset = checked_add(
+        entry_offset,
+        checked_mul(count, size_of::<ApiSetNamespaceEntry>())?,
+    )?;
+    let strings_offset = checked_add(
+        value_offset,
+        checked_mul(count, size_of::<ApiSetValueEntry>())?,
+    )?;
+    let mut string_data = Vec::new();
+    let mut entries = Vec::with_capacity(count);
+    let mut values = Vec::with_capacity(count);
+    let mut hashes = Vec::with_capacity(count);
+
+    for (index, (contract, host_dll)) in mappings.iter().enumerate() {
+        let name = utf16_bytes(contract)?;
+        let host = utf16_bytes(host_dll)?;
+        let name_offset = checked_add(strings_offset, string_data.len())?;
+        string_data.extend_from_slice(&name);
+        let host_offset = checked_add(strings_offset, string_data.len())?;
+        string_data.extend_from_slice(&host);
+        let value_entry_offset = checked_add(
+            value_offset,
+            checked_mul(index, size_of::<ApiSetValueEntry>())?,
+        )?;
+        entries.push(ApiSetNamespaceEntry {
+            flags: API_SET_NAMESPACE_ENTRY_FLAGS,
+            name_offset: to_u32(name_offset)?,
+            name_length: to_u32(name.len())?,
+            hashed_length: to_u32(
+                api_set_hashed_name_len(contract)
+                    .checked_mul(size_of::<u16>())
+                    .ok_or(PeImageAccessError::AddressOverflow)?,
+            )?,
+            value_offset: to_u32(value_entry_offset)?,
+            value_count: 1,
+        });
+        values.push(ApiSetValueEntry {
+            flags: 0,
+            name_offset: 0,
+            name_length: 0,
+            value_offset: to_u32(host_offset)?,
+            value_length: to_u32(host.len())?,
+        });
+        hashes.push(ApiSetHashEntry {
+            hash: api_set_hash(contract),
+            index: to_u32(index)?,
+        });
+    }
+
+    let hash_offset =
+        checked_add(strings_offset, string_data.len())?.next_multiple_of(size_of::<u32>());
+    let size = checked_add(
+        hash_offset,
+        checked_mul(count, size_of::<ApiSetHashEntry>())?,
+    )?;
+    if size > MAX_API_SET_NAMESPACE_SIZE {
+        return Err(PeImageAccessError::AddressOverflow);
+    }
+    hashes.sort_by_key(|entry| (entry.hash, entry.index));
+
+    let namespace = ApiSetNamespace {
+        version: API_SET_NAMESPACE_VERSION,
+        size: to_u32(size)?,
+        flags: 0,
+        count: to_u32(count)?,
+        entry_offset: to_u32(entry_offset)?,
+        hash_offset: to_u32(hash_offset)?,
+        hash_factor: API_SET_NAMESPACE_HASH_FACTOR,
+    };
+
+    let mut bytes = Vec::with_capacity(size);
+    append_struct(&mut bytes, &namespace);
+    for entry in &entries {
+        append_struct(&mut bytes, entry);
+    }
+    for value in &values {
+        append_struct(&mut bytes, value);
+    }
+    bytes.extend_from_slice(&string_data);
+    bytes.resize(hash_offset, 0);
+    for hash in &hashes {
+        append_struct(&mut bytes, hash);
+    }
+    debug_assert_eq!(bytes.len(), size);
+    Ok(bytes)
+}
+
+fn append_struct<T: IntoBytes + Immutable>(bytes: &mut Vec<u8>, value: &T) {
+    bytes.extend_from_slice(value.as_bytes());
+}
+
+fn utf16_bytes(value: &str) -> Result<Vec<u8>, PeImageAccessError> {
+    let mut bytes = Vec::with_capacity(
+        value
+            .len()
+            .checked_mul(size_of::<u16>())
+            .ok_or(PeImageAccessError::AddressOverflow)?,
+    );
+    for unit in value.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+fn api_set_hashed_name_len(name: &str) -> usize {
+    name.rfind('-').unwrap_or(name.len())
+}
+
+fn api_set_hash(name: &str) -> u32 {
+    name[..api_set_hashed_name_len(name)]
+        .bytes()
+        .fold(0, |hash, byte| {
+            hash.wrapping_mul(API_SET_NAMESPACE_HASH_FACTOR)
+                .wrapping_add(u32::from(byte.to_ascii_lowercase()))
+        })
+}
+
+fn checked_add(left: usize, right: usize) -> Result<usize, PeImageAccessError> {
+    left.checked_add(right)
+        .ok_or(PeImageAccessError::AddressOverflow)
+}
+
+fn checked_mul(left: usize, right: usize) -> Result<usize, PeImageAccessError> {
+    left.checked_mul(right)
+        .ok_or(PeImageAccessError::AddressOverflow)
+}
+
+fn to_u32(value: usize) -> Result<u32, PeImageAccessError> {
+    u32::try_from(value).map_err(|_| PeImageAccessError::AddressOverflow)
 }
 
 struct LoadedNtDll {
@@ -986,6 +1365,7 @@ mod tests {
             lp_filename: *mut u16,
             n_size: u32,
         ) -> u32;
+        fn RtlGetCurrentPeb() -> *const ProcessEnvironmentBlock;
     }
 
     macro_rules! print_diff_fields {
@@ -1004,6 +1384,7 @@ mod tests {
                 ($host).csd_version,
             );
         };
+
         ($prefix:literal, $synthetic:expr, $host:expr, static_unicode_string) => {
             print_unicode_string_diff(
                 concat!($prefix, ".", stringify!(static_unicode_string)),
@@ -1018,6 +1399,221 @@ mod tests {
                 ($host).$field,
             );
         };
+    }
+
+    impl ApiSetValueEntry {
+        fn parse(bytes: &[u8], offset: usize) -> Option<Self> {
+            Some(Self::read_from_prefix(bytes.get(offset..)?).ok()?.0)
+        }
+
+        fn name(self, bytes: &[u8]) -> Option<String> {
+            read_utf16_string(bytes, self.name_offset, self.name_length)
+        }
+
+        fn value(self, bytes: &[u8]) -> Option<String> {
+            read_utf16_string(bytes, self.value_offset, self.value_length)
+        }
+    }
+
+    impl ApiSetHashEntry {
+        fn parse(bytes: &[u8], offset: usize) -> Option<Self> {
+            Some(Self::read_from_prefix(bytes.get(offset..)?).ok()?.0)
+        }
+    }
+
+    fn table_offset(base: u32, index: u32, entry_size: usize) -> Option<usize> {
+        (base as usize).checked_add((index as usize).checked_mul(entry_size)?)
+    }
+
+    fn checked_table_end(base: u32, count: u32, entry_size: usize) -> Option<usize> {
+        table_offset(base, count, entry_size)
+    }
+
+    fn read_utf16_string(bytes: &[u8], offset: u32, len: u32) -> Option<String> {
+        let offset = offset as usize;
+        let len = len as usize;
+        let end = offset.checked_add(len)?;
+        let bytes = bytes.get(offset..end)?;
+        let mut chunks = bytes.chunks_exact(size_of::<u16>());
+        if !chunks.remainder().is_empty() {
+            return None;
+        }
+        let units = chunks
+            .by_ref()
+            .map(|chunk| u16::from_le_bytes(chunk.try_into().expect("u16 byte chunk")))
+            .collect::<Vec<_>>();
+        Some(String::from_utf16_lossy(&units))
+    }
+
+    impl ApiSetNamespaceEntry {
+        fn parse(bytes: &[u8], offset: usize) -> Option<Self> {
+            Some(Self::read_from_prefix(bytes.get(offset..)?).ok()?.0)
+        }
+
+        fn name(self, bytes: &[u8]) -> Option<String> {
+            read_utf16_string(bytes, self.name_offset, self.name_length)
+        }
+
+        fn value(self, bytes: &[u8], index: u32) -> Option<ApiSetValueEntry> {
+            if index >= self.value_count {
+                return None;
+            }
+            ApiSetValueEntry::parse(
+                bytes,
+                table_offset(self.value_offset, index, size_of::<ApiSetValueEntry>())?,
+            )
+        }
+    }
+
+    impl ApiSetNamespace {
+        fn parse(bytes: &[u8]) -> Option<Self> {
+            let namespace = Self::read_from_prefix(bytes).ok()?.0;
+            let size = namespace.size as usize;
+            if size != bytes.len()
+                || !(size_of::<Self>()..=MAX_API_SET_NAMESPACE_SIZE).contains(&size)
+            {
+                return None;
+            }
+            if checked_table_end(
+                namespace.entry_offset,
+                namespace.count,
+                size_of::<ApiSetNamespaceEntry>(),
+            )? > size
+            {
+                return None;
+            }
+            if checked_table_end(
+                namespace.hash_offset,
+                namespace.count,
+                size_of::<ApiSetHashEntry>(),
+            )? > size
+            {
+                return None;
+            }
+            Some(namespace)
+        }
+
+        fn entry(self, bytes: &[u8], index: u32) -> Option<ApiSetNamespaceEntry> {
+            if index >= self.count {
+                return None;
+            }
+            ApiSetNamespaceEntry::parse(
+                bytes,
+                table_offset(self.entry_offset, index, size_of::<ApiSetNamespaceEntry>())?,
+            )
+        }
+
+        fn hash_entry(self, bytes: &[u8], index: u32) -> Option<ApiSetHashEntry> {
+            if index >= self.count {
+                return None;
+            }
+            ApiSetHashEntry::parse(
+                bytes,
+                table_offset(self.hash_offset, index, size_of::<ApiSetHashEntry>())?,
+            )
+        }
+    }
+
+    fn dump_api_set_entries(bytes: &[u8], namespace: ApiSetNamespace) {
+        std::println!("entries:");
+        for index in 0..namespace.count {
+            let entry = namespace.entry(bytes, index).expect("namespace entry");
+            std::println!(
+                "  {index:04} name={} flags={:#x} hashed_len={} values={}",
+                entry
+                    .name(bytes)
+                    .unwrap_or_else(|| String::from("<invalid>")),
+                entry.flags,
+                entry.hashed_length,
+                entry.value_count
+            );
+            for value_index in 0..entry.value_count {
+                let value = entry.value(bytes, value_index).expect("namespace value");
+                let name = value.name(bytes).unwrap_or_default();
+                let value_name = value
+                    .value(bytes)
+                    .unwrap_or_else(|| String::from("<invalid>"));
+                std::println!(
+                    "       [{value_index}] name={} value={} flags={:#x}",
+                    if name.is_empty() { "<default>" } else { &name },
+                    value_name,
+                    value.flags
+                );
+            }
+        }
+    }
+
+    fn dump_api_set_hash_entries(bytes: &[u8], namespace: ApiSetNamespace) {
+        std::println!("hash entries:");
+        for index in 0..namespace.count {
+            let entry = namespace.hash_entry(bytes, index).expect("hash entry");
+            std::println!(
+                "  {index:04} hash={:#010x} index={}",
+                entry.hash,
+                entry.index
+            );
+        }
+    }
+
+    fn dump_api_set_namespace(label: &str, ptr: usize, bytes: &[u8]) {
+        let api_set_map = ApiSetNamespace::parse(bytes).expect("valid API_SET_NAMESPACE");
+        std::println!("{label}");
+        std::println!(
+            "API_SET_NAMESPACE ptr={:#x} len={:#x} ({})",
+            ptr,
+            bytes.len(),
+            bytes.len()
+        );
+        std::println!("     version: {:#010x}", api_set_map.version);
+        std::println!("        size: {:#010x}", api_set_map.size);
+        std::println!("       flags: {:#010x}", api_set_map.flags);
+        std::println!("       count: {:#010x}", api_set_map.count);
+        std::println!("entry_offset: {:#010x}", api_set_map.entry_offset);
+        std::println!(" hash_offset: {:#010x}", api_set_map.hash_offset);
+        std::println!(" hash_factor: {:#010x}", api_set_map.hash_factor);
+        std::println!();
+        dump_api_set_entries(bytes, api_set_map);
+        std::println!();
+        dump_api_set_hash_entries(bytes, api_set_map);
+        std::println!();
+    }
+
+    fn dump_host_api_set_namespace_impl() {
+        let peb = unsafe {
+            // SAFETY: `RtlGetCurrentPeb` returns the current process PEB pointer on Windows.
+            RtlGetCurrentPeb().as_ref()
+        }
+        .expect("host PEB");
+        let namespace_ptr = peb.api_set_map as *const ApiSetNamespace;
+        let namespace = unsafe {
+            // SAFETY: `ApiSetMap` points at the host process API_SET_NAMESPACE while the
+            // process is alive; we read only the fixed header first to learn its size.
+            namespace_ptr.as_ref()
+        }
+        .expect("host API_SET_NAMESPACE header");
+        let size = namespace.size as usize;
+        assert!(
+            (size_of::<ApiSetNamespace>()..=MAX_API_SET_NAMESPACE_SIZE).contains(&size),
+            "host API_SET_NAMESPACE has unexpected size {size:#x}"
+        );
+        let bytes = unsafe {
+            // SAFETY: The size was read from the validated namespace header above, and the
+            // host API-set namespace is immutable process-wide data owned by ntdll.
+            core::slice::from_raw_parts(peb.api_set_map as *const u8, size)
+        };
+        dump_api_set_namespace("Host API_SET_NAMESPACE", peb.api_set_map, bytes);
+    }
+
+    #[test]
+    fn dump_host_api_set_namespace() {
+        dump_host_api_set_namespace_impl();
+
+        let namespace = build_api_set_namespace().expect("LiteBox API_SET_NAMESPACE builds");
+        dump_api_set_namespace(
+            "LiteBox synthetic API_SET_NAMESPACE",
+            namespace.as_ptr() as usize,
+            &namespace,
+        );
     }
 
     #[allow(clippy::similar_names)]
