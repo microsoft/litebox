@@ -661,8 +661,7 @@ mod test {
             )
             .unwrap();
 
-        // spawn a thread to write to the eventfd
-        {
+        let writer = {
             let global = task.global.clone();
             let files = Arc::clone(&files);
             std::thread::spawn(move || {
@@ -677,11 +676,12 @@ mod test {
                     .with_entry(&typed, |entry| {
                         entry.write(&WaitState::new(platform()).context(), 1)
                     });
-            });
-        }
+            })
+        };
         epoll
             .wait(&task.global, &WaitState::new(platform()).context(), 1024)
             .unwrap();
+        writer.join().unwrap();
     }
 
     #[test]
