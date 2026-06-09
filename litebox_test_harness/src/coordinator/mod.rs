@@ -12,6 +12,7 @@ pub(crate) mod broker_listener_tests;
 pub(crate) mod clone3_matrix;
 pub(crate) mod common;
 pub(crate) mod concurrent_fork;
+pub(crate) mod df_parent_trigger;
 pub(crate) mod epoll_pidfd;
 pub(crate) mod eventfd;
 pub(crate) mod file_tcp;
@@ -1060,6 +1061,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     proc_self::register_proc_self_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_subtree_kill_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_fork_matrix(&mut registry::Registry::new(&mut tests));
+    df_parent_trigger::register_df_parent_trigger(&mut registry::Registry::new(&mut tests));
     special_cases::register_unix_socket(&mut registry::Registry::new(&mut tests));
     special_cases::register_cross_worker(&mut registry::Registry::new(&mut tests));
     special_cases::register_pipe_eof(&mut registry::Registry::new(&mut tests));
