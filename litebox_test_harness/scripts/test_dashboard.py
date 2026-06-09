@@ -265,26 +265,35 @@ class ShadowPathTests(unittest.TestCase):
     branch-decoding step of GC (the actual git invocations are
     integration-tested by the live supervisor)."""
 
-    def test_branch_to_dirname_round_trip_simple(self):
-        self.assertEqual(
-            dashboard._branch_to_shadow_dirname("main"), "main")
-
-    def test_branch_to_dirname_round_trip_slash(self):
-        self.assertEqual(
-            dashboard._branch_to_shadow_dirname("wportnoy/foo-bar"),
-            "wportnoy%2ffoo-bar",
-        )
-        # And decoding (used by GC) reverses it cleanly.
-        self.assertEqual(
-            "wportnoy%2ffoo-bar".replace("%2f", "/"),
-            "wportnoy/foo-bar",
-        )
-
-    def test_per_branch_path_is_under_shadows_root(self):
+    def test_per_branch_path_simple_branch(self):
         sd = Path("/tmp/sd-test")
-        p = dashboard._per_branch_shadow_path(sd, "wportnoy/x")
-        self.assertEqual(p.parent, dashboard._shadows_root(sd))
-        self.assertEqual(p.name, "wportnoy%2fx")
+        p = dashboard._per_branch_shadow_path(sd, "main")
+        self.assertEqual(p, dashboard._shadows_root(sd) / "main")
+
+    def test_per_branch_path_nested_for_slash(self):
+        # Branches with `/` MUST become nested directories — NOT
+        # URL-encoded as `%2f`. rust-lld URL-decodes `%XX`
+        # sequences in its `-o` output path and fails ENOENT
+        # against the decoded (nonexistent) path.
+        sd = Path("/tmp/sd-test")
+        p = dashboard._per_branch_shadow_path(sd, "wportnoy/foo-bar")
+        self.assertEqual(p, dashboard._shadows_root(sd) / "wportnoy" / "foo-bar")
+        # No `%` escaping anywhere in the resulting path.
+        self.assertNotIn("%", str(p))
+
+    def test_branch_from_shadow_path_roundtrip(self):
+        sd = Path("/tmp/sd-test")
+        for branch in ("main", "wportnoy/foo", "a/b/c"):
+            p = dashboard._per_branch_shadow_path(sd, branch)
+            self.assertEqual(
+                dashboard._branch_from_shadow_path(sd, p), branch,
+            )
+
+    def test_branch_from_shadow_path_outside_shadows_returns_none(self):
+        sd = Path("/tmp/sd-test")
+        self.assertIsNone(
+            dashboard._branch_from_shadow_path(sd, Path("/elsewhere/foo")),
+        )
 
     def test_legacy_path_distinct_from_per_branch_root(self):
         sd = Path("/tmp/sd-test")

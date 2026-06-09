@@ -2706,29 +2706,49 @@ def _shadows_root(state_dir: Path) -> Path:
     return state_dir / "shadows"
 
 
-def _branch_to_shadow_dirname(branch: str) -> str:
-    """Filesystem-safe encoding of `branch` for use as a directory
-    name. `/` is encoded `%2f` so the encoding is unambiguous and
-    flat (no nested directories). Empty branch is rejected upstream
-    (detached worktrees are filtered out of the candidate set
-    earlier)."""
-    return branch.replace("/", "%2f")
-
-
 def _per_branch_shadow_path(state_dir: Path, branch: str) -> Path:
     """Per-branch shadow worktree path. Eliminates the cargo
     incremental-recompile cost that the previous single shared
     shadow paid on every branch flip. Tradeoff: ~10-15 GB disk
     per branch under `target/`; GC reaps stale shadows whose
-    branch no longer exists in the canonical clone."""
-    return _shadows_root(state_dir) / _branch_to_shadow_dirname(branch)
+    branch no longer exists in the canonical clone.
+
+    Branches containing `/` (most do, e.g. `wportnoy/foo`) become
+    nested directories under `shadows/`. We deliberately do NOT
+    URL-encode `/` as `%2f`: `rust-lld` URL-decodes `%XX`
+    sequences in its `-o` output path and then fails ENOENT
+    because the decoded path doesn't exist. Nested directories
+    sidestep the issue entirely. Empty branch is rejected
+    upstream (detached worktrees are filtered out of the
+    candidate set earlier).
+    """
+    return _shadows_root(state_dir) / branch
+
+
+def _branch_from_shadow_path(state_dir: Path, shadow: Path) -> Optional[str]:
+    """Inverse of `_per_branch_shadow_path`: recover the branch
+    name from a shadow path under `shadows/`. Returns None if
+    the path isn't under the shadows root (e.g., a leftover
+    `%XX`-encoded directory from an older layout that GC should
+    reap unconditionally)."""
+    root = _shadows_root(state_dir)
+    try:
+        rel = shadow.relative_to(root)
+    except ValueError:
+        return None
+    parts = rel.parts
+    if not parts:
+        return None
+    return "/".join(parts)
 
 
 def _gc_shadow_worktrees(canonical: Path, state_dir: Path,
                          live_branches: set[str]) -> int:
     """Remove per-branch shadow worktrees whose branch no longer
     exists in the canonical clone, plus the legacy single-shadow
-    path (`<state-dir>/shadow`) if present. Returns count removed.
+    path (`<state-dir>/shadow`) and any legacy `%XX`-encoded
+    flat-layout directories under `shadows/`. Returns count
+    removed.
 
     Best-effort: failures don't abort the supervisor. Live-branches
     set must be non-empty (an empty set would reap every shadow,
@@ -2752,26 +2772,39 @@ def _gc_shadow_worktrees(canonical: Path, state_dir: Path,
                 removed += 1
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
-    # 2) Per-branch shadows under <state-dir>/shadows/.
+    # 2) Per-branch shadows under <state-dir>/shadows/. Enumerate
+    # via `git worktree list --porcelain` (authoritative — handles
+    # the nested-dir layout and ignores stray non-worktree dirs)
+    # then map each path back to a branch via the inverse of
+    # `_per_branch_shadow_path`. Any worktree under `shadows/`
+    # whose decoded branch isn't live gets reaped. Legacy `%XX`
+    # flat-layout shadows decode to a non-existent branch (e.g.
+    # `wportnoy%2ffoo` is not in `live_branches`, which only
+    # contains real branch names like `wportnoy/foo`), so they
+    # are reaped unconditionally — exactly what we want.
     root = _shadows_root(state_dir)
     if root.is_dir():
-        for child in root.iterdir():
-            if not child.is_dir():
-                continue
-            # Decode dirname back to branch.
-            branch = child.name.replace("%2f", "/")
-            if branch in live_branches:
+        shadow_paths = _list_shadow_worktree_paths(canonical, root)
+        for shadow in shadow_paths:
+            branch = _branch_from_shadow_path(state_dir, shadow)
+            if branch is not None and branch in live_branches:
                 continue
             try:
                 subprocess.run(
                     ["git", "-C", str(canonical), "worktree", "remove",
-                     "--force", str(child)],
+                     "--force", str(shadow)],
                     check=False, capture_output=True, text=True, timeout=60,
                 )
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 pass
-            if not child.exists():
+            if not shadow.exists():
                 removed += 1
+        # Best-effort: prune now-empty parent dirs under `shadows/`
+        # so the directory tree doesn't accumulate stale skeleton
+        # dirs (e.g. `shadows/wportnoy/` after every `wportnoy/*`
+        # shadow has been reaped). Only removes empty dirs; never
+        # touches anything with live contents.
+        _prune_empty_dirs(root)
     if removed:
         # `git worktree remove` already updates the admin DB but
         # `prune` mops up any half-removed entries from prior runs.
@@ -2783,6 +2816,58 @@ def _gc_shadow_worktrees(canonical: Path, state_dir: Path,
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
     return removed
+
+
+def _list_shadow_worktree_paths(canonical: Path,
+                                shadows_root: Path) -> list[Path]:
+    """Enumerate paths of all git worktrees rooted under
+    `shadows_root` via `git worktree list --porcelain`. Returns
+    [] on any git failure. Resolves both sides before comparing
+    so that symlink quirks (rare but possible on WSL2) don't
+    cause false negatives."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(canonical), "worktree", "list", "--porcelain"],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    if r.returncode != 0:
+        return []
+    try:
+        root_resolved = shadows_root.resolve()
+    except OSError:
+        root_resolved = shadows_root
+    out: list[Path] = []
+    for line in r.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        path = Path(line[len("worktree "):])
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        try:
+            resolved.relative_to(root_resolved)
+        except ValueError:
+            continue
+        out.append(path)
+    return out
+
+
+def _prune_empty_dirs(root: Path) -> None:
+    """Remove empty subdirectories of `root` (post-order). Never
+    removes `root` itself. Best-effort; ignores all errors."""
+    if not root.is_dir():
+        return
+    for child in sorted(root.iterdir(), reverse=True):
+        if not child.is_dir():
+            continue
+        _prune_empty_dirs(child)
+        try:
+            child.rmdir()
+        except OSError:
+            pass
 
 
 def _ensure_shadow_worktree(canonical: Path, state_dir: Path,
