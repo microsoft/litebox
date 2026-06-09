@@ -13,6 +13,7 @@
 
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::os::eventfd::EventFd;
+use crate::os::pidfd::Pidfd;
 use crate::os::pty::Pty;
 use crate::os::signalfd::Signalfd;
 use crate::{BinaryType, register_handler, register_leaf_subcommand};
@@ -53,6 +54,8 @@ const TCP_CONN_PEER: HandlerToken<TcpConnPeerArgs, TcpConnPeerOutput> =
     HandlerToken::new("inherit_matrix.tcp_conn_peer");
 const FS_FID: HandlerToken<FsFidTrialArgs, ChildOutput> =
     HandlerToken::new("inherit_matrix.fs_fid");
+const PIDFD_MATRIX: HandlerToken<PidfdTrialArgs, ChildOutput> =
+    HandlerToken::new("inherit_matrix.pidfd");
 
 const TCP_CONN_READY: &str = "tcp_conn_listening";
 
@@ -100,6 +103,7 @@ const BROKER_FILE_OPS: &[InheritOp] = &[
     InheritOp::WriteThenParentReadsBack,
     InheritOp::LseekThenRead,
 ];
+const PIDFD_OPS: &[InheritOp] = &[InheritOp::Poll, InheritOp::RecvAfterFork];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -113,6 +117,7 @@ enum InheritSubsystem {
     Timerfd,
     Pty,
     BrokerFile,
+    Pidfd,
 }
 
 impl InheritSubsystem {
@@ -127,6 +132,7 @@ impl InheritSubsystem {
         Self::Timerfd,
         Self::Pty,
         Self::BrokerFile,
+        Self::Pidfd,
     ];
 
     const fn id(self) -> &'static str {
@@ -140,6 +146,7 @@ impl InheritSubsystem {
             Self::Timerfd => "timerfd",
             Self::Pty => "pty",
             Self::BrokerFile => "brokerfile",
+            Self::Pidfd => "pidfd",
         }
     }
 }
@@ -288,6 +295,13 @@ struct TimerfdTrialArgs {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct PidfdTrialArgs {
+    child_binary: String,
+    op: InheritOp,
+    timeout_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct TcpConnTrialArgs {
     child_binary: String,
     op: InheritOp,
@@ -353,6 +367,7 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
     register_handler!(TCP_CONN_MATRIX, handle_tcp_conn_trial);
     register_handler!(TCP_CONN_PEER, handle_tcp_conn_peer);
     register_handler!(FS_FID, handle_fs_fid_trial);
+    register_handler!(PIDFD_MATRIX, handle_pidfd_trial);
     register_leaf_subcommand!("inherit-matrix", leaf_subcmd::subcmd_inherit_matrix);
 
     for scenario in [
@@ -410,6 +425,7 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
         InheritSubsystem::BrokerFile,
         InheritSubsystem::Timerfd,
         InheritSubsystem::TcpConn,
+        InheritSubsystem::Pidfd,
     ] {
         for &parent_bt in BinaryType::ALL {
             for &child_bt in BinaryType::ALL {
@@ -438,6 +454,7 @@ const fn valid_ops(subsystem: InheritSubsystem) -> &'static [InheritOp] {
         InheritSubsystem::Timerfd => TIMERFD_OPS,
         InheritSubsystem::Pty => PTY_OPS,
         InheritSubsystem::BrokerFile => BROKER_FILE_OPS,
+        InheritSubsystem::Pidfd => PIDFD_OPS,
     }
 }
 
@@ -556,6 +573,18 @@ fn register_trial(reg: &mut Registry<'_>, trial: InheritTrial) {
                     InheritSubsystem::TcpConn => {
                         run_tcp_conn_trial(run, &parent_handle, &tcp_peer, trial, child_binary)
                             .await
+                    }
+                    InheritSubsystem::Pidfd => {
+                        run.send_named_typed(
+                            &parent_handle,
+                            &PIDFD_MATRIX,
+                            PidfdTrialArgs {
+                                child_binary,
+                                op: trial.op,
+                                timeout_ms: 3000,
+                            },
+                        )
+                        .await
                     }
                 };
                 match result {
@@ -683,6 +712,7 @@ fn run_scaffolded_trial(subsystem: InheritSubsystem, _op: InheritOp) -> String {
         InheritSubsystem::Timerfd => run_timerfd_trial(),
         InheritSubsystem::Pty => run_pty_trial(),
         InheritSubsystem::BrokerFile => run_broker_file_trial(),
+        InheritSubsystem::Pidfd => "pidfd is implemented by handle_pidfd_trial".into(),
     }
 }
 
@@ -1900,6 +1930,131 @@ fn brokerfile_path(test_id: &str) -> String {
     format!("/tmp/canary-{sanitized}-{}.txt", std::process::id())
 }
 
+async fn handle_pidfd_trial(
+    args: PidfdTrialArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ChildOutput, HandlerError> {
+    // Pick a target sleep that fits the op's timing model:
+    // - Poll: target is alive when child is spawned; exits ~400ms later
+    //   so the child's poll(POLLIN, timeout_ms) observes the transition.
+    // - RecvAfterFork: target exits quickly; parent waits for the exit
+    //   before spawning the child, so the inherited pidfd is already
+    //   POLLIN-ready when the child observes it (sticky).
+    let target_sleep_ms = match args.op {
+        InheritOp::Poll => 400_u32,
+        InheritOp::RecvAfterFork => 50_u32,
+        _ => {
+            return Err(HandlerError(format!(
+                "unsupported pidfd op {}",
+                args.op.id()
+            )));
+        }
+    };
+
+    // SAFETY: fork is followed in the child by only async-signal-safe
+    // libc calls (usleep, _exit). The parent continues normal Rust.
+    let target_pid = unsafe { libc::fork() };
+    if target_pid < 0 {
+        return Err(HandlerError(format!(
+            "pidfd target fork: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if target_pid == 0 {
+        // SAFETY: child path - async-signal-safe primitives only.
+        unsafe {
+            libc::usleep(target_sleep_ms * 1000);
+            libc::_exit(0);
+        }
+    }
+
+    let target_pid_u32 =
+        u32::try_from(target_pid).map_err(|e| HandlerError(format!("pidfd target pid: {e}")))?;
+    let pidfd = match Pidfd::open(target_pid_u32) {
+        Ok(p) => p,
+        Err(e) => {
+            // Best-effort reap; we can't proceed without the pidfd.
+            // SAFETY: target_pid is a child of this process.
+            unsafe {
+                let mut status = 0;
+                libc::waitpid(target_pid, &raw mut status, 0);
+            }
+            return Err(HandlerError(format!("pidfd_open({target_pid_u32}): {e}")));
+        }
+    };
+    let fd = pidfd.as_raw_fd();
+    clear_cloexec(fd)?;
+
+    if args.op == InheritOp::RecvAfterFork {
+        match pidfd.poll_exit_in(i32::try_from(args.timeout_ms).unwrap_or(i32::MAX)) {
+            Ok(true) => {}
+            Ok(false) => {
+                // SAFETY: best-effort reap on the error path.
+                unsafe {
+                    let mut status = 0;
+                    libc::waitpid(target_pid, &raw mut status, 0);
+                }
+                return Err(HandlerError(
+                    "pidfd parent poll_exit_in: target did not exit before child spawn".into(),
+                ));
+            }
+            Err(e) => {
+                // SAFETY: best-effort reap on the error path.
+                unsafe {
+                    let mut status = 0;
+                    libc::waitpid(target_pid, &raw mut status, 0);
+                }
+                return Err(HandlerError(format!("pidfd parent pre-spawn poll: {e}")));
+            }
+        }
+    }
+
+    let mut child = Command::new(&args.child_binary);
+    child
+        .args([
+            "inherit-matrix",
+            "pidfd-child",
+            args.op.id(),
+            &args.timeout_ms.to_string(),
+        ])
+        .env("LITEBOX_INHERIT_FD", fd.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = child
+        .spawn()
+        .map_err(|e| HandlerError(format!("spawn {}: {e}", args.child_binary)))?;
+
+    let output = wait_with_timeout(child, Duration::from_millis(args.timeout_ms + 2000))?;
+
+    // Reap target now that the child has observed (or failed to observe) it.
+    // SAFETY: target_pid is a child of this process; status is writable.
+    unsafe {
+        let mut status = 0;
+        let _ = libc::waitpid(target_pid, &raw mut status, libc::WNOHANG);
+        // If it hasn't exited yet (Poll op may finish first), block briefly.
+        let _ = libc::waitpid(target_pid, &raw mut status, 0);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut exit_code = output.status.code().unwrap_or(-1);
+
+    if exit_code == 0 && stdout != "ready" {
+        exit_code = 1;
+        return Ok(ChildOutput {
+            exit_code,
+            stdout,
+            stderr: format!("pidfd stdout mismatch: expected ready; {stderr}"),
+        });
+    }
+
+    Ok(ChildOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
 async fn handle_eventfd_trial(
     args: EventfdTrialArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -2591,6 +2746,7 @@ mod leaf_subcmd {
             Some("brokerfile-child") => brokerfile_child(args),
             Some("fs-fid-child") => fs_fid_child(args),
             Some("timerfd-child") => timerfd_child(args),
+            Some("pidfd-child") => pidfd_child(args),
             Some(other) => {
                 eprintln!("inherit-matrix: unknown subcommand: {other}");
                 2
@@ -3068,6 +3224,56 @@ mod leaf_subcmd {
                 return 1;
             }
         }
+    }
+
+    fn pidfd_child(args: &[String]) -> i32 {
+        let Some(op) = args.get(3).map(String::as_str) else {
+            eprintln!("inherit-matrix pidfd-child: missing op");
+            return 2;
+        };
+        let Some(timeout_ms) = args.get(4).and_then(|s| s.parse::<i32>().ok()) else {
+            eprintln!("inherit-matrix pidfd-child: bad timeout");
+            return 2;
+        };
+        let Some(fd) = std::env::var("LITEBOX_INHERIT_FD")
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+        else {
+            eprintln!("inherit-matrix pidfd-child: bad LITEBOX_INHERIT_FD");
+            return 2;
+        };
+
+        match op {
+            // Both ops use the same child-side primitive: poll(POLLIN)
+            // on the inherited pidfd. They differ in the parent's
+            // sequencing (alive-then-exits vs. already-exited).
+            "poll" | "recv_after_fork" => poll_pidfd_child(fd, timeout_ms),
+            other => {
+                eprintln!("inherit-matrix pidfd-child: unknown op {other}");
+                2
+            }
+        }
+    }
+
+    fn poll_pidfd_child(fd: RawFd, timeout_ms: i32) -> i32 {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is initialized and the count matches the buffer length.
+        let rc = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+        if rc <= 0 || pfd.revents & libc::POLLIN == 0 {
+            eprintln!(
+                "inherit-matrix pidfd poll: rc={} revents={} err={}",
+                rc,
+                pfd.revents,
+                std::io::Error::last_os_error()
+            );
+            return 1;
+        }
+        println!("ready");
+        0
     }
 
     fn signalfd_child(args: &[String]) -> i32 {
