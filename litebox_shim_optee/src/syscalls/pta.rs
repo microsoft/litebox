@@ -19,12 +19,46 @@ use num_enum::TryFromPrimitive;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const PTA_SYSTEM_UUID: TeeUuid = TeeUuid {
-    time_low: 0x3a2f_8978,
-    time_mid: 0x5dc0,
-    time_hi_and_version: 0x11e8,
-    clock_seq_and_node: [0x9c, 0x2d, 0xfa, 0x7a, 0xe0, 0x1b, 0xbe, 0xbc],
-};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SystemPta;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PseudoTa {
+    System(SystemPta),
+}
+
+impl PseudoTa {
+    pub(crate) fn from_uuid(uuid: &TeeUuid) -> Option<Self> {
+        match *uuid {
+            SystemPta::UUID => Some(Self::System(SystemPta)),
+            _ => None,
+        }
+    }
+
+    /// Open a session to this PTA, returning the allocated session ID.
+    fn open_session(self, params: &UteeParams) -> Result<u32, TeeResult> {
+        match self {
+            Self::System(_) => SystemPta::open_session(params),
+        }
+    }
+
+    pub(crate) fn invoke_command(
+        self,
+        task: &Task,
+        cmd_id: u32,
+        params: &UteeParams,
+    ) -> Result<(), TeeResult> {
+        match self {
+            Self::System(_) => SystemPta::invoke_command(task, cmd_id, params),
+        }
+    }
+
+    fn close_session(self, task: &Task, session_id: u32) {
+        match self {
+            Self::System(_) => SystemPta::close_session(task, session_id),
+        }
+    }
+}
 
 const PTA_SYSTEM_ADD_RNG_ENTROPY: u32 = 0;
 const PTA_SYSTEM_DERIVE_TA_UNIQUE_KEY: u32 = 1;
@@ -51,7 +85,7 @@ const TA_DERIVED_EXTRA_DATA_MAX_SIZE: usize = 1024;
 /// `PTA_SYSTEM_*` command ID from `optee_os/lib/libutee/include/pta_system.h`
 #[derive(Clone, Copy, TryFromPrimitive)]
 #[repr(u32)]
-pub enum PtaSystemCommandId {
+pub(crate) enum PtaSystemCommandId {
     AddRngEntropy = PTA_SYSTEM_ADD_RNG_ENTROPY,
     DeriveTaUniqueKey = PTA_SYSTEM_DERIVE_TA_UNIQUE_KEY,
     MapZi = PTA_SYSTEM_MAP_ZI,
@@ -68,36 +102,84 @@ pub enum PtaSystemCommandId {
     SuppPluginInvoke = PTA_SYSTEM_SUPP_PLUGIN_INVOKE,
 }
 
-/// Checks whether a given TA is a (system) PTA and its parameter is valid.
-pub fn is_pta(ta_uuid: &TeeUuid, params: &UteeParams) -> bool {
-    // TODO: consider other PTAs
-    *ta_uuid == PTA_SYSTEM_UUID
-        && params.get_type(0).is_ok_and(|t| t == TeeParamType::None)
-        && params.get_type(1).is_ok_and(|t| t == TeeParamType::None)
-        && params.get_type(2).is_ok_and(|t| t == TeeParamType::None)
-        && params.get_type(3).is_ok_and(|t| t == TeeParamType::None)
-}
-
-// TODO: replace it with a proper implementation.
-pub fn close_pta_session(_ta_session_id: u32) {}
-
-/// Check whether a given session ID is associated with a PTA.
-pub fn is_pta_session(ta_sess_id: u32) -> bool {
-    ta_sess_id == crate::SessionIdPool::get_pta_session_id()
-}
-
 type HmacSha256 = Hmac<Sha256>;
 
 impl Task {
-    /// Handle a command of the system PTA.
-    pub fn handle_system_pta_command(
+    pub(crate) fn open_pta_session(
         &self,
-        cmd_id: u32,
+        pta: PseudoTa,
         params: &UteeParams,
-    ) -> Result<(), TeeResult> {
+    ) -> Result<u32, TeeResult> {
+        let mut pta_sessions = self.pta_sessions.lock();
+        // OP-TEE OS permits multiple sessions to the same PTA. We intentionally
+        // cap this shim at one session per PTA per TA task to prevent a TA
+        // from exhausting session IDs or memory.
+        if pta_sessions
+            .values()
+            .any(|existing_pta| *existing_pta == pta)
+        {
+            return Err(TeeResult::Busy);
+        }
+
+        let session_id = pta.open_session(params)?;
+        let prev = pta_sessions.insert(session_id, pta);
+        debug_assert!(
+            prev.is_none(),
+            "freshly allocated session ID collided with an existing PTA session",
+        );
+        Ok(session_id)
+    }
+
+    pub(crate) fn close_pta_session(&self, ta_session_id: u32) -> Option<PseudoTa> {
+        let pta = self.pta_sessions.lock().remove(&ta_session_id)?;
+        pta.close_session(self, ta_session_id);
+        crate::SessionIdPool::recycle(ta_session_id);
+        Some(pta)
+    }
+
+    pub(crate) fn pta_for_inter_ta_session(&self, ta_sess_id: u32) -> Option<PseudoTa> {
+        self.pta_sessions.lock().get(&ta_sess_id).copied()
+    }
+
+    pub(crate) fn close_all_pta_sessions(&self) {
+        // Drain into a local buffer and release the lock before invoking
+        // `close_session` to avoid potential dead locks.
+        let sessions: alloc::vec::Vec<(u32, PseudoTa)> = self.pta_sessions.lock().drain().collect();
+        for (session_id, pta) in sessions {
+            pta.close_session(self, session_id);
+            crate::SessionIdPool::recycle(session_id);
+        }
+    }
+}
+
+impl SystemPta {
+    const UUID: TeeUuid = TeeUuid {
+        time_low: 0x3a2f_8978,
+        time_mid: 0x5dc0,
+        time_hi_and_version: 0x11e8,
+        clock_seq_and_node: [0x9c, 0x2d, 0xfa, 0x7a, 0xe0, 0x1b, 0xbe, 0xbc],
+    };
+
+    fn open_session(params: &UteeParams) -> Result<u32, TeeResult> {
+        if !params.has_types([
+            TeeParamType::None,
+            TeeParamType::None,
+            TeeParamType::None,
+            TeeParamType::None,
+        ]) {
+            return Err(TeeResult::BadParameters);
+        }
+
+        crate::SessionIdPool::allocate().ok_or(TeeResult::Busy)
+    }
+
+    fn close_session(_task: &Task, _session_id: u32) {}
+
+    /// Handle a command of the system PTA.
+    fn invoke_command(task: &Task, cmd_id: u32, params: &UteeParams) -> Result<(), TeeResult> {
         #[allow(clippy::single_match_else)]
         match PtaSystemCommandId::try_from(cmd_id).map_err(|_| TeeResult::BadParameters)? {
-            PtaSystemCommandId::DeriveTaUniqueKey => self.derive_ta_unique_key(params),
+            PtaSystemCommandId::DeriveTaUniqueKey => Self::derive_ta_unique_key(task, params),
             _ => {
                 #[cfg(debug_assertions)]
                 todo!("support other system PTA commands {cmd_id}");
@@ -111,7 +193,7 @@ impl Task {
     ///
     /// This follows the OP-TEE `system_derive_ta_unique_key` implementation from
     /// `core/pta/system.c`.
-    fn derive_ta_unique_key(&self, params: &UteeParams) -> Result<(), TeeResult> {
+    fn derive_ta_unique_key(task: &Task, params: &UteeParams) -> Result<(), TeeResult> {
         use TeeParamType::{MemrefInput, MemrefOutput, None};
 
         if !params.has_types([MemrefInput, MemrefOutput, None, None]) {
@@ -153,9 +235,10 @@ impl Task {
         let subkey_ptr = UserMutPtr::<u8>::from_usize(subkey_addr.trunc());
 
         // subkey = KDF(huk, usage || ta_uuid || extra_data)
-        let ta_uuid_bytes = self.ta_app_id.to_le_bytes();
+        let ta_uuid_bytes = task.ta_app_id.to_le_bytes();
         let mut subkey_buf = Zeroizing::new(vec![0u8; subkey_size]);
-        self.huk_subkey_derive(
+        Self::huk_subkey_derive(
+            task,
             HukSubkeyUsage::UniqueTa,
             &[&ta_uuid_bytes, &extra_data],
             &mut subkey_buf,
@@ -171,7 +254,7 @@ impl Task {
     ///
     /// This follows the OP-TEE `huk_subkey_derive` interface from `core/kernel/huk_subkey.c`.
     fn huk_subkey_derive(
-        &self,
+        task: &Task,
         usage: HukSubkeyUsage,
         const_data: &[&[u8]],
         subkey: &mut [u8],
@@ -193,7 +276,7 @@ impl Task {
             output: subkey,
         };
 
-        self.global
+        task.global
             .platform
             .derive_key(Some(huk_subkey_derive_inner), kdf_params)
             .map_err(|err| match err {
