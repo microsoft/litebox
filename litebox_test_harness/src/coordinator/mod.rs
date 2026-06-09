@@ -25,6 +25,7 @@ pub(crate) mod invariants;
 pub(crate) mod iouring_discovery;
 pub mod leaf_subcommand;
 pub(crate) mod matrix;
+pub(crate) mod nested_inherit_matrix;
 pub(crate) mod perf_probes;
 pub(crate) mod pid_uniqueness;
 pub(crate) mod pidfd_inherit;
@@ -1042,6 +1043,9 @@ pub fn collect_all_tests() -> Vec<Test> {
     special_cases::register_process_tests(&mut registry::Registry::new(&mut tests));
     invariants::register_invariant_tests(&mut registry::Registry::new(&mut tests));
     inherit_matrix::register_inherit_matrix_tests(&mut registry::Registry::new(&mut tests));
+    nested_inherit_matrix::register_nested_inherit_matrix_tests(&mut registry::Registry::new(
+        &mut tests,
+    ));
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
     pidfd_inherit::register_pidfd_inherit_tests(&mut registry::Registry::new(&mut tests));
     pidfd_tests::register_pidfd_tests(&mut registry::Registry::new(&mut tests));
