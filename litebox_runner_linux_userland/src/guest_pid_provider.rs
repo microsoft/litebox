@@ -121,6 +121,98 @@ impl GuestPidProvider for RunnerGuestPidProvider {
             .release_all_for_pid(pid)
             .map_err(|e| map_client_error(pid, e))
     }
+
+    fn wait_process_exit_blocking(&self, pid: u32, timeout: core::time::Duration) -> Option<i32> {
+        use litebox_common_linux::cwfd::notification_frame::NotificationFrame;
+        use std::sync::{Condvar, Mutex};
+
+        struct ExitCodeWaker {
+            slot: Mutex<Option<i32>>,
+            cond: Condvar,
+        }
+
+        impl litebox_common_linux::broker_eventfd::NotificationCallback for ExitCodeWaker {
+            fn on_events(&self, _events: u32) {
+                // No-op: exit code arrives via the payload-aware on_frame
+                // override below. Reached only if a notification fires
+                // without a 4-byte payload — defensively wake the waiter
+                // with a sentinel so it doesn't hang.
+                let mut guard = self.slot.lock().expect("slot mutex poisoned");
+                if guard.is_none() {
+                    *guard = Some(0);
+                    self.cond.notify_all();
+                }
+            }
+
+            fn on_frame(&self, frame: &NotificationFrame) {
+                let code = frame
+                    .payload_bytes()
+                    .filter(|p| p.len() >= 4)
+                    .map(|p| i32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+                    .unwrap_or(0);
+                let mut guard = self.slot.lock().expect("slot mutex poisoned");
+                *guard = Some(code);
+                self.cond.notify_all();
+            }
+        }
+
+        let waker = Arc::new(ExitCodeWaker {
+            slot: Mutex::new(None),
+            cond: Condvar::new(),
+        });
+        let subscription_id = self.dispatcher.alloc_subscription_id();
+        let cb: Arc<dyn litebox_common_linux::broker_eventfd::NotificationCallback> = waker.clone();
+        self.dispatcher.register_callback(subscription_id, cb);
+
+        let already = match self.client.subscribe_process_exit(
+            pid,
+            subscription_id,
+            NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                self.dispatcher.unregister_callback(subscription_id);
+                tracing::warn!(pid, error = %e, "wait_process_exit_blocking: subscribe failed");
+                return None;
+            }
+        };
+
+        let result = if let Some(code) = already {
+            Some(code)
+        } else {
+            let mut guard = waker.slot.lock().expect("slot mutex poisoned");
+            let mut remaining = timeout;
+            let start = std::time::Instant::now();
+            while guard.is_none() {
+                if remaining.is_zero() {
+                    tracing::warn!(
+                        pid,
+                        "wait_process_exit_blocking: timed out waiting for broker exit stamp"
+                    );
+                    break;
+                }
+                let res = waker
+                    .cond
+                    .wait_timeout(guard, remaining)
+                    .expect("slot condvar poisoned");
+                guard = res.0;
+                let elapsed = start.elapsed();
+                remaining = timeout.checked_sub(elapsed).unwrap_or_default();
+            }
+            *guard
+        };
+
+        if let Err(e) = self.client.unsubscribe(u64::from(pid), subscription_id) {
+            tracing::warn!(
+                pid,
+                subscription_id,
+                error = %e,
+                "wait_process_exit_blocking: unsubscribe failed",
+            );
+        }
+        self.dispatcher.unregister_callback(subscription_id);
+        result
+    }
 }
 
 struct CallbackBridge {

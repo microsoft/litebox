@@ -120,6 +120,25 @@ pub trait GuestPidProvider: Send + Sync {
     fn release_all_for_pid(&self, _pid: u32) -> Result<u32, GuestPidProviderError> {
         Ok(0)
     }
+
+    /// Block this thread until the broker reports a process-exit event
+    /// for `pid` and return the broker-cached exit code.
+    ///
+    /// Used by the fork-restore parent to wait on the runner-stamped
+    /// install-complete signal (an auxiliary broker process handle
+    /// whose `mark_exited` payload carries 0 on install success or an
+    /// errno on install failure). Returns `None` if the broker
+    /// subscription fails, if the timeout elapses, or if the trait
+    /// impl does not support blocking waits (the default).
+    ///
+    /// `timeout` caps the wait so a crashed runner that never stamps
+    /// is observable: callers treat `None` as install failure and
+    /// reap the host process via the normal `wait_worker_host` path.
+    /// Default-implemented as `None` so test impls do not have to
+    /// provide blocking semantics.
+    fn wait_process_exit_blocking(&self, _pid: u32, _timeout: core::time::Duration) -> Option<i32> {
+        None
+    }
 }
 
 /// Convenience: the `Arc<dyn GuestPidProvider>` shape the shim

@@ -5130,6 +5130,38 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
 
+        // Allocate a broker-owned auxiliary process pid that the
+        // spawned runner will stamp via `try_mark_broker_process_exited`
+        // after running its fork-restore install loop. The parent
+        // blocks on a broker `subscribe_process_exit` for the same
+        // pid; replaces the legacy `--fork-restore-ack-fd` pipe.
+        let ack_pid = match super::guest_pid::try_register_broker_guest_pid() {
+            Some(pid) => pid,
+            None => {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK] pid={}: failed to allocate broker fork-restore ack pid",
+                    self.pid,
+                );
+                for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
+                    self.global.platform.close_host_fd(pr.host_fd);
+                }
+                for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
+                    releaser.release(handle_id);
+                }
+                for (releaser, handle_id) in broker_socketpair_parent_release_on_failure.drain(..) {
+                    releaser.release(handle_id);
+                }
+                fc.vfork_done
+                    .broker_socketpair_parent_installs
+                    .lock()
+                    .clear();
+                put_fc_back(self, fc);
+                return Err(Errno::ENOMEM);
+            }
+        };
+
         // Spawn the child worker host.
         // Build passthrough fds for bidirectional unix socket bridges.
         let bidi_pt: Vec<(usize, i32)> = bidi_passthrough
@@ -5144,18 +5176,10 @@ impl<FS: ShimFS> Task<FS> {
             // via `--broker-fd-bridge`. Includes host-backed,
             // virtual-pipe / socket / PTY, and FS-backed.
             &broker_fd_bridge_specs,
+            ack_pid,
         ) {
             Ok(pid) => {
                 phase_tick!("post_spawn_worker_host");
-                // Phase 3 D5: spawn returned Ok only after the worker's
-                // ack arrived; the worker has finished
-                // `install_broker_fd_bridge_spec` for every spec we
-                // shipped, which means each spec's handle has been
-                // dup_handled into the worker's connection. Safe to
-                // drop the parent's creation ref now.
-                for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
-                    releaser.release(handle_id);
-                }
                 pid
             }
             Err(_err) => {
@@ -5166,6 +5190,7 @@ impl<FS: ShimFS> Task<FS> {
                     self.pid,
                     _err,
                 );
+                super::guest_pid::try_release_broker_guest_pid(ack_pid);
                 // Clean up parent-side OS pipe FDs on failure.
                 for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
                     self.global.platform.close_host_fd(pr.host_fd);
@@ -5190,6 +5215,52 @@ impl<FS: ShimFS> Task<FS> {
                 return Err(Errno::ENOMEM);
             }
         };
+
+        // Wait for the runner to stamp the install-complete ack via
+        // the broker. 0 = success; any non-zero / missing = install
+        // failure (e.g., runner crashed before stamping). Mirrors the
+        // legacy pipe-read in the platform-side spawn helper.
+        let ack_wait_timeout = core::time::Duration::from_secs(30);
+        let ack_status =
+            super::guest_pid::try_wait_broker_process_exit(ack_pid, ack_wait_timeout).unwrap_or(-1);
+        super::guest_pid::try_release_broker_guest_pid(ack_pid);
+        phase_tick!("post_fork_restore_ack");
+
+        if ack_status != 0 {
+            #[cfg(feature = "trace_syscalls")]
+            litebox::log_println!(
+                self.global.platform,
+                "[DELAYED-FORK] pid={}: fork-restore ack failed (status={}); reaping host_pid={}",
+                self.pid,
+                ack_status,
+                host_pid,
+            );
+            // Reap the child runner so it doesn't linger.
+            let _ = self.global.platform.wait_worker_host(host_pid);
+            for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
+                self.global.platform.close_host_fd(pr.host_fd);
+            }
+            for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
+                releaser.release(handle_id);
+            }
+            for (releaser, handle_id) in broker_socketpair_parent_release_on_failure.drain(..) {
+                releaser.release(handle_id);
+            }
+            fc.vfork_done
+                .broker_socketpair_parent_installs
+                .lock()
+                .clear();
+            put_fc_back(self, fc);
+            return Err(Errno::ENOMEM);
+        }
+
+        // Ack success: the worker has finished `install_broker_fd_bridge_spec`
+        // for every spec we shipped, which means each spec's handle has
+        // been dup_handled into the worker's connection. Safe to drop
+        // the parent's creation ref now.
+        for (releaser, handle_id) in broker_fd_bridge_transit_release.drain(..) {
+            releaser.release(handle_id);
+        }
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
@@ -5469,12 +5540,33 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
 
+        // Allocate a broker-owned auxiliary process pid for the
+        // fork-restore install ack (see analog in commit_delayed_fork).
+        let ack_pid = match super::guest_pid::try_register_broker_guest_pid() {
+            Some(pid) => pid,
+            None => {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[TRUE-FORK] pid={} child_pid={}: failed to allocate broker fork-restore ack pid",
+                    self.pid,
+                    child_pid,
+                );
+                for transit in _true_fork_fd_token_transit.drain(..) {
+                    let _ = transit.client.release(transit.token_id);
+                }
+                cleanup(self, child_as_id, child_process_id);
+                return Err(Errno::ENOMEM);
+            }
+        };
+
         // Spawn the child worker host.
         let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
             &snapshot_bytes,
             stdio,
             &[],
             &[],
+            ack_pid,
         ) {
             Ok(pid) => pid,
             Err(err) => {
@@ -5486,6 +5578,7 @@ impl<FS: ShimFS> Task<FS> {
                     child_pid,
                     err,
                 );
+                super::guest_pid::try_release_broker_guest_pid(ack_pid);
                 for transit in _true_fork_fd_token_transit.drain(..) {
                     let _ = transit.client.release(transit.token_id);
                 }
@@ -5493,6 +5586,29 @@ impl<FS: ShimFS> Task<FS> {
                 return Err(Errno::ENOMEM);
             }
         };
+
+        // Wait for the runner's broker-stamped install-complete ack.
+        let ack_wait_timeout = core::time::Duration::from_secs(30);
+        let ack_status =
+            super::guest_pid::try_wait_broker_process_exit(ack_pid, ack_wait_timeout).unwrap_or(-1);
+        super::guest_pid::try_release_broker_guest_pid(ack_pid);
+        if ack_status != 0 {
+            #[cfg(feature = "trace_syscalls")]
+            litebox::log_println!(
+                self.global.platform,
+                "[TRUE-FORK] pid={} child_pid={}: fork-restore ack failed (status={}); reaping host_pid={}",
+                self.pid,
+                child_pid,
+                ack_status,
+                host_pid,
+            );
+            let _ = self.global.platform.wait_worker_host(host_pid);
+            for transit in _true_fork_fd_token_transit.drain(..) {
+                let _ = transit.client.release(transit.token_id);
+            }
+            cleanup(self, child_as_id, child_process_id);
+            return Err(Errno::ENOMEM);
+        }
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(

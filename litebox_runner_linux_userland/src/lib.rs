@@ -212,9 +212,14 @@ pub struct CliArgs {
     #[arg(long = "fork-restore-fd", hide = true, requires = "fork_restore")]
     pub fork_restore_fd: Option<i32>,
 
-    /// Internal: inherited pipe fd used to ack successful restore to the parent.
-    #[arg(long = "fork-restore-ack-fd", hide = true, requires = "fork_restore")]
-    pub fork_restore_ack_fd: Option<i32>,
+    /// Internal: broker-allocated auxiliary process pid used to signal
+    /// "fork-restore install complete" back to the parent. The runner
+    /// stamps it via `try_mark_broker_process_exited(pid, status)`
+    /// after running `install_broker_fd_bridge_spec` for every spec;
+    /// the parent blocks on a broker `subscribe_process_exit` for the
+    /// same pid. Replaces the legacy `--fork-restore-ack-fd` pipe.
+    #[arg(long = "fork-restore-ack-pid", hide = true, requires = "fork_restore")]
+    pub fork_restore_ack_pid: Option<u32>,
 
     /// Internal: bidirectional Unix-socket passthrough specs for worker spawn.
     ///
@@ -1594,7 +1599,7 @@ fn set_broker_fd_bridge_caller_pid_scope(
 fn install_broker_fd_bridge_specs_and_ack_with<F>(
     task_params: litebox_common_linux::TaskParams,
     specs: &[String],
-    ack_fd: i32,
+    ack_pid: u32,
     mut install_spec: F,
 ) -> Result<()>
 where
@@ -1603,14 +1608,12 @@ where
     let _broker_fd_bridge_caller_pid_guard = set_broker_fd_bridge_caller_pid_scope(task_params);
     for spec in specs {
         if let Err(err) = install_spec(spec) {
-            let _ = write_fork_restore_ack_status(
-                ack_fd,
-                litebox_common_linux::errno::Errno::EIO.as_neg(),
-            );
+            stamp_fork_restore_ack(ack_pid, litebox_common_linux::errno::Errno::EIO.as_neg());
             return Err(err.context("fork-restore broker-fd-bridge install failed before ack"));
         }
     }
-    write_fork_restore_ack_status(ack_fd, 0)
+    stamp_fork_restore_ack(ack_pid, 0);
+    Ok(())
 }
 
 fn fork_restore_task_params(
@@ -1626,15 +1629,13 @@ fn fork_restore_task_params(
     }
 }
 
-fn write_fork_restore_ack_status(ack_fd: i32, status: i32) -> Result<()> {
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
-
-    // SAFETY: `ack_fd` is a live fork-restore ack fd transferred to this
-    // helper, and this helper takes ownership so the fd is closed after write.
-    let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
-    ack_file.write_all(&status.to_le_bytes())?;
-    Ok(())
+/// Stamp the broker-allocated auxiliary fork-restore ack pid with
+/// `status` (0 on install success, errno on failure). Replaces the
+/// legacy `--fork-restore-ack-fd` pipe write — the parent blocks on
+/// a broker `subscribe_process_exit` for the same aux pid via
+/// [`litebox_shim_linux::syscalls::try_wait_broker_process_exit`].
+fn stamp_fork_restore_ack(ack_pid: u32, status: i32) {
+    litebox_shim_linux::syscalls::try_mark_broker_process_exited(ack_pid, status);
 }
 
 fn cleanup_cloned_fs_fid_after_install_result<F>(
@@ -1843,9 +1844,9 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     let snapshot_fd = cli_args
         .fork_restore_fd
         .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-fd"))?;
-    let ack_fd = cli_args
-        .fork_restore_ack_fd
-        .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-ack-fd"))?;
+    let ack_pid = cli_args
+        .fork_restore_ack_pid
+        .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-ack-pid"))?;
 
     // Parse bidirectional Unix-socket passthrough specs.
     let unix_socket_passthroughs =
@@ -1856,7 +1857,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
 
     // Mark inherited fds as close-on-exec (except pipe bridge FDs which the
     // shim will use directly).
-    for fd in [Some(snapshot_fd), Some(ack_fd)].into_iter().flatten() {
+    for fd in [Some(snapshot_fd)].into_iter().flatten() {
         set_fd_cloexec(fd)?;
     }
 
@@ -1958,7 +1959,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             &shim,
             snapshot,
             combined_fs,
-            ack_fd,
+            ack_pid,
             &unix_socket_passthroughs,
             &local_pipes,
             &cli_args.broker_fd_bridge,
@@ -1983,7 +1984,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             &shim,
             snapshot,
             initial_file_system,
-            ack_fd,
+            ack_pid,
             &unix_socket_passthroughs,
             &local_pipes,
             &cli_args.broker_fd_bridge,
@@ -2066,15 +2067,17 @@ fn parse_local_pipe_specs(specs: &[String]) -> Result<Vec<LocalPipeSpec>> {
     Ok(pairs)
 }
 
-/// Restore a child process from a fork snapshot and write the ack status to the parent.
+/// Restore a child process from a fork snapshot and stamp the install
+/// ack onto the broker-allocated auxiliary process pid `ack_pid`.
 ///
-/// Installs host-passthrough-fd passthrough fds and local broker pipe pairs, then
-/// acks the parent over `ack_fd`.
+/// Installs host-passthrough-fd passthrough fds and local broker pipe pairs,
+/// then stamps `ack_pid` (0 on success, errno on failure) so the parent's
+/// `subscribe_process_exit` wake fires. Replaces the legacy pipe-based ack.
 fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     shim: &litebox_shim_linux::LinuxShim<FS>,
     snapshot: litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot,
     fs: std::sync::Arc<FS>,
-    ack_fd: i32,
+    ack_pid: u32,
     unix_socket_passthroughs: &[UnixSocketPassthroughSpec],
     local_pipes: &[LocalPipeSpec],
     broker_fd_bridge_specs: &[String],
@@ -2283,14 +2286,14 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
             install_broker_fd_bridge_specs_and_ack_with(
                 broker_fd_bridge_task_params,
                 broker_fd_bridge_specs,
-                ack_fd,
+                ack_pid,
                 |spec| install_broker_fd_bridge_spec(&program.entrypoints, spec),
             )?;
             Ok(program)
         }
         Err(e) => {
-            // Report failure to parent via ack pipe.
-            let _ = write_fork_restore_ack_status(ack_fd, e.as_neg());
+            // Report failure to parent via the broker-stamped ack pid.
+            stamp_fork_restore_ack(ack_pid, e.as_neg());
             anyhow::bail!("fork-restore failed: {e:?}");
         }
     }
@@ -3498,7 +3501,7 @@ mod tests {
             controlling_pty: None,
             fork_restore: false,
             fork_restore_fd: None,
-            fork_restore_ack_fd: None,
+            fork_restore_ack_pid: None,
             unix_socket_passthrough: Vec::new(),
             broker_fd_bridge: Vec::new(),
             local_pipe: Vec::new(),
@@ -3509,11 +3512,13 @@ mod tests {
 
     #[test]
     fn fork_restore_broker_fd_bridge_installs_before_success_ack_with_restored_pid_scope() {
-        use std::io::Read as _;
-        use std::os::fd::IntoRawFd as _;
         use std::sync::{Arc, Mutex};
 
-        let (mut ack_reader, ack_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // No broker provider is installed in unit tests, so the new
+        // stamp_fork_restore_ack is a no-op (verified by the broker-
+        // mediated integration tests). What this test still exercises:
+        // the install loop runs each spec under the restored caller-pid
+        // scope before returning Ok.
         let specs = vec!["7:tcp_conn:42".to_string()];
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_for_install = seen.clone();
@@ -3529,7 +3534,7 @@ mod tests {
                 egid: 0,
             },
             &specs,
-            ack_writer.into_raw_fd(),
+            999, // ack_pid: no broker provider, stamp is a no-op
             |spec| {
                 assert_eq!(
                     litebox_common_linux::fd_token_client::current_caller_pid(),
@@ -3541,20 +3546,18 @@ mod tests {
         )
         .unwrap();
 
-        let mut ack = [0u8; 4];
-        ack_reader.read_exact(&mut ack).unwrap();
-        assert_eq!(i32::from_le_bytes(ack), 0);
         assert_eq!(seen.lock().unwrap().as_slice(), specs.as_slice());
         drop(outer_guard);
     }
 
     #[test]
     fn fork_restore_broker_fd_bridge_install_error_writes_failed_ack() {
-        use std::io::Read as _;
-        use std::os::fd::IntoRawFd as _;
         use std::sync::{Arc, Mutex};
 
-        let (mut ack_reader, ack_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        // As above: stamp is no-op without a broker provider; what this
+        // test verifies is that an install failure short-circuits the
+        // loop and the function returns Err. Broker stamping of the
+        // failure code is covered by the integration tests.
         let specs = vec!["7:tcp_conn:42".to_string()];
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_for_install = seen.clone();
@@ -3569,7 +3572,7 @@ mod tests {
                 egid: 0,
             },
             &specs,
-            ack_writer.into_raw_fd(),
+            999, // ack_pid: no broker provider, stamp is a no-op
             |spec| {
                 seen_for_install.lock().unwrap().push(spec.to_string());
                 anyhow::bail!("injected install failure")
@@ -3577,9 +3580,6 @@ mod tests {
         );
 
         assert!(result.is_err());
-        let mut ack = [0u8; 4];
-        ack_reader.read_exact(&mut ack).unwrap();
-        assert_ne!(i32::from_le_bytes(ack), 0);
         assert_eq!(seen.lock().unwrap().as_slice(), specs.as_slice());
     }
 

@@ -1900,15 +1900,18 @@ impl LinuxUserland {
 
     /// Spawn a worker host process to restore a fork child from a snapshot.
     ///
-    /// Writes the serialized snapshot to a memfd, creates an ack pipe for the
-    /// child to report restore success/failure, and launches a new host process
-    /// via `posix_spawn`.
+    /// Writes the serialized snapshot to a memfd and launches a new host process
+    /// via `posix_spawn`. Returns `Ok(host_pid)` as soon as `posix_spawn`
+    /// succeeds — the caller is responsible for waiting on the runner-stamped
+    /// install-complete signal via the broker (see
+    /// `try_wait_broker_process_exit` in the shim). `ack_pid` is the
+    /// broker-allocated auxiliary process pid that the spawned runner will
+    /// stamp via `try_mark_broker_process_exited(ack_pid, status)` after
+    /// running every `--broker-fd-bridge` install (replaces the legacy
+    /// `--fork-restore-ack-fd` pipe).
     ///
     /// Bidirectional Unix-socket fds from delayed-fork bridges are passed via
     /// `passthrough_fds` and inherit directly.
-    ///
-    /// Returns `Ok(host_pid)` if the child was spawned and reported successful
-    /// restore via the ack pipe.  Returns `Err(errno)` on failure.
     ///
     /// The caller is responsible for registering the child in the multihost
     /// control plane and for reaping it later via `wait_worker_host`.
@@ -1928,6 +1931,7 @@ impl LinuxUserland {
         // consumed by the existing install_broker_fd_bridge_spec path in
         // the runner.
         broker_fd_bridge_specs: &[String],
+        ack_pid: u32,
     ) -> Result<i32, i32>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -1954,20 +1958,15 @@ impl LinuxUserland {
         // Create memfd with serialized snapshot.
         let snapshot_fd = create_worker_fork_snapshot_fd(snapshot_bytes).map_err(|_| -1_i32)?;
 
-        // Create ack pipe: child writes restore status, parent reads it.
-        let (ack_read_fd, ack_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
-
-        // Relocate infrastructure fds to the INFRA range (500+) so
-        // passthrough/bridge fd dup2 actions don't clobber them.
+        // Relocate snapshot fd to the INFRA range (500+) so
+        // passthrough/bridge fd dup2 actions don't clobber it.
         let snapshot_fd = relocate_fd_to_infra_range(snapshot_fd)?;
-        let ack_read_fd = relocate_fd_to_infra_range(ack_read_fd)?;
-        let ack_write_fd = relocate_fd_to_infra_range(ack_write_fd)?;
 
         let host_stdio_temp_sources =
             duplicate_host_stdio_sources_for_spawn(&stdio).map_err(|_| -1_i32)?;
 
         // Build command: /proc/self/exe -Z --fork-restore --fork-restore-fd N
-        //     --fork-restore-ack-fd N
+        //     --fork-restore-ack-pid <broker-allocated aux process pid>
         let self_exe = std::fs::read_link("/proc/self/exe").map_err(|_| -1_i32)?;
         let mut spawn_argv: Vec<CString> = vec![
             CString::new(self_exe.as_os_str().as_bytes()).map_err(|_| -1_i32)?,
@@ -1975,8 +1974,8 @@ impl LinuxUserland {
             CString::new("--fork-restore").unwrap(),
             CString::new("--fork-restore-fd").unwrap(),
             CString::new(snapshot_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
-            CString::new("--fork-restore-ack-fd").unwrap(),
-            CString::new(ack_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
+            CString::new("--fork-restore-ack-pid").unwrap(),
+            CString::new(ack_pid.to_string()).map_err(|_| -1_i32)?,
         ];
 
         // Forward runner infrastructure flags.
@@ -2165,31 +2164,16 @@ impl LinuxUserland {
         }
         drop(host_stdio_temp_sources);
 
-        // Close write end so the parent only reads.
-        drop(ack_write_fd);
+        // The snapshot memfd is fully read by the child during restore;
+        // the parent can drop its end now. The ack channel is no longer
+        // a pipe — the parent waits on a broker subscribe_process_exit
+        // for the ack pid passed via argv (see caller in shim).
         drop(snapshot_fd);
 
         // Close child-side Unix-socket passthrough FDs (child inherited them
         // via posix_spawn since we cleared CLOEXEC).
         for &(_, host_fd) in passthrough_fds {
             self.close_host_fd(host_fd);
-        }
-
-        // Read ack from child: 0 = success, non-zero = error.
-        let ack_status = read_fork_restore_ack(ack_read_fd);
-
-        if ack_status != 0 {
-            // Restore failed. Reap the child synchronously.
-            let mut status: libc::c_int = 0;
-            loop {
-                let ret = unsafe { libc::waitpid(pid, core::ptr::addr_of_mut!(status), 0) };
-                if ret != -1
-                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-                {
-                    break;
-                }
-            }
-            return Err(ack_status);
         }
 
         // Register the child worker so it can be reaped later.
@@ -2544,21 +2528,6 @@ fn create_worker_fork_snapshot_fd(snapshot_bytes: &[u8]) -> std::io::Result<std:
     move_fd_away_from_stdio(file.into())
 }
 
-/// Read a single i32 ack status from the fork-restore ack pipe.
-///
-/// Returns 0 on success, or a non-zero error code if restore failed or the
-/// pipe was closed without an ack (child crashed/exited before writing).
-fn read_fork_restore_ack(ack_fd: std::os::fd::OwnedFd) -> i32 {
-    let mut buf = [0u8; 4];
-    let file = unsafe { std::fs::File::from_raw_fd(ack_fd.into_raw_fd()) };
-    let mut reader = std::io::BufReader::new(file);
-    match std::io::Read::read_exact(&mut reader, &mut buf) {
-        Ok(()) => i32::from_le_bytes(buf),
-        // Pipe closed without data — child exited before acking.
-        Err(_) => -1,
-    }
-}
-
 fn duplicate_host_stdio_fd_for_spawn(source_fd: i32) -> std::io::Result<std::os::fd::OwnedFd> {
     let new_raw_fd = unsafe { libc::fcntl(source_fd, libc::F_DUPFD_CLOEXEC, 3) };
     if new_raw_fd < 0 {
@@ -2627,34 +2596,6 @@ fn create_worker_exec_image_fd(guest_exec_image: &[u8]) -> std::io::Result<std::
     file.write_all(guest_exec_image)?;
     file.seek(std::io::SeekFrom::Start(0))?;
     move_fd_away_from_stdio(file.into())
-}
-
-fn create_worker_result_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let read_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
-    let write_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
-    let flags = unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFD) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe {
-        libc::fcntl(
-            write_fd.as_raw_fd(),
-            libc::F_SETFD,
-            flags & !libc::FD_CLOEXEC,
-        )
-    } < 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((
-        move_fd_away_from_stdio(read_fd)?,
-        move_fd_away_from_stdio(write_fd)?,
-    ))
 }
 
 fn update_fd_nonblocking(fd: &std::os::fd::OwnedFd, nonblocking: bool) -> std::io::Result<()> {
