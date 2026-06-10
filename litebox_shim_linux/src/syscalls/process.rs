@@ -102,19 +102,66 @@ fn worker_raw_wait_status_to_registry_status(raw_wait_status: i32) -> i32 {
     }
 }
 
-fn worker_raw_wait_status_to_exit_status(raw_wait_status: i32) -> ExitStatus {
-    if raw_wait_status_signaled(raw_wait_status) {
-        match litebox_common_linux::signal::Signal::try_from(raw_wait_status_term_signal(
-            raw_wait_status,
-        )) {
+/// True if the broker-side registry status encodes a terminating
+/// signal (using the shell-style `128 + signum + optional 0x80
+/// coredump` convention produced by
+/// [`worker_raw_wait_status_to_registry_status`] and by the runner
+/// when it stamps its own exit).
+fn registry_status_is_signaled(registry_status: i32) -> bool {
+    let low = registry_status & 0x7f;
+    registry_status >= 128 && low != 0 && low != 0x7f
+}
+
+/// Decode a broker-cached registry exit status back to the shim's
+/// internal [`ExitStatus`] enum. Inverse of
+/// [`worker_raw_wait_status_to_registry_status`] modulo the coredump
+/// bit (which `ExitStatus` does not carry).
+fn registry_status_to_exit_status(registry_status: i32) -> ExitStatus {
+    if registry_status_is_signaled(registry_status) {
+        let signum = registry_status & 0x7f;
+        match litebox_common_linux::signal::Signal::try_from(signum) {
             Ok(signal) => ExitStatus::Signal(signal),
             Err(_) => ExitStatus::Exit(127_i32.truncate()),
         }
-    } else if raw_wait_status_exited(raw_wait_status) {
-        ExitStatus::Exit(raw_wait_status_exit_code(raw_wait_status).truncate())
     } else {
-        ExitStatus::Exit(127_i32.truncate())
+        // Normal exit: low byte is the exit code (0..=255).
+        ExitStatus::Exit((registry_status & 0xff).truncate())
     }
+}
+
+/// Convenience: project a registry status back to the single-int
+/// argument that `exit_thread` expects (signum on signaled exit,
+/// exit code on normal exit). Mirrors the legacy branch in
+/// `exec_on_remote_host` that selected between signum and exit code
+/// based on the raw wait4 status word.
+fn registry_status_exit_thread_arg(registry_status: i32) -> i32 {
+    if registry_status_is_signaled(registry_status) {
+        registry_status & 0x7f
+    } else {
+        registry_status & 0xff
+    }
+}
+
+/// Resolve the broker-cached registry exit status for a guest pid,
+/// falling back to the supplied waitpid-derived raw status when the
+/// broker has no record.
+///
+/// Replaces the legacy `--worker-result-fd` pipe channel: the runner
+/// stamps `try_mark_broker_process_exited(pid, registry_status)`
+/// before terminating, and the parent's `wait_worker_host`
+/// post-processing consults the broker via this helper. The fallback
+/// path covers the rare case where the runner died abruptly (SIGKILL,
+/// crash) before stamping.
+fn resolve_worker_exit_registry_status(
+    guest_pid: litebox::process::ProcessId,
+    raw_wait_status_fallback: i32,
+) -> i32 {
+    if let Some(wake) = super::guest_pid::try_subscribe_broker_process_exit(guest_pid)
+        && let Some(code) = wake.already_exited
+    {
+        return code;
+    }
+    worker_raw_wait_status_to_registry_status(raw_wait_status_fallback)
 }
 
 impl ThreadState {
@@ -237,6 +284,11 @@ pub(crate) struct Process {
     pub(crate) posix_timers: Mutex<Platform, PosixTimers>,
     /// Whether transparent huge pages are disabled for this process.
     pub(crate) thp_disabled: AtomicBool,
+    /// The initial PID assigned to this process when it was created.
+    /// Stable for the lifetime of the Process; survives the threads
+    /// map being drained at exit so post-exit callers (e.g. the
+    /// runner stamping broker exit) can recover the pid.
+    pub(crate) initial_pid: i32,
 }
 
 pub(crate) struct Alarm {
@@ -315,6 +367,7 @@ impl Process {
             }),
             posix_timers: Mutex::new(PosixTimers::new()),
             thp_disabled: AtomicBool::new(false),
+            initial_pid: pid,
         }
     }
 
@@ -346,7 +399,13 @@ impl Process {
             }),
             posix_timers: Mutex::new(PosixTimers::new()),
             thp_disabled: AtomicBool::new(thp_disabled),
+            initial_pid: pid,
         }
+    }
+
+    /// Returns the initial PID assigned to this process at creation.
+    pub fn initial_pid(&self) -> i32 {
+        self.initial_pid
     }
 
     /// Returns the current number of threads in this process.
@@ -5195,7 +5254,8 @@ impl<FS: ShimFS> Task<FS> {
             let child_proc_id = self.process_id;
             self.global.platform.spawn_background_task(move || {
                 let raw_wait_status = global.platform.wait_worker_host(host_pid);
-                let exit_status = worker_raw_wait_status_to_registry_status(raw_wait_status);
+                let exit_status =
+                    resolve_worker_exit_registry_status(child_proc_id, raw_wait_status);
 
                 global.fork_child_host_pids.write().remove(&child_proc_id.0);
 
@@ -5471,7 +5531,8 @@ impl<FS: ShimFS> Task<FS> {
             let child_proc_id = child_process_id;
             self.global.platform.spawn_background_task(move || {
                 let raw_wait_status = global.platform.wait_worker_host(host_pid);
-                let exit_status = worker_raw_wait_status_to_registry_status(raw_wait_status);
+                let exit_status =
+                    resolve_worker_exit_registry_status(child_proc_id, raw_wait_status);
 
                 // Remove the fork child host PID mapping first to prevent
                 // kill() from forwarding signals to a potentially-reused PID.
@@ -9228,7 +9289,8 @@ impl<FS: ShimFS> Task<FS> {
             .remote_signalfd_targets
             .write()
             .remove(&self.process_id.0);
-        let broker_exit_status = worker_raw_wait_status_to_registry_status(raw_wait_status);
+        let broker_exit_status =
+            resolve_worker_exit_registry_status(self.process_id, raw_wait_status);
         super::guest_pid::try_mark_broker_process_exited(self.process_id.0, broker_exit_status);
 
         // Phase F.9: now that worker B has exited, release the pipe
@@ -9257,21 +9319,18 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
-            "[EXEC-REMOTE] pid={} worker exited with wait status {}",
+            "[EXEC-REMOTE] pid={} worker exited with registry status {} (raw waitpid {})",
             self.pid,
+            broker_exit_status,
             raw_wait_status,
         );
 
         if vfork_info.is_some() {
-            let status = worker_raw_wait_status_to_exit_status(raw_wait_status);
+            let status = registry_status_to_exit_status(broker_exit_status);
             self.thread.process.inner.lock().exit_status = status;
             self.local_task_terminated.set(true);
-        } else if raw_wait_status_signaled(raw_wait_status) {
-            self.exit_thread(raw_wait_status_term_signal(raw_wait_status).truncate());
-        } else if raw_wait_status_exited(raw_wait_status) {
-            self.exit_thread(raw_wait_status_exit_code(raw_wait_status).truncate());
         } else {
-            self.exit_thread(127_i32.truncate());
+            self.exit_thread(registry_status_exit_thread_arg(broker_exit_status).truncate());
         }
 
         // The remote worker completed; stop the local placeholder before it can

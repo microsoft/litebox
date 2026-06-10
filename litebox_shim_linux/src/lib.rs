@@ -2406,6 +2406,14 @@ impl LinuxShimProcess {
     pub fn has_exited(&self) -> bool {
         self.0.nr_threads() == 0
     }
+
+    /// Returns the initial guest pid assigned to this process at load
+    /// time. Stable for the lifetime of the process and recoverable
+    /// post-exit (when the thread map is drained) — used by the
+    /// runner's exit path to stamp broker-owned process-exit state.
+    pub fn pid(&self) -> i32 {
+        self.0.initial_pid()
+    }
 }
 
 /// Create a default layered file system with the given in-memory and tar read-only layers.

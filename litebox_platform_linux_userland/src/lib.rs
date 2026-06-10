@@ -172,7 +172,6 @@ pub enum NetworkTransport {
 }
 
 struct WorkerHostProcess {
-    result_fd: std::os::fd::OwnedFd,
     bridge_threads: Vec<DetachedWorkerBridge>,
 }
 
@@ -1370,7 +1369,6 @@ impl LinuxUserland {
             .map(create_worker_exec_image_fd)
             .transpose()
             .map_err(|_| -1_i32)?;
-        let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
         let interp_image_fd = guest_interp_image
             .map(|(_, image)| create_worker_exec_image_fd(image))
             .transpose()
@@ -1380,8 +1378,6 @@ impl LinuxUserland {
         // posix_spawn bridge dup2 actions (which target guest fd numbers
         // 3-99) cannot clobber them.
         let exec_image_fd = exec_image_fd.map(relocate_fd_to_infra_range).transpose()?;
-        let result_read_fd = relocate_fd_to_infra_range(result_read_fd)?;
-        let result_write_fd = relocate_fd_to_infra_range(result_write_fd)?;
         let interp_image_fd = interp_image_fd
             .map(relocate_fd_to_infra_range)
             .transpose()?;
@@ -1402,8 +1398,6 @@ impl LinuxUserland {
             spawn_argv
                 .push(CString::new(exec_image_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?);
         }
-        spawn_argv.push(CString::new("--worker-result-fd").unwrap());
-        spawn_argv.push(CString::new(result_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?);
         if let (Some((interp_path, _)), Some(interp_image_fd)) =
             (guest_interp_image, interp_image_fd.as_ref())
         {
@@ -1705,13 +1699,10 @@ impl LinuxUserland {
                 bridge_threads.push(bridge);
             }
         }
-        self.worker_processes.lock().unwrap().insert(
-            pid,
-            WorkerHostProcess {
-                result_fd: result_read_fd,
-                bridge_threads,
-            },
-        );
+        self.worker_processes
+            .lock()
+            .unwrap()
+            .insert(pid, WorkerHostProcess { bridge_threads });
         Ok(WorkerExecSpawnResult {
             host_pid: pid,
             direct_pipes,
@@ -1966,22 +1957,17 @@ impl LinuxUserland {
         // Create ack pipe: child writes restore status, parent reads it.
         let (ack_read_fd, ack_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
 
-        // Create result pipe for exit status (reuses exec infrastructure).
-        let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
-
         // Relocate infrastructure fds to the INFRA range (500+) so
         // passthrough/bridge fd dup2 actions don't clobber them.
         let snapshot_fd = relocate_fd_to_infra_range(snapshot_fd)?;
         let ack_read_fd = relocate_fd_to_infra_range(ack_read_fd)?;
         let ack_write_fd = relocate_fd_to_infra_range(ack_write_fd)?;
-        let result_read_fd = relocate_fd_to_infra_range(result_read_fd)?;
-        let result_write_fd = relocate_fd_to_infra_range(result_write_fd)?;
 
         let host_stdio_temp_sources =
             duplicate_host_stdio_sources_for_spawn(&stdio).map_err(|_| -1_i32)?;
 
         // Build command: /proc/self/exe -Z --fork-restore --fork-restore-fd N
-        //     --fork-restore-ack-fd N --worker-result-fd N
+        //     --fork-restore-ack-fd N
         let self_exe = std::fs::read_link("/proc/self/exe").map_err(|_| -1_i32)?;
         let mut spawn_argv: Vec<CString> = vec![
             CString::new(self_exe.as_os_str().as_bytes()).map_err(|_| -1_i32)?,
@@ -1991,8 +1977,6 @@ impl LinuxUserland {
             CString::new(snapshot_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
             CString::new("--fork-restore-ack-fd").unwrap(),
             CString::new(ack_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
-            CString::new("--worker-result-fd").unwrap(),
-            CString::new(result_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
         ];
 
         // Forward runner infrastructure flags.
@@ -2181,9 +2165,8 @@ impl LinuxUserland {
         }
         drop(host_stdio_temp_sources);
 
-        // Close write ends so the parent only reads.
+        // Close write end so the parent only reads.
         drop(ack_write_fd);
-        drop(result_write_fd);
         drop(snapshot_fd);
 
         // Close child-side Unix-socket passthrough FDs (child inherited them
@@ -2213,7 +2196,6 @@ impl LinuxUserland {
         self.worker_processes.lock().unwrap().insert(
             pid,
             WorkerHostProcess {
-                result_fd: result_read_fd,
                 bridge_threads: Vec::new(),
             },
         );
@@ -2222,12 +2204,17 @@ impl LinuxUserland {
 
     /// Wait for a worker host process to exit and return the raw wait status.
     ///
-    /// Returns the status word reported by `waitpid(2)`, preserving both normal
-    /// exit and signal-death encoding.
+    /// Returns the status word reported by `waitpid(2)` on the worker
+    /// runner process itself — this is a fallback used by the shim
+    /// when the broker has no recorded guest exit (i.e. the runner
+    /// died abruptly before stamping). In the common path, the
+    /// shim's `resolve_worker_exit_registry_status` consults the
+    /// broker via `try_subscribe_broker_process_exit` and ignores
+    /// this value.
     ///
     /// # Panics
     ///
-    /// Panics if the internal worker-result-fd lock is poisoned.
+    /// Panics if the internal worker-processes lock is poisoned.
     pub fn wait_worker_host(&self, host_pid: i32) -> i32 {
         let mut status: libc::c_int = 0;
         let t0 = std::time::Instant::now();
@@ -2258,14 +2245,10 @@ impl LinuxUserland {
                 t0.elapsed().as_millis()
             ));
         }
-        let fallback_status = status;
+        let waitpid_status = status;
         let worker = self.worker_processes.lock().unwrap().remove(&host_pid);
         if let Some(worker) = worker {
-            let WorkerHostProcess {
-                result_fd,
-                bridge_threads,
-            } = worker;
-            let wait_status = read_worker_result_fd(result_fd);
+            let WorkerHostProcess { bridge_threads } = worker;
             {
                 use litebox::platform::DebugLogProvider as _;
                 self.debug_log_print(&format!(
@@ -2312,11 +2295,8 @@ impl LinuxUserland {
                     t0.elapsed().as_millis()
                 ));
             }
-            if let Some(wait_status) = wait_status {
-                return wait_status;
-            }
         }
-        fallback_status
+        waitpid_status
     }
 
     /// Spawn a background host thread that runs the given closure.
@@ -3128,18 +3108,6 @@ fn bridge_worker_output_to_stream(
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
-    }
-}
-
-fn read_worker_result_fd(result_fd: std::os::fd::OwnedFd) -> Option<i32> {
-    use std::io::Read as _;
-
-    let mut file = std::fs::File::from(result_fd);
-    let mut status = [0_u8; core::mem::size_of::<i32>()];
-    match file.read_exact(&mut status) {
-        Ok(()) => Some(i32::from_le_bytes(status)),
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => None,
-        Err(_) => None,
     }
 }
 
