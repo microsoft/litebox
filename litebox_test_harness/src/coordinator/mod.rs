@@ -35,6 +35,7 @@ pub(crate) mod pipe_bridge;
 pub(crate) mod port_router;
 pub(crate) mod proc_self;
 pub(crate) mod process_exit;
+pub(crate) mod promotion_race;
 pub(crate) mod pty;
 pub(crate) mod pxeof;
 pub(crate) mod registry;
@@ -1066,6 +1067,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     fork_matrix::register_subtree_kill_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_fork_matrix(&mut registry::Registry::new(&mut tests));
     df_parent_trigger::register_df_parent_trigger(&mut registry::Registry::new(&mut tests));
+    promotion_race::register_promotion_race(&mut registry::Registry::new(&mut tests));
     special_cases::register_unix_socket(&mut registry::Registry::new(&mut tests));
     special_cases::register_cross_worker(&mut registry::Registry::new(&mut tests));
     special_cases::register_pipe_eof(&mut registry::Registry::new(&mut tests));
