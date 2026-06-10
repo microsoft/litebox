@@ -133,12 +133,13 @@ const PARENT_BTS: &[BinaryType] = &[
 const CHILD_BTS: &[BinaryType] = &[BinaryType::NonPieGlibc, BinaryType::NonPieStaticMusl];
 
 /// Number of inner iterations per test. Each iteration spawns a
-/// non-PIE worker (~0.4s wall time per spawn).
+/// non-PIE worker (~0.15-0.3s wall time per spawn dominated by
+/// fork+exec of the child binary).
 ///
 /// **Sized for `send_cmd`'s 15s default response timeout** for non-
 /// Exec/Spawn commands (see
-/// `litebox_test_harness/src/coordinator/mod.rs:1394`). N=10 → ~4s
-/// wall — comfortably under the budget. The prior N=50 produced
+/// `litebox_test_harness/src/coordinator/mod.rs:1394`). N=10 →
+/// ~2-3s wall — comfortably under the budget. The prior N=50 produced
 /// ~20s handler runtime and consistently tripped the 15s timeout
 /// (coordinator poisoned the agent, test reported "expected Result,
 /// got Error { error: 'timeout' }"). That timeout-bomb was
@@ -352,16 +353,27 @@ fn run_eventfd_iteration(race_pattern: RacePattern, child_binary: &str) -> Resul
 }
 
 fn run_pidfd_iteration(race_pattern: RacePattern, child_binary: &str) -> Result<(), String> {
-    // Fork a short-lived sleeper, open a pidfd on it, hand to child.
+    // Fork a sleeper, open a pidfd on it, hand to child. The target
+    // blocks in `pause()` until the parent SIGKILLs it below (after
+    // the child has been spawned and the race pattern has run). Using
+    // a signal-driven exit instead of a fixed `usleep` keeps the
+    // per-iteration wall time bounded by `spawn` + `poll(POLLIN)`
+    // latency (~ms after SIGKILL) rather than by a fixed sleep, which
+    // matters because the handler must complete N=10 iterations
+    // within `send_cmd`'s 15s response timeout under parallel-test
+    // load (see the module-level doc).
+    //
     // SAFETY: child path uses only async-signal-safe libc.
     let target_pid = unsafe { libc::fork() };
     if target_pid < 0 {
         return Err(format!("target fork: {}", std::io::Error::last_os_error()));
     }
     if target_pid == 0 {
-        // SAFETY: usleep/_exit are async-signal-safe.
+        // SAFETY: pause/_exit are async-signal-safe. pause() returns
+        // only if a non-fatal signal handler runs; SIGKILL terminates
+        // unconditionally so _exit is a defensive fallback.
         unsafe {
-            libc::usleep(400 * 1000);
+            libc::pause();
             libc::_exit(0);
         }
     }
@@ -406,6 +418,16 @@ fn run_pidfd_iteration(race_pattern: RacePattern, child_binary: &str) -> Result<
 
     // CRITICAL: no yield/sleep here. This is the race window.
     let race_result = run_race_pattern(fd, FdKind::Pidfd, race_pattern);
+
+    // Signal target to exit so the child's poll(POLLIN) returns
+    // promptly. SIGKILL is unconditional; the child observes POLLIN
+    // within ~ms of this kill.
+    // SAFETY: target_pid is our own child; kill is safe to ignore on
+    // ESRCH (target already reaped between iterations is impossible
+    // here, but be defensive).
+    unsafe {
+        libc::kill(target_pid, libc::SIGKILL);
+    }
 
     let output = wait_with_timeout(child, Duration::from_millis(ITER_TIMEOUT_MS + 2000));
 
