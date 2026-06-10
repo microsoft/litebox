@@ -382,6 +382,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     ///   a best-effort timerfd reconstruction path, but the true
     ///   fork-snapshot broker-handle path still cannot preserve the
     ///   exact kernel timer object or accumulated expiration count.
+    ///   In the cross-binary fork-snapshot path, the fd itself migrates
+    ///   classified as `FdClass::EventFd` (see `RawFdRef::Eventfd`
+    ///   classification in `process.rs::snapshot_fd_table`); the fd
+    ///   handoff works but the kernel timer's *arm state* (interval,
+    ///   next expiration, accumulated unread expirations) is lost. The
+    ///   child observes a fresh, disarmed timerfd. Known limitation,
+    ///   not a bug — callers that rely on inherited arm state across
+    ///   a delayed-fork commit must re-arm explicitly.
     ///
     /// For handle-backed kinds, the caller MUST `dup_handle` the returned
     /// handle and arrange rollback `release`. For Phase B.2 pidfds, the
