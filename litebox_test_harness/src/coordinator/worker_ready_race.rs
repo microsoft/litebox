@@ -1,31 +1,37 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! `WORKER_READY_RACE.*`: stress-test the asymmetry between
-//! `spawn_worker_host_for_exec` (which returns to the parent
-//! immediately after `posix_spawn` completes — *before* the worker
-//! process has called `install_broker_fd_bridge_spec` for each
-//! inherited broker-backed fd) and `spawn_worker_host_for_fork_restore`
-//! (which blocks on an ack from the worker before returning).
-//! See `litebox_platform_linux_userland/src/lib.rs:1287` vs
-//! `litebox_platform_linux_userland/src/lib.rs:1929`.
+//! `WORKER_READY_RACE.*`: stress-test the
+//! `spawn_worker_host_for_exec` path with rapid spawn iterations,
+//! exercising the parent-side broker-fd-bridge handoff for inherited
+//! broker-held fds. Originally framed as a "race" between the parent's
+//! `spawn_worker_host_for_exec` returning and the worker's local
+//! `install_broker_fd_bridge_spec` (asymmetric vs
+//! `spawn_worker_host_for_fork_restore` which blocks on an ack), but
+//! the actual broker-held architecture has no such race for
+//! parent-side operations:
 //!
-//! The race window is the interval between the parent's
-//! `spawn_worker_host_for_exec` returning and the worker actually
-//! installing each `--broker-fd-bridge` spec. If the parent performs
-//! syscalls against one of the bridged fds during that window, the
-//! shim may observe inconsistent broker state (EBADF, hang, mismatched
-//! payload). The held fix on branch `wportnoy/wave-cleanup-inherit`
-//! (commit `65a9ae87`) adds a one-byte `--worker-ready-fd` pipe
-//! barrier in the parent.
+//! 1. The parent's broker handle is valid the moment the parent
+//!    `dup_handle`'d it (refcount bump on the broker; no per-pid
+//!    bookkeeping).
+//! 2. The parent's ops on its own handle go straight to the broker
+//!    and don't depend on the worker having installed its local
+//!    `BrokerBacked` proxy.
+//! 3. The worker's `install_broker_fd_bridge_spec` is purely local
+//!    (creates an `EventFile::BrokerBacked` variant in the worker's
+//!    fd table; no broker RPC).
+//!
+//! So this family functions as a stress-regression guard for the
+//! non-PIE worker-spawn path (memory pressure, fd-table churn,
+//! broker IPC throughput under repeated dup_handle, posix_spawn
+//! correctness over many iterations) — not as a race detector.
 //!
 //! Test shape: parent (handler on a leaf of `parent_bt`) opens a
 //! broker-backed fd of `fd_kind`, repeatedly fork+execs a non-PIE
 //! child binary (`child_bt`), and immediately after each spawn
 //! performs `race_pattern` operations on the fd before waiting for
 //! the child to complete. A test FAILs if any iteration times out
-//! or returns wrong data; the detail includes the failing iteration
-//! number and failure mode (statistical detection).
+//! or returns wrong data.
 //!
 //! Test ID shape:
 //!   `WORKER_READY_RACE.<fd_kind>.<race_pattern>.<parent_bt>.<child_bt>`
@@ -33,7 +39,15 @@
 //! `child_bt` is restricted to `NonPieGlibc` and `NonPieStaticMusl` —
 //! these are the only binary types that force the
 //! `spawn_worker_host_for_exec` path. PIE children take the
-//! local-exec path and do not exercise the race.
+//! local-exec path and do not exercise the non-PIE worker code.
+//!
+//! `DEFAULT_ITERATIONS = 10`: the per-iter cost (~0.4s) × N must
+//! fit under `send_cmd`'s default 15s response timeout for non-
+//! Exec/Spawn commands (see
+//! `litebox_test_harness/src/coordinator/mod.rs:1394`). 10 iterations
+//! ≈ 4s wall time — comfortably under the budget while still
+//! exercising the spawn path enough times to surface non-trivial
+//! per-spawn bugs.
 
 #![allow(clippy::wildcard_enum_match_arm)]
 
@@ -119,10 +133,18 @@ const PARENT_BTS: &[BinaryType] = &[
 const CHILD_BTS: &[BinaryType] = &[BinaryType::NonPieGlibc, BinaryType::NonPieStaticMusl];
 
 /// Number of inner iterations per test. Each iteration spawns a
-/// non-PIE worker, so the wall-clock cost is N × (worker spawn ms).
-/// 50 keeps tests comfortably under the 60s outer timeout while
-/// providing meaningful statistical coverage of the race window.
-const DEFAULT_ITERATIONS: u32 = 50;
+/// non-PIE worker (~0.4s wall time per spawn).
+///
+/// **Sized for `send_cmd`'s 15s default response timeout** for non-
+/// Exec/Spawn commands (see
+/// `litebox_test_harness/src/coordinator/mod.rs:1394`). N=10 → ~4s
+/// wall — comfortably under the budget. The prior N=50 produced
+/// ~20s handler runtime and consistently tripped the 15s timeout
+/// (coordinator poisoned the agent, test reported "expected Result,
+/// got Error { error: 'timeout' }"). That timeout-bomb was
+/// misdiagnosed as a real race in the broker-held model; see the
+/// module-level doc comment for the correction.
+const DEFAULT_ITERATIONS: u32 = 10;
 
 /// Tight-loop iteration count used by `RacePattern::TightLoop`.
 const TIGHT_LOOP_ITERS: u32 = 256;
