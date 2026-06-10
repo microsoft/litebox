@@ -55,6 +55,9 @@ pub struct PerCpuVariables {
     /// via `rdmsr(HV_REGISTER_VP_INDEX)` and immutable thereafter.
     /// Uses `u32::MAX` as the "uninitialized" sentinel.
     vp_index: Cell<u32>,
+    /// Set once this CPU's preemption timer is configured (see `arch::timer`).
+    /// Zero-initialized to `false`.
+    pub(crate) preemption_timer_enabled: Cell<bool>,
 }
 
 // These Hyper-V pages must be page-aligned.
@@ -407,6 +410,9 @@ impl PerCpuVariablesAsm {
     }
     pub const fn is_in_user_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, is_in_user)
+    }
+    pub(crate) fn is_in_user(&self) -> bool {
+        self.is_in_user.get() != 0
     }
     pub fn get_exception(&self) -> litebox::shim::Exception {
         litebox::shim::Exception(self.exception_trapno.get())

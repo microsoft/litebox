@@ -7,6 +7,7 @@ pub mod interrupts;
 pub mod ioport;
 pub mod mm;
 pub mod msr;
+pub mod timer;
 
 pub(crate) use x86_64::{
     addr::{PhysAddr, VirtAddr},

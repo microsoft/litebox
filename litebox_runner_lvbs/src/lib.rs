@@ -18,7 +18,7 @@ use litebox_common_optee::{
     OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::{
-    arch::{gdt, instrs::hlt_loop, interrupts},
+    arch::{gdt, instrs::hlt_loop, interrupts, timer},
     debug_serial_println,
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables},
     mm::MemoryProvider,
@@ -219,6 +219,10 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
     interrupts::init_idt();
     x86_64::instructions::interrupts::enable();
     Platform::enable_syscall_support();
+
+    // Configure this CPU's STIMER preemption timer (VTL1 self-preemption).
+    // Per-CPU; safe to call on BSP and APs.
+    timer::init();
 
     ret
 }

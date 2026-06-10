@@ -48,6 +48,9 @@ default = ["optee_syscall"]
 optee_syscall = []
 linux_syscall = []
 devbox = []
+# Tighten the preemption timer quantum so runaway-TA preemption can be tested
+# without waiting out the production budget. Test builds only.
+preemption_test_quantum = []
 
 [lints]
 workspace = true

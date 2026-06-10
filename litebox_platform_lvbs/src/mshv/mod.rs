@@ -56,12 +56,28 @@ pub const HV_X64_MSR_SIMP: u32 = 0x_4000_0083;
 pub const HV_X64_MSR_SIMP_ENABLE: u32 = 0x_0000_0001;
 pub const HV_X64_MSR_SINT0: u32 = 0x_4000_0090;
 
+// Partition reference counter and synthetic timer 0 (STIMER0).
+pub const HV_X64_MSR_TIME_REF_COUNT: u32 = 0x_4000_0020;
+pub const HV_X64_MSR_STIMER0_CONFIG: u32 = 0x_4000_00b0;
+pub const HV_X64_MSR_STIMER0_COUNT: u32 = 0x_4000_00b1;
+
+// `HV_X64_MSR_STIMERn_CONFIG` bit layout (Periodic bit 1 left 0 => one-shot).
+pub const HV_STIMER_CONFIG_ENABLE: u64 = 1 << 0;
+pub const HV_STIMER_CONFIG_DIRECT_MODE: u64 = 1 << 12;
+pub const HV_STIMER_CONFIG_VECTOR_SHIFT: u32 = 4; // ApicVector occupies bits 4..=11
+
 pub const HYPERVISOR_CALLBACK_VECTOR: u8 = 0xf3;
 
 pub const HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS: u32 = 0x_4000_0000;
 pub const HYPERV_CPUID_INTERFACE: u32 = 0x_4000_0001;
+pub const HYPERV_CPUID_FEATURES: u32 = 0x_4000_0003;
 pub const HYPERV_CPUID_IMPLEMENT_LIMITS: u32 = 0x_4000_0005;
 pub const HYPERV_HYPERVISOR_PRESENT_BIT: u32 = 0x_8000_0000;
+
+// `HYPERV_CPUID_FEATURES` partition privilege / feature bits.
+pub const HV_FEATURE_REFERENCE_COUNTER: u32 = 1 << 1; // EAX[1]
+pub const HV_FEATURE_SYNTHETIC_TIMER: u32 = 1 << 3; // EAX[3]
+pub const HV_FEATURE_STIMER_DIRECT: u32 = 1 << 19; // EDX[19]
 
 pub const HV_PARTITION_ID_SELF: u64 = u64::MAX;
 pub const HV_VP_INDEX_SELF: u32 = u32::MAX - 1;

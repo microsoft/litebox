@@ -1613,7 +1613,13 @@ fn run_thread_inner(
     // `thread_ctx` will be passed to `syscall_handler` later.
     // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
     // member variable offset calculation in assembly code).
-    unsafe { run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter)) };
+    //
+    // Bracket the whole TA entry with the preemption timer. `run_thread_arch`
+    // returns exactly once, so the deadline spans all of the TA's user execution and
+    // in-VTL1 syscall/fault handling, bounding cumulative VTL1 occupancy.
+    crate::arch::timer::scoped(|| unsafe {
+        run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
+    });
 }
 
 /// Save callee-saved registers onto the stack.
@@ -2131,6 +2137,21 @@ unsafe extern "C" fn exception_handler(
             kernel_mode: false,
         }
     };
+    // The preemption timer fires as a user-mode interrupt (STIMER_VECTOR).
+    if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
+        let still_armed = crate::arch::timer::is_armed();
+        crate::arch::timer::eoi();
+        if still_armed {
+            // A stale, latched fire from prior quantum, not a real timeout.
+            // Resume on the still-armed timer.
+            if is_valid_user_ctx(thread_ctx.ctx) {
+                unsafe { switch_to_user(thread_ctx.ctx) }
+            }
+            return 0;
+        }
+        // Genuine timeout: fall through to the shim, which kills the TA.
+        crate::serial_println!("TA exceeded its execution quantum; terminating");
+    }
     match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
         ContinueOperation::Resume => {
             if kernel_mode {
@@ -2194,6 +2215,7 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
     #[rustfmt::skip]
     core::arch::naked_asm!(
         "switch_to_user_start:",
+        "cli",
         // Flush TLB by reloading CR3
         "mov rax, cr3",
         "mov cr3, rax",

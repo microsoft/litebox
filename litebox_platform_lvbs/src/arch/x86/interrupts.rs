@@ -16,6 +16,7 @@
 //! - **MCE (Vector 18)**: Machine Check Exceptions are delivered to VTL0 and handled
 //!   by the VTL0 kernel. VTL1 does not receive MCEs.
 
+use super::timer::{SPURIOUS_VECTOR, STIMER_VECTOR};
 use crate::mshv::HYPERVISOR_CALLBACK_VECTOR;
 use core::ops::IndexMut;
 use litebox_common_linux::PtRegs;
@@ -42,6 +43,8 @@ unsafe extern "C" {
     fn isr_alignment_check();
     fn isr_simd_floating_point();
     fn isr_hyperv_sint();
+    fn isr_stimer();
+    fn isr_spurious();
 }
 
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
@@ -87,6 +90,10 @@ fn idt() -> &'static InterruptDescriptorTable {
                 .set_handler_addr(VirtAddr::from_ptr(isr_simd_floating_point as *const ()));
             idt.index_mut(HYPERVISOR_CALLBACK_VECTOR)
                 .set_handler_addr(VirtAddr::from_ptr(isr_hyperv_sint as *const ()));
+            idt.index_mut(STIMER_VECTOR)
+                .set_handler_addr(VirtAddr::from_ptr(isr_stimer as *const ()));
+            idt.index_mut(SPURIOUS_VECTOR)
+                .set_handler_addr(VirtAddr::from_ptr(isr_spurious as *const ()));
         }
         idt
     })
@@ -190,6 +197,23 @@ extern "C" fn alignment_check_handler_impl(regs: &PtRegs) {
 #[unsafe(no_mangle)]
 extern "C" fn simd_floating_point_handler_impl(regs: &PtRegs) {
     panic!("EXCEPTION: SIMD FLOATING-POINT ERROR\n{regs:#x?}");
+}
+
+/// Safety net for an STIMER preemption-timer fire delivered in *kernel* mode
+/// (vector 0x40); the common case fires in user mode and routes to
+/// `exception_callback`. Always EOI, but re-arm only while a TA is in scope
+/// (`is_in_user`)---e.g., an expiry in the IF-enabled shim init/reenter window.
+/// Out of scope the fire is stale (latched while interrupts were disabled and
+/// delivered after the TA exited and `scoped` disarmed). Re-arming would leave a
+/// wall-clock timer counting with no TA, which Hyper-V later delivers via a
+/// spurious VTL switch into VTL1.
+#[unsafe(no_mangle)]
+extern "C" fn stimer_handler_impl(_regs: &PtRegs) {
+    use crate::host::per_cpu_variables::with_per_cpu_variables;
+    super::timer::eoi();
+    if with_per_cpu_variables(|pcv| pcv.asm.is_in_user()) {
+        super::timer::arm_preemption();
+    }
 }
 
 // Note: isr_hyperv_sint is defined in interrupts.S as a minimal stub that only

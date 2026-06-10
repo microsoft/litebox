@@ -193,6 +193,15 @@ isr_with_err_code isr_alignment_check alignment_check_handler_impl 17
 isr_no_err_code isr_simd_floating_point simd_floating_point_handler_impl 19
 
 /*
+ * Vector 0x40: Hyper-V STIMER preemption timer - No error code
+ *
+ * Common case is a fire in USER mode (a TA overran its quantum): the macro's
+ * user-mode path routes it to exception_callback. The kernel path into
+ * stimer_handler_impl is a safety net only. See arch::timer.
+ */
+isr_no_err_code isr_stimer stimer_handler_impl 0x40
+
+/*
  * Hypervisor synthetic interrupt handler (vector 0xf3)
  *
  * This synthetic interrupt is an exception for VTL0 security violations (e.g.,
@@ -206,4 +215,15 @@ isr_no_err_code isr_simd_floating_point simd_floating_point_handler_impl 19
  */
 .global isr_hyperv_sint
 isr_hyperv_sint:
+    iretq
+
+/*
+ * Spurious interrupt handler (vector 0xff, programmed into the SVR)
+ *
+ * Delivered when the APIC raised an interrupt that vanished before the core
+ * acknowledged it. It carries no work and takes no EOI (the Intel SDM), so
+ * a bare iretq (no registers touched). See arch::timer (SPURIOUS_VECTOR).
+ */
+.global isr_spurious
+isr_spurious:
     iretq
