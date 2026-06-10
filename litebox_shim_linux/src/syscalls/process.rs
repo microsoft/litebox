@@ -5856,11 +5856,24 @@ impl<FS: ShimFS> Task<FS> {
                             (FdClass::InetListener, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerInetRaw(fd) => {
-                            (FdClass::Other, Some(fd.object_id()), None, None)
+                            (FdClass::BrokerInetRaw, Some(fd.object_id()), None, None)
                         }
                     }
                 })
-                .unwrap_or((FdClass::Other, None, None, None));
+                .unwrap_or_else(|_| {
+                    // `alive_fds` (line 5732) was collected while holding the
+                    // raw_descriptor_store read lock; other threads are
+                    // parked by `park_other_threads` before commit_delayed_fork
+                    // enters this loop. An EBADF here means a sibling closed
+                    // the fd between collection and dispatch, which violates
+                    // the parking invariant — an internal consistency bug,
+                    // not a runtime condition. Panic loudly so the stack
+                    // trace points at the missing barrier.
+                    unreachable!(
+                        "snapshot_fd_table: raw_fd={raw_fd} disappeared from raw_descriptor_store \
+                         between iter_alive and run_on_raw_fd (parking invariant violated)"
+                    )
+                });
 
             // Promote to StdioFd only if this fd sits at a stdio slot AND
             // its object_id matches ANY of the original host stdio descriptors.
@@ -5905,7 +5918,8 @@ impl<FS: ShimFS> Task<FS> {
                 // Rejected — grouped by *why* this fd class can't migrate
                 // across worker hosts. Each variant is named explicitly so
                 // that adding a new `FdClass` variant fails to compile here
-                // and forces an explicit accept/reject decision.
+                // and forces an explicit accept/reject decision. No
+                // catch-all arm by design.
                 //
                 // (a) By-design per-process kernel state. These are NOT
                 //     future broker-host candidates: the kernel object
@@ -5917,21 +5931,20 @@ impl<FS: ShimFS> Task<FS> {
                 FdClass::Epoll | FdClass::Inotify => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
-                // (b) Vestigial — only reachable on legacy builds. Phase F.3
+                // (b) Legacy `worker_local_inet` smoltcp socket. Phase F.3
                 //     moved inet to broker-held (`BrokerInetListener`,
-                //     `BrokerTcpConn`, `BrokerInetDgram`), so `NetworkSocket`
-                //     is only ever produced under
-                //     `cfg(feature = "worker_local_inet")`. The arm stays so
-                //     legacy builds still reject explicitly.
+                //     `BrokerTcpConn`, `BrokerInetDgram`); on default
+                //     `platform_linux_userland` this variant is cfg-gated
+                //     out of existence. The arm is only present on builds
+                //     where the variant compiles.
+                #[cfg(feature = "worker_local_inet")]
                 FdClass::NetworkSocket => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
-                // (c) Catch-all: raw sockets (`BrokerInetRaw` is classified
-                //     as `Other`) and any unrecognized fd kind that fell
-                //     through the classifier above. Genuine reject — adding
-                //     migration support means lifting these into a more
-                //     specific `FdClass` variant first.
-                FdClass::Other => {
+                // (c) Broker-hosted raw IP socket. Migration support is not
+                //     wired up yet; lift this arm into the accept block
+                //     once cross-worker raw-socket state preservation lands.
+                FdClass::BrokerInetRaw => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
             }

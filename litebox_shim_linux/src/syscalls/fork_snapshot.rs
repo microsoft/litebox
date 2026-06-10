@@ -379,8 +379,10 @@ impl core::fmt::Debug for ForkSnapshotBrokerTransit {
 
 /// Classification of a file descriptor for export/import decisions.
 ///
-/// The first version supports only a narrow set; unsupported classes cause
-/// `fork()` to panic with an ENOSYS-audit todo.
+/// Matched exhaustively by `snapshot_fd_table` to make accept/reject
+/// decisions for delayed-fork migration. Adding a new variant fails to
+/// compile at every match site, which is the invariant the enum exists
+/// to enforce — no catch-all `Other` or wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FdClass {
     /// Regular file or directory opened by path.
@@ -389,7 +391,10 @@ pub enum FdClass {
     StdioFd,
     /// Pipe (read or write end).
     Pipe,
-    /// Network socket (TCP/UDP via smoltcp or host passthrough).
+    /// Local-worker TCP/UDP socket via smoltcp. Only assignable on legacy
+    /// builds with `worker_local_inet`; default `platform_linux_userland`
+    /// uses the broker-held inet variants instead (Phase F.3).
+    #[cfg(feature = "worker_local_inet")]
     NetworkSocket,
     /// Unix domain socket.
     UnixSocket,
@@ -403,8 +408,10 @@ pub enum FdClass {
     Inotify,
     /// Broker-hosted TCP listener.
     InetListener,
-    /// Unrecognized / other.
-    Other,
+    /// Broker-hosted raw IP socket (e.g. ICMP). Currently rejects
+    /// migration; lift into an accept arm if/when raw-socket
+    /// cross-worker state preservation is wired up.
+    BrokerInetRaw,
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,19 +1131,20 @@ impl FdClass {
             Self::FilesystemFd => 0,
             Self::StdioFd => 1,
             Self::Pipe => 2,
+            #[cfg(feature = "worker_local_inet")]
             Self::NetworkSocket => 3,
             Self::UnixSocket => 4,
             Self::Epoll => 5,
             Self::EventFd => 6,
             Self::Signalfd => 12,
-            // Wire values 7 (TimerFd), 8 (PidFd), 9 (AnonSpecialFd) are
-            // reserved — those variants were removed as dead code (never
-            // produced by `snapshot_fd_table`'s classifier); the slots are
-            // kept unallocated so old snapshots produced before any future
-            // re-introduction would still fail-closed via InvalidEnum.
+            // Wire values 7 (TimerFd), 8 (PidFd), 9 (AnonSpecialFd), 11
+            // (`Other`) are reserved — those variants were removed as
+            // dead code or replaced with explicit kinds; the slots are
+            // kept unallocated so old snapshots produced before any
+            // future re-introduction still fail-closed via `InvalidEnum`.
             Self::Inotify => 10,
-            Self::Other => 11,
             Self::InetListener => 13,
+            Self::BrokerInetRaw => 14,
         }
     }
 
@@ -1145,15 +1153,16 @@ impl FdClass {
             0 => Ok(Self::FilesystemFd),
             1 => Ok(Self::StdioFd),
             2 => Ok(Self::Pipe),
+            #[cfg(feature = "worker_local_inet")]
             3 => Ok(Self::NetworkSocket),
             4 => Ok(Self::UnixSocket),
             5 => Ok(Self::Epoll),
             6 => Ok(Self::EventFd),
             12 => Ok(Self::Signalfd),
-            // 7/8/9 reserved — see `to_wire` comment.
+            // 7/8/9/11 reserved — see `to_wire` comment.
             10 => Ok(Self::Inotify),
-            11 => Ok(Self::Other),
             13 => Ok(Self::InetListener),
+            14 => Ok(Self::BrokerInetRaw),
             _ => Err(SnapshotDeserializeError::InvalidEnum("FdClass", v)),
         }
     }
