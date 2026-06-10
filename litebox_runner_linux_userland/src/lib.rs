@@ -162,10 +162,6 @@ pub struct CliArgs {
     #[arg(long = "worker-exec-fd", hide = true, requires = "worker_exec")]
     pub worker_exec_fd: Option<i32>,
 
-    /// Internal: inherited pipe fd used to report the guest wait status back to the parent host.
-    #[arg(long = "worker-result-fd", hide = true, required_if_eq_any([("worker_exec", "true"), ("fork_restore", "true")]))]
-    pub worker_result_fd: Option<i32>,
-
     /// Internal: inherited memfd containing the resolved PT_INTERP image, if any.
     #[arg(long = "worker-interp-fd", hide = true, requires = "worker_exec")]
     pub worker_interp_fd: Option<i32>,
@@ -1278,7 +1274,6 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             argv,
             envp,
             None,
-            None,
         )
     } else {
         let initial_file_system = std::sync::Arc::new(fs);
@@ -1297,7 +1292,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(program, shutdown, net_worker, None);
+        run_program(program, shutdown, net_worker);
     }
 }
 
@@ -1342,7 +1337,6 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     argv: Vec<alloc::ffi::CString>,
     envp: Vec<alloc::ffi::CString>,
     task_override: Option<litebox_common_linux::TaskParams>,
-    worker_result_fd: Option<i32>,
 ) -> Result<()> {
     let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
     let is_tcp = broker_addr.parse::<core::net::SocketAddr>().is_ok();
@@ -1451,7 +1445,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             program.entrypoints.set_controlling_pty(pty_id);
         }
 
-        run_program(program, shutdown, net_worker, worker_result_fd);
+        run_program(program, shutdown, net_worker);
     }
 
     // TUN mode: connect via TCP through the guest's smoltcp network stack.
@@ -1548,7 +1542,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         program.entrypoints.set_controlling_pty(pty_id);
     }
 
-    run_program(program, shutdown, net_worker, worker_result_fd);
+    run_program(program, shutdown, net_worker);
 }
 
 /// Process-global override for the root init's guest pid, set by the
@@ -1693,24 +1687,21 @@ fn read_worker_exec_image(fd: i32) -> Result<alloc::borrow::Cow<'static, [u8]>> 
     Ok(data.into())
 }
 
-fn guest_wait_status_to_raw_wait_status(wait_status: i32) -> i32 {
+/// Convert the litebox-internal guest wait status (`0..=255` = exit
+/// code, `256+signum` = signaled) into the broker-side "registry
+/// status" form (`0..=255` = exit code, `128+signum` = signaled —
+/// no coredump bit, since the in-shim guest never dumps core).
+///
+/// Mirrors the inverse path used in the shim
+/// (`worker_raw_wait_status_to_registry_status` /
+/// `registry_status_to_exit_status`) so that the broker-recorded
+/// status round-trips cleanly back to the original `ExitStatus`.
+fn guest_wait_status_to_registry_status(wait_status: i32) -> i32 {
     if wait_status > 255 {
-        wait_status - 256
+        128 + (wait_status - 256)
     } else {
-        (wait_status & 0xff) << 8
+        wait_status & 0xff
     }
-}
-
-fn write_worker_result(wait_status: i32, fd: i32) {
-    use std::io::Write as _;
-    use std::os::fd::FromRawFd as _;
-
-    if fd < 0 {
-        return;
-    }
-    let raw_wait_status = guest_wait_status_to_raw_wait_status(wait_status);
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let _ = file.write_all(&raw_wait_status.to_le_bytes());
 }
 
 fn set_fd_cloexec(fd: i32) -> Result<()> {
@@ -1865,10 +1856,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
 
     // Mark inherited fds as close-on-exec (except pipe bridge FDs which the
     // shim will use directly).
-    for fd in [Some(snapshot_fd), Some(ack_fd), cli_args.worker_result_fd]
-        .into_iter()
-        .flatten()
-    {
+    for fd in [Some(snapshot_fd), Some(ack_fd)].into_iter().flatten() {
         set_fd_cloexec(fd)?;
     }
 
@@ -1983,7 +1971,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         // so the broker routes inbound connections to the correct worker.
         shim.reannounce_listen_ports();
 
-        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
+        run_program(program, shutdown, net_worker);
     } else {
         let initial_file_system = std::sync::Arc::new(default_fs);
 
@@ -2000,7 +1988,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             &local_pipes,
             &cli_args.broker_fd_bridge,
         )?;
-        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
+        run_program(program, shutdown, net_worker);
     }
 }
 
@@ -2343,13 +2331,9 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         .iter()
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
-    for fd in [
-        cli_args.worker_exec_fd,
-        cli_args.worker_result_fd,
-        cli_args.worker_interp_fd,
-    ]
-    .into_iter()
-    .flatten()
+    for fd in [cli_args.worker_exec_fd, cli_args.worker_interp_fd]
+        .into_iter()
+        .flatten()
     {
         set_fd_cloexec(fd)?;
     }
@@ -2465,7 +2449,6 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             guest_argv,
             guest_envp,
             Some(guest_task),
-            cli_args.worker_result_fd,
         )
     } else {
         let initial_file_system = std::sync::Arc::new(default_fs);
@@ -2513,20 +2496,27 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             program.entrypoints.set_controlling_pty(pty_id);
         }
 
-        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
+        run_program(program, shutdown, net_worker);
     }
 }
 
 /// Run the loaded program and exit with its return code.
 ///
 /// This function never returns — it calls `std::process::exit()`.
+///
+/// Replaces the legacy `--worker-result-fd` pipe channel: before
+/// terminating, the runner stamps the broker-owned process registry
+/// with the guest's exit status so the parent worker's
+/// `wait_worker_host` post-processing (via
+/// `resolve_worker_exit_registry_status` in the shim) can read it
+/// without needing a host pipe between parent and child runner.
 fn run_program<FS: litebox_shim_linux::ShimFS>(
     program: litebox_shim_linux::LoadedProgram<FS>,
     shutdown: std::sync::Arc<core::sync::atomic::AtomicBool>,
     net_worker: Option<std::thread::JoinHandle<()>>,
-    worker_result_fd: Option<i32>,
 ) -> ! {
     let local_process_count = program.entrypoints.local_process_count_fn();
+    let guest_pid = program.process.pid();
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
@@ -2559,9 +2549,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
         // wait4 path before letting the worker process report the panic.
         if program.process.has_exited() {
             let wait_status = program.process.wait();
-            if let Some(worker_result_fd) = worker_result_fd {
-                write_worker_result(wait_status, worker_result_fd);
-            }
+            stamp_broker_exit(guest_pid, wait_status);
         }
         std::panic::resume_unwind(payload);
     }
@@ -2604,10 +2592,21 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     // on stuck threads.
     litebox_platform_multiplex::platform()
         .join_background_tasks_timeout(std::time::Duration::from_secs(2));
-    if let Some(worker_result_fd) = worker_result_fd {
-        write_worker_result(wait_status, worker_result_fd);
-    }
+    stamp_broker_exit(guest_pid, wait_status);
     terminate_host_with_guest_wait_status(wait_status)
+}
+
+/// Stamp the broker-hosted process registry with the guest's
+/// registry-format exit status before this runner process exits.
+/// Best-effort: no-op if no broker provider is installed (single-
+/// worker setups), and idempotent if the parent shim later re-stamps
+/// with a fallback value.
+fn stamp_broker_exit(guest_pid: i32, wait_status: i32) {
+    let Ok(pid) = u32::try_from(guest_pid) else {
+        return;
+    };
+    let registry_status = guest_wait_status_to_registry_status(wait_status);
+    litebox_shim_linux::syscalls::try_mark_broker_process_exited(pid, registry_status);
 }
 
 /// Connect to a network broker via Unix domain socket.
@@ -3488,7 +3487,6 @@ mod tests {
             working_directory: None,
             worker_exec: false,
             worker_exec_fd: None,
-            worker_result_fd: None,
             worker_interp_fd: None,
             worker_interp_path: None,
             guest_pid: None,

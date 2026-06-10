@@ -1594,8 +1594,7 @@ impl<FS: ShimFS> Task<FS> {
             match action.sigaction {
                 SIG_DFL => {
                     match signal.default_disposition() {
-                        SignalDisposition::Terminate
-                        | SignalDisposition::Core => {
+                        SignalDisposition::Terminate | SignalDisposition::Core => {
                             // Core dumps are not currently supported.
                             //
                             // Only log full crash context for Core-disposition
