@@ -265,26 +265,35 @@ class ShadowPathTests(unittest.TestCase):
     branch-decoding step of GC (the actual git invocations are
     integration-tested by the live supervisor)."""
 
-    def test_branch_to_dirname_round_trip_simple(self):
-        self.assertEqual(
-            dashboard._branch_to_shadow_dirname("main"), "main")
-
-    def test_branch_to_dirname_round_trip_slash(self):
-        self.assertEqual(
-            dashboard._branch_to_shadow_dirname("wportnoy/foo-bar"),
-            "wportnoy%2ffoo-bar",
-        )
-        # And decoding (used by GC) reverses it cleanly.
-        self.assertEqual(
-            "wportnoy%2ffoo-bar".replace("%2f", "/"),
-            "wportnoy/foo-bar",
-        )
-
-    def test_per_branch_path_is_under_shadows_root(self):
+    def test_per_branch_path_simple_branch(self):
         sd = Path("/tmp/sd-test")
-        p = dashboard._per_branch_shadow_path(sd, "wportnoy/x")
-        self.assertEqual(p.parent, dashboard._shadows_root(sd))
-        self.assertEqual(p.name, "wportnoy%2fx")
+        p = dashboard._per_branch_shadow_path(sd, "main")
+        self.assertEqual(p, dashboard._shadows_root(sd) / "main")
+
+    def test_per_branch_path_nested_for_slash(self):
+        # Branches with `/` MUST become nested directories — NOT
+        # URL-encoded as `%2f`. rust-lld URL-decodes `%XX`
+        # sequences in its `-o` output path and fails ENOENT
+        # against the decoded (nonexistent) path.
+        sd = Path("/tmp/sd-test")
+        p = dashboard._per_branch_shadow_path(sd, "wportnoy/foo-bar")
+        self.assertEqual(p, dashboard._shadows_root(sd) / "wportnoy" / "foo-bar")
+        # No `%` escaping anywhere in the resulting path.
+        self.assertNotIn("%", str(p))
+
+    def test_branch_from_shadow_path_roundtrip(self):
+        sd = Path("/tmp/sd-test")
+        for branch in ("main", "wportnoy/foo", "a/b/c"):
+            p = dashboard._per_branch_shadow_path(sd, branch)
+            self.assertEqual(
+                dashboard._branch_from_shadow_path(sd, p), branch,
+            )
+
+    def test_branch_from_shadow_path_outside_shadows_returns_none(self):
+        sd = Path("/tmp/sd-test")
+        self.assertIsNone(
+            dashboard._branch_from_shadow_path(sd, Path("/elsewhere/foo")),
+        )
 
     def test_legacy_path_distinct_from_per_branch_root(self):
         sd = Path("/tmp/sd-test")
@@ -344,6 +353,53 @@ class ChildrenRegistryTests(unittest.TestCase):
         self.assertEqual(data["children"][0]["harness_pid"], 222)
         self.assertEqual(data["children"][0]["kind"], "agent-coverage")
         self.assertEqual(data["children"][0]["worktree_path"], "/x")
+
+
+class PidfileConcurrentWriteTests(unittest.TestCase):
+    """Regression: concurrent `_write_pidfile_from_state` calls used
+    to share a single `auto.pidfile.tmp` path and race on `replace()`,
+    raising `FileNotFoundError` (one thread renamed the tmp while
+    another was about to). The exception then bubbled up between
+    `_register_child` and the `try`/`finally` in `_drive_*`, leaking
+    the just-registered child slot — observed as 1207 stale entries
+    in a long-running supervisor's pidfile."""
+
+    def test_concurrent_writers_do_not_raise(self):
+        import tempfile
+        import threading
+        s = dashboard._new_supervisor_state()
+        # Pre-populate the registry so each write has content.
+        for i in range(8):
+            cid = dashboard._register_child(
+                s, kind="agent-coverage", worktree_path=f"/w{i}",
+            )
+            dashboard._update_child(s, cid, cargo_pgid=1000 + i)
+        with tempfile.TemporaryDirectory() as td:
+            pf = Path(td) / "auto.pidfile"
+            errors: list[BaseException] = []
+
+            def writer():
+                try:
+                    for _ in range(50):
+                        dashboard._write_pidfile_from_state(pf, 1, s)
+                except BaseException as e:
+                    errors.append(e)
+
+            threads = [threading.Thread(target=writer) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [],
+                             f"concurrent writers raised: {errors[:3]}")
+            # Final file must be valid JSON with the expected shape.
+            data = json.loads(pf.read_text())
+            self.assertEqual(len(data["children"]), 8)
+            # No leftover .tmp files in the directory (per-thread tmp
+            # suffixes get renamed away cleanly).
+            leftovers = [p for p in Path(td).iterdir() if ".tmp" in p.name]
+            self.assertEqual(leftovers, [],
+                             f"leftover tmp files: {leftovers}")
 
 
 class PickTopNTests(unittest.TestCase):
