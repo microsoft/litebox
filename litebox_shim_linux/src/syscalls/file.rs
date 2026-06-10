@@ -6348,27 +6348,24 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        // Phase B-Step7c: if a broker eventfd provider has been
-        // registered (set at runner bootstrap), route this eventfd
-        // through it so its state lives in the broker and is visible
-        // across worker processes via SCM_RIGHTS / fork. Otherwise
-        // fall back to the local-only EventFile::new path, preserving
-        // pre-Phase-B behaviour for configurations without a broker.
-        let eventfd = if let Some(provider) = super::eventfd::broker_eventfd_provider() {
-            match provider.create_eventfd(u64::from(initval), flags.contains(EfdFlags::SEMAPHORE)) {
-                Ok(handle) => super::eventfd::EventFile::new_broker_backed(provider, handle, flags),
-                Err(_) => {
-                    // Broker creation failed; we don't transparently
-                    // fall back to local because that would break the
-                    // cross-worker contract (a sibling worker can't
-                    // reach a local-only eventfd). Surface ENODEV so
-                    // the worker observes a clear error.
-                    return Err(Errno::ENODEV);
-                }
-            }
-        } else {
-            super::eventfd::EventFile::new(u64::from(initval), flags)
-        };
+        // Eager broker-backed creation: every guest-visible eventfd
+        // lives in the broker from birth. This eliminates the
+        // Local→BrokerBacked lazy-promotion-at-fork mechanism that
+        // used to mutate the variant in `ensure_broker_backed_for_fork`.
+        // Trade-off: one broker round-trip per `eventfd2()` call,
+        // even in the single-worker case, in exchange for a simpler
+        // fork-snapshot path and a single state-location invariant.
+        //
+        // If no broker provider has been registered (runner bootstrap
+        // bug, or a unit-test path that didn't install one), surface
+        // ENODEV — silently falling back to a local-only eventfd
+        // would break the cross-worker contract (a sibling worker
+        // can't reach a local-only eventfd).
+        let provider = super::eventfd::broker_eventfd_provider().ok_or(Errno::ENODEV)?;
+        let handle = provider
+            .create_eventfd(u64::from(initval), flags.contains(EfdFlags::SEMAPHORE))
+            .map_err(|_| Errno::ENODEV)?;
+        let eventfd = super::eventfd::EventFile::new_broker_backed(provider, handle, flags);
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<super::eventfd::EventfdSubsystem>(eventfd);
         if flags.contains(EfdFlags::CLOEXEC) {

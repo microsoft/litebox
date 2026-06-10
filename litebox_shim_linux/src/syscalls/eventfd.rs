@@ -45,10 +45,9 @@ impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 
 /// Process-global broker eventfd provider. Set once at runner
 /// bootstrap (in litebox_runner_linux_userland). `sys_eventfd2`
-/// consults this; if `Some`, new eventfds are broker-backed.
-/// If `None`, falls back to the local `EventFile::new` path —
-/// preserves all existing behaviour when fd-token transport is
-/// not configured.
+/// requires this to be set — new eventfds are broker-backed
+/// eagerly at creation time. If unset, `sys_eventfd2` returns
+/// ENODEV.
 static BROKER_EVENTFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerEventfdProvider>> =
     once_cell::race::OnceBox::new();
 static BROKER_PIDFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPidfdProvider>> =
@@ -116,6 +115,10 @@ pub fn broker_pty_provider() -> Option<Arc<dyn BrokerPtyProvider>> {
 }
 
 enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    /// Local in-memory eventfd. Constructed only by the test-only
+    /// [`EventFile::new`]; production `sys_eventfd2` always creates
+    /// the broker-backed variant below.
+    #[cfg_attr(not(test), allow(dead_code))]
     Eventfd {
         counter: u64,
         semaphore: bool,
@@ -184,6 +187,15 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> 
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
+    /// Test-only constructor for the local in-memory eventfd variant.
+    ///
+    /// In production, `sys_eventfd2` always routes through the broker
+    /// (see [`EventFile::new_broker_backed`]) so that every guest-visible
+    /// eventfd is broker-backed from birth. This local constructor is
+    /// retained only for in-process unit tests of read/write/poll
+    /// semantics that don't need cross-worker visibility or a real
+    /// broker connection.
+    #[cfg(test)]
     pub(crate) fn new(count: u64, flags: EfdFlags) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
@@ -365,14 +377,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         }
     }
 
-    /// Phase 2.F fork-snapshot bridge: extract or mint a broker
-    /// handle so the child worker can reattach to the same shared
-    /// state across the cross-binary-type fork boundary.
+    /// Phase 2.F fork-snapshot bridge: extract the broker handle so
+    /// the child worker can reattach to the same shared state across
+    /// the cross-binary-type fork boundary.
     ///
     /// Behavior by variant:
     /// - `BrokerBacked` / `PidfdBrokerBacked`: returns the existing handle.
-    /// - `Eventfd`: promotes in place to `BrokerBacked` (migrates counter
-    ///   value); fails closed if no eventfd provider is supplied.
     /// - `Pidfd { broker_subscription: Some(_), .. }`: Phase B.2 pidfds are
     ///   already broker-backed by process-exit subscription, so this is a
     ///   no-op that exports the target ProcessId as the child restore token.
@@ -390,18 +400,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     ///   child observes a fresh, disarmed timerfd. Known limitation,
     ///   not a bug — callers that rely on inherited arm state across
     ///   a delayed-fork commit must re-arm explicitly.
+    /// - local `Eventfd`: unreachable in production. `sys_eventfd2`
+    ///   creates eventfds as broker-backed eagerly (post eager-creation
+    ///   refactor), so any guest-visible eventfd reaches fork as
+    ///   `BrokerBacked`. The local variant exists only for in-process
+    ///   unit tests that never reach this fork bridge.
     ///
     /// For handle-backed kinds, the caller MUST `dup_handle` the returned
     /// handle and arrange rollback `release`. For Phase B.2 pidfds, the
     /// returned value is a broker process token and needs no fd-handle dup.
     pub(crate) fn ensure_broker_backed_for_fork(
         &self,
-        eventfd_provider: Option<&Arc<dyn BrokerEventfdProvider>>,
+        _eventfd_provider: Option<&Arc<dyn BrokerEventfdProvider>>,
         _pidfd_provider: Option<&Arc<dyn BrokerPidfdProvider>>,
     ) -> Result<Option<(super::fork_snapshot::BrokerHandleKind, u64)>, BrokerOpError> {
         use super::fork_snapshot::BrokerHandleKind;
-        use litebox_common_linux::cwfd::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
-        let mut guard = self.inner.lock();
+        let guard = self.inner.lock();
         match &*guard {
             EventFileInner::BrokerBacked { common, .. } => {
                 Ok(Some((BrokerHandleKind::Eventfd, common.handle())))
@@ -410,35 +424,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 Ok(Some((BrokerHandleKind::Pidfd, common.handle())))
             }
             EventFileInner::Timerfd(_) => Ok(None),
-            EventFileInner::Eventfd { counter, semaphore } => {
-                let Some(provider) = eventfd_provider else {
-                    return Ok(None);
-                };
-                let counter_val = *counter;
-                let semaphore_val = *semaphore;
-                let handle = provider.create_eventfd(counter_val, semaphore_val)?;
-                let subscribable: Arc<
-                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
-                > = Arc::clone(provider) as _;
-                let common = super::broker_backed::BrokerBackedCommon::new(
-                    subscribable,
-                    handle,
-                    NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT,
+            EventFileInner::Eventfd { .. } => {
+                unreachable!(
+                    "local Eventfd variant must not reach fork-snapshot in production: \
+                     sys_eventfd2 creates eventfds as broker-backed eagerly"
                 );
-                // Note: existing observers on `self.pollee` won't be
-                // re-driven from broker notifications until a fresh
-                // `register_observer` call triggers `ensure_subscribed`
-                // (matches the lazy subscribe behavior of BrokerBacked).
-                // For the fork-snapshot case this is acceptable: the
-                // parent is about to fork, and the child constructs
-                // its own BrokerBacked via the restore path which will
-                // subscribe lazily on first poll registration.
-                *guard = EventFileInner::BrokerBacked {
-                    provider: Arc::clone(provider),
-                    common,
-                    semaphore: semaphore_val,
-                };
-                Ok(Some((BrokerHandleKind::Eventfd, handle)))
             }
             EventFileInner::Pidfd {
                 target_pid,
@@ -1683,140 +1673,6 @@ mod tests {
         assert_eq!(err, Errno::EAGAIN);
 
         task.sys_close(efd).expect("close eventfd");
-    }
-
-    /// Phase 2.F.2 unit test: `ensure_broker_backed_for_fork` on a
-    /// local Eventfd should mint a broker handle, transfer the
-    /// counter value, and mutate the variant in place to
-    /// `BrokerBacked`. A subsequent read must observe the migrated
-    /// counter value through the broker (proving state was
-    /// preserved across the promotion).
-    #[test]
-    fn promote_local_eventfd_to_broker_preserves_counter() {
-        use crate::syscalls::fork_snapshot::BrokerHandleKind;
-        use alloc::sync::Arc;
-        use litebox_broker::fd_token_socket::spawn_control_listener;
-        use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
-        use litebox_broker::inotify_dispatcher::InotifyDispatcher;
-        use litebox_broker::state_registry::BrokerStateRegistry;
-        use litebox_common_linux::{
-            broker_eventfd_provider::BrokerEventfdProvider,
-            broker_eventfd_provider::BrokerOpError,
-            cwfd::broker_subscribable::{BrokerEventCallback, BrokerSubscribable},
-            fd_token_client::FdTokenClient,
-        };
-        use std::sync::Mutex as StdMutex;
-        use tempfile::tempdir;
-
-        let _task = crate::syscalls::tests::init_platform(None);
-
-        struct RealProviderForTest {
-            client: StdMutex<FdTokenClient>,
-        }
-        impl BrokerSubscribable for RealProviderForTest {
-            fn subscribe(
-                &self,
-                _: u64,
-                _: u32,
-                _: Arc<dyn BrokerEventCallback>,
-            ) -> Result<u64, BrokerOpError> {
-                Err(BrokerOpError::Io)
-            }
-            fn unsubscribe(&self, _: u64, _: u64) {}
-            fn release(&self, handle: u64) {
-                let _ = self.client.lock().unwrap().release(handle);
-            }
-            fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
-                self.client
-                    .lock()
-                    .unwrap()
-                    .dup_handle(handle)
-                    .map_err(|_| BrokerOpError::Io)
-            }
-            fn query_events(&self, handle: u64) -> Result<u32, BrokerOpError> {
-                self.client
-                    .lock()
-                    .unwrap()
-                    .query_events(handle)
-                    .map_err(|_| BrokerOpError::Io)
-            }
-        }
-        impl BrokerEventfdProvider for RealProviderForTest {
-            fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
-                self.client
-                    .lock()
-                    .unwrap()
-                    .create_eventfd(initial, semaphore)
-                    .map_err(|_| BrokerOpError::Io)
-            }
-            fn read_eventfd(&self, handle: u64) -> Result<u64, BrokerOpError> {
-                self.client
-                    .lock()
-                    .unwrap()
-                    .read_eventfd(handle)
-                    .map_err(|_| BrokerOpError::Io)
-            }
-            fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError> {
-                self.client
-                    .lock()
-                    .unwrap()
-                    .write_eventfd(handle, value)
-                    .map_err(|_| BrokerOpError::Io)
-            }
-        }
-
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("fd-token.sock");
-        let fd_registry = std::sync::Arc::new(BrokerFdTokenRegistry::new());
-        let state_registry = std::sync::Arc::new(BrokerStateRegistry::new());
-        let process_registry = std::sync::Arc::new(BrokerStateRegistry::new());
-        let inotify_dispatcher = std::sync::Arc::new(InotifyDispatcher::new());
-        let _listener = spawn_control_listener(
-            &path,
-            std::sync::Arc::clone(&fd_registry),
-            std::sync::Arc::clone(&state_registry),
-            std::sync::Arc::clone(&process_registry),
-            std::sync::Arc::clone(&inotify_dispatcher),
-        )
-        .expect("spawn listener");
-        for _ in 0..100 {
-            if path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let client = FdTokenClient::connect(&path).expect("connect");
-        let provider: Arc<dyn BrokerEventfdProvider> = Arc::new(RealProviderForTest {
-            client: StdMutex::new(client),
-        });
-
-        // Start with a local Eventfd at counter=42.
-        let ef =
-            super::EventFile::<litebox_platform_multiplex::Platform>::new(42, EfdFlags::NONBLOCK);
-
-        let result = ef.ensure_broker_backed_for_fork(Some(&provider), None);
-        let (kind, handle_id) = result
-            .expect("promote: broker call should succeed")
-            .expect("promote: should produce a handle for local Eventfd");
-        assert_eq!(kind, BrokerHandleKind::Eventfd);
-
-        // After promotion, calling promote again is idempotent and
-        // returns the same handle.
-        let again = ef
-            .ensure_broker_backed_for_fork(Some(&provider), None)
-            .expect("idempotent broker call")
-            .expect("already-promoted should still produce handle");
-        assert_eq!(again, (kind, handle_id));
-
-        // The broker now has a counter of 42; reading once must
-        // return that value.
-        let got = provider
-            .read_eventfd(handle_id)
-            .expect("read promoted eventfd from broker");
-        assert_eq!(
-            got, 42,
-            "promotion should have migrated the local counter to the broker"
-        );
     }
 
     /// Phase 2.F.2 unit test: `ensure_broker_backed_for_fork` on a
