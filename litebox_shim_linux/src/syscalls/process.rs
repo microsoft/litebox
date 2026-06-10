@@ -2586,104 +2586,111 @@ impl<FS: ShimFS> Task<FS> {
             // Returns Ok(true) if threads were parked and need to be
             // unparked later, Ok(false) if no other threads exist, or
             // Err if another thread is already forking.
-            let (did_park, cow_state) = if nested_delayed_fork {
-                // A fork issued by an unmigrated delayed-fork child runs while
-                // the outer vfork already owns the process-wide fork gate.
-                // Reusing that gate lets fork+exec grandchildren make progress
-                // without broadening the delayed-fork migration path.
-                (false, None)
+            //
+            // For a fork issued by an unmigrated delayed-fork child
+            // (`nested_delayed_fork == true`), the outer vfork already
+            // owns the process-wide fork gate, so do NOT re-park; but
+            // we still need our own CoW layer so the grandchild's
+            // user-space post-fork code (glibc's `__nptl_fork_child`
+            // touches TLS / pthread_t / malloc arenas) cannot clobber
+            // the parent's live stack canary and TLS state before the
+            // grandchild execs or exits. Without this nested CoW,
+            // static-PIE glibc binaries reliably trip
+            // `__stack_chk_fail` in the parent's `__libc_fork`
+            // epilogue.
+            let did_park = if nested_delayed_fork {
+                false
             } else {
-                let Ok(did_park) = self.park_other_threads() else {
+                let Ok(parked) = self.park_other_threads() else {
                     return Err(Errno::EAGAIN);
                 };
+                parked
+            };
+            let cow_state = {
+                let ps = self.process_state.borrow();
+                let mappings = ps.pm.mappings();
+                drop(ps);
 
-                let cow_state = {
-                    let ps = self.process_state.borrow();
-                    let mappings = ps.pm.mappings();
-                    drop(ps);
+                let mut eager_dirty = BTreeMap::<usize, alloc::vec::Vec<u8>>::new();
+                let mut protected = alloc::vec::Vec::new();
 
-                    let mut eager_dirty = BTreeMap::<usize, alloc::vec::Vec<u8>>::new();
-                    let mut protected = alloc::vec::Vec::new();
-
-                    for (range, flags) in &mappings {
-                        if !flags.contains(VmFlags::VM_WRITE) {
-                            continue;
-                        }
-
-                        if <crate::Platform as AddressSpaceProvider>::EAGER_COW_FOR_VFORK {
-                            // Eagerly snapshot pages and leave them writable.
-                            for page_addr in (range.start..range.end).step_by(PAGE_SIZE) {
-                                let mut buf = alloc::vec![0u8; PAGE_SIZE];
-                                // SAFETY: pages are committed; all other threads
-                                // are parked so content is stable.
-                                unsafe {
-                                    core::ptr::copy_nonoverlapping(
-                                        page_addr as *const u8,
-                                        buf.as_mut_ptr(),
-                                        PAGE_SIZE,
-                                    );
-                                }
-                                eager_dirty.insert(page_addr, buf);
-                            }
-                        } else {
-                            // Lazy CoW: mark writable pages read-only and
-                            // snapshot individual pages on first write fault.
-                            use litebox::platform::page_mgmt::MemoryRegionPermissions;
-
-                            let len = range.end - range.start;
-                            let orig_perms = {
-                                let mut p = MemoryRegionPermissions::READ;
-                                if flags.contains(VmFlags::VM_EXEC) {
-                                    p |= MemoryRegionPermissions::EXEC;
-                                }
-                                p | MemoryRegionPermissions::WRITE
-                            };
-                            let ro_perms = orig_perms & !MemoryRegionPermissions::WRITE;
-                            // SAFETY: pages are mapped; all other threads are
-                            // parked so no concurrent writes.
-                            let ok = unsafe {
-                                <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
-                                            self.global.platform,
-                                            range.start..range.end,
-                                            ro_perms,
-                                        )
-                                        .is_ok()
-                            };
-                            if !ok {
-                                for &(base, len, perms) in &protected {
-                                    unsafe {
-                                        <crate::Platform as PageManagementProvider<
-                                                    PAGE_SIZE,
-                                                >>::update_permissions(
-                                                    self.global.platform,
-                                                    base..base + len,
-                                                    perms,
-                                                )
-                                                .expect("CoW setup rollback: failed to restore permissions");
-                                    }
-                                }
-                                if did_park {
-                                    self.unpark_other_threads();
-                                }
-                                return Err(Errno::ENOMEM);
-                            }
-                            protected.push((range.start, len, orig_perms));
-                        }
+                for (range, flags) in &mappings {
+                    if !flags.contains(VmFlags::VM_WRITE) {
+                        continue;
                     }
-                    let cow = Arc::new(crate::CowState {
-                        protected_ranges: protected,
-                        dirty_pages: litebox::sync::Mutex::new(eager_dirty),
-                    });
-                    // Store CoW state in ProcessState so all threads (and the
-                    // fault handler) can access it.
-                    self.process_state
-                        .borrow()
-                        .active_vfork_layers
-                        .lock()
-                        .push(cow.clone());
-                    Some(cow)
-                };
-                (did_park, cow_state)
+
+                    if <crate::Platform as AddressSpaceProvider>::EAGER_COW_FOR_VFORK {
+                        // Eagerly snapshot pages and leave them writable.
+                        for page_addr in (range.start..range.end).step_by(PAGE_SIZE) {
+                            let mut buf = alloc::vec![0u8; PAGE_SIZE];
+                            // SAFETY: pages are committed; all other threads
+                            // are parked so content is stable.
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    page_addr as *const u8,
+                                    buf.as_mut_ptr(),
+                                    PAGE_SIZE,
+                                );
+                            }
+                            eager_dirty.insert(page_addr, buf);
+                        }
+                    } else {
+                        // Lazy CoW: mark writable pages read-only and
+                        // snapshot individual pages on first write fault.
+                        use litebox::platform::page_mgmt::MemoryRegionPermissions;
+
+                        let len = range.end - range.start;
+                        let orig_perms = {
+                            let mut p = MemoryRegionPermissions::READ;
+                            if flags.contains(VmFlags::VM_EXEC) {
+                                p |= MemoryRegionPermissions::EXEC;
+                            }
+                            p | MemoryRegionPermissions::WRITE
+                        };
+                        let ro_perms = orig_perms & !MemoryRegionPermissions::WRITE;
+                        // SAFETY: pages are mapped; all other threads are
+                        // parked so no concurrent writes.
+                        let ok = unsafe {
+                            <crate::Platform as PageManagementProvider<PAGE_SIZE>>::update_permissions(
+                                        self.global.platform,
+                                        range.start..range.end,
+                                        ro_perms,
+                                    )
+                                    .is_ok()
+                        };
+                        if !ok {
+                            for &(base, len, perms) in &protected {
+                                unsafe {
+                                    <crate::Platform as PageManagementProvider<
+                                                PAGE_SIZE,
+                                            >>::update_permissions(
+                                                self.global.platform,
+                                                base..base + len,
+                                                perms,
+                                            )
+                                            .expect("CoW setup rollback: failed to restore permissions");
+                                }
+                            }
+                            if did_park {
+                                self.unpark_other_threads();
+                            }
+                            return Err(Errno::ENOMEM);
+                        }
+                        protected.push((range.start, len, orig_perms));
+                    }
+                }
+                let cow = Arc::new(crate::CowState {
+                    protected_ranges: protected,
+                    dirty_pages: litebox::sync::Mutex::new(eager_dirty),
+                });
+                // Store CoW state in ProcessState so all threads (and the
+                // fault handler) can access it.
+                self.process_state
+                    .borrow()
+                    .active_vfork_layers
+                    .lock()
+                    .push(cow.clone());
+                Some(cow)
             };
 
             let fc = crate::ForkContext {
@@ -5849,11 +5856,24 @@ impl<FS: ShimFS> Task<FS> {
                             (FdClass::InetListener, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerInetRaw(fd) => {
-                            (FdClass::Other, Some(fd.object_id()), None, None)
+                            (FdClass::BrokerInetRaw, Some(fd.object_id()), None, None)
                         }
                     }
                 })
-                .unwrap_or((FdClass::Other, None, None, None));
+                .unwrap_or_else(|_| {
+                    // `alive_fds` (line 5732) was collected while holding the
+                    // raw_descriptor_store read lock; other threads are
+                    // parked by `park_other_threads` before commit_delayed_fork
+                    // enters this loop. An EBADF here means a sibling closed
+                    // the fd between collection and dispatch, which violates
+                    // the parking invariant — an internal consistency bug,
+                    // not a runtime condition. Panic loudly so the stack
+                    // trace points at the missing barrier.
+                    unreachable!(
+                        "snapshot_fd_table: raw_fd={raw_fd} disappeared from raw_descriptor_store \
+                         between iter_alive and run_on_raw_fd (parking invariant violated)"
+                    )
+                });
 
             // Promote to StdioFd only if this fd sits at a stdio slot AND
             // its object_id matches ANY of the original host stdio descriptors.
@@ -5895,16 +5915,36 @@ impl<FS: ShimFS> Task<FS> {
                 // Linux fork semantics); broker-backed reattaches the same
                 // broker handle.
                 FdClass::EventFd | FdClass::Signalfd | FdClass::InetListener => {}
-                // Rejected (fd class not yet migratable across worker hosts).
-                // Each variant called out explicitly so adding a new
-                // FdClass forces the developer to decide accept vs reject.
-                FdClass::NetworkSocket
-                | FdClass::Epoll
-                | FdClass::TimerFd
-                | FdClass::PidFd
-                | FdClass::AnonSpecialFd
-                | FdClass::Inotify
-                | FdClass::Other => {
+                // Rejected — grouped by *why* this fd class can't migrate
+                // across worker hosts. Each variant is named explicitly so
+                // that adding a new `FdClass` variant fails to compile here
+                // and forces an explicit accept/reject decision. No
+                // catch-all arm by design.
+                //
+                // (a) By-design per-process kernel state. These are NOT
+                //     future broker-host candidates: the kernel object
+                //     (epoll interest set, inotify watch list) is inherently
+                //     per-process and cross-worker sharing would require a
+                //     different abstraction. The shared-AS vfork fall-through
+                //     (CoW-protected as of 5241b07c) is the intended handoff
+                //     path, not a workaround.
+                FdClass::Epoll | FdClass::Inotify => {
+                    reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
+                }
+                // (b) Legacy `worker_local_inet` smoltcp socket. Phase F.3
+                //     moved inet to broker-held (`BrokerInetListener`,
+                //     `BrokerTcpConn`, `BrokerInetDgram`); on default
+                //     `platform_linux_userland` this variant is cfg-gated
+                //     out of existence. The arm is only present on builds
+                //     where the variant compiles.
+                #[cfg(feature = "worker_local_inet")]
+                FdClass::NetworkSocket => {
+                    reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
+                }
+                // (c) Broker-hosted raw IP socket. Migration support is not
+                //     wired up yet; lift this arm into the accept block
+                //     once cross-worker raw-socket state preservation lands.
+                FdClass::BrokerInetRaw => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
             }

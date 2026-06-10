@@ -12,6 +12,7 @@ pub(crate) mod broker_listener_tests;
 pub(crate) mod clone3_matrix;
 pub(crate) mod common;
 pub(crate) mod concurrent_fork;
+pub(crate) mod df_parent_trigger;
 pub(crate) mod epoll_pidfd;
 pub(crate) mod eventfd;
 pub(crate) mod file_tcp;
@@ -25,6 +26,8 @@ pub(crate) mod invariants;
 pub(crate) mod iouring_discovery;
 pub mod leaf_subcommand;
 pub(crate) mod matrix;
+pub(crate) mod multi_inherit_matrix;
+pub(crate) mod nested_inherit_matrix;
 pub(crate) mod perf_probes;
 pub(crate) mod pid_uniqueness;
 pub(crate) mod pidfd_inherit;
@@ -33,6 +36,7 @@ pub(crate) mod pipe_bridge;
 pub(crate) mod port_router;
 pub(crate) mod proc_self;
 pub(crate) mod process_exit;
+pub(crate) mod promotion_race;
 pub(crate) mod pty;
 pub(crate) mod pxeof;
 pub(crate) mod registry;
@@ -48,6 +52,7 @@ pub(crate) mod tcp_state;
 pub(crate) mod tcp_stress;
 pub(crate) mod uds_stream;
 pub(crate) mod vscode_shape;
+pub(crate) mod worker_ready_race;
 
 #[must_use]
 pub fn dispatch_fast_leaf(args: &[String]) -> Option<i32> {
@@ -1042,6 +1047,12 @@ pub fn collect_all_tests() -> Vec<Test> {
     special_cases::register_process_tests(&mut registry::Registry::new(&mut tests));
     invariants::register_invariant_tests(&mut registry::Registry::new(&mut tests));
     inherit_matrix::register_inherit_matrix_tests(&mut registry::Registry::new(&mut tests));
+    multi_inherit_matrix::register_multi_inherit_matrix_tests(&mut registry::Registry::new(
+        &mut tests,
+    ));
+    nested_inherit_matrix::register_nested_inherit_matrix_tests(&mut registry::Registry::new(
+        &mut tests,
+    ));
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
     pidfd_inherit::register_pidfd_inherit_tests(&mut registry::Registry::new(&mut tests));
     pidfd_tests::register_pidfd_tests(&mut registry::Registry::new(&mut tests));
@@ -1060,6 +1071,9 @@ pub fn collect_all_tests() -> Vec<Test> {
     proc_self::register_proc_self_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_subtree_kill_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_fork_matrix(&mut registry::Registry::new(&mut tests));
+    df_parent_trigger::register_df_parent_trigger(&mut registry::Registry::new(&mut tests));
+    promotion_race::register_promotion_race(&mut registry::Registry::new(&mut tests));
+    worker_ready_race::register_worker_ready_race(&mut registry::Registry::new(&mut tests));
     special_cases::register_unix_socket(&mut registry::Registry::new(&mut tests));
     special_cases::register_cross_worker(&mut registry::Registry::new(&mut tests));
     special_cases::register_pipe_eof(&mut registry::Registry::new(&mut tests));

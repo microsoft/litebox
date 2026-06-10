@@ -365,8 +365,7 @@ const LINE_DISCIPLINE_CR_TO_NL: HandlerToken<TargetArgs, PtyOut> =
     HandlerToken::new("pty.line_discipline.cr_to_nl");
 const IOCTL_TIOCGPTN_ONLY_ON_MASTER: HandlerToken<(), PtyOut> =
     HandlerToken::new("pty.ioctl.tiocgptn_only_on_master");
-const DEVPTS_DIR_OPENABLE: HandlerToken<(), PtyOut> =
-    HandlerToken::new("pty.devpts.dir_openable");
+const DEVPTS_DIR_OPENABLE: HandlerToken<(), PtyOut> = HandlerToken::new("pty.devpts.dir_openable");
 const SLAVE_REOPEN_WRITE_REACHES_MASTER: HandlerToken<(), PtyOut> =
     HandlerToken::new("pty.slave_reopen.write_reaches_master");
 const CHILD_SLAVE_REOPEN_WRITE_REACHES_MASTER: HandlerToken<TargetArgs, PtyOut> =
@@ -1283,14 +1282,12 @@ async fn handle_ioctl_tiocgptn_only_on_master(
 
     let mut slave_n: i32 = 0;
     // SAFETY: slave_fd is a live PTY slave fd; slave_n is a valid &mut i32 sink.
-    let slave_rc =
-        unsafe { libc::ioctl(slave_fd, libc::TIOCGPTN, &mut slave_n as *mut i32) };
+    let slave_rc = unsafe { libc::ioctl(slave_fd, libc::TIOCGPTN, &mut slave_n as *mut i32) };
     let slave_errno = std::io::Error::last_os_error().raw_os_error();
 
     let mut master_n: i32 = -1;
     // SAFETY: master_fd is a live PTY master fd; master_n is a valid &mut i32 sink.
-    let master_rc =
-        unsafe { libc::ioctl(master_fd, libc::TIOCGPTN, &mut master_n as *mut i32) };
+    let master_rc = unsafe { libc::ioctl(master_fd, libc::TIOCGPTN, &mut master_n as *mut i32) };
     let master_errno = std::io::Error::last_os_error().raw_os_error();
 
     // SAFETY: slave_fd is owned by us; close exactly once.
@@ -1509,13 +1506,8 @@ async fn handle_slave_reopen_write_reaches_master(
     }
     const MAGIC: &[u8] = b"HELLO_FROM_REOPENED_SLAVE\n";
     // SAFETY: slave_fd is a valid writable PTY slave fd.
-    let written = unsafe {
-        libc::write(
-            slave_fd,
-            MAGIC.as_ptr() as *const libc::c_void,
-            MAGIC.len(),
-        )
-    };
+    let written =
+        unsafe { libc::write(slave_fd, MAGIC.as_ptr() as *const libc::c_void, MAGIC.len()) };
     if written != MAGIC.len() as isize {
         // SAFETY: slave_fd owned by us; close once.
         unsafe { libc::close(slave_fd) };
@@ -1803,7 +1795,10 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
         "pty-child-slave-reopen-write",
         leaf_subcmd::subcmd_pty_child_slave_reopen_write
     );
-    crate::register_leaf_subcommand!("pty-sigttin-self-kill", leaf_subcmd::subcmd_pty_sigttin_self_kill);
+    crate::register_leaf_subcommand!(
+        "pty-sigttin-self-kill",
+        leaf_subcmd::subcmd_pty_sigttin_self_kill
+    );
     crate::register_leaf_subcommand!(
         "pty-stdout-post-sleep",
         leaf_subcmd::subcmd_pty_stdout_post_sleep
@@ -1894,68 +1889,77 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     );
     {
         let token = &CHILD_SLAVE_REOPEN_WRITE_REACHES_MASTER;
-        reg.test("vscode", "pty", "PTY.child_slave_reopen.write_reaches_master.pie-glibc.dpg1")
-            .timeout(30)
-            .build(move |cx| {
-                let handle = cx.require(AgentName::Dpg1);
-                Box::new(move |run| {
-                    Box::pin(async move {
-                        let target =
-                            crate::binary_path(crate::BinaryType::PieGlibc, run.self_exe());
-                        let result = run
-                            .send_named_typed(&handle, token, TargetArgs { target })
-                            .await;
-                        match result {
-                            Ok(out) => TestOutcome::new("dpg1", true, out.detail),
-                            Err(detail) => TestOutcome::new("dpg1", false, detail),
-                        }
-                    })
+        reg.test(
+            "vscode",
+            "pty",
+            "PTY.child_slave_reopen.write_reaches_master.pie-glibc.dpg1",
+        )
+        .timeout(30)
+        .build(move |cx| {
+            let handle = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let target = crate::binary_path(crate::BinaryType::PieGlibc, run.self_exe());
+                    let result = run
+                        .send_named_typed(&handle, token, TargetArgs { target })
+                        .await;
+                    match result {
+                        Ok(out) => TestOutcome::new("dpg1", true, out.detail),
+                        Err(detail) => TestOutcome::new("dpg1", false, detail),
+                    }
                 })
-            });
+            })
+        });
     }
     {
         let token = &SIGTTIN_DFL_DOES_NOT_KILL;
-        reg.test("vscode", "pty", "PTY.sigttin_dfl_does_not_kill.pie-glibc.dpg1")
-            .timeout(15)
-            .build(move |cx| {
-                let handle = cx.require(AgentName::Dpg1);
-                Box::new(move |run| {
-                    Box::pin(async move {
-                        let target =
-                            crate::binary_path(crate::BinaryType::PieGlibc, run.self_exe());
-                        let result = run
-                            .send_named_typed(&handle, token, TargetArgs { target })
-                            .await;
-                        match result {
-                            Ok(out) => TestOutcome::new("dpg1", true, out.detail),
-                            Err(detail) => TestOutcome::new("dpg1", false, detail),
-                        }
-                    })
+        reg.test(
+            "vscode",
+            "pty",
+            "PTY.sigttin_dfl_does_not_kill.pie-glibc.dpg1",
+        )
+        .timeout(15)
+        .build(move |cx| {
+            let handle = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let target = crate::binary_path(crate::BinaryType::PieGlibc, run.self_exe());
+                    let result = run
+                        .send_named_typed(&handle, token, TargetArgs { target })
+                        .await;
+                    match result {
+                        Ok(out) => TestOutcome::new("dpg1", true, out.detail),
+                        Err(detail) => TestOutcome::new("dpg1", false, detail),
+                    }
                 })
-            });
+            })
+        });
     }
     // PTY.readlink.proc_self_fd_stdio_returns_pty_path uses
     // TargetArgs to pass the leaf binary path to the child.
     {
         let token = &READLINK_PROC_SELF_FD_STDIO_RETURNS_PTY_PATH;
-        reg.test("vscode", "pty", "PTY.readlink.proc_self_fd_stdio_returns_pty_path.pie-glibc.dpg1")
-            .timeout(30)
-            .build(move |cx| {
-                let handle = cx.require(AgentName::Dpg1);
-                Box::new(move |run| {
-                    Box::pin(async move {
-                        let target =
-                            crate::binary_path(crate::BinaryType::PieGlibc, run.self_exe());
-                        let result = run
-                            .send_named_typed(&handle, token, TargetArgs { target })
-                            .await;
-                        match result {
-                            Ok(out) => TestOutcome::new("dpg1", true, out.detail),
-                            Err(detail) => TestOutcome::new("dpg1", false, detail),
-                        }
-                    })
+        reg.test(
+            "vscode",
+            "pty",
+            "PTY.readlink.proc_self_fd_stdio_returns_pty_path.pie-glibc.dpg1",
+        )
+        .timeout(30)
+        .build(move |cx| {
+            let handle = cx.require(AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let target = crate::binary_path(crate::BinaryType::PieGlibc, run.self_exe());
+                    let result = run
+                        .send_named_typed(&handle, token, TargetArgs { target })
+                        .await;
+                    match result {
+                        Ok(out) => TestOutcome::new("dpg1", true, out.detail),
+                        Err(detail) => TestOutcome::new("dpg1", false, detail),
+                    }
                 })
-            });
+            })
+        });
     }
 
     for &agent in PTY_AGENTS {
@@ -2801,13 +2805,8 @@ mod leaf_subcmd {
         }
         const MAGIC: &[u8] = b"MAGIC=PROBE_BYTES_REACHED_MASTER\n";
         // SAFETY: reopened is a valid writable fd we just opened.
-        let _ = unsafe {
-            libc::write(
-                reopened,
-                MAGIC.as_ptr() as *const libc::c_void,
-                MAGIC.len(),
-            )
-        };
+        let _ =
+            unsafe { libc::write(reopened, MAGIC.as_ptr() as *const libc::c_void, MAGIC.len()) };
         // SAFETY: reopened owned by us; close once.
         unsafe { libc::close(reopened) };
         println!("DONE");
