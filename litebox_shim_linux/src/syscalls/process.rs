@@ -5902,16 +5902,36 @@ impl<FS: ShimFS> Task<FS> {
                 // Linux fork semantics); broker-backed reattaches the same
                 // broker handle.
                 FdClass::EventFd | FdClass::Signalfd | FdClass::InetListener => {}
-                // Rejected (fd class not yet migratable across worker hosts).
-                // Each variant called out explicitly so adding a new
-                // FdClass forces the developer to decide accept vs reject.
-                FdClass::NetworkSocket
-                | FdClass::Epoll
-                | FdClass::TimerFd
-                | FdClass::PidFd
-                | FdClass::AnonSpecialFd
-                | FdClass::Inotify
-                | FdClass::Other => {
+                // Rejected — grouped by *why* this fd class can't migrate
+                // across worker hosts. Each variant is named explicitly so
+                // that adding a new `FdClass` variant fails to compile here
+                // and forces an explicit accept/reject decision.
+                //
+                // (a) By-design per-process kernel state. These are NOT
+                //     future broker-host candidates: the kernel object
+                //     (epoll interest set, inotify watch list) is inherently
+                //     per-process and cross-worker sharing would require a
+                //     different abstraction. The shared-AS vfork fall-through
+                //     (CoW-protected as of 5241b07c) is the intended handoff
+                //     path, not a workaround.
+                FdClass::Epoll | FdClass::Inotify => {
+                    reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
+                }
+                // (b) Vestigial — only reachable on legacy builds. Phase F.3
+                //     moved inet to broker-held (`BrokerInetListener`,
+                //     `BrokerTcpConn`, `BrokerInetDgram`), so `NetworkSocket`
+                //     is only ever produced under
+                //     `cfg(feature = "worker_local_inet")`. The arm stays so
+                //     legacy builds still reject explicitly.
+                FdClass::NetworkSocket => {
+                    reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
+                }
+                // (c) Catch-all: raw sockets (`BrokerInetRaw` is classified
+                //     as `Other`) and any unrecognized fd kind that fell
+                //     through the classifier above. Genuine reject — adding
+                //     migration support means lifting these into a more
+                //     specific `FdClass` variant first.
+                FdClass::Other => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
             }

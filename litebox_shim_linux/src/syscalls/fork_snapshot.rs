@@ -399,12 +399,6 @@ pub enum FdClass {
     EventFd,
     /// signalfd.
     Signalfd,
-    /// timerfd.
-    TimerFd,
-    /// pidfd.
-    PidFd,
-    /// memfd or other anonymous special file.
-    AnonSpecialFd,
     /// inotify instance.
     Inotify,
     /// Broker-hosted TCP listener.
@@ -1135,9 +1129,11 @@ impl FdClass {
             Self::Epoll => 5,
             Self::EventFd => 6,
             Self::Signalfd => 12,
-            Self::TimerFd => 7,
-            Self::PidFd => 8,
-            Self::AnonSpecialFd => 9,
+            // Wire values 7 (TimerFd), 8 (PidFd), 9 (AnonSpecialFd) are
+            // reserved — those variants were removed as dead code (never
+            // produced by `snapshot_fd_table`'s classifier); the slots are
+            // kept unallocated so old snapshots produced before any future
+            // re-introduction would still fail-closed via InvalidEnum.
             Self::Inotify => 10,
             Self::Other => 11,
             Self::InetListener => 13,
@@ -1154,9 +1150,7 @@ impl FdClass {
             5 => Ok(Self::Epoll),
             6 => Ok(Self::EventFd),
             12 => Ok(Self::Signalfd),
-            7 => Ok(Self::TimerFd),
-            8 => Ok(Self::PidFd),
-            9 => Ok(Self::AnonSpecialFd),
+            // 7/8/9 reserved — see `to_wire` comment.
             10 => Ok(Self::Inotify),
             11 => Ok(Self::Other),
             13 => Ok(Self::InetListener),
