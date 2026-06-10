@@ -52,6 +52,7 @@ pub(crate) mod tcp_state;
 pub(crate) mod tcp_stress;
 pub(crate) mod uds_stream;
 pub(crate) mod vscode_shape;
+pub(crate) mod worker_ready_race;
 
 #[must_use]
 pub fn dispatch_fast_leaf(args: &[String]) -> Option<i32> {
@@ -1072,6 +1073,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     fork_matrix::register_fork_matrix(&mut registry::Registry::new(&mut tests));
     df_parent_trigger::register_df_parent_trigger(&mut registry::Registry::new(&mut tests));
     promotion_race::register_promotion_race(&mut registry::Registry::new(&mut tests));
+    worker_ready_race::register_worker_ready_race(&mut registry::Registry::new(&mut tests));
     special_cases::register_unix_socket(&mut registry::Registry::new(&mut tests));
     special_cases::register_cross_worker(&mut registry::Registry::new(&mut tests));
     special_cases::register_pipe_eof(&mut registry::Registry::new(&mut tests));
