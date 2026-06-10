@@ -126,6 +126,23 @@ pub fn try_mark_broker_process_exited(pid: u32, exit_code: i32) {
     }
 }
 
+/// Block until the broker reports an exit on `pid`, returning the
+/// stamped status code. Returns `None` if no broker provider is
+/// installed, if the subscribe RPC fails, or if `timeout` elapses
+/// before any stamp arrives.
+///
+/// Used by the fork-restore parent to wait on the runner's
+/// install-complete signal: the parent allocates an auxiliary
+/// broker process handle (via [`try_register_broker_guest_pid`]),
+/// passes its pid to the runner via argv, then calls this helper
+/// to block on the runner's `try_mark_broker_process_exited(aux_pid, status)`
+/// stamp. A status of 0 means install succeeded; any non-zero status
+/// is an errno-shaped failure code that the parent surfaces back to
+/// the shim caller.
+pub fn try_wait_broker_process_exit(pid: u32, timeout: core::time::Duration) -> Option<i32> {
+    broker_guest_pid_provider()?.wait_process_exit_blocking(pid, timeout)
+}
+
 /// Convenience: stamp a setpgid with the broker if a provider is installed.
 pub fn try_broker_set_pgid(
     caller_pid: u32,
