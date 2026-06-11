@@ -624,15 +624,16 @@ pub trait MapMemory {
 ///
 /// See [`compute_reserve_regions`] for details.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct ReserveRegions {
-    /// Page- and `align`-aligned base address of the requested `len` bytes
-    /// inside the over-sized reservation.
+pub struct ReservedRegions {
+    /// Base address of the requested `len` bytes inside the over-sized
+    /// reservation, aligned up to the `align` argument passed to
+    /// [`compute_reserve_regions`].
     pub aligned_ptr: usize,
-    /// `(start, len)` of the page-aligned head slice that should be returned
-    /// to the kernel via `munmap`, or `None` if no head trim is needed.
+    /// `(start, len)` of the page-aligned head slice that should be
+    /// released with `munmap`, or `None` if no head trim is needed.
     pub head_unmap: Option<(usize, usize)>,
-    /// `(start, len)` of the page-aligned tail slice that should be returned
-    /// to the kernel via `munmap`, or `None` if no tail trim is needed.
+    /// `(start, len)` of the page-aligned tail slice that should be
+    /// released with `munmap`, or `None` if no tail trim is needed.
     pub tail_unmap: Option<(usize, usize)>,
 }
 
@@ -666,7 +667,7 @@ pub fn compute_reserve_regions(
     mapping_len: usize,
     len: usize,
     align: usize,
-) -> ReserveRegions {
+) -> ReservedRegions {
     let aligned_ptr = mapping_ptr.next_multiple_of(align);
     let end = aligned_ptr + len;
     let mapping_end = mapping_ptr + mapping_len;
@@ -688,7 +689,7 @@ pub fn compute_reserve_regions(
         None
     };
 
-    ReserveRegions {
+    ReservedRegions {
         aligned_ptr,
         head_unmap,
         tail_unmap,
@@ -766,7 +767,7 @@ impl Protection {
 #[cfg(test)]
 mod reserve_regions_tests {
     extern crate std;
-    use super::{PAGE_SIZE, ReserveRegions, compute_reserve_regions};
+    use super::{PAGE_SIZE, ReservedRegions, compute_reserve_regions};
 
     /// The exact non-page-aligned PT_LOAD span observed for the prebuilt
     /// linux-x64 node.js binary in the `litebox-test` Docker image, which
@@ -778,7 +779,7 @@ mod reserve_regions_tests {
     /// (callers always pass `len + (align.max(PAGE_SIZE) - PAGE_SIZE)`),
     /// but we test the helper's tolerance to it anyway, because the kernel
     /// rounds up to whole pages and so should we.
-    fn assert_page_aligned(regions: &ReserveRegions) {
+    fn assert_page_aligned(regions: &ReservedRegions) {
         if let Some((addr, size)) = regions.head_unmap {
             assert_eq!(addr % PAGE_SIZE, 0, "head start not page-aligned");
             assert_eq!(size % PAGE_SIZE, 0, "head size not page-aligned");
