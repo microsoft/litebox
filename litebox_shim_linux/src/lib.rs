@@ -3120,110 +3120,21 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     BrokerInetRaw(&'a Arc<TypedFd<syscalls::broker_inet_raw::BrokerInetRawSubsystem>>),
 }
 
-/// Planned worker-exec fd-bridge decision for a `RawFdRef`.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) enum WorkerExecBridgeDecision {
-    Bridge(WorkerExecBridgeState),
-    NotNeeded(WorkerExecNoBridgeReason),
-}
-
-/// Explicit non-bridgeable outcomes so every `RawFdRef` variant records a decision.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) enum WorkerExecNoBridgeReason {
-    KernelFdInherited,
-    BrokerOnlyState,
-    NotWorkerExecBridgeable,
-}
-
-/// Closed worker-exec fd state carried through the runner bridge spec channel.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) enum WorkerExecBridgeState {
-    BrokerFile(BrokerFileBridgeState),
-    TcpListen(TcpListenBridgeState),
-    Signalfd(SignalfdBridgeState),
-    Timerfd(TimerfdBridgeState),
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct BrokerFileBridgeState {
-    pub(crate) handle_id: u64,
-    pub(crate) access_mode: u32,
-    pub(crate) status_flags: u32,
-    pub(crate) offset: u64,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct TcpListenBridgeState {
-    pub(crate) port: u16,
-    pub(crate) reuse_port: bool,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct SignalfdBridgeState {
-    pub(crate) handle_id: u64,
-    pub(crate) mask_bits: u64,
-    pub(crate) nonblock: bool,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct TimerfdBridgeState {
-    pub(crate) clock_id: i32,
-    pub(crate) flags: u32,
-    pub(crate) next_expiration_ns: u64,
-    pub(crate) interval_ns: u64,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl<'a, FS: ShimFS> RawFdRef<'a, FS> {
-    pub(crate) fn worker_exec_bridge_decision(&self) -> WorkerExecBridgeDecision {
-        match self {
-            RawFdRef::Fs(_fd) => todo!("encode BrokerFileBridgeState when fs fd is broker-backed"),
-            #[cfg(feature = "worker_local_inet")]
-            RawFdRef::Net(_fd) => {
-                todo!("encode TcpListenBridgeState when socket is a bridged listener")
-            }
-            RawFdRef::Eventfd(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::KernelFdInherited)
-            }
-            RawFdRef::Epoll(_fd) => WorkerExecBridgeDecision::NotNeeded(
-                WorkerExecNoBridgeReason::NotWorkerExecBridgeable,
-            ),
-            RawFdRef::Unix(_fd) => WorkerExecBridgeDecision::NotNeeded(
-                WorkerExecNoBridgeReason::NotWorkerExecBridgeable,
-            ),
-            RawFdRef::HostPassthroughFd(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::KernelFdInherited)
-            }
-            RawFdRef::BrokerPipe(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
-            }
-            RawFdRef::BrokerSocketPair(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
-            }
-            RawFdRef::BrokerTcpConn(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
-            }
-            RawFdRef::BrokerPty(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
-            }
-            RawFdRef::Signalfd(_fd) => {
-                todo!("encode SignalfdBridgeState from broker-backed signalfd")
-            }
-            RawFdRef::Inotify(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
-            }
-            RawFdRef::BrokerInetListener(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
-            }
-            RawFdRef::BrokerInetDgram(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
-            }
-            RawFdRef::BrokerInetRaw(_fd) => {
-                WorkerExecBridgeDecision::NotNeeded(WorkerExecNoBridgeReason::BrokerOnlyState)
-            }
-        }
-    }
-}
+// (Removed: pre-migration-gate scaffolding —
+// `WorkerExecBridgeDecision` / `WorkerExecBridgeState` /
+// `WorkerExecNoBridgeReason` / `BrokerFileBridgeState` /
+// `TcpListenBridgeState` / `SignalfdBridgeState` / `TimerfdBridgeState`
+// and `RawFdRef::worker_exec_bridge_decision`. These were added in
+// `e3d38772` ("design: scaffold generic worker-exec fd bridge", May
+// 2026) as an unused design sketch with `todo!()` arms, intended to
+// become the cross-fork-path policy gate. That role is now filled by
+// `litebox_shim_linux::syscalls::migration_policy::migration_policies_for`,
+// which is exhaustive over `RawFdRef`, wired into all three fork-path
+// entry points via `reference_gate`, and split across the three
+// concrete fork-path dimensions (`worker_exec`, `delayed_fork`,
+// `independent_fork`) rather than the single-dimension sketch this
+// scaffold was. The scaffold had zero callers and four `todo!()`
+// stubs at deletion time.)
 
 // This places size limits on maximum read/write sizes that might occur; it exists primarily to
 // prevent OOM due to the user asking for a _massive_ read or such at once. Keeping this too small

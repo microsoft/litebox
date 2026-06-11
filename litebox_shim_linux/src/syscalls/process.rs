@@ -47,6 +47,35 @@ type ExecVforkInfo = (
     Vec<(usize, usize, u64)>,
 );
 
+/// Compile-time-linked names for the per-subsystem emit loops inside
+/// [`Task::exec_on_remote_host`]. Each `BridgedByLoop` arm in
+/// [`crate::syscalls::migration_policy::migration_policies_for`] references
+/// one of these constants via a typed path (e.g.
+/// `super::process::EVENTFD_AND_TIMERFD_BRIDGE_LOOP_NAME`). Renaming or
+/// removing a constant without updating both the policy arm and the
+/// adjacent emit loop is rejected by `rustc` (unresolved path), which
+/// closes the "dishonest attestation" gap acknowledged in the
+/// migration-gate merge commit (`6566d5da`): previously a developer
+/// could declare `BridgedByLoop { loop_name: "<arbitrary string>" }`
+/// with no compile-time link to an actual emit loop.
+///
+/// **Invariant**: each constant lives immediately above (or beside) its
+/// emit loop in `exec_on_remote_host`. When you add/rename/remove an
+/// emit loop, update the constant here and the matching arm in
+/// `migration_policy.rs` in the same commit.
+pub(crate) const EVENTFD_AND_TIMERFD_BRIDGE_LOOP_NAME: &str = "eventfd_and_timerfd";
+pub(crate) const BROKER_PIPE_BRIDGE_LOOP_NAME: &str = "broker_pipe";
+pub(crate) const BROKER_PTY_BRIDGE_LOOP_NAME: &str = "broker_pty";
+pub(crate) const BROKER_SOCKETPAIR_BRIDGE_LOOP_NAME: &str = "broker_socketpair";
+pub(crate) const BROKER_TCP_CONN_BRIDGE_LOOP_NAME: &str = "broker_tcp_conn";
+pub(crate) const BROKER_INET_LISTENER_BRIDGE_LOOP_NAME: &str = "broker_inet_listener";
+pub(crate) const FS_BROKERFILE_BRIDGE_LOOP_NAME: &str = "fs_brokerfile";
+pub(crate) const SIGNALFD_BRIDGE_LOOP_NAME: &str = "signalfd";
+#[cfg(feature = "worker_local_inet")]
+pub(crate) const NETWORK_TCP_LISTEN_BRIDGE_LOOP_NAME: &str = "network_tcp_listen";
+pub(crate) const INOTIFY_BRIDGE_LOOP_NAME: &str = "inotify";
+pub(crate) const EPOLL_BRIDGE_LOOP_NAME: &str = "epoll";
+
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState {
     pub(crate) init_state: Cell<ThreadInitState>,
