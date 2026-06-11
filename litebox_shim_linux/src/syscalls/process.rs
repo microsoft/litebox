@@ -67,6 +67,8 @@ pub(crate) const EVENTFD_AND_TIMERFD_BRIDGE_LOOP_NAME: &str = "eventfd_and_timer
 pub(crate) const BROKER_PIPE_BRIDGE_LOOP_NAME: &str = "broker_pipe";
 pub(crate) const BROKER_PTY_BRIDGE_LOOP_NAME: &str = "broker_pty";
 pub(crate) const BROKER_SOCKETPAIR_BRIDGE_LOOP_NAME: &str = "broker_socketpair";
+pub(crate) const BROKER_SOCKET_DGRAM_BRIDGE_LOOP_NAME: &str = "broker_socket_dgram";
+pub(crate) const BROKER_SOCKET_SEQPACKET_BRIDGE_LOOP_NAME: &str = "broker_socket_seqpacket";
 pub(crate) const BROKER_TCP_CONN_BRIDGE_LOOP_NAME: &str = "broker_tcp_conn";
 pub(crate) const BROKER_INET_LISTENER_BRIDGE_LOOP_NAME: &str = "broker_inet_listener";
 pub(crate) const FS_BROKERFILE_BRIDGE_LOOP_NAME: &str = "fs_brokerfile";
@@ -3687,6 +3689,8 @@ impl<FS: ShimFS> Task<FS> {
                         | crate::RawFdRef::Unix(_)
                         | crate::RawFdRef::BrokerPipe(_)
                         | crate::RawFdRef::BrokerSocketPair(_)
+                        | crate::RawFdRef::BrokerSocketDgram(_)
+                        | crate::RawFdRef::BrokerSocketSeqPacket(_)
                         | crate::RawFdRef::BrokerTcpConn(_)
                         | crate::RawFdRef::BrokerPty(_)
                         | crate::RawFdRef::Signalfd(_)
@@ -6093,6 +6097,18 @@ impl<FS: ShimFS> Task<FS> {
                             // UnixSocket so the broker-handle metadata is emitted
                             // below and the restored worker can re-attach to the
                             // same broker `SocketPairState` endpoint.
+                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerSocketDgram(fd) => {
+                            // Broker-backed AF_UNIX SOCK_DGRAM. Same shape as
+                            // `BrokerSocketPair`: classify as UnixSocket so the
+                            // broker-handle metadata is emitted and the restored
+                            // worker reattaches by broker handle.
+                            (FdClass::UnixSocket, Some(fd.object_id()), None, None)
+                        }
+                        crate::RawFdRef::BrokerSocketSeqPacket(fd) => {
+                            // Broker-backed AF_UNIX SOCK_SEQPACKET. Same shape as
+                            // `BrokerSocketPair`.
                             (FdClass::UnixSocket, Some(fd.object_id()), None, None)
                         }
                         crate::RawFdRef::BrokerTcpConn(fd) => {
@@ -10661,6 +10677,8 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                 // the actual inherited/closed stdio behavior later.
                 crate::RawFdRef::BrokerPipe(_broker_pipe) => false,
                 crate::RawFdRef::BrokerSocketPair(_broker_socketpair) => false,
+                crate::RawFdRef::BrokerSocketDgram(_broker_socket_dgram) => false,
+                crate::RawFdRef::BrokerSocketSeqPacket(_broker_socket_seqpacket) => false,
                 crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => false,
                 crate::RawFdRef::BrokerPty(_broker_pty) => false,
                 crate::RawFdRef::Signalfd(_signalfd) => false,
@@ -10829,6 +10847,12 @@ fn worker_exec_input_binding<FS: ShimFS>(
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::BrokerSocketPair(_broker_pipe) => WorkerExecInputBinding::Close,
+            crate::RawFdRef::BrokerSocketDgram(_broker_socket_dgram) => {
+                WorkerExecInputBinding::Close
+            }
+            crate::RawFdRef::BrokerSocketSeqPacket(_broker_socket_seqpacket) => {
+                WorkerExecInputBinding::Close
+            }
             crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => WorkerExecInputBinding::Close,
 
             // BrokerPipeSubsystem (Phase C.3): close the worker's stdin slot
@@ -10984,6 +11008,12 @@ fn worker_exec_output_binding<FS: ShimFS>(
             // before exec; the --broker-fd-bridge install path will install
             // the broker pipe fd at the same slot during worker startup.
             crate::RawFdRef::BrokerSocketPair(_broker_pipe) => WorkerExecOutputBinding::Close,
+            crate::RawFdRef::BrokerSocketDgram(_broker_socket_dgram) => {
+                WorkerExecOutputBinding::Close
+            }
+            crate::RawFdRef::BrokerSocketSeqPacket(_broker_socket_seqpacket) => {
+                WorkerExecOutputBinding::Close
+            }
             crate::RawFdRef::BrokerTcpConn(_broker_tcp_conn) => WorkerExecOutputBinding::Close,
 
             // BrokerPipeSubsystem (Phase C.3): close the worker's output slot

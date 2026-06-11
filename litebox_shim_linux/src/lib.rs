@@ -3063,6 +3063,14 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
             drop(rds);
+            return Ok(f(RawFdRef::BrokerSocketDgram(&fd)));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(f(RawFdRef::BrokerSocketSeqPacket(&fd)));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
             return Ok(f(RawFdRef::BrokerTcpConn(&fd)));
         }
         if let Ok(fd) = rds.fd_from_raw_integer(fd) {
@@ -3109,6 +3117,10 @@ pub(crate) enum RawFdRef<'a, FS: ShimFS> {
     HostPassthroughFd(&'a Arc<TypedFd<syscalls::host_passthrough_fd::HostPassthroughFd>>),
     BrokerPipe(&'a Arc<TypedFd<syscalls::broker_pipe::BrokerPipeSubsystem>>),
     BrokerSocketPair(&'a Arc<TypedFd<syscalls::broker_socketpair::BrokerSocketPairSubsystem>>),
+    BrokerSocketDgram(&'a Arc<TypedFd<syscalls::broker_socket_dgram::BrokerSocketDgramSubsystem>>),
+    BrokerSocketSeqPacket(
+        &'a Arc<TypedFd<syscalls::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>>,
+    ),
     BrokerTcpConn(&'a Arc<TypedFd<syscalls::broker_tcp_conn::BrokerTcpConnSubsystem>>),
     BrokerPty(&'a Arc<TypedFd<syscalls::broker_pty::BrokerPtySubsystem>>),
     Signalfd(&'a Arc<TypedFd<syscalls::signalfd::SignalfdSubsystem>>),
@@ -3377,6 +3389,12 @@ impl<FS: ShimFS> Task<FS> {
                 crate::RawFdRef::BrokerPipe(_fd) => alloc::format!("raw={raw_fd} broker_pipe"),
                 RawFdRef::BrokerSocketPair(_fd) => {
                     alloc::format!("raw={raw_fd} broker_socketpair")
+                }
+                crate::RawFdRef::BrokerSocketDgram(_fd) => {
+                    alloc::format!("raw={raw_fd} broker_socket_dgram")
+                }
+                crate::RawFdRef::BrokerSocketSeqPacket(_fd) => {
+                    alloc::format!("raw={raw_fd} broker_socket_seqpacket")
                 }
                 crate::RawFdRef::BrokerTcpConn(_fd) => {
                     alloc::format!("raw={raw_fd} broker_tcp_conn")
