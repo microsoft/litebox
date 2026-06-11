@@ -9265,6 +9265,116 @@ impl<FS: ShimFS> Task<FS> {
                     ));
                 }
             }
+
+            // Wave-cleanup-2 epoll cluster: migrate inherited Inotify
+            // fds across cross-binary-type exec. Mirrors the signalfd
+            // block above (broker-backed handle id + nonblock bit).
+            // The shim-side `InotifyFile` already owns a broker
+            // handle; we `dup_handle` so the worker's reattach
+            // doesn't race with parent-side close, and register the
+            // transit ref in `broker_eventfd_transit_release` (same
+            // post-exec lifetime as signalfd — released only on
+            // spawn failure; the worker's broker connection cleanup
+            // balances the dup on normal exit).
+            let inotify_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::inotify::InotifySubsystem>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::inotify::InotifySubsystem>(raw_fd)
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in inotify_fds {
+                let inotify_provider = super::inotify::broker_inotify_provider();
+                let dt_local = self.global.litebox.descriptor_table();
+                let info = dt_local.with_entry(&typed, |ino: &super::inotify::InotifyFile| {
+                    (
+                        ino.handle(),
+                        ino.get_status().contains(litebox::fs::OFlags::NONBLOCK),
+                    )
+                });
+                drop(dt_local);
+                if let (Some(provider), Some((handle_id, nonblock))) = (inotify_provider, info) {
+                    use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                    let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                        alloc::sync::Arc::clone(&provider) as _;
+                    if releaser.dup_handle(handle_id).is_err() {
+                        continue;
+                    }
+                    broker_eventfd_specs.push(alloc::format!(
+                        "{raw_fd}:inotify:{handle_id}:{}",
+                        u8::from(nonblock),
+                    ));
+                    broker_eventfd_transit_release.push((releaser, handle_id));
+                }
+            }
+
+            // Wave-cleanup-2 epoll cluster: migrate inherited Epoll
+            // fds. Unlike every other subsystem here, epoll has no
+            // broker handle — its interest list is shim-local. We
+            // snapshot the interest list as `(target_fd, events,
+            // data)` tuples (see `EpollFile::snapshot_interests`)
+            // and the worker rebuilds a fresh `EpollFile` and
+            // re-adds each interest via `epoll_ctl(EPOLL_CTL_ADD)`.
+            //
+            // INVARIANT: this block must come LAST in the bridge
+            // spec emission order. The runner installs specs in
+            // order, and epoll's `EpollDescriptor::try_from` looks
+            // up each interest's target fd in the worker's
+            // descriptor store — every other subsystem's install
+            // must complete first.
+            let epoll_fds: alloc::vec::Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::epoll::EpollSubsystem<FS>>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut out = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
+                    {
+                        out.push((raw_fd, typed));
+                    }
+                }
+                out
+            };
+            for (raw_fd, typed) in epoll_fds {
+                let dt_local = self.global.litebox.descriptor_table();
+                let entries = dt_local
+                    .with_entry(&typed, |ep: &super::epoll::EpollFile<FS>| {
+                        ep.snapshot_interests()
+                    })
+                    .unwrap_or_default();
+                drop(dt_local);
+                let mut spec = alloc::format!("{raw_fd}:epoll");
+                if !entries.is_empty() {
+                    spec.push(':');
+                    let mut first = true;
+                    for (tfd, events, data) in entries {
+                        if !first {
+                            spec.push(',');
+                        }
+                        first = false;
+                        spec.push_str(&alloc::format!("{tfd}_{events}_{data}"));
+                    }
+                }
+                broker_eventfd_specs.push(spec);
+            }
         }
 
         // Resolve the worker load path through the current guest filesystem so

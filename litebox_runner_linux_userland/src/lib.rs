@@ -504,6 +504,78 @@ fn install_broker_fd_bridge_spec<FS: litebox_shim_linux::ShimFS>(
             .map_err(|err| anyhow!("broker-fd-bridge: signalfd {spec:?}: {err:?}"));
     }
 
+    // Wave-cleanup-2 epoll cluster: inherited inotify fd across
+    // cross-binary-type exec. Mirrors the signalfd spec shape (kind
+    // + broker handle id + nonblock bit). Parent dup_handle'd the
+    // broker handle in `exec_on_remote_host`; this worker re-attaches
+    // by constructing a fresh `InotifyFile` over the same handle id.
+    // Spec: `fd:inotify:handle_id:nb_0_or_1`.
+    if parts.get(1) == Some(&"inotify") && parts.len() == 4 {
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let handle_id: u64 = parts[2]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad inotify handle {:?}: {e}", parts[2]))?;
+        let nonblock = match parts[3] {
+            "0" => false,
+            "1" => true,
+            other => anyhow::bail!("broker-fd-bridge: bad inotify nonblock flag {other:?}"),
+        };
+        return entrypoints
+            .install_inotify_bridge_fd(guest_fd, handle_id, nonblock)
+            .map_err(|err| anyhow!("broker-fd-bridge: inotify {spec:?}: {err:?}"));
+    }
+
+    // Wave-cleanup-2 epoll cluster: inherited epoll instance across
+    // cross-binary-type exec. Unlike other broker-backed fds, epoll
+    // has no broker handle — its state is shim-local. The parent
+    // snapshots its interest list (see `EpollFile::snapshot_interests`)
+    // and ships it as a sequence of `target_fd_events_data` entries
+    // separated by `,`. Field separator within an entry is `_` so we
+    // don't clash with the outer `:` separator.
+    //
+    // Spec: `fd:epoll[:entry1[,entry2,...]]`
+    //   entry = `target_fd_events_data` (events and data are decimal)
+    //
+    // Two-field (no entries) shape `fd:epoll` is allowed for empty
+    // interest lists.
+    if parts.get(1) == Some(&"epoll") && (parts.len() == 2 || parts.len() == 3) {
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|e| anyhow!("broker-fd-bridge: bad fd {:?}: {e}", parts[0]))?;
+        let mut entries: Vec<(u32, u32, u64)> = Vec::new();
+        if let Some(entries_str) = parts.get(2)
+            && !entries_str.is_empty()
+        {
+            for entry in entries_str.split(',') {
+                let fields: Vec<&str> = entry.split('_').collect();
+                if fields.len() != 3 {
+                    anyhow::bail!("broker-fd-bridge: bad epoll entry {entry:?}");
+                }
+                let target_fd: u32 = fields[0].parse().map_err(|e| {
+                    anyhow!("broker-fd-bridge: bad epoll entry fd {:?}: {e}", fields[0])
+                })?;
+                let events: u32 = fields[1].parse().map_err(|e| {
+                    anyhow!(
+                        "broker-fd-bridge: bad epoll entry events {:?}: {e}",
+                        fields[1]
+                    )
+                })?;
+                let data: u64 = fields[2].parse().map_err(|e| {
+                    anyhow!(
+                        "broker-fd-bridge: bad epoll entry data {:?}: {e}",
+                        fields[2]
+                    )
+                })?;
+                entries.push((target_fd, events, data));
+            }
+        }
+        return entrypoints
+            .install_epoll_bridge_fd(guest_fd, &entries)
+            .map_err(|err| anyhow!("broker-fd-bridge: epoll {spec:?}: {err:?}"));
+    }
+
     if parts.get(1) == Some(&"brokerfile") && parts.len() == 5 {
         let guest_fd: usize = parts[0]
             .parse()
