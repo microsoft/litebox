@@ -5080,6 +5080,16 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
+        // wave-cleanup-2 fork-snapshot epoll extension: emit
+        // `--broker-fd-bridge` specs for Epoll and Inotify fds so the
+        // worker reconstructs their state after snapshot restore.
+        // MUST run after every other spec push (epoll bridge install
+        // requires all other subsystem installs to have completed).
+        self.collect_epoll_inotify_bridge_specs(
+            &mut broker_fd_bridge_specs,
+            &mut broker_fd_bridge_transit_release,
+        );
+
         let snapshot = super::fork_snapshot::ForkSnapshot {
             identity,
             process_wide,
@@ -5511,6 +5521,25 @@ impl<FS: ShimFS> Task<FS> {
             todo!("ENOSYS audit: true fork rejected snapshot state; reachable but not implemented");
         }
 
+        // wave-cleanup-2 fork-snapshot epoll extension: emit
+        // `--broker-fd-bridge` specs for Epoll and Inotify fds so the
+        // worker reconstructs their state after snapshot restore.
+        // True-fork has no other broker_fd_bridge specs (delayed-fork
+        // commits its pipe/socket bridges first), so this is the only
+        // population path for the snapshot-restore worker's spec list.
+        let mut true_fork_broker_fd_bridge_specs: alloc::vec::Vec<alloc::string::String> =
+            alloc::vec::Vec::new();
+        let mut true_fork_broker_fd_bridge_transit_release: alloc::vec::Vec<(
+            alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            >,
+            u64,
+        )> = alloc::vec::Vec::new();
+        self.collect_epoll_inotify_bridge_specs(
+            &mut true_fork_broker_fd_bridge_specs,
+            &mut true_fork_broker_fd_bridge_transit_release,
+        );
+
         let snapshot = super::fork_snapshot::ForkSnapshot {
             identity,
             process_wide,
@@ -5581,7 +5610,7 @@ impl<FS: ShimFS> Task<FS> {
             &snapshot_bytes,
             stdio,
             &[],
-            &[],
+            &true_fork_broker_fd_bridge_specs,
             ack_pid,
         ) {
             Ok(pid) => pid,
@@ -5597,6 +5626,9 @@ impl<FS: ShimFS> Task<FS> {
                 super::guest_pid::try_release_broker_guest_pid(ack_pid);
                 for transit in _true_fork_fd_token_transit.drain(..) {
                     let _ = transit.client.release(transit.token_id);
+                }
+                for (releaser, handle_id) in true_fork_broker_fd_bridge_transit_release.drain(..) {
+                    releaser.release(handle_id);
                 }
                 cleanup(self, child_as_id, child_process_id);
                 return Err(Errno::ENOMEM);
@@ -5622,8 +5654,18 @@ impl<FS: ShimFS> Task<FS> {
             for transit in _true_fork_fd_token_transit.drain(..) {
                 let _ = transit.client.release(transit.token_id);
             }
+            for (releaser, handle_id) in true_fork_broker_fd_bridge_transit_release.drain(..) {
+                releaser.release(handle_id);
+            }
             cleanup(self, child_as_id, child_process_id);
             return Err(Errno::ENOMEM);
+        }
+
+        // Ack success: worker has installed every spec we shipped (each
+        // spec's handle has been `dup_handle`'d into the worker's
+        // connection). Safe to drop the parent's transit dup ref.
+        for (releaser, handle_id) in true_fork_broker_fd_bridge_transit_release.drain(..) {
+            releaser.release(handle_id);
         }
 
         #[cfg(feature = "trace_syscalls")]
@@ -6108,23 +6150,29 @@ impl<FS: ShimFS> Task<FS> {
                 // Linux fork semantics); broker-backed reattaches the same
                 // broker handle.
                 FdClass::EventFd | FdClass::Signalfd | FdClass::InetListener => {}
+                // wave-cleanup-2 fork-snapshot epoll extension: Epoll and
+                // Inotify are NOT carried by the snapshot's FdEntrySnapshot
+                // wire format. Instead, the caller of `snapshot_fd_table`
+                // (`commit_delayed_fork` / `true_fork`) emits matching
+                // `--broker-fd-bridge fd:epoll:...` / `fd:inotify:...`
+                // specs via `collect_epoll_inotify_bridge_specs`, mirroring
+                // the worker-exec migration shape added in 5387acc3. The
+                // snapshot's class=Epoll/Inotify FdEntrySnapshot is benign
+                // on restore: every restore-loop filters by class, none of
+                // them match Epoll/Inotify, so the slot stays empty until
+                // the matching bridge-spec install populates it. This
+                // ordering — snapshot-restore loops first, then bridge-spec
+                // install — also satisfies the invariant that epoll bridge
+                // installation runs after every other subsystem's install
+                // (see `install_epoll_bridge_fd` doc).
+                FdClass::Epoll | FdClass::Inotify => {}
                 // Rejected — grouped by *why* this fd class can't migrate
                 // across worker hosts. Each variant is named explicitly so
                 // that adding a new `FdClass` variant fails to compile here
                 // and forces an explicit accept/reject decision. No
                 // catch-all arm by design.
                 //
-                // (a) By-design per-process kernel state. These are NOT
-                //     future broker-host candidates: the kernel object
-                //     (epoll interest set, inotify watch list) is inherently
-                //     per-process and cross-worker sharing would require a
-                //     different abstraction. The shared-AS vfork fall-through
-                //     (CoW-protected as of 5241b07c) is the intended handoff
-                //     path, not a workaround.
-                FdClass::Epoll | FdClass::Inotify => {
-                    reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
-                }
-                // (b) Legacy `worker_local_inet` smoltcp socket. Phase F.3
+                // (a) Legacy `worker_local_inet` smoltcp socket. Phase F.3
                 //     moved inet to broker-held (`BrokerInetListener`,
                 //     `BrokerTcpConn`, `BrokerInetDgram`); on default
                 //     `platform_linux_userland` this variant is cfg-gated
@@ -6134,7 +6182,7 @@ impl<FS: ShimFS> Task<FS> {
                 FdClass::NetworkSocket => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
-                // (c) Broker-hosted raw IP socket. Migration support is not
+                // (b) Broker-hosted raw IP socket. Migration support is not
                 //     wired up yet; lift this arm into the accept block
                 //     once cross-worker raw-socket state preservation lands.
                 FdClass::BrokerInetRaw => {
@@ -6752,6 +6800,137 @@ impl<FS: ShimFS> Task<FS> {
             entries,
             open_file_descriptions,
             stdio_object_ids,
+        }
+    }
+
+    /// wave-cleanup-2 fork-snapshot epoll extension: collect
+    /// `--broker-fd-bridge` specs that migrate inherited Epoll and
+    /// Inotify fds across a delayed-fork or true-fork commit.
+    ///
+    /// The snapshot/restore path doesn't carry epoll interest lists
+    /// or inotify broker handles in the `FdTableSnapshot` wire format
+    /// — instead, the caller forwards the returned specs to
+    /// `spawn_worker_host_for_fork_restore`'s `broker_fd_bridge_specs`
+    /// parameter, where the runner installs them via
+    /// `install_broker_fd_bridge_spec` after the snapshot-restore
+    /// phase completes. This reuses the shape that
+    /// `exec_on_remote_host` ships in 5387acc3 (the worker-exec
+    /// counterpart).
+    ///
+    /// INVARIANT: epoll bridge specs must be installed AFTER every
+    /// other fd subsystem's install (the spec's per-entry
+    /// `EpollDescriptor::try_from` looks up target fds in the
+    /// worker's descriptor store). The runner installs the
+    /// `broker_fd_bridge_specs` vector in order, so the caller must
+    /// invoke this helper LAST in spec emission (and within this
+    /// helper, inotify is emitted before epoll for the same reason
+    /// in case any interest targets the inotify fd).
+    ///
+    /// Inotify transit releases are pushed to `transit_release` so
+    /// the caller balances them after the worker acks (see existing
+    /// `broker_fd_bridge_transit_release` lifetime pattern in
+    /// `commit_delayed_fork`). Epoll has no broker handle so it does
+    /// not contribute to `transit_release`.
+    fn collect_epoll_inotify_bridge_specs(
+        &self,
+        specs: &mut alloc::vec::Vec<alloc::string::String>,
+        transit_release: &mut alloc::vec::Vec<(
+            alloc::sync::Arc<
+                dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+            >,
+            u64,
+        )>,
+    ) {
+        // Inotify first: mirror the signalfd spec shape (broker handle id +
+        // nonblock bit). The shim-side `InotifyFile` already owns a broker
+        // handle; `dup_handle` so the child's reattach doesn't race with
+        // parent-side close. Lifetime: released only on spawn failure; on
+        // worker ack, the child's broker connection cleanup balances the
+        // dup. The caller's `transit_release` plumbing handles both edges.
+        let inotify_fds: alloc::vec::Vec<(
+            usize,
+            alloc::sync::Arc<litebox::fd::TypedFd<super::inotify::InotifySubsystem>>,
+        )> = {
+            let files = self.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            let mut out = alloc::vec::Vec::new();
+            for raw_fd in rds.iter_alive() {
+                if let Ok(typed) =
+                    rds.fd_from_raw_integer::<super::inotify::InotifySubsystem>(raw_fd)
+                {
+                    out.push((raw_fd, typed));
+                }
+            }
+            out
+        };
+        for (raw_fd, typed) in inotify_fds {
+            let inotify_provider = super::inotify::broker_inotify_provider();
+            let dt_local = self.global.litebox.descriptor_table();
+            let info = dt_local.with_entry(&typed, |ino: &super::inotify::InotifyFile| {
+                (
+                    ino.handle(),
+                    ino.get_status().contains(litebox::fs::OFlags::NONBLOCK),
+                )
+            });
+            drop(dt_local);
+            if let (Some(provider), Some((handle_id, nonblock))) = (inotify_provider, info) {
+                use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+                let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                    alloc::sync::Arc::clone(&provider) as _;
+                if releaser.dup_handle(handle_id).is_err() {
+                    continue;
+                }
+                specs.push(alloc::format!(
+                    "{raw_fd}:inotify:{handle_id}:{}",
+                    u8::from(nonblock),
+                ));
+                transit_release.push((releaser, handle_id));
+            }
+        }
+
+        // Epoll last: snapshot the per-instance interest list as
+        // `(target_fd, events, data)` tuples (see
+        // `EpollFile::snapshot_interests`). The worker rebuilds a
+        // fresh `EpollFile` and re-adds each interest via
+        // `epoll_ctl(EPOLL_CTL_ADD)`. Epoll has no broker handle so
+        // there's no transit_release entry.
+        let epoll_fds: alloc::vec::Vec<(
+            usize,
+            alloc::sync::Arc<litebox::fd::TypedFd<super::epoll::EpollSubsystem<FS>>>,
+        )> = {
+            let files = self.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            let mut out = alloc::vec::Vec::new();
+            for raw_fd in rds.iter_alive() {
+                if let Ok(typed) =
+                    rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
+                {
+                    out.push((raw_fd, typed));
+                }
+            }
+            out
+        };
+        for (raw_fd, typed) in epoll_fds {
+            let dt_local = self.global.litebox.descriptor_table();
+            let entries = dt_local
+                .with_entry(&typed, |ep: &super::epoll::EpollFile<FS>| {
+                    ep.snapshot_interests()
+                })
+                .unwrap_or_default();
+            drop(dt_local);
+            let mut spec = alloc::format!("{raw_fd}:epoll");
+            if !entries.is_empty() {
+                spec.push(':');
+                let mut first = true;
+                for (tfd, events, data) in entries {
+                    if !first {
+                        spec.push(',');
+                    }
+                    first = false;
+                    spec.push_str(&alloc::format!("{tfd}_{events}_{data}"));
+                }
+            }
+            specs.push(spec);
         }
     }
 
