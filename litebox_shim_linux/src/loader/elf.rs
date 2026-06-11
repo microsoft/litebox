@@ -88,11 +88,11 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
             )?
             .as_usize();
 
-        // See `compute_reserve_regions` for why the trim regions must be
+        // See `compute_reserved_regions` for why the trim regions must be
         // computed in page units: `len` (an ELF's `max_vaddr - min_vaddr`
         // span) is in general not page-aligned, and `munmap` rejects
         // non-page-aligned start addresses with EINVAL.
-        let regions = litebox_common_linux::loader::compute_reserve_regions(
+        let regions = litebox_common_linux::loader::compute_reserved_regions(
             mapping_ptr,
             mapping_len,
             len,

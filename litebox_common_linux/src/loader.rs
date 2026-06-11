@@ -622,12 +622,12 @@ pub trait MapMemory {
 /// The result of computing the head/tail trim regions for an over-sized
 /// anonymous reservation made by [`MapMemory::reserve`].
 ///
-/// See [`compute_reserve_regions`] for details.
+/// See [`compute_reserved_regions`] for details.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct ReservedRegions {
     /// Base address of the requested `len` bytes inside the over-sized
     /// reservation, aligned up to the `align` argument passed to
-    /// [`compute_reserve_regions`].
+    /// [`compute_reserved_regions`].
     pub aligned_ptr: usize,
     /// `(start, len)` of the page-aligned head slice that should be
     /// released with `munmap`, or `None` if no head trim is needed.
@@ -662,7 +662,7 @@ pub struct ReservedRegions {
 /// PT_LOAD span of `0x6403D68`), the kernel rejected the `munmap` with
 /// `EINVAL`, surfacing as `execve` → `ENOEXEC` for any guest fork+exec
 /// of node.
-pub fn compute_reserve_regions(
+pub fn compute_reserved_regions(
     mapping_ptr: usize,
     mapping_len: usize,
     len: usize,
@@ -767,7 +767,7 @@ impl Protection {
 #[cfg(test)]
 mod reserve_regions_tests {
     extern crate std;
-    use super::{PAGE_SIZE, ReservedRegions, compute_reserve_regions};
+    use super::{PAGE_SIZE, ReservedRegions, compute_reserved_regions};
 
     /// The exact non-page-aligned PT_LOAD span observed for the prebuilt
     /// linux-x64 node.js binary in the `litebox-test` Docker image, which
@@ -798,7 +798,7 @@ mod reserve_regions_tests {
         let len = 0x10_0000; // 1 MiB, page-aligned
         let align = PAGE_SIZE;
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
-        let r = compute_reserve_regions(mapping_ptr, mapping_len, len, align);
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
         assert_eq!(r.aligned_ptr, mapping_ptr);
         assert_eq!(r.head_unmap, None);
         assert_eq!(r.tail_unmap, None);
@@ -814,7 +814,7 @@ mod reserve_regions_tests {
         let mapping_len = len + (align - PAGE_SIZE);
         // mapping_ptr page-aligned but not align-aligned.
         let mapping_ptr = 0x4000_0000 + PAGE_SIZE;
-        let r = compute_reserve_regions(mapping_ptr, mapping_len, len, align);
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
         assert_eq!(r.aligned_ptr % align, 0);
         assert!(r.aligned_ptr >= mapping_ptr);
         assert!(r.aligned_ptr + len <= mapping_ptr + mapping_len);
@@ -837,7 +837,7 @@ mod reserve_regions_tests {
         let align = PAGE_SIZE;
         let len = NODE_LEN;
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
-        let r = compute_reserve_regions(mapping_ptr, mapping_len, len, align);
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
         assert_eq!(r.aligned_ptr, mapping_ptr);
         assert_eq!(r.head_unmap, None);
         assert_eq!(r.tail_unmap, None);
@@ -872,7 +872,7 @@ mod reserve_regions_tests {
             "old tail size happened to be page-aligned",
         );
 
-        let r = compute_reserve_regions(mapping_ptr, mapping_len, len, align);
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
         assert_eq!(r.aligned_ptr, old_aligned_ptr);
         let (tail_start, tail_size) = r.tail_unmap.expect("tail trim expected with large align");
         // Tail covers everything from the page after the requested end to
@@ -895,7 +895,7 @@ mod reserve_regions_tests {
         let mapping_len = page_aligned_len + (align - PAGE_SIZE);
         for offset_pages in 0..8 {
             let mapping_ptr = 0x4000_0000 + offset_pages * PAGE_SIZE;
-            let r = compute_reserve_regions(mapping_ptr, mapping_len, page_aligned_len, align);
+            let r = compute_reserved_regions(mapping_ptr, mapping_len, page_aligned_len, align);
             assert_eq!(r.aligned_ptr % align, 0);
             let head = r.head_unmap.map_or(0, |(_, s)| s);
             let tail = r.tail_unmap.map_or(0, |(_, s)| s);
