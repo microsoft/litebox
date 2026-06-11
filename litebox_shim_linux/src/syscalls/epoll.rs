@@ -109,6 +109,8 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             crate::RawFdRef::BrokerInetDgram(fd) => {
                 Ok(EpollDescriptor::BrokerInetDgram(Arc::clone(fd)))
             }
+            crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+            crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerInetRaw(fd) => {
                 Ok(EpollDescriptor::BrokerInetRaw(Arc::clone(fd)))
             }

@@ -257,6 +257,24 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
+        // Broker-backed AF_UNIX SOCK_DGRAM. Emit-side `dup_handle` +
+        // bridge spec; same shape as `BrokerSocketPair`.
+        RawFdRef::BrokerSocketDgram(_) => PerFdMigrationPolicies {
+            worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
+                loop_name: process::BROKER_SOCKET_DGRAM_BRIDGE_LOOP_NAME,
+            },
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
+        },
+        // Broker-backed AF_UNIX SOCK_SEQPACKET. Emit-side `dup_handle`
+        // + bridge spec; same shape as `BrokerSocketPair`.
+        RawFdRef::BrokerSocketSeqPacket(_) => PerFdMigrationPolicies {
+            worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
+                loop_name: process::BROKER_SOCKET_SEQPACKET_BRIDGE_LOOP_NAME,
+            },
+            delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
+            independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
+        },
         RawFdRef::BrokerTcpConn(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
                 loop_name: process::BROKER_TCP_CONN_BRIDGE_LOOP_NAME,
@@ -347,6 +365,8 @@ mod tests {
             process::EPOLL_BRIDGE_LOOP_NAME,
             process::BROKER_PIPE_BRIDGE_LOOP_NAME,
             process::BROKER_SOCKETPAIR_BRIDGE_LOOP_NAME,
+            process::BROKER_SOCKET_DGRAM_BRIDGE_LOOP_NAME,
+            process::BROKER_SOCKET_SEQPACKET_BRIDGE_LOOP_NAME,
             process::BROKER_TCP_CONN_BRIDGE_LOOP_NAME,
             process::BROKER_PTY_BRIDGE_LOOP_NAME,
             process::SIGNALFD_BRIDGE_LOOP_NAME,

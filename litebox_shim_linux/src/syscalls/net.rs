@@ -3205,6 +3205,8 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 handle.with_entry(|entry| entry.shutdown(how))
             }
+            crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+            crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerInetRaw(_) => Err(Errno::EINVAL),
             crate::RawFdRef::BrokerPty(_) => Err(Errno::ENOTSOCK),
             crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Err(Errno::ENOTSOCK),
@@ -3724,6 +3726,12 @@ impl<FS: ShimFS> Task<FS> {
                             Ok(true)
                         }
                         crate::RawFdRef::BrokerInetDgram(_) => Ok(false),
+                        crate::RawFdRef::BrokerSocketDgram(_)
+                        | crate::RawFdRef::BrokerSocketSeqPacket(_) => {
+                            // Broker socket dgram/seqpacket are not broker-token-
+                            // transferable over SCM yet (same status as BrokerSocketPair).
+                            Ok(false)
+                        }
                         crate::RawFdRef::Signalfd(_) | crate::RawFdRef::Inotify(_) => Ok(false),
                     }
                 })??;
