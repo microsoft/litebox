@@ -151,6 +151,7 @@ impl InheritSubsystem {
     /// the structural-coverage gap caught by the wave-cleanup-2
     /// epoll/inotify regression cannot be re-introduced silently in
     /// the test-discovery layer.
+    #[cfg(test)]
     const fn discriminant_index(self) -> usize {
         match self {
             Self::TcpListen => 0,
@@ -170,6 +171,7 @@ impl InheritSubsystem {
 
     /// Must equal the number of arms in `discriminant_index`. Verified
     /// by the unit test below.
+    #[cfg(test)]
     const EXPECTED_VARIANT_COUNT: usize = 12;
 
     const fn id(self) -> &'static str {
