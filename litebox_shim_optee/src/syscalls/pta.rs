@@ -13,16 +13,16 @@ use litebox::platform::{
 };
 use litebox::utils::TruncateExt;
 use litebox_common_optee::{
-    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, TeeParamType, TeeResult, TeeUuid, UteeParams,
+    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, TaFlags, TeeParamType, TeeResult, TeeUuid, UteeParams,
 };
 use num_enum::TryFromPrimitive;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SystemPta;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum PseudoTa {
     System(SystemPta),
 }
@@ -48,6 +48,7 @@ impl PseudoTa {
         cmd_id: u32,
         params: &UteeParams,
     ) -> Result<(), TeeResult> {
+        let _busy = task.enter_pta(self)?;
         match self {
             Self::System(_) => SystemPta::invoke_command(task, cmd_id, params),
         }
@@ -57,6 +58,27 @@ impl PseudoTa {
         match self {
             Self::System(_) => SystemPta::close_session(task, session_id),
         }
+    }
+
+    fn flags(self) -> TaFlags {
+        match self {
+            Self::System(_) => SystemPta::FLAGS,
+        }
+    }
+}
+
+const PTA_DEFAULT_FLAGS: TaFlags = TaFlags::SINGLE_INSTANCE
+    .union(TaFlags::MULTI_SESSION)
+    .union(TaFlags::INSTANCE_KEEP_ALIVE);
+
+struct PtaBusyGuard<'a> {
+    task: &'a Task,
+    pta: PseudoTa,
+}
+
+impl Drop for PtaBusyGuard<'_> {
+    fn drop(&mut self) {
+        self.task.global.pta_busy.lock().remove(&self.pta);
     }
 }
 
@@ -105,11 +127,26 @@ pub(crate) enum PtaSystemCommandId {
 type HmacSha256 = Hmac<Sha256>;
 
 impl Task {
+    fn enter_pta(&self, pta: PseudoTa) -> Result<Option<PtaBusyGuard<'_>>, TeeResult> {
+        if pta.flags().contains(TaFlags::CONCURRENT) {
+            return Ok(None);
+        }
+
+        let mut busy = self.global.pta_busy.lock();
+        if busy.contains(&pta) {
+            return Err(TeeResult::Busy);
+        }
+
+        busy.insert(pta);
+        Ok(Some(PtaBusyGuard { task: self, pta }))
+    }
+
     pub(crate) fn open_pta_session(
         &self,
         pta: PseudoTa,
         params: &UteeParams,
     ) -> Result<u32, TeeResult> {
+        let _busy = self.enter_pta(pta)?;
         let mut pta_sessions = self.pta_sessions.lock();
         // OP-TEE OS permits multiple sessions to the same PTA. We intentionally
         // cap this shim at one session per PTA per TA task to prevent a TA
@@ -153,6 +190,8 @@ impl Task {
 }
 
 impl SystemPta {
+    const FLAGS: TaFlags = PTA_DEFAULT_FLAGS.union(TaFlags::CONCURRENT);
+
     const UUID: TeeUuid = TeeUuid {
         time_low: 0x3a2f_8978,
         time_mid: 0x5dc0,

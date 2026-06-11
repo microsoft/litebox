@@ -14,7 +14,7 @@ use aes::{Aes128, Aes192, Aes256};
 use alloc::{sync::Arc, vec};
 use core::cell::Cell;
 use ctr::Ctr128BE;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use litebox::{
     LiteBox,
     mm::{PageManager, linux::PAGE_SIZE},
@@ -149,6 +149,7 @@ impl OpteeShimBuilder {
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
             ta_uuid_map: TaUuidMap::new(),
+            pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
         });
         OpteeShim(global)
     }
@@ -164,6 +165,8 @@ struct GlobalState {
     _litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: TaUuidMap,
+    /// Non-concurrent PTAs currently entered in this shim instance.
+    pta_busy: spin::mutex::SpinMutex<HashSet<PseudoTa>>,
 }
 
 impl GlobalState {
