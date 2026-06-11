@@ -66,6 +66,7 @@
 //! The same is required for [`DelayedForkPolicy`] and
 //! [`IndependentForkPolicy`].
 
+use crate::syscalls::process;
 use crate::{RawFdRef, ShimFS};
 
 /// Per-subsystem migration policy decisions, one record per fork
@@ -88,11 +89,18 @@ pub(crate) struct PerFdMigrationPolicies {
 pub(crate) enum WorkerExecMigrationPolicy {
     /// The corresponding `exec_on_remote_host` loop emits a
     /// `--broker-fd-bridge` spec so the new worker re-attaches.
-    /// The string names the emit loop for traceability — if you
-    /// rename a loop, update the label here.
+    ///
+    /// `loop_name` **must** be a `pub(crate) const &str` exported by
+    /// [`crate::syscalls::process`] (e.g.
+    /// [`crate::syscalls::process::EPOLL_BRIDGE_LOOP_NAME`]). The typed
+    /// path ensures that renaming or removing the emit loop without
+    /// updating this arm fails to compile (unresolved path) — closing
+    /// the "dishonest attestation" gap where a hand-typed string could
+    /// claim a loop that does not exist.
     BridgedByLoop {
-        /// Short identifier for the emit block (e.g. `"signalfd"`,
-        /// `"broker_pipe"`, `"epoll"`).
+        /// Short identifier for the emit block. Must reference one of
+        /// the `*_BRIDGE_LOOP_NAME` constants in
+        /// [`crate::syscalls::process`].
         loop_name: &'static str,
     },
     /// Not bridged across exec. The fd is intentionally dropped (in
@@ -177,7 +185,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
         // `fs_fds` brokerfile loop in `exec_on_remote_host`.
         RawFdRef::Fs(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
-                loop_name: "fs_brokerfile",
+                loop_name: process::FS_BROKERFILE_BRIDGE_LOOP_NAME,
             },
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::KernelInherits,
@@ -188,7 +196,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
         #[cfg(feature = "worker_local_inet")]
         RawFdRef::Net(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
-                loop_name: "network_tcp_listen",
+                loop_name: process::NETWORK_TCP_LISTEN_BRIDGE_LOOP_NAME,
             },
             delayed_fork: DelayedForkPolicy::CfgOnlyVariant,
             independent_fork: IndependentForkPolicy::CfgOnlyVariant,
@@ -198,7 +206,7 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
         // timerfd snapshot respectively.
         RawFdRef::Eventfd(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
-                loop_name: "eventfd_and_timerfd",
+                loop_name: process::EVENTFD_AND_TIMERFD_BRIDGE_LOOP_NAME,
             },
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
@@ -207,7 +215,9 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
         // the new worker. The corresponding emit loop MUST stay
         // last in `exec_on_remote_host` (see invariant note there).
         RawFdRef::Epoll(_) => PerFdMigrationPolicies {
-            worker_exec: WorkerExecMigrationPolicy::BridgedByLoop { loop_name: "epoll" },
+            worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
+                loop_name: process::EPOLL_BRIDGE_LOOP_NAME,
+            },
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::KernelInherits,
         },
@@ -235,49 +245,49 @@ pub(crate) fn migration_policies_for<FS: ShimFS>(r: &RawFdRef<'_, FS>) -> PerFdM
         // post-spawn release tracked in `broker_pipe_transit_release`.
         RawFdRef::BrokerPipe(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
-                loop_name: "broker_pipe",
+                loop_name: process::BROKER_PIPE_BRIDGE_LOOP_NAME,
             },
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::BrokerSocketPair(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
-                loop_name: "broker_socketpair",
+                loop_name: process::BROKER_SOCKETPAIR_BRIDGE_LOOP_NAME,
             },
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::BrokerTcpConn(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
-                loop_name: "broker_tcp_conn",
+                loop_name: process::BROKER_TCP_CONN_BRIDGE_LOOP_NAME,
             },
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::BrokerPty(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
-                loop_name: "broker_pty",
+                loop_name: process::BROKER_PTY_BRIDGE_LOOP_NAME,
             },
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::Signalfd(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
-                loop_name: "signalfd",
+                loop_name: process::SIGNALFD_BRIDGE_LOOP_NAME,
             },
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::Inotify(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
-                loop_name: "inotify",
+                loop_name: process::INOTIFY_BRIDGE_LOOP_NAME,
             },
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
         },
         RawFdRef::BrokerInetListener(_) => PerFdMigrationPolicies {
             worker_exec: WorkerExecMigrationPolicy::BridgedByLoop {
-                loop_name: "broker_inet_listener",
+                loop_name: process::BROKER_INET_LISTENER_BRIDGE_LOOP_NAME,
             },
             delayed_fork: DelayedForkPolicy::SnapshottedByFdClass,
             independent_fork: IndependentForkPolicy::BrokerHandleDupViaOnDup,
@@ -320,25 +330,28 @@ pub(crate) fn reference_gate<FS: ShimFS>() -> fn(&RawFdRef<'_, FS>) -> PerFdMigr
 mod tests {
     use super::*;
 
-    /// Smoke test: every concrete `WorkerExecMigrationPolicy::BridgedByLoop`
-    /// arm must name a non-empty loop label. The exhaustiveness of
-    /// the underlying `match` is enforced by rustc + clippy at the
-    /// definition site (`migration_policies_for`), not by this test
-    /// — but the test pins the labels we expect downstream tooling
-    /// (test-coverage gates) to recognize.
+    /// All `BridgedByLoop` loop labels are now typed paths to
+    /// `pub(crate) const &str` items in [`crate::syscalls::process`].
+    /// Renaming/removing a constant without updating both the policy
+    /// arm and the emit loop fails to compile (unresolved path), so
+    /// the previous hand-typed-string smoke test became redundant.
+    ///
+    /// This test is retained as **documentation** of the canonical
+    /// loop-name set; it also pins string values that test-coverage
+    /// gates may grep for.
     #[test]
     fn worker_exec_loop_labels_are_documented() {
         let labels = [
-            "fs_brokerfile",
-            "eventfd_and_timerfd",
-            "epoll",
-            "broker_pipe",
-            "broker_socketpair",
-            "broker_tcp_conn",
-            "broker_pty",
-            "signalfd",
-            "inotify",
-            "broker_inet_listener",
+            process::FS_BROKERFILE_BRIDGE_LOOP_NAME,
+            process::EVENTFD_AND_TIMERFD_BRIDGE_LOOP_NAME,
+            process::EPOLL_BRIDGE_LOOP_NAME,
+            process::BROKER_PIPE_BRIDGE_LOOP_NAME,
+            process::BROKER_SOCKETPAIR_BRIDGE_LOOP_NAME,
+            process::BROKER_TCP_CONN_BRIDGE_LOOP_NAME,
+            process::BROKER_PTY_BRIDGE_LOOP_NAME,
+            process::SIGNALFD_BRIDGE_LOOP_NAME,
+            process::INOTIFY_BRIDGE_LOOP_NAME,
+            process::BROKER_INET_LISTENER_BRIDGE_LOOP_NAME,
         ];
         for label in labels {
             assert!(!label.is_empty(), "loop label must be non-empty");
