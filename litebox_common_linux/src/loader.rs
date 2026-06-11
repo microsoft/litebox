@@ -619,6 +619,83 @@ pub trait MapMemory {
     -> Result<(), Self::Error>;
 }
 
+/// The result of computing the head/tail trim regions for an over-sized
+/// anonymous reservation made by [`MapMemory::reserve`].
+///
+/// See [`compute_reserved_regions`] for details.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ReservedRegions {
+    /// Base address of the requested `len` bytes inside the over-sized
+    /// reservation, aligned up to the `align` argument passed to
+    /// [`compute_reserved_regions`].
+    pub aligned_ptr: usize,
+    /// `(start, len)` of the page-aligned head slice that should be
+    /// released with `munmap`, or `None` if no head trim is needed.
+    pub head_unmap: Option<(usize, usize)>,
+    /// `(start, len)` of the page-aligned tail slice that should be
+    /// released with `munmap`, or `None` if no tail trim is needed.
+    pub tail_unmap: Option<(usize, usize)>,
+}
+
+/// Given an over-sized anonymous reservation `[mapping_ptr, mapping_ptr +
+/// mapping_len)` returned by `mmap`, compute the `align`-aligned sub-range
+/// of length `len` to keep, plus the page-aligned head and tail slices to
+/// release with `munmap`.
+///
+/// `mmap`/`munmap` operate at page granularity, so this helper is careful
+/// to round both the head slice and the tail slice to whole pages:
+///
+/// * `mapping_ptr` is assumed to be page-aligned (the kernel guarantees
+///   this) and `align` is assumed to be a multiple of `PAGE_SIZE`, so the
+///   head slice is naturally page-aligned.
+/// * `len` (the caller's requested length — typically an ELF's
+///   `max_vaddr - min_vaddr` span) is **not** required to be page-aligned.
+///   The kernel rounds the original `mmap` allocation up to a whole number
+///   of pages, so the actual mapped region extends to
+///   `(mapping_ptr + mapping_len).next_multiple_of(PAGE_SIZE)`. The tail
+///   slice is computed in page units: release everything from the first
+///   page strictly after `aligned_ptr + len` to that page-aligned end.
+///
+/// Prior to this helper, callers used `(aligned_ptr + len, mapping_end -
+/// (aligned_ptr + len))` directly as the tail `munmap` args. Whenever
+/// `len` ended mid-page (e.g. node.js's prebuilt linux-x64 binary has a
+/// PT_LOAD span of `0x6403D68`), the kernel rejected the `munmap` with
+/// `EINVAL`, surfacing as `execve` → `ENOEXEC` for any guest fork+exec
+/// of node.
+pub fn compute_reserved_regions(
+    mapping_ptr: usize,
+    mapping_len: usize,
+    len: usize,
+    align: usize,
+) -> ReservedRegions {
+    let aligned_ptr = mapping_ptr.next_multiple_of(align);
+    let end = aligned_ptr + len;
+    let mapping_end = mapping_ptr + mapping_len;
+    // The kernel rounds the mmap allocation up to a whole number of pages,
+    // so the *actual* mapped region is
+    // `[mapping_ptr, mapping_end.next_multiple_of(PAGE_SIZE))`.
+    let mapping_end_aligned = mapping_end.next_multiple_of(PAGE_SIZE);
+
+    let head_unmap = if aligned_ptr == mapping_ptr {
+        None
+    } else {
+        Some((mapping_ptr, aligned_ptr - mapping_ptr))
+    };
+
+    let tail_start = end.next_multiple_of(PAGE_SIZE);
+    let tail_unmap = if tail_start < mapping_end_aligned {
+        Some((tail_start, mapping_end_aligned - tail_start))
+    } else {
+        None
+    };
+
+    ReservedRegions {
+        aligned_ptr,
+        head_unmap,
+        tail_unmap,
+    }
+}
+
 /// Trait for reading and writing memory that has been mapped via [`MapMemory`].
 pub trait AccessMemory {
     /// Read from memory.
@@ -684,5 +761,146 @@ impl Protection {
             flags |= crate::ProtFlags::PROT_EXEC;
         }
         flags
+    }
+}
+
+#[cfg(test)]
+mod reserve_regions_tests {
+    extern crate std;
+    use super::{PAGE_SIZE, ReservedRegions, compute_reserved_regions};
+
+    /// The exact non-page-aligned PT_LOAD span observed for the prebuilt
+    /// linux-x64 node.js binary in the `litebox-test` Docker image, which
+    /// triggered the EINVAL fault on every guest fork+exec of node prior
+    /// to commit 05b091ba.
+    const NODE_LEN: usize = 0x6403D68;
+
+    /// A non-page-aligned `mapping_len` doesn't really happen in practice
+    /// (callers always pass `len + (align.max(PAGE_SIZE) - PAGE_SIZE)`),
+    /// but we test the helper's tolerance to it anyway, because the kernel
+    /// rounds up to whole pages and so should we.
+    fn assert_page_aligned(regions: &ReservedRegions) {
+        if let Some((addr, size)) = regions.head_unmap {
+            assert_eq!(addr % PAGE_SIZE, 0, "head start not page-aligned");
+            assert_eq!(size % PAGE_SIZE, 0, "head size not page-aligned");
+        }
+        if let Some((addr, size)) = regions.tail_unmap {
+            assert_eq!(addr % PAGE_SIZE, 0, "tail start not page-aligned");
+            assert_eq!(size % PAGE_SIZE, 0, "tail size not page-aligned");
+        }
+    }
+
+    /// Reservation matches request exactly (`align == PAGE_SIZE`): no
+    /// head or tail trim needed when `len` is a page multiple.
+    #[test]
+    fn page_aligned_len_no_trim() {
+        let mapping_ptr = 0x4000_0000;
+        let len = 0x10_0000; // 1 MiB, page-aligned
+        let align = PAGE_SIZE;
+        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
+        assert_eq!(r.aligned_ptr, mapping_ptr);
+        assert_eq!(r.head_unmap, None);
+        assert_eq!(r.tail_unmap, None);
+        assert_page_aligned(&r);
+    }
+
+    /// Larger `align` than PAGE_SIZE: head trim happens when `mapping_ptr`
+    /// isn't already aligned to `align`; tail trim mirrors the slack.
+    #[test]
+    fn larger_align_trims_head_and_tail() {
+        let align = 0x10_0000; // 1 MiB
+        let len = 0x1234_0000; // page-aligned
+        let mapping_len = len + (align - PAGE_SIZE);
+        // mapping_ptr page-aligned but not align-aligned.
+        let mapping_ptr = 0x4000_0000 + PAGE_SIZE;
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
+        assert_eq!(r.aligned_ptr % align, 0);
+        assert!(r.aligned_ptr >= mapping_ptr);
+        assert!(r.aligned_ptr + len <= mapping_ptr + mapping_len);
+        // Total trimmed = (align - PAGE_SIZE).
+        let head = r.head_unmap.map_or(0, |(_, s)| s);
+        let tail = r.tail_unmap.map_or(0, |(_, s)| s);
+        assert_eq!(head + tail, align - PAGE_SIZE);
+        assert_page_aligned(&r);
+    }
+
+    /// With `align == PAGE_SIZE` the over-allocation slack is zero so the
+    /// old formula's `if end != mapping_end` check happened to skip the
+    /// `munmap` entirely — even though `end` was non-page-aligned. The new
+    /// helper reaches the same "no tail trim" conclusion the right way:
+    /// `tail_start = end.next_multiple_of(PAGE_SIZE)` equals the
+    /// page-rounded mapping end.
+    #[test]
+    fn node_align_page_size_no_tail_trim_needed() {
+        let mapping_ptr = 0x4000_0000;
+        let align = PAGE_SIZE;
+        let len = NODE_LEN;
+        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
+        assert_eq!(r.aligned_ptr, mapping_ptr);
+        assert_eq!(r.head_unmap, None);
+        assert_eq!(r.tail_unmap, None);
+        assert_page_aligned(&r);
+    }
+
+    /// Stronger version of the node case: non-page-aligned `len` with a
+    /// larger `align`, so the trailing slack actually does require a tail
+    /// `munmap`. Under the old formula, the tail munmap start was
+    /// `aligned_ptr + len` (non-page-aligned) and the kernel rejected it.
+    /// Under the helper, the tail start is rounded up to the next page.
+    #[test]
+    fn non_page_aligned_len_with_large_align_trims_page_aligned_tail() {
+        let align = 0x20_0000_usize; // 2 MiB
+        let len = NODE_LEN; // ends at 0xD68 within a page
+        let mapping_len = len + (align - PAGE_SIZE);
+        let mapping_ptr = 0x4000_0000_usize; // page-aligned but not 2 MiB-aligned
+
+        // Old formula tail args.
+        let old_aligned_ptr = mapping_ptr.next_multiple_of(align);
+        let old_end = old_aligned_ptr + len;
+        let old_mapping_end = mapping_ptr + mapping_len;
+        let old_tail_size = old_mapping_end - old_end;
+        assert_ne!(
+            old_end % PAGE_SIZE,
+            0,
+            "old tail start would be non-page-aligned (the EINVAL trigger)",
+        );
+        assert_eq!(
+            old_tail_size % PAGE_SIZE,
+            0,
+            "old tail size happened to be page-aligned",
+        );
+
+        let r = compute_reserved_regions(mapping_ptr, mapping_len, len, align);
+        assert_eq!(r.aligned_ptr, old_aligned_ptr);
+        let (tail_start, tail_size) = r.tail_unmap.expect("tail trim expected with large align");
+        // Tail covers everything from the page after the requested end to
+        // the page-rounded end of the actual reservation.
+        let page_end = (r.aligned_ptr + len).next_multiple_of(PAGE_SIZE);
+        let mapping_end_aligned = old_mapping_end.next_multiple_of(PAGE_SIZE);
+        assert_eq!(tail_start, page_end);
+        assert_eq!(tail_size, mapping_end_aligned - tail_start);
+        // The page that contains the last byte of the reserved range stays
+        // mapped (the caller still owns up to byte `aligned_ptr + len`).
+        assert!(tail_start >= r.aligned_ptr + len);
+        assert_page_aligned(&r);
+    }
+
+    /// Head and tail trim sizes together exhaust the over-allocation slack.
+    #[test]
+    fn head_plus_tail_equals_slack_when_len_page_aligned() {
+        let align = 0x40_0000; // 4 MiB
+        let page_aligned_len = 0x80_0000;
+        let mapping_len = page_aligned_len + (align - PAGE_SIZE);
+        for offset_pages in 0..8 {
+            let mapping_ptr = 0x4000_0000 + offset_pages * PAGE_SIZE;
+            let r = compute_reserved_regions(mapping_ptr, mapping_len, page_aligned_len, align);
+            assert_eq!(r.aligned_ptr % align, 0);
+            let head = r.head_unmap.map_or(0, |(_, s)| s);
+            let tail = r.tail_unmap.map_or(0, |(_, s)| s);
+            assert_eq!(head + tail, align - PAGE_SIZE);
+            assert_page_aligned(&r);
+        }
     }
 }

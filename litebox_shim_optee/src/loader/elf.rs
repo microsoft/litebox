@@ -91,18 +91,23 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
             )?
             .as_usize();
 
-        let ptr = mapping_ptr.next_multiple_of(align);
-        let end = ptr + len;
-        let mapping_end = mapping_ptr + mapping_len;
-        if ptr != mapping_ptr {
-            self.task
-                .sys_munmap(MutPtr::from_usize(mapping_ptr), ptr - mapping_ptr)?;
+        // See `compute_reserved_regions` for why the trim regions must be
+        // computed in page units: `len` (an ELF's `max_vaddr - min_vaddr`
+        // span) is in general not page-aligned, and `munmap` rejects
+        // non-page-aligned start addresses with EINVAL.
+        let regions = litebox_common_linux::loader::compute_reserved_regions(
+            mapping_ptr,
+            mapping_len,
+            len,
+            align,
+        );
+        if let Some((addr, size)) = regions.head_unmap {
+            self.task.sys_munmap(MutPtr::from_usize(addr), size)?;
         }
-        if end != mapping_end {
-            self.task
-                .sys_munmap(MutPtr::from_usize(end), mapping_end - end)?;
+        if let Some((addr, size)) = regions.tail_unmap {
+            self.task.sys_munmap(MutPtr::from_usize(addr), size)?;
         }
-        Ok(ptr)
+        Ok(regions.aligned_ptr)
     }
 
     /// This function imitates file-based mapping by using the in-memory ELF file.
