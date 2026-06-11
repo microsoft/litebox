@@ -240,6 +240,131 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         )
     }
 
+    /// Install a broker-backed inotify fd at `guest_fd`, materialised
+    /// from a broker handle that the parent dup'd before
+    /// `exec_on_remote_host`. Mirrors `install_signalfd_bridge_fd`'s
+    /// shape: shim-side `InotifyFile::new` wraps the inherited
+    /// `handle_id` and registers at the matching descriptor-table
+    /// slot. Called by the runner from `--inotify-bridge` specs.
+    ///
+    /// Returns `Err(ENODEV)` if no broker inotify provider is
+    /// installed (the runner always installs one in `run()`, so this
+    /// is a defensive guard rather than an expected runtime case).
+    pub fn install_inotify_bridge_fd(
+        &self,
+        guest_fd: usize,
+        handle_id: u64,
+        nonblock: bool,
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
+        let provider = syscalls::broker_inotify_provider().ok_or(Errno::ENODEV)?;
+        use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+        let releaser: Arc<dyn BrokerSubscribable> = Arc::clone(&provider) as _;
+        releaser.dup_handle(handle_id).map_err(|_| Errno::ENODEV)?;
+        let mut flags = litebox::fs::OFlags::empty();
+        if nonblock {
+            flags |= litebox::fs::OFlags::NONBLOCK;
+        }
+        let file = syscalls::inotify::InotifyFile::new(provider, handle_id, flags);
+        let typed: litebox::fd::TypedFd<syscalls::inotify::InotifySubsystem> =
+            self.task.global.litebox.descriptor_table_mut().insert(file);
+
+        let _ = self.task.do_close(guest_fd);
+        let files = self.task.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+        if rds.fd_into_specific_raw_integer(typed, guest_fd) {
+            Ok(())
+        } else {
+            Err(Errno::EBADF)
+        }
+    }
+
+    /// Install a fresh epoll instance at `guest_fd` and re-add every
+    /// interest the parent had registered before
+    /// `exec_on_remote_host`. Called by the runner from
+    /// `--epoll-bridge` specs.
+    ///
+    /// `entries` is the snapshot of the parent's interest list as
+    /// `(target_fd, events_bits, user_data)` tuples (see
+    /// `EpollFile::snapshot_interests`). Each entry's `target_fd`
+    /// must already be present in the worker's descriptor table —
+    /// the runner orders `--epoll-bridge` install after
+    /// `--broker-fd-bridge` and `--inotify-bridge` for exactly that
+    /// reason.
+    ///
+    /// Entries whose target fd is not present or rejected by
+    /// `epoll_ctl(ADD)` are skipped with a debug log marker rather
+    /// than failing the whole install; matching the spirit of the
+    /// pre-migration behaviour (the entry was lost when the fd
+    /// became invalid).
+    pub fn install_epoll_bridge_fd(
+        &self,
+        guest_fd: usize,
+        entries: &[(u32, u32, u64)],
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
+        let epoll_file = syscalls::epoll::EpollFile::<FS>::new();
+        let typed: litebox::fd::TypedFd<syscalls::epoll::EpollSubsystem<FS>> = self
+            .task
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .insert(epoll_file);
+
+        let _ = self.task.do_close(guest_fd);
+        {
+            let files = self.task.files.borrow();
+            let mut rds = files.raw_descriptor_store.write();
+            if !rds.fd_into_specific_raw_integer(typed, guest_fd) {
+                return Err(Errno::EBADF);
+            }
+        }
+
+        for &(target_fd, events_bits, data) in entries {
+            let res = (|| -> Result<(), Errno> {
+                let files = self.task.files.borrow();
+                let epoll_typed = files
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<syscalls::epoll::EpollSubsystem<FS>>(guest_fd)
+                    .map_err(|_| Errno::EBADF)?;
+                let descriptor = syscalls::epoll::EpollDescriptor::try_from(
+                    &self.task.global,
+                    &files,
+                    target_fd as usize,
+                )?;
+                let event = litebox_common_linux::EpollEvent {
+                    events: events_bits,
+                    data,
+                };
+                let handle = self
+                    .task
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(&epoll_typed)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|entry| {
+                    entry.epoll_ctl(
+                        &self.task.global,
+                        &*files.fs,
+                        litebox_common_linux::EpollOp::EpollCtlAdd,
+                        target_fd,
+                        &descriptor,
+                        Some(event),
+                    )
+                })
+            })();
+            if let Err(e) = res {
+                use litebox::platform::DebugLogProvider as _;
+                let msg = alloc::format!(
+                    "[epoll-bridge] skip ADD epfd={guest_fd} fd={target_fd} \
+                     events={events_bits:#x} data={data:#x}: errno={e:?}\n"
+                );
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
+            }
+        }
+        Ok(())
+    }
+
     pub fn install_broker_tcp_conn_bridge_fd(
         &self,
         guest_fd: usize,
