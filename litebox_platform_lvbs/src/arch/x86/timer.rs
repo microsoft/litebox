@@ -72,7 +72,7 @@ const QUANTUM_100NS: u64 = QUANTUM_MICROS * REF_TICKS_PER_MICRO;
 
 // TODO: This backend is Hyper-V specific (STIMER direct mode). For non-Hyper-V
 // platforms, add alternative one-shot timer sources behind the same
-// arm/disarm/is_armed/eoi interface and have `init` pick one per platform:
+// arm/disarm/eoi interface and have `init` pick one per platform:
 // - x86: the LAPIC TSC-deadline timer (deadline via the IA32_TSC_DEADLINE MSR,
 //   armed through the LVT timer in TSC-deadline mode, delivered to the same
 //   vector; x2APIC is already enabled here).
@@ -88,24 +88,10 @@ const QUANTUM_100NS: u64 = QUANTUM_MICROS * REF_TICKS_PER_MICRO;
 pub fn init() {
     use core::arch::x86_64::__cpuid;
 
-    let leaf1 = __cpuid(CPUID_FEATURE_INFO);
     // x2APIC software-enable is needed to EOI the direct-mode STIMER interrupt.
-    if leaf1.ecx & CPUID_FEATURE_INFO_ECX_X2APIC == 0 || !enable_x2apic() {
+    if __cpuid(CPUID_FEATURE_INFO).ecx & CPUID_FEATURE_INFO_ECX_X2APIC == 0 || !enable_x2apic() {
         crate::serial_println!("preemption disabled: x2APIC unavailable");
         return;
-    }
-
-    if leaf1.ecx & HYPERV_HYPERVISOR_PRESENT_BIT != 0
-        && __cpuid(HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS).eax >= HYPERV_CPUID_FEATURES
-    {
-        let feat = __cpuid(HYPERV_CPUID_FEATURES);
-        crate::debug_serial_println!(
-            "HV feature leaf {HYPERV_CPUID_FEATURES:#x}: eax={:#010x} edx={:#010x}",
-            feat.eax,
-            feat.edx
-        );
-    } else {
-        crate::serial_println!("no Hyper-V timer-capability leaf");
     }
 
     if init_stimer() {
@@ -119,11 +105,16 @@ pub fn init() {
 /// Enable x2APIC mode (if not already) and software-enable the local APIC with
 /// spurious vector [`SPURIOUS_VECTOR`]. Returns `false` if x2APIC did not enable.
 fn enable_x2apic() -> bool {
-    let apic_base = rdmsr(IA32_APIC_BASE);
-    if apic_base & IA32_APIC_BASE_EXTD == 0 {
+    let base = rdmsr(IA32_APIC_BASE);
+    if base & IA32_APIC_BASE_EXTD == 0 {
+        // The SDM requires enabling xAPIC (EN) before x2APIC (EXTD); writing both
+        // from a fully-disabled APIC is a documented #GP, so set EN first.
+        if base & IA32_APIC_BASE_EN == 0 {
+            wrmsr(IA32_APIC_BASE, base | IA32_APIC_BASE_EN);
+        }
         wrmsr(
             IA32_APIC_BASE,
-            apic_base | IA32_APIC_BASE_EN | IA32_APIC_BASE_EXTD,
+            base | IA32_APIC_BASE_EN | IA32_APIC_BASE_EXTD,
         );
         if rdmsr(IA32_APIC_BASE) & IA32_APIC_BASE_EXTD == 0 {
             return false;
@@ -138,8 +129,10 @@ fn enable_x2apic() -> bool {
     true
 }
 
-/// True if the hypervisor advertises everything STIMER needs.
-fn stimer_direct_available() -> bool {
+/// Verify STIMER capabilities (reference counter, synthetic-timer MSRs, direct
+/// mode), log the raw feature leaf, and leave STIMER0 disabled (armed later via
+/// [`arm_preemption`]). Returns `false` if any capability is missing.
+fn init_stimer() -> bool {
     use core::arch::x86_64::__cpuid;
     if __cpuid(CPUID_FEATURE_INFO).ecx & HYPERV_HYPERVISOR_PRESENT_BIT == 0
         || __cpuid(HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS).eax < HYPERV_CPUID_FEATURES
@@ -147,15 +140,15 @@ fn stimer_direct_available() -> bool {
         return false;
     }
     let feat = __cpuid(HYPERV_CPUID_FEATURES);
-    feat.eax & HV_FEATURE_REFERENCE_COUNTER != 0
-        && feat.eax & HV_FEATURE_SYNTHETIC_TIMER != 0
-        && feat.edx & HV_FEATURE_STIMER_DIRECT != 0
-}
-
-/// Prepare STIMER0: verify capabilities and leave it disabled (armed later via
-/// [`arm_preemption`]). Returns `false` if unsupported.
-fn init_stimer() -> bool {
-    if !stimer_direct_available() {
+    crate::debug_serial_println!(
+        "HV feature leaf {HYPERV_CPUID_FEATURES:#x}: eax={:#010x} edx={:#010x}",
+        feat.eax,
+        feat.edx
+    );
+    if feat.eax & HV_FEATURE_REFERENCE_COUNTER == 0
+        || feat.eax & HV_FEATURE_SYNTHETIC_TIMER == 0
+        || feat.edx & HV_FEATURE_STIMER_DIRECT == 0
+    {
         return false;
     }
     // Known-disabled starting state; arm_preemption writes the full config.
@@ -205,16 +198,6 @@ fn disarm_preemption() {
         return;
     }
     wrmsr(HV_X64_MSR_STIMER0_CONFIG, 0);
-}
-
-/// True if STIMER0 is still armed and has not fired. A one-shot STIMER
-/// auto-clears Enable on fire, so false means it fired or was never armed.
-#[inline]
-pub(crate) fn is_armed() -> bool {
-    if !with_per_cpu_variables(|pcv| pcv.preemption_timer_enabled.get()) {
-        return false;
-    }
-    rdmsr(HV_X64_MSR_STIMER0_CONFIG) & HV_STIMER_CONFIG_ENABLE != 0
 }
 
 /// Signal end-of-interrupt to the local APIC. Must be called for every delivered

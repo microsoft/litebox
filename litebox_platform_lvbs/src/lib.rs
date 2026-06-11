@@ -2137,19 +2137,10 @@ unsafe extern "C" fn exception_handler(
             kernel_mode: false,
         }
     };
-    // The preemption timer fires as a user-mode interrupt (STIMER_VECTOR).
+    // A user-mode STIMER_VECTOR fire is the preemption timeout: EOI it and fall
+    // through to the shim, which kills the TA with TEE_ERROR_TARGET_DEAD.
     if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
-        let still_armed = crate::arch::timer::is_armed();
         crate::arch::timer::eoi();
-        if still_armed {
-            // A stale, latched fire from prior quantum, not a real timeout.
-            // Resume on the still-armed timer.
-            if is_valid_user_ctx(thread_ctx.ctx) {
-                unsafe { switch_to_user(thread_ctx.ctx) }
-            }
-            return 0;
-        }
-        // Genuine timeout: fall through to the shim, which kills the TA.
         crate::serial_println!("TA exceeded its execution quantum; terminating");
     }
     match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
