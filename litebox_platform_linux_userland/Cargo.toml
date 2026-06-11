@@ -20,6 +20,7 @@ seccompiler = { version = "0.5.0" }
 default = ["linux_syscall"]
 linux_syscall = []
 optee_syscall = ["dep:litebox_common_optee"]
+loom = ["litebox/loom"]
 
 [lints]
 workspace = true

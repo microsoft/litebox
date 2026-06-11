@@ -77,10 +77,20 @@ fn has_reached_max_readers(state: u32) -> bool {
 
 impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
     #[inline]
+    #[cfg(not(feature = "loom"))]
     const fn new() -> Self {
         Self {
             state: <Platform::RawMutex as RawMutex>::INIT,
             writer_notify: <Platform::RawMutex as RawMutex>::INIT,
+        }
+    }
+
+    #[inline]
+    #[cfg(feature = "loom")]
+    fn new() -> Self {
+        Self {
+            state: <Platform::RawMutex as RawMutex>::new(),
+            writer_notify: <Platform::RawMutex as RawMutex>::new(),
         }
     }
 
@@ -361,12 +371,18 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
     /// Spin for a while, but stop directly at the given condition.
     #[inline]
     fn spin_until(&self, f: impl Fn(u32) -> bool) -> u32 {
+        #[cfg(feature = "loom")]
+        let mut spin = 2;
+        #[cfg(not(feature = "loom"))]
         let mut spin = 100; // Chosen by fair dice roll.
         loop {
             let state = self.state.underlying_atomic().load(Relaxed);
             if f(state) || spin == 0 {
                 return state;
             }
+            #[cfg(feature = "loom")]
+            loom::thread::yield_now();
+            #[cfg(not(feature = "loom"))]
             core::hint::spin_loop();
             spin -= 1;
         }
@@ -600,7 +616,21 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     /// Returns a new reader/writer lock wrapping the given value.
     #[inline]
     #[cfg_attr(feature = "lock_tracing", track_caller)]
+    #[cfg(not(feature = "loom"))]
     pub const fn new(val: T) -> Self {
+        Self {
+            raw: RawRwLock::new(),
+            #[cfg(feature = "lock_tracing")]
+            creation: super::lock_tracing::Creation::new(),
+            data: UnsafeCell::new(val),
+        }
+    }
+
+    /// Returns a new reader/writer lock wrapping the given value.
+    #[inline]
+    #[cfg_attr(feature = "lock_tracing", track_caller)]
+    #[cfg(feature = "loom")]
+    pub fn new(val: T) -> Self {
         Self {
             raw: RawRwLock::new(),
             #[cfg(feature = "lock_tracing")]
@@ -709,3 +739,113 @@ unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for RwLock<Platfo
 // writer can transfer `T` between threads, but the `Sync` bound is necessary,
 // too, since readers on multiple threads can share `T` simultaneously.
 unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + Sync> Sync for RwLock<Platform, T> {}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::platform::loom_model::{Arc, LoomPlatform};
+
+    use super::RwLock;
+
+    fn model(f: impl Fn() + Send + Sync + 'static) {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(f);
+    }
+
+    #[test]
+    fn readers_can_share() {
+        model(|| {
+            let lock = Arc::new(RwLock::<LoomPlatform, usize>::new(0));
+            let active_readers = Arc::new(AtomicUsize::new(0));
+
+            let reader = |lock: Arc<RwLock<LoomPlatform, usize>>,
+                          active_readers: Arc<AtomicUsize>| {
+                loom::thread::spawn(move || {
+                    let guard = lock.read();
+                    let readers = active_readers.fetch_add(1, Ordering::SeqCst) + 1;
+                    assert!(readers <= 2);
+                    let value = *guard;
+                    loom::thread::yield_now();
+                    assert_eq!(*guard, value);
+                    active_readers.fetch_sub(1, Ordering::SeqCst);
+                    drop(guard);
+                })
+            };
+
+            let reader_a = reader(Arc::clone(&lock), Arc::clone(&active_readers));
+            let reader_b = reader(Arc::clone(&lock), Arc::clone(&active_readers));
+
+            reader_a.join().unwrap();
+            reader_b.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn reader_and_writer_are_exclusive() {
+        model(|| {
+            let lock = Arc::new(RwLock::<LoomPlatform, usize>::new(0));
+            let active_readers = Arc::new(AtomicUsize::new(0));
+            let active_writers = Arc::new(AtomicUsize::new(0));
+
+            let reader = {
+                let lock = Arc::clone(&lock);
+                let active_readers = Arc::clone(&active_readers);
+                let active_writers = Arc::clone(&active_writers);
+                loom::thread::spawn(move || {
+                    let guard = lock.read();
+                    active_readers.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(active_writers.load(Ordering::SeqCst), 0);
+                    loom::thread::yield_now();
+                    assert_eq!(active_writers.load(Ordering::SeqCst), 0);
+                    active_readers.fetch_sub(1, Ordering::SeqCst);
+                    drop(guard);
+                })
+            };
+
+            let writer = loom::thread::spawn(move || {
+                let mut guard = lock.write();
+                assert_eq!(active_writers.swap(1, Ordering::SeqCst), 0);
+                assert_eq!(active_readers.load(Ordering::SeqCst), 0);
+                *guard += 1;
+                loom::thread::yield_now();
+                assert_eq!(active_readers.load(Ordering::SeqCst), 0);
+                active_writers.store(0, Ordering::SeqCst);
+                drop(guard);
+            });
+
+            reader.join().unwrap();
+            writer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn writers_are_exclusive() {
+        model(|| {
+            let lock = Arc::new(RwLock::<LoomPlatform, usize>::new(0));
+            let active_writers = Arc::new(AtomicUsize::new(0));
+
+            let writer = |lock: Arc<RwLock<LoomPlatform, usize>>,
+                          active_writers: Arc<AtomicUsize>| {
+                loom::thread::spawn(move || {
+                    let mut guard = lock.write();
+                    assert_eq!(active_writers.swap(1, Ordering::SeqCst), 0);
+                    let value = *guard;
+                    loom::thread::yield_now();
+                    *guard = value + 1;
+                    active_writers.store(0, Ordering::SeqCst);
+                    drop(guard);
+                })
+            };
+
+            let writer_a = writer(Arc::clone(&lock), Arc::clone(&active_writers));
+            let writer_b = writer(Arc::clone(&lock), Arc::clone(&active_writers));
+
+            writer_a.join().unwrap();
+            writer_b.join().unwrap();
+
+            assert_eq!(*lock.read(), 2);
+        });
+    }
+}

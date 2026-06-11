@@ -234,6 +234,7 @@ impl<FS: ShimFS> UnixInitStream<FS> {
     /// # Arguments
     ///
     /// * `backlog` - Maximum number of pending connections to queue
+    #[allow(clippy::result_large_err)]
     fn listen(
         self,
         backlog: u16,
@@ -311,6 +312,7 @@ impl<FS: ShimFS> Backlog<FS> {
     }
 
     /// Attempts to establish a connection without blocking.
+    #[allow(clippy::result_large_err)]
     fn try_connect(
         &self,
         init: UnixInitStream<FS>,

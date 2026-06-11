@@ -173,7 +173,7 @@ pub(crate) enum ExitStatus {
 impl Process {
     /// Creates a new process with the given initial thread.
     fn new(pid: i32, remote: Arc<ThreadRemote>) -> Self {
-        let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
+        let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::new();
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
             nr_threads,

@@ -80,7 +80,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> LoanListEntry<'a, Platform, T> 
             node: Node {
                 ptrs: UnsafeCell::new(ListPointers::new()),
                 data: EntryData {
-                    state: <Platform::RawMutex as RawMutex>::INIT,
+                    state: <Platform::RawMutex as RawMutex>::new(),
                     value,
                 },
             },
@@ -202,6 +202,9 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
                 }
                 EntryState::REMOVED_WAKING => {
                     // Spin until the remover finishes waking us.
+                    #[cfg(feature = "loom")]
+                    loom::thread::yield_now();
+                    #[cfg(not(feature = "loom"))]
                     core::hint::spin_loop();
                 }
                 state => panic!("invalid state waiting for entry removal: {state:?}"),
@@ -518,7 +521,7 @@ impl<T> LinkedList<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     extern crate std;
 
@@ -619,5 +622,112 @@ mod tests {
         assert_eq!(removed, observed_removed);
         assert_eq!(removed, entries_per_key / 2);
         std::println!("{removed} items removed and observed");
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use alloc::boxed::Box;
+    use core::ops::ControlFlow;
+
+    use loom::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{LoanList, LoanListEntry};
+    use crate::platform::loom_model::{Arc, LoomPlatform};
+
+    fn model(f: impl Fn() + Send + Sync + 'static) {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(f);
+    }
+
+    #[test]
+    fn owner_remove_waits_for_loan_to_complete() {
+        model(|| {
+            struct Value {
+                removed: AtomicBool,
+            }
+
+            let list = Arc::new(LoanList::<LoomPlatform, Value>::new());
+            let inserted = Arc::new(AtomicBool::new(false));
+            let loaned = Arc::new(AtomicBool::new(false));
+            let owner_removed = Arc::new(AtomicBool::new(false));
+
+            let owner = {
+                let list = Arc::clone(&list);
+                let inserted = Arc::clone(&inserted);
+                let loaned = Arc::clone(&loaned);
+                let owner_removed = Arc::clone(&owner_removed);
+                loom::thread::spawn(move || {
+                    let mut entry = Box::pin(LoanListEntry::new(Value {
+                        removed: AtomicBool::new(false),
+                    }));
+                    entry.as_mut().insert(&list);
+                    inserted.store(true, Ordering::SeqCst);
+
+                    while !loaned.load(Ordering::SeqCst) {
+                        loom::thread::yield_now();
+                    }
+
+                    entry.as_mut().remove();
+                    owner_removed.store(true, Ordering::SeqCst);
+                    assert!(entry.get().removed.load(Ordering::SeqCst));
+                })
+            };
+
+            let remover = loom::thread::spawn(move || {
+                while !inserted.load(Ordering::SeqCst) {
+                    loom::thread::yield_now();
+                }
+
+                let mut items = list.extract_if(|_| ControlFlow::Continue(true));
+                let item = items.next().expect("expected loaned item");
+                assert!(items.next().is_none());
+
+                loaned.store(true, Ordering::SeqCst);
+                loom::thread::yield_now();
+                item.removed.store(true, Ordering::SeqCst);
+                drop(item);
+            });
+
+            owner.join().unwrap();
+            remover.join().unwrap();
+            assert!(owner_removed.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn concurrent_extract_and_owner_remove() {
+        model(|| {
+            struct Value {
+                key: usize,
+            }
+
+            let list = Arc::new(LoanList::<LoomPlatform, Value>::new());
+            let mut entry1 = Box::pin(LoanListEntry::new(Value { key: 0 }));
+            let mut entry2 = Box::pin(LoanListEntry::new(Value { key: 1 }));
+
+            entry1.as_mut().insert(&list);
+            entry2.as_mut().insert(&list);
+
+            let remover = {
+                let list = Arc::clone(&list);
+                loom::thread::spawn(move || {
+                    let mut removed = 0;
+                    for item in list.extract_if(|value| ControlFlow::Continue(value.key == 0)) {
+                        assert_eq!(item.key, 0);
+                        removed += 1;
+                        loom::thread::yield_now();
+                    }
+                    assert_eq!(removed, 1);
+                })
+            };
+
+            loom::thread::yield_now();
+            entry2.as_mut().remove();
+
+            remover.join().unwrap();
+            entry1.as_mut().remove();
+        });
     }
 }

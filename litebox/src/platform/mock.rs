@@ -11,7 +11,6 @@
 // Pull in `std` for the test-only world, so that we have a nicer/easier time writing tests
 extern crate std;
 
-use core::sync::atomic::AtomicU32;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -60,7 +59,7 @@ impl MockPlatform {
 impl Provider for MockPlatform {}
 
 pub(crate) struct MockRawMutex {
-    inner: AtomicU32,
+    inner: RawAtomicU32,
     internal_state: std::sync::RwLock<MockRawMutexInternalState>,
 }
 
@@ -70,9 +69,21 @@ struct MockRawMutexInternalState {
 }
 
 impl MockRawMutex {
+    #[cfg(not(feature = "loom"))]
     const fn new() -> Self {
         Self {
-            inner: AtomicU32::new(0),
+            inner: RawAtomicU32::new(0),
+            internal_state: std::sync::RwLock::new(MockRawMutexInternalState {
+                number_to_wake_up: 0,
+                number_blocked: 0,
+            }),
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    fn new() -> Self {
+        Self {
+            inner: RawAtomicU32::new(0),
             internal_state: std::sync::RwLock::new(MockRawMutexInternalState {
                 number_to_wake_up: 0,
                 number_blocked: 0,
@@ -144,9 +155,15 @@ impl MockRawMutex {
 }
 
 impl RawMutex for MockRawMutex {
+    #[cfg(not(feature = "loom"))]
     const INIT: Self = Self::new();
 
-    fn underlying_atomic(&self) -> &AtomicU32 {
+    #[cfg(feature = "loom")]
+    fn new() -> Self {
+        MockRawMutex::new()
+    }
+
+    fn underlying_atomic(&self) -> &RawAtomicU32 {
         &self.inner
     }
 

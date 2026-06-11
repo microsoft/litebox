@@ -11,10 +11,12 @@ use core::{arch::asm, sync::atomic::AtomicU32};
 
 use litebox::mm::linux::PageRange;
 use litebox::platform::RawPointerProvider;
+#[cfg(not(feature = "loom"))]
+use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
     IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider, Punchthrough,
-    PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider,
 };
 use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
@@ -143,7 +145,10 @@ impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
 
 /// An implementation of [`litebox::platform::RawMutex`]
 pub struct RawMutex<Host: HostInterface> {
+    #[cfg(not(feature = "loom"))]
     inner: AtomicU32,
+    #[cfg(feature = "loom")]
+    futex: litebox::platform::loom_model::LoomFutex,
     host: core::marker::PhantomData<fn(Host) -> Host>,
 }
 
@@ -151,16 +156,36 @@ unsafe impl<Host: HostInterface> Send for RawMutex<Host> {}
 unsafe impl<Host: HostInterface> Sync for RawMutex<Host> {}
 
 impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
+    #[cfg(not(feature = "loom"))]
     const INIT: Self = Self::new();
 
-    fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
-        &self.inner
+    #[cfg(feature = "loom")]
+    fn new() -> Self {
+        RawMutex::new()
     }
 
+    fn underlying_atomic(&self) -> &litebox::platform::RawAtomicU32 {
+        #[cfg(feature = "loom")]
+        {
+            self.futex.word()
+        }
+        #[cfg(not(feature = "loom"))]
+        {
+            &self.inner
+        }
+    }
+
+    #[cfg(not(feature = "loom"))]
     fn wake_many(&self, n: usize) -> usize {
         Host::wake_many(&self.inner, n).unwrap()
     }
 
+    #[cfg(feature = "loom")]
+    fn wake_many(&self, n: usize) -> usize {
+        self.futex.wake_many(n)
+    }
+
+    #[cfg(not(feature = "loom"))]
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
         match self.block_or_maybe_timeout(val, None) {
             Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
@@ -169,6 +194,12 @@ impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
         }
     }
 
+    #[cfg(feature = "loom")]
+    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
+        self.futex.block(val)
+    }
+
+    #[cfg(not(feature = "loom"))]
     fn block_or_timeout(
         &self,
         val: u32,
@@ -176,9 +207,19 @@ impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
     ) -> Result<litebox::platform::UnblockedOrTimedOut, ImmediatelyWokenUp> {
         self.block_or_maybe_timeout(val, Some(time))
     }
+
+    #[cfg(feature = "loom")]
+    fn block_or_timeout(
+        &self,
+        val: u32,
+        time: core::time::Duration,
+    ) -> Result<litebox::platform::UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        self.futex.block_or_timeout(val, time)
+    }
 }
 
 impl<Host: HostInterface> RawMutex<Host> {
+    #[cfg(not(feature = "loom"))]
     const fn new() -> Self {
         Self {
             inner: AtomicU32::new(0),
@@ -186,6 +227,15 @@ impl<Host: HostInterface> RawMutex<Host> {
         }
     }
 
+    #[cfg(feature = "loom")]
+    fn new() -> Self {
+        Self {
+            futex: litebox::platform::loom_model::LoomFutex::new(0),
+            host: core::marker::PhantomData,
+        }
+    }
+
+    #[cfg(not(feature = "loom"))]
     fn block_or_maybe_timeout(
         &self,
         val: u32,

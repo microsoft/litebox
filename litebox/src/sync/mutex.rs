@@ -26,7 +26,15 @@ struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
 impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
     /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](crate::platform::RawMutex).
     #[inline]
+    #[cfg(not(feature = "loom"))]
     const fn new(raw: Platform::RawMutex) -> Self {
+        Self { raw }
+    }
+
+    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](crate::platform::RawMutex).
+    #[inline]
+    #[cfg(feature = "loom")]
+    fn new(raw: Platform::RawMutex) -> Self {
         Self { raw }
     }
 
@@ -194,10 +202,26 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     /// Returns a new mutex wrapping the given value.
     #[inline]
     #[cfg_attr(feature = "lock_tracing", track_caller)]
+    #[cfg(not(feature = "loom"))]
     pub const fn new(val: T) -> Self {
         Self {
             raw: SpinEnabledRawMutex::new(
                 <Platform as crate::platform::RawMutexProvider>::RawMutex::INIT,
+            ),
+            #[cfg(feature = "lock_tracing")]
+            creation: super::lock_tracing::Creation::new(),
+            data: UnsafeCell::new(val),
+        }
+    }
+
+    /// Returns a new mutex wrapping the given value.
+    #[inline]
+    #[cfg_attr(feature = "lock_tracing", track_caller)]
+    #[cfg(feature = "loom")]
+    pub fn new(val: T) -> Self {
+        Self {
+            raw: SpinEnabledRawMutex::new(
+                <Platform as crate::platform::RawMutexProvider>::RawMutex::new(),
             ),
             #[cfg(feature = "lock_tracing")]
             creation: super::lock_tracing::Creation::new(),
@@ -251,5 +275,77 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for Mutex<Platform, T>
     fn drop(&mut self) {
         self.creation
             .record_destruction_if_registered(LockType::Mutex, self.raw.raw.underlying_atomic());
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::platform::loom_model::{Arc, LoomPlatform};
+
+    use super::Mutex;
+
+    fn model(f: impl Fn() + Send + Sync + 'static) {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(1);
+        builder.check(f);
+    }
+
+    #[test]
+    fn guards_are_exclusive() {
+        model(|| {
+            let mutex = Arc::new(Mutex::<LoomPlatform, usize>::new(0));
+            let active_guards = Arc::new(AtomicUsize::new(0));
+
+            let worker = |mutex: Arc<Mutex<LoomPlatform, usize>>,
+                          active_guards: Arc<AtomicUsize>| {
+                loom::thread::spawn(move || {
+                    let mut guard = mutex.lock();
+                    assert_eq!(active_guards.swap(1, Ordering::SeqCst), 0);
+
+                    let value = *guard;
+                    loom::thread::yield_now();
+                    *guard = value + 1;
+
+                    active_guards.store(0, Ordering::SeqCst);
+                    drop(guard);
+                })
+            };
+
+            let worker_a = worker(Arc::clone(&mutex), Arc::clone(&active_guards));
+            let worker_b = worker(Arc::clone(&mutex), Arc::clone(&active_guards));
+
+            worker_a.join().unwrap();
+            worker_b.join().unwrap();
+
+            assert_eq!(*mutex.lock(), 2);
+        });
+    }
+
+    #[test]
+    fn contended_lock_wakes_waiter() {
+        model(|| {
+            let mutex = Arc::new(Mutex::<LoomPlatform, usize>::new(0));
+
+            let holder = {
+                let mutex = Arc::clone(&mutex);
+                loom::thread::spawn(move || {
+                    let mut guard = mutex.lock();
+                    *guard += 1;
+                    loom::thread::yield_now();
+                    drop(guard);
+                })
+            };
+
+            let waiter = loom::thread::spawn(move || {
+                let mut guard = mutex.lock();
+                *guard += 1;
+                drop(guard);
+            });
+
+            holder.join().unwrap();
+            waiter.join().unwrap();
+        });
     }
 }

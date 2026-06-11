@@ -15,9 +15,18 @@ pub struct Condvar<Platform: RawMutexProvider> {
 
 impl<Platform: RawMutexProvider> Condvar<Platform> {
     #[inline]
+    #[cfg(not(feature = "loom"))]
     pub(super) const fn new() -> Self {
         Self {
             futex: <Platform::RawMutex as crate::platform::RawMutex>::INIT,
+        }
+    }
+
+    #[inline]
+    #[cfg(feature = "loom")]
+    pub(super) fn new() -> Self {
+        Self {
+            futex: <Platform::RawMutex as crate::platform::RawMutex>::new(),
         }
     }
 }

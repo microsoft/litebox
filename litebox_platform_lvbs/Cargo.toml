@@ -46,6 +46,7 @@ default = ["optee_syscall"]
 optee_syscall = []
 linux_syscall = []
 devbox = []
+loom = ["litebox/loom"]
 
 [lints]
 workspace = true

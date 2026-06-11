@@ -5,7 +5,11 @@
 
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::{Arc, Weak};
+
+#[cfg(not(feature = "loom"))]
 use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 

@@ -10,7 +10,9 @@
 use std::cell::Cell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+#[cfg(not(feature = "loom"))]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use std::unimplemented;
 
@@ -1097,16 +1099,28 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
 
 pub struct RawMutex {
     // The `inner` is the value shown to the outside world as an underlying atomic.
+    #[cfg(not(feature = "loom"))]
     inner: AtomicU32,
+    #[cfg(feature = "loom")]
+    futex: litebox::platform::loom_model::LoomFutex,
 }
 
 impl RawMutex {
+    #[cfg(not(feature = "loom"))]
     const fn new() -> Self {
         Self {
             inner: AtomicU32::new(0),
         }
     }
 
+    #[cfg(feature = "loom")]
+    fn new() -> Self {
+        Self {
+            futex: litebox::platform::loom_model::LoomFutex::new(0),
+        }
+    }
+
+    #[cfg(not(feature = "loom"))]
     fn block_or_maybe_timeout(
         &self,
         val: u32,
@@ -1132,12 +1146,26 @@ impl RawMutex {
 }
 
 impl litebox::platform::RawMutex for RawMutex {
+    #[cfg(not(feature = "loom"))]
     const INIT: Self = Self::new();
 
-    fn underlying_atomic(&self) -> &AtomicU32 {
-        &self.inner
+    #[cfg(feature = "loom")]
+    fn new() -> Self {
+        RawMutex::new()
     }
 
+    fn underlying_atomic(&self) -> &litebox::platform::RawAtomicU32 {
+        #[cfg(feature = "loom")]
+        {
+            self.futex.word()
+        }
+        #[cfg(not(feature = "loom"))]
+        {
+            &self.inner
+        }
+    }
+
+    #[cfg(not(feature = "loom"))]
     fn wake_many(&self, n: usize) -> usize {
         assert!(n > 0);
         let n: u32 = n.try_into().unwrap();
@@ -1152,6 +1180,12 @@ impl litebox::platform::RawMutex for RawMutex {
         .expect("failed to wake up waiters")
     }
 
+    #[cfg(feature = "loom")]
+    fn wake_many(&self, n: usize) -> usize {
+        self.futex.wake_many(n)
+    }
+
+    #[cfg(not(feature = "loom"))]
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
         match self.block_or_maybe_timeout(val, None) {
             Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
@@ -1160,12 +1194,27 @@ impl litebox::platform::RawMutex for RawMutex {
         }
     }
 
+    #[cfg(feature = "loom")]
+    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
+        self.futex.block(val)
+    }
+
+    #[cfg(not(feature = "loom"))]
     fn block_or_timeout(
         &self,
         val: u32,
         timeout: Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         self.block_or_maybe_timeout(val, Some(timeout))
+    }
+
+    #[cfg(feature = "loom")]
+    fn block_or_timeout(
+        &self,
+        val: u32,
+        timeout: Duration,
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        self.futex.block_or_timeout(val, timeout)
     }
 }
 
@@ -1336,6 +1385,7 @@ impl litebox::platform::RawPointerProvider for LinuxUserland {
 
 /// Operations currently supported by the safer variants of the Linux futex syscall
 /// ([`futex_timeout`] and [`futex_val2`]).
+#[cfg(not(feature = "loom"))]
 #[repr(i32)]
 enum FutexOperation {
     Wait = litebox_common_linux::FUTEX_WAIT,
@@ -1343,6 +1393,7 @@ enum FutexOperation {
 }
 
 /// Safer invocation of the Linux futex syscall, with the "timeout" variant of the arguments.
+#[cfg(not(feature = "loom"))]
 #[expect(clippy::similar_names, reason = "sec/nsec are as needed by libc")]
 fn futex_timeout(
     uaddr: &AtomicU32,
@@ -1393,6 +1444,7 @@ fn futex_timeout(
 }
 
 /// Safer invocation of the Linux futex syscall, with the "val2" variant of the arguments.
+#[cfg(not(feature = "loom"))]
 fn futex_val2(
     uaddr: &AtomicU32,
     futex_op: FutexOperation,
@@ -2399,7 +2451,6 @@ impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
     use litebox::{fs::OFlags, platform::RawMutex};
@@ -2411,15 +2462,13 @@ mod tests {
 
     #[test]
     fn test_raw_mutex() {
-        let mutex = std::sync::Arc::new(super::RawMutex {
-            inner: AtomicU32::new(0),
-        });
+        let mutex = std::sync::Arc::new(super::RawMutex::new());
 
         let copied_mutex = mutex.clone();
         std::thread::spawn(move || {
             sleep(core::time::Duration::from_millis(500));
             copied_mutex
-                .inner
+                .underlying_atomic()
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             copied_mutex.wake_many(10);
         });

@@ -25,6 +25,11 @@
 use alloc::sync::Arc;
 use core::{marker::PhantomData, sync::atomic::Ordering};
 
+#[cfg(not(feature = "loom"))]
+use core::sync::atomic::fence;
+#[cfg(feature = "loom")]
+use loom::sync::atomic::fence;
+
 use crate::{
     platform::{
         ImmediatelyWokenUp, Instant as _, RawMutex, ThreadProvider, TimeProvider,
@@ -83,7 +88,7 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
         Self {
             waker: Waker(Arc::new(WaitStateInner {
                 platform,
-                condvar: <Platform::RawMutex as RawMutex>::INIT,
+                condvar: <Platform::RawMutex as RawMutex>::new(),
             })),
             _phantom: PhantomData,
         }
@@ -110,6 +115,11 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
         }
     }
 
+    #[cfg(all(test, feature = "loom"))]
+    pub(crate) fn is_running_in_host_for_test(&self) -> bool {
+        self.waker.0.state_for_assert() == ThreadState::RUNNING_IN_HOST
+    }
+
     /// Sets the wait state so that [`ThreadHandle::interrupt`] will interrupt
     /// the guest execution, then calls `f` to see if the guest is still ready
     /// to run.
@@ -132,6 +142,9 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
         self.waker
             .0
             .set_state(ThreadState::RUNNING_IN_GUEST, Ordering::SeqCst);
+        // loom does not support SeqCst for load/store: see https://github.com/tokio-rs/loom/issues/180
+        #[cfg(feature = "loom")]
+        loom::sync::atomic::fence(Ordering::SeqCst);
         let ready_to_run_guest = f();
         if !ready_to_run_guest {
             self.waker
@@ -182,7 +195,7 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
             Err(_) => {
                 // Provide a consistent release fence even if we didn't wake up
                 // the thread.
-                core::sync::atomic::fence(Ordering::Release);
+                fence(Ordering::Release);
             }
         }
     }
@@ -192,9 +205,13 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
     }
 
     fn set_state(&self, new_state: ThreadState, ordering: Ordering) {
+        #[cfg(not(feature = "loom"))]
         self.condvar
             .underlying_atomic()
             .store(new_state.0, ordering);
+        // See test `relaxed_load_does_not_observe_own_relaxed_store`
+        #[cfg(feature = "loom")]
+        let _ = self.condvar.underlying_atomic().swap(new_state.0, ordering);
     }
 }
 
@@ -235,7 +252,7 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
             Err(_) => {
                 // Provide a consistent release fence even if we didn't wake up
                 // the thread.
-                core::sync::atomic::fence(Ordering::Release);
+                fence(Ordering::Release);
             }
         }
     }
@@ -292,7 +309,7 @@ pub trait CheckForInterrupt {
     ///
     /// This is called by [`WaitContext::wait_until`] each time it is about to
     /// block the thread. If this returns `true`, the wait will return with
-    /// [`WaitError::Interrupted`].
+    /// [`WaitError::Interrupted`], which in turn is converted into the wait's error type.
     fn check_for_interrupt(&self) -> bool;
 }
 
@@ -378,6 +395,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
+        // loom does not support SeqCst for load/store: see https://github.com/tokio-rs/loom/issues/180
+        #[cfg(feature = "loom")]
+        loom::sync::atomic::fence(Ordering::SeqCst);
     }
 
     /// Returns the thread to the running state after a wait.
