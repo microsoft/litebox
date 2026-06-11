@@ -58,6 +58,9 @@ pub struct PerCpuVariables {
     /// Set once this CPU's preemption timer is configured (see `arch::timer`).
     /// Zero-initialized to `false`.
     pub(crate) preemption_timer_enabled: Cell<bool>,
+    /// True while the preemption timer is armed (see `arch::timer`).
+    /// Zero-initialized to `false`.
+    pub(crate) preemption_armed: Cell<bool>,
 }
 
 // These Hyper-V pages must be page-aligned.
@@ -410,9 +413,6 @@ impl PerCpuVariablesAsm {
     }
     pub const fn is_in_user_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, is_in_user)
-    }
-    pub(crate) fn is_in_user(&self) -> bool {
-        self.is_in_user.get() != 0
     }
     pub fn get_exception(&self) -> litebox::shim::Exception {
         litebox::shim::Exception(self.exception_trapno.get())

@@ -161,16 +161,21 @@ fn init_stimer() -> bool {
 /// (`interrupts::stimer_handler_impl`). No-op if STIMER is not configured.
 #[inline]
 pub(crate) fn arm_preemption() {
-    if !with_per_cpu_variables(|pcv| pcv.preemption_timer_enabled.get()) {
-        return;
-    }
-    // One-shot at reference-now + quantum; write COUNT before CONFIG (Enable).
-    let now = rdmsr(HV_X64_MSR_TIME_REF_COUNT);
-    wrmsr(HV_X64_MSR_STIMER0_COUNT, now.wrapping_add(QUANTUM_100NS));
-    let cfg = HV_STIMER_CONFIG_ENABLE
-        | HV_STIMER_CONFIG_DIRECT_MODE
-        | (u64::from(STIMER_VECTOR) << HV_STIMER_CONFIG_VECTOR_SHIFT);
-    wrmsr(HV_X64_MSR_STIMER0_CONFIG, cfg);
+    with_per_cpu_variables(|pcv| {
+        if !pcv.preemption_timer_enabled.get() {
+            return;
+        }
+        // Mark armed *before* touching the MSR: a fire is only possible once the
+        // MSR is armed, so this guarantees every in-entry fire sees the flag set.
+        pcv.preemption_armed.set(true);
+        // One-shot at reference-now + quantum; write COUNT before CONFIG (Enable).
+        let now = rdmsr(HV_X64_MSR_TIME_REF_COUNT);
+        wrmsr(HV_X64_MSR_STIMER0_COUNT, now.wrapping_add(QUANTUM_100NS));
+        let cfg = HV_STIMER_CONFIG_ENABLE
+            | HV_STIMER_CONFIG_DIRECT_MODE
+            | (u64::from(STIMER_VECTOR) << HV_STIMER_CONFIG_VECTOR_SHIFT);
+        wrmsr(HV_X64_MSR_STIMER0_CONFIG, cfg);
+    });
 }
 
 /// Run `f` with the preemption timer armed, disarming when it returns.
@@ -194,10 +199,15 @@ pub(crate) fn scoped<R>(f: impl FnOnce() -> R) -> R {
 /// [`scoped`]'s drop guard disarms. No-op if STIMER is not configured.
 #[inline]
 fn disarm_preemption() {
-    if !with_per_cpu_variables(|pcv| pcv.preemption_timer_enabled.get()) {
-        return;
-    }
-    wrmsr(HV_X64_MSR_STIMER0_CONFIG, 0);
+    with_per_cpu_variables(|pcv| {
+        if !pcv.preemption_timer_enabled.get() {
+            return;
+        }
+        // Clear armed *before* disarming the MSR: a stale fire in this window is
+        // then ACKed without re-arming, and the MSR is never left armed.
+        pcv.preemption_armed.set(false);
+        wrmsr(HV_X64_MSR_STIMER0_CONFIG, 0);
+    });
 }
 
 /// Signal end-of-interrupt to the local APIC. Must be called for every delivered

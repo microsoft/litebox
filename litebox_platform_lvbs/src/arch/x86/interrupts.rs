@@ -199,20 +199,22 @@ extern "C" fn simd_floating_point_handler_impl(regs: &PtRegs) {
     panic!("EXCEPTION: SIMD FLOATING-POINT ERROR\n{regs:#x?}");
 }
 
-/// Handles an STIMER preemption-timer fire delivered in *kernel* mode (vector
-/// 0x40); the common case fires in user mode (`exception_callback`). EOI
-/// always; re-arm only while a TA is in scope (`is_in_user`) - out of scope
-/// there is no TA to bound.
+/// Handles an STIMER preemption-timer fire delivered in kernel mode (vector
+/// 0x40); the common case fires in user mode (`exception_callback`).
+/// Re-arm only while the `preemption_armed` flag is set. A stale fire
+/// (the flag is clear) is just ACKed.
 ///
-/// In-scope kernel-mode fires only occur in the bounded shim init/reenter
-/// prologue (other in-VTL1 handlers keep IF clear via `SFMASK` / exception
-/// gates), so the re-arm cannot let a runaway TA reset its quantum — load-bearing
-/// for the cumulative bound in `arch::timer`.
+/// Two invariants keep the re-arm safe: `arm`/`disarm` set the flag before /
+/// clear it after the STIMER MSR, so no fire leaves the timer disarmed while
+/// the preemption target (i.e., user-mode code) keeps running. In-VTL1
+/// handlers run with IF clear, so an in-scope kernel-mode fire only lands
+/// in the bounded init/reenter prologue, where the re-arm just refreshes
+/// that prologue's quantum.
 #[unsafe(no_mangle)]
 extern "C" fn stimer_handler_impl(_regs: &PtRegs) {
     use crate::host::per_cpu_variables::with_per_cpu_variables;
     super::timer::eoi();
-    if with_per_cpu_variables(|pcv| pcv.asm.is_in_user()) {
+    if with_per_cpu_variables(|pcv| pcv.preemption_armed.get()) {
         crate::debug_serial_println!("preemption timer fired in kernel mode (in scope)");
         super::timer::arm_preemption();
     }
