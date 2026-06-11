@@ -129,7 +129,6 @@ enum InheritSubsystem {
 }
 
 impl InheritSubsystem {
-    #[allow(dead_code)]
     const ALL: &'static [Self] = &[
         Self::TcpListen,
         Self::Pipe,
@@ -144,6 +143,34 @@ impl InheritSubsystem {
         Self::Epoll,
         Self::Inotify,
     ];
+
+    /// Compile-time-exhaustive variant index. Adding a new
+    /// `InheritSubsystem` variant must extend this match (rustc E0004)
+    /// AND `Self::ALL` AND bump `EXPECTED_VARIANT_COUNT` below. The
+    /// `every_variant_in_all_array` unit test wires those together so
+    /// the structural-coverage gap caught by the wave-cleanup-2
+    /// epoll/inotify regression cannot be re-introduced silently in
+    /// the test-discovery layer.
+    const fn discriminant_index(self) -> usize {
+        match self {
+            Self::TcpListen => 0,
+            Self::Pipe => 1,
+            Self::SocketPair => 2,
+            Self::TcpConn => 3,
+            Self::Eventfd => 4,
+            Self::Signalfd => 5,
+            Self::Timerfd => 6,
+            Self::Pty => 7,
+            Self::BrokerFile => 8,
+            Self::Pidfd => 9,
+            Self::Epoll => 10,
+            Self::Inotify => 11,
+        }
+    }
+
+    /// Must equal the number of arms in `discriminant_index`. Verified
+    /// by the unit test below.
+    const EXPECTED_VARIANT_COUNT: usize = 12;
 
     const fn id(self) -> &'static str {
         match self {
@@ -448,20 +475,14 @@ pub(crate) fn register_inherit_matrix_tests(reg: &mut Registry<'_>) {
             });
     }
 
-    for &subsystem in &[
-        InheritSubsystem::TcpListen,
-        InheritSubsystem::Pipe,
-        InheritSubsystem::SocketPair,
-        InheritSubsystem::Eventfd,
-        InheritSubsystem::Pty,
-        InheritSubsystem::Signalfd,
-        InheritSubsystem::BrokerFile,
-        InheritSubsystem::Timerfd,
-        InheritSubsystem::TcpConn,
-        InheritSubsystem::Pidfd,
-        InheritSubsystem::Epoll,
-        InheritSubsystem::Inotify,
-    ] {
+    // Drive trial registration from `InheritSubsystem::ALL` so adding a
+    // new variant only requires updating one place. The
+    // `every_variant_in_all_array` test below asserts ALL stays
+    // exhaustive vs the exhaustive-match in `discriminant_index`, so a
+    // new variant cannot silently miss the cross-product registration
+    // (the test-discovery-time gate Option 3 of the wave-cleanup-2
+    // migration-gate work stream).
+    for &subsystem in InheritSubsystem::ALL {
         for &parent_bt in BinaryType::ALL {
             for &child_bt in BinaryType::ALL {
                 for &op in valid_ops(subsystem) {
@@ -4280,5 +4301,76 @@ mod leaf_subcmd {
         }
         println!("{value}");
         i32::from(value != 1)
+    }
+}
+
+#[cfg(test)]
+mod coverage_gate {
+    //! Test-discovery-time gate: assert that every `InheritSubsystem`
+    //! variant is reachable from `InheritSubsystem::ALL` (and therefore
+    //! that the cartesian-product trial registration above covers it).
+    //!
+    //! This is Option 3 of the wave-cleanup-2 migration-gate work
+    //! stream: the gap that produced the epoll/inotify worker-exec
+    //! regression (commit 5387acc3, 68/99 hard FAILs) was missed at
+    //! the shim side AND at the test-discovery side — adding a new
+    //! subsystem without registering its inherit-matrix family is a
+    //! silent gap that this gate makes loud. Pairs with the
+    //! shim-side compile-time gate in
+    //! `litebox_shim_linux/src/syscalls/migration_policy.rs`.
+
+    use super::InheritSubsystem;
+
+    #[test]
+    fn discriminant_indices_are_unique_and_consecutive() {
+        // discriminant_index is exhaustively matched on InheritSubsystem
+        // (rustc E0004 if a variant is missed). Verify ALL covers every
+        // index 0..EXPECTED_VARIANT_COUNT exactly once.
+        assert_eq!(
+            InheritSubsystem::ALL.len(),
+            InheritSubsystem::EXPECTED_VARIANT_COUNT,
+            "InheritSubsystem::ALL length must equal EXPECTED_VARIANT_COUNT; \
+             update ALL (and EXPECTED_VARIANT_COUNT) when adding a new variant"
+        );
+        let mut indices: Vec<usize> = InheritSubsystem::ALL
+            .iter()
+            .copied()
+            .map(InheritSubsystem::discriminant_index)
+            .collect();
+        indices.sort_unstable();
+        let expected: Vec<usize> = (0..InheritSubsystem::EXPECTED_VARIANT_COUNT).collect();
+        assert_eq!(
+            indices, expected,
+            "InheritSubsystem::ALL must contain each variant exactly once; \
+             gaps or duplicates indicate a missing or duplicated entry. \
+             A common cause is adding a new InheritSubsystem variant and \
+             discriminant_index arm but forgetting to append it to ALL."
+        );
+    }
+
+    #[test]
+    fn ids_are_unique() {
+        // Inherit-matrix test IDs reach the dashboard as
+        // `INHERIT.<id>.*.{dng,snm}` families; collisions would silently
+        // alias families. The exhaustive match in `id()` already prevents
+        // a new variant from being unnamed; this check prevents typos
+        // that produce duplicate ids.
+        let mut ids: Vec<&'static str> = InheritSubsystem::ALL
+            .iter()
+            .copied()
+            .map(InheritSubsystem::id)
+            .collect();
+        ids.sort_unstable();
+        let unique_count = {
+            let mut copy = ids.clone();
+            copy.dedup();
+            copy.len()
+        };
+        assert_eq!(
+            ids.len(),
+            unique_count,
+            "InheritSubsystem::id() must be unique across variants; \
+             duplicates: {ids:?}",
+        );
     }
 }
