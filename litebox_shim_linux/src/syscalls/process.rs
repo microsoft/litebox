@@ -2375,6 +2375,15 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         use litebox::platform::AddressSpaceProvider;
 
+        // Compile-time gate (no runtime cost): every `RawFdRef` variant is
+        // required to have an explicit per-fork-path policy in
+        // `migration_policy::migration_policies_for`. Adding a new variant
+        // without updating that gate fails to compile, which prevents the
+        // class of bug where a new fd subsystem silently gets dropped or
+        // mishandled by one of the fork paths. See
+        // `litebox_shim_linux/src/syscalls/migration_policy.rs` for details.
+        let _migration_gate = super::migration_policy::reference_gate::<FS>();
+
         // Log fork entry for debugging child stdio issues.
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
@@ -3314,6 +3323,13 @@ impl<FS: ShimFS> Task<FS> {
         ctx: &litebox_common_linux::ExecutionContext,
     ) -> Result<(), Errno> {
         use super::fork_snapshot::ForkRejectReasons;
+
+        // Compile-time gate: see `do_fork` above. The actual per-fd
+        // accept/reject decision lives in `snapshot_fd_table` and is keyed
+        // on `FdClass`; this reference keeps the `RawFdRef`-level policy
+        // table in the build graph so new subsystems can't silently bypass
+        // the snapshot gate.
+        let _migration_gate = super::migration_policy::reference_gate::<FS>();
 
         // Take the fork context.  This gives us the VforkDone handle and
         // the child's address-space ID.
@@ -8501,6 +8517,16 @@ impl<FS: ShimFS> Task<FS> {
         guest_interp_image: Option<(&str, &[u8])>,
         vfork_info: Option<ExecVforkInfo>,
     ) -> Result<usize, Errno> {
+        // Compile-time gate: every `RawFdRef` variant must declare a
+        // worker-exec migration policy in
+        // `migration_policy::migration_policies_for`. Adding a new
+        // subsystem without either (a) extending the policy table with a
+        // `BridgedByLoop { loop_name }` arm and a matching per-subsystem
+        // emit loop below, or (b) explicitly marking it `NotBridged` with
+        // a documented reason, fails to compile. This closes the bug
+        // class that caused 68/99 hard FAILs when epoll/inotify were
+        // added without matching emit loops here (see commit 5387acc3).
+        let _migration_gate = super::migration_policy::reference_gate::<FS>();
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
