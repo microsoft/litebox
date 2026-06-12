@@ -22,7 +22,7 @@ use litebox_common_linux::{
 use litebox_platform_multiplex::Platform;
 
 use super::broker_backed::{BrokerBackedCommon, broker_err_to_errno};
-use super::fork_snapshot::BrokerHandleKind;
+use super::fork_snapshot::BrokerHandleSnapshot;
 
 static BROKER_PIPE_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPipeProvider>> =
     once_cell::race::OnceBox::new();
@@ -188,14 +188,11 @@ where
         );
     }
 
-    pub(crate) fn fork_snapshot_handle(
-        &self,
-    ) -> (
-        BrokerHandleKind,
-        u64,
-        litebox_common_linux::broker_pipe_provider::BrokerPipeEnd,
-    ) {
-        (BrokerHandleKind::Pipe, self.handle(), self.direction)
+    pub(crate) fn fork_snapshot_handle(&self) -> BrokerHandleSnapshot {
+        BrokerHandleSnapshot::Pipe {
+            handle_id: self.handle(),
+            direction: self.direction,
+        }
     }
 }
 

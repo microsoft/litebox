@@ -34,7 +34,7 @@ use litebox_common_linux::{
 use litebox_platform_multiplex::Platform;
 
 use super::broker_backed::{BrokerBackedCommon, broker_err_to_errno};
-use super::fork_snapshot::BrokerHandleKind;
+use super::fork_snapshot::BrokerHandleSnapshot;
 
 static BROKER_SOCKETPAIR_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerSocketPairProvider>> =
     once_cell::race::OnceBox::new();
@@ -165,8 +165,11 @@ where
         );
     }
 
-    pub(crate) fn fork_snapshot_handle(&self) -> (BrokerHandleKind, u64, BrokerSocketPairEndpoint) {
-        (BrokerHandleKind::UnixSocket, self.handle(), self.endpoint)
+    pub(crate) fn fork_snapshot_handle(&self) -> BrokerHandleSnapshot {
+        BrokerHandleSnapshot::UnixSocket {
+            handle_id: self.handle(),
+            endpoint: self.endpoint,
+        }
     }
 }
 
