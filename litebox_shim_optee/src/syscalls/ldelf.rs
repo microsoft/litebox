@@ -57,7 +57,10 @@ impl Task {
     }
 
     #[inline]
-    fn checked_pad_end_start(padded_start: usize, num_bytes: usize) -> Result<usize, TeeResult> {
+    fn get_aligned_start_of_pad_end(
+        padded_start: usize,
+        num_bytes: usize,
+    ) -> Result<usize, TeeResult> {
         padded_start
             .checked_add(num_bytes)
             .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
@@ -128,7 +131,7 @@ impl Task {
             let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
         // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
-        let pad_end_start = Self::checked_pad_end_start(padded_start, num_bytes)?;
+        let pad_end_start = Self::get_aligned_start_of_pad_end(padded_start, num_bytes)?;
         let region_end = addr
             .as_usize()
             .checked_add(total_size)
@@ -326,7 +329,7 @@ impl Task {
             let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
         // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
-        let pad_end_start = Self::checked_pad_end_start(padded_start, num_bytes)?;
+        let pad_end_start = Self::get_aligned_start_of_pad_end(padded_start, num_bytes)?;
         let region_end = addr
             .as_usize()
             .checked_add(total_size)
