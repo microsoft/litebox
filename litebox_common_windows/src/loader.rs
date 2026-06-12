@@ -50,6 +50,7 @@ pub struct PeImageInfo {
 }
 
 /// Information about the mapped PE image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MappingInfo {
     pub base_addr: usize,
     pub image_size: usize,

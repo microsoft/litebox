@@ -117,6 +117,7 @@ impl NtStatus {
             0xC0000014 => "STATUS_UNRECOGNIZED_MEDIA: Unrecognized media",
             0xC0000016 => "STATUS_MORE_PROCESSING_REQUIRED: More processing required",
             0xC0000017 => "STATUS_NO_MEMORY: Insufficient memory",
+            0xC0000018 => "STATUS_CONFLICTING_ADDRESSES: Conflicting addresses",
             0xC0000019 => "STATUS_NOT_MAPPED_VIEW: Not mapped view",
             0xC000001A => "STATUS_UNABLE_TO_FREE_VM: Unable to free virtual memory",
             0xC000001B => "STATUS_UNABLE_TO_DELETE_SECTION: Unable to delete section",
@@ -310,6 +311,9 @@ impl NtStatus {
 
     /// STATUS_NO_MEMORY
     pub const NO_MEMORY: Self = Self::from_raw(0xC0000017);
+
+    /// STATUS_CONFLICTING_ADDRESSES
+    pub const CONFLICTING_ADDRESSES: Self = Self::from_raw(0xC0000018);
 
     /// STATUS_NOT_MAPPED_VIEW
     pub const NOT_MAPPED_VIEW: Self = Self::from_raw(0xC0000019);

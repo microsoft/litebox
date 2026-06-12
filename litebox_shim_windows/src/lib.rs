@@ -30,9 +30,9 @@ use litebox::sync::RawSyncPrimitivesProvider;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
-use crate::syscalls::SyscallRequest;
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
+use crate::syscalls::{SyscallRequest, mm};
 
 mod loader;
 mod nt_types;
@@ -73,6 +73,17 @@ pub(crate) type WindowsHandleStore<Platform> =
     litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
 pub(crate) type WindowsNlsSectionMappings<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
+pub(crate) type WindowsVirtualAllocations<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WindowsVirtualAllocation {
+    pub(crate) base: usize,
+    pub(crate) size: usize,
+    pub(crate) allocation_protect: syscalls::mm::PageProtection,
+    pub(crate) type_: syscalls::mm::MemoryType,
+    pub(crate) pages: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
+}
 
 pub type DefaultFS<Platform> = WindowsFS<Platform>;
 
@@ -299,6 +310,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             peb_address: load_info.environment.peb,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
+            virtual_allocations: load_info.virtual_allocations,
             system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
@@ -338,6 +350,7 @@ pub struct Process<Platform: RawSyncPrimitivesProvider> {
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
+    virtual_allocations: WindowsVirtualAllocations<Platform>,
     system_lcid: AtomicU32,
     user_lcid: AtomicU32,
     user_ui_language: AtomicU32,
@@ -576,17 +589,85 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 allocation_type,
                 protect,
             } => {
-                // TODO: placeholder for NtAllocateVirtualMemory
-                litebox_util_log::debug!(
-                    process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
-                    base_address:% = format_args!("{:#x}", base_address.as_usize()),
-                    zero_bits:% = format_args!("{:#x}", zero_bits),
-                    region_size:% = format_args!("{:#x}", region_size.as_usize()),
-                    allocation_type:% = format_args!("{:#x}", allocation_type),
-                    protect:% = format_args!("{:#x}", protect);
-                    "Handling NtAllocateVirtualMemory syscall"
+                let status = self.sys_nt_allocate_virtual_memory(
+                    process_handle,
+                    base_address,
+                    zero_bits,
+                    region_size,
+                    allocation_type,
+                    protect,
                 );
-                (NtStatus::UNSUCCESSFUL, ContinueOperation::Terminate)
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtAllocateVirtualMemoryEx {
+                process_handle,
+                base_address,
+                region_size,
+                allocation_type,
+                protect,
+                extended_parameters,
+                extended_parameter_count,
+            } => {
+                let status = self.sys_nt_allocate_virtual_memory_ex(
+                    process_handle,
+                    base_address,
+                    region_size,
+                    allocation_type,
+                    protect,
+                    mm::MemoryExtendedParameters {
+                        parameters: extended_parameters,
+                        count: extended_parameter_count,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtFreeVirtualMemory {
+                process_handle,
+                base_address,
+                region_size,
+                free_type,
+            } => {
+                let status = self.sys_nt_free_virtual_memory(
+                    process_handle,
+                    base_address,
+                    region_size,
+                    free_type,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtProtectVirtualMemory {
+                process_handle,
+                base_address,
+                region_size,
+                new_protect,
+                old_protect,
+            } => {
+                let status = self.sys_nt_protect_virtual_memory(
+                    process_handle,
+                    base_address,
+                    region_size,
+                    new_protect,
+                    old_protect,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryVirtualMemory {
+                process_handle,
+                base_address,
+                memory_information_class,
+                memory_information,
+                memory_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_virtual_memory(
+                    process_handle,
+                    base_address,
+                    memory_information_class,
+                    memory_information,
+                    memory_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtTerminateProcess {
                 process_handle,

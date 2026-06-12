@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::collections::btree_map::BTreeMap;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::marker::PhantomData;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
@@ -17,6 +18,7 @@ use litebox_common_windows::loader::{
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, MapMemory, MappingInfo, PAGE_SIZE, PeExportError,
     PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt, page_align_down,
 };
+use rangemap::RangeMap;
 use thiserror::Error;
 use zerocopy::{FromZeros, IntoBytes};
 
@@ -25,6 +27,7 @@ use crate::nt_types::{
     ClientId, PebBitField, ProcessEnvironmentBlock, RtlUserProcFlags, RtlUserProcessParameters,
     ThreadEnvironmentBlock, UnicodeString, X64Context,
 };
+use crate::syscalls::mm::{MemoryType, PageProtection};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32/ntdll.dll"];
@@ -58,10 +61,11 @@ pub(crate) struct WindowsProcessEnvironment {
     pub(crate) context: usize,
 }
 
-pub(crate) struct PeLoadInfo {
+pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
     pub(crate) entry_point: usize,
     pub(crate) stack_top: usize,
     pub(crate) ntdll_mapping: Option<MappingInfo>,
+    pub(crate) virtual_allocations: crate::WindowsVirtualAllocations<Platform>,
     pub(crate) environment: WindowsProcessEnvironment,
 }
 
@@ -84,7 +88,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         }
     }
 
-    pub(crate) fn load(&self, path: &str) -> Result<PeLoadInfo, WindowsLoadError> {
+    pub(crate) fn load(&self, path: &str) -> Result<PeLoadInfo<Platform>, WindowsLoadError> {
         let image = load_image(self.platform, self.fs.clone(), path, self.page_manager)?;
         let application_entry_point = image.mapping.entry_point;
         let ntdll = load_ntdll(
@@ -142,10 +146,22 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
                 .ok_or(PeImageAccessError::MemoryAccess)?;
         }
 
+        let virtual_allocations =
+            crate::WindowsVirtualAllocations::<Platform>::new(BTreeMap::new());
+        register_image_virtual_allocation(&virtual_allocations, image.mapping, image.pages);
+        let ntdll_mapping = if let Some(ntdll) = ntdll {
+            let mapping = ntdll.image.mapping;
+            register_image_virtual_allocation(&virtual_allocations, mapping, ntdll.image.pages);
+            Some(mapping)
+        } else {
+            None
+        };
+
         Ok(PeLoadInfo {
             entry_point,
             stack_top,
-            ntdll_mapping: ntdll.map(|ntdll| ntdll.image.mapping),
+            ntdll_mapping,
+            virtual_allocations,
             environment,
         })
     }
@@ -354,8 +370,26 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
     }
 }
 
+fn register_image_virtual_allocation<Platform: crate::ShimPlatform>(
+    virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
+    mapping: MappingInfo,
+    pages: RangeMap<usize, PageProtection>,
+) {
+    virtual_allocations.write().insert(
+        mapping.base_addr,
+        crate::WindowsVirtualAllocation {
+            base: mapping.base_addr,
+            size: mapping.image_size,
+            allocation_protect: PageProtection::PAGE_EXECUTE_WRITECOPY,
+            type_: MemoryType::MEM_IMAGE,
+            pages,
+        },
+    );
+}
+
 struct LoadedImage {
     mapping: MappingInfo,
+    pages: RangeMap<usize, PageProtection>,
     parsed: PeParsedFile,
 }
 
@@ -459,12 +493,17 @@ fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(
         file: &file,
         page_manager,
         chunk: alloc::vec![0u8; FILE_CHUNK_BYTES],
+        pages: RangeMap::new(),
     };
     let mut memory = PeImageMemory::<Platform>(PhantomData);
     let mapping = parsed
         .load_with_writable_sections(&mut mapper, &mut memory, writable_section_names)
         .map_err(WindowsLoadError::Load)?;
-    Ok(LoadedImage { mapping, parsed })
+    Ok(LoadedImage {
+        mapping,
+        pages: mapper.pages,
+        parsed,
+    })
 }
 
 fn ntdll_exports<Platform: RawPointerProvider>(
@@ -609,6 +648,26 @@ struct PeImageMapper<'a, Platform: crate::ShimPlatform, FS: ShimFS> {
     page_manager: &'a crate::WindowsPageManager<Platform>,
     /// Reusable per-call I/O staging buffer for [`MapMemory::map_file`].
     chunk: Vec<u8>,
+    pages: RangeMap<usize, PageProtection>,
+}
+
+impl<Platform: crate::ShimPlatform, FS: ShimFS> PeImageMapper<'_, Platform, FS> {
+    fn record_pages(
+        &mut self,
+        address: usize,
+        len: usize,
+        protect: PageProtection,
+    ) -> Result<(), PeImageAccessError> {
+        let (start, len) = page_range(address, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        let end = start
+            .checked_add(len)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        self.pages.insert(start..end, protect);
+        Ok(())
+    }
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, Platform, FS> {
@@ -638,7 +697,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, 
                 |_| Ok(0),
             )?
         };
-        Ok(ptr.as_usize())
+        let base = ptr.as_usize();
+        self.record_pages(base, len, PageProtection::PAGE_NOACCESS)?;
+        Ok(base)
     }
 
     fn map_zero(
@@ -656,7 +717,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, 
                 .ok_or(PeImageAccessError::MemoryAccess)?;
             written += chunk;
         }
-        protect_pages(self.page_manager, address, len, *prot)
+        protect_pages(self.page_manager, address, len, *prot)?;
+        self.record_pages(address, len, page_protection_from_loader_protection(*prot))
     }
 
     fn map_file(
@@ -685,7 +747,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, 
                 .ok_or(PeImageAccessError::MemoryAccess)?;
             read += n;
         }
-        protect_pages(self.page_manager, address, len, *prot)
+        protect_pages(self.page_manager, address, len, *prot)?;
+        self.record_pages(address, len, page_protection_from_loader_protection(*prot))
     }
 
     fn protect(
@@ -694,7 +757,19 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, 
         len: usize,
         prot: &Protection,
     ) -> Result<(), Self::Error> {
-        protect_pages(self.page_manager, address, len, *prot)
+        protect_pages(self.page_manager, address, len, *prot)?;
+        self.record_pages(address, len, page_protection_from_loader_protection(*prot))
+    }
+}
+
+fn page_protection_from_loader_protection(protect: Protection) -> PageProtection {
+    match (protect.read, protect.write, protect.execute) {
+        (_, true, true) => PageProtection::PAGE_EXECUTE_READWRITE,
+        (_, true, false) => PageProtection::PAGE_READWRITE,
+        (true, false, true) => PageProtection::PAGE_EXECUTE_READ,
+        (false, false, true) => PageProtection::PAGE_EXECUTE,
+        (true, false, false) => PageProtection::PAGE_READONLY,
+        (false, false, false) => PageProtection::PAGE_NOACCESS,
     }
 }
 
@@ -1574,6 +1649,7 @@ mod tests {
                 image_size: parsed.image_size(),
                 entry_point: base_addr,
             },
+            pages: RangeMap::new(),
             parsed,
         }
     }

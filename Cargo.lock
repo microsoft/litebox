@@ -1787,6 +1787,7 @@ dependencies = [
  "litebox_platform_linux_userland",
  "litebox_platform_windows_userland",
  "litebox_util_log",
+ "rangemap",
  "thiserror",
  "zerocopy",
 ]

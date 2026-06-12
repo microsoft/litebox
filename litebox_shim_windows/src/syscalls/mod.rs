@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 pub(crate) mod file;
+pub(crate) mod mm;
 pub(crate) mod nls;
 pub(crate) mod registry;
 pub(crate) mod sysinfo;
@@ -67,11 +68,6 @@ impl ProcessHandle {
     #[must_use]
     pub(crate) const fn from_raw(raw: usize) -> Self {
         Self(Handle::from_raw(raw))
-    }
-
-    #[must_use]
-    pub(crate) const fn as_raw(self) -> usize {
-        self.0.as_raw()
     }
 
     #[must_use]
@@ -171,6 +167,36 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         region_size: Platform::RawMutPointer<usize>,
         allocation_type: u32,
         protect: u32,
+    },
+    NtAllocateVirtualMemoryEx {
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        region_size: Platform::RawMutPointer<usize>,
+        allocation_type: u32,
+        protect: u32,
+        extended_parameters: Option<Platform::RawConstPointer<mm::MemoryExtendedParameter>>,
+        extended_parameter_count: u32,
+    },
+    NtFreeVirtualMemory {
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        region_size: Platform::RawMutPointer<usize>,
+        free_type: u32,
+    },
+    NtProtectVirtualMemory {
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        region_size: Platform::RawMutPointer<usize>,
+        new_protect: u32,
+        old_protect: Platform::RawMutPointer<u32>,
+    },
+    NtQueryVirtualMemory {
+        process_handle: ProcessHandle,
+        base_address: usize,
+        memory_information_class: u32,
+        memory_information: Platform::RawMutPointer<u8>,
+        memory_information_length: usize,
+        return_length: Option<Platform::RawMutPointer<usize>>,
     },
     NtTerminateProcess {
         process_handle: ProcessHandle,
@@ -284,6 +310,36 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 region_size:*,
                 allocation_type,
                 protect,
+            })),
+            NtSysno::NtAllocateVirtualMemoryEx => Some(sys_req!(NtAllocateVirtualMemoryEx {
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                region_size:*,
+                allocation_type,
+                protect,
+                extended_parameters:*,
+                extended_parameter_count,
+            })),
+            NtSysno::NtFreeVirtualMemory => Some(sys_req!(NtFreeVirtualMemory {
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                region_size:*,
+                free_type,
+            })),
+            NtSysno::NtProtectVirtualMemory => Some(sys_req!(NtProtectVirtualMemory {
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                region_size:*,
+                new_protect,
+                old_protect:*,
+            })),
+            NtSysno::NtQueryVirtualMemory => Some(sys_req!(NtQueryVirtualMemory {
+                process_handle: { ProcessHandle::from_raw },
+                base_address,
+                memory_information_class,
+                memory_information:*,
+                memory_information_length,
+                return_length:*,
             })),
             NtSysno::NtTerminateProcess => Some(sys_req!(NtTerminateProcess {
                 process_handle: { ProcessHandle::from_raw },

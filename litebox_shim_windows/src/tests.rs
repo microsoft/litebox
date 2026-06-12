@@ -123,6 +123,9 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             peb_address: 0,
             handles: WindowsHandleStore::<TestPlatform>::new(RawDescriptorStorage::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<TestPlatform>::new(BTreeMap::new()),
+            virtual_allocations: crate::WindowsVirtualAllocations::<TestPlatform>::new(
+                BTreeMap::new(),
+            ),
             system_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
