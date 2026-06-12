@@ -10363,6 +10363,191 @@ where
     out
 }
 
+/// Per-`RawFdRef`-variant bucket vectors of inherited file descriptors
+/// that may be migrated across a fork or exec.
+///
+/// Populated by `collect_migratable_fds` via a single walk over the
+/// descriptor store with an exhaustive `match` on `RawFdRef`. Each
+/// fork path consumes only the buckets it needs (e.g.
+/// `commit_delayed_fork` / `true_fork` consume only `inotify` and
+/// `epoll` because the fork snapshot covers the others;
+/// `exec_on_remote_host` consumes every bucket).
+///
+/// Adding a new `RawFdRef` variant fails to compile at
+/// `collect_migratable_fds`'s match site (workspace
+/// `clippy::wildcard_enum_match_arm = "deny"` + rustc E0004),
+/// forcing the author to choose: add a bucket here and consume it
+/// from each migration path, or explicitly skip with a comment.
+#[cfg_attr(not(feature = "worker_local_inet"), allow(dead_code))]
+pub(crate) struct CollectedMigratableFds<FS: ShimFS> {
+    pub(crate) eventfd: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::eventfd::EventfdSubsystem>>,
+    )>,
+    pub(crate) broker_pipe: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::broker_pipe::BrokerPipeSubsystem>>,
+    )>,
+    pub(crate) broker_pty: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::broker_pty::BrokerPtySubsystem>>,
+    )>,
+    pub(crate) broker_socketpair: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>,
+    )>,
+    pub(crate) broker_socket_dgram: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<
+            litebox::fd::TypedFd<super::broker_socket_dgram::BrokerSocketDgramSubsystem>,
+        >,
+    )>,
+    pub(crate) broker_socket_seqpacket: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<
+            litebox::fd::TypedFd<super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>,
+        >,
+    )>,
+    pub(crate) broker_tcp_conn: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>>,
+    )>,
+    pub(crate) broker_inet_listener: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<
+            litebox::fd::TypedFd<super::broker_inet_listener::BrokerInetListenerSubsystem>,
+        >,
+    )>,
+    pub(crate) fs: alloc::vec::Vec<(usize, alloc::sync::Arc<litebox::fd::TypedFd<FS>>)>,
+    pub(crate) signalfd: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::signalfd::SignalfdSubsystem>>,
+    )>,
+    pub(crate) inotify: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::inotify::InotifySubsystem>>,
+    )>,
+    pub(crate) epoll: alloc::vec::Vec<(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::epoll::EpollSubsystem<FS>>>,
+    )>,
+    #[cfg(feature = "worker_local_inet")]
+    pub(crate) network: alloc::vec::Vec<usize>,
+}
+
+impl<FS: ShimFS> Default for CollectedMigratableFds<FS> {
+    fn default() -> Self {
+        Self {
+            eventfd: alloc::vec::Vec::new(),
+            broker_pipe: alloc::vec::Vec::new(),
+            broker_pty: alloc::vec::Vec::new(),
+            broker_socketpair: alloc::vec::Vec::new(),
+            broker_socket_dgram: alloc::vec::Vec::new(),
+            broker_socket_seqpacket: alloc::vec::Vec::new(),
+            broker_tcp_conn: alloc::vec::Vec::new(),
+            broker_inet_listener: alloc::vec::Vec::new(),
+            fs: alloc::vec::Vec::new(),
+            signalfd: alloc::vec::Vec::new(),
+            inotify: alloc::vec::Vec::new(),
+            epoll: alloc::vec::Vec::new(),
+            #[cfg(feature = "worker_local_inet")]
+            network: alloc::vec::Vec::new(),
+        }
+    }
+}
+
+/// Single walk of `rds.iter_alive()` with an exhaustive `match` on
+/// `RawFdRef`. Replaces all per-subsystem `iter_alive` walks in
+/// `exec_on_remote_host`, `commit_delayed_fork`, and `true_fork`.
+///
+/// `survives_exec_filter` controls whether the worker-exec
+/// CLOEXEC/alive filter is applied. Pass `true` from
+/// `exec_on_remote_host` (only fds that survive exec are
+/// migrated); pass `false` from the fork-snapshot paths (the
+/// snapshot captures everything alive, no CLOEXEC filtering).
+///
+/// `skip_stdio` is **not** a parameter: behavior preservation
+/// requires the per-bucket policy (eventfd / fs skip stdio; other
+/// buckets include it because e.g. stdio can legitimately be a
+/// broker_pipe in a pipelined shell). Phase-2 emit blocks that
+/// want stdio excluded apply their own `if raw_fd <= 2 { continue; }`
+/// filter when iterating their bucket.
+fn collect_migratable_fds<FS: ShimFS>(
+    files: &crate::syscalls::file::FilesState<FS>,
+    global: &crate::GlobalState<FS>,
+    survives_exec_filter: bool,
+) -> CollectedMigratableFds<FS> {
+    let raw_fds: alloc::vec::Vec<usize> = {
+        let rds = files.raw_descriptor_store.read();
+        rds.iter_alive().collect()
+    };
+    let mut out = CollectedMigratableFds::default();
+    for raw_fd in raw_fds {
+        if survives_exec_filter && !worker_exec_fd_survives_exec(raw_fd, global, files) {
+            continue;
+        }
+        let _ = files.run_on_raw_fd(raw_fd, |raw_fd_ref| match raw_fd_ref {
+            crate::RawFdRef::Eventfd(typed) => {
+                out.eventfd.push((raw_fd, alloc::sync::Arc::clone(typed)))
+            }
+            crate::RawFdRef::BrokerPipe(typed) => {
+                out.broker_pipe.push((raw_fd, alloc::sync::Arc::clone(typed)))
+            }
+            crate::RawFdRef::BrokerPty(typed) => {
+                out.broker_pty.push((raw_fd, alloc::sync::Arc::clone(typed)))
+            }
+            crate::RawFdRef::BrokerSocketPair(typed) => out
+                .broker_socketpair
+                .push((raw_fd, alloc::sync::Arc::clone(typed))),
+            crate::RawFdRef::BrokerSocketDgram(typed) => out
+                .broker_socket_dgram
+                .push((raw_fd, alloc::sync::Arc::clone(typed))),
+            crate::RawFdRef::BrokerSocketSeqPacket(typed) => out
+                .broker_socket_seqpacket
+                .push((raw_fd, alloc::sync::Arc::clone(typed))),
+            crate::RawFdRef::BrokerTcpConn(typed) => out
+                .broker_tcp_conn
+                .push((raw_fd, alloc::sync::Arc::clone(typed))),
+            crate::RawFdRef::BrokerInetListener(typed) => out
+                .broker_inet_listener
+                .push((raw_fd, alloc::sync::Arc::clone(typed))),
+            crate::RawFdRef::Fs(typed) => out.fs.push((raw_fd, alloc::sync::Arc::clone(typed))),
+            crate::RawFdRef::Signalfd(typed) => {
+                out.signalfd.push((raw_fd, alloc::sync::Arc::clone(typed)))
+            }
+            crate::RawFdRef::Inotify(typed) => {
+                out.inotify.push((raw_fd, alloc::sync::Arc::clone(typed)))
+            }
+            crate::RawFdRef::Epoll(typed) => {
+                out.epoll.push((raw_fd, alloc::sync::Arc::clone(typed)))
+            }
+            #[cfg(feature = "worker_local_inet")]
+            crate::RawFdRef::Net(_) => out.network.push(raw_fd),
+            // Explicit-skip arms (no wildcards: workspace
+            // `clippy::wildcard_enum_match_arm = "deny"`).
+            crate::RawFdRef::Unix(_) => {
+                // Shim-local unix socket: not migrated across worker-exec
+                // (see migration_policy::NoBridgeReason::
+                // NoCrossWorkerStatePreservation).
+            }
+            crate::RawFdRef::HostPassthroughFd(_) => {
+                // Real Linux fd dup'd via posix_spawn file actions; no
+                // shim spec needed (the host kernel preserves the fd
+                // across exec).
+            }
+            crate::RawFdRef::BrokerInetDgram(_) => {
+                // Migration not yet wired up. See migration_policy::
+                // NoBridgeReason::BrokerStateNotYetMigratable.
+            }
+            crate::RawFdRef::BrokerInetRaw(_) => {
+                // Migration not yet wired up. See migration_policy::
+                // NoBridgeReason::BrokerStateNotYetMigratable.
+            }
+        });
+    }
+    out
+}
+
 fn brokerfile_bridge_encode_path(path: &str) -> alloc::string::String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = alloc::string::String::with_capacity(path.len() * 2);
