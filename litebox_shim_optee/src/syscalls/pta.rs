@@ -19,10 +19,10 @@ use num_enum::TryFromPrimitive;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SystemPta;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum PseudoTa {
     System(SystemPta),
 }
