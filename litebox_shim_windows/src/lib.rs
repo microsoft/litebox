@@ -500,7 +500,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtSetEventBoostPriority { event_handle } => {
-                let status = self.sys_nt_set_event(event_handle, None);
+                let status = self.sys_nt_set_event_boost_priority(event_handle);
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtOpenFile {

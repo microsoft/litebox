@@ -910,7 +910,9 @@ fn map_mkdir_error(error: MkdirError) -> NtStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{TestFS, TestPlatform, const_ptr, mut_ptr, null_mut_ptr};
+    use crate::tests::{
+        TestFS, TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes, unicode_string,
+    };
     use litebox::fs::FileSystem as _;
 
     extern crate std;
@@ -936,29 +938,8 @@ mod tests {
         <TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(f)
     }
 
-    fn unicode_string(value: &[u16]) -> UnicodeString {
-        let byte_len = u16::try_from(core::mem::size_of_val(value)).unwrap();
-        UnicodeString {
-            length: byte_len,
-            maximum_length: byte_len,
-            padding_0: [0; 4],
-            buffer: value.as_ptr() as usize,
-        }
-    }
-
     fn utf16(value: &str) -> std::vec::Vec<u16> {
         value.encode_utf16().collect()
-    }
-
-    fn object_attributes(name: &UnicodeString) -> ObjectAttributes {
-        ObjectAttributes {
-            length: u32::try_from(core::mem::size_of::<ObjectAttributes>()).unwrap(),
-            root_directory: Handle::default(),
-            object_name: core::ptr::from_ref(name) as usize,
-            attributes: 0,
-            security_descriptor: 0,
-            security_quality_of_service: 0,
-        }
     }
 
     fn open_object_attributes(
@@ -970,7 +951,7 @@ mod tests {
     ) {
         let path = utf16(path);
         let name = std::boxed::Box::new(unicode_string(&path));
-        let attributes = object_attributes(&name);
+        let attributes = object_attributes(&name, 0);
         (path, name, attributes)
     }
 
@@ -1666,7 +1647,7 @@ mod tests {
         }
 
         fn host_object_attributes(name: &UnicodeString) -> ObjectAttributes {
-            object_attributes(name)
+            object_attributes(name, 0)
         }
 
         fn close_host_handle(handle: *mut c_void) {

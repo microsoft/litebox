@@ -839,7 +839,10 @@ fn map_read_error(error: ReadError) -> NtStatus {
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_platform};
+    use crate::tests::{
+        TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, test_platform,
+        unicode_string,
+    };
 
     use super::*;
     use core::mem::size_of;
@@ -905,29 +908,8 @@ mod tests {
         fn RegDeleteTreeW(hKey: *mut core::ffi::c_void, lpSubKey: *const u16) -> i32;
     }
 
-    fn unicode_string(value: &[u16]) -> UnicodeString {
-        let byte_len = u16::try_from(core::mem::size_of_val(value)).unwrap();
-        UnicodeString {
-            length: byte_len,
-            maximum_length: byte_len,
-            padding_0: [0; 4],
-            buffer: value.as_ptr() as usize,
-        }
-    }
-
     fn utf16(value: &str) -> std::vec::Vec<u16> {
         value.encode_utf16().collect()
-    }
-
-    fn object_attributes(name: &UnicodeString) -> ObjectAttributes {
-        ObjectAttributes {
-            length: u32::try_from(size_of::<ObjectAttributes>()).unwrap(),
-            root_directory: Handle::default(),
-            object_name: core::ptr::from_ref(name) as usize,
-            attributes: 0,
-            security_descriptor: 0,
-            security_quality_of_service: 0,
-        }
     }
 
     fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
@@ -946,7 +928,7 @@ mod tests {
     fn open_code_page_key(task: &Task<TestPlatform, TestFS>) -> Handle {
         let code_page_name = utf16(DEFAULT_CODE_PAGE_KEY);
         let code_page_name = unicode_string(&code_page_name);
-        let object_attributes = object_attributes(&code_page_name);
+        let object_attributes = object_attributes(&code_page_name, 0);
         open_key(task, object_attributes).expect("Failed to open code page key")
     }
 
@@ -1165,13 +1147,13 @@ mod tests {
         let task = crate::tests::test_task();
         let nls_name = utf16("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls");
         let nls_name = unicode_string(&nls_name);
-        let nls_object_attributes = object_attributes(&nls_name);
+        let nls_object_attributes = object_attributes(&nls_name, 0);
         let nls_handle = open_key(&task, nls_object_attributes).expect("Failed to open NLS key");
         assert_ne!(nls_handle, Handle::default());
 
         let code_page_name = utf16("CodePage");
         let code_page_name = unicode_string(&code_page_name);
-        let mut code_page_object_attributes = object_attributes(&code_page_name);
+        let mut code_page_object_attributes = object_attributes(&code_page_name, 0);
         code_page_object_attributes.root_directory = nls_handle;
         let code_page_handle =
             open_key(&task, code_page_object_attributes).expect("Failed to open code page key");
@@ -1183,7 +1165,7 @@ mod tests {
         let task = crate::tests::test_task();
         let name = utf16("\\Registry\\Machine\\Software\\Missing");
         let name = unicode_string(&name);
-        let object_attributes = object_attributes(&name);
+        let object_attributes = object_attributes(&name, 0);
         assert_eq!(
             open_key(&task, object_attributes).unwrap_err(),
             NtStatus::OBJECT_NAME_NOT_FOUND
@@ -1195,7 +1177,7 @@ mod tests {
         let task = crate::tests::test_task();
         let name = utf16("Child");
         let name = unicode_string(&name);
-        let mut object_attributes = object_attributes(&name);
+        let mut object_attributes = object_attributes(&name, 0);
         object_attributes.root_directory = Handle::from_raw(0x1234);
         assert_eq!(
             open_key(&task, object_attributes).unwrap_err(),
@@ -1216,7 +1198,7 @@ mod tests {
 
         let private_name = utf16(private_key);
         let private_name = unicode_string(&private_name);
-        let read_object_attributes = object_attributes(&private_name);
+        let read_object_attributes = object_attributes(&private_name, 0);
         assert_eq!(
             open_key(&task, read_object_attributes).unwrap_err(),
             NtStatus::ACCESS_DENIED
@@ -1224,7 +1206,7 @@ mod tests {
 
         let private_name = utf16(private_key);
         let private_name = unicode_string(&private_name);
-        let write_object_attributes = object_attributes(&private_name);
+        let write_object_attributes = object_attributes(&private_name, 0);
         let handle = task
             .do_nt_open_key(RegistryKeyAccess::SET_VALUE.bits(), write_object_attributes)
             .expect("write-only access should use write filesystem permissions");
@@ -1312,7 +1294,7 @@ mod tests {
         let task = crate::tests::test_task();
         let code_page_name = utf16(DEFAULT_CODE_PAGE_KEY);
         let code_page_name = unicode_string(&code_page_name);
-        let object_attributes = object_attributes(&code_page_name);
+        let object_attributes = object_attributes(&code_page_name, 0);
         let key_handle = task
             .do_nt_open_key(RegistryKeyAccess::SET_VALUE.bits(), object_attributes)
             .expect("write-only open should succeed against the seeded registry store");

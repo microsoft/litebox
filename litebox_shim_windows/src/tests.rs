@@ -6,12 +6,15 @@ extern crate std;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
+use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, AtomicU32};
 use litebox::LiteBox;
 use litebox::fd::RawDescriptorStorage;
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 
+use crate::nt_types::{ObjectAttributes, UnicodeString};
+use crate::syscalls::Handle;
 use crate::{
     ConstPtr, DefaultFS, GlobalState, MutPtr, Process, Task, WindowsHandleStore,
     WindowsNlsSectionMappings, WindowsPageManager,
@@ -44,6 +47,28 @@ pub(crate) fn null_const_ptr<T: zerocopy::FromBytes>() -> ConstPtr<TestPlatform,
 pub(crate) fn null_mut_ptr<T: zerocopy::FromBytes + zerocopy::IntoBytes>() -> MutPtr<TestPlatform, T>
 {
     MutPtr::<TestPlatform, T>::from_usize(0)
+}
+
+pub(crate) fn unicode_string(units: &[u16]) -> UnicodeString {
+    let byte_len = u16::try_from(core::mem::size_of_val(units)).expect("test name fits in USHORT");
+    UnicodeString {
+        length: byte_len,
+        maximum_length: byte_len,
+        padding_0: [0; 4],
+        buffer: units.as_ptr() as usize,
+    }
+}
+
+pub(crate) fn object_attributes(name: &UnicodeString, attributes: u32) -> ObjectAttributes {
+    ObjectAttributes {
+        length: u32::try_from(size_of::<ObjectAttributes>())
+            .expect("OBJECT_ATTRIBUTES fits in ULONG"),
+        root_directory: Handle::default(),
+        object_name: core::ptr::from_ref(name) as usize,
+        attributes,
+        security_descriptor: 0,
+        security_quality_of_service: 0,
+    }
 }
 
 pub(crate) fn test_platform() -> &'static TestPlatform {
