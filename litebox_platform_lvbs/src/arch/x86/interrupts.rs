@@ -200,9 +200,9 @@ extern "C" fn simd_floating_point_handler_impl(regs: &PtRegs) {
 }
 
 /// Handles an STIMER preemption-timer fire delivered in kernel mode (vector
-/// 0x40); the common case fires in user mode (`exception_callback`).
-/// Re-arm only while the `preemption_armed` flag is set. A stale fire
-/// (the flag is clear) is just ACKed.
+/// 0x40); the common case fires in user mode (`exception_callback`). Re-arm
+/// only while the `preemption_armed` flag is set. A stale fire (the flag is
+/// clear) is just ACKed.
 ///
 /// Two invariants keep the re-arm safe: `arm`/`disarm` set the flag before /
 /// clear it after the STIMER MSR, so no fire leaves the timer disarmed while
@@ -216,7 +216,7 @@ extern "C" fn stimer_handler_impl(_regs: &PtRegs) {
     super::timer::eoi();
     if with_per_cpu_variables(|pcv| pcv.preemption_armed.get()) {
         crate::debug_serial_println!("preemption timer fired in kernel mode (in scope)");
-        super::timer::arm_preemption();
+        super::timer::rearm_preemption();
     }
 }
 

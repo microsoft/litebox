@@ -1,27 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Hyper-V synthetic-timer (STIMER) preemption timer: VTL1 preempts a runaway TA.
+//! Hyper-V synthetic-timer (STIMER) preemption timer: forcefully terminates
+//! runaway user-mode code in VTL1.
 //!
-//! VTL0 cannot interrupt VTL1 and OP-TEE has no scheduler, so a TA that
-//! spins without returning would hold the VP forever and freeze VTL0 too.
-//! VTL1 arms a VTL1-local Hyper-V synthetic timer (STIMER0 in direct mode)
-//! that the TA cannot tamper with; on expiry it is delivered as
-//! `STIMER_VECTOR` and the shim kills the TA with
-//! `TEE_ERROR_TARGET_DEAD`.
+//! VTL1 has no preemptive scheduler and VTL0 cannot interrupt VTL1, so
+//! user-mode code that spins without returning holds the VP forever and freezes
+//! VTL0 too. In lieu of a scheduler, VTL1 arms a VTL1-local Hyper-V synthetic
+//! timer (STIMER0 in direct mode) that user-mode code cannot tamper with; on
+//! expiry it fires `STIMER_VECTOR` and the shim terminates the offending
+//! thread.
 //!
-//! `scoped` brackets a whole TA entry: arm before `run_thread_arch`,
-//! disarm once it fully returns to the VTL1 kernel: i.e., after the TA has
-//! left ring 3, and before the VP is handed back to VTL0. The timer stays
-//! armed across the TA's syscalls and faults (VTL1's own kernel work is
-//! trusted and bounded), so it bounds the *cumulative* time the VP is held
-//! in VTL1 per entry, which is what keeps VTL0 from tripping its
-//! CPU lockup watchdog.
+//! The timer is armed when entering user-mode code (`arm_preemption`) and
+//! disarmed at the VTL0-return boundary (`vtl_switch`). Disarming there is
+//! the hard invariant: VTL1 never hands the VP back to VTL0 with the timer
+//! live. The deadline spans a whole dispatch, bounding the *cumulative* VTL1
+//! residency which touches guest code. The timer stays armed across the
+//! guest's syscalls and faults (VTL1's own kernel work is trusted and
+//! bounded). This is what keeps VTL0 from tripping its CPU lockup watchdog.
 //!
-//! Direct mode injects `STIMER_VECTOR` straight into the local APIC, so
-//! the usual fire path is an ordinary user-mode interrupt (ISR ->
-//! exception_callback -> kill) with a rare in-kernel safety net
-//! (`interrupts::stimer_handler_impl`).
+//! Direct mode injects `STIMER_VECTOR` straight into the local APIC, so the
+//! usual fire path is an ordinary user-mode interrupt (ISR -> exception_callback
+//! -> kill) with a rare in-kernel safety net (`interrupts::stimer_handler_impl`,
+//! which re-arms via `rearm_preemption`).
 
 use super::instrs::{rdmsr, wrmsr};
 use crate::host::per_cpu_variables::with_per_cpu_variables;
@@ -54,12 +55,12 @@ const CPUID_FEATURE_INFO: u32 = 1;
 const CPUID_FEATURE_INFO_ECX_X2APIC: u32 = 1 << 21;
 
 /// Per-entry execution budget in microseconds. 8 s sits under Linux's default
-/// 10 s hard-lockup watchdog, so VTL1 kills a runaway TA and returns the VP
+/// 10 s hard-lockup watchdog, so VTL1 kills a runaway guest and returns the VP
 /// before VTL0 declares its CPU locked, with margin for the kill/return path.
 #[cfg(not(feature = "preemption_test_quantum"))]
 const QUANTUM_MICROS: u64 = 8_000_000; // 8 s
 
-/// Tight budget under the `preemption_test_quantum` feature so a runaway-TA
+/// Tight budget under the `preemption_test_quantum` feature so a runaway-guest
 /// kill fires in ~10 ms. Test builds only.
 #[cfg(feature = "preemption_test_quantum")]
 const QUANTUM_MICROS: u64 = 10_000; // 10 ms
@@ -156,51 +157,59 @@ fn init_stimer() -> bool {
     true
 }
 
-/// Arm the preemption timer to fire one quantum from now. Normally driven by
-/// [`scoped`]; also re-armed by the kernel-mode-fire safety net
-/// (`interrupts::stimer_handler_impl`). No-op if STIMER is not configured.
+/// Program STIMER0 to fire one quantum from reference-now (one-shot, direct
+/// mode); writes COUNT before CONFIG, which carries the Enable bit. The caller
+/// owns the `preemption_armed` flag and the `preemption_timer_enabled` gate.
+#[inline]
+fn program_stimer_deadline() {
+    let now = rdmsr(HV_X64_MSR_TIME_REF_COUNT);
+    wrmsr(HV_X64_MSR_STIMER0_COUNT, now.wrapping_add(QUANTUM_100NS));
+    let cfg = HV_STIMER_CONFIG_ENABLE
+        | HV_STIMER_CONFIG_DIRECT_MODE
+        | (u64::from(STIMER_VECTOR) << HV_STIMER_CONFIG_VECTOR_SHIFT);
+    wrmsr(HV_X64_MSR_STIMER0_CONFIG, cfg);
+}
+
+/// Arm the preemption timer for a VTL1 residency, one quantum from now.
+/// Idempotent: while a residency is already armed (a nested re-entry) it
+/// leaves the in-flight deadline in place, so the nested chain shares one
+/// quantum. No-op if STIMER is not configured.
 #[inline]
 pub(crate) fn arm_preemption() {
     with_per_cpu_variables(|pcv| {
-        if !pcv.preemption_timer_enabled.get() {
+        if !pcv.preemption_timer_enabled.get() || pcv.preemption_armed.get() {
             return;
         }
-        // Mark armed *before* touching the MSR: a fire is only possible once the
-        // MSR is armed, so this guarantees every in-entry fire sees the flag set.
+        // Mark armed *before* programming the MSR: a fire is only possible once
+        // the MSR is armed, so every in-residency fire sees the flag set.
         pcv.preemption_armed.set(true);
-        // One-shot at reference-now + quantum; write COUNT before CONFIG (Enable).
-        let now = rdmsr(HV_X64_MSR_TIME_REF_COUNT);
-        wrmsr(HV_X64_MSR_STIMER0_COUNT, now.wrapping_add(QUANTUM_100NS));
-        let cfg = HV_STIMER_CONFIG_ENABLE
-            | HV_STIMER_CONFIG_DIRECT_MODE
-            | (u64::from(STIMER_VECTOR) << HV_STIMER_CONFIG_VECTOR_SHIFT);
-        wrmsr(HV_X64_MSR_STIMER0_CONFIG, cfg);
+        program_stimer_deadline();
     });
 }
 
-/// Run `f` with the preemption timer armed, disarming when it returns.
-/// The single arm/disarm pairing; used to bracket a TA entry (see the module doc).
+/// Re-arm after a kernel-mode fire; the one-shot auto-disables on expiry. Only
+/// the in-kernel safety net (`interrupts::stimer_handler_impl`) calls this, and
+/// only while a residency is armed, to refresh the deadline so the entry/exit
+/// prologue the fire landed in can finish. No-op if STIMER is not configured or
+/// no residency is armed.
 #[inline]
-pub(crate) fn scoped<R>(f: impl FnOnce() -> R) -> R {
-    /// Disarms on drop so an early return cannot leave the timer live.
-    struct Disarm;
-    impl Drop for Disarm {
-        fn drop(&mut self) {
-            disarm_preemption();
+pub(crate) fn rearm_preemption() {
+    with_per_cpu_variables(|pcv| {
+        if !pcv.preemption_timer_enabled.get() || !pcv.preemption_armed.get() {
+            return;
         }
-    }
-
-    arm_preemption();
-    let _disarm = Disarm;
-    f()
+        program_stimer_deadline();
+    });
 }
 
-/// Disarm the preemption timer (clear STIMER0 CONFIG.Enable). Only
-/// [`scoped`]'s drop guard disarms. No-op if STIMER is not configured.
+/// Disarm the preemption timer (clear STIMER0 CONFIG.Enable) before the VP is
+/// handed back to VTL0. Called at the VTL0-return boundary (the `vtl_switch`
+/// loop); a dispatch that never armed (HVCI/HEKI) returns without touching the
+/// MSR. No-op if STIMER is not configured.
 #[inline]
-fn disarm_preemption() {
+pub(crate) fn disarm_preemption() {
     with_per_cpu_variables(|pcv| {
-        if !pcv.preemption_timer_enabled.get() {
+        if !pcv.preemption_timer_enabled.get() || !pcv.preemption_armed.get() {
             return;
         }
         // Clear armed *before* disarming the MSR: a stale fire in this window is

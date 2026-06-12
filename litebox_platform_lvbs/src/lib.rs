@@ -1614,12 +1614,14 @@ fn run_thread_inner(
     // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
     // member variable offset calculation in assembly code).
     //
-    // Bracket the whole TA entry with the preemption timer. `run_thread_arch`
-    // returns exactly once, so the deadline spans all of the TA's user execution and
-    // in-VTL1 syscall/fault handling, bounding cumulative VTL1 occupancy.
-    crate::arch::timer::scoped(|| unsafe {
+    // Arm the preemption timer for this TA entry; disarmed at the VTL0-return
+    // boundary in `vtl_switch`.
+    crate::arch::timer::arm_preemption();
+    // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
+    // the duration of the call, and `run_thread_arch` returns exactly once.
+    unsafe {
         run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
-    });
+    }
 }
 
 /// Save callee-saved registers onto the stack.
