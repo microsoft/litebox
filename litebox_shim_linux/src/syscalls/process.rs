@@ -5124,12 +5124,14 @@ impl<FS: ShimFS> Task<FS> {
                 &self.global,
                 /* survives_exec_filter */ false,
             );
-            emit_fork_inotify_epoll_bridge_specs::<FS>(
+            emit_inotify_bridge_specs(
                 self,
-                collected,
+                &collected.inotify,
                 &mut broker_fd_bridge_specs,
                 &mut broker_fd_bridge_transit_release,
             );
+            // Epoll last (no broker handle; targets resolved at install).
+            emit_epoll_bridge_specs(self, &collected.epoll, &mut broker_fd_bridge_specs);
         }
 
         let snapshot = super::fork_snapshot::ForkSnapshot {
@@ -5583,11 +5585,17 @@ impl<FS: ShimFS> Task<FS> {
                 &self.global,
                 /* survives_exec_filter */ false,
             );
-            emit_fork_inotify_epoll_bridge_specs::<FS>(
+            emit_inotify_bridge_specs(
                 self,
-                collected,
+                &collected.inotify,
                 &mut true_fork_broker_fd_bridge_specs,
                 &mut true_fork_broker_fd_bridge_transit_release,
+            );
+            // Epoll last (no broker handle; targets resolved at install).
+            emit_epoll_bridge_specs(
+                self,
+                &collected.epoll,
+                &mut true_fork_broker_fd_bridge_specs,
             );
         }
 
@@ -6218,7 +6226,8 @@ impl<FS: ShimFS> Task<FS> {
                 // wire format. Instead, the caller of `snapshot_fd_table`
                 // (`commit_delayed_fork` / `true_fork`) emits matching
                 // `--broker-fd-bridge fd:epoll:...` / `fd:inotify:...`
-                // specs via `emit_fork_inotify_epoll_bridge_specs`, mirroring
+                // specs via `emit_inotify_bridge_specs` /
+                // `emit_epoll_bridge_specs`, mirroring
                 // the worker-exec migration shape added in 5387acc3. The
                 // snapshot's class=Epoll/Inotify FdEntrySnapshot is benign
                 // on restore: every restore-loop filters by class, none of
@@ -10490,104 +10499,6 @@ fn emit_epoll_bridge_specs<FS: ShimFS>(
         let dt_local = task.global.litebox.descriptor_table();
         let entries = dt_local
             .with_entry(typed, |ep: &super::epoll::EpollFile<FS>| {
-                ep.snapshot_interests()
-            })
-            .unwrap_or_default();
-        drop(dt_local);
-        let mut spec = alloc::format!("{raw_fd}:epoll");
-        if !entries.is_empty() {
-            spec.push(':');
-            let mut first = true;
-            for (tfd, events, data) in entries {
-                if !first {
-                    spec.push(',');
-                }
-                first = false;
-                spec.push_str(&alloc::format!("{tfd}_{events}_{data}"));
-            }
-        }
-        specs.push(spec);
-    }
-}
-
-/// wave-cleanup-2 fork-snapshot epoll extension: emit
-/// `--broker-fd-bridge` specs for inherited Inotify and Epoll fds
-/// across a delayed-fork or true-fork commit, given a pre-collected
-/// `CollectedMigratableFds`.
-///
-/// The snapshot/restore path doesn't carry epoll interest lists or
-/// inotify broker handles in the `FdTableSnapshot` wire format —
-/// the caller forwards the returned specs to
-/// `spawn_worker_host_for_fork_restore`'s `broker_fd_bridge_specs`
-/// parameter, where the runner installs them via
-/// `install_broker_fd_bridge_spec` after the snapshot-restore
-/// phase completes. This reuses the shape that
-/// `exec_on_remote_host` ships (the worker-exec counterpart).
-///
-/// INVARIANT: epoll bridge specs must be installed AFTER every
-/// other fd subsystem's install (the spec's per-entry
-/// `EpollDescriptor::try_from` looks up target fds in the
-/// worker's descriptor store). The runner installs the
-/// `broker_fd_bridge_specs` vector in order, so the caller must
-/// invoke this helper LAST in spec emission (and within this
-/// helper, inotify is emitted before epoll for the same reason
-/// in case any interest targets the inotify fd).
-///
-/// Inotify transit releases are pushed to `transit_release` so
-/// the caller balances them after the worker acks (see existing
-/// `broker_fd_bridge_transit_release` lifetime pattern in
-/// `commit_delayed_fork`). Epoll has no broker handle so it does
-/// not contribute to `transit_release`.
-fn emit_fork_inotify_epoll_bridge_specs<FS: ShimFS>(
-    task: &Task<FS>,
-    collected: CollectedMigratableFds<FS>,
-    specs: &mut alloc::vec::Vec<alloc::string::String>,
-    transit_release: &mut alloc::vec::Vec<(
-        alloc::sync::Arc<dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable>,
-        u64,
-    )>,
-) {
-    // Inotify first: mirror the signalfd spec shape (broker handle id +
-    // nonblock bit). The shim-side `InotifyFile` already owns a broker
-    // handle; `dup_handle` so the child's reattach doesn't race with
-    // parent-side close. Lifetime: released only on spawn failure; on
-    // worker ack, the child's broker connection cleanup balances the
-    // dup. The caller's `transit_release` plumbing handles both edges.
-    for (raw_fd, typed) in collected.inotify {
-        let inotify_provider = super::inotify::broker_inotify_provider();
-        let dt_local = task.global.litebox.descriptor_table();
-        let info = dt_local.with_entry(&typed, |ino: &super::inotify::InotifyFile| {
-            (
-                ino.handle(),
-                ino.get_status().contains(litebox::fs::OFlags::NONBLOCK),
-            )
-        });
-        drop(dt_local);
-        if let (Some(provider), Some((handle_id, nonblock))) = (inotify_provider, info) {
-            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
-            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
-                alloc::sync::Arc::clone(&provider) as _;
-            if releaser.dup_handle(handle_id).is_err() {
-                continue;
-            }
-            specs.push(alloc::format!(
-                "{raw_fd}:inotify:{handle_id}:{}",
-                u8::from(nonblock),
-            ));
-            transit_release.push((releaser, handle_id));
-        }
-    }
-
-    // Epoll last: snapshot the per-instance interest list as
-    // `(target_fd, events, data)` tuples (see
-    // `EpollFile::snapshot_interests`). The worker rebuilds a
-    // fresh `EpollFile` and re-adds each interest via
-    // `epoll_ctl(EPOLL_CTL_ADD)`. Epoll has no broker handle so
-    // there's no transit_release entry.
-    for (raw_fd, typed) in collected.epoll {
-        let dt_local = task.global.litebox.descriptor_table();
-        let entries = dt_local
-            .with_entry(&typed, |ep: &super::epoll::EpollFile<FS>| {
                 ep.snapshot_interests()
             })
             .unwrap_or_default();
