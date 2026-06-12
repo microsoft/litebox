@@ -12,6 +12,7 @@ bindgen = "0.71.0"
 bitflags = "2.9.0"
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 paste = "1.0.15"
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 arrayvec = { version = "0.7.6", default-features = false }
@@ -23,7 +24,6 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
 
 [dev-dependencies]
-litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 syscalls = { version = "0.6", default-features = false }
 
 [lints]

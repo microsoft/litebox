@@ -197,7 +197,13 @@ pub unsafe fn run_thread(
 
     let shim = tls.shim.get().unwrap().as_ref();
     match shim.init(regs) {
-        litebox::shim::ContinueOperation::Resume => unsafe { crate::switch_to_guest(regs) },
+        litebox::shim::ContinueOperation::Resume => {
+            if regs.sanitize_for_user_return() {
+                unsafe { crate::switch_to_guest(regs) }
+            }
+            litebox_util_log::warn!("terminating thread with invalid user return context");
+            exit_thread()
+        }
         litebox::shim::ContinueOperation::Terminate => exit_thread(),
     }
 }
@@ -225,7 +231,13 @@ fn exit_thread() -> ! {
 pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) -> ! {
     let tls = unsafe { &*get_tls() };
     match tls.shim.get().unwrap().syscall(pt_regs) {
-        litebox::shim::ContinueOperation::Resume => unsafe { crate::switch_to_guest(pt_regs) },
+        litebox::shim::ContinueOperation::Resume => {
+            if pt_regs.sanitize_for_user_return() {
+                unsafe { crate::switch_to_guest(pt_regs) }
+            }
+            litebox_util_log::warn!("terminating thread with invalid user return context");
+            exit_thread()
+        }
         litebox::shim::ContinueOperation::Terminate => exit_thread(),
     }
 }

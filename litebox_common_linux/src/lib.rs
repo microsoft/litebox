@@ -3141,7 +3141,56 @@ pub struct PtRegs {
 #[cfg(target_arch = "x86_64")]
 pub const EFLAGS_DF: usize = 0x400;
 
+#[cfg(target_arch = "x86_64")]
+mod arch {
+    pub const USER_ADDR_END: usize = 0x0000_8000_0000_0000;
+    pub const EFLAGS_CF: usize = 1 << 0;
+    pub const EFLAGS_FIXED: usize = 1 << 1;
+    pub const EFLAGS_PF: usize = 1 << 2;
+    pub const EFLAGS_AF: usize = 1 << 4;
+    pub const EFLAGS_ZF: usize = 1 << 6;
+    pub const EFLAGS_SF: usize = 1 << 7;
+    pub const EFLAGS_IF: usize = 1 << 9;
+    pub const EFLAGS_DF: usize = 1 << 10;
+    pub const EFLAGS_OF: usize = 1 << 11;
+    pub const EFLAGS_RF: usize = 1 << 16;
+    pub const EFLAGS_ID: usize = 1 << 21;
+    pub const SAFE_USER_EFLAGS: usize = EFLAGS_CF
+        | EFLAGS_FIXED
+        | EFLAGS_PF
+        | EFLAGS_AF
+        | EFLAGS_ZF
+        | EFLAGS_SF
+        | EFLAGS_IF
+        | EFLAGS_DF
+        | EFLAGS_OF
+        | EFLAGS_RF
+        | EFLAGS_ID;
+}
+
 impl PtRegs {
+    /// Returns whether `rip` and `rsp` are low-canonical user return addresses.
+    #[cfg(target_arch = "x86_64")]
+    #[must_use]
+    pub fn has_user_return_addresses(&self) -> bool {
+        self.rip < arch::USER_ADDR_END && self.rsp < arch::USER_ADDR_END
+    }
+
+    /// Sanitizes CPU state before returning to user mode.
+    ///
+    /// Returns `false` if `rip` or `rsp` are not low-canonical user addresses.
+    /// On success, privileged or unsafe RFLAGS bits are cleared, the fixed
+    /// RFLAGS bit is set, and interrupts are enabled.
+    #[cfg(target_arch = "x86_64")]
+    #[must_use]
+    pub fn sanitize_for_user_return(&mut self) -> bool {
+        if !self.has_user_return_addresses() {
+            return false;
+        }
+        self.eflags = (self.eflags & arch::SAFE_USER_EFLAGS) | arch::EFLAGS_FIXED | arch::EFLAGS_IF;
+        true
+    }
+
     /// Get the `idx`th syscall argument.
     ///
     /// # Panics
