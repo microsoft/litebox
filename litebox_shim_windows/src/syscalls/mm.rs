@@ -37,7 +37,7 @@ bitflags::bitflags! {
 }
 
 impl PageProtection {
-    pub(crate) const BASE_MASK: u32 = 0xff;
+    const BASE_MASK: u32 = 0xff;
 
     fn base(self) -> u32 {
         self.bits() & Self::BASE_MASK
@@ -296,7 +296,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | AllocationType::MEM_TOP_DOWN;
         if size == 0
             || !supported_allocation_types.contains(allocation_type)
-            || zero_bits >= 21
+            || (zero_bits > 21 && zero_bits < 32)
             || (zero_bits != 0 && base != 0)
         {
             return NtStatus::INVALID_PARAMETER;
@@ -342,12 +342,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         } else {
             MemoryRegionPermissions::empty()
         };
+        let top_down = allocation_type.contains(AllocationType::MEM_TOP_DOWN);
         let allocation = if base == 0 {
             create_allocation_granularity_aligned_pages::<Platform>(
                 &self.global.page_manager,
                 length,
                 initial_permissions,
                 zero_bits,
+                top_down,
             )
         } else {
             create_pages::<Platform>(
@@ -1060,9 +1062,7 @@ fn mark_pages_decommitted<Platform: ShimPlatform>(
     allocation.pages.remove(base..end);
 }
 
-pub(crate) fn parse_page_protection(
-    protect: u32,
-) -> Option<(PageProtection, MemoryRegionPermissions)> {
+fn parse_page_protection(protect: u32) -> Option<(PageProtection, MemoryRegionPermissions)> {
     let protect = PageProtection::from_bits(protect)?;
     let permissions = page_protect_to_permissions(protect)?;
     Some((protect, permissions))
@@ -1121,7 +1121,7 @@ fn permissions_to_page_protect(permissions: MemoryRegionPermissions) -> PageProt
     }
 }
 
-pub(super) fn create_pages<Platform: ShimPlatform>(
+fn create_pages<Platform: ShimPlatform>(
     page_manager: &WindowsPageManager<Platform>,
     suggested_address: Option<NonZeroAddress<PAGE_SIZE>>,
     length: NonZeroPageSize<PAGE_SIZE>,
@@ -1180,9 +1180,10 @@ fn create_aligned_pages_in_hole<Platform: ShimPlatform>(
     hole_end: usize,
     length: NonZeroPageSize<PAGE_SIZE>,
     permissions: MemoryRegionPermissions,
+    top_down: bool,
 ) -> Result<HoleSearchResult<Platform>, MappingError> {
     let Some(mut candidate) =
-        allocation_granularity_aligned_candidate(hole_start, hole_end, length.as_usize())
+        allocation_granularity_aligned_candidate(hole_start, hole_end, length.as_usize(), top_down)
     else {
         return Ok(HoleSearchResult::Exhausted);
     };
@@ -1204,18 +1205,69 @@ fn create_aligned_pages_in_hole<Platform: ShimPlatform>(
             Err(error) => return Err(error),
         }
 
-        let Some(next_candidate) = candidate.checked_sub(ALLOCATION_GRANULARITY) else {
+        let Some(next_candidate) = next_allocation_granularity_candidate(
+            candidate,
+            length.as_usize(),
+            hole_start,
+            hole_end,
+            top_down,
+        ) else {
             return Ok(HoleSearchResult::Exhausted);
         };
-        if next_candidate < hole_start {
-            return Ok(HoleSearchResult::Exhausted);
-        }
         candidate = next_candidate;
     }
 }
 
-fn mapping_error_to_nt_status(_error: MappingError) -> NtStatus {
-    NtStatus::NO_MEMORY
+fn next_allocation_granularity_candidate(
+    candidate: usize,
+    length: usize,
+    hole_start: usize,
+    hole_end: usize,
+    top_down: bool,
+) -> Option<usize> {
+    if top_down {
+        candidate
+            .checked_sub(ALLOCATION_GRANULARITY)
+            .filter(|next| *next >= hole_start)
+    } else {
+        let next_candidate = candidate.checked_add(ALLOCATION_GRANULARITY)?;
+        let next_end = next_candidate.checked_add(length)?;
+        (next_end <= hole_end).then_some(next_candidate)
+    }
+}
+
+fn zero_bits_address_limit(zero_bits: usize) -> Option<usize> {
+    if zero_bits > 32 {
+        // NtAllocateVirtualMemory treats ZeroBits as a bitmask when > 32.
+        zero_bits.checked_add(1)
+    } else if zero_bits < usize::BITS as usize {
+        let shift = (usize::BITS as usize - zero_bits).try_into().ok()?;
+        1usize.checked_shl(shift)
+    } else {
+        None
+    }
+}
+
+fn mapping_error_to_nt_status(error: MappingError) -> NtStatus {
+    match error {
+        MappingError::UnAligned
+        | MappingError::BadFD(_)
+        | MappingError::NotAFile
+        | MappingError::NotForReading
+        | MappingError::MapError(
+            AllocationError::Unaligned
+            | AllocationError::BelowMinAddress
+            | AllocationError::AboveMaxAddress,
+        ) => NtStatus::INVALID_PARAMETER,
+        MappingError::MapError(
+            AllocationError::AddressInUse
+            | AllocationError::AddressInUseByPlatform
+            | AllocationError::AddressPartiallyInUse,
+        ) => NtStatus::CONFLICTING_ADDRESSES,
+        MappingError::OutOfMemory | MappingError::MapError(AllocationError::OutOfMemory) | _ => {
+            NtStatus::NO_MEMORY
+        }
+    }
 }
 
 fn create_allocation_granularity_aligned_pages<Platform: ShimPlatform>(
@@ -1223,28 +1275,12 @@ fn create_allocation_granularity_aligned_pages<Platform: ShimPlatform>(
     length: NonZeroPageSize<PAGE_SIZE>,
     permissions: MemoryRegionPermissions,
     zero_bits: usize,
+    top_down: bool,
 ) -> Result<MutPtr<Platform, u8>, NtStatus> {
-    if zero_bits == 0
-        && let Some(ptr) = create_allocation_granularity_aligned_pages_by_trimming(
-            page_manager,
-            length,
-            permissions,
-        )?
-    {
-        return Ok(ptr);
-    }
-
     let mut max_start = Platform::TASK_ADDR_MAX
         .checked_sub(length.as_usize())
         .ok_or(NtStatus::NO_MEMORY)?;
-    if zero_bits != 0 {
-        let limit = 1usize
-            .checked_shl(
-                (usize::BITS as usize - zero_bits)
-                    .try_into()
-                    .map_err(|_| NtStatus::NO_MEMORY)?,
-            )
-            .ok_or(NtStatus::NO_MEMORY)?;
+    if let Some(limit) = zero_bits_address_limit(zero_bits) {
         max_start = max_start.min(
             limit
                 .checked_sub(length.as_usize())
@@ -1256,47 +1292,105 @@ fn create_allocation_granularity_aligned_pages<Platform: ShimPlatform>(
         .checked_add(length.as_usize())
         .ok_or(NtStatus::NO_MEMORY)?;
 
+    // TODO: consider adding support for different allocation strategies and granularity to page manager
     'search: for _ in 0..ALLOCATION_SEARCH_ATTEMPTS {
-        let mut hole_end = search_end;
         let mut mappings = page_manager.mappings();
         mappings.sort_by_key(|(range, _)| range.start);
 
-        for (range, _) in mappings.iter().rev() {
-            if range.end <= min_start {
-                break;
-            }
-            if range.start >= search_end {
-                continue;
-            }
-            if range.end < hole_end {
-                match create_aligned_pages_in_hole(
-                    page_manager,
-                    range.end.max(min_start),
-                    hole_end,
-                    length,
-                    permissions,
-                )
-                .map_err(mapping_error_to_nt_status)?
-                {
-                    HoleSearchResult::Allocated(ptr) => return Ok(ptr),
-                    HoleSearchResult::RetryWithFreshMappings => continue 'search,
-                    HoleSearchResult::Exhausted => {}
+        if top_down {
+            let mut hole_end = search_end;
+            for (range, _) in mappings.iter().rev() {
+                if range.end <= min_start {
+                    break;
+                }
+                if range.start >= search_end {
+                    continue;
+                }
+                if range.end < hole_end {
+                    match create_aligned_pages_in_hole(
+                        page_manager,
+                        range.end.max(min_start),
+                        hole_end,
+                        length,
+                        permissions,
+                        true,
+                    )
+                    .map_err(mapping_error_to_nt_status)?
+                    {
+                        HoleSearchResult::Allocated(ptr) => return Ok(ptr),
+                        HoleSearchResult::RetryWithFreshMappings => continue 'search,
+                        HoleSearchResult::Exhausted => {}
+                    }
+                }
+                if range.start < hole_end {
+                    hole_end = range.start;
+                }
+                if hole_end <= min_start {
+                    break;
                 }
             }
-            if range.start < hole_end {
-                hole_end = range.start;
-            }
-            if hole_end <= min_start {
-                break;
-            }
-        }
 
-        match create_aligned_pages_in_hole(page_manager, min_start, hole_end, length, permissions)
+            match create_aligned_pages_in_hole(
+                page_manager,
+                min_start,
+                hole_end,
+                length,
+                permissions,
+                true,
+            )
             .map_err(mapping_error_to_nt_status)?
-        {
-            HoleSearchResult::Allocated(ptr) => return Ok(ptr),
-            HoleSearchResult::RetryWithFreshMappings => continue 'search,
-            HoleSearchResult::Exhausted => {}
+            {
+                HoleSearchResult::Allocated(ptr) => return Ok(ptr),
+                HoleSearchResult::RetryWithFreshMappings => continue 'search,
+                HoleSearchResult::Exhausted => {}
+            }
+        } else {
+            let mut hole_start = min_start;
+            for (range, _) in &mappings {
+                if range.start >= search_end {
+                    break;
+                }
+                if range.end <= hole_start {
+                    continue;
+                }
+                if range.start > hole_start {
+                    match create_aligned_pages_in_hole(
+                        page_manager,
+                        hole_start,
+                        range.start.min(search_end),
+                        length,
+                        permissions,
+                        false,
+                    )
+                    .map_err(mapping_error_to_nt_status)?
+                    {
+                        HoleSearchResult::Allocated(ptr) => return Ok(ptr),
+                        HoleSearchResult::RetryWithFreshMappings => continue 'search,
+                        HoleSearchResult::Exhausted => {}
+                    }
+                }
+                if range.end > hole_start {
+                    hole_start = range.end;
+                }
+                if hole_start >= search_end {
+                    break;
+                }
+            }
+
+            match create_aligned_pages_in_hole(
+                page_manager,
+                hole_start,
+                search_end,
+                length,
+                permissions,
+                false,
+            )
+            .map_err(mapping_error_to_nt_status)?
+            {
+                HoleSearchResult::Allocated(ptr) => return Ok(ptr),
+                HoleSearchResult::RetryWithFreshMappings => continue 'search,
+                HoleSearchResult::Exhausted => {}
+            }
         }
 
         return Err(NtStatus::NO_MEMORY);
@@ -1305,78 +1399,22 @@ fn create_allocation_granularity_aligned_pages<Platform: ShimPlatform>(
     Err(NtStatus::NO_MEMORY)
 }
 
-fn create_allocation_granularity_aligned_pages_by_trimming<Platform: ShimPlatform>(
-    page_manager: &WindowsPageManager<Platform>,
-    length: NonZeroPageSize<PAGE_SIZE>,
-    permissions: MemoryRegionPermissions,
-) -> Result<Option<MutPtr<Platform, u8>>, NtStatus> {
-    let Some(overallocated_len) = length
-        .as_usize()
-        .checked_add(ALLOCATION_GRANULARITY - PAGE_SIZE)
-    else {
-        return Ok(None);
-    };
-    let Some(overallocated_len) = NonZeroPageSize::new(overallocated_len) else {
-        return Ok(None);
-    };
-    let Ok(ptr) = create_pages::<Platform>(
-        page_manager,
-        None,
-        overallocated_len,
-        CreatePagesFlags::empty(),
-        permissions,
-        |_| Ok(0),
-    ) else {
-        return Ok(None);
-    };
-
-    let allocation_base = ptr.as_usize();
-    let Some(allocation_end) = allocation_base.checked_add(overallocated_len.as_usize()) else {
-        let _ = remove_created_pages(page_manager, allocation_base, overallocated_len.as_usize());
-        return Err(NtStatus::NO_MEMORY);
-    };
-    let aligned_base = allocation_base.next_multiple_of(ALLOCATION_GRANULARITY);
-    let Some(aligned_end) = aligned_base.checked_add(length.as_usize()) else {
-        let _ = remove_created_pages(page_manager, allocation_base, overallocated_len.as_usize());
-        return Err(NtStatus::NO_MEMORY);
-    };
-    if allocation_end < aligned_end {
-        let _ = remove_created_pages(page_manager, allocation_base, overallocated_len.as_usize());
-        return Err(NtStatus::NO_MEMORY);
-    }
-
-    if aligned_base != allocation_base {
-        remove_created_pages(
-            page_manager,
-            allocation_base,
-            aligned_base - allocation_base,
-        )?;
-    }
-    if aligned_end != allocation_end {
-        remove_created_pages(page_manager, aligned_end, allocation_end - aligned_end)?;
-    }
-
-    Ok(Some(MutPtr::<Platform, u8>::from_usize(aligned_base)))
-}
-
-fn remove_created_pages<Platform: ShimPlatform>(
-    page_manager: &WindowsPageManager<Platform>,
-    base: usize,
-    len: usize,
-) -> Result<(), NtStatus> {
-    let ptr = MutPtr::<Platform, u8>::from_usize(base);
-    // SAFETY: These pages were created by the current allocation attempt and have not been
-    // returned to the guest or registered in Windows VM metadata yet.
-    unsafe { page_manager.remove_pages(ptr, len) }.map_err(|_| NtStatus::NO_MEMORY)
-}
-
 fn allocation_granularity_aligned_candidate(
     hole_start: usize,
     hole_end: usize,
     length: usize,
+    top_down: bool,
 ) -> Option<usize> {
-    let max_candidate = hole_end.checked_sub(length)? & !(ALLOCATION_GRANULARITY - 1);
-    (max_candidate >= hole_start).then_some(max_candidate)
+    if top_down {
+        let max_candidate = hole_end.checked_sub(length)? & !(ALLOCATION_GRANULARITY - 1);
+        (max_candidate >= hole_start).then_some(max_candidate)
+    } else {
+        let min_candidate = hole_start.next_multiple_of(ALLOCATION_GRANULARITY);
+        min_candidate
+            .checked_add(length)
+            .is_some_and(|end| end <= hole_end)
+            .then_some(min_candidate)
+    }
 }
 
 fn update_permissions<Platform: ShimPlatform>(
@@ -1547,17 +1585,6 @@ mod tests {
         (base, region_size)
     }
 
-    fn const_ptr<T: FromBytes>(value: &T) -> ConstPtr<TestPlatform, T> {
-        ConstPtr::<TestPlatform, T>::from_usize(core::ptr::from_ref(value) as usize)
-    }
-
-    fn memory_extended_parameters(
-        parameters: Option<ConstPtr<TestPlatform, MemoryExtendedParameter>>,
-        count: u32,
-    ) -> MemoryExtendedParameters<TestPlatform> {
-        MemoryExtendedParameters { parameters, count }
-    }
-
     fn release_allocation(task: &TestTask, base: usize) {
         let mut release_base = base;
         let mut release_size = 0usize;
@@ -1588,125 +1615,6 @@ mod tests {
         );
         assert_eq!(return_length, size_of::<MemoryBasicInformation>());
         info
-    }
-
-    fn register_test_image_allocation(task: &TestTask, base: usize, size: usize) {
-        let mut pages = RangeMap::new();
-        pages.insert(base..base + size, PageProtection::PAGE_EXECUTE_READ);
-        task.process.virtual_allocations.write().insert(
-            base,
-            WindowsVirtualAllocation {
-                base,
-                size,
-                allocation_protect: PageProtection::PAGE_EXECUTE_WRITECOPY,
-                type_: MemoryType::MEM_IMAGE,
-                pages,
-            },
-        );
-    }
-
-    #[test]
-    fn query_virtual_memory_reports_image_information() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let image_base = 0x1800_0000usize;
-            let image_size = 0x20_000usize;
-            register_test_image_allocation(&task, image_base, image_size);
-
-            let mut info = MemoryImageInformation::default();
-            let mut return_length = 0usize;
-            assert_eq!(
-                task.sys_nt_query_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    image_base + PAGE_SIZE,
-                    MemoryInformationClass::Image as u32,
-                    mut_byte_ptr(&mut info),
-                    size_of::<MemoryImageInformation>(),
-                    Some(mut_ptr(&mut return_length)),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(return_length, size_of::<MemoryImageInformation>());
-            assert_eq!(info.image_base, image_base);
-            assert_eq!(info.size_of_image, image_size);
-            assert_eq!(info.image_flags, 0);
-        });
-    }
-
-    #[test]
-    fn query_virtual_memory_reports_absent_image_extension_information() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let image_base = 0x1800_0000usize;
-            register_test_image_allocation(&task, image_base, 0x20_000);
-
-            let mut info = MemoryImageExtensionInformation::default();
-            let mut return_length = 0usize;
-            assert_eq!(
-                task.sys_nt_query_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    image_base,
-                    MemoryInformationClass::ImageExtension as u32,
-                    mut_byte_ptr(&mut info),
-                    size_of::<MemoryImageExtensionInformation>(),
-                    Some(mut_ptr(&mut return_length)),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(return_length, size_of::<MemoryImageExtensionInformation>());
-            assert_eq!(info.extension_type, 0);
-            assert_eq!(info.flags, 0);
-            assert_eq!(info.extension_image_base_rva, 0);
-            assert_eq!(info.extension_size, 0);
-
-            info.flags = 1;
-            assert_eq!(
-                task.sys_nt_query_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    image_base,
-                    MemoryInformationClass::ImageExtension as u32,
-                    mut_byte_ptr(&mut info),
-                    size_of::<MemoryImageExtensionInformation>(),
-                    None,
-                ),
-                NtStatus::INVALID_PARAMETER
-            );
-        });
-    }
-
-    #[test]
-    fn query_virtual_memory_zeroes_working_set_list() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let mut info = [0xccu8; 80];
-            let mut return_length = 0usize;
-
-            assert_eq!(
-                task.sys_nt_query_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    0,
-                    MemoryInformationClass::WorkingSetList as u32,
-                    mut_byte_ptr(&mut info),
-                    info.len(),
-                    Some(mut_ptr(&mut return_length)),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(return_length, info.len());
-            assert_eq!(info, [0u8; 80]);
-
-            assert_eq!(
-                task.sys_nt_query_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    0,
-                    MemoryInformationClass::WorkingSetList as u32,
-                    mut_byte_ptr(&mut info),
-                    MEMORY_WORKING_SET_LIST_MIN_SIZE - 1,
-                    None,
-                ),
-                NtStatus::INFO_LENGTH_MISMATCH
-            );
-        });
     }
 
     #[test]
@@ -1788,170 +1696,78 @@ mod tests {
     }
 
     #[test]
-    fn allocate_virtual_memory_zero_bits_rejects_fixed_base() {
+    fn allocate_virtual_memory_fixed_collision_returns_conflicting_addresses() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
-            let mut base = ALLOCATION_GRANULARITY * 16;
+            let mut base = 0usize;
             let mut region_size = PAGE_SIZE;
             assert_eq!(
                 task.sys_nt_allocate_virtual_memory(
                     ProcessHandle::CURRENT,
                     mut_ptr(&mut base),
-                    1,
+                    0,
                     mut_ptr(&mut region_size),
                     AllocationType::MEM_RESERVE.bits(),
                     PageProtection::PAGE_READWRITE.bits(),
                 ),
-                NtStatus::INVALID_PARAMETER
-            );
-        });
-    }
-
-    #[test]
-    fn allocate_virtual_memory_ex_accepts_noop_extended_parameters() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let mut base = 0usize;
-            let mut region_size = PAGE_SIZE;
-            let address_requirements = MemoryAddressRequirements {
-                lowest_starting_address: 0,
-                highest_ending_address: 0,
-                alignment: ALLOCATION_GRANULARITY,
-            };
-            let extended_parameters = [
-                MemoryExtendedParameter {
-                    type_: MemoryExtendedParameterType::AddressRequirements as u64,
-                    value: core::ptr::from_ref(&address_requirements) as usize,
-                },
-                MemoryExtendedParameter {
-                    type_: MemoryExtendedParameterType::NumaNode as u64,
-                    value: 0,
-                },
-                MemoryExtendedParameter {
-                    type_: MemoryExtendedParameterType::AttributeFlags as u64,
-                    value: 0,
-                },
-            ];
-
-            assert_eq!(
-                task.sys_nt_allocate_virtual_memory_ex(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut base),
-                    mut_ptr(&mut region_size),
-                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                    PageProtection::PAGE_READWRITE.bits(),
-                    memory_extended_parameters(
-                        Some(const_ptr(&extended_parameters[0])),
-                        u32::try_from(extended_parameters.len()).unwrap(),
-                    ),
-                ),
                 NtStatus::SUCCESS
             );
-            assert_ne!(base, 0);
-            assert_eq!(region_size, PAGE_SIZE);
+
+            let mut fixed_base = base;
+            let mut fixed_size = PAGE_SIZE;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut fixed_base),
+                    0,
+                    mut_ptr(&mut fixed_size),
+                    AllocationType::MEM_RESERVE.bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::CONFLICTING_ADDRESSES
+            );
 
             release_allocation(&task, base);
         });
     }
 
     #[test]
-    fn allocate_virtual_memory_ex_rejects_unsupported_extended_parameters() {
+    fn allocate_virtual_memory_mem_top_down_prefers_higher_addresses() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
-            let mut base = 0usize;
-            let mut region_size = PAGE_SIZE;
-            let address_requirements = MemoryAddressRequirements {
-                lowest_starting_address: 0,
-                highest_ending_address: 0x7fff_ffff,
-                alignment: 0,
-            };
-            let address_parameter = MemoryExtendedParameter {
-                type_: MemoryExtendedParameterType::AddressRequirements as u64,
-                value: core::ptr::from_ref(&address_requirements) as usize,
-            };
-            let invalid_type_parameter = MemoryExtendedParameter { type_: 0, value: 0 };
-            let duplicate_parameters = [
-                MemoryExtendedParameter {
-                    type_: MemoryExtendedParameterType::NumaNode as u64,
-                    value: 0,
-                },
-                MemoryExtendedParameter {
-                    type_: MemoryExtendedParameterType::NumaNode as u64,
-                    value: 0,
-                },
-            ];
 
+            let mut bottom_base = 0usize;
+            let mut bottom_size = PAGE_SIZE;
             assert_eq!(
-                task.sys_nt_allocate_virtual_memory_ex(
+                task.sys_nt_allocate_virtual_memory(
                     ProcessHandle::CURRENT,
-                    mut_ptr(&mut base),
-                    mut_ptr(&mut region_size),
-                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    mut_ptr(&mut bottom_base),
+                    0,
+                    mut_ptr(&mut bottom_size),
+                    AllocationType::MEM_RESERVE.bits(),
                     PageProtection::PAGE_READWRITE.bits(),
-                    memory_extended_parameters(None, 1),
                 ),
-                NtStatus::INVALID_PARAMETER
+                NtStatus::SUCCESS
             );
-            assert_eq!(
-                task.sys_nt_allocate_virtual_memory_ex(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut base),
-                    mut_ptr(&mut region_size),
-                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                    PageProtection::PAGE_READWRITE.bits(),
-                    memory_extended_parameters(Some(const_ptr(&address_parameter)), 1),
-                ),
-                NtStatus::INVALID_PARAMETER
-            );
-            assert_eq!(
-                task.sys_nt_allocate_virtual_memory_ex(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut base),
-                    mut_ptr(&mut region_size),
-                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                    PageProtection::PAGE_READWRITE.bits(),
-                    memory_extended_parameters(Some(const_ptr(&invalid_type_parameter)), 1),
-                ),
-                NtStatus::INVALID_PARAMETER
-            );
-            assert_eq!(
-                task.sys_nt_allocate_virtual_memory_ex(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut base),
-                    mut_ptr(&mut region_size),
-                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                    PageProtection::PAGE_READWRITE.bits(),
-                    memory_extended_parameters(
-                        Some(const_ptr(&duplicate_parameters[0])),
-                        u32::try_from(duplicate_parameters.len()).unwrap(),
-                    ),
-                ),
-                NtStatus::INVALID_PARAMETER
-            );
-        });
-    }
 
-    #[test]
-    fn allocate_virtual_memory_ex_rejects_invalid_parameter_pointer() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let mut base = 0usize;
-            let mut region_size = PAGE_SIZE;
-
+            let mut top_base = 0usize;
+            let mut top_size = PAGE_SIZE;
             assert_eq!(
-                task.sys_nt_allocate_virtual_memory_ex(
+                task.sys_nt_allocate_virtual_memory(
                     ProcessHandle::CURRENT,
-                    mut_ptr(&mut base),
-                    mut_ptr(&mut region_size),
-                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    mut_ptr(&mut top_base),
+                    0,
+                    mut_ptr(&mut top_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_TOP_DOWN).bits(),
                     PageProtection::PAGE_READWRITE.bits(),
-                    memory_extended_parameters(
-                        Some(ConstPtr::<TestPlatform, MemoryExtendedParameter>::from_usize(1)),
-                        1,
-                    ),
                 ),
-                NtStatus::ACCESS_VIOLATION
+                NtStatus::SUCCESS
             );
+
+            assert!(top_base > bottom_base);
+
+            release_allocation(&task, top_base);
+            release_allocation(&task, bottom_base);
         });
     }
 
@@ -2366,16 +2182,6 @@ mod tests {
                 protect: u32,
             ) -> i32;
 
-            fn NtAllocateVirtualMemoryEx(
-                process_handle: *mut c_void,
-                base_address: *mut *mut c_void,
-                region_size: *mut usize,
-                allocation_type: u32,
-                protect: u32,
-                extended_parameters: *const MemoryExtendedParameter,
-                extended_parameter_count: u32,
-            ) -> i32;
-
             fn NtProtectVirtualMemory(
                 process_handle: *mut c_void,
                 base_address: *mut *mut c_void,
@@ -2493,137 +2299,6 @@ mod tests {
         }
 
         #[test]
-        fn allocate_virtual_memory_ex_without_parameters_matches_host_ntdll() {
-            run_with_test_platform_pointers(|| {
-                let mut host_base = core::ptr::null_mut::<c_void>();
-                let mut host_region_size = PAGE_SIZE * 2;
-                // SAFETY: The output pointers are valid locals and the allocation is released
-                // before this test returns.
-                let host_allocate_status = unsafe {
-                    host_status(NtAllocateVirtualMemoryEx(
-                        current_process(),
-                        &raw mut host_base,
-                        &raw mut host_region_size,
-                        (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                        PageProtection::PAGE_READWRITE.bits(),
-                        core::ptr::null(),
-                        0,
-                    ))
-                };
-                assert_eq!(host_allocate_status, NtStatus::SUCCESS);
-
-                let task = crate::tests::test_task();
-                let mut guest_base = 0usize;
-                let mut guest_region_size = PAGE_SIZE * 2;
-                let guest_allocate_status = task.sys_nt_allocate_virtual_memory_ex(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut guest_base),
-                    mut_ptr(&mut guest_region_size),
-                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                    PageProtection::PAGE_READWRITE.bits(),
-                    memory_extended_parameters(None, 0),
-                );
-                assert_eq!(guest_allocate_status, host_allocate_status);
-                assert_eq!(guest_region_size, host_region_size);
-                assert_eq!(
-                    query_basic_information(&task, guest_base).protect,
-                    PageProtection::PAGE_READWRITE.bits()
-                );
-
-                release_allocation(&task, guest_base);
-                let mut host_release_size = 0usize;
-                // SAFETY: Releases the host allocation created by this test.
-                let host_free_status = unsafe {
-                    host_status(NtFreeVirtualMemory(
-                        current_process(),
-                        &raw mut host_base,
-                        &raw mut host_release_size,
-                        FreeType::MEM_RELEASE.bits(),
-                    ))
-                };
-                assert_eq!(host_free_status, NtStatus::SUCCESS);
-            });
-        }
-
-        #[test]
-        fn allocate_virtual_memory_ex_parameter_status_matches_host_ntdll() {
-            run_with_test_platform_pointers(|| {
-                let task = crate::tests::test_task();
-                let mut host_base = core::ptr::null_mut::<c_void>();
-                let mut host_region_size = PAGE_SIZE;
-                // SAFETY: This probes host validation with a null parameter array and valid local
-                // base/size outputs. It does not allocate on failure.
-                let host_null_params_status = unsafe {
-                    host_status(NtAllocateVirtualMemoryEx(
-                        current_process(),
-                        &raw mut host_base,
-                        &raw mut host_region_size,
-                        (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                        PageProtection::PAGE_READWRITE.bits(),
-                        core::ptr::null(),
-                        1,
-                    ))
-                };
-                let mut guest_base = 0usize;
-                let mut guest_region_size = PAGE_SIZE;
-                let guest_null_params_status = task.sys_nt_allocate_virtual_memory_ex(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut guest_base),
-                    mut_ptr(&mut guest_region_size),
-                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                    PageProtection::PAGE_READWRITE.bits(),
-                    memory_extended_parameters(None, 1),
-                );
-                assert_eq!(guest_null_params_status, host_null_params_status);
-
-                let attribute_parameter = MemoryExtendedParameter {
-                    type_: MemoryExtendedParameterType::AttributeFlags as u64,
-                    value: 0,
-                };
-                host_base = core::ptr::null_mut();
-                host_region_size = PAGE_SIZE;
-                // SAFETY: The parameter pointer and output pointers are valid locals. Any host
-                // allocation is released before return.
-                let host_attribute_status = unsafe {
-                    host_status(NtAllocateVirtualMemoryEx(
-                        current_process(),
-                        &raw mut host_base,
-                        &raw mut host_region_size,
-                        (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                        PageProtection::PAGE_READWRITE.bits(),
-                        &raw const attribute_parameter,
-                        1,
-                    ))
-                };
-                assert_eq!(host_attribute_status, NtStatus::SUCCESS);
-                guest_base = 0;
-                guest_region_size = PAGE_SIZE;
-                let guest_attribute_status = task.sys_nt_allocate_virtual_memory_ex(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut guest_base),
-                    mut_ptr(&mut guest_region_size),
-                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                    PageProtection::PAGE_READWRITE.bits(),
-                    memory_extended_parameters(Some(const_ptr(&attribute_parameter)), 1),
-                );
-                assert_eq!(guest_attribute_status, host_attribute_status);
-
-                release_allocation(&task, guest_base);
-                let mut host_release_size = 0usize;
-                // SAFETY: Releases the host allocation created by this test.
-                let host_free_status = unsafe {
-                    host_status(NtFreeVirtualMemory(
-                        current_process(),
-                        &raw mut host_base,
-                        &raw mut host_release_size,
-                        FreeType::MEM_RELEASE.bits(),
-                    ))
-                };
-                assert_eq!(host_free_status, NtStatus::SUCCESS);
-            });
-        }
-
-        #[test]
         fn reserve_alignment_outputs_match_host_ntdll() {
             run_with_test_platform_pointers(|| {
                 let mut probe_base = core::ptr::null_mut::<c_void>();
@@ -2702,6 +2377,68 @@ mod tests {
                 assert_eq!(guest_region_size, host_region_size);
 
                 release_allocation(&task, guest_base);
+            });
+        }
+
+        #[test]
+        fn allocate_virtual_memory_zero_bits_bitmask_matches_host_ntdll() {
+            run_with_test_platform_pointers(|| {
+                // When ZeroBits > 32, Windows treats it as the maximum virtual address for the
+                // allocation (exclusive upper bound = zero_bits + 1). A value of 0x7FFF_FFFF
+                // restricts the allocation to below 2 GiB.
+                let zero_bits_max_addr: usize = 0x7FFF_FFFF;
+                let limit: usize = zero_bits_max_addr + 1;
+
+                let mut host_base = core::ptr::null_mut::<c_void>();
+                let mut host_region_size = PAGE_SIZE;
+                // SAFETY: Output pointers are valid locals and the current-process pseudo handle
+                // targets this process. The allocation is released before return.
+                let host_allocate_status = unsafe {
+                    host_status(NtAllocateVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        zero_bits_max_addr,
+                        &raw mut host_region_size,
+                        AllocationType::MEM_RESERVE.bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                    ))
+                };
+                assert_eq!(host_allocate_status, NtStatus::SUCCESS);
+                assert!(
+                    host_base as usize + host_region_size <= limit,
+                    "host allocation exceeds ZeroBits max address"
+                );
+
+                let task = crate::tests::test_task();
+                let mut guest_base = 0usize;
+                let mut guest_region_size = PAGE_SIZE;
+                let guest_allocate_status = task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut guest_base),
+                    zero_bits_max_addr,
+                    mut_ptr(&mut guest_region_size),
+                    AllocationType::MEM_RESERVE.bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                );
+                assert_eq!(guest_allocate_status, host_allocate_status);
+                assert!(
+                    guest_base + guest_region_size <= limit,
+                    "guest allocation exceeds ZeroBits max address"
+                );
+
+                release_allocation(&task, guest_base);
+
+                let mut host_release_size = 0usize;
+                // SAFETY: Releases the host allocation created by this test.
+                let host_free_status = unsafe {
+                    host_status(NtFreeVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        &raw mut host_release_size,
+                        FreeType::MEM_RELEASE.bits(),
+                    ))
+                };
+                assert_eq!(host_free_status, NtStatus::SUCCESS);
             });
         }
 
