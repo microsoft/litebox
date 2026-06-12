@@ -440,7 +440,6 @@ pub fn decode_ta_request(
         out_shm_info: [const { None }; UteeParamOwned::TEE_NUM_PARAMS],
     };
 
-    let num_params = msg_args.num_params as usize;
     if num_params
         .checked_sub(skip)
         .is_none_or(|n| n > UteeParamOwned::TEE_NUM_PARAMS)
