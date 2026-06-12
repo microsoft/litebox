@@ -3609,10 +3609,9 @@ impl<FS: ShimFS> Task<FS> {
                                 let promoted = entry_handle.with_entry(|e| {
                                     e.ensure_broker_backed_for_fork(Some(&provider), None)
                                 });
-                                if let Ok(Some((
-                                    super::fork_snapshot::BrokerHandleKind::Eventfd,
+                                if let Ok(Some(super::fork_snapshot::BrokerHandleSnapshot::Eventfd {
                                     handle_id,
-                                ))) = promoted
+                                })) = promoted
                                 {
                                     broker_info = Some((handle_id, provider));
                                 }

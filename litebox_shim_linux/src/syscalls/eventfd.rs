@@ -413,15 +413,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         &self,
         _eventfd_provider: Option<&Arc<dyn BrokerEventfdProvider>>,
         _pidfd_provider: Option<&Arc<dyn BrokerPidfdProvider>>,
-    ) -> Result<Option<(super::fork_snapshot::BrokerHandleKind, u64)>, BrokerOpError> {
-        use super::fork_snapshot::BrokerHandleKind;
+    ) -> Result<Option<super::fork_snapshot::BrokerHandleSnapshot>, BrokerOpError> {
+        use super::fork_snapshot::BrokerHandleSnapshot;
         let guard = self.inner.lock();
         match &*guard {
             EventFileInner::BrokerBacked { common, .. } => {
-                Ok(Some((BrokerHandleKind::Eventfd, common.handle())))
+                Ok(Some(BrokerHandleSnapshot::Eventfd {
+                    handle_id: common.handle(),
+                }))
             }
             EventFileInner::PidfdBrokerBacked { common, .. } => {
-                Ok(Some((BrokerHandleKind::Pidfd, common.handle())))
+                Ok(Some(BrokerHandleSnapshot::Pidfd {
+                    handle_id: common.handle(),
+                }))
             }
             EventFileInner::Timerfd(_) => Ok(None),
             EventFileInner::Eventfd { .. } => {
@@ -436,7 +440,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 ..
             } => {
                 if broker_subscription.is_some() {
-                    Ok(Some((BrokerHandleKind::Pidfd, u64::from(target_pid.0))))
+                    Ok(Some(BrokerHandleSnapshot::Pidfd {
+                        handle_id: u64::from(target_pid.0),
+                    }))
                 } else {
                     Ok(None)
                 }

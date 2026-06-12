@@ -6007,8 +6007,8 @@ impl<FS: ShimFS> Task<FS> {
         preserve_cloexec_fd: Option<usize>,
     ) -> super::fork_snapshot::FdTableSnapshot {
         use super::fork_snapshot::{
-            BrokerFdTokenSnapshot, BrokerHandleKind, BrokerHandleSnapshot, FdClass,
-            FdEntrySnapshot, FdMetadataSnapshot, ForkRejectReason, ForkSnapshotBrokerTransit,
+            BrokerFdTokenSnapshot, BrokerHandleSnapshot, FdClass, FdEntrySnapshot,
+            FdMetadataSnapshot, ForkRejectReason, ForkSnapshotBrokerTransit,
             ForkSnapshotFdTokenTransit,
         };
 
@@ -6384,62 +6384,46 @@ impl<FS: ShimFS> Task<FS> {
                             )
                         });
                     match result {
-                        Some(Ok(Some((kind, handle_id)))) => {
+                        Some(Ok(Some(snapshot))) => {
                             // Dup the handle so the snapshot's
                             // transit reference is independently
                             // tracked. On rollback we release this
                             // dup; on success the child's restore-
                             // side BrokerBacked adopts it.
+                            //
+                            // Pidfd uses a process-exit subscription
+                            // instead of a broker subscribable; the
+                            // dup_handle/releaser path doesn't apply.
+                            let handle_id = snapshot.handle_id();
                             let releaser_opt: Option<
                                 alloc::sync::Arc<
                                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
                                 >,
-                            > = match kind {
-                                BrokerHandleKind::Eventfd => eventfd_provider
+                            > = match &snapshot {
+                                BrokerHandleSnapshot::Eventfd { .. } => eventfd_provider
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
-                                BrokerHandleKind::Pidfd => pidfd_provider
+                                BrokerHandleSnapshot::Pidfd { .. } => pidfd_provider
                                     .as_ref()
                                     .map(|p| alloc::sync::Arc::clone(p) as _),
-                                BrokerHandleKind::Signalfd => None,
-                                BrokerHandleKind::Pty => super::eventfd::broker_pty_provider()
-                                    .as_ref()
-                                    .map(|p| alloc::sync::Arc::clone(p) as _),
-                                BrokerHandleKind::Pipe => super::broker_pipe::broker_pipe_provider()
-                                    .as_ref()
-                                    .map(|p| alloc::sync::Arc::clone(p) as _),
-                                BrokerHandleKind::UnixSocket => {
-                                    super::broker_socketpair::broker_socketpair_provider()
-                                        .as_ref()
-                                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                                }
-                                BrokerHandleKind::SocketDgram => {
-                                    super::broker_socket_dgram::broker_socket_dgram_provider()
-                                        .as_ref()
-                                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                                }
-                                BrokerHandleKind::SocketSeqPacket => {
-                                    super::broker_socket_seqpacket::broker_socket_seqpacket_provider()
-                                        .as_ref()
-                                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                                }
-                                BrokerHandleKind::TcpConn => {
-                                    super::broker_tcp_conn::broker_tcp_conn_provider()
-                                        .as_ref()
-                                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                                }
-                                BrokerHandleKind::InetListener => {
-                                    super::broker_inet_listener::broker_inet_listener_provider()
-                                        .as_ref()
-                                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                                }
-                                BrokerHandleKind::InetDgram => {
-                                    super::broker_inet_dgram::broker_inet_dgram_provider()
-                                        .as_ref()
-                                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                                }
+                                // `ensure_broker_backed_for_fork` only
+                                // produces `Eventfd` or `Pidfd` (see
+                                // `eventfd.rs`); other variants here
+                                // would be a logic error. Per AGENTS.md
+                                // "loud failure for logic errors".
+                                BrokerHandleSnapshot::Signalfd { .. }
+                                | BrokerHandleSnapshot::Pty { .. }
+                                | BrokerHandleSnapshot::Pipe { .. }
+                                | BrokerHandleSnapshot::UnixSocket { .. }
+                                | BrokerHandleSnapshot::SocketDgram { .. }
+                                | BrokerHandleSnapshot::SocketSeqPacket { .. }
+                                | BrokerHandleSnapshot::TcpConn { .. }
+                                | BrokerHandleSnapshot::InetListener { .. }
+                                | BrokerHandleSnapshot::InetDgram { .. } => unreachable!(
+                                    "ensure_broker_backed_for_fork must only return Eventfd or Pidfd, got {snapshot:?}",
+                                ),
                             };
-                            if kind == BrokerHandleKind::Pidfd {
+                            if matches!(snapshot, BrokerHandleSnapshot::Pidfd { .. }) {
                                 if let Ok(target_pid) = u32::try_from(handle_id)
                                     && let Some(wake) =
                                         super::guest_pid::try_subscribe_broker_process_exit(
@@ -6448,30 +6432,16 @@ impl<FS: ShimFS> Task<FS> {
                                 {
                                     pidfd_process_transit.push(wake);
                                 }
-                                Some(BrokerHandleSnapshot {
-                                    kind,
-                                    handle_id,
-                                    pipe_direction: None,
-                                    socketpair_endpoint: None,
-                                    pty_role: None,
-                                    pty_id: None,
-                                })
+                                Some(snapshot)
                             } else if let Some(releaser) = releaser_opt {
                                 match releaser.dup_handle(handle_id) {
                                     Ok(()) => {
                                         broker_transit.push(ForkSnapshotBrokerTransit {
                                             releaser,
                                             handle_id,
-                                            kind,
+                                            kind: snapshot.spec_token(),
                                         });
-                                        Some(BrokerHandleSnapshot {
-                                            kind,
-                                            handle_id,
-                                            pipe_direction: None,
-                                            socketpair_endpoint: None,
-                                            pty_role: None,
-                                            pty_id: None,
-                                        })
+                                        Some(snapshot)
                                     }
                                     Err(_) => None,
                                 }
@@ -6493,22 +6463,16 @@ impl<FS: ShimFS> Task<FS> {
                         sfd.fork_snapshot_handle()
                     });
                     match (result, signalfd_provider) {
-                        (Some((kind, handle_id)), Some(releaser)) => {
+                        (Some(snapshot), Some(releaser)) => {
+                            let handle_id = snapshot.handle_id();
                             match releaser.dup_handle(handle_id) {
                                 Ok(()) => {
                                     broker_transit.push(ForkSnapshotBrokerTransit {
                                         releaser: releaser as _,
                                         handle_id,
-                                        kind,
+                                        kind: snapshot.spec_token(),
                                     });
-                                    Some(BrokerHandleSnapshot {
-                                        kind,
-                                        handle_id,
-                                        pipe_direction: None,
-                                        socketpair_endpoint: None,
-                                        pty_role: None,
-                                        pty_id: None,
-                                    })
+                                    Some(snapshot)
                                 }
                                 Err(_) => None,
                             }
@@ -6522,36 +6486,29 @@ impl<FS: ShimFS> Task<FS> {
                 rds.fd_from_raw_integer::<super::broker_pty::BrokerPtySubsystem>(raw_fd)
             {
                 let pty_provider = super::broker_pty::broker_pty_provider();
-                let entry_result = dt.with_entry(
+                let snapshot_opt = dt.with_entry(
                     &typed,
                     |pty_fd: &super::broker_pty::BrokerPtyFd<crate::Platform>| {
-                        let (kind, handle_id) = pty_fd.fork_snapshot_handle();
-                        (kind, handle_id, pty_fd.role(), pty_fd.pty_id())
+                        pty_fd.fork_snapshot_handle()
                     },
                 );
-                match entry_result {
-                    Some((kind, handle_id, role, pty_id)) => {
+                match snapshot_opt {
+                    Some(snapshot) => {
                         let releaser_opt: Option<
                             alloc::sync::Arc<
                                 dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
                             >,
                         > = pty_provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
                         if let Some(releaser) = releaser_opt {
+                            let handle_id = snapshot.handle_id();
                             match releaser.dup_handle(handle_id) {
                                 Ok(()) => {
                                     broker_transit.push(ForkSnapshotBrokerTransit {
                                         releaser,
                                         handle_id,
-                                        kind,
+                                        kind: snapshot.spec_token(),
                                     });
-                                    Some(BrokerHandleSnapshot {
-                                        kind,
-                                        handle_id,
-                                        pipe_direction: None,
-                                        socketpair_endpoint: None,
-                                        pty_role: Some(role),
-                                        pty_id: Some(pty_id),
-                                    })
+                                    Some(snapshot)
                                 }
                                 Err(_) => None,
                             }
@@ -6570,14 +6527,14 @@ impl<FS: ShimFS> Task<FS> {
                     rds.fd_from_raw_integer::<super::broker_pipe::BrokerPipeSubsystem>(raw_fd)
                 {
                     let pipe_provider = super::broker_pipe::broker_pipe_provider();
-                    let entry_result = dt.with_entry(
+                    let snapshot_opt = dt.with_entry(
                         &typed,
                         |bp_fd: &super::broker_pipe::BrokerPipeFd<crate::Platform>| {
                             bp_fd.fork_snapshot_handle()
                         },
                     );
-                    match entry_result {
-                        Some((kind, handle_id, direction)) => {
+                    match snapshot_opt {
+                        Some(snapshot) => {
                             let releaser_opt: Option<
                                 alloc::sync::Arc<
                                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
@@ -6586,21 +6543,15 @@ impl<FS: ShimFS> Task<FS> {
                                 .as_ref()
                                 .map(|p| alloc::sync::Arc::clone(p) as _);
                             if let Some(releaser) = releaser_opt {
+                                let handle_id = snapshot.handle_id();
                                 match releaser.dup_handle(handle_id) {
                                     Ok(()) => {
                                         broker_transit.push(ForkSnapshotBrokerTransit {
                                             releaser,
                                             handle_id,
-                                            kind,
+                                            kind: snapshot.spec_token(),
                                         });
-                                        Some(BrokerHandleSnapshot {
-                                            kind,
-                                            handle_id,
-                                            pipe_direction: Some(direction),
-                                            socketpair_endpoint: None,
-                                            pty_role: None,
-                                            pty_id: None,
-                                        })
+                                        Some(snapshot)
                                     }
                                     Err(_) => None,
                                 }
@@ -6628,19 +6579,14 @@ impl<FS: ShimFS> Task<FS> {
                     match (entry_result, listener_provider) {
                         (Some(handle_id), Some(releaser)) => match releaser.dup_handle(handle_id) {
                             Ok(()) => {
+                                let snapshot =
+                                    BrokerHandleSnapshot::InetListener { handle_id };
                                 broker_transit.push(ForkSnapshotBrokerTransit {
                                     releaser: releaser as _,
                                     handle_id,
-                                    kind: BrokerHandleKind::InetListener,
+                                    kind: snapshot.spec_token(),
                                 });
-                                Some(BrokerHandleSnapshot {
-                                    kind: BrokerHandleKind::InetListener,
-                                    handle_id,
-                                    pipe_direction: None,
-                                    socketpair_endpoint: None,
-                                    pty_role: None,
-                                    pty_id: None,
-                                })
+                                Some(snapshot)
                             }
                             Err(_) => None,
                         },
@@ -6665,14 +6611,14 @@ impl<FS: ShimFS> Task<FS> {
                 {
                     let socketpair_provider =
                         super::broker_socketpair::broker_socketpair_provider();
-                    let entry_result = dt.with_entry(
+                    let snapshot_opt = dt.with_entry(
                         &typed,
                         |sp_fd: &super::broker_socketpair::BrokerSocketPairFd<crate::Platform>| {
                             sp_fd.fork_snapshot_handle()
                         },
                     );
-                    match entry_result {
-                        Some((kind, handle_id, endpoint)) => {
+                    match snapshot_opt {
+                        Some(snapshot) => {
                             let releaser_opt: Option<
                                 alloc::sync::Arc<
                                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
@@ -6681,21 +6627,15 @@ impl<FS: ShimFS> Task<FS> {
                                 .as_ref()
                                 .map(|p| alloc::sync::Arc::clone(p) as _);
                             if let Some(releaser) = releaser_opt {
+                                let handle_id = snapshot.handle_id();
                                 match releaser.dup_handle(handle_id) {
                                     Ok(()) => {
                                         broker_transit.push(ForkSnapshotBrokerTransit {
                                             releaser,
                                             handle_id,
-                                            kind,
+                                            kind: snapshot.spec_token(),
                                         });
-                                        Some(BrokerHandleSnapshot {
-                                            kind,
-                                            handle_id,
-                                            pipe_direction: None,
-                                            socketpair_endpoint: Some(endpoint),
-                                            pty_role: None,
-                                            pty_id: None,
-                                        })
+                                        Some(snapshot)
                                     }
                                     Err(_) => None,
                                 }
@@ -6711,35 +6651,29 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 {
                     let provider = super::broker_socket_dgram::broker_socket_dgram_provider();
-                    let entry_result = dt.with_entry(
+                    let snapshot_opt = dt.with_entry(
                         &typed,
                         |dgram_fd: &super::broker_socket_dgram::BrokerSocketDgramFd<
                             crate::Platform,
                         >| { dgram_fd.fork_snapshot_handle() },
                     );
-                    match entry_result {
-                        Some((kind, handle_id)) => {
+                    match snapshot_opt {
+                        Some(snapshot) => {
                             let releaser_opt: Option<
                                 alloc::sync::Arc<
                                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
                                 >,
                             > = provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
                             if let Some(releaser) = releaser_opt {
+                                let handle_id = snapshot.handle_id();
                                 match releaser.dup_handle(handle_id) {
                                     Ok(()) => {
                                         broker_transit.push(ForkSnapshotBrokerTransit {
                                             releaser,
                                             handle_id,
-                                            kind,
+                                            kind: snapshot.spec_token(),
                                         });
-                                        Some(BrokerHandleSnapshot {
-                                            kind,
-                                            handle_id,
-                                            pipe_direction: None,
-                                            socketpair_endpoint: None,
-                                            pty_role: None,
-                                            pty_id: None,
-                                        })
+                                        Some(snapshot)
                                     }
                                     Err(_) => None,
                                 }
@@ -6753,35 +6687,29 @@ impl<FS: ShimFS> Task<FS> {
                     .fd_from_raw_integer::<super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>(raw_fd)
                 {
                     let provider = super::broker_socket_seqpacket::broker_socket_seqpacket_provider();
-                    let entry_result = dt.with_entry(
+                    let snapshot_opt = dt.with_entry(
                         &typed,
                         |seqpacket_fd: &super::broker_socket_seqpacket::BrokerSocketSeqPacketFd<
                             crate::Platform,
                         >| { seqpacket_fd.fork_snapshot_handle() },
                     );
-                    match entry_result {
-                        Some((kind, handle_id)) => {
+                    match snapshot_opt {
+                        Some(snapshot) => {
                             let releaser_opt: Option<
                                 alloc::sync::Arc<
                                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
                                 >,
                             > = provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
                             if let Some(releaser) = releaser_opt {
+                                let handle_id = snapshot.handle_id();
                                 match releaser.dup_handle(handle_id) {
                                     Ok(()) => {
                                         broker_transit.push(ForkSnapshotBrokerTransit {
                                             releaser,
                                             handle_id,
-                                            kind,
+                                            kind: snapshot.spec_token(),
                                         });
-                                        Some(BrokerHandleSnapshot {
-                                            kind,
-                                            handle_id,
-                                            pipe_direction: None,
-                                            socketpair_endpoint: None,
-                                            pty_role: None,
-                                            pty_id: None,
-                                        })
+                                        Some(snapshot)
                                     }
                                     Err(_) => None,
                                 }
@@ -6795,35 +6723,29 @@ impl<FS: ShimFS> Task<FS> {
                     .fd_from_raw_integer::<super::broker_tcp_conn::BrokerTcpConnSubsystem>(raw_fd)
                 {
                     let tcp_provider = super::broker_tcp_conn::broker_tcp_conn_provider();
-                    let entry_result = dt.with_entry(
+                    let snapshot_opt = dt.with_entry(
                         &typed,
                         |tcp_fd: &super::broker_tcp_conn::BrokerTcpConnFd<crate::Platform>| {
                             tcp_fd.fork_snapshot_handle()
                         },
                     );
-                    match entry_result {
-                        Some((kind, handle_id)) => {
+                    match snapshot_opt {
+                        Some(snapshot) => {
                             let releaser_opt: Option<
                                 alloc::sync::Arc<
                                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
                                 >,
                             > = tcp_provider.as_ref().map(|p| alloc::sync::Arc::clone(p) as _);
                             if let Some(releaser) = releaser_opt {
+                                let handle_id = snapshot.handle_id();
                                 match releaser.dup_handle(handle_id) {
                                     Ok(()) => {
                                         broker_transit.push(ForkSnapshotBrokerTransit {
                                             releaser,
                                             handle_id,
-                                            kind,
+                                            kind: snapshot.spec_token(),
                                         });
-                                        Some(BrokerHandleSnapshot {
-                                            kind,
-                                            handle_id,
-                                            pipe_direction: None,
-                                            socketpair_endpoint: None,
-                                            pty_role: None,
-                                            pty_id: None,
-                                        })
+                                        Some(snapshot)
                                     }
                                     Err(_) => None,
                                 }
@@ -9962,7 +9884,7 @@ type BrokerTransitReleaseEntry = (
 /// each fd to its current backing broker handle via
 /// `EventFile::ensure_broker_backed_for_fork` (which promotes a host
 /// eventfd to broker-backed if needed and returns the
-/// `(BrokerHandleKind, handle_id)` pair).
+/// `BrokerHandleSnapshot`).
 ///
 /// Skips stdio (fds 0/1/2). Pairs with `emit_timerfd_bridge_specs`,
 /// which iterates the same bucket and handles the timerfd subset
@@ -9998,69 +9920,36 @@ fn emit_eventfd_bridge_specs<FS: ShimFS>(
                 ef.ensure_broker_backed_for_fork(eventfd_provider.as_ref(), pidfd_provider.as_ref())
             });
         drop(dt_local);
-        if let Some(Ok(Some((kind, handle_id)))) = result {
-            use super::fork_snapshot::BrokerHandleKind;
-            let kind_str = match kind {
-                BrokerHandleKind::Eventfd => "eventfd",
-                BrokerHandleKind::Pidfd => "pidfd",
-                BrokerHandleKind::Signalfd => "signalfd",
-                BrokerHandleKind::Pty => "pty",
-                BrokerHandleKind::Pipe => "pipe",
-                BrokerHandleKind::UnixSocket => "unix_socket",
-                BrokerHandleKind::SocketDgram => "socket_dgram",
-                BrokerHandleKind::SocketSeqPacket => "socket_seqpacket",
-                BrokerHandleKind::TcpConn => "tcp_conn",
-                BrokerHandleKind::InetListener => "inet_listener",
-                BrokerHandleKind::InetDgram => "inet_dgram",
-            };
+        if let Some(Ok(Some(snapshot))) = result {
+            use super::fork_snapshot::BrokerHandleSnapshot;
+            let handle_id = snapshot.handle_id();
+            let kind_str = snapshot.spec_token();
+            // `ensure_broker_backed_for_fork` only produces `Eventfd`
+            // or `Pidfd`; any other variant here is a logic error.
             let releaser: Option<
                 alloc::sync::Arc<
                     dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
                 >,
-            > = match kind {
-                BrokerHandleKind::Eventfd => eventfd_provider
+            > = match &snapshot {
+                BrokerHandleSnapshot::Eventfd { .. } => eventfd_provider
                     .as_ref()
                     .map(|p| alloc::sync::Arc::clone(p) as _),
-                BrokerHandleKind::Pidfd => pidfd_provider
+                BrokerHandleSnapshot::Pidfd { .. } => pidfd_provider
                     .as_ref()
                     .map(|p| alloc::sync::Arc::clone(p) as _),
-                BrokerHandleKind::Signalfd => None,
-                BrokerHandleKind::Pty => super::eventfd::broker_pty_provider()
-                    .as_ref()
-                    .map(|p| alloc::sync::Arc::clone(p) as _),
-                BrokerHandleKind::Pipe => super::broker_pipe::broker_pipe_provider()
-                    .as_ref()
-                    .map(|p| alloc::sync::Arc::clone(p) as _),
-                BrokerHandleKind::UnixSocket => {
-                    super::broker_socketpair::broker_socketpair_provider()
-                        .as_ref()
-                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                }
-                BrokerHandleKind::SocketDgram => {
-                    super::broker_socket_dgram::broker_socket_dgram_provider()
-                        .as_ref()
-                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                }
-                BrokerHandleKind::SocketSeqPacket => {
-                    super::broker_socket_seqpacket::broker_socket_seqpacket_provider()
-                        .as_ref()
-                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                }
-                BrokerHandleKind::TcpConn => super::broker_tcp_conn::broker_tcp_conn_provider()
-                    .as_ref()
-                    .map(|p| alloc::sync::Arc::clone(p) as _),
-                BrokerHandleKind::InetListener => {
-                    super::broker_inet_listener::broker_inet_listener_provider()
-                        .as_ref()
-                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                }
-                BrokerHandleKind::InetDgram => {
-                    super::broker_inet_dgram::broker_inet_dgram_provider()
-                        .as_ref()
-                        .map(|p| alloc::sync::Arc::clone(p) as _)
-                }
+                BrokerHandleSnapshot::Signalfd { .. }
+                | BrokerHandleSnapshot::Pty { .. }
+                | BrokerHandleSnapshot::Pipe { .. }
+                | BrokerHandleSnapshot::UnixSocket { .. }
+                | BrokerHandleSnapshot::SocketDgram { .. }
+                | BrokerHandleSnapshot::SocketSeqPacket { .. }
+                | BrokerHandleSnapshot::TcpConn { .. }
+                | BrokerHandleSnapshot::InetListener { .. }
+                | BrokerHandleSnapshot::InetDgram { .. } => unreachable!(
+                    "ensure_broker_backed_for_fork must only return Eventfd or Pidfd, got {snapshot:?}",
+                ),
             };
-            if kind == BrokerHandleKind::Pidfd {
+            if matches!(snapshot, BrokerHandleSnapshot::Pidfd { .. }) {
                 if let Ok(target_pid) = u32::try_from(handle_id)
                     && let Some(wake) = super::guest_pid::try_subscribe_broker_process_exit(
                         litebox::process::ProcessId(target_pid),

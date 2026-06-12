@@ -23,7 +23,7 @@ use litebox_common_linux::{
 use litebox_platform_multiplex::Platform;
 
 use super::broker_backed::{BrokerBackedCommon, broker_err_to_errno};
-use super::fork_snapshot::BrokerHandleKind;
+use super::fork_snapshot::BrokerHandleSnapshot;
 
 pub use super::eventfd::{broker_pty_provider, set_broker_pty_provider};
 
@@ -118,8 +118,12 @@ where
         );
     }
 
-    pub(crate) fn fork_snapshot_handle(&self) -> (BrokerHandleKind, u64) {
-        (BrokerHandleKind::Pty, self.handle())
+    pub(crate) fn fork_snapshot_handle(&self) -> BrokerHandleSnapshot {
+        BrokerHandleSnapshot::Pty {
+            handle_id: self.handle(),
+            role: self.role(),
+            pty_id: Some(self.pty_id()),
+        }
     }
 }
 

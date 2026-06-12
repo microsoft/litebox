@@ -71,11 +71,10 @@ impl SignalfdFile {
         }
     }
 
-    pub(crate) fn fork_snapshot_handle(&self) -> (super::fork_snapshot::BrokerHandleKind, u64) {
-        (
-            super::fork_snapshot::BrokerHandleKind::Signalfd,
-            self.common.handle(),
-        )
+    pub(crate) fn fork_snapshot_handle(&self) -> super::fork_snapshot::BrokerHandleSnapshot {
+        super::fork_snapshot::BrokerHandleSnapshot::Signalfd {
+            handle_id: self.common.handle(),
+        }
     }
 
     pub(crate) fn worker_exec_bridge_snapshot(&self) -> (u64, u64, bool) {
