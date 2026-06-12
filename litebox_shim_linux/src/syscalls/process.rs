@@ -8858,16 +8858,26 @@ impl<FS: ShimFS> Task<FS> {
         > = alloc::vec::Vec::new();
         let mut remote_signalfd_entries = alloc::vec::Vec::new();
         {
+            // Unified Phase-1 walk: single pass over iter_alive with an
+            // exhaustive RawFdRef match populating per-subsystem buckets.
+            // All Phase-2 emit blocks below consume from `collected`.
+            // See `collect_migratable_fds` for the exhaustiveness gate.
+            let collected = collect_migratable_fds::<FS>(
+                &self.files.borrow(),
+                &self.global,
+                /* survives_exec_filter */ true,
+            );
+
             // Collect EventfdSubsystem fds (non-stdio) and promote each to
             // broker-backed if not already. Skip on broker-provider absence
             // (worker will have no fd at the slot, binary read → EBADF).
-            let eventfd_fds =
-                collect_worker_exec_subsystem_fds::<FS, super::eventfd::EventfdSubsystem>(
-                    &self.files.borrow(),
-                    &self.global,
-                    /* skip_stdio */ true,
-                );
+            // `.clone()` so the timerfd block below (per-entry is_timerfd
+            // filter) can re-iterate the same bucket.
+            let eventfd_fds = collected.eventfd.clone();
             for (raw_fd, typed) in eventfd_fds {
+                if raw_fd <= 2 {
+                    continue;
+                }
                 let eventfd_provider = super::eventfd::broker_eventfd_provider();
                 let pidfd_provider = super::eventfd::broker_pidfd_provider();
                 let dt_local = self.global.litebox.descriptor_table();
@@ -8965,17 +8975,11 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            // Phase C.3: collect BrokerPipeSubsystem fds and emit bridge
-            // specs so the remote worker re-installs broker pipes at the
-            // matching slots. Eager-broker pipes are already broker-backed
-            // (no promote step needed); just dup the handle and ship it.
-            let broker_pipe_fds =
-                collect_worker_exec_subsystem_fds::<FS, super::broker_pipe::BrokerPipeSubsystem>(
-                    &self.files.borrow(),
-                    &self.global,
-                    /* skip_stdio */ false,
-                );
-            for (raw_fd, typed) in broker_pipe_fds {
+            // Phase C.3: emit broker-pipe bridge specs so the remote worker
+            // re-installs broker pipes at matching slots. Eager-broker
+            // pipes are already broker-backed (no promote step needed);
+            // just dup the handle and ship it.
+            for (raw_fd, typed) in collected.broker_pipe {
                 let pipe_provider = super::broker_pipe::broker_pipe_provider();
                 let dt_local = self.global.litebox.descriptor_table();
                 let pipe_info = dt_local.with_entry(
@@ -9016,16 +9020,9 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            // Stage A: collect BrokerPtySubsystem fds and emit pty
-            // bridge specs so the remote worker re-installs broker PTY
-            // handles at matching fd slots.
-            let broker_pty_fds =
-                collect_worker_exec_subsystem_fds::<FS, super::broker_pty::BrokerPtySubsystem>(
-                    &self.files.borrow(),
-                    &self.global,
-                    /* skip_stdio */ false,
-                );
-            for (raw_fd, typed) in broker_pty_fds {
+            // Stage A: emit broker-pty bridge specs so the remote worker
+            // re-installs broker PTY handles at matching fd slots.
+            for (raw_fd, typed) in collected.broker_pty {
                 let pty_provider = super::broker_pty::broker_pty_provider();
                 let dt_local = self.global.litebox.descriptor_table();
                 let pty_info = dt_local.with_entry(
@@ -9054,23 +9051,10 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            // Phase F: collect BrokerSocketPairSubsystem fds and emit
-            // unix_socket bridge specs. Mirrors the BrokerPipe block
-            // above. Worker B's install_broker_bridge_fd calls
-            // dup_handle to record the +1 on its own connection.
-            // Phase F: collect BrokerSocketPairSubsystem fds and emit
-            // unix_socket bridge specs. Mirrors the BrokerPipe block
-            // above. Worker B's install_broker_bridge_fd calls
-            // dup_handle to record the +1 on its own connection.
-            let broker_socketpair_fds = collect_worker_exec_subsystem_fds::<
-                FS,
-                super::broker_socketpair::BrokerSocketPairSubsystem,
-            >(
-                &self.files.borrow(),
-                &self.global,
-                /* skip_stdio */ false,
-            );
-            for (raw_fd, typed) in broker_socketpair_fds {
+            // Phase F: emit unix_socket bridge specs. Mirrors the
+            // BrokerPipe block above. Worker B's install_broker_bridge_fd
+            // calls dup_handle to record the +1 on its own connection.
+            for (raw_fd, typed) in collected.broker_socketpair {
                 let sp_provider = super::broker_socketpair::broker_socketpair_provider();
                 let dt_local = self.global.litebox.descriptor_table();
                 let sp_info = dt_local.with_entry(
@@ -9116,15 +9100,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            let broker_socket_dgram_fds = collect_worker_exec_subsystem_fds::<
-                FS,
-                super::broker_socket_dgram::BrokerSocketDgramSubsystem,
-            >(
-                &self.files.borrow(),
-                &self.global,
-                /* skip_stdio */ false,
-            );
-            for (raw_fd, typed) in broker_socket_dgram_fds {
+            for (raw_fd, typed) in collected.broker_socket_dgram {
                 let provider = super::broker_socket_dgram::broker_socket_dgram_provider();
                 let dt_local = self.global.litebox.descriptor_table();
                 let handle_id = dt_local.with_entry(
@@ -9145,15 +9121,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            let broker_socket_seqpacket_fds = collect_worker_exec_subsystem_fds::<
-                FS,
-                super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem,
-            >(
-                &self.files.borrow(),
-                &self.global,
-                /* skip_stdio */ false,
-            );
-            for (raw_fd, typed) in broker_socket_seqpacket_fds {
+            for (raw_fd, typed) in collected.broker_socket_seqpacket {
                 let provider = super::broker_socket_seqpacket::broker_socket_seqpacket_provider();
                 let dt_local = self.global.litebox.descriptor_table();
                 let handle_id = dt_local.with_entry(
@@ -9175,15 +9143,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            let broker_tcp_conn_fds = collect_worker_exec_subsystem_fds::<
-                FS,
-                super::broker_tcp_conn::BrokerTcpConnSubsystem,
-            >(
-                &self.files.borrow(),
-                &self.global,
-                /* skip_stdio */ false,
-            );
-            for (raw_fd, typed) in broker_tcp_conn_fds {
+            for (raw_fd, typed) in collected.broker_tcp_conn {
                 let tcp_provider = super::broker_tcp_conn::broker_tcp_conn_provider();
                 let dt_local = self.global.litebox.descriptor_table();
                 let handle_id = dt_local.with_entry(
@@ -9205,15 +9165,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            let broker_inet_listener_fds = collect_worker_exec_subsystem_fds::<
-                FS,
-                super::broker_inet_listener::BrokerInetListenerSubsystem,
-            >(
-                &self.files.borrow(),
-                &self.global,
-                /* skip_stdio */ false,
-            );
-            for (raw_fd, typed) in broker_inet_listener_fds {
+            for (raw_fd, typed) in collected.broker_inet_listener {
                 let listener_provider =
                     super::broker_inet_listener::broker_inet_listener_provider();
                 let dt_local = self.global.litebox.descriptor_table();
@@ -9236,12 +9188,12 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            let fs_fds = collect_worker_exec_subsystem_fds::<FS, FS>(
-                &self.files.borrow(),
-                &self.global,
-                /* skip_stdio */ true,
-            );
-            for (raw_fd, typed) in fs_fds {
+            // FS (brokerfile) bridge: skip stdio (worker_stdio bindings
+            // handle fds 0/1/2).
+            for (raw_fd, typed) in collected.fs {
+                if raw_fd <= 2 {
+                    continue;
+                }
                 let bridge_info = {
                     let files = self.files.borrow();
                     files.fs.fd_path(&typed).and_then(|path| {
@@ -9266,13 +9218,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            let signalfd_fds =
-                collect_worker_exec_subsystem_fds::<FS, super::signalfd::SignalfdSubsystem>(
-                    &self.files.borrow(),
-                    &self.global,
-                    /* skip_stdio */ false,
-                );
-            for (raw_fd, typed) in signalfd_fds {
+            for (raw_fd, typed) in collected.signalfd {
                 let signalfd_provider = super::signalfd::broker_signalfd_provider();
                 let dt_local = self.global.litebox.descriptor_table();
                 let bridge_info = dt_local
@@ -9301,24 +9247,8 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            let network_fds: alloc::vec::Vec<usize> = {
-                let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
-                let mut out = alloc::vec::Vec::new();
-                for raw_fd in rds.iter_alive() {
-                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
-                        continue;
-                    }
-                    if rds
-                        .fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
-                        .is_ok()
-                    {
-                        out.push(raw_fd);
-                    }
-                }
-                out
-            };
-            for raw_fd in network_fds {
+            #[cfg(feature = "worker_local_inet")]
+            for raw_fd in collected.network {
                 if let Some(spec) = self.tcp_listen_worker_exec_bridge_spec(raw_fd) {
                     broker_eventfd_specs.push(spec);
                 }
@@ -9327,32 +9257,25 @@ impl<FS: ShimFS> Task<FS> {
             // Non-PIE worker-exec timerfd snapshot. Timerfd shares the
             // EventfdSubsystem storage (see `EventFile::new_timer`); we
             // identify timerfd entries via `is_timerfd()` then snapshot
-            // their state for reconstruction in the child.
+            // their state for reconstruction in the child. Consumes
+            // `collected.eventfd` (moved — the eventfd block above
+            // cloned it).
             let timerfd_fds: alloc::vec::Vec<(
                 usize,
                 alloc::sync::Arc<litebox::fd::TypedFd<super::eventfd::EventfdSubsystem>>,
             )> = {
-                let files = self.files.borrow();
-                let rds = files.raw_descriptor_store.read();
                 let mut out = alloc::vec::Vec::new();
-                for raw_fd in rds.iter_alive() {
-                    if !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
-                        continue;
-                    }
-                    if let Ok(typed) =
-                        rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-                    {
-                        let dt_local = self.global.litebox.descriptor_table();
-                        let is_timer = dt_local
-                            .with_entry(
-                                &typed,
-                                |evf: &super::eventfd::EventFile<crate::Platform>| evf.is_timerfd(),
-                            )
-                            .unwrap_or(false);
-                        drop(dt_local);
-                        if is_timer {
-                            out.push((raw_fd, typed));
-                        }
+                for (raw_fd, typed) in collected.eventfd {
+                    let dt_local = self.global.litebox.descriptor_table();
+                    let is_timer = dt_local
+                        .with_entry(
+                            &typed,
+                            |evf: &super::eventfd::EventFile<crate::Platform>| evf.is_timerfd(),
+                        )
+                        .unwrap_or(false);
+                    drop(dt_local);
+                    if is_timer {
+                        out.push((raw_fd, typed));
                     }
                 }
                 out
@@ -9393,12 +9316,7 @@ impl<FS: ShimFS> Task<FS> {
             // post-exec lifetime as signalfd — released only on
             // spawn failure; the worker's broker connection cleanup
             // balances the dup on normal exit).
-            let inotify_fds =
-                collect_worker_exec_subsystem_fds::<FS, super::inotify::InotifySubsystem>(
-                    &self.files.borrow(),
-                    &self.global,
-                    /* skip_stdio */ false,
-                );
+            let inotify_fds = collected.inotify;
             for (raw_fd, typed) in inotify_fds {
                 let inotify_provider = super::inotify::broker_inotify_provider();
                 let dt_local = self.global.litebox.descriptor_table();
@@ -9438,11 +9356,7 @@ impl<FS: ShimFS> Task<FS> {
             // up each interest's target fd in the worker's
             // descriptor store — every other subsystem's install
             // must complete first.
-            let epoll_fds = collect_worker_exec_subsystem_fds::<FS, super::epoll::EpollSubsystem<FS>>(
-                &self.files.borrow(),
-                &self.global,
-                /* skip_stdio */ false,
-            );
+            let epoll_fds = collected.epoll;
             for (raw_fd, typed) in epoll_fds {
                 let dt_local = self.global.litebox.descriptor_table();
                 let entries = dt_local
