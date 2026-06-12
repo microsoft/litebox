@@ -5124,14 +5124,24 @@ impl<FS: ShimFS> Task<FS> {
                 &self.global,
                 /* survives_exec_filter */ false,
             );
+            // Mirror the `snapshot_fd_table` CLOEXEC reject gate for
+            // Epoll/Inotify: emitting bridge specs for fds the snapshot
+            // path then rejects causes a mismatch between the
+            // bridge-spec set and the snapshot's `FdEntrySnapshot` set.
+            let files_ref = self.files.borrow();
+            let inotify_non_cloexec =
+                filter_non_cloexec_bucket(&collected.inotify, &self.global, &files_ref);
+            let epoll_non_cloexec =
+                filter_non_cloexec_bucket(&collected.epoll, &self.global, &files_ref);
+            drop(files_ref);
             emit_inotify_bridge_specs(
                 self,
-                &collected.inotify,
+                &inotify_non_cloexec,
                 &mut broker_fd_bridge_specs,
                 &mut broker_fd_bridge_transit_release,
             );
             // Epoll last (no broker handle; targets resolved at install).
-            emit_epoll_bridge_specs(self, &collected.epoll, &mut broker_fd_bridge_specs);
+            emit_epoll_bridge_specs(self, &epoll_non_cloexec, &mut broker_fd_bridge_specs);
         }
 
         let snapshot = super::fork_snapshot::ForkSnapshot {
@@ -5585,16 +5595,23 @@ impl<FS: ShimFS> Task<FS> {
                 &self.global,
                 /* survives_exec_filter */ false,
             );
+            // Mirror the snapshot CLOEXEC reject gate (see commit_delayed_fork).
+            let files_ref = self.files.borrow();
+            let inotify_non_cloexec =
+                filter_non_cloexec_bucket(&collected.inotify, &self.global, &files_ref);
+            let epoll_non_cloexec =
+                filter_non_cloexec_bucket(&collected.epoll, &self.global, &files_ref);
+            drop(files_ref);
             emit_inotify_bridge_specs(
                 self,
-                &collected.inotify,
+                &inotify_non_cloexec,
                 &mut true_fork_broker_fd_bridge_specs,
                 &mut true_fork_broker_fd_bridge_transit_release,
             );
             // Epoll last (no broker handle; targets resolved at install).
             emit_epoll_bridge_specs(
                 self,
-                &collected.epoll,
+                &epoll_non_cloexec,
                 &mut true_fork_broker_fd_bridge_specs,
             );
         }
@@ -6237,7 +6254,30 @@ impl<FS: ShimFS> Task<FS> {
                 // install — also satisfies the invariant that epoll bridge
                 // installation runs after every other subsystem's install
                 // (see `install_epoll_bridge_fd` doc).
-                FdClass::Epoll | FdClass::Inotify => {}
+                //
+                // CLOEXEC fds are rejected: they will be closed by the
+                // impending exec anyway, so emitting bridge specs and
+                // doing the migration work is wasted effort. Returning
+                // `UnsupportedFdClass` here causes `commit_delayed_fork`
+                // to return ENOSYS, falling through to vfork shared-AS
+                // — the fast pre-cf7348e5 behaviour. Tokio (used by the
+                // test harness runtime) creates `epoll_create1(EPOLL_CLOEXEC)`
+                // at startup, so without this gate every test handler
+                // that calls `Command::spawn(non-PIE)` incurs the +13.4s
+                // snapshot/serialize/worker-spawn cost, blowing the 15s
+                // `send_cmd` budget (regressed WORKER_READY_RACE.pidfd).
+                //
+                // Non-CLOEXEC epoll/inotify still take the migration
+                // path — that's the case cf7348e5 was actually written
+                // for, validated by `DF_PARENT_TRIGGER.{epoll,inotify}.*`
+                // which themselves use CLOEXEC (and so reach this reject
+                // arm) but passed pre-cf7348e5 via the same vfork
+                // shared-AS fall-through that this gate restores.
+                FdClass::Epoll | FdClass::Inotify => {
+                    if fd_flags.contains(FileDescriptorFlags::FD_CLOEXEC) {
+                        reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
+                    }
+                }
                 // Rejected — grouped by *why* this fd class can't migrate
                 // across worker hosts. Each variant is named explicitly so
                 // that adding a new `FdClass` variant fails to compile here
@@ -9877,6 +9917,37 @@ fn collect_migratable_fds<FS: ShimFS>(
         });
     }
     out
+}
+
+/// Filter a `(raw_fd, Arc<TypedFd<S>>)` bucket to entries whose
+/// `FD_CLOEXEC` flag is NOT set.
+///
+/// Used by `commit_delayed_fork` / `true_fork` to mirror the
+/// `snapshot_fd_table` Epoll/Inotify reject-on-CLOEXEC gate. If we
+/// emitted bridge specs for CLOEXEC epoll/inotify fds but the
+/// snapshot then rejected the same fds (and the parent fell through
+/// to vfork shared-AS), the bridge specs would either be wasted
+/// work on the snapshot-restore path or — worse — mismatched against
+/// the snapshot's `FdEntrySnapshot` set, causing assertion failures
+/// downstream. Keeping the two filters in lockstep is the simplest
+/// way to maintain the invariant.
+fn filter_non_cloexec_bucket<FS: ShimFS, S>(
+    entries: &[(usize, alloc::sync::Arc<litebox::fd::TypedFd<S>>)],
+    global: &crate::GlobalState<FS>,
+    files: &crate::syscalls::file::FilesState<FS>,
+) -> alloc::vec::Vec<(usize, alloc::sync::Arc<litebox::fd::TypedFd<S>>)>
+where
+    S: litebox::fd::FdEnabledSubsystem,
+{
+    entries
+        .iter()
+        .filter(|(raw_fd, _)| {
+            get_file_descriptor_flags(*raw_fd, global, files)
+                .map(|flags| !flags.contains(FileDescriptorFlags::FD_CLOEXEC))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Transit-release entry: `(broker_subscribable, handle_id)` pairs that
