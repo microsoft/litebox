@@ -41,13 +41,14 @@
 //! `spawn_worker_host_for_exec` path. PIE children take the
 //! local-exec path and do not exercise the non-PIE worker code.
 //!
-//! `DEFAULT_ITERATIONS = 10`: the per-iter cost (~0.4s) × N must
-//! fit under `send_cmd`'s default 15s response timeout for non-
-//! Exec/Spawn commands (see
-//! `litebox_test_harness/src/coordinator/mod.rs:1394`). 10 iterations
-//! ≈ 4s wall time — comfortably under the budget while still
-//! exercising the spawn path enough times to surface non-trivial
-//! per-spawn bugs.
+//! `DEFAULT_ITERATIONS`: per-fd-kind (`default_iterations`). The
+//! per-iter cost × N must fit under `send_cmd`'s default 15s
+//! response timeout for non-Exec/Spawn commands (see
+//! `litebox_test_harness/src/coordinator/mod.rs:1394`). Eventfd
+//! runs at N=10 (~3-4s wall), pidfd at N=5 (~3-4s wall — pidfd has
+//! an extra `fork()` + `pidfd_open` + SIGKILL/waitpid per iter
+//! relative to eventfd, so the same wall-time budget admits fewer
+//! iterations).
 
 #![allow(clippy::wildcard_enum_match_arm)]
 
@@ -132,20 +133,35 @@ const PARENT_BTS: &[BinaryType] = &[
 
 const CHILD_BTS: &[BinaryType] = &[BinaryType::NonPieGlibc, BinaryType::NonPieStaticMusl];
 
-/// Number of inner iterations per test. Each iteration spawns a
-/// non-PIE worker (~0.15-0.3s wall time per spawn dominated by
-/// fork+exec of the child binary).
+/// Number of inner iterations per test, per-fd-kind. Each iteration
+/// spawns a non-PIE worker (~0.15-0.3s wall time per spawn dominated
+/// by fork+exec of the child binary).
 ///
 /// **Sized for `send_cmd`'s 15s default response timeout** for non-
 /// Exec/Spawn commands (see
-/// `litebox_test_harness/src/coordinator/mod.rs:1394`). N=10 →
-/// ~2-3s wall — comfortably under the budget. The prior N=50 produced
-/// ~20s handler runtime and consistently tripped the 15s timeout
-/// (coordinator poisoned the agent, test reported "expected Result,
-/// got Error { error: 'timeout' }"). That timeout-bomb was
-/// misdiagnosed as a real race in the broker-held model; see the
-/// module-level doc comment for the correction.
-const DEFAULT_ITERATIONS: u32 = 10;
+/// `litebox_test_harness/src/coordinator/mod.rs:1394`). The prior
+/// N=50 produced ~20s handler runtime and consistently tripped the
+/// 15s timeout (coordinator poisoned the agent, test reported
+/// "expected Result, got Error { error: 'timeout' }"). That
+/// timeout-bomb was misdiagnosed as a real race in the broker-held
+/// model; see the module-level doc comment for the correction.
+///
+/// Pidfd iterations carry extra per-iter cost the eventfd path does
+/// not: an additional `fork()` of a sleeper target, a `pidfd_open`,
+/// and the SIGKILL/waitpid teardown. Empirically, eventfd at N=10
+/// fits comfortably under the 15s budget even under parallel test
+/// load, while pidfd at N=10 occasionally exceeds it (~5-10% per
+/// cargo-test cycle on a loaded host, concentrated on the dng
+/// child variant which is the slowest non-PIE worker spawn). Halving
+/// pidfd's N restores a comparable safety margin while preserving
+/// the "many repeated spawns per test" property that gives the
+/// family its stress-regression coverage.
+const fn default_iterations(fd_kind: FdKind) -> u32 {
+    match fd_kind {
+        FdKind::Eventfd => 10,
+        FdKind::Pidfd => 5,
+    }
+}
 
 /// Tight-loop iteration count used by `RacePattern::TightLoop`.
 const TIGHT_LOOP_ITERS: u32 = 256;
@@ -553,7 +569,7 @@ pub(crate) fn register_worker_ready_race(reg: &mut Registry<'_>) {
                                                 fd_kind,
                                                 race_pattern,
                                                 child_binary,
-                                                iterations: DEFAULT_ITERATIONS,
+                                                iterations: default_iterations(fd_kind),
                                             },
                                         )
                                         .await;

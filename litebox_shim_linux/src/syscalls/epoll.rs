@@ -109,6 +109,8 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             crate::RawFdRef::BrokerInetDgram(fd) => {
                 Ok(EpollDescriptor::BrokerInetDgram(Arc::clone(fd)))
             }
+            crate::RawFdRef::BrokerSocketDgram(_) => Err(Errno::EBADF),
+            crate::RawFdRef::BrokerSocketSeqPacket(_) => Err(Errno::EBADF),
             crate::RawFdRef::BrokerInetRaw(fd) => {
                 Ok(EpollDescriptor::BrokerInetRaw(Arc::clone(fd)))
             }
@@ -391,6 +393,33 @@ impl<FS: ShimFS> EpollFile<FS> {
             status: core::sync::atomic::AtomicU32::new(OFlags::RDWR.bits()),
             needs_host_poll: core::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Snapshot the current interest list for cross-binary-type exec
+    /// migration (see `exec_on_remote_host` in `process.rs`). Returns
+    /// `(parent_raw_fd, events_bits, user_data)` for every interest
+    /// whose target descriptor is still live. The events bits combine
+    /// the [`Events`] mask and the [`EpollFlags`] (EDGE_TRIGGER /
+    /// ONE_SHOT / EXCLUSIVE / WAKE_UP), matching the wire format the
+    /// guest originally passed to `epoll_ctl(EPOLL_CTL_ADD)`.
+    ///
+    /// The remote worker re-creates these interests by calling
+    /// `EpollFile::add_interest` after every other bridge fd has been
+    /// installed at its matching slot — the parent's `fd` is preserved
+    /// across the exec boundary by the slot-preserving bridge install
+    /// path.
+    pub fn snapshot_interests(&self) -> Vec<(u32, u32, u64)> {
+        let interests = self.interests.lock();
+        let mut out: Vec<(u32, u32, u64)> = Vec::with_capacity(interests.len());
+        for (key, entry) in interests.iter() {
+            if entry.desc.upgrade().is_none() {
+                continue;
+            }
+            let inner = entry.inner.lock();
+            let events_bits = inner.mask.bits() | inner.flags.bits();
+            out.push((key.0, events_bits, inner.data));
+        }
+        out
     }
 
     pub(crate) fn wait(

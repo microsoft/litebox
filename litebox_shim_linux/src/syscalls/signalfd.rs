@@ -71,11 +71,10 @@ impl SignalfdFile {
         }
     }
 
-    pub(crate) fn fork_snapshot_handle(&self) -> (super::fork_snapshot::BrokerHandleKind, u64) {
-        (
-            super::fork_snapshot::BrokerHandleKind::Signalfd,
-            self.common.handle(),
-        )
+    pub(crate) fn fork_snapshot_handle(&self) -> super::fork_snapshot::BrokerHandleSnapshot {
+        super::fork_snapshot::BrokerHandleSnapshot::Signalfd {
+            handle_id: self.common.handle(),
+        }
     }
 
     pub(crate) fn worker_exec_bridge_snapshot(&self) -> (u64, u64, bool) {
@@ -225,12 +224,25 @@ impl<FS: crate::ShimFS> crate::Task<FS> {
         let Some(provider) = broker_signalfd_provider() else {
             unreachable!("installing signalfd bridge requires the broker signalfd provider");
         };
-        let file = SignalfdFile::new_broker_backed(
-            provider,
-            handle_id,
-            nonblock,
-            SigSet::from_u64(mask_bits),
-        );
+        let mask = SigSet::from_u64(mask_bits);
+        // Worker-exec hands the new shim a signalfd whose mask the parent
+        // had blocked via sigprocmask before fork. The kernel-level signal
+        // mask is not propagated through the cross-binary `posix_spawn`
+        // path (no `--blocked-signal-mask` style transfer exists), and
+        // worker-exec is the only fork shape that crosses a fresh shim
+        // instance — true-fork preserves the mask via `ThreadSnapshot`.
+        // Without this propagation, a child that self-raises one of the
+        // signalfd's signals (e.g. `raise(SIGUSR1)`) reaches the shim's
+        // `do_kill` with `signals.blocked` empty, so the signal is
+        // delivered through default action and terminates the process
+        // instead of being routed to the signalfd. Folding the bridge's
+        // mask into the child shim's blocked set restores the parent's
+        // (sigprocmask+signalfd) invariant on the child side. Repeats
+        // POSIX user practice of blocking exactly the signals one wires
+        // to a signalfd.
+        let merged_blocked = self.signals.get_blocked() | mask;
+        self.signals.set_blocked(merged_blocked);
+        let file = SignalfdFile::new_broker_backed(provider, handle_id, nonblock, mask);
         let typed = self
             .global
             .litebox
