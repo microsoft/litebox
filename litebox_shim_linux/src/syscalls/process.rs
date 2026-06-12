@@ -10308,6 +10308,646 @@ fn collect_migratable_fds<FS: ShimFS>(
     out
 }
 
+/// Transit-release entry: `(broker_subscribable, handle_id)` pairs that
+/// the caller balances after the worker acks (or on spawn failure).
+/// See per-emit-helper doc comments for the per-kind release timing.
+type BrokerTransitReleaseEntry = (
+    alloc::sync::Arc<dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable>,
+    u64,
+);
+
+/// Emit `--broker-fd-bridge` specs for `EventfdSubsystem` fds, dispatching
+/// each fd to its current backing broker handle via
+/// `EventFile::ensure_broker_backed_for_fork` (which promotes a host
+/// eventfd to broker-backed if needed and returns the
+/// `(BrokerHandleKind, handle_id)` pair).
+///
+/// Skips stdio (fds 0/1/2). Pairs with `emit_timerfd_bridge_specs`,
+/// which iterates the same bucket and handles the timerfd subset
+/// (filtered via `EventFile::is_timerfd`).
+///
+/// For most kinds, dup_handle's transit ref lifetime matches
+/// `eventfd`/`signalfd`/`pty` (released only on spawn failure; worker's
+/// broker-conn cleanup balances the dup on normal exit) and is pushed
+/// to `transit_release`. `Pidfd` instead pushes a
+/// `BrokerProcessExitWake` to `pidfd_process_transit` so the in-transit
+/// exit subscription survives until the remote exec'd child installs
+/// its own subscription.
+fn emit_eventfd_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::eventfd::EventfdSubsystem>>,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+    transit_release: &mut alloc::vec::Vec<BrokerTransitReleaseEntry>,
+    pidfd_process_transit: &mut alloc::vec::Vec<super::guest_pid::BrokerProcessExitWake>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        if raw_fd <= 2 {
+            continue;
+        }
+        let eventfd_provider = super::eventfd::broker_eventfd_provider();
+        let pidfd_provider = super::eventfd::broker_pidfd_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let result =
+            dt_local.with_entry(typed, |ef: &super::eventfd::EventFile<crate::Platform>| {
+                ef.ensure_broker_backed_for_fork(eventfd_provider.as_ref(), pidfd_provider.as_ref())
+            });
+        drop(dt_local);
+        if let Some(Ok(Some((kind, handle_id)))) = result {
+            use super::fork_snapshot::BrokerHandleKind;
+            let kind_str = match kind {
+                BrokerHandleKind::Eventfd => "eventfd",
+                BrokerHandleKind::Pidfd => "pidfd",
+                BrokerHandleKind::Signalfd => "signalfd",
+                BrokerHandleKind::Pty => "pty",
+                BrokerHandleKind::Pipe => "pipe",
+                BrokerHandleKind::UnixSocket => "unix_socket",
+                BrokerHandleKind::SocketDgram => "socket_dgram",
+                BrokerHandleKind::SocketSeqPacket => "socket_seqpacket",
+                BrokerHandleKind::TcpConn => "tcp_conn",
+                BrokerHandleKind::InetListener => "inet_listener",
+                BrokerHandleKind::InetDgram => "inet_dgram",
+            };
+            let releaser: Option<
+                alloc::sync::Arc<
+                    dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                >,
+            > = match kind {
+                BrokerHandleKind::Eventfd => eventfd_provider
+                    .as_ref()
+                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                BrokerHandleKind::Pidfd => pidfd_provider
+                    .as_ref()
+                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                BrokerHandleKind::Signalfd => None,
+                BrokerHandleKind::Pty => super::eventfd::broker_pty_provider()
+                    .as_ref()
+                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                BrokerHandleKind::Pipe => super::broker_pipe::broker_pipe_provider()
+                    .as_ref()
+                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                BrokerHandleKind::UnixSocket => {
+                    super::broker_socketpair::broker_socketpair_provider()
+                        .as_ref()
+                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                }
+                BrokerHandleKind::SocketDgram => {
+                    super::broker_socket_dgram::broker_socket_dgram_provider()
+                        .as_ref()
+                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                }
+                BrokerHandleKind::SocketSeqPacket => {
+                    super::broker_socket_seqpacket::broker_socket_seqpacket_provider()
+                        .as_ref()
+                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                }
+                BrokerHandleKind::TcpConn => super::broker_tcp_conn::broker_tcp_conn_provider()
+                    .as_ref()
+                    .map(|p| alloc::sync::Arc::clone(p) as _),
+                BrokerHandleKind::InetListener => {
+                    super::broker_inet_listener::broker_inet_listener_provider()
+                        .as_ref()
+                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                }
+                BrokerHandleKind::InetDgram => {
+                    super::broker_inet_dgram::broker_inet_dgram_provider()
+                        .as_ref()
+                        .map(|p| alloc::sync::Arc::clone(p) as _)
+                }
+            };
+            if kind == BrokerHandleKind::Pidfd {
+                if let Ok(target_pid) = u32::try_from(handle_id)
+                    && let Some(wake) = super::guest_pid::try_subscribe_broker_process_exit(
+                        litebox::process::ProcessId(target_pid),
+                    )
+                {
+                    pidfd_process_transit.push(wake);
+                }
+                specs.push(alloc::format!("{raw_fd}:{kind_str}:{handle_id}"));
+            } else if let Some(releaser) = releaser
+                && releaser.dup_handle(handle_id).is_ok()
+            {
+                specs.push(alloc::format!("{raw_fd}:{kind_str}:{handle_id}"));
+                transit_release.push((releaser, handle_id));
+            }
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for broker-pipe fds. Eager-broker pipes
+/// are already broker-backed (no promote step); just dup the handle and
+/// ship it.
+///
+/// Pipe transit refs use a different release timing from eventfd/signalfd/
+/// pty: they must be released ON SPAWN SUCCESS (after worker B finishes
+/// writing + exits) so the reader gets HUP/EOF. Pushed to
+/// `pipe_transit_release` (drained post-`wait_worker_host`) rather than
+/// the shared `transit_release`.
+fn emit_broker_pipe_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::broker_pipe::BrokerPipeSubsystem>>,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+    pipe_transit_release: &mut alloc::vec::Vec<BrokerTransitReleaseEntry>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let pipe_provider = super::broker_pipe::broker_pipe_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let pipe_info = dt_local.with_entry(
+            typed,
+            |bp_fd: &super::broker_pipe::BrokerPipeFd<crate::Platform>| {
+                (bp_fd.handle(), bp_fd.direction())
+            },
+        );
+        drop(dt_local);
+        if let (Some(provider), Some((handle_id, direction))) = (pipe_provider, pipe_info) {
+            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle_id).is_err() {
+                continue;
+            }
+            let dir_char = match direction {
+                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Read => 'r',
+                litebox_common_linux::broker_pipe_provider::BrokerPipeEnd::Write => 'w',
+            };
+            specs.push(alloc::format!("{raw_fd}:pipe:{handle_id}:{dir_char}"));
+            pipe_transit_release.push((releaser, handle_id));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for broker-pty fds. PTY slave-close
+/// HUP has the same release-on-spawn-success lifetime as pipes: pushed
+/// to `pty_transit_release` (drained post-`wait_worker_host`) so the
+/// broker can observe last-slave-close and notify the master after the
+/// remote worker exits.
+fn emit_broker_pty_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::broker_pty::BrokerPtySubsystem>>,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+    pty_transit_release: &mut alloc::vec::Vec<BrokerTransitReleaseEntry>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let pty_provider = super::broker_pty::broker_pty_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let pty_info = dt_local.with_entry(
+            typed,
+            |pty_fd: &super::broker_pty::BrokerPtyFd<crate::Platform>| {
+                (pty_fd.handle(), pty_fd.role(), pty_fd.pty_id())
+            },
+        );
+        drop(dt_local);
+        if let (Some(provider), Some((handle_id, role, pty_id))) = (pty_provider, pty_info) {
+            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle_id).is_err() {
+                continue;
+            }
+            pty_transit_release.push((releaser, handle_id));
+            let role_char = match role {
+                litebox_common_linux::broker_pty_provider::BrokerPtyRole::Master => 'm',
+                litebox_common_linux::broker_pty_provider::BrokerPtyRole::Slave => 's',
+            };
+            specs.push(alloc::format!(
+                "{raw_fd}:pty:{handle_id}:{role_char}:{pty_id}"
+            ));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for broker-socketpair (unix_socket)
+/// fds. Pre-dup balances the timing race between the migrated worker's
+/// `close_all_fds` and the new worker's `install_broker_bridge_fd`
+/// (see the inline comment that previously documented this in
+/// `exec_on_remote_host`).
+fn emit_broker_socketpair_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::broker_socketpair::BrokerSocketPairSubsystem>>,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let sp_provider = super::broker_socketpair::broker_socketpair_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let sp_info = dt_local.with_entry(
+            typed,
+            |sp_fd: &super::broker_socketpair::BrokerSocketPairFd<crate::Platform>| {
+                (sp_fd.handle(), sp_fd.endpoint())
+            },
+        );
+        drop(dt_local);
+        if let (Some(provider), Some((handle_id, endpoint))) = (sp_provider, sp_info) {
+            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle_id).is_err() {
+                continue;
+            }
+            let endpoint_char = match endpoint {
+                litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::A => {
+                    'a'
+                }
+                litebox_common_linux::broker_socketpair_provider::BrokerSocketPairEndpoint::B => {
+                    'b'
+                }
+            };
+            specs.push(alloc::format!(
+                "{raw_fd}:unix_socket:{handle_id}:{endpoint_char}"
+            ));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for broker-socket-dgram fds.
+fn emit_broker_socket_dgram_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<
+            litebox::fd::TypedFd<super::broker_socket_dgram::BrokerSocketDgramSubsystem>,
+        >,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let provider = super::broker_socket_dgram::broker_socket_dgram_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let handle_id = dt_local.with_entry(
+            typed,
+            |fd: &super::broker_socket_dgram::BrokerSocketDgramFd<crate::Platform>| fd.handle(),
+        );
+        drop(dt_local);
+        if let (Some(provider), Some(handle_id)) = (provider, handle_id) {
+            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle_id).is_err() {
+                continue;
+            }
+            specs.push(alloc::format!("{raw_fd}:socket_dgram:{handle_id}"));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for broker-socket-seqpacket fds.
+fn emit_broker_socket_seqpacket_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<
+            litebox::fd::TypedFd<super::broker_socket_seqpacket::BrokerSocketSeqPacketSubsystem>,
+        >,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let provider = super::broker_socket_seqpacket::broker_socket_seqpacket_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let handle_id = dt_local.with_entry(
+            typed,
+            |fd: &super::broker_socket_seqpacket::BrokerSocketSeqPacketFd<crate::Platform>| {
+                fd.handle()
+            },
+        );
+        drop(dt_local);
+        if let (Some(provider), Some(handle_id)) = (provider, handle_id) {
+            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle_id).is_err() {
+                continue;
+            }
+            specs.push(alloc::format!("{raw_fd}:socket_seqpacket:{handle_id}"));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for broker-tcp-conn fds. Records
+/// transit refs in `tcp_conn_transit_release` (drained on spawn
+/// success/failure path shared with inet_listener).
+fn emit_broker_tcp_conn_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::broker_tcp_conn::BrokerTcpConnSubsystem>>,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+    tcp_conn_transit_release: &mut alloc::vec::Vec<BrokerTransitReleaseEntry>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let tcp_provider = super::broker_tcp_conn::broker_tcp_conn_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let handle_id = dt_local.with_entry(
+            typed,
+            |tcp_fd: &super::broker_tcp_conn::BrokerTcpConnFd<crate::Platform>| tcp_fd.handle(),
+        );
+        drop(dt_local);
+        if let (Some(provider), Some(handle_id)) = (tcp_provider, handle_id) {
+            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle_id).is_err() {
+                continue;
+            }
+            specs.push(alloc::format!("{raw_fd}:tcp_conn:{handle_id}"));
+            tcp_conn_transit_release.push((releaser, handle_id));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for broker-inet-listener fds.
+/// Shares `tcp_conn_transit_release` with `emit_broker_tcp_conn_bridge_specs`.
+fn emit_broker_inet_listener_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<
+            litebox::fd::TypedFd<super::broker_inet_listener::BrokerInetListenerSubsystem>,
+        >,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+    tcp_conn_transit_release: &mut alloc::vec::Vec<BrokerTransitReleaseEntry>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let listener_provider = super::broker_inet_listener::broker_inet_listener_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let handle_id = dt_local.with_entry(
+            typed,
+            |listener: &super::broker_inet_listener::BrokerInetListenerFd<crate::Platform>| {
+                listener.handle()
+            },
+        );
+        drop(dt_local);
+        if let (Some(provider), Some(handle_id)) = (listener_provider, handle_id) {
+            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle_id).is_err() {
+                continue;
+            }
+            specs.push(alloc::format!("{raw_fd}:inet_listener:{handle_id}"));
+            tcp_conn_transit_release.push((releaser, handle_id));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for FS (brokerfile) fds. Skips stdio
+/// (worker_stdio bindings handle fds 0/1/2).
+fn emit_fs_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(usize, alloc::sync::Arc<litebox::fd::TypedFd<FS>>)],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        if raw_fd <= 2 {
+            continue;
+        }
+        let bridge_info = {
+            let files = task.files.borrow();
+            files.fs.fd_path(typed).and_then(|path| {
+                let position = files
+                    .fs
+                    .seek(typed, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
+                    .ok()?;
+                let status_flags_bits = task
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(typed, |crate::StdioStatusFlags(flags)| flags.bits())
+                    .unwrap_or(OFlags::RDONLY.bits());
+                Some((path, position, status_flags_bits))
+            })
+        };
+        if let Some((path, position, status_flags_bits)) = bridge_info {
+            specs.push(alloc::format!(
+                "{raw_fd}:brokerfile:{status_flags_bits}:{position}:{}",
+                brokerfile_bridge_encode_path(&path)
+            ));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for signalfd fds. Pushes a
+/// `RemoteSignalfdEntry` to `remote_signalfd_entries` (for the
+/// remote process's signal-mask reconstruction) in addition to the
+/// spec + transit_release entry.
+fn emit_signalfd_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::signalfd::SignalfdSubsystem>>,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+    transit_release: &mut alloc::vec::Vec<BrokerTransitReleaseEntry>,
+    remote_signalfd_entries: &mut alloc::vec::Vec<crate::RemoteSignalfdEntry>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let signalfd_provider = super::signalfd::broker_signalfd_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let bridge_info = dt_local.with_entry(typed, |sfd: &super::signalfd::SignalfdFile| {
+            sfd.worker_exec_bridge_snapshot()
+        });
+        drop(dt_local);
+        if let (Some(provider), Some((handle_id, mask_bits, nonblock))) =
+            (signalfd_provider, bridge_info)
+        {
+            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle_id).is_err() {
+                continue;
+            }
+            specs.push(alloc::format!(
+                "{raw_fd}:signalfd:{handle_id}:{mask_bits}:{}",
+                u8::from(nonblock)
+            ));
+            remote_signalfd_entries.push(crate::RemoteSignalfdEntry {
+                handle_id,
+                mask_bits,
+            });
+            transit_release.push((releaser, handle_id));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for worker-local-inet (TCP listen)
+/// fds. cfg-gated on `worker_local_inet`.
+#[cfg(feature = "worker_local_inet")]
+fn emit_network_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[usize],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+) {
+    for raw_fd in bucket {
+        if let Some(spec) = task.tcp_listen_worker_exec_bridge_spec(*raw_fd) {
+            specs.push(spec);
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for the timerfd subset of the
+/// eventfd bucket (`EventFile::is_timerfd` returning true). Snapshots
+/// timer state for reconstruction in the child worker.
+///
+/// Pairs with `emit_eventfd_bridge_specs`, which iterates the same
+/// bucket and handles the non-timerfd entries. Both helpers walk
+/// the full `eventfd` bucket; the per-entry filter (`is_timerfd`
+/// here, broker promotion in the eventfd helper) determines which
+/// subset is emitted.
+fn emit_timerfd_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::eventfd::EventfdSubsystem>>,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let dt_local = task.global.litebox.descriptor_table();
+        let is_timer = dt_local
+            .with_entry(typed, |evf: &super::eventfd::EventFile<crate::Platform>| {
+                evf.is_timerfd()
+            })
+            .unwrap_or(false);
+        drop(dt_local);
+        if !is_timer {
+            continue;
+        }
+        let dt_local = task.global.litebox.descriptor_table();
+        let snapshot = dt_local
+            .with_entry(typed, |evf: &super::eventfd::EventFile<crate::Platform>| {
+                evf.timerfd_worker_exec_bridge_snapshot()
+            })
+            .flatten();
+        drop(dt_local);
+        if let Some((clockid, nonblock, spec, pending, snapshot_now_ns)) = snapshot {
+            specs.push(alloc::format!(
+                "{raw_fd}:timerfd:{}:{}:{}:{}:{}:{}:{}:{}",
+                clockid as u32,
+                u8::from(nonblock),
+                spec.value.tv_sec,
+                spec.value.tv_nsec,
+                spec.interval.tv_sec,
+                spec.interval.tv_nsec,
+                pending,
+                snapshot_now_ns,
+            ));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for inotify fds. Mirrors the
+/// signalfd spec shape (broker handle id + nonblock bit). The
+/// shim-side `InotifyFile` already owns a broker handle; `dup_handle`
+/// so the child's reattach doesn't race with parent-side close.
+/// Transit-release lifetime matches eventfd/signalfd (released only
+/// on spawn failure; worker's broker connection cleanup balances the
+/// dup on normal exit).
+fn emit_inotify_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::inotify::InotifySubsystem>>,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+    transit_release: &mut alloc::vec::Vec<BrokerTransitReleaseEntry>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let inotify_provider = super::inotify::broker_inotify_provider();
+        let dt_local = task.global.litebox.descriptor_table();
+        let info = dt_local.with_entry(typed, |ino: &super::inotify::InotifyFile| {
+            (
+                ino.handle(),
+                ino.get_status().contains(litebox::fs::OFlags::NONBLOCK),
+            )
+        });
+        drop(dt_local);
+        if let (Some(provider), Some((handle_id, nonblock))) = (inotify_provider, info) {
+            use litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable;
+            let releaser: alloc::sync::Arc<dyn BrokerSubscribable> =
+                alloc::sync::Arc::clone(&provider) as _;
+            if releaser.dup_handle(handle_id).is_err() {
+                continue;
+            }
+            specs.push(alloc::format!(
+                "{raw_fd}:inotify:{handle_id}:{}",
+                u8::from(nonblock),
+            ));
+            transit_release.push((releaser, handle_id));
+        }
+    }
+}
+
+/// Emit `--broker-fd-bridge` specs for epoll fds.
+///
+/// INVARIANT: this helper MUST be called LAST in bridge-spec emission.
+/// Unlike every other subsystem, epoll has no broker handle — its
+/// interest list is shim-local. We snapshot interests as
+/// `(target_fd, events, data)` tuples (see
+/// `EpollFile::snapshot_interests`); the worker rebuilds a fresh
+/// `EpollFile` and re-adds each interest via
+/// `epoll_ctl(EPOLL_CTL_ADD)`. The runner installs specs in order,
+/// and `EpollDescriptor::try_from` looks up each interest's target
+/// fd in the worker's descriptor store — every other subsystem's
+/// install must complete first.
+///
+/// Epoll has no broker handle and therefore no transit_release entry.
+fn emit_epoll_bridge_specs<FS: ShimFS>(
+    task: &Task<FS>,
+    bucket: &[(
+        usize,
+        alloc::sync::Arc<litebox::fd::TypedFd<super::epoll::EpollSubsystem<FS>>>,
+    )],
+    specs: &mut alloc::vec::Vec<alloc::string::String>,
+) {
+    for (raw_fd, typed) in bucket {
+        let raw_fd = *raw_fd;
+        let dt_local = task.global.litebox.descriptor_table();
+        let entries = dt_local
+            .with_entry(typed, |ep: &super::epoll::EpollFile<FS>| {
+                ep.snapshot_interests()
+            })
+            .unwrap_or_default();
+        drop(dt_local);
+        let mut spec = alloc::format!("{raw_fd}:epoll");
+        if !entries.is_empty() {
+            spec.push(':');
+            let mut first = true;
+            for (tfd, events, data) in entries {
+                if !first {
+                    spec.push(',');
+                }
+                first = false;
+                spec.push_str(&alloc::format!("{tfd}_{events}_{data}"));
+            }
+        }
+        specs.push(spec);
+    }
+}
+
 /// wave-cleanup-2 fork-snapshot epoll extension: emit
 /// `--broker-fd-bridge` specs for inherited Inotify and Epoll fds
 /// across a delayed-fork or true-fork commit, given a pre-collected
