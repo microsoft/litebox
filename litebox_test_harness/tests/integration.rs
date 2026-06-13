@@ -4778,10 +4778,147 @@ mod vscode {
         )
     }
 
-    fn run_connect_cross_ssh(_pass: &str) -> Result<(), Failed> {
-        Err(Failed::from(
-            "vscode::connect_cross_ssh not yet implemented (see plan: vscode-connect-cross-ssh-scenario)",
-        ))
+    fn run_connect_cross_ssh(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "connect_cross_ssh").map_err(Failed::from)?;
+        ensure_vscode_image(&super::workspace_root());
+
+        let test_id = "vscode::connect_cross_ssh".to_string();
+        let spec = build_vscode_spec(pass, &fixture_dir);
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "connect_cross_ssh",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let commit = match detect_cli_commit(port, Duration::from_secs(30)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("detect_cli_commit: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-connect_cross_ssh");
+
+                // SSH session A — starts the CLI in background,
+                // captures the port from the CLI's log, writes the
+                // port to /tmp/vscode-port-A inside the container,
+                // then exits. The CLI keeps running after session A
+                // ends because of `nohup` + `--parent-process-id 1`
+                // (= the container's init = sshd/litebox; never
+                // exits during the trial) + `< /dev/null`.
+                let cli_path = format!("/root/.vscode-server/code-{commit}");
+                let session_a_cmd = build_cross_ssh_session_a_cmd(&cli_path, 60);
+                let session_a_out = match run_remote_command_retry(port, &session_a_cmd, 90) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("session A (start CLI + capture port): {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.session-a.log")),
+                    &session_a_out,
+                );
+                let stripped_a = copilot::strip_ansi(&session_a_out);
+                let captured_port = match parse_vsl_port(&stripped_a) {
+                    Some(p) if p != 0 => p,
+                    _ => {
+                        let preview: String = stripped_a.chars().take(1500).collect();
+                        return drive_fail(
+                            format!(
+                                "session A: no VSL_PORT marker \
+                                 (detected_commit={commit}). session-a log: {}\n\
+                                 first 1500 chars (ANSI-stripped):\n{preview}",
+                                log_dir.join(format!("{safe}.session-a.log")).display(),
+                            ),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                // SSH session B — a completely fresh SSH session
+                // to the same container. Connects to the port
+                // session A told us about. Under litebox this
+                // exercises cross-worker loopback TCP (each SSH
+                // session is its own dropbear → bash worker tree).
+                let session_b_cmd = build_cross_ssh_session_b_cmd(captured_port);
+                let session_b_out = match run_remote_command_retry(port, &session_b_cmd, 30) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("session B (cross-ssh connect to port {captured_port}): {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.session-b.log")),
+                    &session_b_out,
+                );
+                let stripped_b = copilot::strip_ansi(&session_b_out);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+                let conn_ok = stripped_b.lines().any(|l| l.trim() == "VSL_CONN_OK");
+
+                if conn_ok {
+                    super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    }
+                } else {
+                    let preview: String = stripped_b.chars().take(1500).collect();
+                    drive_fail(
+                        format!(
+                            "session B: no VSL_CONN_OK marker \
+                             (port from session A = {captured_port}). \
+                             session-b log: {}\n\
+                             first 1500 chars (ANSI-stripped):\n{preview}",
+                            log_dir.join(format!("{safe}.session-b.log")).display(),
+                        ),
+                        t_docker_start_ms,
+                        t_useful_ms,
+                    )
+                }
+            },
+        )
     }
 
     // ───────────────────────────────────────────────────────────────
@@ -5068,6 +5205,72 @@ mod vscode {
              else \
                 echo VSL_CONN_FAIL exit=$?; \
                 cat \"$LOG\"; \
+                exit 1; \
+             fi"
+        )
+    }
+
+    /// Remote-shell program for SSH session A of
+    /// `vscode::connect_cross_ssh`. Same start-CLI-and-poll shape
+    /// as `build_server_listen_remote_cmd`, but additionally
+    /// writes the captured port to `/tmp/vscode-port-A` in the
+    /// container's filesystem so session B can read it from a
+    /// completely separate SSH session. Exits after emitting
+    /// `VSL_PORT=` (the CLI keeps running because of `nohup` +
+    /// `--parent-process-id 1`).
+    fn build_cross_ssh_session_a_cmd(cli_path: &str, poll_secs: u32) -> String {
+        let cli_q = copilot::shell_quote(cli_path);
+        let token = "litebox-vscode-itest-token";
+        format!(
+            "set -e; \
+             LOG=/tmp/vscode-cross-ssh.log; \
+             PORT_FILE=/tmp/vscode-port-A; \
+             rm -f \"$LOG\" \"$PORT_FILE\"; \
+             nohup env VSCODE_CLI_REQUIRE_TOKEN={token} \
+                {cli_q} command-shell \
+                --cli-data-dir /tmp/vscode-cli-data \
+                --parent-process-id 1 \
+                --on-host=127.0.0.1 --on-port=0 \
+                > \"$LOG\" 2>&1 < /dev/null & \
+             CLI_PID=$!; \
+             disown $CLI_PID 2>/dev/null || true; \
+             echo VSL_CLI_PID=$CLI_PID; \
+             for _ in $(seq 1 {poll_secs}); do \
+                LISTEN_LINE=$(grep -aE 'Listening on .+' \"$LOG\" 2>/dev/null | head -1); \
+                if [ -n \"$LISTEN_LINE\" ]; then \
+                    PORT=$(echo \"$LISTEN_LINE\" | sed -nE 's/.*:([0-9]+).*/\\1/p'); \
+                    if [ -n \"$PORT\" ]; then \
+                        printf '%s' \"$PORT\" > \"$PORT_FILE\"; \
+                        echo VSL_PORT=$PORT; \
+                        exit 0; \
+                    fi; \
+                fi; \
+                if ! kill -0 $CLI_PID 2>/dev/null; then \
+                    echo VSL_CLI_DIED; \
+                    cat \"$LOG\"; \
+                    exit 1; \
+                fi; \
+                sleep 1; \
+             done; \
+             echo VSL_NO_PORT; \
+             cat \"$LOG\"; \
+             exit 1"
+        )
+    }
+
+    /// Remote-shell program for SSH session B of
+    /// `vscode::connect_cross_ssh`. Connects to the CLI's bound
+    /// port (passed in directly from the host so we don't depend
+    /// on reading session A's `/tmp/vscode-port-A` file — the
+    /// host already parsed VSL_PORT from session A's stdout). 3 s
+    /// `timeout` on the connect bounds litebox-side hangs.
+    fn build_cross_ssh_session_b_cmd(captured_port: u16) -> String {
+        format!(
+            "if timeout 3 bash -c \"exec 3<>/dev/tcp/127.0.0.1/{captured_port}\" 2>&1; then \
+                echo VSL_CONN_OK; \
+                exit 0; \
+             else \
+                echo VSL_CONN_FAIL exit=$?; \
                 exit 1; \
              fi"
         )
