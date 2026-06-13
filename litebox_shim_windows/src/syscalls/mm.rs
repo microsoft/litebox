@@ -17,7 +17,7 @@ use crate::{
     WindowsVirtualAllocation, WindowsVirtualAllocations,
 };
 
-const ALLOCATION_GRANULARITY: usize = 0x1_0000;
+pub(super) const ALLOCATION_GRANULARITY: usize = 0x1_0000;
 const ALLOCATION_SEARCH_ATTEMPTS: usize = 8;
 const MEMORY_WORKING_SET_LIST_MIN_SIZE: usize = 16;
 const MEM_EXTENDED_PARAMETER_TYPE_MASK: u64 = 0xff;

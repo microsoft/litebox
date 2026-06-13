@@ -6,7 +6,7 @@ pub(crate) mod file;
 pub(crate) mod mm;
 pub(crate) mod nls;
 pub(crate) mod registry;
-pub(crate) mod sysinfo;
+mod sysinfo;
 
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
