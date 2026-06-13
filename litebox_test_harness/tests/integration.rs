@@ -4166,21 +4166,12 @@ mod copilot {
 // for the workflow.
 
 mod vscode {
-    use super::{Failed, Trial};
-    // The skeleton-commit stubs don't yet reach into `copilot::*` helpers,
-    // `Pty`, or `Instant`, but every scenario body landing in the next
-    // commits will. Keep them imported here as the forward declaration of
-    // the surface each scenario will use.
-    #[allow(unused_imports)]
-    use super::copilot;
-    #[allow(unused_imports)]
+    use super::{Failed, Trial, copilot};
     use litebox_test_harness::os::pty::Pty;
     use std::path::Path;
     use std::process::Command;
     use std::sync::OnceLock;
-    use std::time::Duration;
-    #[allow(unused_imports)]
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     // ───────────────────────────────────────────────────────────────
     // Image-stage selection
@@ -4214,7 +4205,6 @@ mod vscode {
     /// idempotent — re-running over an up-to-date file is a no-op
     /// on disk but always invalidates the layer's cache key only
     /// when the binary actually changes.
-    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
     fn ensure_vscode_image(ws_root: &Path) {
         let stage = vscode_image_base();
         let tag = vscode_image_tag();
@@ -4279,11 +4269,9 @@ mod vscode {
     /// `CopilotPermit` — keeps VS Code Server trials from saturating
     /// dockerd and from racing each other on port allocation in
     /// the cross-SSH scenario.
-    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
     struct VsCodePermit;
 
     impl VsCodePermit {
-        #[allow(dead_code)]
         fn acquire() -> Self {
             loop {
                 {
@@ -4313,10 +4301,10 @@ mod vscode {
     /// Build the per-trial container spec. Same shape as
     /// `build_copilot_spec` (native = bare dropbear; litebox =
     /// `litebox_tool_executor --ssh`), but pointed at the
-    /// `litebox-vscode[-prewrite]` image. No `--workspace` bind
-    /// mount today — the VS Code Server trials don't need
-    /// per-trial fixture files.
-    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
+    /// `litebox-vscode[-prewrite]` image. The fixture dir is
+    /// bind-mounted at `/workspace` so scenarios can stage
+    /// patched scripts or other inputs there and reach them
+    /// from the container.
     fn build_vscode_spec(pass: &str, fixture_dir: &Path) -> super::framework::ContainerSpec {
         let bin_dir = super::debug_dir();
         let mut docker_args: Vec<String> = vec![
@@ -4427,10 +4415,156 @@ mod vscode {
     // present in the dashboard universe from skeleton commit onward.
     // ───────────────────────────────────────────────────────────────
 
-    fn run_bootstrap(_pass: &str) -> Result<(), Failed> {
-        Err(Failed::from(
-            "vscode::bootstrap not yet implemented (see plan: vscode-bootstrap-scenario)",
-        ))
+    fn run_bootstrap(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "bootstrap").map_err(Failed::from)?;
+        ensure_vscode_image(&super::workspace_root());
+
+        // Stage the captured bootstrap script into the per-trial
+        // fixture directory (bind-mounted at /workspace in the
+        // container). We patch two things at runtime:
+        //   1) The hardcoded COMMIT_ID in the captured script with
+        //      whatever commit the Docker image has staged. The
+        //      Dockerfile pre-installs the CLI as both `code` and
+        //      `code-${VSCODE_COMMIT}`, but the script's "is the
+        //      CLI installed?" check looks for `code-${COMMIT_ID}`
+        //      against its hardcoded ID — without patching, the
+        //      script falls into the download path.
+        //   2) The trailing `while true; do sleep 180; printf ' ';
+        //      done` keepalive — designed to hold the SSH session
+        //      open forever while VS Code Remote-SSH uses the
+        //      backgrounded CLI. For an end-to-end test we want
+        //      the script to exit normally once it's printed its
+        //      success markers.
+        let template =
+            include_str!("../../litebox_tool_executor/scripts/vscode/vscode-bootstrap-captured.sh");
+        let script_path = fixture_dir.join("bootstrap.sh");
+
+        let test_id = "vscode::bootstrap".to_string();
+        let spec = build_vscode_spec(pass, &fixture_dir);
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "bootstrap",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                // Step 1: detect the installed CLI commit hash.
+                let commit = match detect_cli_commit(port, Duration::from_secs(30)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("detect_cli_commit: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                if commit.len() != 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return drive_fail(
+                        format!("detected commit not a 40-hex-char hash: {commit:?}"),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+
+                // Step 2: patch the captured script.
+                let patched = template
+                    .replace(
+                        "COMMIT_ID=\"41dd792b5e652393e7787322889ed5fdc58bd75b\"",
+                        &format!("COMMIT_ID=\"{commit}\""),
+                    )
+                    .replace("while true; do sleep 180; printf ' '; done", "exit 0");
+                if patched == template {
+                    return drive_fail(
+                        "bootstrap script patch produced no changes — the captured \
+                         script no longer contains the expected commit-id or \
+                         keepalive-loop lines"
+                            .to_string(),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+                if let Err(e) = std::fs::write(&script_path, patched.as_bytes()) {
+                    return drive_fail(
+                        format!("write patched script {}: {e}", script_path.display()),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+
+                // Step 3: run `sh /workspace/bootstrap.sh` over SSH
+                // and read its complete output.
+                let output = match run_remote_script(port, "/workspace/bootstrap.sh", 120) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("run_remote_script: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-bootstrap");
+                let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &output);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+
+                // Step 4: validate markers.
+                let stripped = copilot::strip_ansi(&output);
+                let has_start = stripped.contains(": start");
+                let has_end = stripped.contains(": end");
+                let has_listening = stripped.contains("listeningOn==");
+                let has_found = stripped.contains("Found existing installation");
+
+                if has_start && has_end && has_listening && has_found {
+                    return super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+                let preview: String = stripped.chars().take(1200).collect();
+                drive_fail(
+                    format!(
+                        "bootstrap markers missing: start={has_start} end={has_end} \
+                         listening={has_listening} found_existing_install={has_found} \
+                         (detected_commit={commit}). raw log: {}\n\
+                         first 1200 chars (ANSI-stripped):\n{preview}",
+                        log_dir.join(format!("{safe}.raw.log")).display(),
+                    ),
+                    t_docker_start_ms,
+                    t_useful_ms,
+                )
+            },
+        )
     }
 
     fn run_server_listen(_pass: &str) -> Result<(), Failed> {
@@ -4457,7 +4591,6 @@ mod vscode {
 
     /// Per-trial fixture directory. Cleared and recreated at the
     /// start of each scenario so a re-run sees a fresh `/workspace`.
-    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
     fn vscode_fixture_dir(pass: &str, scenario_id: &str) -> std::path::PathBuf {
         super::target_dir()
             .join("vscode-fixtures")
@@ -4467,7 +4600,6 @@ mod vscode {
     /// Create + return a fresh fixture dir. Borrowed from the
     /// per-scenario bootstrap in `run_startup_then_exit` /
     /// `run_copilot_trial`.
-    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
     fn prep_fixture_dir(pass: &str, scenario_id: &str) -> Result<std::path::PathBuf, String> {
         let dir = vscode_fixture_dir(pass, scenario_id);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4478,13 +4610,139 @@ mod vscode {
 
     /// Convert the static `&str` pass label into a `&'static str`
     /// suitable for `framework::run_trial`'s typed pass argument.
-    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
     fn pass_static(pass: &str) -> &'static str {
         match pass {
             "native" => "native",
             "litebox" => "litebox",
             _ => "unknown",
         }
+    }
+
+    /// Build a uniform `DriveResult::FAIL` envelope from a detail
+    /// string and the timing fields the caller has already captured.
+    /// Hides the noise of the seven-field struct literal at each
+    /// failure site.
+    fn drive_fail(
+        detail: String,
+        t_docker_start_ms: u128,
+        t_useful_ms: u128,
+    ) -> super::framework::DriveResult {
+        super::framework::DriveResult {
+            verdict: "FAIL",
+            detail: Some(detail),
+            t_docker_start_ms,
+            t_useful_ms,
+            sub_phases: super::SubPhaseMs::default(),
+            t_docker_spawn_ms: None,
+            t_litebox_init_ms: None,
+            t_harness_load_ms: None,
+        }
+    }
+
+    /// Run a shell command over SSH (no PTY needed; `-T` disables
+    /// remote PTY allocation so bytes flow through clean pipes),
+    /// read its merged stdout/stderr to EOF within `timeout_secs`,
+    /// and return the captured output as a String.
+    ///
+    /// Uses a single SSH session: argv is the literal remote
+    /// command. Caller is responsible for any shell-quoting inside
+    /// `remote_cmd`.
+    fn run_remote_command(
+        port: u16,
+        remote_cmd: &str,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let pty = Pty::open()?;
+        let mut argv = copilot::ssh_argv_base(port);
+        argv.push(remote_cmd.to_string());
+        let pid = pty.fork_exec(&argv, /* ctrl_tty = */ true)?;
+        let result = copilot::read_with_deadline(&pty, Duration::from_secs(timeout_secs))?;
+        let _ = copilot::wait_pid(pid, Duration::from_secs(10));
+        Ok(result)
+    }
+
+    /// Two-shot retry for `run_remote_command` to absorb the
+    /// "dropbear accepted TCP before SSH handshake was ready"
+    /// flake that `drive_pminus` already documents in mod copilot.
+    fn run_remote_command_retry(
+        port: u16,
+        remote_cmd: &str,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let first = run_remote_command(port, remote_cmd, timeout_secs)?;
+        if first.contains("kex_exchange_identification") || first.trim().is_empty() {
+            std::thread::sleep(Duration::from_secs(7));
+            return run_remote_command(port, remote_cmd, timeout_secs);
+        }
+        Ok(first)
+    }
+
+    /// Detect the installed VS Code CLI commit hash inside the
+    /// running container by calling `/root/.vscode-server/code
+    /// --version` over SSH and finding a 40-char lowercase-hex
+    /// token anywhere in the output. `code --version` prints
+    /// `code <ver> (commit <40-hex>)\n<arch>` — the original VSI
+    /// code grepped with Perl `'commit \K[a-f0-9]{40}'`; a plain
+    /// scan over the bytes is equivalent and doesn't need a regex
+    /// dep.
+    fn detect_cli_commit(port: u16, timeout: Duration) -> Result<String, String> {
+        let cmd = "/root/.vscode-server/code --version 2>/dev/null";
+        let output = run_remote_command_retry(port, cmd, timeout.as_secs())?;
+        if let Some(commit) = extract_first_hex40(&output) {
+            return Ok(commit);
+        }
+        Err(format!(
+            "no 40-char hex commit substring in `code --version` output:\n{}",
+            output.chars().take(800).collect::<String>(),
+        ))
+    }
+
+    /// Return the first contiguous 40-lowercase-hex substring in
+    /// `s`, or None. Used to lift the VS Code commit hash out of
+    /// `code --version` output without pulling in a regex dep.
+    ///
+    /// The contract is exercised end-to-end by `native::vscode::bootstrap`:
+    /// that trial calls `detect_cli_commit` against the live `code`
+    /// binary in the `litebox-vscode` image; a regression in this
+    /// helper would produce a precise FAIL there (`detect_cli_commit:
+    /// no 40-char hex commit substring …`). The harness uses
+    /// `libtest_mimic` (`harness = false`) so `#[test]` functions
+    /// here would not be auto-collected — the integration trial is
+    /// the contract test.
+    fn extract_first_hex40(s: &str) -> Option<String> {
+        let bytes = s.as_bytes();
+        let is_lc_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        let mut i = 0;
+        while i + 40 <= bytes.len() {
+            if !is_lc_hex(bytes[i]) {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j < bytes.len() && is_lc_hex(bytes[j]) {
+                j += 1;
+            }
+            // Exactly 40 hex chars — VS Code's commit format. A
+            // longer run is some other hex blob; skip it.
+            if j - i == 40 {
+                return Some(s[i..j].to_string());
+            }
+            i = j + 1;
+        }
+        None
+    }
+
+    /// Run an executable script that lives at `remote_script_path`
+    /// in the container (typically `/workspace/<name>.sh` via the
+    /// fixture bind mount). Uses `sh <path>` so the script doesn't
+    /// need the executable bit set.
+    fn run_remote_script(
+        port: u16,
+        remote_script_path: &str,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let cmd = format!("sh {}", copilot::shell_quote(remote_script_path));
+        run_remote_command_retry(port, &cmd, timeout_secs)
     }
 }
 
