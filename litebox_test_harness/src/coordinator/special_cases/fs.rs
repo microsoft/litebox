@@ -871,6 +871,116 @@ pub(super) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                 });
         }
 
+        // CWF.full_visibility: child writes 4 distinct lines and KEEPS
+        // fd open; parent reads via the FS_READ handler and validates
+        // the COMPLETE content (all 4 lines) is visible.
+        //
+        // This is the strict cross-process visibility test. Failure
+        // mode reproduces the VS Code Server `vscode::server_listen`
+        // litebox-pass FAIL: a static-PIE-musl writer process
+        // (`code-${COMMIT}` in the real scenario) writes its
+        // `Listening on N.N.N.N:PORT` line to a redirected stdout,
+        // then continues running (doesn't exit, doesn't close fd).
+        // A bash subshell from a second SSH session reads the file
+        // via `grep` and never sees the `Listening on` line — even
+        // 30+ seconds after the writer claims to have written it.
+        //
+        // Root cause hypothesis: `litebox/src/fs/nine_p/mod.rs`'s
+        // write-behind buffer (`write_buffers: BTreeMap<Fid,
+        // WriteBuffer>` line 397, `WRITE_BUFFER_CAPACITY = 256 KiB`
+        // line 331) is per-litebox-client (= per guest process).
+        // The write-behind buffer is flushed only on intra-process
+        // events: reads/seeks/opens on the same file (line
+        // 1469/1278/1372/1721/1758), sibling-fid writes (line
+        // 1598), or close (line 1431). Reads from a DIFFERENT guest
+        // process don't see the writer's buffered data because each
+        // litebox runner instance has its own buffer map. POSIX
+        // requires writes from one process to be immediately visible
+        // to reads from another — litebox's write-behind violates
+        // that contract.
+        //
+        // CWF.hold passes today only because it checks
+        // `starts_with("line0")` — it would pass even if only the
+        // first 6 bytes are visible. This test asserts the COMPLETE
+        // 30-byte content.
+        for &bt in crate::BinaryType::ALL {
+            let bt_label = bt.label();
+            let bin_label = crate::coordinator::common::fork_binary_label(bt);
+            let a = agent_s.clone();
+            reg.test(
+                "xworker",
+                "cross_worker_file",
+                format!("CWF.full_visibility.{bt_label}.{agent}"),
+            )
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                let leaf = cx.declare_ephemeral(
+                    agent,
+                    format!("CrossWorkerFileFullVis_{bt_label}_{agent}"),
+                    SpawnKind::Fork {
+                        binary: bin_label,
+                        inherit_listen_ports: vec![],
+                    },
+                );
+                Box::new(move |run| {
+                    let a = a.clone();
+                    Box::pin(async move {
+                        let path = format!("/shared/cwf-fullvis-{bt_label}-{a}.txt");
+                        let _ = run
+                            .typed_or_error(&handle, &FS_DELETE, FsPathArgs { path: path.clone() })
+                            .await;
+                        if let Err(e) = run
+                            .run_leaf_write(
+                                &leaf,
+                                &CROSS_WORKER_FILE,
+                                CrossWorkerFileArgs {
+                                    mode: "write-and-hold".into(),
+                                    path: path.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            return crate::coordinator::TestOutcome::new(&a, false, e);
+                        }
+                        if let Err(e) = run
+                            .run_leaf_read_checkpoint(&leaf, "cross-worker-file-ready")
+                            .await
+                        {
+                            return crate::coordinator::TestOutcome::new(&a, false, e);
+                        }
+                        // Writer claims it has written all 5 lines and flushed.
+                        // Strict check: reader sees the EXACT expected content.
+                        let expected = "line0\nline1\nline2\nline3\nline4\n";
+                        let resp = run
+                            .typed_or_error(&handle, &FS_READ, FsPathArgs { path: path.clone() })
+                            .await;
+                        let (pass, detail) = match &resp {
+                            Response::Ok { data: Some(d) } if d == expected => {
+                                (true, format!("read {} bytes, exact match", d.len()))
+                            }
+                            Response::Ok { data: Some(d) } => (
+                                false,
+                                format!(
+                                    "INCOMPLETE: writer wrote {} bytes, reader sees {} bytes. \
+                                     Expected {:?}, got {:?}",
+                                    expected.len(),
+                                    d.len(),
+                                    expected,
+                                    d,
+                                ),
+                            ),
+                            other => (false, format!("read failed: {other:?}")),
+                        };
+                        let _ = run.run_leaf_resume(&leaf, "cross-worker-file-ready").await;
+                        let _ = run.run_leaf_read_result(&leaf, &CROSS_WORKER_FILE).await;
+                        let _ = run.run_leaf_exit(&leaf).await;
+                        crate::coordinator::TestOutcome::new(&a, pass, detail)
+                    })
+                })
+            });
+        }
+
         // CWF.self_open: child opens file itself (no inherited fd).
         {
             let a = agent_s.clone();
