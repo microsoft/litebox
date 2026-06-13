@@ -4567,10 +4567,114 @@ mod vscode {
         )
     }
 
-    fn run_server_listen(_pass: &str) -> Result<(), Failed> {
-        Err(Failed::from(
-            "vscode::server_listen not yet implemented (see plan: vscode-server-listen-scenario)",
-        ))
+    fn run_server_listen(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "server_listen").map_err(Failed::from)?;
+        ensure_vscode_image(&super::workspace_root());
+
+        let test_id = "vscode::server_listen".to_string();
+        let spec = build_vscode_spec(pass, &fixture_dir);
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "server_listen",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let commit = match detect_cli_commit(port, Duration::from_secs(30)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("detect_cli_commit: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                // One SSH session: start the CLI in the background,
+                // poll its log for "Listening on N.N.N.N:PORT", emit
+                // a stable VSL_PORT=<port> marker on stdout. We use
+                // host-side `nohup` + `disown` to detach the CLI
+                // from the SSH session so it survives the session's
+                // exit; whether it actually stays alive after the
+                // session closes is incidental — we only validate
+                // that it reached the listening state.
+                let cli_path = format!("/root/.vscode-server/code-{commit}");
+                let remote_cmd = build_server_listen_remote_cmd(&cli_path, 60);
+                let output = match run_remote_command_retry(port, &remote_cmd, 90) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("run_remote_command_retry: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-server_listen");
+                let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &output);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+                let stripped = copilot::strip_ansi(&output);
+
+                match parse_vsl_port(&stripped) {
+                    Some(captured) if captured != 0 => super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    },
+                    Some(_) => drive_fail(
+                        format!(
+                            "VSL_PORT=0 parsed from output (CLI bound to port 0?). raw log: {}",
+                            log_dir.join(format!("{safe}.raw.log")).display(),
+                        ),
+                        t_docker_start_ms,
+                        t_useful_ms,
+                    ),
+                    None => {
+                        let preview: String = stripped.chars().take(1500).collect();
+                        drive_fail(
+                            format!(
+                                "no VSL_PORT marker in `code command-shell` output \
+                                 (detected_commit={commit}). raw log: {}\n\
+                                 first 1500 chars (ANSI-stripped):\n{preview}",
+                                log_dir.join(format!("{safe}.raw.log")).display(),
+                            ),
+                            t_docker_start_ms,
+                            t_useful_ms,
+                        )
+                    }
+                }
+            },
+        )
     }
 
     fn run_connect_loopback(_pass: &str) -> Result<(), Failed> {
@@ -4743,6 +4847,73 @@ mod vscode {
     ) -> Result<String, String> {
         let cmd = format!("sh {}", copilot::shell_quote(remote_script_path));
         run_remote_command_retry(port, &cmd, timeout_secs)
+    }
+
+    /// Construct the remote-shell command for `vscode::server_listen`.
+    /// One SSH session does it all: start the CLI in background,
+    /// poll its log up to `poll_secs` times (1 sample/s), emit
+    /// `VSL_PORT=<port>` once the listen line shows up, exit.
+    ///
+    /// `nohup` + `disown` + `< /dev/null` mirrors the bootstrap
+    /// script's CLI launch shape. The CLI's `--parent-process-id`
+    /// gets bound to PID 1 (the container's init = sshd/litebox)
+    /// so the CLI doesn't auto-exit when our SSH session ends —
+    /// useful for the downstream `connect_loopback` /
+    /// `connect_cross_ssh` scenarios.
+    fn build_server_listen_remote_cmd(cli_path: &str, poll_secs: u32) -> String {
+        let cli_q = copilot::shell_quote(cli_path);
+        let token = "litebox-vscode-itest-token";
+        format!(
+            "set -e; \
+             LOG=/tmp/vscode-server-listen.log; \
+             rm -f \"$LOG\"; \
+             nohup env VSCODE_CLI_REQUIRE_TOKEN={token} \
+                {cli_q} command-shell \
+                --cli-data-dir /tmp/vscode-cli-data \
+                --parent-process-id 1 \
+                --on-host=127.0.0.1 --on-port=0 \
+                > \"$LOG\" 2>&1 < /dev/null & \
+             CLI_PID=$!; \
+             disown $CLI_PID 2>/dev/null || true; \
+             echo VSL_CLI_PID=$CLI_PID; \
+             for _ in $(seq 1 {poll_secs}); do \
+                LISTEN_LINE=$(grep -aE 'Listening on .+' \"$LOG\" 2>/dev/null | head -1); \
+                if [ -n \"$LISTEN_LINE\" ]; then \
+                    PORT=$(echo \"$LISTEN_LINE\" | sed -nE 's/.*:([0-9]+).*/\\1/p'); \
+                    if [ -n \"$PORT\" ]; then \
+                        echo VSL_PORT=$PORT; \
+                        echo VSL_LISTEN_LINE=$LISTEN_LINE; \
+                        exit 0; \
+                    fi; \
+                fi; \
+                if ! kill -0 $CLI_PID 2>/dev/null; then \
+                    echo VSL_CLI_DIED; \
+                    cat \"$LOG\"; \
+                    exit 1; \
+                fi; \
+                sleep 1; \
+             done; \
+             echo VSL_NO_PORT; \
+             cat \"$LOG\"; \
+             exit 1"
+        )
+    }
+
+    /// Parse the `VSL_PORT=<u16>` marker emitted by
+    /// `build_server_listen_remote_cmd`. Returns `Some(port)` on
+    /// successful parse, `None` if the marker is absent or
+    /// non-numeric. End-to-end contracted by the
+    /// `native::vscode::server_listen` trial (= the
+    /// `libtest_mimic` harness doesn't run `#[test]` functions).
+    fn parse_vsl_port(s: &str) -> Option<u16> {
+        for line in s.lines() {
+            if let Some(rest) = line.trim().strip_prefix("VSL_PORT=") {
+                if let Ok(p) = rest.trim().parse::<u16>() {
+                    return Some(p);
+                }
+            }
+        }
+        None
     }
 }
 
