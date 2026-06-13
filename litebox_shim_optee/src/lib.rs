@@ -750,7 +750,7 @@ impl Task {
                 ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
             )?;
         ta_stack
-            .init(params)
+            .init(self.global.platform, params)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ThreadInitState::Ta {

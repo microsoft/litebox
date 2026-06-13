@@ -31,6 +31,8 @@ object = { version = "0.36.7", default-features = false, features = ["pe"] }
 digest = { version = "0.10.7", default-features = false }
 aligned-vec = { version = "0.6.4", default-features = false }
 raw-cpuid = "11.6.0"
+rand_chacha = { version = "0.3.1", default-features = false }
+rand_core = { version = "0.6.4", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 zeroize = { version = "1.8", default-features = false }
 

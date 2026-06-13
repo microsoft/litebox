@@ -7,6 +7,8 @@ use crate::{
     Errno, HostInterface, arch::ioport::serial_print_string,
     host::per_cpu_variables::with_per_cpu_variables,
 };
+use digest::Digest;
+use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
@@ -103,15 +105,72 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
 
 impl litebox::platform::CrngProvider for LvbsLinuxKernel {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
-        // FIXME: generate real random data.
-        static RANDOM: spin::mutex::SpinMutex<litebox::utils::rng::FastRng> =
-            spin::mutex::SpinMutex::new(litebox::utils::rng::FastRng::new_from_seed(
-                core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
-            ));
+        static RANDOM: spin::mutex::SpinMutex<Option<LvbsCrng>> = spin::mutex::SpinMutex::new(None);
+
         let mut random = RANDOM.lock();
-        for b in buf.chunks_mut(8) {
-            b.copy_from_slice(&random.next_u64().to_ne_bytes()[..b.len()]);
+        random
+            .get_or_insert_with(|| {
+                LvbsCrng::new(
+                    PRK_ONCE.get().expect("Platform root key not initialized"),
+                    rdrand_seed().expect("RDRAND unavailable during CRNG initialization"),
+                )
+            })
+            .fill_bytes(buf, rdrand_seed);
+    }
+}
+
+type CrngSeed = <rand_chacha::ChaCha20Rng as SeedableRng>::Seed;
+
+const CRNG_RESEED_INTERVAL_BYTES: usize = 1024 * 1024;
+const CRNG_RESEED_BACKOFF_BYTES: usize = 64 * 1024;
+const CRNG_RESEED_STATE_BYTES: usize = 32;
+const RDRAND_RETRY_ATTEMPTS: u32 = 10;
+
+struct LvbsCrng {
+    random: rand_chacha::ChaCha20Rng,
+    bytes_until_reseed: usize,
+    reseed_counter: usize,
+}
+
+impl LvbsCrng {
+    fn new(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> Self {
+        Self {
+            random: rand_chacha::ChaCha20Rng::from_seed(crng_seed_from_prk_and_rdrand(
+                prk,
+                rdrand_seed,
+            )),
+            bytes_until_reseed: CRNG_RESEED_INTERVAL_BYTES,
+            reseed_counter: 0,
         }
+    }
+
+    fn fill_bytes(&mut self, mut buf: &mut [u8], rdrand_seed: impl Fn() -> Option<CrngSeed>) {
+        while !buf.is_empty() {
+            let len = buf.len().min(self.bytes_until_reseed);
+            let (chunk, rest) = buf.split_at_mut(len);
+            self.random.fill_bytes(chunk);
+            buf = rest;
+            self.bytes_until_reseed -= len;
+
+            if self.bytes_until_reseed == 0 {
+                match rdrand_seed() {
+                    Some(seed) => self.reseed(seed),
+                    None => self.bytes_until_reseed = CRNG_RESEED_BACKOFF_BYTES,
+                }
+            }
+        }
+    }
+
+    fn reseed(&mut self, rdrand_seed: CrngSeed) {
+        self.reseed_counter += 1;
+        let mut current_state = Zeroizing::new([0u8; CRNG_RESEED_STATE_BYTES]);
+        self.random.fill_bytes(&mut *current_state);
+        self.random = rand_chacha::ChaCha20Rng::from_seed(crng_reseed_from_rdrand_and_state(
+            rdrand_seed,
+            self.reseed_counter,
+            &current_state,
+        ));
+        self.bytes_until_reseed = CRNG_RESEED_INTERVAL_BYTES;
     }
 }
 
@@ -154,6 +213,51 @@ impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
             Some(kdf) => Ok(kdf(prk, params)?),
         }
     }
+}
+
+fn rdrand_seed() -> Option<CrngSeed> {
+    let mut seed = CrngSeed::default();
+    for chunk in seed.chunks_mut(8) {
+        let mut word = 0;
+        let mut ok = false;
+        for _ in 0..RDRAND_RETRY_ATTEMPTS {
+            // Safety: `RDRAND` is available on the LVBS target CPUs. A false
+            // carry flag means random data is temporarily unavailable.
+            if unsafe { core::arch::x86_64::_rdrand64_step(&mut word) } == 1 {
+                ok = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !ok {
+            return None;
+        }
+        chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]);
+    }
+    Some(seed)
+}
+
+fn crng_seed_from_prk_and_rdrand(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> CrngSeed {
+    sha2::Sha256::new()
+        .chain_update(b"litebox-lvbs-crng-seed-v1")
+        .chain_update(prk)
+        .chain_update(rdrand_seed)
+        .finalize()
+        .into()
+}
+
+fn crng_reseed_from_rdrand_and_state(
+    rdrand_seed: CrngSeed,
+    reseed_counter: usize,
+    current_state: &[u8; CRNG_RESEED_STATE_BYTES],
+) -> CrngSeed {
+    sha2::Sha256::new()
+        .chain_update(b"litebox-lvbs-crng-reseed-v1")
+        .chain_update(rdrand_seed)
+        .chain_update(reseed_counter.to_le_bytes())
+        .chain_update(current_state)
+        .finalize()
+        .into()
 }
 
 pub struct HostLvbsInterface;
@@ -203,5 +307,33 @@ impl HostInterface for HostLvbsInterface {
 
     fn switch(_result: u64) -> ! {
         unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    const TEST_PRK: [u8; PRK_LEN] = [0x42; PRK_LEN];
+    const INIT_SEED: CrngSeed = [0xA5; 32];
+    const RESEED_SEED: CrngSeed = [0x5A; 32];
+
+    #[test]
+    fn crosses_reseed_boundary_twice_with_accurate_budget() {
+        let mut crng = LvbsCrng::new(&TEST_PRK, INIT_SEED);
+        let mut buf = vec![0u8; CRNG_RESEED_INTERVAL_BYTES * 2 + 7];
+        crng.fill_bytes(&mut buf, || Some(RESEED_SEED));
+        assert_eq!(crng.reseed_counter, 2);
+        assert_eq!(crng.bytes_until_reseed, CRNG_RESEED_INTERVAL_BYTES - 7);
+    }
+
+    #[test]
+    fn rdrand_failure_engages_backoff_without_reseed() {
+        let mut crng = LvbsCrng::new(&TEST_PRK, INIT_SEED);
+        let mut buf = vec![0u8; CRNG_RESEED_INTERVAL_BYTES];
+        crng.fill_bytes(&mut buf, || None);
+        assert_eq!(crng.reseed_counter, 0);
+        assert_eq!(crng.bytes_until_reseed, CRNG_RESEED_BACKOFF_BYTES);
     }
 }
