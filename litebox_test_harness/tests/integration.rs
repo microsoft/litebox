@@ -1516,6 +1516,12 @@ fn main() {
     let _ = setup();
     copilot::register_trials(&mut trials);
 
+    // VS Code Remote Server integration scenarios — always registered
+    // (no token required). See `mod vscode` for the scenario set and
+    // `litebox_test_harness/CLAUDE.md` "VS Code Server integration
+    // scenarios" for invocation knobs.
+    vscode::register_trials(&mut trials);
+
     // Record the universe size on the runs row so the renderer can
     // show "N covered of M known".
     if !args.list {
@@ -4114,6 +4120,371 @@ mod copilot {
             i += 1;
         }
         out
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// mod vscode — VS Code Remote Server integration scenarios
+// ════════════════════════════════════════════════════════════════════
+//
+// Mirrors `mod copilot` exactly in shape: per-pass `docker run` of a
+// dropbear-in-container image, host-side driven via SSH-over-PTY. The
+// VS Code Server scenarios are the end-to-end validation layer that
+// Goal B's `docs/product-goal-map.md` calls out as the remaining gap
+// after the capability nodes flipped to ✅.
+//
+// Trial namespace: `vscode::<scenario>`. Each registers as
+// `native::vscode::<scenario>` and `litebox::vscode::<scenario>`.
+//
+//   vscode::bootstrap          — replay the captured Remote-SSH
+//                                bootstrap script through `sh -s`.
+//   vscode::server_listen      — start `code command-shell` directly,
+//                                capture its TCP listening port.
+//   vscode::connect_loopback   — same SSH session opens a TCP
+//                                connection to the captured port.
+//   vscode::connect_cross_ssh  — second independent SSH session
+//                                does the same connect (Remote-SSH
+//                                SOCKS-proxy pattern).
+//
+// Image flexibility: `LITEBOX_VSCODE_IMAGE_STAGE` env var picks
+// `litebox-vscode` (default — runtime-rewritten) or
+// `litebox-vscode-prewrite` (faster startup, requires
+// `litebox_syscall_rewriter`, which `setup()` already builds).
+//
+// Concurrency cap: `LITEBOX_VSCODE_JOBS` (default `1`). The serial
+// default protects shared / autonomous runs from dockerd
+// stress and from cross-test port conflicts in the cross-SSH
+// scenario. One-shot validation runs can raise it
+// (`LITEBOX_VSCODE_JOBS=4`).
+//
+// No GitHub token plumbing — VS Code's `--connection-token` is
+// locally-generated and never validated against an external
+// service.
+//
+// Native is the gold standard. Any litebox-pass failure is a real
+// shim/runner regression; see CLAUDE.md "Investigating a failure"
+// for the workflow.
+
+mod vscode {
+    use super::{Failed, Trial};
+    // The skeleton-commit stubs don't yet reach into `copilot::*` helpers,
+    // `Pty`, or `Instant`, but every scenario body landing in the next
+    // commits will. Keep them imported here as the forward declaration of
+    // the surface each scenario will use.
+    #[allow(unused_imports)]
+    use super::copilot;
+    #[allow(unused_imports)]
+    use litebox_test_harness::os::pty::Pty;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    #[allow(unused_imports)]
+    use std::time::Instant;
+
+    // ───────────────────────────────────────────────────────────────
+    // Image-stage selection
+    // ───────────────────────────────────────────────────────────────
+
+    /// Docker stage to use for the trials. Default = `litebox-vscode`
+    /// (no extra build prerequisite beyond what `setup()` already
+    /// does). `LITEBOX_VSCODE_IMAGE_STAGE=prewrite` switches to
+    /// `litebox-vscode-prewrite` (pre-rewritten node / dropbear /
+    /// bash; saves ~10.5 s startup per trial; requires
+    /// `litebox_syscall_rewriter` to be copied into the build
+    /// context — `ensure_vscode_image` handles that).
+    fn vscode_image_base() -> &'static str {
+        match std::env::var("LITEBOX_VSCODE_IMAGE_STAGE").as_deref() {
+            Ok("prewrite") | Ok("litebox-vscode-prewrite") => "litebox-vscode-prewrite",
+            _ => "litebox-vscode",
+        }
+    }
+
+    /// Per-worktree resolved tag (`<stage>:wt-<sha256>`). Mirrors
+    /// `copilot_image_tag` in the outer scope.
+    fn vscode_image_tag() -> String {
+        super::image_tag::image_tag(vscode_image_base())
+    }
+
+    /// Build the requested VS Code Docker image if missing.
+    ///
+    /// For the prewrite stage, copies `litebox_syscall_rewriter`
+    /// (built by `setup()` in `target/debug/`) into the path the
+    /// Dockerfile's `COPY` instruction expects. The copy is
+    /// idempotent — re-running over an up-to-date file is a no-op
+    /// on disk but always invalidates the layer's cache key only
+    /// when the binary actually changes.
+    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
+    fn ensure_vscode_image(ws_root: &Path) {
+        let stage = vscode_image_base();
+        let tag = vscode_image_tag();
+        let check = Command::new("docker")
+            .args(["image", "inspect", &tag])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if matches!(check, Ok(s) if s.success()) {
+            return;
+        }
+        eprintln!("Building {tag} Docker image (stage={stage})...");
+
+        if stage == "litebox-vscode-prewrite" {
+            // The prewrite stage's `COPY
+            // litebox_tool_executor/rootfs/litebox_syscall_rewriter
+            // /tmp/rewriter` instruction needs the rewriter binary
+            // at that path in the build context. setup() already
+            // built it in target/debug/.
+            let rewriter_src = super::debug_dir().join("litebox_syscall_rewriter");
+            let rewriter_dst =
+                ws_root.join("litebox_tool_executor/rootfs/litebox_syscall_rewriter");
+            std::fs::copy(&rewriter_src, &rewriter_dst).unwrap_or_else(|e| {
+                panic!(
+                    "ensure_vscode_image: copy {} -> {} for prewrite stage: {e}",
+                    rewriter_src.display(),
+                    rewriter_dst.display(),
+                )
+            });
+        }
+
+        let dockerfile = ws_root.join("litebox_tool_executor/rootfs/Dockerfile");
+        let status = Command::new("docker")
+            .args(["build", "--target", stage, "-t", &tag, "-f"])
+            .arg(&dockerfile)
+            .arg(ws_root)
+            .status()
+            .expect("docker build vscode image");
+        assert!(
+            status.success(),
+            "docker build {tag} (stage={stage}) failed"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Concurrency cap
+    // ───────────────────────────────────────────────────────────────
+
+    fn jobs_cap() -> usize {
+        std::env::var("LITEBOX_VSCODE_JOBS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    }
+
+    fn vscode_semaphore() -> &'static std::sync::Mutex<usize> {
+        static SEM: OnceLock<std::sync::Mutex<usize>> = OnceLock::new();
+        SEM.get_or_init(|| std::sync::Mutex::new(jobs_cap()))
+    }
+
+    /// Tiny manual semaphore: acquire a slot or sleep. Mirrors
+    /// `CopilotPermit` — keeps VS Code Server trials from saturating
+    /// dockerd and from racing each other on port allocation in
+    /// the cross-SSH scenario.
+    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
+    struct VsCodePermit;
+
+    impl VsCodePermit {
+        #[allow(dead_code)]
+        fn acquire() -> Self {
+            loop {
+                {
+                    let mut g = vscode_semaphore().lock().expect("vscode sem");
+                    if *g > 0 {
+                        *g -= 1;
+                        return VsCodePermit;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    impl Drop for VsCodePermit {
+        fn drop(&mut self) {
+            if let Ok(mut g) = vscode_semaphore().lock() {
+                *g += 1;
+            }
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Per-pass container spec
+    // ───────────────────────────────────────────────────────────────
+
+    /// Build the per-trial container spec. Same shape as
+    /// `build_copilot_spec` (native = bare dropbear; litebox =
+    /// `litebox_tool_executor --ssh`), but pointed at the
+    /// `litebox-vscode[-prewrite]` image. No `--workspace` bind
+    /// mount today — the VS Code Server trials don't need
+    /// per-trial fixture files.
+    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
+    fn build_vscode_spec(pass: &str, fixture_dir: &Path) -> super::framework::ContainerSpec {
+        let bin_dir = super::debug_dir();
+        let mut docker_args: Vec<String> = vec![
+            "--cap-add".into(),
+            "SYS_PTRACE".into(),
+            "-p".into(),
+            "127.0.0.1:0:22".into(),
+            "-v".into(),
+            format!("{}:/opt/litebox:ro", bin_dir.display()),
+            "-v".into(),
+            format!("{}:/workspace", fixture_dir.display()),
+        ];
+        // Pass through the same env vars `build_copilot_spec` does
+        // so a session's broker/runner tuning knobs apply uniformly.
+        for var in [
+            "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+            "LITEBOX_EAGER_BROKER_SOCKETSEQPACKET",
+            "LITEBOX_BROKER_TCP_CONN",
+            "LITEBOX_BROKER_INET_RAW",
+            "LITEBOX_BROKER_INET_DELAY_NS",
+            "LITEBOX_PE10_DIAG",
+            "LITEBOX_PE5_DIAG",
+            "LITEBOX_CLEANUP_DELAY_MS",
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                docker_args.push("-e".into());
+                docker_args.push(format!("{var}={val}"));
+            }
+        }
+        let command: Vec<String> = match pass {
+            "native" => vec![
+                "/usr/sbin/dropbear".into(),
+                "-F".into(),
+                "-E".into(),
+                "-B".into(),
+                "-R".into(),
+                "-p".into(),
+                "22".into(),
+            ],
+            "litebox" => vec![
+                "/opt/litebox/litebox_tool_executor".into(),
+                "--rootfs".into(),
+                "/".into(),
+                "--record-baseline".into(),
+                "--ssh".into(),
+                "--ssh-port".into(),
+                "22".into(),
+            ],
+            _ => panic!("unknown pass {pass}"),
+        };
+        super::framework::ContainerSpec {
+            image: vscode_image_tag(),
+            docker_args,
+            command,
+            detached: true,
+            timeout_secs: None,
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Trial registration
+    // ───────────────────────────────────────────────────────────────
+
+    /// All trial scenarios, in declared order. Each registers a
+    /// `native::vscode::<id>` and `litebox::vscode::<id>` Trial.
+    const SCENARIOS: &[&str] = &[
+        "bootstrap",
+        "server_listen",
+        "connect_loopback",
+        "connect_cross_ssh",
+    ];
+
+    /// Register every `vscode::<scenario>` Trial pair. Called
+    /// unconditionally from `main()` so the dashboard universe
+    /// stays consistent and the autonomous `--fill` selector can
+    /// pick them up.
+    pub(super) fn register_trials(trials: &mut Vec<Trial>) {
+        for scn in SCENARIOS {
+            for pass in ["native", "litebox"] {
+                let name = format!("{pass}::vscode::{scn}");
+                let pass_owned = pass.to_string();
+                let scn_owned = (*scn).to_string();
+                trials.push(Trial::test(name, move || {
+                    run_scenario(&pass_owned, &scn_owned)
+                }));
+            }
+        }
+    }
+
+    /// Dispatch on scenario id. Each scenario function is
+    /// self-contained: acquire permit, ensure image, build spec,
+    /// run trial via `framework::run_trial`.
+    fn run_scenario(pass: &str, scenario_id: &str) -> Result<(), Failed> {
+        match scenario_id {
+            "bootstrap" => run_bootstrap(pass),
+            "server_listen" => run_server_listen(pass),
+            "connect_loopback" => run_connect_loopback(pass),
+            "connect_cross_ssh" => run_connect_cross_ssh(pass),
+            other => Err(Failed::from(format!("unknown vscode scenario: {other}"))),
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Scenario stubs — bodies land in vscode-{bootstrap,...}-scenario
+    // todos. Each fails loudly until implemented so the trial set is
+    // present in the dashboard universe from skeleton commit onward.
+    // ───────────────────────────────────────────────────────────────
+
+    fn run_bootstrap(_pass: &str) -> Result<(), Failed> {
+        Err(Failed::from(
+            "vscode::bootstrap not yet implemented (see plan: vscode-bootstrap-scenario)",
+        ))
+    }
+
+    fn run_server_listen(_pass: &str) -> Result<(), Failed> {
+        Err(Failed::from(
+            "vscode::server_listen not yet implemented (see plan: vscode-server-listen-scenario)",
+        ))
+    }
+
+    fn run_connect_loopback(_pass: &str) -> Result<(), Failed> {
+        Err(Failed::from(
+            "vscode::connect_loopback not yet implemented (see plan: vscode-connect-loopback-scenario)",
+        ))
+    }
+
+    fn run_connect_cross_ssh(_pass: &str) -> Result<(), Failed> {
+        Err(Failed::from(
+            "vscode::connect_cross_ssh not yet implemented (see plan: vscode-connect-cross-ssh-scenario)",
+        ))
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Shared helpers (kept ready for scenario bodies)
+    // ───────────────────────────────────────────────────────────────
+
+    /// Per-trial fixture directory. Cleared and recreated at the
+    /// start of each scenario so a re-run sees a fresh `/workspace`.
+    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
+    fn vscode_fixture_dir(pass: &str, scenario_id: &str) -> std::path::PathBuf {
+        super::target_dir()
+            .join("vscode-fixtures")
+            .join(format!("{pass}-{scenario_id}"))
+    }
+
+    /// Create + return a fresh fixture dir. Borrowed from the
+    /// per-scenario bootstrap in `run_startup_then_exit` /
+    /// `run_copilot_trial`.
+    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
+    fn prep_fixture_dir(pass: &str, scenario_id: &str) -> Result<std::path::PathBuf, String> {
+        let dir = vscode_fixture_dir(pass, scenario_id);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("create fixture dir {}: {e}", dir.display()))?;
+        Ok(dir)
+    }
+
+    /// Convert the static `&str` pass label into a `&'static str`
+    /// suitable for `framework::run_trial`'s typed pass argument.
+    #[allow(dead_code)] // used by scenario bodies landing in subsequent commits
+    fn pass_static(pass: &str) -> &'static str {
+        match pass {
+            "native" => "native",
+            "litebox" => "litebox",
+            _ => "unknown",
+        }
     }
 }
 
