@@ -1373,3 +1373,125 @@ coverage. The agent-sandbox-demo branch
 hand-driven demo with policy enforcement; this suite is the
 automated companion for repeatable validation.
 
+## VS Code Server integration scenarios
+
+A parallel suite of integration trials exercises **VS Code
+Remote Server running inside a litebox sandbox over SSH**, in
+the production-shaped configuration: dropbear-in-container,
+host-side driven over SSH-via-PTY. These trials are the
+end-to-end validation layer that `docs/product-goal-map.md`
+identifies as Goal B's remaining gap after every capability
+node already flipped to ✅.
+
+**Trial namespace:** `vscode::<scenario>`. Each registers as
+`native::vscode::<scenario>` and `litebox::vscode::<scenario>`.
+4 scenarios × 2 passes = 8 trials.
+
+| Scenario              | What it exercises                                                                                            |
+|-----------------------|--------------------------------------------------------------------------------------------------------------|
+| `bootstrap`           | The **exact** VS Code Remote-SSH bootstrap payload — `vscode-bootstrap-captured.sh` patched at runtime with the image's CLI commit hash, piped through `ssh sh -s`. Validates `: start` / `: end` / `listeningOn==` / `Found existing installation` markers. |
+| `server_listen`       | Invokes `code command-shell --on-host=127.0.0.1 --on-port=0 --parent-process-id 1` directly (no bootstrap-script wrapping). Polls its log for `Listening on N.N.N.N:PORT`, emits `VSL_PORT=` marker. Narrower diagnostic surface than `bootstrap` — points at the CLI startup path itself. |
+| `connect_loopback`    | Same SSH session as `server_listen`, plus a TCP 3-way handshake to the captured port via bash's `/dev/tcp/127.0.0.1/$PORT`. Validates loopback TCP delivery inside the sandbox. |
+| `connect_cross_ssh`   | Two independent SSH sessions: session A starts the CLI and emits the captured port; session B (separate dropbear → bash worker tree) does the connect. Mirrors the VS Code Remote-SSH SOCKS-proxy pattern; under litebox exercises broker cross-worker loopback TCP. |
+
+**No token required** — VS Code's `--connection-token` is
+locally-generated and never validated externally. (Unlike
+`mod copilot`, which calls the GitHub Copilot API and gates
+each trial on `gh auth token` / `COPILOT_GITHUB_TOKEN`.)
+
+**Invocation:**
+
+```bash
+# Single scenario:
+cargo test -p litebox_test_harness --test integration -- \
+  'native::vscode::bootstrap' --exact
+
+# All native vscode scenarios:
+cargo test -p litebox_test_harness --test integration -- 'native::vscode::'
+
+# Full VS Code suite (defaults to LITEBOX_VSCODE_JOBS=1 — serial,
+# safest for shared / autonomous-driver runs):
+cargo test -p litebox_test_harness --test integration -- 'vscode::'
+
+# Same suite, parallelized:
+LITEBOX_VSCODE_JOBS=4 \
+  cargo test -p litebox_test_harness --test integration -- 'vscode::'
+```
+
+**Image-stage selection (`LITEBOX_VSCODE_IMAGE_STAGE`):**
+
+| Value (default = unset) | Stage used                  | When to use |
+|-------------------------|-----------------------------|-------------|
+| unset / anything else   | `litebox-vscode`            | Default — runtime ELF rewriting; no extra build prerequisite. |
+| `prewrite`              | `litebox-vscode-prewrite`   | Pre-rewritten `node`, `dropbear`, `bash`; saves ~10.5 s per litebox-pass trial. Requires `litebox_syscall_rewriter`, which `setup()` already builds (`integration.rs:1961`); `ensure_vscode_image` copies it into the build context for the `COPY` instruction in the Dockerfile. |
+
+The two stages share all surrounding code — flip via env var
+once the suite is stable. `ensure_vscode_image` is idempotent
+(inspect-then-build), so token-free / one-shot validation runs
+incur zero rebuild cost.
+
+**Concurrency cap:** `LITEBOX_VSCODE_JOBS` (default `1`),
+independent of both `LITEBOX_TEST_JOBS` and
+`LITEBOX_COPILOT_JOBS`. Serial default protects shared runs
+from dockerd contention; cross-SSH scenarios additionally
+benefit from serial because session-A's CLI continues running
+between sessions and would otherwise compete with concurrent
+trial-containers' CLIs for fork-restore slots under litebox.
+
+**Native is the gold standard.** Every trial passes on native;
+any litebox-pass failure is a real shim regression. As of the
+work-stream landing commit:
+
+| Trial                             | native | litebox       |
+|-----------------------------------|--------|---------------|
+| `vscode::bootstrap`               | ok     | FAIL (CLI doesn't reach `Listening on` line; bootstrap markers `: start` / `: end` / `listeningOn==` never appear). |
+| `vscode::server_listen`           | ok     | FAIL (same root: `VSL_CLI_PID` printed, then 60 s poll runs out without ever seeing `Listening on`). |
+| `vscode::connect_loopback`        | ok     | FAIL (inherits server_listen — never gets to the connect step). |
+| `vscode::connect_cross_ssh`       | ok     | FAIL (session A inherits server_listen — never gets to session B). |
+
+All four litebox-pass failures share the same root: the
+`code-${VSCODE_COMMIT}` static-PIE-musl binary launches under
+litebox but never reaches its `Listening on N.N.N.N:PORT`
+stage within 60 s. The fix-first workflow (rule 12) applies —
+the next work stream identifies the suspect capability with a
+self-contained test in the harness, watches it fail under
+litebox, and fixes the product code.
+
+**Per-trial transcripts:** `target/test-logs/vscode-<pass>-<scenario>.raw.log`,
+plus `.session-{a,b}.log` for `connect_cross_ssh`.
+
+**Driver internals.** Reuses every host-side helper that
+`mod copilot` already factored out:
+`copilot::ssh_argv_base` / `wait_for_sshd` / `shell_quote` /
+`read_with_deadline` / `wait_pid` / `strip_ansi`. The local
+helpers added in `mod vscode` are: `build_vscode_spec` (per-pass
+container spec), `ensure_vscode_image` (image-stage-aware
+docker build), `VsCodePermit` (the concurrency cap),
+`build_server_listen_remote_cmd` / `build_connect_loopback_remote_cmd` /
+`build_cross_ssh_session_a_cmd` / `build_cross_ssh_session_b_cmd`
+(the in-container shell programs), and `parse_vsl_port` /
+`extract_first_hex40` (host-side parsers, end-to-end
+contracted by their respective native trials).
+
+**Files involved:**
+- `litebox_tool_executor/rootfs/Dockerfile` —
+  `litebox-vscode` / `litebox-vscode-prewrite` /
+  `litebox-vscode-native` stages.
+- `litebox_tool_executor/scripts/vscode/vscode-bootstrap-captured.sh`
+  — the exact payload VS Code Remote-SSH pipes through `sh`;
+  `vscode::bootstrap` `include_str!`s it and patches two
+  lines at runtime.
+- `litebox_test_harness/tests/integration.rs` — `mod vscode`
+  and unconditional registration in `main()`.
+
+**Out of scope (deferred):**
+- Full desktop VS Code → Remote-SSH session under load.
+  Needs a desktop driver (Playwright-on-Electron); not
+  appropriate for `cargo test`.
+- Speaking the VS Code tunnel-mode protocol on the captured
+  TCP port. The trials assert "TCP 3-way handshake completes"
+  which is sufficient to validate the listener + broker TCP
+  loopback; speaking the protocol would couple to a moving
+  upstream binary format.
+
+
