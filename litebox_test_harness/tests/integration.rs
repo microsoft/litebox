@@ -4677,10 +4677,105 @@ mod vscode {
         )
     }
 
-    fn run_connect_loopback(_pass: &str) -> Result<(), Failed> {
-        Err(Failed::from(
-            "vscode::connect_loopback not yet implemented (see plan: vscode-connect-loopback-scenario)",
-        ))
+    fn run_connect_loopback(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "connect_loopback").map_err(Failed::from)?;
+        ensure_vscode_image(&super::workspace_root());
+
+        let test_id = "vscode::connect_loopback".to_string();
+        let spec = build_vscode_spec(pass, &fixture_dir);
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "connect_loopback",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let commit = match detect_cli_commit(port, Duration::from_secs(30)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("detect_cli_commit: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                // Same SSH session does the start-CLI-then-connect
+                // sequence. The CLI stays alive for the entire
+                // session lifetime, so the connect runs while it's
+                // still listening.
+                let cli_path = format!("/root/.vscode-server/code-{commit}");
+                let remote_cmd = build_connect_loopback_remote_cmd(&cli_path, 60);
+                let output = match run_remote_command_retry(port, &remote_cmd, 120) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("run_remote_command_retry: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-connect_loopback");
+                let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &output);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+                let stripped = copilot::strip_ansi(&output);
+
+                let port_captured = parse_vsl_port(&stripped);
+                let conn_ok = stripped.lines().any(|l| l.trim() == "VSL_CONN_OK");
+
+                match (port_captured, conn_ok) {
+                    (Some(p), true) if p != 0 => super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    },
+                    (port_opt, conn_opt) => {
+                        let preview: String = stripped.chars().take(1500).collect();
+                        drive_fail(
+                            format!(
+                                "connect_loopback failed: port={port_opt:?} conn_ok={conn_opt} \
+                                 (detected_commit={commit}). raw log: {}\n\
+                                 first 1500 chars (ANSI-stripped):\n{preview}",
+                                log_dir.join(format!("{safe}.raw.log")).display(),
+                            ),
+                            t_docker_start_ms,
+                            t_useful_ms,
+                        )
+                    }
+                }
+            },
+        )
     }
 
     fn run_connect_cross_ssh(_pass: &str) -> Result<(), Failed> {
@@ -4914,6 +5009,68 @@ mod vscode {
             }
         }
         None
+    }
+
+    /// Remote-shell program for `vscode::connect_loopback`. Reuses
+    /// the start-CLI-and-poll logic from
+    /// `build_server_listen_remote_cmd`, then opens a TCP
+    /// connection to the captured port via bash's `/dev/tcp/`
+    /// pseudo-device, gated on a 3 s `timeout` so a litebox-side
+    /// bug that hangs `connect(2)` produces a bounded FAIL
+    /// instead of running out the trial deadline.
+    ///
+    /// Just the TCP handshake completing is sufficient — we don't
+    /// try to speak the VS Code tunnel protocol (custom mTLS-ish
+    /// shape). A successful 3-way handshake proves the CLI bound
+    /// the port AND that loopback TCP delivery works through
+    /// litebox's broker.
+    fn build_connect_loopback_remote_cmd(cli_path: &str, poll_secs: u32) -> String {
+        let cli_q = copilot::shell_quote(cli_path);
+        let token = "litebox-vscode-itest-token";
+        format!(
+            "set -e; \
+             LOG=/tmp/vscode-connect-loopback.log; \
+             rm -f \"$LOG\"; \
+             nohup env VSCODE_CLI_REQUIRE_TOKEN={token} \
+                {cli_q} command-shell \
+                --cli-data-dir /tmp/vscode-cli-data \
+                --parent-process-id 1 \
+                --on-host=127.0.0.1 --on-port=0 \
+                > \"$LOG\" 2>&1 < /dev/null & \
+             CLI_PID=$!; \
+             disown $CLI_PID 2>/dev/null || true; \
+             echo VSL_CLI_PID=$CLI_PID; \
+             PORT=; \
+             for _ in $(seq 1 {poll_secs}); do \
+                LISTEN_LINE=$(grep -aE 'Listening on .+' \"$LOG\" 2>/dev/null | head -1); \
+                if [ -n \"$LISTEN_LINE\" ]; then \
+                    PORT=$(echo \"$LISTEN_LINE\" | sed -nE 's/.*:([0-9]+).*/\\1/p'); \
+                    if [ -n \"$PORT\" ]; then \
+                        echo VSL_PORT=$PORT; \
+                        break; \
+                    fi; \
+                fi; \
+                if ! kill -0 $CLI_PID 2>/dev/null; then \
+                    echo VSL_CLI_DIED; \
+                    cat \"$LOG\"; \
+                    exit 1; \
+                fi; \
+                sleep 1; \
+             done; \
+             if [ -z \"$PORT\" ]; then \
+                echo VSL_NO_PORT; \
+                cat \"$LOG\"; \
+                exit 1; \
+             fi; \
+             if timeout 3 bash -c \"exec 3<>/dev/tcp/127.0.0.1/$PORT\" 2>&1; then \
+                echo VSL_CONN_OK; \
+                exit 0; \
+             else \
+                echo VSL_CONN_FAIL exit=$?; \
+                cat \"$LOG\"; \
+                exit 1; \
+             fi"
+        )
     }
 }
 
