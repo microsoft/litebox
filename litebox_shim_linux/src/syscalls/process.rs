@@ -2140,31 +2140,58 @@ impl<FS: ShimFS> Task<FS> {
         // requested for this thread). This prevents concurrent fork/clone
         // operations from bypassing parking invariants.
         //
-        // If another fork/vfork is in progress, briefly wait for it to
-        // complete instead of returning EAGAIN immediately. This avoids
-        // spurious failures when the guest issues two forks in quick
-        // succession (e.g. a shell spawning a pipeline).
+        // If another fork/vfork is in progress, **inline-park** here so
+        // the active forker can count us toward its `parked_count` target
+        // and proceed. A passive wait that does NOT increment
+        // `parked_count` would deadlock: the active forker's
+        // `park_other_threads` wait loop requires `parked_count ==
+        // threads.len() - 1`, and a thread blocked here without
+        // counting is invisible to that wait.
+        //
+        // This matters for `PROMOTION_RACE.concurrent_fork`: three
+        // sibling threads race the fork-gate. The first wins; the
+        // others must wait *and count*. Both "park atomic non-zero"
+        // (the fork is in its parking phase) and "is_suspended set"
+        // (the fork has marked us via `park_other_threads`) signal
+        // we should wait — we loop until *both* are clear, which
+        // mirrors the order `unpark_other_threads` releases them
+        // (clears `is_suspended` first, then `park`).
+        //
+        // We do not inline-park when `nested_delayed_fork` is set:
+        // we are already inside a delayed-fork commit and must
+        // proceed without re-entering the gate.
         {
+            use litebox::platform::RawMutex as _;
             let ps = self.process_state.borrow();
-            if self.is_suspended() {
-                return Err(Errno::EAGAIN);
-            }
             let parking_atomic = ps.vfork_parking.park.underlying_atomic();
             let nested_delayed_fork = self.fork_context.borrow().is_some();
-            if parking_atomic.load(Ordering::Acquire) != 0 && !nested_delayed_fork {
-                // Wait up to ~500 ms for the ongoing fork to finish.
-                for _ in 0..100 {
-                    let v = parking_atomic.load(Ordering::Acquire);
-                    if v == 0 {
+            if !nested_delayed_fork {
+                loop {
+                    let suspended = self.is_suspended();
+                    let park_v = parking_atomic.load(Ordering::Acquire);
+                    if !suspended && park_v == 0 {
                         break;
                     }
-                    let _ = ps
-                        .vfork_parking
-                        .park
-                        .block_or_timeout(v, core::time::Duration::from_millis(5));
-                }
-                if parking_atomic.load(Ordering::Acquire) != 0 {
-                    return Err(Errno::EAGAIN);
+                    if self.is_exiting() {
+                        return Err(Errno::EINTR);
+                    }
+                    // Count ourselves as parked so the active forker
+                    // can satisfy its `parked_count == expected` wait
+                    // and proceed.
+                    ps.vfork_parking
+                        .parked_count
+                        .underlying_atomic()
+                        .fetch_add(1, Ordering::Release);
+                    ps.vfork_parking.parked_count.wake_all();
+                    let v = parking_atomic.load(Ordering::Acquire);
+                    if v != 0 {
+                        let _ = ps.vfork_parking.park.block(v);
+                    }
+                    ps.vfork_parking
+                        .parked_count
+                        .underlying_atomic()
+                        .fetch_sub(1, Ordering::Release);
+                    ps.vfork_parking.parked_count.wake_all();
                 }
             }
         }
@@ -7033,11 +7060,24 @@ impl<FS: ShimFS> Task<FS> {
     /// reach the park check in `prepare_to_run_guest`. Waits until all
     /// have confirmed they are parked (via `vfork_parked_count`).
     ///
+    /// **Fork serialization**: if another fork is already in progress
+    /// (`is_forking == true`), the calling thread parks itself on the
+    /// shared `park` futex so the active forker can count it toward
+    /// `parked_count` and proceed. When the active forker unparks,
+    /// the calling thread retries claiming the gate. This avoids the
+    /// race where two sibling threads racing `fork()` both pass the
+    /// `do_clone3` pre-check (which only inspects the `park` atomic,
+    /// not `is_forking`) and one of them then sees `is_forking == true`
+    /// inside this function — the previous Err(EAGAIN) behaviour
+    /// surfaced as a spurious fork failure to the guest.
+    ///
     /// Returns:
     /// - `Ok(true)` if threads were parked (and must be unparked later).
     /// - `Ok(false)` if there were no other threads to park.
-    /// - `Err(())` if another thread is already forking (caller should
-    ///   return EAGAIN).
+    /// - `Err(())` if the gate could not be claimed within a bounded
+    ///   number of retries (caller returns EAGAIN). This is now a
+    ///   genuinely exceptional path; in normal operation the inline
+    ///   parking loop completes within one or two iterations.
     fn park_other_threads(&self) -> Result<bool, ()> {
         use litebox::platform::RawMutex as _;
 
@@ -7047,62 +7087,120 @@ impl<FS: ShimFS> Task<FS> {
         // under the process lock. This avoids using the separate
         // ProcessState::thread_count which may not be decremented on exit.
         let expected;
-        {
-            let mut inner = self.thread.process.inner.lock();
 
-            // Prevent two threads from simultaneously entering park.
-            // The first thread to acquire the lock sets is_forking; the
-            // second sees it and bails out, returning false so the caller
-            // gets EAGAIN and retries after the first fork completes.
-            if inner.is_forking {
+        // Bounded retry loop. Each iteration either claims the gate
+        // (and breaks out to the parking-confirm wait below) or parks
+        // the calling thread inline until the active forker finishes.
+        // The bound matches the do_clone3 pre-check (~500ms total wait
+        // budget): 100 retries × ≤5ms per inline-park wake.
+        const MAX_GATE_RETRIES: usize = 100;
+        let mut retries = 0usize;
+        loop {
+            {
+                let mut inner = self.thread.process.inner.lock();
+
+                if !inner.is_forking {
+                    expected = u32::try_from(
+                        inner
+                            .threads
+                            .len()
+                            .checked_sub(1)
+                            .expect("calling thread must be in the map"),
+                    )
+                    .expect("thread count must fit in u32");
+                    if expected == 0 {
+                        return Ok(false);
+                    }
+
+                    inner.is_forking = true;
+
+                    // Set per-thread is_suspended flag under the lock.
+                    for (&tid, thread) in &inner.threads {
+                        if tid != self.tid {
+                            thread.is_suspended.store(true, Ordering::Relaxed);
+                        }
+                    }
+
+                    // Set the process-wide park futex AFTER the per-thread flags.
+                    // This ensures that a thread loading vfork_park with Acquire
+                    // also observes the is_suspended store (Release pairs with
+                    // the Acquire load in park_for_vfork_if_requested).
+                    ps.vfork_parking
+                        .park
+                        .underlying_atomic()
+                        .store(1, Ordering::Release);
+
+                    // Signal the transport to break out of spin loops.
+                    self.global
+                        .transport_interrupt
+                        .store(true, Ordering::Release);
+
+                    // Wake threads blocked in raw futex waits (e.g., wait_for_child)
+                    // so they see is_suspended when they re-check.
+                    self.global
+                        .litebox
+                        .process_registry()
+                        .notify_waiters(self.process_id);
+                    for (&tid, thread) in &inner.threads {
+                        if tid != self.tid {
+                            thread.interrupt();
+                        }
+                    }
+
+                    break;
+                }
+
+                // Another fork is in progress. Drop the lock and park
+                // ourselves so the active forker can count us toward
+                // its parked_count target and proceed.
+            }
+
+            if retries >= MAX_GATE_RETRIES {
                 return Err(());
             }
+            retries += 1;
 
-            expected = u32::try_from(
-                inner
-                    .threads
-                    .len()
-                    .checked_sub(1)
-                    .expect("calling thread must be in the map"),
-            )
-            .expect("thread count must fit in u32");
-            if expected == 0 {
-                return Ok(false);
-            }
-
-            inner.is_forking = true;
-
-            // Set per-thread is_suspended flag under the lock.
-            for (&tid, thread) in &inner.threads {
-                if tid != self.tid {
-                    thread.is_suspended.store(true, Ordering::Relaxed);
-                }
-            }
-
-            // Set the process-wide park futex AFTER the per-thread flags.
-            // This ensures that a thread loading vfork_park with Acquire
-            // also observes the is_suspended store (Release pairs with
-            // the Acquire load in park_for_vfork_if_requested).
-            ps.vfork_parking
+            // Two sub-cases:
+            //   (a) park == 1: active forker is in its parking phase.
+            //       We mirror park_for_vfork_if_requested's bookkeeping
+            //       (parked_count fetch_add, block on park, fetch_sub).
+            //   (b) park == 0: window between active forker's `park=0`
+            //       and its `is_forking=false`. We block briefly on
+            //       park to wait for the trailing wake_all that
+            //       unpark_other_threads issues after clearing
+            //       is_forking.
+            let park_v = ps
+                .vfork_parking
                 .park
                 .underlying_atomic()
-                .store(1, Ordering::Release);
-
-            // Signal the transport to break out of spin loops.
-            self.global
-                .transport_interrupt
-                .store(true, Ordering::Release);
-
-            // Wake threads blocked in raw futex waits (e.g., wait_for_child)
-            // so they see is_suspended when they re-check.
-            self.global
-                .litebox
-                .process_registry()
-                .notify_waiters(self.process_id);
-            for (&tid, thread) in &inner.threads {
-                if tid != self.tid {
-                    thread.interrupt();
+                .load(Ordering::Acquire);
+            if park_v != 0 {
+                ps.vfork_parking
+                    .parked_count
+                    .underlying_atomic()
+                    .fetch_add(1, Ordering::Release);
+                ps.vfork_parking.parked_count.wake_all();
+                loop {
+                    let v = ps
+                        .vfork_parking
+                        .park
+                        .underlying_atomic()
+                        .load(Ordering::Acquire);
+                    if v == 0 || self.is_exiting() {
+                        break;
+                    }
+                    let _ = ps.vfork_parking.park.block(v);
                 }
+                ps.vfork_parking
+                    .parked_count
+                    .underlying_atomic()
+                    .fetch_sub(1, Ordering::Release);
+                ps.vfork_parking.parked_count.wake_all();
+            } else {
+                let _ = ps
+                    .vfork_parking
+                    .park
+                    .block_or_timeout(0, core::time::Duration::from_millis(5));
             }
         }
 
@@ -7211,6 +7309,14 @@ impl<FS: ShimFS> Task<FS> {
             let mut inner = self.thread.process.inner.lock();
             inner.is_forking = false;
         }
+
+        // Wake any sibling-fork waiters parked inside `park_other_threads`.
+        // They block on `park` (value 0) during the brief window between
+        // the `park=0` store above and the `is_forking=false` flip just
+        // performed; without this trailing wake they would only re-check
+        // on their next timeout tick. The wake is a no-op when no such
+        // waiters exist (the common single-forker case).
+        ps.vfork_parking.park.wake_all();
     }
 
     fn install_d5_mux_master_pty_fd(
