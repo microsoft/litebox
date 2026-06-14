@@ -3936,6 +3936,36 @@ impl<FS: ShimFS> Task<FS> {
             // Argument-aware: prctl — only allow SET_PDEATHSIG and SET_NAME.
             // PR_SET_PDEATHSIG=1, PR_SET_NAME=15
             Some(Sysno::prctl) => matches!(ctx.rdi, 1 | 15),
+            // Argument-aware: futex — only allow non-blocking WAKE-flavoured
+            // operations. After fork, glibc's `__libc_fork` epilogue releases
+            // its internal pthread atfork mutex via
+            // `futex(FUTEX_WAKE_PRIVATE, 1)` (op=0x81). Without this allowlist
+            // every static-PIE-glibc fork-child traps into
+            // `commit_delayed_fork`, which (for tests that hold a CLOEXEC
+            // epoll fd — e.g. the tokio runtime in the test harness) then
+            // rejects and falls back to vfork shared-AS anyway. The wasted
+            // snapshot_fd_table + snapshot_memory work per fork blows the
+            // `PROMOTION_RACE.concurrent_fork.{eventfd,signalfd}.spg`
+            // 15s send_cmd budget. Dynamic-PIE-glibc emits no futex post-fork
+            // (its atfork lock release inlines as an atomic store), so this
+            // gate only affects static-glibc binaries.
+            //
+            // Operation nibble (rsi & FUTEX_CMD_MASK = 0x7f) we accept:
+            //   FUTEX_WAKE          = 1
+            //   FUTEX_REQUEUE       = 3
+            //   FUTEX_CMP_REQUEUE   = 4
+            //   FUTEX_WAKE_OP       = 5
+            //   FUTEX_UNLOCK_PI     = 7
+            //   FUTEX_WAKE_BITSET   = 10
+            // All are non-blocking releases that cannot stall the vfork
+            // parent. Blocking ops (FUTEX_WAIT, FUTEX_WAIT_BITSET,
+            // FUTEX_LOCK_PI, FUTEX_TRYLOCK_PI) deliberately remain off the
+            // list — letting them run pre-exec would let a fork-child wait
+            // for a wake-up the parked vfork parent cannot deliver.
+            Some(Sysno::futex) => {
+                let op = (ctx.rsi as u32) & 0x7f;
+                matches!(op, 1 | 3 | 4 | 5 | 7 | 10)
+            }
             // Any unrecognized or non-allowlisted syscall triggers a delayed fork.
             _ => false,
         }
@@ -6223,6 +6253,8 @@ mod tests {
         assert_rejected(Sysno::accept);
         assert_rejected(Sysno::wait4);
         assert_rejected(Sysno::kill);
+        // Default arg (FUTEX_WAIT=0) — still rejected. WAKE-only ops are
+        // covered by `pre_exec_syscall_futex_allows_wake_ops` below.
         assert_rejected(Sysno::futex);
     }
 
@@ -6276,6 +6308,49 @@ mod tests {
                 !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
                 "prctl op={op} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_futex_allows_wake_ops() {
+        use ::syscalls::Sysno;
+        // Glibc's `__libc_fork` epilogue invokes
+        // `futex(FUTEX_WAKE_PRIVATE, 1)` (op = 0x81) to release its
+        // pthread atfork mutex. Without this allowlist, every
+        // static-PIE-glibc fork-child trips into commit_delayed_fork
+        // and pays the snapshot+reject cost on each PROMOTION_RACE
+        // iteration. Cover both the bare and PRIVATE-flagged
+        // variants of every WAKE-flavoured op (per FUTEX_CMD_MASK).
+        for op in [1u32, 3, 4, 5, 7, 10] {
+            for &priv_flag in &[0u32, 0x80] {
+                let raw = (op | priv_flag) as usize;
+                let ctx = make_syscall_ctx(Sysno::futex as usize, 0, raw);
+                assert!(
+                    Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+                    "futex op=0x{raw:x} should be allowed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_futex_rejects_blocking_ops() {
+        use ::syscalls::Sysno;
+        // FUTEX_WAIT=0, FUTEX_FD=2, FUTEX_LOCK_PI=6, FUTEX_TRYLOCK_PI=8,
+        // FUTEX_WAIT_BITSET=9. Blocking ops must remain off the
+        // allowlist: a fork-child waiting for a wake-up the parked vfork
+        // parent cannot deliver would deadlock the test process.
+        for op in [0u32, 2, 6, 8, 9] {
+            for &priv_flag in &[0u32, 0x80] {
+                let raw = (op | priv_flag) as usize;
+                let ctx = make_syscall_ctx(Sysno::futex as usize, 0, raw);
+                assert!(
+                    !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+                    "futex op=0x{raw:x} should be rejected"
+                );
+            }
         }
     }
 }
