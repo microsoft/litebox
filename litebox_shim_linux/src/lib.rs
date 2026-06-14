@@ -3843,7 +3843,7 @@ impl<FS: ShimFS> Task<FS> {
     fn is_pre_exec_syscall_for_task(&self, ctx: &litebox_common_linux::ExecutionContext) -> bool {
         use ::syscalls::Sysno;
 
-        let socketpair_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read)) && {
+        let parent_synchronizing_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read)) && {
             let files = self.files.borrow();
             let rds = files.raw_descriptor_store.read();
             rds.fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
@@ -3853,22 +3853,32 @@ impl<FS: ShimFS> Task<FS> {
                         ctx.rdi,
                     )
                     .is_ok()
+                || rds
+                    .fd_from_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(ctx.rdi)
+                    .is_ok()
         };
-        Self::is_pre_exec_syscall_impl(ctx, socketpair_read)
+        Self::is_pre_exec_syscall_impl(ctx, parent_synchronizing_read)
     }
 
     fn is_pre_exec_syscall_impl(
         ctx: &litebox_common_linux::ExecutionContext,
-        unix_socket_read: bool,
+        parent_synchronizing_read: bool,
     ) -> bool {
         use ::syscalls::Sysno;
 
         let nr = ctx.orig_rax;
 
-        // A blocking read from an inherited Unix socket is real post-fork work,
-        // not fork/exec bookkeeping.  Let delayed-fork migration run first so
-        // the parent can resume and communicate with the child.
-        if unix_socket_read {
+        // A blocking read from an inherited Unix socket, broker socketpair, or
+        // broker pipe is real post-fork work, not fork/exec bookkeeping.  In
+        // particular, bash's `make_child()` creates a sync pipe before fork,
+        // then has the child `read(pipe_read_end, 1)` while the parent writes
+        // the sync byte once it has set the child's process group.  Under
+        // litebox the fork is rewritten to vfork + delayed-fork; if read stayed
+        // in the pre-exec allowlist, the vfork-parked parent could never write
+        // the sync byte and the child would block forever.  Force delayed-fork
+        // migration in this case so the parent resumes and the synchronization
+        // can complete.
+        if parent_synchronizing_read {
             return false;
         }
 
