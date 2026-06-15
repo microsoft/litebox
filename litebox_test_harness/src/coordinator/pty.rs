@@ -1858,6 +1858,7 @@ pub(crate) fn register_pty_tests(reg: &mut Registry<'_>) {
     register_pty_stdio_lockstep(reg);
     register_parent_exit_then_child_io(reg);
     register_slave_write_after_master_close(reg);
+    register_pty_marker_latency_tests(reg);
 
     // TIOCGPTN-on-slave-must-return-ENOTTY probe. Single-agent
     // because the bug is in the shim's ioctl handler, not in any
@@ -2220,6 +2221,420 @@ fn errno_name(e: i32) -> &'static str {
         libc::ENOTTY => "ENOTTY",
         libc::EPERM => "EPERM",
         _ => "other",
+    }
+}
+
+/// PTYM.* — PTY marker-based command-completion-detection latency.
+///
+/// Reproduces the substrate divergence isolated by session
+/// `wave3-copilot-ctx-window` (see `docs/copilot-pty-marker-divergence.md`
+/// on the wave3 branch): GitHub Copilot CLI's persistent `node-pty`
+/// bash session uses the marker pattern
+///
+/// ```text
+/// write to PTY master:
+///     <command>\n
+///     echo ___DONE_MARKER_<exitcode>___\n
+/// read PTY master until "___DONE_MARKER_" substring appears
+/// ```
+///
+/// to know when each command finishes. Under copilot's wrapping,
+/// commands that complete in 30–900 ms when invoked directly (no PTY,
+/// no persistent session) routinely hang past `initial_wait=30 s` on
+/// litebox. The copilot stack adds many layers (Docker → dropbear →
+/// SSH → node-pty → bash); this family strips all of them away and
+/// keeps only PTY + interactive bash + marker detection so the
+/// divergence — if it's in those primitives — is bisectable.
+///
+/// # Diagnosed root cause (session `wportnoy/pty-marker-latency`)
+///
+/// **Under litebox, both `bash_interactive` and `bash_noediting`
+/// hang at the SETUP HANDSHAKE — bash never executes the first
+/// command.** This is a more fundamental failure than the original
+/// "marker arrives late" hypothesis, and it explains why copilot's
+/// marker DONE never appeared: bash never ran the command at all.
+///
+/// Audit-log analysis (`litebox_audit_query sql ... FROM syscalls
+/// WHERE exit_ts IS NULL`) shows the failure pattern is a deadlock
+/// between:
+///
+///   * The shim's syscall rewriter, which turns bash's `fork()`
+///     (`clone(SIGCHLD)`) into `clone(CLONE_VM | CLONE_VFORK)` —
+///     see `litebox_shim_linux/src/syscalls/process.rs:2586-2589`
+///     (`"every fork appears as vfork because the syscall rewriter
+///     adds CLONE_VM | CLONE_VFORK"`).
+///   * Bash's `PGRP_PIPE` job-control pre-exec synchronization
+///     (bash `jobs.c:2261-2264`): immediately after `fork()` the
+///     child closes the pipe's write end and `read(pp[0], &ch, 1)`
+///     to block until the parent has finished setting up
+///     `pipeline_pgrp` for every child. The parent later writes
+///     one byte to `pgrp_pipe[1]` to release the child.
+///
+/// Sequence captured in audit log:
+///   `seq=12221  pid=2 (bash)   pipe2(0)            → fd 3/4`
+///   `seq=12222  pid=2 (bash)   clone(0x4100=VFORK|VM)  ← never returns`
+///   `seq=12223  pid=3 (child)  getpid, sigaction, setpgid(3,3),`
+///   `             ioctl(255, TIOCSPGRP), close(3)`
+///   `seq=12233  pid=3 (child)  read(fd=4, 1)       ← never returns`
+///
+/// The parent is suspended in `VforkDone::is_done()`
+/// (`process.rs:3122-3137`) waiting for the child to `execve`
+/// or `exit`. The child is suspended in
+/// `pipe_read(pgrp_pipe)` waiting for the parent to write.
+/// Neither can make progress.
+///
+/// Why the existing `delayed-fork-commit` mechanism doesn't break
+/// the deadlock: `is_pre_exec_syscall_impl`
+/// (`litebox_shim_linux/src/lib.rs:3860-3942`) keeps `Sysno::read`
+/// in the pre-exec allowlist (it's required for nested
+/// `$(cmd)`). The `unix_socket_read` short-circuit at
+/// `lib.rs:3846-3873` forces a delayed-fork commit on blocking
+/// reads from Unix-domain sockets, but bash's `pgrp_pipe` is an
+/// ordinary `pipe2(2)`, so the short-circuit doesn't trigger.
+/// The child therefore stays parked on the vfork path, and the
+/// parent stays blocked in `wait_until(vd.is_done())`.
+///
+/// Bash uses `pgrp_pipe` only when **job control is enabled**, which
+/// is the default for interactive shells. Both `bash_interactive`
+/// and `bash_noediting` are interactive (no `-c`), so both trip
+/// the deadlock. A hypothetical `bash -c "<setup>"` variant would
+/// pass under litebox (no job control, no `pgrp_pipe`) — confirming
+/// the bug is in the interaction between vfork rewrite and
+/// `pgrp_pipe`, not in the PTY layer itself.
+///
+/// Fix proposal (NOT implemented in this session — owned by parent):
+/// extend the `is_pre_exec_syscall_for_task` deadlock-detection to
+/// commit the delayed fork on blocking reads from pipes whose
+/// write end is held by the (suspended) parent. The narrowest
+/// change is in `litebox_shim_linux/src/lib.rs:3846-3873`: add a
+/// `pipe_read_would_block` predicate alongside `unix_socket_read`.
+///
+/// # Test design
+///
+/// Two scenarios per family member:
+///
+///  - `echo_marker` — control: send `echo MARKER`. Must complete in
+///    a small fixed budget on both native and litebox. If this fails
+///    the test fixture itself is broken.
+///  - `find_root_home` — workload: send
+///    `find /root /home -type f 2>/dev/null | head -5`. The prior
+///    probe measured this at ~30 ms native direct, ~907 ms litebox
+///    direct, ~5.9 s litebox-through-`script`-PTY, and >30 s in
+///    copilot's persistent PTY session.
+///
+/// Two invocations per scenario:
+///
+///  - `bash_interactive` — `/bin/bash --noprofile --norc`
+///  - `bash_noediting`   — `/bin/bash --noprofile --norc --noediting`
+///
+/// Both scenarios reuse the SAME persistent bash session for two
+/// successive commands (`first`/`second`), to surface any per-session
+/// state-accrual effect (e.g., output-buffer growth, scrollback,
+/// signal-mask churn) that copilot's persistent-shell wrapper relies
+/// on but a one-shot `Pty::open(); fork; exec(bash -c ...)` test
+/// would miss.
+///
+/// Failure mode is `handshake: timed out after Ns waiting for "..."`
+/// when the deadlock fires (current litebox behaviour) and
+/// `{first,second}: elapsed=Nms over budget=Bms` when bash runs but
+/// the marker is slow (the originally-hypothesised mode — not
+/// reachable in litebox until the deadlock is fixed). The captured
+/// tail bytes go into the detail string so the next investigator can
+/// see exactly what bash echoed before the deadlock fired.
+fn register_pty_marker_latency_tests(reg: &mut Registry<'_>) {
+    // Scenarios are the cross product of:
+    //   - {echo_marker, find_root_home}   — control vs. workload
+    //   - {bash_interactive, bash_noediting}
+    //                                     — bash invocation mode
+    //
+    // Budget rationale:
+    //   - `echo_marker`: 500 ms — bash writes one line, no fork; on
+    //     either substrate this should be tens of ms. 500 ms picks up
+    //     a 10x regression but tolerates load on shared CI hosts.
+    //   - `find_root_home`: 3000 ms — direct litebox measured 907 ms
+    //     for this exact pipeline (prior probe). Under PTY-wrapped
+    //     `script -qc` it ballooned to 5941 ms. 3000 ms separates the
+    //     "direct-litebox" baseline (passing) from the "PTY-amplified"
+    //     failure mode (failing). Native consistently sub-100 ms.
+    //
+    // Invocation rationale:
+    //   - `bash_interactive`: `/bin/bash --noprofile --norc` — bash
+    //     enters interactive mode because isatty(stdin) is true. Uses
+    //     readline for input editing (bracketed paste, line redraw).
+    //     This is the EXACT pattern copilot CLI uses (node-pty spawns
+    //     `/bin/bash` with no flags; the PTY makes it interactive).
+    //   - `bash_noediting`: `/bin/bash --noprofile --norc --noediting`
+    //     — interactive bash WITHOUT readline. Reads input via simple
+    //     getc in canonical mode. Splits the variable space: if
+    //     `_interactive` fails and `_noediting` passes, the bug is in
+    //     readline's interaction with litebox PTY (likely a SIGWINCH,
+    //     terminal-control-sequence, or input-decoding path). If both
+    //     fail with the same shape, the bug is in master→slave input
+    //     delivery itself.
+    struct Scenario {
+        cmd_suffix: &'static str,
+        cmd: &'static str,
+        budget_ms: u128,
+    }
+    const SCENARIOS: &[Scenario] = &[
+        Scenario {
+            cmd_suffix: "echo_marker",
+            cmd: "echo hello-from-marker-probe",
+            budget_ms: 500,
+        },
+        Scenario {
+            cmd_suffix: "find_root_home",
+            cmd: "find /root /home -type f 2>/dev/null | head -5",
+            budget_ms: 3000,
+        },
+    ];
+
+    struct Invocation {
+        suffix: &'static str,
+        argv: &'static [&'static str],
+    }
+    const INVOCATIONS: &[Invocation] = &[
+        Invocation {
+            suffix: "bash_interactive",
+            argv: &["/bin/bash", "--noprofile", "--norc"],
+        },
+        Invocation {
+            suffix: "bash_noediting",
+            // `--noediting` disables readline entirely; bash reads via
+            // simple read(2) in canonical mode. Same interactive
+            // command-loop, but without the terminal-control noise
+            // readline emits. The litebox-vs-native delta isolates
+            // readline as a cause vs. effect of the divergence.
+            argv: &["/bin/bash", "--noprofile", "--norc", "--noediting"],
+        },
+    ];
+
+    for sc in SCENARIOS {
+        for inv in INVOCATIONS {
+            let test_id = format!("PTYM.{}.{}.dpg1", sc.cmd_suffix, inv.suffix);
+            let cmd: &'static str = sc.cmd;
+            let budget_ms: u128 = sc.budget_ms;
+            let argv: &'static [&'static str] = inv.argv;
+            reg.test("vscode", "pty", test_id)
+                .timeout(60)
+                .build(move |_cx| {
+                    Box::new(move |_run| {
+                        Box::pin(async move {
+                            let outcome = run_pty_marker_scenario(argv, cmd, budget_ms);
+                            match outcome {
+                                Ok(detail) => TestOutcome::new("dpg1", true, detail),
+                                Err(detail) => TestOutcome::new("dpg1", false, detail),
+                            }
+                        })
+                    })
+                });
+        }
+    }
+}
+
+/// Drives one PTYM scenario:
+///   1. open PTY pair, fork `/bin/bash --noprofile --norc` on slave;
+///   2. send a setup line that defines a bash variable
+///      `__MK='___PTYM_MARKER___'`, then disables echo + prompt,
+///      then prints `${__MK}READY` — read until that constructed
+///      string appears, proving bash is past startup AND echo is off
+///      AND the constructed marker is detectable;
+///   3. send `<cmd>; echo "${__MK}DONE_$?"` and measure wall time
+///      from the write to the appearance of `___PTYM_MARKER___DONE_`
+///      on master;
+///   4. repeat step 3 with the same persistent bash (`second`
+///      round) — this exposes per-session state-accrual effects
+///      copilot's wrapper relies on;
+///   5. tear down (write `exit\n`, reap).
+///
+/// Why the marker is constructed in-process rather than written
+/// verbatim: bash's PTY local echo (enabled by default until
+/// `stty -echo` takes effect) replays the typed command line back
+/// to the master before bash executes it. A literal marker string
+/// in the command line would appear in the echoed input AND in
+/// the command's output, and a naive `contains` check would match
+/// the echoed-input copy and report success before bash had
+/// actually run anything. By splitting the marker across two
+/// concatenated bash fragments (`"${__MK}"DONE_`), the joined
+/// string `___PTYM_MARKER___DONE_` only ever exists in bash's
+/// stdout, never in the typed input. See `pty_marker_round` for
+/// the exact construction.
+///
+/// Returns Ok(detail) with measured timings, or Err(detail) if any
+/// individual round overran `budget_ms`, the marker never appeared,
+/// or the captured output didn't contain the expected substring.
+fn run_pty_marker_scenario(
+    bash_argv: &[&str],
+    cmd: &'static str,
+    budget_ms: u128,
+) -> Result<String, String> {
+    let pty = Pty::open()?;
+    ensure_slave_path(&pty)?;
+    let owned_argv: Vec<String> = bash_argv.iter().map(|s| (*s).to_string()).collect();
+    let pid = pty.fork_exec(&owned_argv, true)?;
+    let mut bash_alive = true;
+
+    let result = (|| -> Result<String, String> {
+        // Step 1: ready handshake. Define the marker variable, turn
+        // off echo + prompt, emit the constructed `<MK>READY` token
+        // and wait for it. `<MK>READY` cannot appear in any echoed
+        // input — only in stdout — so the wait is unambiguous.
+        //
+        // 30 s handshake budget is intentionally large: under the
+        // copilot persistent-PTY repro the bash setup line itself
+        // takes >30 s to be echoed back, and the natural failure
+        // mode is "marker never appears." A short budget would
+        // confound "bash never executed the setup" with "bash is
+        // slow" — we want the former to be observable as a clean
+        // FAIL with the full captured buffer in the detail string.
+        let setup_line = "__MK='___PTYM_MARKER___'; stty -echo; PS1=''; echo \"${__MK}READY\"\n";
+        pty.write_all(setup_line.as_bytes())?;
+        read_until_with_timeout(&pty, "___PTYM_MARKER___READY", Duration::from_secs(30))
+            .map_err(|e| format!("handshake: {e}"))?;
+
+        // Step 2 + 3: timed round-trip, twice on the same bash.
+        let first = pty_marker_round(&pty, "first", cmd, budget_ms)?;
+        let second = pty_marker_round(&pty, "second", cmd, budget_ms)?;
+
+        Ok(format!("first={first} second={second}"))
+    })();
+
+    // Tear down: ask bash to exit cleanly, then reap. Best-effort —
+    // a measurement failure shouldn't be masked by a teardown error.
+    let _ = pty.write_all(b"exit\n");
+    let reaped = wait_child_timeout(pid, Duration::from_secs(5));
+    if reaped.is_ok() {
+        bash_alive = false;
+    }
+    if bash_alive {
+        // SAFETY: pid was returned by fork in this process; SIGKILL+reap is safe.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &raw mut status, 0);
+        }
+    }
+
+    result
+}
+
+/// One round of "write command + marker; read until marker" with a
+/// per-round budget. Returns a string like `cmd_ok elapsed=42ms` on
+/// success or an error detail with the actual measurement on
+/// failure.
+fn pty_marker_round(pty: &Pty, label: &str, cmd: &str, budget_ms: u128) -> Result<String, String> {
+    // `<cmd>; echo "${__MK}DONE_<label>_$?"` — the joined string
+    // `___PTYM_MARKER___DONE_<label>_<exit>` only exists in the
+    // command's stdout, never in the typed input that bash echoes.
+    // The `<label>` keeps the first and second rounds distinguishable
+    // even if both ran the same command.
+    let done_search = format!("___PTYM_MARKER___DONE_{label}_");
+    let line = format!("{cmd}; echo \"${{__MK}}DONE_{label}_$?\"\n");
+
+    let start = std::time::Instant::now();
+    pty.write_all(line.as_bytes())?;
+    let captured = read_until_with_timeout(
+        pty,
+        &done_search,
+        Duration::from_millis(u64::try_from(budget_ms.saturating_mul(2)).unwrap_or(u64::MAX)),
+    )?;
+    let elapsed_ms = start.elapsed().as_millis();
+
+    if elapsed_ms > budget_ms {
+        return Err(format!(
+            "{label}: elapsed={elapsed_ms}ms over budget={budget_ms}ms; cmd={cmd:?}; \
+             captured_bytes={}; tail={:?}",
+            captured.len(),
+            // Tail is the last 200 chars — enough to see the marker
+            // line plus a few of the command's output lines without
+            // dumping kilobytes into the test report.
+            tail_chars(&captured, 200),
+        ));
+    }
+
+    Ok(format!(
+        "ok elapsed={elapsed_ms}ms bytes={}",
+        captured.len()
+    ))
+}
+
+/// Drain the PTY master incrementally until `marker` appears or
+/// `timeout` expires. Uses non-blocking `poll`+`try_read_now` for
+/// efficient byte arrival, unlike the blocking `read_until` helper
+/// (which reads byte-by-byte and hard-codes a 10 s deadline).
+///
+/// This shape matters for the PTYM measurement: we need
+/// millisecond-resolution timing to distinguish a fast successful
+/// round (~30 ms) from the budget-overrun failure mode (>500 ms or
+/// >3000 ms depending on scenario). A byte-per-syscall reader would
+/// itself consume measurement headroom on multi-KB outputs like
+/// `find /root /home`.
+fn read_until_with_timeout(pty: &Pty, marker: &str, timeout: Duration) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut data = String::new();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "timed out after {:?} waiting for {marker:?}; got {} bytes; tail={:?}",
+                timeout,
+                data.len(),
+                tail_chars(&data, 200),
+            ));
+        }
+        let remaining = deadline - now;
+        let timeout_ms = i32::try_from(remaining.as_millis().min(1_000)).unwrap_or(1_000);
+        let revents = pty.poll_now_timeout(libc::POLLIN | libc::POLLHUP, timeout_ms)?;
+        if revents & libc::POLLIN != 0 {
+            // Drain everything currently available without re-polling
+            // between reads. Each `try_read_now` is a single
+            // non-blocking `read(2)`; loop until EAGAIN.
+            loop {
+                let Some(bytes) = pty.try_read_now(4096)? else {
+                    break;
+                };
+                if bytes.is_empty() {
+                    // EOF on the master — bash exited unexpectedly.
+                    return Err(format!(
+                        "PTY read returned EOF before marker {marker:?}; got {} bytes; tail={:?}",
+                        data.len(),
+                        tail_chars(&data, 200),
+                    ));
+                }
+                data.push_str(&String::from_utf8_lossy(&bytes));
+                if data.contains(marker) {
+                    return Ok(data);
+                }
+            }
+        }
+        if revents & libc::POLLHUP != 0 && !data.contains(marker) {
+            // HUP without POLLIN: bash closed slave without flushing
+            // marker. Drain once more in case data was queued, then
+            // fail.
+            while let Some(bytes) = pty.try_read_now(4096)? {
+                if bytes.is_empty() {
+                    break;
+                }
+                data.push_str(&String::from_utf8_lossy(&bytes));
+                if data.contains(marker) {
+                    return Ok(data);
+                }
+            }
+            return Err(format!(
+                "PTY POLLHUP before marker {marker:?}; got {} bytes; tail={:?}",
+                data.len(),
+                tail_chars(&data, 200),
+            ));
+        }
+    }
+}
+
+fn tail_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let start = s.char_indices().nth_back(n - 1).map_or(0, |(i, _)| i);
+        s[start..].to_string()
     }
 }
 

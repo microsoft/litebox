@@ -201,3 +201,8 @@ litebox_tool_executor/rootfs/litebox_syscall_rewriter
 # Test-result dashboard store (sqlite + rendered markdown + CI logs).
 # See litebox_test_harness/scripts/dashboard.py.
 /.dashboard/
+
+# pty-marker investigation artifacts (local only, do not commit)
+/_investigation/
+/audit-out/
+/docs/copilot-pty-marker-divergence.md
