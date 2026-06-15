@@ -59,8 +59,25 @@ Then once VS Code is open:
    `127.0.0.1:2222`, and for the recommended VS Code profile
    settings.)
 
+   On the **first** connect VS Code will prompt for a password —
+   just press **Enter** (the demo's dropbear runs with `-B` for
+   blank-password root). With `remote.SSH.showLoginTerminal: true`
+   in your user settings, the prompt surfaces in a terminal you
+   can interact with; otherwise the prompt appears in the
+   notification area at the top of the window.
+
 That second window's editor, terminal, and extensions all execute
 **inside** the sandbox.
+
+### Windows + WSL2 path note
+
+On Windows + WSL2, VS Code on Windows uses **Windows OpenSSH**,
+not WSL's ssh. So the ssh-config file Remote-SSH actually reads
+is `%USERPROFILE%\.ssh\config` (= `/mnt/c/Users/<USER>/.ssh/config`
+from WSL), and `UserKnownHostsFile` in that file must be `NUL`
+(not `/dev/null`). The demo workspace is opened from WSL via
+`code .`, but the SSH config it uses to connect lives on the
+Windows side.
 
 ## Single demo at a time
 

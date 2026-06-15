@@ -36,8 +36,15 @@
     // in your "LiteBox" profile's user settings.json, not here):
     //
     //   "remote.SSH.showLoginTerminal": true,
-    //   "remote.SSH.remotePlatform": { "litebox": "linux" },
-    //   "remote.SSH.enableReconnection": false
+    //   "remote.SSH.remotePlatform": { "litebox": "linux" }
+    //
+    // (Don't add `remote.SSH.enableReconnection: false` — it's
+    // deprecated and ignored by current Remote-SSH; VS Code shows
+    // it as grayed-out unknown. The "fail fast when the demo
+    // container stops" behavior is bounded by the
+    // ConnectionAttempts 1 + ServerAliveCountMax 1 in the
+    // ~/.ssh/config block below, which clamps the underlying ssh
+    // client's reconnect window.)
     //
     // And in ~/.ssh/config:
     //
@@ -45,10 +52,18 @@
     //     HostName 127.0.0.1
     //     Port 2222
     //     User root
+    //     PreferredAuthentications password
+    //     PubkeyAuthentication no
+    //     NumberOfPasswordPrompts 1
+    //     StrictHostKeyChecking no
+    //     UserKnownHostsFile /dev/null  ; on Windows: NUL
     //     ConnectionAttempts 1
     //     ServerAliveCountMax 1
-    //     StrictHostKeyChecking no
-    //     UserKnownHostsFile /dev/null
+    //
+    // (On Windows + WSL2, the file Remote-SSH actually reads is
+    // %USERPROFILE%\.ssh\config — VS Code on Windows uses Windows
+    // OpenSSH, not WSL's ssh. UserKnownHostsFile must be `NUL`
+    // there, not `/dev/null`.)
     //
     // ============================================================
     // For repeatable automated validation (no human in the loop)
