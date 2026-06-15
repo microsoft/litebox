@@ -31,6 +31,36 @@
     // ports — out of scope for the hand-driven Remote-SSH
     // workflow where you only attach one VS Code window at a
     // time anyway).
+    //
+    // VS Code Server hostname `--add-host` workaround: the
+    // litebox broker's DNS proxy in
+    // `litebox_broker/src/cwfd/inet_dgram_state.rs::forward_dns_query`
+    // intermittently drops responses for CNAME-heavy /
+    // Azure-traffic-manager-fronted hostnames (likely an issue
+    // with UDP-truncation TCP-fallback handling — large
+    // responses get truncated and the resolver retries via TCP,
+    // which the proxy's per-query thread doesn't currently
+    // forward). Simple A-record hostnames (github.com,
+    // example.com) resolve fine. The `--add-host` entries below
+    // hard-code IPv4 addresses for the hostnames the VS Code
+    // Server / CLI hit at startup, bypassing DNS for them
+    // entirely. IPs are correct as of the 2026-06-15 timing of
+    // this commit; they may drift over time but Azure / Microsoft
+    // edge IPs are relatively stable across years. If a future
+    // VS Code update adds a new required hostname not in this
+    // list and you see "Opening Remote..." hang in VS Code,
+    // refresh the IPs via:
+    //
+    //   for h in update.code.visualstudio.com \
+    //            vscode.download.prss.microsoft.com \
+    //            marketplace.visualstudio.com \
+    //            vscode-sync.trafficmanager.net \
+    //            default.exp-tas.com \
+    //            global.rel.tunnels.api.visualstudio.com; do
+    //     printf "%-55s %s\n" "$h" \
+    //       "$(getent ahostsv4 $h 2>/dev/null | head -1 | awk '{print $1}')"
+    //   done
+    //
     // ────────────────────────────────────────────────────────────
     "version": "2.0.0",
     "tasks": [
@@ -85,7 +115,7 @@
         {
             "label": "LiteBox: Start VS Code Server",
             "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
+            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE --add-host update.code.visualstudio.com:13.107.226.70 --add-host vscode.download.prss.microsoft.com:151.101.22.172 --add-host marketplace.visualstudio.com:150.171.74.16 --add-host vscode-sync.trafficmanager.net:13.66.138.105 --add-host default.exp-tas.com:13.107.5.93 --add-host global.rel.tunnels.api.visualstudio.com:20.69.79.91 -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
@@ -98,7 +128,7 @@
         {
             "label": "LiteBox: Start VS Code Server (Debug)",
             "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug 9999",
+            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE --add-host update.code.visualstudio.com:13.107.226.70 --add-host vscode.download.prss.microsoft.com:151.101.22.172 --add-host marketplace.visualstudio.com:150.171.74.16 --add-host vscode-sync.trafficmanager.net:13.66.138.105 --add-host default.exp-tas.com:13.107.5.93 --add-host global.rel.tunnels.api.visualstudio.com:20.69.79.91 -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug 9999",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
