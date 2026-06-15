@@ -275,7 +275,7 @@ def main():
     print(f"🔒 Lock Viewer starting on http://localhost:{args.port}")
     print(f"   Reading events from: {args.file}")
 
-    app.run(host="0.0.0.0", port=args.port, debug=True)
+    app.run(host="127.0.0.1", port=args.port, debug=False)
 
 
 if __name__ == "__main__":
