@@ -167,7 +167,10 @@ fn sanitize_for_user_return(ctx: &mut litebox_common_linux::PtRegs) -> bool {
     if !has_lvbs_user_return_addresses(ctx) {
         return false;
     }
-    ctx.sanitize_for_user_return()
+    if !ctx.sanitize_for_user_return() {
+        return false;
+    }
+    true
 }
 
 /// Manages base and task page tables.

@@ -3144,6 +3144,8 @@ pub const EFLAGS_DF: usize = 0x400;
 #[cfg(target_arch = "x86_64")]
 mod arch {
     pub const USER_ADDR_END: usize = 0x0000_8000_0000_0000;
+    pub const USER_CS: usize = 0x33;
+    pub const USER_DS: usize = 0x2b;
     pub const EFLAGS_CF: usize = 1 << 0;
     pub const EFLAGS_FIXED: usize = 1 << 1;
     pub const EFLAGS_PF: usize = 1 << 2;
@@ -3176,11 +3178,12 @@ impl PtRegs {
         self.rip < arch::USER_ADDR_END && self.rsp < arch::USER_ADDR_END
     }
 
-    /// Sanitizes CPU state before returning to user mode.
+    /// Sanitizes CPU state and normalizes the context to the x86_64 Linux user ABI.
     ///
     /// Returns `false` if `rip` or `rsp` are not low-canonical user addresses.
     /// On success, privileged or unsafe RFLAGS bits are cleared, the fixed
-    /// RFLAGS bit is set, and interrupts are enabled.
+    /// RFLAGS bit is set, interrupts are enabled, and the user CS/SS selectors
+    /// are set to the x86_64 Linux ABI values.
     #[cfg(target_arch = "x86_64")]
     #[must_use]
     pub fn sanitize_for_user_return(&mut self) -> bool {
@@ -3188,6 +3191,8 @@ impl PtRegs {
             return false;
         }
         self.eflags = (self.eflags & arch::SAFE_USER_EFLAGS) | arch::EFLAGS_FIXED | arch::EFLAGS_IF;
+        self.cs = arch::USER_CS;
+        self.ss = arch::USER_DS;
         true
     }
 
