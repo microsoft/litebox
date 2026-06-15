@@ -1019,3 +1019,32 @@ fn hook_syscall_and_after(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn decodes_instruction_crossing_4g_host_boundary() {
+        let mut code = vec![0u8; (1usize << 32) + CHUNK_OVERLAP_LEN + MAX_X86_INSTRUCTION_LEN];
+        let base_addr = code.as_mut_ptr() as usize;
+        let boundary_addr =
+            (base_addr + CHUNK_OVERLAP_LEN + ((1usize << 32) - 1)) & !((1usize << 32) - 1);
+        let section_offset = boundary_addr - CHUNK_OVERLAP_LEN - base_addr;
+        let section_len = MAX_X86_INSTRUCTION_LEN + CHUNK_OVERLAP_LEN;
+        let section = &mut code[section_offset..section_offset + section_len];
+        section.fill(0x90);
+
+        // 15-byte NOP. The final byte lands after the 4GiB boundary, reproducing
+        // the iced-x86 pointer-wrap panic that the decoder workaround avoids.
+        section[..MAX_X86_INSTRUCTION_LEN].copy_from_slice(&[
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00,
+            0x00,
+        ]);
+
+        let instructions = decode_section_instructions(Arch::X86_64, section, 0x1000).unwrap();
+
+        assert_eq!(instructions[0].len(), MAX_X86_INSTRUCTION_LEN);
+    }
+}
