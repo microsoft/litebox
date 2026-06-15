@@ -819,32 +819,94 @@ fn decode_section_instructions(
         let chunk_start_ip = section_base_addr + offset as u64;
         let chunk_end_ip = chunk_start_ip + chunk_advance_len as u64;
 
-        let mut decoder = iced_x86::Decoder::new(
+        append_decoded_instructions(
             bitness,
             &remaining[..decode_window_len],
-            iced_x86::DecoderOptions::NONE,
-        );
-        decoder.set_ip(chunk_start_ip);
-
-        for inst in &mut decoder {
-            if inst.len() == 0 {
-                return Err(Error::DisassemblyFailure(format!(
-                    "iced-x86 decoded zero-length instruction at {:#x}",
-                    inst.ip()
-                )));
-            }
-
-            if inst.ip() >= chunk_end_ip {
-                break;
-            }
-
-            instructions.push(inst);
-        }
+            chunk_start_ip,
+            chunk_end_ip,
+            &mut instructions,
+        )?;
 
         offset = offset.checked_add(chunk_advance_len).unwrap();
     }
 
     Ok(instructions)
+}
+
+fn append_decoded_instructions(
+    bitness: u32,
+    window: &[u8],
+    chunk_start_ip: u64,
+    chunk_end_ip: u64,
+    instructions: &mut Vec<iced_x86::Instruction>,
+) -> Result<()> {
+    if bytes_until_next_4g_boundary(window.as_ptr()) >= window.len() {
+        return append_decoded_non_crossing_window(
+            bitness,
+            window,
+            chunk_start_ip,
+            chunk_end_ip,
+            instructions,
+        );
+    }
+
+    // If the scratch allocation starts immediately before a 4GiB boundary, the
+    // copied window can be shifted to start at that boundary. 2x window length
+    // always leaves enough room for that worst-case shift.
+    let scratch_len = window
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| Error::DisassemblyFailure("decode window too large".into()))?;
+    let mut scratch = vec![0; scratch_len];
+    let scratch_boundary_dist = bytes_until_next_4g_boundary(scratch.as_ptr());
+    let scratch_offset = if scratch_boundary_dist >= window.len() {
+        0
+    } else {
+        scratch_boundary_dist
+    };
+    let scratch_end = scratch_offset
+        .checked_add(window.len())
+        .filter(|&end| end <= scratch.len())
+        .ok_or_else(|| Error::DisassemblyFailure("decode scratch window overflow".into()))?;
+    scratch[scratch_offset..scratch_end].copy_from_slice(window);
+
+    let scratch_window = &scratch[scratch_offset..scratch_end];
+    assert!(bytes_until_next_4g_boundary(scratch_window.as_ptr()) >= scratch_window.len());
+    append_decoded_non_crossing_window(
+        bitness,
+        scratch_window,
+        chunk_start_ip,
+        chunk_end_ip,
+        instructions,
+    )
+}
+
+fn append_decoded_non_crossing_window(
+    bitness: u32,
+    window: &[u8],
+    chunk_start_ip: u64,
+    chunk_end_ip: u64,
+    instructions: &mut Vec<iced_x86::Instruction>,
+) -> Result<()> {
+    let mut decoder = iced_x86::Decoder::new(bitness, window, iced_x86::DecoderOptions::NONE);
+    decoder.set_ip(chunk_start_ip);
+
+    for inst in &mut decoder {
+        if inst.len() == 0 {
+            return Err(Error::DisassemblyFailure(format!(
+                "iced-x86 decoded zero-length instruction at {:#x}",
+                inst.ip()
+            )));
+        }
+
+        if inst.ip() >= chunk_end_ip {
+            break;
+        }
+
+        instructions.push(inst);
+    }
+
+    Ok(())
 }
 
 /// Returns the section data slice from `buf` corresponding to `section`, or an error if out of bounds.
@@ -1026,6 +1088,7 @@ mod tests {
 
     #[cfg(target_pointer_width = "64")]
     #[test]
+    #[ignore = "allocates over 4GiB to reproduce the iced-x86 host-pointer bug without mmap"]
     fn decodes_instruction_crossing_4g_host_boundary() {
         let mut code = vec![0u8; (1usize << 32) + CHUNK_OVERLAP_LEN + MAX_X86_INSTRUCTION_LEN];
         let base_addr = code.as_mut_ptr() as usize;
