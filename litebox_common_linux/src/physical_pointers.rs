@@ -179,7 +179,7 @@ where
     /// Read the value at the given offset from the physical pointer.
     ///
     /// Returns an owned copy of the value read from physical memory.
-    pub fn read_at_offset(&mut self, count: usize) -> Result<alloc::boxed::Box<T>, PhysPointerError>
+    pub fn read_at_offset(&self, count: usize) -> Result<alloc::boxed::Box<T>, PhysPointerError>
     where
         T: FromBytes,
     {
@@ -211,7 +211,7 @@ where
     ///
     /// Copies values from physical memory into the caller-provided slice.
     pub fn read_slice_at_offset(
-        &mut self,
+        &self,
         count: usize,
         values: &mut [T],
     ) -> Result<(), PhysPointerError>
@@ -248,7 +248,7 @@ where
     }
 
     /// Write the value at the given offset to the physical pointer.
-    pub fn write_at_offset(&mut self, count: usize, value: T) -> Result<(), PhysPointerError>
+    pub fn write_at_offset(&self, count: usize, value: T) -> Result<(), PhysPointerError>
     where
         T: IntoBytes,
     {
@@ -276,11 +276,7 @@ where
     }
 
     /// Write a slice of values at the given offset to the physical pointer.
-    pub fn write_slice_at_offset(
-        &mut self,
-        count: usize,
-        values: &[T],
-    ) -> Result<(), PhysPointerError>
+    pub fn write_slice_at_offset(&self, count: usize, values: &[T]) -> Result<(), PhysPointerError>
     where
         T: IntoBytes,
     {
@@ -327,10 +323,10 @@ where
     ///
     /// # Safety
     ///
-    /// Same as [`Self::map_range`]. The returned guard borrows `self` mutably, ensuring
-    /// the mapping is released when the guard goes out of scope.
+    /// Same as [`Self::map_range`]. The returned guard is tied to `self`'s lifetime
+    /// and releases the mapping when it goes out of scope.
     unsafe fn map_and_get_ptr_guard(
-        &mut self,
+        &self,
         count: usize,
         size: usize,
         perms: PhysPageMapPermissions,
@@ -362,7 +358,7 @@ where
     /// This function assumes that the underlying platform safely handles concurrent mapping/unmapping
     /// requests for the same physical pages.
     unsafe fn map_range(
-        &mut self,
+        &self,
         start: usize,
         end: usize,
         perms: PhysPageMapPermissions,
@@ -387,7 +383,7 @@ struct MappedGuard<'a, T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>
     map_info: Option<MapInfoOf<V, ALIGN>>,
     ptr: *mut T,
     size: usize,
-    _owner: PhantomData<&'a mut PhysMutPtr<T, ALIGN, V>>,
+    _owner: PhantomData<&'a PhysMutPtr<T, ALIGN, V>>,
 }
 
 impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop

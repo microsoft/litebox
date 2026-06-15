@@ -708,7 +708,7 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
         if buffer.len() > self.len {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
-        let mut ptr = NormalWorldMutPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
+        let ptr = NormalWorldMutPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
         // Data comes from a buffer owned by LiteBox.
         ptr.write_slice_at_offset(0, buffer)?;
         Ok(())

@@ -280,7 +280,7 @@ fn optee_smc_handler_entry_inner(
 
     // Write back the SMC arguments page to normal world memory.
     // All OP-TEE return codes (success or error) are delivered via smc_args.args[0].
-    let mut smc_args_ptr = NormalWorldMutPtr::<OpteeSmcArgs, PAGE_SIZE>::with_usize(smc_args_addr)
+    let smc_args_ptr = NormalWorldMutPtr::<OpteeSmcArgs, PAGE_SIZE>::with_usize(smc_args_addr)
         .map_err(|_| litebox_common_linux::errno::Errno::EINVAL)?;
     smc_args_ptr
         .write_at_offset(0, smc_args_updated)
@@ -1296,7 +1296,7 @@ fn write_msg_args_to_normal_world(
     let mut blob = vec![0u8; msg_args_size];
     msg_args.serialize(&mut blob)?;
 
-    let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+    let ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
         msg_args_phys_addr.trunc(),
         msg_args_size,
     )?;
@@ -1320,7 +1320,7 @@ fn write_non_ta_msg_args_to_normal_world(
     let mut blob = vec![0u8; msg_args_size];
     msg_args.serialize(&mut blob)?;
 
-    let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+    let ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
         msg_args_phys_addr.trunc(),
         msg_args_size,
     )?;
@@ -1350,7 +1350,7 @@ fn write_rpc_args_to_normal_world(
     let rpc_pa: usize = <u64 as litebox::utils::TruncateExt<usize>>::trunc(msg_args_phys_addr)
         .checked_add(msg_args_size)
         .ok_or(OpteeSmcReturnCode::EBadAddr)?; // RPC args are placed right after the main msg_args blob
-    let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(rpc_pa, rpc_args_size)?;
+    let ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(rpc_pa, rpc_args_size)?;
     ptr.write_slice_at_offset(0, &blob)?;
     Ok(())
 }

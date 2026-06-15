@@ -901,7 +901,7 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
                     <= heki_patch_pa_0.align_down(Size4KiB::SIZE).as_u64() + Size4KiB::SIZE,
             "patch crosses page boundary but pa_1 is null"
         );
-        let mut ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+        let ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
             heki_patch_pa_0.as_u64().trunc(),
             patch.len(),
         )
@@ -917,7 +917,7 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
             PhysPageAddr::<PAGE_SIZE>::new(heki_patch_pa_1.as_u64().trunc())
                 .ok_or(VsmError::Vtl0CopyFailed)?,
         ];
-        let mut ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::new(
+        let ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::new(
             &pages,
             (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
         )

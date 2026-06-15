@@ -140,10 +140,9 @@ pub type PhysPageAddrArray<const ALIGN: usize> = [PhysPageAddr<ALIGN>];
 
 /// Mapping information returned by `vmap()`.
 ///
-/// Implementors own the lifetime of the virtual mapping and any platform-specific reservation.
-/// Dropping the map info may release those resources, so callers must treat the
-/// value as an RAII guard and pass it back to the same platform's `vunmap()` when explicitly
-/// unmapping.
+/// Implementors use this value to track the virtual mapping and any platform-specific resources
+/// tied to it. Callers must pass it back to the same platform's `vunmap()` to explicitly unmap;
+/// drop behavior is implementation-specific.
 pub trait PhysPageMapInfo {
     /// Virtual address of the mapped region which is page aligned.
     fn base(&self) -> *mut u8;
