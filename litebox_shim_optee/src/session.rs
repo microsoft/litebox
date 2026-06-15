@@ -299,7 +299,7 @@ impl SingleInstanceCache {
     /// Evict only if the cached instance matches `task_page_table_id`.
     /// Distinguishes the live instance from a freshly-created one with the
     /// same UUID when the caller wants to remove a specific one.
-    fn remove_if_pt(&self, uuid: &TeeUuid, task_page_table_id: usize) -> bool {
+    fn remove_matching_instance(&self, uuid: &TeeUuid, task_page_table_id: usize) -> bool {
         let mut guard = self.inner.lock();
         match guard.get(uuid) {
             Some(current) if current.task_page_table_id == task_page_table_id => {
@@ -337,8 +337,8 @@ fn recycle_session_id(session_id: u32) {
     SessionIdPool::recycle(session_id);
 }
 
-/// RAII token bundling the serialization primitives required to safely
-/// execute an OP-TEE TA operation.
+/// An unified RAII token to safely execute an OP-TEE TA operation with
+/// instance- or session-specific serialization primitives.
 ///
 /// Bundles whichever combination of locks the current operation requires:
 ///
@@ -492,6 +492,9 @@ impl SessionManager {
         // so a freshly-allocated id can never collide with a marker slot
         // that's still held by a previous owner.
         let inserted = self.active_sessions.lock().insert(session_id);
+        if !inserted && !cfg!(debug_assertions) {
+            litebox_util_log::warn!(session_id = session_id; "freshly-allocated session_id collided with an active marker");
+        }
         debug_assert!(
             inserted,
             "freshly-allocated session_id collided with an active marker"
@@ -619,9 +622,10 @@ impl SessionManager {
     /// at a torn-down page table.
     ///
     /// Defense in depth: the entry's `(uuid, flags)` are validated against
-    /// the pre-marker snapshot. If they diverge (the id was recycled and
-    /// reused under a different TA between our first read and the marker
-    /// insert), we return `EThreadLimit` so the Linux driver retries.
+    /// the state observed before inserting the active-session marker. If
+    /// they diverge (the id was recycled and reused under a different TA
+    /// between our first read and the marker insert), we return
+    /// `EThreadLimit` so the Linux driver retries.
     fn try_acquire_for_session(
         &self,
         session_id: u32,
@@ -630,8 +634,8 @@ impl SessionManager {
             .sessions
             .get_entry(session_id)
             .ok_or(OpteeSmcReturnCode::EBadCmd)?;
-        let snapshot_uuid = entry.ta_uuid();
-        let snapshot_single = entry.ta_flags().is_single_instance();
+        let pre_marker_uuid = entry.ta_uuid();
+        let pre_marker_single = entry.ta_flags().is_single_instance();
 
         if !self.active_sessions.lock().insert(session_id) {
             return Err(OpteeSmcReturnCode::EThreadLimit);
@@ -647,20 +651,20 @@ impl SessionManager {
         // instance TAs. This blocks any concurrent mark-dead / cache
         // eviction so the re-read result is stable. On failure, the
         // token's `Drop` releases the marker we already took.
-        if snapshot_single {
+        if pre_marker_single {
             token.uuid_lock = Some(
-                self.try_acquire_uuid_lock(snapshot_uuid)
+                self.try_acquire_uuid_lock(pre_marker_uuid)
                     .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
             );
         }
 
-        // Re-read under both locks and validate against the snapshot.
+        // Re-read under both locks and validate against the pre-marker state.
         let entry_now = self
             .sessions
             .get_entry(session_id)
             .ok_or(OpteeSmcReturnCode::EBadCmd)?;
-        if entry_now.ta_uuid() != snapshot_uuid
-            || entry_now.ta_flags().is_single_instance() != snapshot_single
+        if entry_now.ta_uuid() != pre_marker_uuid
+            || entry_now.ta_flags().is_single_instance() != pre_marker_single
         {
             return Err(OpteeSmcReturnCode::EThreadLimit);
         }
@@ -809,7 +813,7 @@ impl SessionManager {
     /// that point there are no sibling sessions to fence out.
     pub fn evict_cached_instance(&self, instance: &TaInstance) -> bool {
         self.single_instance_cache
-            .remove_if_pt(&instance.ta_uuid, instance.task_page_table_id)
+            .remove_matching_instance(&instance.ta_uuid, instance.task_page_table_id)
     }
 
     /// Get the total count of unique TA instances (for limit checking).
@@ -861,7 +865,7 @@ impl SessionManager {
         // Whether we started on the unknown-load path is determined by the
         // identity of the lock the token carries. Captured before `f` runs
         // so we know which branch to take in the post-`f` adoption step.
-        let on_unknown_path = token
+        let on_unknown_uuid_path = token
             .uuid_lock
             .as_ref()
             .is_some_and(|arc| Arc::ptr_eq(arc, &self.unknown_uuid_lock));
@@ -910,7 +914,8 @@ impl SessionManager {
         // force-unlocking the old (unknown) lock. Token drop then releases
         // the per-UUID lock at the end of `with_ta`. UUID-keyed throughout,
         // so concurrent `with_ta(other_uuid)` cannot adopt our lock.
-        if result.is_ok() && on_unknown_path && self.single_instance_cache.get(uuid).is_some() {
+        if result.is_ok() && on_unknown_uuid_path && self.single_instance_cache.get(uuid).is_some()
+        {
             let per_uuid = self.uuid_lock_arc(*uuid);
             if let Some(old) = token.uuid_lock.replace(per_uuid) {
                 // SAFETY: see `SessionToken::drop` — same invariant.

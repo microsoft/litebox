@@ -712,7 +712,13 @@ fn open_session_new_instance(
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
-    let ta_bin = find_ta_binary(ta_uuid).ok_or(OpteeSmcReturnCode::ENotAvail)?;
+    let Some(ta_bin) = find_ta_binary(ta_uuid) else {
+        msg_args.session = 0;
+        msg_args.ret = TeeResult::ItemNotFound;
+        msg_args.ret_origin = TeeOrigin::Tee;
+        write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
+        return Ok(());
+    };
 
     // Token is declared before `task_pt_guard` so it drops AFTER it.
     // Marker only releases once CR3 is back to base. See
