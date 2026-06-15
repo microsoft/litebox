@@ -165,7 +165,8 @@ struct GlobalState {
     _litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: TaUuidMap,
-    /// Non-concurrent PTAs currently entered in this shim instance.
+    /// Maintain whether non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
+    /// are busy or not to serialize their command invocation
     pta_busy: spin::mutex::SpinMutex<HashSet<PseudoTa>>,
 }
 

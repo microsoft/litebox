@@ -22,6 +22,9 @@ use zeroize::{Zeroize, Zeroizing};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SystemPta;
 
+/// A common interface to interact with various PTAs including the system PTA.
+///
+/// Add new PTAs here as needed.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum PseudoTa {
     System(SystemPta),
@@ -174,7 +177,8 @@ impl Task {
         Some(pta)
     }
 
-    pub(crate) fn pta_for_inter_ta_session(&self, ta_sess_id: u32) -> Option<PseudoTa> {
+    /// Get the PTA associated with a session (if exists).
+    pub(crate) fn pta_for_session(&self, ta_sess_id: u32) -> Option<PseudoTa> {
         self.pta_sessions.lock().get(&ta_sess_id).copied()
     }
 
@@ -212,7 +216,9 @@ impl SystemPta {
         crate::SessionIdPool::allocate().ok_or(TeeResult::Busy)
     }
 
-    fn close_session(_task: &Task, _session_id: u32) {}
+    fn close_session(_task: &Task, _session_id: u32) {
+        // System PTA has no per-session state
+    }
 
     /// Handle a command of the system PTA.
     fn invoke_command(task: &Task, cmd_id: u32, params: &UteeParams) -> Result<(), TeeResult> {

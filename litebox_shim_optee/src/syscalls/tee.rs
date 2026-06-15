@@ -177,9 +177,10 @@ impl Task {
             // `open_ta_session` syscall lets a user-mode TA open a session to a PTA which provides
             // several import services (it works as a proxy for extra system calls).
             let session_id = self.open_pta_session(pta, &usr_params)?;
-            ta_sess_id
-                .write_at_offset(0, session_id)
-                .ok_or(TeeResult::AccessDenied)?;
+            if ta_sess_id.write_at_offset(0, session_id).is_none() {
+                self.close_pta_session(session_id);
+                return Err(TeeResult::AccessDenied);
+            }
             Ok(())
         } else {
             // `open_ta_session` syscall lets a user-mode TA open a session to another user-mode TA
@@ -219,7 +220,7 @@ impl Task {
         ret_orig
             .write_at_offset(0, TeeOrigin::Tee)
             .ok_or(TeeResult::AccessDenied)?;
-        if let Some(pta) = self.pta_for_inter_ta_session(ta_sess_id) {
+        if let Some(pta) = self.pta_for_session(ta_sess_id) {
             pta.invoke_command(self, cmd_id, &params)
         } else {
             #[cfg(debug_assertions)]
