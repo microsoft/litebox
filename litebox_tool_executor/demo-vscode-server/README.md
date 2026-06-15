@@ -19,35 +19,41 @@ SSH-over-PTY for the four scenarios `vscode::bootstrap`,
 `vscode::server_listen`, `vscode::connect_loopback`, and
 `vscode::connect_cross_ssh`.
 
-## Workflow (one-time setup)
+## Workflow
 
-In the WSL distribution where the litebox source tree lives (this
-demo assumes `~/src/litebox`):
+From a WSL bash shell in **any** litebox worktree (the demo is
+worktree-relative, not pinned to the main checkout):
 
 ```sh
-cd ~/src/litebox/litebox_tool_executor/demo-vscode-server
+cd <worktree>/litebox_tool_executor/demo-vscode-server
 code .
 ```
 
 (`code` is the VS Code WSL helper; it opens the folder in your
-desktop VS Code via the Remote-WSL extension.)
+desktop VS Code via the Remote-WSL extension.) Worktree examples:
+
+```sh
+# Main worktree
+cd ~/src/litebox/litebox_tool_executor/demo-vscode-server && code .
+
+# Some feature-branch worktree
+cd ~/src/litebox-vscode-integration-tests/litebox_tool_executor/demo-vscode-server && code .
+```
+
+The tasks resolve all paths via `${workspaceFolder}/../..`, so each
+demo workspace builds and bind-mounts from **its own worktree's**
+`target/debug/` — no hardcoded `~/src/litebox`.
 
 Then once VS Code is open:
 
-1. **Terminal → Run Task → `LiteBox: Build`** —
-   `cargo build` the litebox binaries to the default
-   `target/debug/` directory (no `--target-dir` overrides).
+1. **Terminal → Run Task → `LiteBox: Setup and Start VS Code Server`** —
+   one-shot: builds the litebox binaries, builds the
+   `litebox-vscode` Docker image, then `docker run`s it.
+   The three component tasks (`Build`, `Build VS Code Image`,
+   `Start VS Code Server`) are also runnable individually if
+   you only need to redo one step.
 
-2. **Terminal → Run Task → `LiteBox: Build VS Code Image`** —
-   `docker build --target litebox-vscode -t litebox-vscode`.
-   Builds the Docker image that bundles dropbear + the VS Code
-   CLI + the VS Code Server bundle on top of `litebox-base`.
-
-3. **Terminal → Run Task → `LiteBox: Start VS Code Server`** —
-   `docker run … --vscode-server`. The container's port 22
-   (dropbear) is forwarded to host port `2222`.
-
-4. **In a separate desktop VS Code window** — `Ctrl+Shift+P → Remote-SSH: Connect to Host… → litebox`.
+2. **In a separate desktop VS Code window** — `Ctrl+Shift+P → Remote-SSH: Connect to Host… → litebox`.
    (See `.vscode/settings.json` in this folder for the
    `~/.ssh/config` entry that maps `litebox` to
    `127.0.0.1:2222`, and for the recommended VS Code profile
@@ -56,16 +62,38 @@ Then once VS Code is open:
 That second window's editor, terminal, and extensions all execute
 **inside** the sandbox.
 
+## Single demo at a time
+
+The container is named `litebox-vscode` (shared across worktrees)
+and binds host port `2222`. So:
+
+- **Switching worktrees**: `LiteBox: Setup and Start VS Code
+  Server` from worktree B kills any container left over from
+  worktree A (`docker rm -f litebox-vscode` runs before the new
+  `docker run`), then binds port 2222 cleanly. The new
+  Remote-SSH `litebox` host points at the new worktree's
+  binaries.
+- **Two demos side-by-side**: not supported. Would require
+  per-worktree container names + ports (out of scope for the
+  hand-driven Remote-SSH workflow where you attach one VS Code
+  window at a time anyway).
+
+For repeatable automated validation in parallel across
+worktrees, use the integration tests below — those are designed
+for parallel execution and use `:wt-<sha256(worktree)>` image
+tags + ephemeral container names per trial.
+
 ## Filesystem note
 
-The binaries are `-v` bind-mounted from `~/src/litebox/target/debug`
+The binaries are `-v` bind-mounted from
+`${workspaceFolder}/../../target/debug` (= `<worktree>/target/debug`)
 on the WSL ext4 filesystem. NTFS (`/mnt/c`, `\\wsl$\…`) is **not**
 supported as the bind-mount source — Docker Desktop on Windows
 cannot `mmap(2)` ELF binaries through NTFS (you get
 `unsupported version 3 of Verneed record` and a segfault). If
 you've cloned the repo on the Windows side, either move it into
-WSL or copy your `target/debug/` over to WSL before running the
-"Start" task.
+WSL or copy your `target/debug/` over to WSL before running
+`LiteBox: Setup and Start VS Code Server`.
 
 ## Automated companion
 
@@ -76,8 +104,12 @@ debugging. For repeatable regression coverage, run:
 cargo test -p litebox_test_harness --test integration -- 'vscode::'
 ```
 
+(or run the `LiteBox: Run Integration Tests (vscode::*)` task
+in VS Code.)
+
 That registers eight trials (`native::vscode::*` and
 `litebox::vscode::*` for four scenarios) which exercise the same
 image headlessly. See
 `litebox_test_harness/CLAUDE.md` § "VS Code Server integration
 scenarios" for the full reference.
+

@@ -3,23 +3,63 @@
     // LiteBox VS Code Remote Server demo tasks.
     //
     // Assumes this workspace is opened from a WSL bash shell
-    // (`code .` from `~/src/litebox/litebox_tool_executor/demo-vscode-server`);
+    // (`code .` from `<worktree>/litebox_tool_executor/demo-vscode-server`);
     // VS Code's Remote-WSL extension then runs all tasks inside
     // the same WSL distribution where the source tree lives.
     //
-    // The litebox repo lives on the WSL ext4 filesystem at
-    // `~/src/litebox`. Cargo's default `target/` directory is
-    // used — no `--target-dir` overrides. Docker can `-v`
-    // bind-mount `~/src/litebox/target/debug` directly (WSL ext4
-    // is fine for ELF mmap; the old NTFS-via-`\\wsl$` workaround
-    // is no longer needed).
+    // All paths are anchored at `${workspaceFolder}/../..`, which
+    // resolves to the **repo root of whichever worktree** this
+    // workspace is opened from. So the demo works equally well
+    // from `~/src/litebox/litebox_tool_executor/demo-vscode-server`
+    // (main worktree) and from any sibling worktree like
+    // `~/src/litebox-<work-stream>/litebox_tool_executor/demo-vscode-server`.
+    //
+    // Cargo's default `target/` directory is used — no
+    // `--target-dir` overrides. Docker can `-v` bind-mount
+    // `<worktree>/target/debug` directly (WSL ext4 is fine for
+    // ELF mmap; the old NTFS-via-`\\wsl$` workaround is no
+    // longer needed).
+    //
+    // Single-demo-at-a-time invariant: the container is named
+    // `litebox-vscode` (shared across worktrees) and binds host
+    // port `2222`. Starting a demo from worktree B while a demo
+    // from worktree A is running will: (a) `docker rm -f
+    // litebox-vscode` kills A's container, and (b) B's
+    // `docker run` then binds port 2222 cleanly. So "switch
+    // worktrees, restart demo" works; "two demos side-by-side"
+    // does not (would need per-worktree container names and
+    // ports — out of scope for the hand-driven Remote-SSH
+    // workflow where you only attach one VS Code window at a
+    // time anyway).
     // ────────────────────────────────────────────────────────────
     "version": "2.0.0",
     "tasks": [
         {
+            // One-shot: run all three setup steps in sequence,
+            // then start the server. Use this for first-time
+            // setup or after switching worktrees. The
+            // `dependsOrder: "sequence"` is required — without
+            // it VS Code starts the dependent tasks in parallel
+            // and the docker-run task races the docker-build.
+            "label": "LiteBox: Setup and Start VS Code Server",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "LiteBox: Build",
+                "LiteBox: Build VS Code Image",
+                "LiteBox: Start VS Code Server"
+            ],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "echo": true
+            }
+        },
+        {
             "label": "LiteBox: Build",
             "type": "shell",
-            "command": "cd ~/src/litebox && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland && cargo rustc --target-dir target/nonpie -p litebox_test_harness -- -C link-args=-no-pie",
+            "command": "cd ${workspaceFolder}/../.. && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland && cargo rustc --target-dir target/nonpie -p litebox_test_harness -- -C link-args=-no-pie",
             "group": "build",
             "problemMatcher": "$rustc",
             "presentation": {
@@ -32,7 +72,7 @@
         {
             "label": "LiteBox: Build VS Code Image",
             "type": "shell",
-            "command": "cd ~/src/litebox && docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .",
+            "command": "cd ${workspaceFolder}/../.. && docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .",
             "group": "build",
             "problemMatcher": [],
             "presentation": {
@@ -45,7 +85,7 @@
         {
             "label": "LiteBox: Start VS Code Server",
             "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v $HOME/src/litebox/target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
+            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
@@ -58,7 +98,7 @@
         {
             "label": "LiteBox: Start VS Code Server (Debug)",
             "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v $HOME/src/litebox/target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug 9999",
+            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug 9999",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
@@ -81,7 +121,7 @@
         {
             "label": "LiteBox: Run Integration Tests (vscode::*)",
             "type": "shell",
-            "command": "cd ~/src/litebox && cargo test -p litebox_test_harness --test integration -- 'vscode::'",
+            "command": "cd ${workspaceFolder}/../.. && cargo test -p litebox_test_harness --test integration -- 'vscode::'",
             "group": "test",
             "problemMatcher": "$rustc",
             "presentation": {

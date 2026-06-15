@@ -3,15 +3,27 @@
     // LiteBox VS Code Remote Server demo workspace
     // ============================================================
     //
-    // Open this folder in VS Code (from a WSL bash shell):
+    // Open this folder in VS Code from a WSL bash shell in ANY
+    // litebox worktree (tasks are anchored at
+    // `${workspaceFolder}/../..`, which resolves to the repo root
+    // of whichever worktree you opened the demo from — main, or
+    // any sibling work-stream worktree):
     //
-    //   cd ~/src/litebox/litebox_tool_executor/demo-vscode-server
+    //   cd <worktree>/litebox_tool_executor/demo-vscode-server
     //   code .
     //
-    // Then use the tasks in `.vscode/tasks.json` to:
+    // Then run the one-shot task:
+    //
+    //   Terminal → Run Task → "LiteBox: Setup and Start VS Code Server"
+    //
+    // which runs three tasks in sequence:
+    //
     //   1. "LiteBox: Build"                — cargo build the litebox binaries.
     //   2. "LiteBox: Build VS Code Image"  — docker build litebox-vscode.
     //   3. "LiteBox: Start VS Code Server" — docker run the image with --vscode-server.
+    //
+    // The three are also runnable individually if you only need to
+    // redo one step.
     //
     // Then in a separate VS Code window, Remote-SSH connect to
     // `litebox` (configure `~/.ssh/config` Host litebox HostName
@@ -45,6 +57,8 @@
     //
     //   cargo test -p litebox_test_harness --test integration -- 'vscode::'
     //
+    // (or use the "LiteBox: Run Integration Tests (vscode::*)"
+    //  task in this workspace.)
     // ============================================================
 
     // No workspace-scoped overrides today. All knobs live in the
