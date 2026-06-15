@@ -288,8 +288,8 @@ def get_snippet():
             )
 
         return jsonify({"lines": snippet_lines, "target_line": line, "file": file_path})
-    except Exception as e:
-        return jsonify({"error": str(e), "lines": [], "target_line": line})
+    except Exception:
+        return jsonify({"error": "Could not read file", "lines": [], "target_line": line})
 
 
 def main():
