@@ -3139,10 +3139,7 @@ pub struct PtRegs {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub const EFLAGS_DF: usize = 0x400;
-
-#[cfg(target_arch = "x86_64")]
-mod arch {
+pub mod arch {
     // User returns must not target the null-guard region.
     pub const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
     // Exclusive upper bound; the final low-canonical page is reserved as a guard page.
