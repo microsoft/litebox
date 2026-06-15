@@ -84,7 +84,6 @@ fn align_up(len: usize, align: usize) -> usize {
 ///   virtually contiguous.
 /// - `offset`: The offset within `pages[0]` where the object starts. It should be smaller than `ALIGN`.
 /// - `count`: The number of objects of type `T` that can be accessed from this pointer.
-/// - `map_info`: The mapping information of the currently mapped physical pages, if any.
 /// - `T`: The type of the object being pointed to. `pages` with respect to `offset` should cover enough
 ///   memory for an object of type `T`.
 #[repr(C)]
@@ -92,7 +91,6 @@ pub struct PhysMutPtr<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>>
     pages: alloc::boxed::Box<[PhysPageAddr<ALIGN>]>,
     offset: usize,
     count: usize,
-    map_info: Option<MapInfoOf<V, ALIGN>>,
     _type: PhantomData<T>,
     _vmap: PhantomData<V>,
 }
@@ -134,7 +132,6 @@ where
             pages: pages.into(),
             offset,
             count: size / core::mem::size_of::<T>(),
-            map_info: None,
             _type: PhantomData,
             _vmap: PhantomData,
         })
@@ -348,19 +345,13 @@ where
             .ok_or(PhysPointerError::Overflow)?;
         let start = skip / ALIGN;
         let end = (skip + size).div_ceil(ALIGN);
-        unsafe {
-            self.map_range(start, end, perms)?;
-        }
-        let map_info = self
-            .map_info
-            .as_ref()
-            .ok_or(PhysPointerError::NoMappingInfo)?;
+        let map_info = unsafe { self.map_range(start, end, perms)? };
         let ptr = map_info.base().wrapping_add(skip % ALIGN).cast::<T>();
-        let _ = map_info;
         Ok(MappedGuard {
-            owner: self,
+            map_info: Some(map_info),
             ptr,
             size,
+            _owner: PhantomData,
         })
     }
 
@@ -375,7 +366,7 @@ where
         start: usize,
         end: usize,
         perms: PhysPageMapPermissions,
-    ) -> Result<(), PhysPointerError> {
+    ) -> Result<MapInfoOf<V, ALIGN>, PhysPointerError> {
         if start >= end || end > self.pages.len() {
             return Err(PhysPointerError::IndexOutOfBounds(end, self.pages.len()));
         }
@@ -383,50 +374,20 @@ where
         if perms.bits() & !accept_perms.bits() != 0 {
             return Err(PhysPointerError::UnsupportedPermissions(perms.bits()));
         }
-        if self.map_info.is_none() {
-            let sub_pages = &self.pages[start..end];
-            unsafe {
-                self.map_info = Some(V::manager().vmap(sub_pages, perms)?);
-            }
-            Ok(())
-        } else {
-            Err(PhysPointerError::AlreadyMapped(
-                self.pages.first().map_or(0, |p| p.as_usize()),
-            ))
-        }
-    }
-
-    /// Unmap the physical pages if mapped.
-    ///
-    /// # Safety
-    ///
-    /// This function assumes that the underlying platform safely handles concurrent mapping/unmapping
-    /// requests for the same physical pages.
-    unsafe fn unmap(&mut self) -> Result<(), PhysPointerError> {
-        if let Some(map_info) = self.map_info.take() {
-            // On failure, `vunmap` hands `map_info` back so the reservation it
-            // carries is not lost; restore it so a later drop/retry can release it.
-            if let Err((err, map_info)) = unsafe { V::manager().vunmap(map_info) } {
-                self.map_info = Some(map_info);
-                return Err(err);
-            }
-            Ok(())
-        } else {
-            Err(PhysPointerError::Unmapped(
-                self.pages.first().map_or(0, |p| p.as_usize()),
-            ))
-        }
+        let sub_pages = &self.pages[start..end];
+        unsafe { V::manager().vmap(sub_pages, perms) }
     }
 }
 
 /// RAII guard that unmaps physical pages when dropped.
 ///
-/// Created by `map_and_get_ptr_guard`. Holds a mutable borrow on the parent
-/// `PhysMutPtr` and provides the mapped base pointer for the duration of the mapping.
+/// Created by `map_and_get_ptr_guard`. Its lifetime is tied to the parent
+/// `PhysMutPtr`, and it owns the map info for the duration of the temporary mapping.
 struct MappedGuard<'a, T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
-    owner: &'a mut PhysMutPtr<T, ALIGN, V>,
+    map_info: Option<MapInfoOf<V, ALIGN>>,
     ptr: *mut T,
     size: usize,
+    _owner: PhantomData<&'a mut PhysMutPtr<T, ALIGN, V>>,
 }
 
 impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop
@@ -434,34 +395,12 @@ impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop
 {
     fn drop(&mut self) {
         // SAFETY: The platform is expected to handle unmapping safely. Drop cannot
-        // report errors, so a failed unmap leaves map_info restored in the owner and
-        // is only reported by debug assertion.
-        let result = unsafe { self.owner.unmap() };
-        debug_assert!(
-            result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
-            "unexpected error during unmap in drop: {result:?}",
-        );
-    }
-}
-
-impl<T: Clone, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop for PhysMutPtr<T, ALIGN, V> {
-    fn drop(&mut self) {
-        // SAFETY: The platform is expected to handle unmapping safely. Drop cannot
-        // report errors. If unmapping fails, `unmap` restores map_info so its reservation
-        // remains live. Leak it rather than releasing that reservation while the mapping
-        // may still be installed.
-        let result = unsafe { self.unmap() };
-        if result.is_err() && self.map_info.is_some() {
-            let _ = self
-                .map_info
-                .take()
-                .map(alloc::boxed::Box::new)
-                .map(alloc::boxed::Box::leak);
+        // report errors. If unmapping fails, drop the returned private map_info;
+        // platform-specific resources that cannot be reclaimed are handled by the
+        // platform `vunmap` implementation.
+        if let Some(map_info) = self.map_info.take() {
+            let _ = unsafe { V::manager().vunmap(map_info) };
         }
-        debug_assert!(
-            result.is_ok() || matches!(result, Err(PhysPointerError::Unmapped(_))),
-            "unexpected error during unmap in drop: {result:?}",
-        );
     }
 }
 

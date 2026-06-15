@@ -60,13 +60,16 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     /// This function is analogous to Linux kernel's `vunmap()`.
     ///
     /// On failure, the unchanged `vmap_info` is returned alongside the error so the caller does
-    /// not lose the reservation it carries and can retry or drop it explicitly.
+    /// not lose the reservation it carries and can retry or drop it explicitly. Dropping returned
+    /// map info is not guaranteed to release platform resources; each implementation owns the
+    /// retention policy for resources that cannot be safely reclaimed after a failed unmap.
     ///
     /// # Safety
     ///
     /// The caller must ensure there are no outstanding raw-pointer uses or Rust references derived
     /// from `PhysPageMapInfo::base()`. After a successful call, the virtual mapping is invalid and
-    /// the reservation carried by `vmap_info` is released.
+    /// any platform resources tied to the mapping lifetime have been released or otherwise handled
+    /// by the implementation.
     unsafe fn vunmap(
         &self,
         vmap_info: Self::MapInfo,

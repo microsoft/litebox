@@ -61,9 +61,9 @@ struct PhysRangeReservationInner {
 
 /// Mapping info returned by [`LinuxKernel`]'s [`VmapManager::vmap`].
 ///
-/// Carries the virtual base/size of the mapping together with an RAII access reservation for the
-/// physical ranges it covers. Dropping it (or passing it to `vunmap`) releases the reservation,
-/// which serializes cooperating LiteBox mappings for the safe physical pointer APIs.
+/// Carries the virtual base/size of the mapping together with an access reservation for the
+/// physical ranges it covers. The reservation is released explicitly only after successful
+/// `vunmap`; dropping this map info does not release it.
 pub struct LvbsPhysPageMapInfo {
     base: *mut u8,
     size: usize,
@@ -139,7 +139,7 @@ fn build_phys_access_reservation_ranges<const ALIGN: usize>(
 /// `pages`.
 ///
 /// Adjacent pages are coalesced into one range to keep the global lock list compact for the
-/// common contiguous mapping path. Duplicate pages are rejected so the drop path can release every
+/// common contiguous mapping path. Duplicate pages are rejected so explicit release removes every
 /// reserved range exactly once. This is a cooperative LiteBox reservation, not Rust ownership of
 /// the foreign physical memory; external agents may still access it unless hardware protection is
 /// applied separately.
@@ -163,11 +163,11 @@ fn reserve_phys_range_access<const ALIGN: usize>(
     Ok(LvbsPhysRangeReservation { ranges })
 }
 
-impl Drop for LvbsPhysRangeReservation {
-    fn drop(&mut self) {
+impl LvbsPhysRangeReservation {
+    fn release(self) {
         let mut inner = PHYS_RANGE_RESERVATIONS.lock();
-        for range in &self.ranges {
-            if let Some(index) = inner.entries.iter().position(|entry| entry == range) {
+        for range in self.ranges {
+            if let Some(index) = inner.entries.iter().position(|entry| *entry == range) {
                 inner.entries.swap_remove(index);
             }
         }
@@ -1453,9 +1453,9 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
 
         // PTEs are already cleared at this point, so the mapping is functionally gone
         // and a retry would only re-fail against empty page-table entries. If the VA
-        // allocator's bookkeeping is inconsistent, surface it via `debug_assert!` and
-        // drop `vmap_info` to release the reservation. The VA region
-        // is leaked but cannot be safely recycled.
+        // allocator's bookkeeping is inconsistent, surface it via `debug_assert!`. The
+        // VA region is leaked but cannot be safely recycled; the physical access
+        // reservation is still explicitly released below.
         let unregister_ok = !crate::mm::vmap::is_vmap_address(base_va)
             || crate::mm::vmap::vmap_allocator()
                 .unregister_allocation(base_va)
@@ -1465,7 +1465,9 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             "vmap allocator unregister failed at {base_va:?}",
         );
 
-        ManuallyDrop::into_inner(vmap_info);
+        ManuallyDrop::into_inner(vmap_info)
+            ._access_reservation
+            .release();
         Ok(())
     }
 
