@@ -193,3 +193,7 @@ venv/
 dev_bench/unixbench/prepared/
 dev_bench/unixbench/byte-unixbench-*/
 dev_bench/unixbench/*.zip
+
+### Direnv ###
+.direnv
+.envrc
