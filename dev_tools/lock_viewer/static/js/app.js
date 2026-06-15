@@ -214,6 +214,21 @@ function formatDuration(ns) {
 }
 
 /**
+ * Escape a value for use as a JavaScript string argument in inline handlers.
+ */
+function jsStringArg(value) {
+    return escapeHtml(JSON.stringify(String(value)));
+}
+
+/**
+ * Normalize trace line numbers before embedding them in inline handlers.
+ */
+function safeLineNumber(value) {
+    const line = Number.parseInt(value, 10);
+    return Number.isFinite(line) ? line : 0;
+}
+
+/**
  * Show the no-data state.
  */
 function showNoData() {
@@ -376,28 +391,27 @@ function updateLockFilter() {
         const strippedCreationFile = data.creationFile ? stripCommonPrefix(data.creationFile) : '';
         const strippedFile = stripCommonPrefix(data.file);
         const selectedClass = data.selected ? 'selected' : '';
+        const creationLine = safeLineNumber(data.creationLine);
+        const maxWaitLine = safeLineNumber(data.line);
         const creationDisplay = data.creationFile
-            ? `${strippedCreationFile}:${data.creationLine}`
+            ? `${escapeHtml(strippedCreationFile)}:${creationLine}`
             : '<span style="color: #666;">—</span>';
-        const creationTitle = data.creationFile
-            ? `${data.creationFile}:${data.creationLine}`
-            : 'No creation event recorded';
         const creationHover = data.creationFile
-            ? `onmouseenter="showFileTooltip(event, '${data.creationFile.replace(/'/g, "\\'")}', ${data.creationLine}, 'Created At')" onmouseleave="hideTooltip()"`
+            ? `onmouseenter="showFileTooltip(event, ${jsStringArg(data.creationFile)}, ${creationLine}, 'Created At')" onmouseleave="hideTooltip()"`
             : '';
         const maxWaitAtHover = data.file
-            ? `onmouseenter="showFileTooltip(event, '${data.file.replace(/'/g, "\\'")}', ${data.line}, 'Max Wait At')" onmouseleave="hideTooltip()"`
+            ? `onmouseenter="showFileTooltip(event, ${jsStringArg(data.file)}, ${maxWaitLine}, 'Max Wait At')" onmouseleave="hideTooltip()"`
             : '';
         const maxWaitAtDisplay = data.file
-            ? `${strippedFile}:${data.line}`
+            ? `${escapeHtml(strippedFile)}:${maxWaitLine}`
             : '<span style="color: #666;">—</span>';
         html += `
-            <tr class="lock-row ${selectedClass}" onclick="toggleLock('${data.lock}')">
+            <tr class="lock-row ${selectedClass}" onclick="toggleLock(${jsStringArg(data.lock)})">
                 <td class="lock-table-checkbox">
-                    <input type="checkbox" ${data.selected ? 'checked' : ''} onclick="event.stopPropagation(); toggleLock('${data.lock}')">
+                    <input type="checkbox" ${data.selected ? 'checked' : ''} onclick="event.stopPropagation(); toggleLock(${jsStringArg(data.lock)})">
                 </td>
-                <td class="lock-addr">${data.lock}</td>
-                <td class="lock-type">${data.lockType}</td>
+                <td class="lock-addr">${escapeHtml(data.lock)}</td>
+                <td class="lock-type">${escapeHtml(data.lockType)}</td>
                 <td class="lock-stat">${formatDuration(data.totalWait)}</td>
                 <td class="lock-stat">${data.attempts}</td>
                 <td class="lock-stat">${formatDuration(data.maxWait)}</td>
@@ -624,10 +638,11 @@ function renderTimeline() {
         let lockLabel, headerHover;
         if (creation) {
             const strippedCreationFile = stripCommonPrefix(creation.file);
-            lockLabel = `${lock} [${lockType} @ ${strippedCreationFile}:${creation.line}]`;
-            headerHover = `onmouseenter="showFileTooltip(event, '${creation.file.replace(/'/g, "\\'")}', ${creation.line}, 'Created At')" onmouseleave="hideTooltip()"`;
+            const creationLine = safeLineNumber(creation.line);
+            lockLabel = `${escapeHtml(lock)} [${escapeHtml(lockType)} @ ${escapeHtml(strippedCreationFile)}:${creationLine}]`;
+            headerHover = `onmouseenter="showFileTooltip(event, ${jsStringArg(creation.file)}, ${creationLine}, 'Created At')" onmouseleave="hideTooltip()"`;
         } else {
-            lockLabel = `${lock} [${lockType}]`;
+            lockLabel = `${escapeHtml(lock)} [${escapeHtml(lockType)}]`;
             headerHover = '';
         }
 
@@ -648,12 +663,12 @@ function renderTimeline() {
             const locationEvents = locationGroups[location];
             const spans = buildSpans(locationEvents);
             const locationFile = location.split(':')[0];
-            const locationLine = parseInt(location.split(':')[1]) || 0;
+            const locationLine = safeLineNumber(location.split(':')[1]);
             const strippedLocation = stripCommonPrefix(locationFile) + ':' + locationLine;
-            const trackHover = `onmouseenter="showFileTooltip(event, '${locationFile.replace(/'/g, "\\'")}', ${locationLine}, 'Location')" onmouseleave="hideTooltip()"`;
+            const trackHover = `onmouseenter="showFileTooltip(event, ${jsStringArg(locationFile)}, ${locationLine}, 'Location')" onmouseleave="hideTooltip()"`;
 
             html += `<div class="timeline-track">`;
-            html += `<div class="timeline-track-label" ${trackHover}>${strippedLocation}</div>`;
+            html += `<div class="timeline-track-label" ${trackHover}>${escapeHtml(strippedLocation)}</div>`;
 
             // Render spans
             spans.forEach(span => {
@@ -679,7 +694,7 @@ function renderTimeline() {
                 html += `
                     <div class="timeline-span ${spanClass}"
                          style="left: ${startPos}%; width: ${width}%;"
-                         onmouseenter="showSpanTooltip(event, '${span.type}', ${duration}, '${lock}', '${location.replace(/'/g, "\\'")}')"
+                         onmouseenter="showSpanTooltip(event, '${span.type}', ${duration}, ${jsStringArg(lock)}, ${jsStringArg(location)})"
                          onmouseleave="hideTooltip()">
                     </div>
                 `;
@@ -792,9 +807,12 @@ async function fetchSnippet(filePath, line) {
  * Escape HTML entities to prevent XSS.
  */
 function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 /**
@@ -824,7 +842,7 @@ async function showFileTooltip(mouseEvent, filePath, line, label) {
 
     // Show tooltip immediately with loading state
     tooltip.innerHTML = `
-        <div class="tooltip-row"><span class="tooltip-label">${label}:</span>${filePath}:${line}</div>
+        <div class="tooltip-row"><span class="tooltip-label">${escapeHtml(label)}:</span>${escapeHtml(filePath)}:${safeLineNumber(line)}</div>
         <div class="snippet-loading">Loading code...</div>
     `;
 
@@ -837,7 +855,7 @@ async function showFileTooltip(mouseEvent, filePath, line, label) {
         const snippet = await fetchSnippet(filePath, line);
         if (tooltip.classList.contains('visible')) {
             tooltip.innerHTML = `
-                <div class="tooltip-row"><span class="tooltip-label">${label}:</span>${filePath}:${line}</div>
+                <div class="tooltip-row"><span class="tooltip-label">${escapeHtml(label)}:</span>${escapeHtml(filePath)}:${safeLineNumber(line)}</div>
                 ${snippet || '<div class="snippet-loading">Could not load source</div>'}
             `;
             // Auto-scroll to the highlighted line in the snippet
@@ -868,9 +886,9 @@ function showSpanTooltip(mouseEvent, spanType, duration, lock, location) {
     tooltip.innerHTML = `
         <div class="tooltip-row"><span class="tooltip-label">Span:</span>${spanLabel}</div>
         <div class="tooltip-row"><span class="tooltip-label">Duration:</span>${formatDuration(duration)}</div>
-        <div class="tooltip-row"><span class="tooltip-label">Lock:</span>${lock}</div>
-        <div class="tooltip-row"><span class="tooltip-label">Type:</span>${lockType}</div>
-        <div class="tooltip-row"><span class="tooltip-label">Location:</span>${location}</div>
+        <div class="tooltip-row"><span class="tooltip-label">Lock:</span>${escapeHtml(lock)}</div>
+        <div class="tooltip-row"><span class="tooltip-label">Type:</span>${escapeHtml(lockType)}</div>
+        <div class="tooltip-row"><span class="tooltip-label">Location:</span>${escapeHtml(location)}</div>
         ${contentionInfo}
     `;
 
