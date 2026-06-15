@@ -3842,33 +3842,67 @@ impl<FS: ShimFS> Task<FS> {
 
     fn is_pre_exec_syscall_for_task(&self, ctx: &litebox_common_linux::ExecutionContext) -> bool {
         use ::syscalls::Sysno;
+        use litebox::fs::OFlags;
 
-        let socketpair_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read)) && {
+        // Only a *blocking* read on an inherited synchronizing fd
+        // (Unix socket / broker socketpair / broker pipe) can deadlock
+        // against a vfork-parked parent.  A non-blocking read returns
+        // EAGAIN immediately whether the parent has written or not, so
+        // it is safe to leave in the pre-exec allowlist — and forcing
+        // commit_delayed_fork for it adds full snapshot/restore latency
+        // that the PFLG.nonblock_fork tests are designed to detect.
+        let parent_synchronizing_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read)) && {
             let files = self.files.borrow();
             let rds = files.raw_descriptor_store.read();
-            rds.fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
-                .is_ok()
-                || rds
-                    .fd_from_raw_integer::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
-                        ctx.rdi,
-                    )
-                    .is_ok()
+            let dt = self.global.litebox.descriptor_table();
+            let is_blocking_unix = rds
+                .fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
+                .ok()
+                .and_then(|fd| dt.with_entry(&fd, |sock| sock.get_status()))
+                .is_some_and(|flags| !flags.contains(OFlags::NONBLOCK));
+            let is_blocking_socketpair = rds
+                .fd_from_raw_integer::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+                    ctx.rdi,
+                )
+                .ok()
+                .and_then(|fd| dt.with_entry(&fd, |sock| sock.get_status()))
+                .is_some_and(|flags| !flags.contains(OFlags::NONBLOCK));
+            let is_blocking_pipe = rds
+                .fd_from_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(ctx.rdi)
+                .ok()
+                .and_then(|fd| dt.with_entry(&fd, |pipe| pipe.get_status()))
+                .is_some_and(|flags| !flags.contains(OFlags::NONBLOCK));
+            is_blocking_unix || is_blocking_socketpair || is_blocking_pipe
         };
-        Self::is_pre_exec_syscall_impl(ctx, socketpair_read)
+        Self::is_pre_exec_syscall_impl(ctx, parent_synchronizing_read)
     }
 
     fn is_pre_exec_syscall_impl(
         ctx: &litebox_common_linux::ExecutionContext,
-        unix_socket_read: bool,
+        parent_synchronizing_read: bool,
     ) -> bool {
         use ::syscalls::Sysno;
 
         let nr = ctx.orig_rax;
 
-        // A blocking read from an inherited Unix socket is real post-fork work,
-        // not fork/exec bookkeeping.  Let delayed-fork migration run first so
-        // the parent can resume and communicate with the child.
-        if unix_socket_read {
+        // A *blocking* read from an inherited Unix socket, broker socketpair,
+        // or broker pipe is real post-fork work, not fork/exec bookkeeping.  In
+        // particular, bash's `make_child()` creates a sync pipe before fork,
+        // then has the child `read(pipe_read_end, 1)` while the parent writes
+        // the sync byte once it has set the child's process group.  Under
+        // litebox the fork is rewritten to vfork + delayed-fork; if read stayed
+        // in the pre-exec allowlist, the vfork-parked parent could never write
+        // the sync byte and the child would block forever.  Force delayed-fork
+        // migration in this case so the parent resumes and the synchronization
+        // can complete.
+        //
+        // Non-blocking reads (`O_NONBLOCK` set) are excluded by the caller in
+        // `is_pre_exec_syscall_for_task` — they return EAGAIN immediately
+        // whether or not the parent has written, so they can stay pre-exec
+        // without deadlocking.  Forcing commit_delayed_fork on them would add
+        // unnecessary snapshot/restore latency (the `PFLG.nonblock_fork.*`
+        // tests are designed to catch exactly that regression).
+        if parent_synchronizing_read {
             return false;
         }
 
@@ -3936,6 +3970,36 @@ impl<FS: ShimFS> Task<FS> {
             // Argument-aware: prctl — only allow SET_PDEATHSIG and SET_NAME.
             // PR_SET_PDEATHSIG=1, PR_SET_NAME=15
             Some(Sysno::prctl) => matches!(ctx.rdi, 1 | 15),
+            // Argument-aware: futex — only allow non-blocking WAKE-flavoured
+            // operations. After fork, glibc's `__libc_fork` epilogue releases
+            // its internal pthread atfork mutex via
+            // `futex(FUTEX_WAKE_PRIVATE, 1)` (op=0x81). Without this allowlist
+            // every static-PIE-glibc fork-child traps into
+            // `commit_delayed_fork`, which (for tests that hold a CLOEXEC
+            // epoll fd — e.g. the tokio runtime in the test harness) then
+            // rejects and falls back to vfork shared-AS anyway. The wasted
+            // snapshot_fd_table + snapshot_memory work per fork blows the
+            // `PROMOTION_RACE.concurrent_fork.{eventfd,signalfd}.spg`
+            // 15s send_cmd budget. Dynamic-PIE-glibc emits no futex post-fork
+            // (its atfork lock release inlines as an atomic store), so this
+            // gate only affects static-glibc binaries.
+            //
+            // Operation nibble (rsi & FUTEX_CMD_MASK = 0x7f) we accept:
+            //   FUTEX_WAKE          = 1
+            //   FUTEX_REQUEUE       = 3
+            //   FUTEX_CMP_REQUEUE   = 4
+            //   FUTEX_WAKE_OP       = 5
+            //   FUTEX_UNLOCK_PI     = 7
+            //   FUTEX_WAKE_BITSET   = 10
+            // All are non-blocking releases that cannot stall the vfork
+            // parent. Blocking ops (FUTEX_WAIT, FUTEX_WAIT_BITSET,
+            // FUTEX_LOCK_PI, FUTEX_TRYLOCK_PI) deliberately remain off the
+            // list — letting them run pre-exec would let a fork-child wait
+            // for a wake-up the parked vfork parent cannot deliver.
+            Some(Sysno::futex) => {
+                let op = (ctx.rsi as u32) & 0x7f;
+                matches!(op, 1 | 3 | 4 | 5 | 7 | 10)
+            }
             // Any unrecognized or non-allowlisted syscall triggers a delayed fork.
             _ => false,
         }
@@ -6223,6 +6287,8 @@ mod tests {
         assert_rejected(Sysno::accept);
         assert_rejected(Sysno::wait4);
         assert_rejected(Sysno::kill);
+        // Default arg (FUTEX_WAIT=0) — still rejected. WAKE-only ops are
+        // covered by `pre_exec_syscall_futex_allows_wake_ops` below.
         assert_rejected(Sysno::futex);
     }
 
@@ -6276,6 +6342,49 @@ mod tests {
                 !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
                 "prctl op={op} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_futex_allows_wake_ops() {
+        use ::syscalls::Sysno;
+        // Glibc's `__libc_fork` epilogue invokes
+        // `futex(FUTEX_WAKE_PRIVATE, 1)` (op = 0x81) to release its
+        // pthread atfork mutex. Without this allowlist, every
+        // static-PIE-glibc fork-child trips into commit_delayed_fork
+        // and pays the snapshot+reject cost on each PROMOTION_RACE
+        // iteration. Cover both the bare and PRIVATE-flagged
+        // variants of every WAKE-flavoured op (per FUTEX_CMD_MASK).
+        for op in [1u32, 3, 4, 5, 7, 10] {
+            for &priv_flag in &[0u32, 0x80] {
+                let raw = (op | priv_flag) as usize;
+                let ctx = make_syscall_ctx(Sysno::futex as usize, 0, raw);
+                assert!(
+                    Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+                    "futex op=0x{raw:x} should be allowed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_futex_rejects_blocking_ops() {
+        use ::syscalls::Sysno;
+        // FUTEX_WAIT=0, FUTEX_FD=2, FUTEX_LOCK_PI=6, FUTEX_TRYLOCK_PI=8,
+        // FUTEX_WAIT_BITSET=9. Blocking ops must remain off the
+        // allowlist: a fork-child waiting for a wake-up the parked vfork
+        // parent cannot deliver would deadlock the test process.
+        for op in [0u32, 2, 6, 8, 9] {
+            for &priv_flag in &[0u32, 0x80] {
+                let raw = (op | priv_flag) as usize;
+                let ctx = make_syscall_ctx(Sysno::futex as usize, 0, raw);
+                assert!(
+                    !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+                    "futex op=0x{raw:x} should be rejected"
+                );
+            }
         }
     }
 }
