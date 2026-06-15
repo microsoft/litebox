@@ -325,10 +325,56 @@ impl From<Rlerror> for Error {
     }
 }
 
-/// Maximum write-behind buffer size per open file. Tuned to be large enough
-/// to coalesce many small writes (e.g., cargo build emitting .d/.rmeta files)
-/// while keeping total memory use reasonable across many open files.
-const WRITE_BUFFER_CAPACITY: usize = 256 * 1024;
+/// Maximum write-behind buffer size per open file.
+///
+/// **Set to 0 to disable buffering entirely**, restoring POSIX
+/// read-after-write visibility semantics across processes.
+///
+/// History: this buffer was added as a perf optimization to coalesce
+/// small sequential writes (e.g., cargo build emitting `.d`/`.rmeta`
+/// files) into fewer 9P RPCs. But the buffer is per-litebox-client
+/// (= per guest process — each runner instance has its own
+/// `write_buffers: BTreeMap<Fid, WriteBuffer>` map), and the flush
+/// triggers (`flush_write_buffers_for_file` on read/open/seek/truncate
+/// from the same process, `flush_sibling_write_buffers` on writes to
+/// sibling fids in the same process, `flush_write_buffer` on close)
+/// only fire on intra-process events. A reader in a DIFFERENT guest
+/// process opens a fresh fid, walks straight to the 9P server, reads
+/// from the host file, and sees ONLY the bytes that have actually
+/// been pwritten by the broker — NOT the writer's still-buffered
+/// tail bytes.
+///
+/// When the writer process goes idle after the last write (e.g.
+/// VS Code Server CLI sitting in its `epoll_pwait` accept loop, or
+/// any logging process between log lines), the tail bytes of the
+/// write_behind buffer sit there indefinitely. Cross-process readers
+/// never see the writer's most recent writes.
+///
+/// Reproduced and fix-verified by
+/// `CWF.full_visibility.{nonpie-glibc,non-pie-static-musl}.*` tests
+/// (which writers `writeln!` 5 lines and a separate-process reader
+/// validates the full 30-byte content). With the buffer enabled, the
+/// non-PIE-writer-spawned variants reproducibly lose the final 1 byte
+/// (the trailing `'\n'` of the last writeln). With the buffer disabled
+/// here, they pass. The same fix transitively unblocks 3 of the 4
+/// `vscode::*` litebox-pass trials (`server_listen`,
+/// `connect_loopback`, `connect_cross_ssh`) — the VS Code Server's
+/// `code` CLI was hitting the same root cause (the CLI's
+/// `Listening on N.N.N.N:PORT` line was sitting in its write-buffer
+/// after the CLI entered its epoll loop; the bash-subshell reader
+/// never saw it).
+///
+/// Perf trade-off: small-write-heavy workloads (cargo builds) lose
+/// the coalescing benefit and pay one 9P RPC per write. Mitigations
+/// for the future: (a) keep a small buffer (e.g. 4 KB) with a
+/// **debounced eager-flush timer** that fires Nms after the last
+/// write, restoring perf for tight-loop writes while bounding the
+/// cross-process visibility delay; (b) broker-side cross-client
+/// pending-write tracking that proactively asks clients to flush
+/// when any other client opens or reads the same file. Both are
+/// strictly larger changes than the value 0 here and can land
+/// incrementally without re-breaking correctness.
+const WRITE_BUFFER_CAPACITY: usize = 0;
 
 /// Maximum read-ahead size per `Tread` RPC. When a caller requests a small
 /// read (e.g. 4 KB mmap page), we request this much from the server and

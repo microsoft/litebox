@@ -1516,6 +1516,12 @@ fn main() {
     let _ = setup();
     copilot::register_trials(&mut trials);
 
+    // VS Code Remote Server integration scenarios — always registered
+    // (no token required). See `mod vscode` for the scenario set and
+    // `litebox_test_harness/CLAUDE.md` "VS Code Server integration
+    // scenarios" for invocation knobs.
+    vscode::register_trials(&mut trials);
+
     // Record the universe size on the runs row so the renderer can
     // show "N covered of M known".
     if !args.list {
@@ -4114,6 +4120,1160 @@ mod copilot {
             i += 1;
         }
         out
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// mod vscode — VS Code Remote Server integration scenarios
+// ════════════════════════════════════════════════════════════════════
+//
+// Mirrors `mod copilot` exactly in shape: per-pass `docker run` of a
+// dropbear-in-container image, host-side driven via SSH-over-PTY. The
+// VS Code Server scenarios are the end-to-end validation layer that
+// Goal B's `docs/product-goal-map.md` calls out as the remaining gap
+// after the capability nodes flipped to ✅.
+//
+// Trial namespace: `vscode::<scenario>`. Each registers as
+// `native::vscode::<scenario>` and `litebox::vscode::<scenario>`.
+//
+//   vscode::bootstrap          — replay the captured Remote-SSH
+//                                bootstrap script through `sh -s`.
+//   vscode::server_listen      — start `code command-shell` directly,
+//                                capture its TCP listening port.
+//   vscode::connect_loopback   — same SSH session opens a TCP
+//                                connection to the captured port.
+//   vscode::connect_cross_ssh  — second independent SSH session
+//                                does the same connect (Remote-SSH
+//                                SOCKS-proxy pattern).
+//
+// Image flexibility: `LITEBOX_VSCODE_IMAGE_STAGE` env var picks
+// `litebox-vscode` (default — runtime-rewritten) or
+// `litebox-vscode-prewrite` (faster startup, requires
+// `litebox_syscall_rewriter`, which `setup()` already builds).
+//
+// Concurrency cap: `LITEBOX_VSCODE_JOBS` (default `1`). The serial
+// default protects shared / autonomous runs from dockerd
+// stress and from cross-test port conflicts in the cross-SSH
+// scenario. One-shot validation runs can raise it
+// (`LITEBOX_VSCODE_JOBS=4`).
+//
+// No GitHub token plumbing — VS Code's `--connection-token` is
+// locally-generated and never validated against an external
+// service.
+//
+// Native is the gold standard. Any litebox-pass failure is a real
+// shim/runner regression; see CLAUDE.md "Investigating a failure"
+// for the workflow.
+
+mod vscode {
+    use super::{Failed, Trial, copilot};
+    use litebox_test_harness::os::pty::Pty;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    // ───────────────────────────────────────────────────────────────
+    // Image-stage selection
+    // ───────────────────────────────────────────────────────────────
+
+    /// Docker stage to use for the trials. Default = `litebox-vscode`
+    /// (no extra build prerequisite beyond what `setup()` already
+    /// does). `LITEBOX_VSCODE_IMAGE_STAGE=prewrite` switches to
+    /// `litebox-vscode-prewrite` (pre-rewritten node / dropbear /
+    /// bash; saves ~10.5 s startup per trial; requires
+    /// `litebox_syscall_rewriter` to be copied into the build
+    /// context — `ensure_vscode_image` handles that).
+    fn vscode_image_base() -> &'static str {
+        match std::env::var("LITEBOX_VSCODE_IMAGE_STAGE").as_deref() {
+            Ok("prewrite") | Ok("litebox-vscode-prewrite") => "litebox-vscode-prewrite",
+            _ => "litebox-vscode",
+        }
+    }
+
+    /// Per-worktree resolved tag (`<stage>:wt-<sha256>`). Mirrors
+    /// `copilot_image_tag` in the outer scope.
+    fn vscode_image_tag() -> String {
+        super::image_tag::image_tag(vscode_image_base())
+    }
+
+    /// Build the requested VS Code Docker image if missing.
+    ///
+    /// For the prewrite stage, copies `litebox_syscall_rewriter`
+    /// (built by `setup()` in `target/debug/`) into the path the
+    /// Dockerfile's `COPY` instruction expects. The copy is
+    /// idempotent — re-running over an up-to-date file is a no-op
+    /// on disk but always invalidates the layer's cache key only
+    /// when the binary actually changes.
+    fn ensure_vscode_image(ws_root: &Path) {
+        let stage = vscode_image_base();
+        let tag = vscode_image_tag();
+        let check = Command::new("docker")
+            .args(["image", "inspect", &tag])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if matches!(check, Ok(s) if s.success()) {
+            return;
+        }
+        eprintln!("Building {tag} Docker image (stage={stage})...");
+
+        if stage == "litebox-vscode-prewrite" {
+            // The prewrite stage's `COPY
+            // litebox_tool_executor/rootfs/litebox_syscall_rewriter
+            // /tmp/rewriter` instruction needs the rewriter binary
+            // at that path in the build context. setup() already
+            // built it in target/debug/.
+            let rewriter_src = super::debug_dir().join("litebox_syscall_rewriter");
+            let rewriter_dst =
+                ws_root.join("litebox_tool_executor/rootfs/litebox_syscall_rewriter");
+            std::fs::copy(&rewriter_src, &rewriter_dst).unwrap_or_else(|e| {
+                panic!(
+                    "ensure_vscode_image: copy {} -> {} for prewrite stage: {e}",
+                    rewriter_src.display(),
+                    rewriter_dst.display(),
+                )
+            });
+        }
+
+        let dockerfile = ws_root.join("litebox_tool_executor/rootfs/Dockerfile");
+        let status = Command::new("docker")
+            .args(["build", "--target", stage, "-t", &tag, "-f"])
+            .arg(&dockerfile)
+            .arg(ws_root)
+            .status()
+            .expect("docker build vscode image");
+        assert!(
+            status.success(),
+            "docker build {tag} (stage={stage}) failed"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Concurrency cap
+    // ───────────────────────────────────────────────────────────────
+
+    fn jobs_cap() -> usize {
+        std::env::var("LITEBOX_VSCODE_JOBS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    }
+
+    fn vscode_semaphore() -> &'static std::sync::Mutex<usize> {
+        static SEM: OnceLock<std::sync::Mutex<usize>> = OnceLock::new();
+        SEM.get_or_init(|| std::sync::Mutex::new(jobs_cap()))
+    }
+
+    /// Tiny manual semaphore: acquire a slot or sleep. Mirrors
+    /// `CopilotPermit` — keeps VS Code Server trials from saturating
+    /// dockerd and from racing each other on port allocation in
+    /// the cross-SSH scenario.
+    struct VsCodePermit;
+
+    impl VsCodePermit {
+        fn acquire() -> Self {
+            loop {
+                {
+                    let mut g = vscode_semaphore().lock().expect("vscode sem");
+                    if *g > 0 {
+                        *g -= 1;
+                        return VsCodePermit;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    impl Drop for VsCodePermit {
+        fn drop(&mut self) {
+            if let Ok(mut g) = vscode_semaphore().lock() {
+                *g += 1;
+            }
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Per-pass container spec
+    // ───────────────────────────────────────────────────────────────
+
+    /// Build the per-trial container spec. Same shape as
+    /// `build_copilot_spec` (native = bare dropbear; litebox =
+    /// `litebox_tool_executor --ssh`), but pointed at the
+    /// `litebox-vscode[-prewrite]` image. The fixture dir is
+    /// bind-mounted at `/workspace` so scenarios can stage
+    /// patched scripts or other inputs there and reach them
+    /// from the container.
+    fn build_vscode_spec(pass: &str, fixture_dir: &Path) -> super::framework::ContainerSpec {
+        let bin_dir = super::debug_dir();
+        let mut docker_args: Vec<String> = vec![
+            "--cap-add".into(),
+            "SYS_PTRACE".into(),
+            "-p".into(),
+            "127.0.0.1:0:22".into(),
+            "-v".into(),
+            format!("{}:/opt/litebox:ro", bin_dir.display()),
+            "-v".into(),
+            format!("{}:/workspace", fixture_dir.display()),
+        ];
+        // Pass through the same env vars `build_copilot_spec` does
+        // so a session's broker/runner tuning knobs apply uniformly.
+        for var in [
+            "LITEBOX_EAGER_BROKER_SOCKETPAIR",
+            "LITEBOX_EAGER_BROKER_SOCKETSEQPACKET",
+            "LITEBOX_BROKER_TCP_CONN",
+            "LITEBOX_BROKER_INET_RAW",
+            "LITEBOX_BROKER_INET_DELAY_NS",
+            "LITEBOX_PE10_DIAG",
+            "LITEBOX_PE5_DIAG",
+            "LITEBOX_CLEANUP_DELAY_MS",
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                docker_args.push("-e".into());
+                docker_args.push(format!("{var}={val}"));
+            }
+        }
+        let command: Vec<String> = match pass {
+            "native" => vec![
+                "/usr/sbin/dropbear".into(),
+                "-F".into(),
+                "-E".into(),
+                "-B".into(),
+                "-R".into(),
+                "-p".into(),
+                "22".into(),
+            ],
+            "litebox" => vec![
+                "/opt/litebox/litebox_tool_executor".into(),
+                "--rootfs".into(),
+                "/".into(),
+                "--record-baseline".into(),
+                "--ssh".into(),
+                "--ssh-port".into(),
+                "22".into(),
+            ],
+            _ => panic!("unknown pass {pass}"),
+        };
+        super::framework::ContainerSpec {
+            image: vscode_image_tag(),
+            docker_args,
+            command,
+            detached: true,
+            timeout_secs: None,
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Trial registration
+    // ───────────────────────────────────────────────────────────────
+
+    /// All trial scenarios, in declared order. Each registers a
+    /// `native::vscode::<id>` and `litebox::vscode::<id>` Trial.
+    const SCENARIOS: &[&str] = &[
+        "bootstrap",
+        "server_listen",
+        "connect_loopback",
+        "connect_cross_ssh",
+    ];
+
+    /// Register every `vscode::<scenario>` Trial pair. Called
+    /// unconditionally from `main()` so the dashboard universe
+    /// stays consistent and the autonomous `--fill` selector can
+    /// pick them up.
+    pub(super) fn register_trials(trials: &mut Vec<Trial>) {
+        for scn in SCENARIOS {
+            for pass in ["native", "litebox"] {
+                let name = format!("{pass}::vscode::{scn}");
+                let pass_owned = pass.to_string();
+                let scn_owned = (*scn).to_string();
+                trials.push(Trial::test(name, move || {
+                    run_scenario(&pass_owned, &scn_owned)
+                }));
+            }
+        }
+    }
+
+    /// Dispatch on scenario id. Each scenario function is
+    /// self-contained: acquire permit, ensure image, build spec,
+    /// run trial via `framework::run_trial`.
+    fn run_scenario(pass: &str, scenario_id: &str) -> Result<(), Failed> {
+        match scenario_id {
+            "bootstrap" => run_bootstrap(pass),
+            "server_listen" => run_server_listen(pass),
+            "connect_loopback" => run_connect_loopback(pass),
+            "connect_cross_ssh" => run_connect_cross_ssh(pass),
+            other => Err(Failed::from(format!("unknown vscode scenario: {other}"))),
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Scenario stubs — bodies land in vscode-{bootstrap,...}-scenario
+    // todos. Each fails loudly until implemented so the trial set is
+    // present in the dashboard universe from skeleton commit onward.
+    // ───────────────────────────────────────────────────────────────
+
+    fn run_bootstrap(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "bootstrap").map_err(Failed::from)?;
+        ensure_vscode_image(&super::workspace_root());
+
+        // Stage the captured bootstrap script into the per-trial
+        // fixture directory (bind-mounted at /workspace in the
+        // container). We patch two things at runtime:
+        //   1) The hardcoded COMMIT_ID in the captured script with
+        //      whatever commit the Docker image has staged. The
+        //      Dockerfile pre-installs the CLI as both `code` and
+        //      `code-${VSCODE_COMMIT}`, but the script's "is the
+        //      CLI installed?" check looks for `code-${COMMIT_ID}`
+        //      against its hardcoded ID — without patching, the
+        //      script falls into the download path.
+        //   2) The trailing `while true; do sleep 180; printf ' ';
+        //      done` keepalive — designed to hold the SSH session
+        //      open forever while VS Code Remote-SSH uses the
+        //      backgrounded CLI. For an end-to-end test we want
+        //      the script to exit normally once it's printed its
+        //      success markers.
+        let template =
+            include_str!("../../litebox_tool_executor/scripts/vscode/vscode-bootstrap-captured.sh");
+        let script_path = fixture_dir.join("bootstrap.sh");
+
+        let test_id = "vscode::bootstrap".to_string();
+        let spec = build_vscode_spec(pass, &fixture_dir);
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "bootstrap",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                // Step 1: detect the installed CLI commit hash.
+                let commit = match detect_cli_commit(port, Duration::from_secs(30)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("detect_cli_commit: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                if commit.len() != 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return drive_fail(
+                        format!("detected commit not a 40-hex-char hash: {commit:?}"),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+
+                // Step 2: patch the captured script.
+                let patched = template
+                    .replace(
+                        "COMMIT_ID=\"41dd792b5e652393e7787322889ed5fdc58bd75b\"",
+                        &format!("COMMIT_ID=\"{commit}\""),
+                    )
+                    .replace("while true; do sleep 180; printf ' '; done", "exit 0");
+                if patched == template {
+                    return drive_fail(
+                        "bootstrap script patch produced no changes — the captured \
+                         script no longer contains the expected commit-id or \
+                         keepalive-loop lines"
+                            .to_string(),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+                if let Err(e) = std::fs::write(&script_path, patched.as_bytes()) {
+                    return drive_fail(
+                        format!("write patched script {}: {e}", script_path.display()),
+                        t_docker_start_ms,
+                        t_useful_start.elapsed().as_millis(),
+                    );
+                }
+
+                // Step 3: run `sh /workspace/bootstrap.sh` over SSH
+                // and read its complete output.
+                let output = match run_remote_script(port, "/workspace/bootstrap.sh", 120) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("run_remote_script: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-bootstrap");
+                let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &output);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+
+                // Step 4: validate markers.
+                let stripped = copilot::strip_ansi(&output);
+                let has_start = stripped.contains(": start");
+                let has_end = stripped.contains(": end");
+                let has_listening = stripped.contains("listeningOn==");
+                let has_found = stripped.contains("Found existing installation");
+
+                if has_start && has_end && has_listening && has_found {
+                    return super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    };
+                }
+                let preview: String = stripped.chars().take(1200).collect();
+                drive_fail(
+                    format!(
+                        "bootstrap markers missing: start={has_start} end={has_end} \
+                         listening={has_listening} found_existing_install={has_found} \
+                         (detected_commit={commit}). raw log: {}\n\
+                         first 1200 chars (ANSI-stripped):\n{preview}",
+                        log_dir.join(format!("{safe}.raw.log")).display(),
+                    ),
+                    t_docker_start_ms,
+                    t_useful_ms,
+                )
+            },
+        )
+    }
+
+    fn run_server_listen(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "server_listen").map_err(Failed::from)?;
+        ensure_vscode_image(&super::workspace_root());
+
+        let test_id = "vscode::server_listen".to_string();
+        let spec = build_vscode_spec(pass, &fixture_dir);
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "server_listen",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let commit = match detect_cli_commit(port, Duration::from_secs(30)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("detect_cli_commit: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                // One SSH session: start the CLI in the background,
+                // poll its log for "Listening on N.N.N.N:PORT", emit
+                // a stable VSL_PORT=<port> marker on stdout. We use
+                // host-side `nohup` + `disown` to detach the CLI
+                // from the SSH session so it survives the session's
+                // exit; whether it actually stays alive after the
+                // session closes is incidental — we only validate
+                // that it reached the listening state.
+                let cli_path = format!("/root/.vscode-server/code-{commit}");
+                let remote_cmd = build_server_listen_remote_cmd(&cli_path, 60);
+                let output = match run_remote_command_retry(port, &remote_cmd, 90) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("run_remote_command_retry: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-server_listen");
+                let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &output);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+                let stripped = copilot::strip_ansi(&output);
+
+                match parse_vsl_port(&stripped) {
+                    Some(captured) if captured != 0 => super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    },
+                    Some(_) => drive_fail(
+                        format!(
+                            "VSL_PORT=0 parsed from output (CLI bound to port 0?). raw log: {}",
+                            log_dir.join(format!("{safe}.raw.log")).display(),
+                        ),
+                        t_docker_start_ms,
+                        t_useful_ms,
+                    ),
+                    None => {
+                        let preview: String = stripped.chars().take(1500).collect();
+                        drive_fail(
+                            format!(
+                                "no VSL_PORT marker in `code command-shell` output \
+                                 (detected_commit={commit}). raw log: {}\n\
+                                 first 1500 chars (ANSI-stripped):\n{preview}",
+                                log_dir.join(format!("{safe}.raw.log")).display(),
+                            ),
+                            t_docker_start_ms,
+                            t_useful_ms,
+                        )
+                    }
+                }
+            },
+        )
+    }
+
+    fn run_connect_loopback(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "connect_loopback").map_err(Failed::from)?;
+        ensure_vscode_image(&super::workspace_root());
+
+        let test_id = "vscode::connect_loopback".to_string();
+        let spec = build_vscode_spec(pass, &fixture_dir);
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "connect_loopback",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let commit = match detect_cli_commit(port, Duration::from_secs(30)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("detect_cli_commit: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                // Same SSH session does the start-CLI-then-connect
+                // sequence. The CLI stays alive for the entire
+                // session lifetime, so the connect runs while it's
+                // still listening.
+                let cli_path = format!("/root/.vscode-server/code-{commit}");
+                let remote_cmd = build_connect_loopback_remote_cmd(&cli_path, 60);
+                let output = match run_remote_command_retry(port, &remote_cmd, 120) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("run_remote_command_retry: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-connect_loopback");
+                let _ = std::fs::write(log_dir.join(format!("{safe}.raw.log")), &output);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+                let stripped = copilot::strip_ansi(&output);
+
+                let port_captured = parse_vsl_port(&stripped);
+                let conn_ok = stripped.lines().any(|l| l.trim() == "VSL_CONN_OK");
+
+                match (port_captured, conn_ok) {
+                    (Some(p), true) if p != 0 => super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    },
+                    (port_opt, conn_opt) => {
+                        let preview: String = stripped.chars().take(1500).collect();
+                        drive_fail(
+                            format!(
+                                "connect_loopback failed: port={port_opt:?} conn_ok={conn_opt} \
+                                 (detected_commit={commit}). raw log: {}\n\
+                                 first 1500 chars (ANSI-stripped):\n{preview}",
+                                log_dir.join(format!("{safe}.raw.log")).display(),
+                            ),
+                            t_docker_start_ms,
+                            t_useful_ms,
+                        )
+                    }
+                }
+            },
+        )
+    }
+
+    fn run_connect_cross_ssh(pass: &str) -> Result<(), Failed> {
+        let _permit = VsCodePermit::acquire();
+        let fixture_dir = prep_fixture_dir(pass, "connect_cross_ssh").map_err(Failed::from)?;
+        ensure_vscode_image(&super::workspace_root());
+
+        let test_id = "vscode::connect_cross_ssh".to_string();
+        let spec = build_vscode_spec(pass, &fixture_dir);
+
+        super::framework::run_trial(
+            pass_static(pass),
+            &test_id,
+            "vscode",
+            "connect_cross_ssh",
+            spec,
+            move |container| {
+                let t_dispatch = Instant::now();
+                let Some(&port) = container.published_ports.get(&22) else {
+                    return drive_fail(
+                        format!("container {} did not publish port 22", container.name),
+                        0,
+                        0,
+                    );
+                };
+                if let Err(e) = copilot::wait_for_sshd(port, Duration::from_secs(30)) {
+                    return drive_fail(
+                        format!("wait_for_sshd port {port}: {e}"),
+                        t_dispatch.elapsed().as_millis(),
+                        0,
+                    );
+                }
+                let t_useful_start = Instant::now();
+                let t_docker_start_ms = t_useful_start.duration_since(t_dispatch).as_millis();
+
+                let commit = match detect_cli_commit(port, Duration::from_secs(30)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("detect_cli_commit: {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                let log_dir = super::log_dir();
+                let _ = std::fs::create_dir_all(log_dir);
+                let safe = format!("vscode-{pass}-connect_cross_ssh");
+
+                // SSH session A — starts the CLI in background,
+                // captures the port from the CLI's log, writes the
+                // port to /tmp/vscode-port-A inside the container,
+                // then exits. The CLI keeps running after session A
+                // ends because of `nohup` + `--parent-process-id 1`
+                // (= the container's init = sshd/litebox; never
+                // exits during the trial) + `< /dev/null`.
+                let cli_path = format!("/root/.vscode-server/code-{commit}");
+                let session_a_cmd = build_cross_ssh_session_a_cmd(&cli_path, 60);
+                let session_a_out = match run_remote_command_retry(port, &session_a_cmd, 90) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("session A (start CLI + capture port): {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.session-a.log")),
+                    &session_a_out,
+                );
+                let stripped_a = copilot::strip_ansi(&session_a_out);
+                let captured_port = match parse_vsl_port(&stripped_a) {
+                    Some(p) if p != 0 => p,
+                    _ => {
+                        let preview: String = stripped_a.chars().take(1500).collect();
+                        return drive_fail(
+                            format!(
+                                "session A: no VSL_PORT marker \
+                                 (detected_commit={commit}). session-a log: {}\n\
+                                 first 1500 chars (ANSI-stripped):\n{preview}",
+                                log_dir.join(format!("{safe}.session-a.log")).display(),
+                            ),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+
+                // SSH session B — a completely fresh SSH session
+                // to the same container. Connects to the port
+                // session A told us about. Under litebox this
+                // exercises cross-worker loopback TCP (each SSH
+                // session is its own dropbear → bash worker tree).
+                let session_b_cmd = build_cross_ssh_session_b_cmd(captured_port);
+                let session_b_out = match run_remote_command_retry(port, &session_b_cmd, 30) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return drive_fail(
+                            format!("session B (cross-ssh connect to port {captured_port}): {e}"),
+                            t_docker_start_ms,
+                            t_useful_start.elapsed().as_millis(),
+                        );
+                    }
+                };
+                let _ = std::fs::write(
+                    log_dir.join(format!("{safe}.session-b.log")),
+                    &session_b_out,
+                );
+                let stripped_b = copilot::strip_ansi(&session_b_out);
+
+                let t_useful_ms = t_useful_start.elapsed().as_millis();
+                let conn_ok = stripped_b.lines().any(|l| l.trim() == "VSL_CONN_OK");
+
+                if conn_ok {
+                    super::framework::DriveResult {
+                        verdict: "pass",
+                        detail: None,
+                        t_docker_start_ms,
+                        t_useful_ms,
+                        sub_phases: super::SubPhaseMs::default(),
+                        t_docker_spawn_ms: None,
+                        t_litebox_init_ms: None,
+                        t_harness_load_ms: None,
+                    }
+                } else {
+                    let preview: String = stripped_b.chars().take(1500).collect();
+                    drive_fail(
+                        format!(
+                            "session B: no VSL_CONN_OK marker \
+                             (port from session A = {captured_port}). \
+                             session-b log: {}\n\
+                             first 1500 chars (ANSI-stripped):\n{preview}",
+                            log_dir.join(format!("{safe}.session-b.log")).display(),
+                        ),
+                        t_docker_start_ms,
+                        t_useful_ms,
+                    )
+                }
+            },
+        )
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Shared helpers (kept ready for scenario bodies)
+    // ───────────────────────────────────────────────────────────────
+
+    /// Per-trial fixture directory. Cleared and recreated at the
+    /// start of each scenario so a re-run sees a fresh `/workspace`.
+    fn vscode_fixture_dir(pass: &str, scenario_id: &str) -> std::path::PathBuf {
+        super::target_dir()
+            .join("vscode-fixtures")
+            .join(format!("{pass}-{scenario_id}"))
+    }
+
+    /// Create + return a fresh fixture dir. Borrowed from the
+    /// per-scenario bootstrap in `run_startup_then_exit` /
+    /// `run_copilot_trial`.
+    fn prep_fixture_dir(pass: &str, scenario_id: &str) -> Result<std::path::PathBuf, String> {
+        let dir = vscode_fixture_dir(pass, scenario_id);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("create fixture dir {}: {e}", dir.display()))?;
+        Ok(dir)
+    }
+
+    /// Convert the static `&str` pass label into a `&'static str`
+    /// suitable for `framework::run_trial`'s typed pass argument.
+    fn pass_static(pass: &str) -> &'static str {
+        match pass {
+            "native" => "native",
+            "litebox" => "litebox",
+            _ => "unknown",
+        }
+    }
+
+    /// Build a uniform `DriveResult::FAIL` envelope from a detail
+    /// string and the timing fields the caller has already captured.
+    /// Hides the noise of the seven-field struct literal at each
+    /// failure site.
+    fn drive_fail(
+        detail: String,
+        t_docker_start_ms: u128,
+        t_useful_ms: u128,
+    ) -> super::framework::DriveResult {
+        super::framework::DriveResult {
+            verdict: "FAIL",
+            detail: Some(detail),
+            t_docker_start_ms,
+            t_useful_ms,
+            sub_phases: super::SubPhaseMs::default(),
+            t_docker_spawn_ms: None,
+            t_litebox_init_ms: None,
+            t_harness_load_ms: None,
+        }
+    }
+
+    /// Run a shell command over SSH (no PTY needed; `-T` disables
+    /// remote PTY allocation so bytes flow through clean pipes),
+    /// read its merged stdout/stderr to EOF within `timeout_secs`,
+    /// and return the captured output as a String.
+    ///
+    /// Uses a single SSH session: argv is the literal remote
+    /// command. Caller is responsible for any shell-quoting inside
+    /// `remote_cmd`.
+    fn run_remote_command(
+        port: u16,
+        remote_cmd: &str,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let pty = Pty::open()?;
+        let mut argv = copilot::ssh_argv_base(port);
+        argv.push(remote_cmd.to_string());
+        let pid = pty.fork_exec(&argv, /* ctrl_tty = */ true)?;
+        let result = copilot::read_with_deadline(&pty, Duration::from_secs(timeout_secs))?;
+        let _ = copilot::wait_pid(pid, Duration::from_secs(10));
+        Ok(result)
+    }
+
+    /// Two-shot retry for `run_remote_command` to absorb the
+    /// "dropbear accepted TCP before SSH handshake was ready"
+    /// flake that `drive_pminus` already documents in mod copilot.
+    fn run_remote_command_retry(
+        port: u16,
+        remote_cmd: &str,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let first = run_remote_command(port, remote_cmd, timeout_secs)?;
+        if first.contains("kex_exchange_identification") || first.trim().is_empty() {
+            std::thread::sleep(Duration::from_secs(7));
+            return run_remote_command(port, remote_cmd, timeout_secs);
+        }
+        Ok(first)
+    }
+
+    /// Detect the installed VS Code CLI commit hash inside the
+    /// running container by calling `/root/.vscode-server/code
+    /// --version` over SSH and finding a 40-char lowercase-hex
+    /// token anywhere in the output. `code --version` prints
+    /// `code <ver> (commit <40-hex>)\n<arch>` — the original VSI
+    /// code grepped with Perl `'commit \K[a-f0-9]{40}'`; a plain
+    /// scan over the bytes is equivalent and doesn't need a regex
+    /// dep.
+    fn detect_cli_commit(port: u16, timeout: Duration) -> Result<String, String> {
+        let cmd = "/root/.vscode-server/code --version 2>/dev/null";
+        let output = run_remote_command_retry(port, cmd, timeout.as_secs())?;
+        if let Some(commit) = extract_first_hex40(&output) {
+            return Ok(commit);
+        }
+        Err(format!(
+            "no 40-char hex commit substring in `code --version` output:\n{}",
+            output.chars().take(800).collect::<String>(),
+        ))
+    }
+
+    /// Return the first contiguous 40-lowercase-hex substring in
+    /// `s`, or None. Used to lift the VS Code commit hash out of
+    /// `code --version` output without pulling in a regex dep.
+    ///
+    /// The contract is exercised end-to-end by `native::vscode::bootstrap`:
+    /// that trial calls `detect_cli_commit` against the live `code`
+    /// binary in the `litebox-vscode` image; a regression in this
+    /// helper would produce a precise FAIL there (`detect_cli_commit:
+    /// no 40-char hex commit substring …`). The harness uses
+    /// `libtest_mimic` (`harness = false`) so `#[test]` functions
+    /// here would not be auto-collected — the integration trial is
+    /// the contract test.
+    fn extract_first_hex40(s: &str) -> Option<String> {
+        let bytes = s.as_bytes();
+        let is_lc_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        let mut i = 0;
+        while i + 40 <= bytes.len() {
+            if !is_lc_hex(bytes[i]) {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j < bytes.len() && is_lc_hex(bytes[j]) {
+                j += 1;
+            }
+            // Exactly 40 hex chars — VS Code's commit format. A
+            // longer run is some other hex blob; skip it.
+            if j - i == 40 {
+                return Some(s[i..j].to_string());
+            }
+            i = j + 1;
+        }
+        None
+    }
+
+    /// Run an executable script that lives at `remote_script_path`
+    /// in the container (typically `/workspace/<name>.sh` via the
+    /// fixture bind mount). Uses `sh <path>` so the script doesn't
+    /// need the executable bit set.
+    fn run_remote_script(
+        port: u16,
+        remote_script_path: &str,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let cmd = format!("sh {}", copilot::shell_quote(remote_script_path));
+        run_remote_command_retry(port, &cmd, timeout_secs)
+    }
+
+    /// Construct the remote-shell command for `vscode::server_listen`.
+    /// One SSH session does it all: start the CLI in background,
+    /// poll its log up to `poll_secs` times (1 sample/s), emit
+    /// `VSL_PORT=<port>` once the listen line shows up, exit.
+    ///
+    /// `nohup` + `disown` + `< /dev/null` mirrors the bootstrap
+    /// script's CLI launch shape. The CLI's `--parent-process-id`
+    /// gets bound to PID 1 (the container's init = sshd/litebox)
+    /// so the CLI doesn't auto-exit when our SSH session ends —
+    /// useful for the downstream `connect_loopback` /
+    /// `connect_cross_ssh` scenarios.
+    fn build_server_listen_remote_cmd(cli_path: &str, poll_secs: u32) -> String {
+        let cli_q = copilot::shell_quote(cli_path);
+        let token = "litebox-vscode-itest-token";
+        format!(
+            "set -e; \
+             LOG=/tmp/vscode-server-listen.log; \
+             rm -f \"$LOG\"; \
+             nohup env VSCODE_CLI_REQUIRE_TOKEN={token} \
+                {cli_q} command-shell \
+                --cli-data-dir /tmp/vscode-cli-data \
+                --parent-process-id 1 \
+                --on-host=127.0.0.1 --on-port=0 \
+                > \"$LOG\" 2>&1 < /dev/null & \
+             CLI_PID=$!; \
+             disown $CLI_PID 2>/dev/null || true; \
+             echo VSL_CLI_PID=$CLI_PID; \
+             for _ in $(seq 1 {poll_secs}); do \
+                LISTEN_LINE=$(grep -aE 'Listening on .+' \"$LOG\" 2>/dev/null | head -1); \
+                if [ -n \"$LISTEN_LINE\" ]; then \
+                    PORT=$(echo \"$LISTEN_LINE\" | sed -nE 's/.*:([0-9]+).*/\\1/p'); \
+                    if [ -n \"$PORT\" ]; then \
+                        echo VSL_PORT=$PORT; \
+                        echo VSL_LISTEN_LINE=$LISTEN_LINE; \
+                        exit 0; \
+                    fi; \
+                fi; \
+                if ! kill -0 $CLI_PID 2>/dev/null; then \
+                    echo VSL_CLI_DIED; \
+                    cat \"$LOG\"; \
+                    exit 1; \
+                fi; \
+                sleep 1; \
+             done; \
+             echo VSL_NO_PORT; \
+             cat \"$LOG\"; \
+             exit 1"
+        )
+    }
+
+    /// Parse the `VSL_PORT=<u16>` marker emitted by
+    /// `build_server_listen_remote_cmd`. Returns `Some(port)` on
+    /// successful parse, `None` if the marker is absent or
+    /// non-numeric. End-to-end contracted by the
+    /// `native::vscode::server_listen` trial (= the
+    /// `libtest_mimic` harness doesn't run `#[test]` functions).
+    fn parse_vsl_port(s: &str) -> Option<u16> {
+        for line in s.lines() {
+            if let Some(rest) = line.trim().strip_prefix("VSL_PORT=") {
+                if let Ok(p) = rest.trim().parse::<u16>() {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    /// Remote-shell program for `vscode::connect_loopback`. Reuses
+    /// the start-CLI-and-poll logic from
+    /// `build_server_listen_remote_cmd`, then opens a TCP
+    /// connection to the captured port via bash's `/dev/tcp/`
+    /// pseudo-device, gated on a 3 s `timeout` so a litebox-side
+    /// bug that hangs `connect(2)` produces a bounded FAIL
+    /// instead of running out the trial deadline.
+    ///
+    /// Just the TCP handshake completing is sufficient — we don't
+    /// try to speak the VS Code tunnel protocol (custom mTLS-ish
+    /// shape). A successful 3-way handshake proves the CLI bound
+    /// the port AND that loopback TCP delivery works through
+    /// litebox's broker.
+    fn build_connect_loopback_remote_cmd(cli_path: &str, poll_secs: u32) -> String {
+        let cli_q = copilot::shell_quote(cli_path);
+        let token = "litebox-vscode-itest-token";
+        format!(
+            "set -e; \
+             LOG=/tmp/vscode-connect-loopback.log; \
+             rm -f \"$LOG\"; \
+             nohup env VSCODE_CLI_REQUIRE_TOKEN={token} \
+                {cli_q} command-shell \
+                --cli-data-dir /tmp/vscode-cli-data \
+                --parent-process-id 1 \
+                --on-host=127.0.0.1 --on-port=0 \
+                > \"$LOG\" 2>&1 < /dev/null & \
+             CLI_PID=$!; \
+             disown $CLI_PID 2>/dev/null || true; \
+             echo VSL_CLI_PID=$CLI_PID; \
+             PORT=; \
+             for _ in $(seq 1 {poll_secs}); do \
+                LISTEN_LINE=$(grep -aE 'Listening on .+' \"$LOG\" 2>/dev/null | head -1); \
+                if [ -n \"$LISTEN_LINE\" ]; then \
+                    PORT=$(echo \"$LISTEN_LINE\" | sed -nE 's/.*:([0-9]+).*/\\1/p'); \
+                    if [ -n \"$PORT\" ]; then \
+                        echo VSL_PORT=$PORT; \
+                        break; \
+                    fi; \
+                fi; \
+                if ! kill -0 $CLI_PID 2>/dev/null; then \
+                    echo VSL_CLI_DIED; \
+                    cat \"$LOG\"; \
+                    exit 1; \
+                fi; \
+                sleep 1; \
+             done; \
+             if [ -z \"$PORT\" ]; then \
+                echo VSL_NO_PORT; \
+                cat \"$LOG\"; \
+                exit 1; \
+             fi; \
+             if timeout 3 bash -c \"exec 3<>/dev/tcp/127.0.0.1/$PORT\" 2>&1; then \
+                echo VSL_CONN_OK; \
+                exit 0; \
+             else \
+                echo VSL_CONN_FAIL exit=$?; \
+                cat \"$LOG\"; \
+                exit 1; \
+             fi"
+        )
+    }
+
+    /// Remote-shell program for SSH session A of
+    /// `vscode::connect_cross_ssh`. Same start-CLI-and-poll shape
+    /// as `build_server_listen_remote_cmd`, but additionally
+    /// writes the captured port to `/tmp/vscode-port-A` in the
+    /// container's filesystem so session B can read it from a
+    /// completely separate SSH session. Exits after emitting
+    /// `VSL_PORT=` (the CLI keeps running because of `nohup` +
+    /// `--parent-process-id 1`).
+    fn build_cross_ssh_session_a_cmd(cli_path: &str, poll_secs: u32) -> String {
+        let cli_q = copilot::shell_quote(cli_path);
+        let token = "litebox-vscode-itest-token";
+        format!(
+            "set -e; \
+             LOG=/tmp/vscode-cross-ssh.log; \
+             PORT_FILE=/tmp/vscode-port-A; \
+             rm -f \"$LOG\" \"$PORT_FILE\"; \
+             nohup env VSCODE_CLI_REQUIRE_TOKEN={token} \
+                {cli_q} command-shell \
+                --cli-data-dir /tmp/vscode-cli-data \
+                --parent-process-id 1 \
+                --on-host=127.0.0.1 --on-port=0 \
+                > \"$LOG\" 2>&1 < /dev/null & \
+             CLI_PID=$!; \
+             disown $CLI_PID 2>/dev/null || true; \
+             echo VSL_CLI_PID=$CLI_PID; \
+             for _ in $(seq 1 {poll_secs}); do \
+                LISTEN_LINE=$(grep -aE 'Listening on .+' \"$LOG\" 2>/dev/null | head -1); \
+                if [ -n \"$LISTEN_LINE\" ]; then \
+                    PORT=$(echo \"$LISTEN_LINE\" | sed -nE 's/.*:([0-9]+).*/\\1/p'); \
+                    if [ -n \"$PORT\" ]; then \
+                        printf '%s' \"$PORT\" > \"$PORT_FILE\"; \
+                        echo VSL_PORT=$PORT; \
+                        exit 0; \
+                    fi; \
+                fi; \
+                if ! kill -0 $CLI_PID 2>/dev/null; then \
+                    echo VSL_CLI_DIED; \
+                    cat \"$LOG\"; \
+                    exit 1; \
+                fi; \
+                sleep 1; \
+             done; \
+             echo VSL_NO_PORT; \
+             cat \"$LOG\"; \
+             exit 1"
+        )
+    }
+
+    /// Remote-shell program for SSH session B of
+    /// `vscode::connect_cross_ssh`. Connects to the CLI's bound
+    /// port (passed in directly from the host so we don't depend
+    /// on reading session A's `/tmp/vscode-port-A` file — the
+    /// host already parsed VSL_PORT from session A's stdout). 3 s
+    /// `timeout` on the connect bounds litebox-side hangs.
+    fn build_cross_ssh_session_b_cmd(captured_port: u16) -> String {
+        format!(
+            "if timeout 3 bash -c \"exec 3<>/dev/tcp/127.0.0.1/{captured_port}\" 2>&1; then \
+                echo VSL_CONN_OK; \
+                exit 0; \
+             else \
+                echo VSL_CONN_FAIL exit=$?; \
+                exit 1; \
+             fi"
+        )
     }
 }
 

@@ -134,6 +134,8 @@ flowchart TD
 | Mux relay topology retired | ✅ | All CL3 / mux test families | Phase 3 D6/D7 — `multiplexer.rs` and `litebox::pipes` module deleted. |
 | HostPassthroughFd rename + install-site invariant audit | ✅ | INV families | Session 16 round 4 (`goal3-externalfd-rename`, commit `25dadda4`). Outbound TCP raw-host fallback deleted (broker TCP mandatory). |
 | cli → node transition (StaticPieMusl → NonPieGlibc) | ✅ | `Dpg1SpmDng.*` agent + `VS.shape.smoke` | Covered by canonical agent tree per `litebox_test_harness/CLAUDE.md`. |
+| **Goal-B end-to-end validation: VS Code Remote Server inside Litebox** | ✅ | `vscode::bootstrap`, `vscode::server_listen`, `vscode::connect_loopback`, `vscode::connect_cross_ssh` (4 scenarios × 2 passes = 8 trials, in `litebox_test_harness/tests/integration.rs` `mod vscode`) | Work stream `wportnoy/vscode-integration-tests` (merge `0d000938`, component commits `9f304b6c..ec79648b`). Mirrors `mod copilot`'s shape: per-pass `docker run` of the `litebox-vscode` Dockerfile stage, host-side driven via SSH-over-PTY. Native: 4/4 pass in ~22 s. Litebox: 4/4 pass post-`e4bc258f` (was 0/4 pre-fix — the CLI's `Listening on N.N.N.N:PORT` line sat in the 9P write-behind buffer indefinitely after the CLI entered its `epoll_pwait` accept loop; cross-process bash subshells never saw it). Image flexibility: `LITEBOX_VSCODE_IMAGE_STAGE=prewrite` flips to the `litebox-vscode-prewrite` Dockerfile stage (pre-rewritten `node`/`dropbear`/`bash`); `ensure_vscode_image` copies the workspace-built `litebox_syscall_rewriter` into the build context automatically. Concurrency cap: `LITEBOX_VSCODE_JOBS` (default 1). `litebox::vscode::connect_cross_ssh` is a parallelism-flake candidate at high `LITEBOX_TEST_JOBS` (passes in isolation; CLI bind latency × 8-container CPU contention pushes past the 60 s polling window — same shape as the documented "~16-test parallelism flake cluster"). See `litebox_test_harness/CLAUDE.md` § "VS Code Server integration scenarios". |
+| **9P cross-process read-after-write visibility** | ✅ | `CWF.full_visibility.{pie-glibc,nonpie-glibc,static-pie-glibc,static-pie-musl,non-pie-static-musl}.{dpg1,dpg1_dpg1,dpg2}` (5 binary types × 3 agents × 2 passes = 30 trials, in `litebox_test_harness/src/coordinator/special_cases/fs.rs`). Pre-fix: 6/30 FAIL with `"writer wrote 30 bytes, reader sees 29 bytes"` (non-PIE writer variants). Post-fix: 30/30 pass. | Surfaced and fixed by merge `0d000938` (component commit `e4bc258f`). The 9P client's per-process write-behind buffer in `litebox/src/fs/nine_p/mod.rs:331` (`WRITE_BUFFER_CAPACITY = 256 KiB`, `write_buffers: BTreeMap<Fid, WriteBuffer>`) had flush triggers (`flush_write_buffers_for_file` on read/open/seek/truncate, `flush_sibling_write_buffers` on sibling-fid writes, `flush_write_buffer` on close) that only fired on intra-process events. When the writer process went idle after its last write, the tail bytes stayed in the buffer indefinitely — cross-process readers walked straight to the 9P server, read from the host file, and saw only previously-flushed bytes. **Why this only surfaced now**: PIE-writer scenarios pass because PIE binaries can be loaded into the parent's address space and share the runner (and thus the `write_buffers` map), so the parent reader's flush trigger fires on the shared buffer. Non-PIE-writer scenarios go to separate workers with separate runners. Even PIE writers can hit the bug via fork+exec chains where bash (NonPieGlibc) opens the fd and the runner state is inherited through to the final PIE writer process whose runner the reader doesn't share. The fix sets `WRITE_BUFFER_CAPACITY = 0`, short-circuiting every write to the direct-RPC path. **Perf trade-off**: small-write-heavy workloads (cargo build emitting `.d`/`.rmeta` files) lose the coalescing benefit and pay one 9P RPC per write. **Proper perf-preserving follow-up** documented in the constant's doc-comment: small (4 KB) buffer + debounced eager-flush timer that fires Nms after the last write, bounding cross-process visibility delay while preserving tight-loop coalescing — strictly larger change that can land incrementally without re-breaking correctness. |
 
 ## What's still in flight or unmapped
 
@@ -154,14 +156,22 @@ Cross-checked against current open todos in active session
 
 The map's leaf-status flips for Goal A would be: TUI mode startup → ✅
 (unblocks Goal A and W8/W10 simultaneously). Goal B's capability nodes
-are all ✅ as of round 5 (Session 16); remaining gap is end-to-end
-validation.
+are all ✅ as of round 5 (Session 16); its end-to-end validation layer
+landed in merge `0d000938` (work stream
+`wportnoy/vscode-integration-tests`) with 4 `vscode::*` Trials all
+passing under both native and litebox after the same merge's 9P
+write-behind buffer correctness fix.
 
-After those flip, the remaining gap to declaring each goal "done"
-is *end-to-end validation* — actually running the Copilot CLI TUI
-(Goal A) and a full VS Code Remote Server session (Goal B) under
-Litebox and verifying user-visible behavior matches native. That's
-a separate validation milestone not captured here as a capability.
+After Goal A's TUI mode startup flips, the remaining gap to declaring
+each goal "done" is *end-to-end validation*. **Goal B is now covered**
+by the `vscode::*` Trials added in merge `0d000938` (running the
+actual VS Code CLI inside the litebox sandbox over SSH, validating
+bootstrap, listener bind, loopback connect, and cross-SSH connect).
+**Goal A** is similarly covered for non-LLM scenarios by the
+`copilot::tui.startup_then_exit` + `copilot::tui.bang.*` Trials
+(Session 7c1fc95d); LLM-driven Trials still depend on a GitHub token
+and the upstream model's response shape, so they remain flaky-by-
+design rather than a hard gate on Goal A.
 
 ## Maintenance
 
