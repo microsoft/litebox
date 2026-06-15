@@ -67,7 +67,7 @@ struct PhysRangeReservationInner {
 pub struct LvbsPhysPageMapInfo {
     base: *mut u8,
     size: usize,
-    _access_reservation: LvbsPhysRangeReservation,
+    access_reservation: LvbsPhysRangeReservation,
 }
 
 struct LvbsPhysRangeReservation {
@@ -79,7 +79,7 @@ impl LvbsPhysPageMapInfo {
         Self {
             base,
             size,
-            _access_reservation: access_reservation,
+            access_reservation,
         }
     }
 }
@@ -1466,7 +1466,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         );
 
         ManuallyDrop::into_inner(vmap_info)
-            ._access_reservation
+            .access_reservation
             .release();
         Ok(())
     }
