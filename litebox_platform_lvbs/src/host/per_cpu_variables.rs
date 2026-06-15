@@ -61,6 +61,8 @@ pub struct PerCpuVariables {
     /// True while the preemption timer is armed (see `arch::timer`).
     /// Zero-initialized to `false`.
     pub(crate) preemption_armed: Cell<bool>,
+    /// Set when a preemption timer killed user-mode code.
+    pub(crate) preemption_timeout_killed_user: Cell<bool>,
 }
 
 // These Hyper-V pages must be page-aligned.

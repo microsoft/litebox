@@ -215,7 +215,6 @@ extern "C" fn stimer_handler_impl(_regs: &PtRegs) {
     use crate::host::per_cpu_variables::with_per_cpu_variables;
     super::timer::eoi();
     if with_per_cpu_variables(|pcv| pcv.preemption_armed.get()) {
-        crate::debug_serial_println!("preemption timer fired in kernel mode (in scope)");
         super::timer::rearm_preemption();
     }
 }

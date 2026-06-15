@@ -202,6 +202,22 @@ pub(crate) fn rearm_preemption() {
     });
 }
 
+/// Record that a preemption timer fire killed user-mode code.
+#[inline]
+pub(crate) fn mark_user_timeout_kill() {
+    with_per_cpu_variables(|pcv| pcv.preemption_timeout_killed_user.set(true));
+}
+
+/// Consume a pending user-timeout kill notification.
+#[inline]
+pub(crate) fn take_user_timeout_kill() -> bool {
+    with_per_cpu_variables(|pcv| {
+        let killed = pcv.preemption_timeout_killed_user.get();
+        pcv.preemption_timeout_killed_user.set(false);
+        killed
+    })
+}
+
 /// Disarm the preemption timer (clear STIMER0 CONFIG.Enable) before the VP is
 /// handed back to VTL0. Called at the VTL0-return boundary (the `vtl_switch`
 /// loop); a dispatch that never armed (HVCI/HEKI) returns without touching the

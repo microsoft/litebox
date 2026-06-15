@@ -2143,7 +2143,7 @@ unsafe extern "C" fn exception_handler(
     // through to the shim, which kills the TA with TEE_ERROR_TARGET_DEAD.
     if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
         crate::arch::timer::eoi();
-        crate::serial_println!("TA exceeded its execution quantum; terminating");
+        crate::arch::timer::mark_user_timeout_kill();
     }
     match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
         ContinueOperation::Resume => {
