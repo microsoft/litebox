@@ -1,31 +1,84 @@
 {
-    "version": "2.0.0",
-    // ────────────────────────────────────────────────────────────────
-    // IMPORTANT: this demo workspace lives on NTFS
-    // (C:\src\litebox-vscode-server / /mnt/c/src/litebox-vscode-server).
-    // Docker Desktop on Windows cannot mmap ELF binaries from NTFS bind
-    // mounts (causes "unsupported version 3 of Verneed record"). So the
-    // build task builds to ~/litebox-out/ (WSL2 ext4) and the Docker
-    // run tasks mount from there. Do NOT change the mount source to
-    // C:\... or /mnt/c/... — it will segfault.
+    // ────────────────────────────────────────────────────────────
+    // LiteBox VS Code Remote Server demo tasks.
     //
-    // The canonical ext4 workspace at ~/src/litebox does NOT need
-    // --target-dir ~/litebox-out; it uses the default target/ per
-    // AGENTS.md. This file only needs the override because the demo
-    // workspace itself is on NTFS.
-    // ────────────────────────────────────────────────────────────────
+    // Assumes this workspace is opened from a WSL bash shell
+    // (`code .` from `<worktree>/litebox_tool_executor/demo-vscode-server`);
+    // VS Code's Remote-WSL extension then runs all tasks inside
+    // the same WSL distribution where the source tree lives.
+    //
+    // All paths are anchored at `${workspaceFolder}/../..`, which
+    // resolves to the **repo root of whichever worktree** this
+    // workspace is opened from. So the demo works equally well
+    // from `~/src/litebox/litebox_tool_executor/demo-vscode-server`
+    // (main worktree) and from any sibling worktree like
+    // `~/src/litebox-<work-stream>/litebox_tool_executor/demo-vscode-server`.
+    //
+    // Cargo's default `target/` directory is used — no
+    // `--target-dir` overrides. Docker can `-v` bind-mount
+    // `<worktree>/target/debug` directly (WSL ext4 is fine for
+    // ELF mmap; the old NTFS-via-`\\wsl$` workaround is no
+    // longer needed).
+    //
+    // Single-demo-at-a-time invariant: the container is named
+    // `litebox-vscode` (shared across worktrees) and binds host
+    // port `2222`. Starting a demo from worktree B while a demo
+    // from worktree A is running will: (a) `docker rm -f
+    // litebox-vscode` kills A's container, and (b) B's
+    // `docker run` then binds port 2222 cleanly. So "switch
+    // worktrees, restart demo" works; "two demos side-by-side"
+    // does not (would need per-worktree container names and
+    // ports — out of scope for the hand-driven Remote-SSH
+    // workflow where you only attach one VS Code window at a
+    // time anyway).
+    //
+    // VS Code Server hostname `--add-host` workaround: the
+    // litebox broker's DNS proxy in
+    // `litebox_broker/src/cwfd/inet_dgram_state.rs::forward_dns_query`
+    // intermittently drops responses for CNAME-heavy /
+    // Azure-traffic-manager-fronted hostnames (likely an issue
+    // with UDP-truncation TCP-fallback handling — large
+    // responses get truncated and the resolver retries via TCP,
+    // which the proxy's per-query thread doesn't currently
+    // forward). Simple A-record hostnames (github.com,
+    // example.com) resolve fine. The `--add-host` entries below
+    // hard-code IPv4 addresses for the hostnames the VS Code
+    // Server / CLI hit at startup, bypassing DNS for them
+    // entirely. IPs are correct as of the 2026-06-15 timing of
+    // this commit; they may drift over time but Azure / Microsoft
+    // edge IPs are relatively stable across years. If a future
+    // VS Code update adds a new required hostname not in this
+    // list and you see "Opening Remote..." hang in VS Code,
+    // refresh the IPs via:
+    //
+    //   for h in update.code.visualstudio.com \
+    //            vscode.download.prss.microsoft.com \
+    //            marketplace.visualstudio.com \
+    //            vscode-sync.trafficmanager.net \
+    //            default.exp-tas.com \
+    //            global.rel.tunnels.api.visualstudio.com; do
+    //     printf "%-55s %s\n" "$h" \
+    //       "$(getent ahostsv4 $h 2>/dev/null | head -1 | awk '{print $1}')"
+    //   done
+    //
+    // ────────────────────────────────────────────────────────────
+    "version": "2.0.0",
     "tasks": [
         {
-            "label": "LiteBox: Build All",
-            "type": "process",
-            "command": "wsl.exe",
-            "args": [
-                "-d", "Ubuntu", "-u", "wportnoy", "--",
-                "bash", "-lc",
-                "cd /mnt/c/src/litebox-vscode-server && mkdir -p ~/litebox-out && cargo build --target-dir ~/litebox-out -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland -p litebox_test_harness && cargo rustc --target-dir ~/litebox-out/nonpie -p litebox_test_harness -- -C link-args=-no-pie"
+            // One-shot: run all three setup steps in sequence,
+            // then start the server. Use this for first-time
+            // setup or after switching worktrees. The
+            // `dependsOrder: "sequence"` is required — without
+            // it VS Code starts the dependent tasks in parallel
+            // and the docker-run task races the docker-build.
+            "label": "LiteBox: Setup and Start VS Code Server",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "LiteBox: Build",
+                "LiteBox: Build VS Code Image",
+                "LiteBox: Start VS Code Server"
             ],
-            "group": "build",
-            "problemMatcher": "$rustc",
+            "problemMatcher": [],
             "presentation": {
                 "reveal": "always",
                 "panel": "shared",
@@ -34,9 +87,22 @@
             }
         },
         {
-            "label": "LiteBox: Build Docker Images",
+            "label": "LiteBox: Build",
             "type": "shell",
-            "command": "docker build --target litebox-vscode -t litebox-vscode -f C:\\src\\litebox-vscode-server\\litebox_tool_executor\\rootfs\\Dockerfile C:\\src\\litebox-vscode-server && docker build --target litebox-test -t litebox-test -f C:\\src\\litebox-vscode-server\\litebox_tool_executor\\rootfs\\Dockerfile C:\\src\\litebox-vscode-server",
+            "command": "cd ${workspaceFolder}/../.. && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland",
+            "group": "build",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "echo": true
+            }
+        },
+        {
+            "label": "LiteBox: Build VS Code Image",
+            "type": "shell",
+            "command": "cd ${workspaceFolder}/../.. && docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .",
             "group": "build",
             "problemMatcher": [],
             "presentation": {
@@ -49,7 +115,7 @@
         {
             "label": "LiteBox: Start VS Code Server",
             "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v \\\\wsl$\\Ubuntu\\home\\wportnoy\\litebox-out\\debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
+            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE --add-host update.code.visualstudio.com:13.107.226.70 --add-host vscode.download.prss.microsoft.com:151.101.22.172 --add-host marketplace.visualstudio.com:150.171.74.16 --add-host vscode-sync.trafficmanager.net:13.66.138.105 --add-host default.exp-tas.com:13.107.5.93 --add-host global.rel.tunnels.api.visualstudio.com:20.69.79.91 -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
@@ -62,20 +128,7 @@
         {
             "label": "LiteBox: Start VS Code Server (Debug)",
             "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v \\\\wsl$\\Ubuntu\\home\\wportnoy\\litebox-out\\debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug",
-            "problemMatcher": [],
-            "isBackground": true,
-            "presentation": {
-                "reveal": "always",
-                "panel": "dedicated",
-                "focus": false,
-                "echo": true
-            }
-        },
-        {
-            "label": "LiteBox: Start VS Code Server (Record Baseline)",
-            "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v \\\\wsl$\\Ubuntu\\home\\wportnoy\\litebox-out\\debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
+            "command": "docker rm -f litebox-vscode 2>/dev/null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE --add-host update.code.visualstudio.com:13.107.226.70 --add-host vscode.download.prss.microsoft.com:151.101.22.172 --add-host marketplace.visualstudio.com:150.171.74.16 --add-host vscode-sync.trafficmanager.net:13.66.138.105 --add-host default.exp-tas.com:13.107.5.93 --add-host global.rel.tunnels.api.visualstudio.com:20.69.79.91 -v ${workspaceFolder}/../../target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug 9999",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {
@@ -88,11 +141,24 @@
         {
             "label": "LiteBox: Stop VS Code Server",
             "type": "shell",
-            "command": "docker stop litebox-vscode",
+            "command": "docker stop litebox-vscode || true",
             "problemMatcher": [],
             "presentation": {
                 "reveal": "silent",
                 "panel": "shared"
+            }
+        },
+        {
+            "label": "LiteBox: Run Integration Tests (vscode::*)",
+            "type": "shell",
+            "command": "cd ${workspaceFolder}/../.. && cargo test -p litebox_test_harness --test integration -- 'vscode::'",
+            "group": "test",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "echo": true
             }
         }
     ]

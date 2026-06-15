@@ -1,57 +1,82 @@
 {
-    // ================================================================
-    // LiteBox VS Code Server: Full agent sandboxing
-    // ================================================================
+    // ============================================================
+    // LiteBox VS Code Remote Server demo workspace
+    // ============================================================
     //
-    // Prerequisites:
-    //   1. Build the Docker images:
-    //      Run task "LiteBox: Build Docker Images"
-    //   2. Build the binaries in WSL2:
-    //      Run task "LiteBox: Build All"
+    // Open this folder in VS Code from a WSL bash shell in ANY
+    // litebox worktree (tasks are anchored at
+    // `${workspaceFolder}/../..`, which resolves to the repo root
+    // of whichever worktree you opened the demo from — main, or
+    // any sibling work-stream worktree):
     //
-    // Setup:
-    //   remote.SSH.path and remote.SSH.showLoginTerminal have application
-    //   scope. To avoid affecting your normal SSH workflows, create a
-    //   dedicated VS Code profile:
+    //   cd <worktree>/litebox_tool_executor/demo-vscode-server
+    //   code .
     //
-    //   1. File → Preferences → Profiles → Create Profile → name it "LiteBox"
-    //   2. In the LiteBox profile's user settings (JSON), add:
-    //        "remote.SSH.showLoginTerminal": true,
-    //        "remote.SSH.remotePlatform": { "litebox": "linux" },
-    //        "remote.SSH.enableReconnection": false
-    //   And in ~/.ssh/config add ConnectionAttempts 1 + ServerAliveCountMax 1
-    //   to the litebox host block to prevent SSH/VS Code retries.
-    //   All remote.SSH.* settings have application scope — they cannot
-    //   be set per-workspace, only in user settings (Default profile).
+    // Then run the one-shot task:
     //
-    // Usage:
-    //   1. Switch to the "LiteBox" profile
-    //   2. Run task "LiteBox: Start VS Code Server"
-    //   3. Ctrl+Shift+P → "Remote-SSH: Connect to Host..." → litebox
-    //   4. All operations execute inside the sandbox
+    //   Terminal → Run Task → "LiteBox: Setup and Start VS Code Server"
     //
-    // Note: The Docker container IS the rootfs. Binaries are bind-mounted
-    // at /opt/litebox/ from ~/litebox-out/debug/ (WSL2 ext4 filesystem).
-    // NTFS bind mounts (C:\...) break ELF mmap — always mount from WSL.
+    // which runs three tasks in sequence:
+    //
+    //   1. "LiteBox: Build"                — cargo build the litebox binaries.
+    //   2. "LiteBox: Build VS Code Image"  — docker build litebox-vscode.
+    //   3. "LiteBox: Start VS Code Server" — docker run the image with --vscode-server.
+    //
+    // The three are also runnable individually if you only need to
+    // redo one step.
+    //
+    // Then in a separate VS Code window, Remote-SSH connect to
+    // `litebox` (configure `~/.ssh/config` Host litebox HostName
+    // 127.0.0.1 Port 2222 User root + empty password — dropbear
+    // is started with `-B` to allow blank-password root login for
+    // this demo).
+    //
+    // Recommended VS Code profile setup for Remote-SSH against
+    // litebox (one-time, application-scoped settings — put them
+    // in your "LiteBox" profile's user settings.json, not here):
+    //
+    //   "remote.SSH.showLoginTerminal": true,
+    //   "remote.SSH.remotePlatform": { "litebox": "linux" }
+    //
+    // (Don't add `remote.SSH.enableReconnection: false` — it's
+    // deprecated and ignored by current Remote-SSH; VS Code shows
+    // it as grayed-out unknown. The "fail fast when the demo
+    // container stops" behavior is bounded by the
+    // ConnectionAttempts 1 + ServerAliveCountMax 1 in the
+    // ~/.ssh/config block below, which clamps the underlying ssh
+    // client's reconnect window.)
+    //
+    // And in ~/.ssh/config:
+    //
+    //   Host litebox
+    //     HostName 127.0.0.1
+    //     Port 2222
+    //     User root
+    //     PreferredAuthentications password
+    //     PubkeyAuthentication no
+    //     NumberOfPasswordPrompts 1
+    //     StrictHostKeyChecking no
+    //     UserKnownHostsFile /dev/null  ; on Windows: NUL
+    //     ConnectionAttempts 1
+    //     ServerAliveCountMax 1
+    //
+    // (On Windows + WSL2, the file Remote-SSH actually reads is
+    // %USERPROFILE%\.ssh\config — VS Code on Windows uses Windows
+    // OpenSSH, not WSL's ssh. UserKnownHostsFile must be `NUL`
+    // there, not `/dev/null`.)
+    //
+    // ============================================================
+    // For repeatable automated validation (no human in the loop)
+    // use the integration test suite instead — see
+    // `litebox_test_harness/tests/integration.rs` mod vscode:
+    //
+    //   cargo test -p litebox_test_harness --test integration -- 'vscode::'
+    //
+    // (or use the "LiteBox: Run Integration Tests (vscode::*)"
+    //  task in this workspace.)
+    // ============================================================
 
-    // Terminal profiles (for shell-only sandboxing via Docker)
-    "terminal.integrated.profiles.windows": {
-        "LiteBox Sandbox (Docker)": {
-            "path": "docker",
-            "args": ["run", "--rm", "-it", "--cap-add", "SYS_PTRACE",
-                "-v", "\\\\wsl$\\Ubuntu\\home\\wportnoy\\litebox-out\\debug:/opt/litebox:ro",
-                "-v", "C:\\src\\litebox-vscode-server\\litebox_tool_executor\\policies:/opt/policies:ro",
-                "litebox-test",
-                "/opt/litebox/litebox_tool_executor",
-                "--rootfs", "/",
-                "--policy", "/opt/policies/demo-policy.json",
-                "--interactive"
-            ],
-            "icon": "shield"
-        },
-        "PowerShell": {
-            "path": "powershell.exe",
-            "icon": "terminal-powershell"
-        }
-    }
+    // No workspace-scoped overrides today. All knobs live in the
+    // user-profile settings above (per Remote-SSH application
+    // scope) or in tasks.json.
 }
