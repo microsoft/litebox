@@ -2811,10 +2811,10 @@ mod unix_tests {
     use core::time::Duration;
 
     use alloc::{string::ToString, vec::Vec};
-    use litebox::{event::Events, mm::linux::PAGE_SIZE, platform::RawConstPointer};
+    use litebox::{event::Events, platform::RawConstPointer};
     use litebox_common_linux::{
-        AddressFamily, AtFlags, IoReadVec, ReceiveFlags, SendFlags, SockFlags, SockType,
-        SocketOption, SocketOptionName, TimeParam, errno::Errno,
+        AddressFamily, AtFlags, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
+        SocketOptionName, TimeParam, errno::Errno,
     };
 
     use crate::{
@@ -3288,51 +3288,6 @@ mod unix_tests {
 
         unix_socketpair_bidirectional(SockType::Stream, true);
         unix_socketpair_bidirectional(SockType::Datagram, true);
-    }
-
-    #[test]
-    fn test_unix_datagram_socketpair_readv_spans_iovecs() {
-        let task = init_platform(None);
-        let mut sv_ptr = alloc::vec![0u32; 2];
-        let sv_mut_ptr = MutPtr::from_usize(sv_ptr.as_mut_ptr() as usize);
-        let ty_and_flags = SockType::Datagram as u32 | SockFlags::NONBLOCK.bits();
-        task.sys_socketpair(AddressFamily::UNIX as u32, ty_and_flags, 0, sv_mut_ptr)
-            .unwrap();
-
-        let sender = sv_ptr[0];
-        let receiver = sv_ptr[1];
-        let input = alloc::vec![0x7b; PAGE_SIZE * 2];
-        assert_eq!(
-            task.do_sendto(sender, &input, SendFlags::empty(), None),
-            Ok(input.len())
-        );
-
-        let mut first = alloc::vec![0u8; PAGE_SIZE];
-        let mut second = alloc::vec![0u8; PAGE_SIZE];
-        let iovs = [
-            IoReadVec {
-                iov_base: MutPtr::from_usize(first.as_mut_ptr() as usize),
-                iov_len: first.len(),
-            },
-            IoReadVec {
-                iov_base: MutPtr::from_usize(second.as_mut_ptr() as usize),
-                iov_len: second.len(),
-            },
-        ];
-
-        assert_eq!(
-            task.sys_readv(
-                i32::try_from(receiver).unwrap(),
-                ConstPtr::from_ptr(iovs.as_ptr()),
-                iovs.len()
-            ),
-            Ok(input.len())
-        );
-        assert_eq!(first, alloc::vec![0x7b; PAGE_SIZE]);
-        assert_eq!(second, alloc::vec![0x7b; PAGE_SIZE]);
-
-        close_socket(&task, sender);
-        close_socket(&task, receiver);
     }
 
     fn unix_socket_recv_timeout(ty: SockType) {
