@@ -59,9 +59,9 @@
         {
             "label": "LiteBox: Build",
             "type": "shell",
-            "command": "cd ${workspaceFolder}/../.. && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland && cargo rustc --target-dir target/nonpie -p litebox_test_harness -- -C link-args=-no-pie",
+            "command": "cd ${workspaceFolder}/../.. && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland",
             "group": "build",
-            "problemMatcher": "$rustc",
+            "problemMatcher": [],
             "presentation": {
                 "reveal": "always",
                 "panel": "shared",
@@ -123,7 +123,7 @@
             "type": "shell",
             "command": "cd ${workspaceFolder}/../.. && cargo test -p litebox_test_harness --test integration -- 'vscode::'",
             "group": "test",
-            "problemMatcher": "$rustc",
+            "problemMatcher": [],
             "presentation": {
                 "reveal": "always",
                 "panel": "shared",
