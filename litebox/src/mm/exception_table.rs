@@ -98,12 +98,12 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
             "cmp {size}, #16",
             "b.lo 20f",
             // 16-byte chunk loop.
-            "10:",
+            "30:",
             "ldp {t1}, {t2}, [{src}], #16",
             "stp {t1}, {t2}, [{dst}], #16",
             "sub {size}, {size}, #16",
             "cmp {size}, #16",
-            "b.hs 10b",
+            "b.hs 30b",
             // Byte tail (0..15 bytes remaining).
             "20:",
             "cbz {size}, 3f",
