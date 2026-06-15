@@ -304,11 +304,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         &self,
         fs: Arc<FS>,
         path: &str,
-        _argv: Vec<alloc::ffi::CString>,
-        _envp: Vec<alloc::ffi::CString>,
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<Platform, FS>, loader::WindowsLoadError> {
-        let load_info =
-            loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager).load(path)?;
+        let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
+            .load(path, &argv, &envp)?;
         let process = Arc::new(Process {
             ntdll_mapping: load_info.ntdll_mapping,
             peb_address: load_info.environment.peb,

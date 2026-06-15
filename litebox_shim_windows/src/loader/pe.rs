@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use alloc::collections::btree_map::BTreeMap;
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
 use core::{marker::PhantomData, mem::size_of};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
@@ -16,7 +16,8 @@ use litebox::{
 use litebox_common_windows::loader::{
     AccessMemory, Fault, KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, MapMemory, MappingInfo, PAGE_SIZE, PeExportError,
-    PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt, page_align_down,
+    PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt, build_api_set_namespace,
+    page_align_down,
 };
 use rangemap::RangeMap;
 use thiserror::Error;
@@ -38,10 +39,8 @@ const INITIAL_STACK_SIZE: usize = 1024 * 1024;
 const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
 const CSR_SERVER_DLL_MAX: usize = 4;
 const BASESRV_SERVERDLL_INDEX: usize = 1;
-// TODO: this is an artificial offset and should be replaced with the actual offset
-const WINDOWS_STATIC_SERVER_DATA_TABLE_OFFSET: usize = 0x750;
-const WINDOWS_BASE_STATIC_SERVER_DATA_OFFSET: usize =
-    WINDOWS_STATIC_SERVER_DATA_TABLE_OFFSET + CSR_SERVER_DLL_MAX * core::mem::size_of::<usize>();
+const WINDOWS_DIRECTORY: &str = r"C:\Windows";
+const WINDOWS_SYSTEM_DIRECTORY: &str = r"C:\Windows\System32";
 const WINDOWS_OS_MAJOR_VERSION: u32 = 10;
 const WINDOWS_OS_MINOR_VERSION: u32 = 0;
 const WINDOWS_OS_BUILD_NUMBER: u16 = 19041;
@@ -54,10 +53,6 @@ const WINDOWS_HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD: u64 = PAGE_SIZE as u64;
 const WINDOWS_NT_TIB_VERSION: usize = 30 << 8;
 const INITIAL_PROCESS_ID: usize = 1;
 const INITIAL_THREAD_ID: usize = 1;
-const API_SET_NAMESPACE_VERSION: u32 = 6;
-const API_SET_NAMESPACE_ENTRY_FLAGS: u32 = 1;
-const API_SET_NAMESPACE_HASH_FACTOR: u32 = 31;
-const MAX_API_SET_NAMESPACE_SIZE: usize = 16 * 1024 * 1024;
 
 pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
@@ -71,6 +66,16 @@ pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
     pub(crate) ntdll_mapping: Option<MappingInfo>,
     pub(crate) virtual_allocations: crate::WindowsVirtualAllocations<Platform>,
     pub(crate) environment: WindowsProcessEnvironment,
+}
+
+struct ProcessEnvironmentInput<'a> {
+    image: &'a PeParsedFile,
+    image_base_address: usize,
+    image_path: &'a str,
+    argv: &'a [CString],
+    envp: &'a [CString],
+    stack_base: usize,
+    stack_allocation_top: usize,
 }
 
 pub(crate) struct PeLoader<'a, Platform: crate::ShimPlatform, FS: ShimFS> {
@@ -92,15 +97,15 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         }
     }
 
-    pub(crate) fn load(&self, path: &str) -> Result<PeLoadInfo<Platform>, WindowsLoadError> {
+    pub(crate) fn load(
+        &self,
+        path: &str,
+        argv: &[CString],
+        envp: &[CString],
+    ) -> Result<PeLoadInfo<Platform>, WindowsLoadError> {
         let image = load_image(self.platform, self.fs.clone(), path, self.page_manager)?;
         let application_entry_point = image.mapping.entry_point;
-        let ntdll = load_ntdll(
-            self.platform,
-            self.fs.clone(),
-            self.page_manager,
-            NTDLL_PATHS,
-        )?;
+        let ntdll = load_ntdll(self.platform, self.fs.clone(), self.page_manager)?;
 
         let entry_point = if let Some(ntdll) = &ntdll {
             if !ntdll.image.parsed.has_trampoline() {
@@ -119,25 +124,27 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         let stack_base = unsafe {
             self.page_manager
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
-                .map_err(PeImageAccessError::Mapping)?
-        };
-        let stack_top = stack_base
+        }
+        .map_err(PeImageAccessError::Mapping)?;
+        let stack_allocation_top = stack_base
             .as_usize()
             .checked_add(INITIAL_STACK_SIZE)
             .ok_or(PeImageAccessError::AddressOverflow)?;
-        let stack_top = if stack_top.is_multiple_of(16) {
-            stack_top - core::mem::size_of::<usize>()
+        let stack_top = if stack_allocation_top.is_multiple_of(16) {
+            stack_allocation_top - core::mem::size_of::<usize>()
         } else {
-            stack_top
+            stack_allocation_top
         };
 
-        let environment = self.create_process_environment(
-            &image.parsed,
-            image.mapping.base_addr,
-            path,
-            stack_base.as_usize(),
-            stack_top,
-        )?;
+        let environment = self.create_process_environment(ProcessEnvironmentInput {
+            image: &image.parsed,
+            image_base_address: image.mapping.base_addr,
+            image_path: path,
+            argv,
+            envp,
+            stack_base: stack_base.as_usize(),
+            stack_allocation_top,
+        })?;
         if let Some(ntdll) = &ntdll {
             let context = X64Context::initial_thread_context(
                 ntdll.exports.rtl_user_thread_start,
@@ -209,16 +216,14 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
 
     fn create_process_environment(
         &self,
-        image: &PeParsedFile,
-        image_base_address: usize,
-        image_path: &str,
-        stack_base: usize,
-        stack_top: usize,
+        input: ProcessEnvironmentInput<'_>,
     ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
         let create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
             let aligned_length = size.next_multiple_of(PAGE_SIZE);
             let length =
                 NonZeroPageSize::new(aligned_length).ok_or(PeImageAccessError::AddressOverflow)?;
+            // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` leaves address
+            // selection to the page manager, so this cannot replace an existing mapping.
             let ptr = unsafe {
                 self.page_manager.create_writable_pages(
                     None,
@@ -227,27 +232,34 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
                     |_| Ok(0),
                 )
             }?;
-            let base = ptr.as_usize();
-            Ok(base)
+            Ok(ptr.as_usize())
         };
-        let teb_ptr = create_pages(core::mem::size_of::<ThreadEnvironmentBlock>())?;
-        let peb_ptr = create_pages(core::mem::size_of::<ProcessEnvironmentBlock>())?;
-        let api_set_map = build_api_set_namespace()?;
+        let teb_ptr = create_pages(size_of::<ThreadEnvironmentBlock>())?;
+        let peb_ptr = create_pages(size_of::<ProcessEnvironmentBlock>())?;
+        let api_set_map = build_api_set_namespace(API_SET_MAPPINGS)
+            .map_err(|_| PeImageAccessError::AddressOverflow)?;
         let api_set_map_ptr = create_pages(api_set_map.len())?;
         crate::write_slice::<Platform, _>(api_set_map_ptr, &api_set_map)
             .ok_or(PeImageAccessError::MemoryAccess)?;
-        let ctx_ptr = create_pages(core::mem::size_of::<X64Context>())?;
+        let ctx_ptr = create_pages(size_of::<X64Context>())?;
 
-        let dos_image_path = dos_image_path(image_path);
+        let win32_image_path = win32_image_path(input.image_path);
+        let dos_image_path = dos_image_path(input.image_path);
         let current_directory_path = Utf16StringBuffer::new(r"C:\")?;
         let dll_path = Utf16StringBuffer::new(r"C:\Windows\System32;C:\")?;
         let image_path_name = Utf16StringBuffer::new(&dos_image_path)?;
-        let command_line = Utf16StringBuffer::new(&dos_image_path)?;
+        let command_line =
+            Utf16StringBuffer::new(&windows_command_line(&win32_image_path, input.argv))?;
         let window_title = Utf16StringBuffer::new(&dos_image_path)?;
         let desktop_info = Utf16StringBuffer::new("")?;
         let shell_info = Utf16StringBuffer::new("")?;
         let runtime_data = Utf16StringBuffer::new("")?;
         let redirection_dll_name = Utf16StringBuffer::new("")?;
+        let environment_block = windows_environment_block(input.envp);
+        let environment_size = checked_mul(environment_block.len(), size_of::<u16>())?;
+        let environment_ptr = create_pages(environment_size)?;
+        crate::write_slice::<Platform, _>(environment_ptr, &environment_block)
+            .ok_or(PeImageAccessError::MemoryAccess)?;
         let process_parameter_strings = [
             &current_directory_path,
             &dll_path,
@@ -260,7 +272,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             &redirection_dll_name,
         ];
         let process_parameters_length = process_parameter_strings.iter().try_fold(
-            core::mem::size_of::<RtlUserProcessParameters>(),
+            size_of::<RtlUserProcessParameters>(),
             |length, string| {
                 length
                     .checked_add(usize::from(string.maximum_length))
@@ -272,35 +284,34 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         let process_parameters_ptr = create_pages(process_parameters_length)?;
 
         let mut process_parameters = RtlUserProcessParameters::new_zeroed();
-        process_parameters.maximum_length = u32::try_from(process_parameters_allocation_length)
-            .map_err(|_| PeImageAccessError::AddressOverflow)?;
-        process_parameters.length = u32::try_from(process_parameters_length)
-            .map_err(|_| PeImageAccessError::AddressOverflow)?;
+        process_parameters.maximum_length = to_u32(process_parameters_allocation_length)?;
+        process_parameters.length = to_u32(process_parameters_length)?;
         process_parameters.flags = RtlUserProcFlags::NORMALIZED.bits();
+        process_parameters.environment = environment_ptr;
+        process_parameters.environment_size =
+            u64::try_from(environment_size).map_err(|_| PeImageAccessError::AddressOverflow)?;
         let mut process_parameter_tail = process_parameters_ptr
-            .checked_add(core::mem::size_of::<RtlUserProcessParameters>())
+            .checked_add(size_of::<RtlUserProcessParameters>())
             .ok_or(PeImageAccessError::AddressOverflow)?;
-        process_parameters.current_directory.dos_path = write_process_parameter_string::<Platform>(
+        process_parameters.current_directory.dos_path = write_tail_utf16_string::<Platform>(
             &mut process_parameter_tail,
             &current_directory_path,
         )?;
         process_parameters.dll_path =
-            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &dll_path)?;
-        process_parameters.image_path_name = write_process_parameter_string::<Platform>(
-            &mut process_parameter_tail,
-            &image_path_name,
-        )?;
+            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &dll_path)?;
+        process_parameters.image_path_name =
+            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &image_path_name)?;
         process_parameters.command_line =
-            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &command_line)?;
+            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &command_line)?;
         process_parameters.window_title =
-            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &window_title)?;
+            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &window_title)?;
         process_parameters.desktop_info =
-            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &desktop_info)?;
+            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &desktop_info)?;
         process_parameters.shell_info =
-            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &shell_info)?;
+            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &shell_info)?;
         process_parameters.runtime_data =
-            write_process_parameter_string::<Platform>(&mut process_parameter_tail, &runtime_data)?;
-        process_parameters.redirection_dll_name = write_process_parameter_string::<Platform>(
+            write_tail_utf16_string::<Platform>(&mut process_parameter_tail, &runtime_data)?;
+        process_parameters.redirection_dll_name = write_tail_utf16_string::<Platform>(
             &mut process_parameter_tail,
             &redirection_dll_name,
         )?;
@@ -308,26 +319,25 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             .ok_or(PeImageAccessError::MemoryAccess)?;
 
         let read_only_shared_memory_base = create_pages(WINDOWS_SHARED_SECTION_SIZE)?;
-        let read_only_static_server_data = read_only_shared_memory_base
-            .checked_add(WINDOWS_STATIC_SERVER_DATA_TABLE_OFFSET)
-            .ok_or(PeImageAccessError::AddressOverflow)?;
-        let base_static_server_data = read_only_shared_memory_base
-            .checked_add(WINDOWS_BASE_STATIC_SERVER_DATA_OFFSET)
-            .ok_or(PeImageAccessError::AddressOverflow)?;
-        let base_static_server_data_entry = read_only_static_server_data
-            .checked_add(BASESRV_SERVERDLL_INDEX * core::mem::size_of::<usize>())
-            .ok_or(PeImageAccessError::AddressOverflow)?;
-        crate::write_value::<Platform, _>(base_static_server_data_entry, base_static_server_data)
-            .ok_or(PeImageAccessError::MemoryAccess)?;
-
+        let read_only_static_server_data =
+            initialize_windows_static_server_data::<Platform>(read_only_shared_memory_base)?;
         let mut peb = ProcessEnvironmentBlock::new_zeroed();
-        peb.image_base_address = image_base_address;
-        if image_base_address != image.image_base() || image.has_dynamic_base() {
+        peb.image_base_address = input.image_base_address;
+        if input.image_base_address != input.image.image_base() || input.image.has_dynamic_base() {
             peb.bit_field = PebBitField::IS_IMAGE_DYNAMICALLY_RELOCATED.bits();
         }
         let process_heaps = initial_process_heaps_array(peb_ptr)?;
+        let fast_peb_lock = create_pages(size_of::<RtlCriticalSection>())?;
+        crate::write_value::<Platform, _>(fast_peb_lock, RtlCriticalSection::initialized(0))
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+        let loader_lock = create_pages(size_of::<RtlCriticalSection>())?;
+        crate::write_value::<Platform, _>(loader_lock, RtlCriticalSection::initialized(0))
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+
         peb.api_set_map = api_set_map_ptr;
         peb.process_parameters = process_parameters_ptr;
+        peb.fast_peb_lock = fast_peb_lock;
+        peb.shared_data = read_only_shared_memory_base;
         peb.number_of_processors = 1;
         peb.critical_section_timeout = WINDOWS_CRITICAL_SECTION_TIMEOUT_100NS;
         peb.heap_segment_reserve = WINDOWS_HEAP_SEGMENT_RESERVE;
@@ -336,14 +346,15 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         peb.heap_de_commit_free_block_threshold = WINDOWS_HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD;
         peb.maximum_number_of_heaps = process_heaps.maximum_number_of_heaps;
         peb.process_heaps = process_heaps.address;
+        peb.loader_lock = loader_lock;
         peb.active_process_affinity_mask = 1;
         peb.os_major_version = WINDOWS_OS_MAJOR_VERSION;
         peb.os_minor_version = WINDOWS_OS_MINOR_VERSION;
         peb.os_build_number = WINDOWS_OS_BUILD_NUMBER;
         peb.os_platform_id = WINDOWS_OS_PLATFORM_WIN32_NT;
-        peb.image_subsystem = u32::from(image.subsystem());
-        peb.image_subsystem_major_version = u32::from(image.major_subsystem_version());
-        peb.image_subsystem_minor_version = u32::from(image.minor_subsystem_version());
+        peb.image_subsystem = u32::from(input.image.subsystem());
+        peb.image_subsystem_major_version = u32::from(input.image.major_subsystem_version());
+        peb.image_subsystem_minor_version = u32::from(input.image.minor_subsystem_version());
         peb.read_only_shared_memory_base = read_only_shared_memory_base;
         peb.read_only_static_server_data = read_only_static_server_data;
         peb.csr_server_read_only_shared_memory_base = read_only_shared_memory_base as u64;
@@ -351,8 +362,8 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
 
         let mut teb = ThreadEnvironmentBlock::new_zeroed();
         teb.nt_tib.exception_list = 0;
-        teb.nt_tib.stack_base = stack_top;
-        teb.nt_tib.stack_limit = stack_base;
+        teb.nt_tib.stack_base = input.stack_allocation_top;
+        teb.nt_tib.stack_limit = input.stack_base;
         teb.nt_tib.fiber_data_or_version = WINDOWS_NT_TIB_VERSION;
         teb.nt_tib.self_pointer = teb_ptr;
         // TODO: set real ID
@@ -368,7 +379,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             teb_ptr + core::mem::offset_of!(ThreadEnvironmentBlock, activation_stack);
         teb.static_unicode_string =
             initial_teb_static_unicode_string(teb_ptr, &teb.static_unicode_buffer)?;
-        teb.deallocation_stack = stack_base;
+        teb.deallocation_stack = input.stack_base;
         crate::write_value::<Platform, _>(teb_ptr, teb).ok_or(PeImageAccessError::MemoryAccess)?;
         Ok(WindowsProcessEnvironment {
             peb: peb_ptr,
@@ -376,6 +387,71 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             context: ctx_ptr,
         })
     }
+}
+
+fn initialize_windows_static_server_data<Platform: RawPointerProvider>(
+    read_only_shared_memory_base: usize,
+) -> Result<usize, PeImageAccessError> {
+    let read_only_static_server_data =
+        SyntheticReadOnlySharedMemory::static_server_data_table_address(
+            read_only_shared_memory_base,
+        )?;
+    let client_base_static_server_data =
+        SyntheticReadOnlySharedMemory::base_static_server_data_address(
+            read_only_shared_memory_base,
+        )?;
+    initialize_static_server_data::<Platform>(
+        read_only_static_server_data,
+        client_base_static_server_data,
+    )?;
+    Ok(read_only_static_server_data)
+}
+
+fn initialize_static_server_data<Platform: RawPointerProvider>(
+    static_server_data_table: usize,
+    base_static_server_data: usize,
+) -> Result<(), PeImageAccessError> {
+    for server_index in [0, BASESRV_SERVERDLL_INDEX] {
+        let entry =
+            SyntheticStaticServerDataTable::entry_address(static_server_data_table, server_index)?;
+        crate::write_value::<Platform, _>(entry, base_static_server_data)
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+    }
+
+    write_static_server_unicode_string::<Platform>(
+        SyntheticBaseStaticServerData::windows_directory_address(base_static_server_data)?,
+        SyntheticBaseStaticServerData::windows_directory_string_address(base_static_server_data)?,
+        WINDOWS_DIRECTORY,
+    )?;
+    write_static_server_unicode_string::<Platform>(
+        SyntheticBaseStaticServerData::system_directory_address(base_static_server_data)?,
+        SyntheticBaseStaticServerData::system_directory_string_address(base_static_server_data)?,
+        WINDOWS_SYSTEM_DIRECTORY,
+    )?;
+
+    let rebase_anchor =
+        SyntheticBaseStaticServerData::rebase_anchor_address(base_static_server_data)?;
+    crate::write_value::<Platform, _>(rebase_anchor, base_static_server_data)
+        .ok_or(PeImageAccessError::MemoryAccess)
+}
+
+fn write_static_server_unicode_string<Platform: RawPointerProvider>(
+    string_address: usize,
+    buffer: usize,
+    value: &str,
+) -> Result<(), PeImageAccessError> {
+    let string = Utf16StringBuffer::new(value)?;
+    crate::write_slice::<Platform, _>(buffer, &string.units)
+        .ok_or(PeImageAccessError::MemoryAccess)?;
+
+    let unicode_string = UnicodeString {
+        length: string.length,
+        maximum_length: string.maximum_length,
+        padding_0: [0; 4],
+        buffer,
+    };
+    crate::write_value::<Platform, _>(string_address, unicode_string)
+        .ok_or(PeImageAccessError::MemoryAccess)
 }
 
 fn register_image_virtual_allocation<Platform: crate::ShimPlatform>(
@@ -387,7 +463,7 @@ fn register_image_virtual_allocation<Platform: crate::ShimPlatform>(
         mapping.base_addr,
         crate::WindowsVirtualAllocation {
             base: mapping.base_addr,
-            size: mapping.image_size,
+            size: mapping.mapping_size,
             allocation_protect: PageProtection::PAGE_EXECUTE_WRITECOPY,
             type_: MemoryType::MEM_IMAGE,
             pages,
@@ -435,43 +511,115 @@ impl LoadedImage {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
-struct ApiSetNamespace {
-    version: u32,
-    size: u32,
-    flags: u32,
-    count: u32,
-    entry_offset: u32,
-    hash_offset: u32,
-    hash_factor: u32,
+struct RtlCriticalSection {
+    debug_info: usize,
+    lock_count: i32,
+    recursion_count: u32,
+    owning_thread: usize,
+    lock_semaphore: usize,
+    spin_count: usize,
+}
+
+impl RtlCriticalSection {
+    const fn initialized(spin_count: usize) -> Self {
+        Self {
+            debug_info: usize::MAX,
+            lock_count: -1,
+            recursion_count: 0,
+            owning_thread: 0,
+            lock_semaphore: 0,
+            spin_count,
+        }
+    }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
-struct ApiSetNamespaceEntry {
-    flags: u32,
-    name_offset: u32,
-    name_length: u32,
-    hashed_length: u32,
-    value_offset: u32,
-    value_count: u32,
+struct SyntheticReadOnlySharedMemory {
+    _padding_to_static_server_data_table:
+        [u8; SyntheticReadOnlySharedMemory::STATIC_SERVER_DATA_TABLE_PADDING_BYTES],
+    static_server_data_table: SyntheticStaticServerDataTable,
+    base_static_server_data: SyntheticBaseStaticServerData,
+}
+
+impl SyntheticReadOnlySharedMemory {
+    const STATIC_SERVER_DATA_TABLE_PADDING_BYTES: usize = 0x750;
+    const STATIC_SERVER_DATA_TABLE_OFFSET: usize =
+        core::mem::offset_of!(Self, static_server_data_table);
+    const BASE_STATIC_SERVER_DATA_OFFSET: usize =
+        core::mem::offset_of!(Self, base_static_server_data);
+
+    fn static_server_data_table_address(base: usize) -> Result<usize, PeImageAccessError> {
+        checked_add(base, Self::STATIC_SERVER_DATA_TABLE_OFFSET)
+    }
+
+    fn base_static_server_data_address(base: usize) -> Result<usize, PeImageAccessError> {
+        checked_add(base, Self::BASE_STATIC_SERVER_DATA_OFFSET)
+    }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
-struct ApiSetValueEntry {
-    flags: u32,
-    name_offset: u32,
-    name_length: u32,
-    value_offset: u32,
-    value_length: u32,
+struct SyntheticStaticServerDataTable {
+    entries: [usize; CSR_SERVER_DLL_MAX],
+}
+
+impl SyntheticStaticServerDataTable {
+    fn entry_address(table: usize, server_index: usize) -> Result<usize, PeImageAccessError> {
+        checked_add(table, checked_mul(server_index, size_of::<usize>())?)
+    }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
-struct ApiSetHashEntry {
-    hash: u32,
-    index: u32,
+struct SyntheticBaseStaticServerData {
+    windows_directory: UnicodeString,
+    system_directory: UnicodeString,
+    _padding_to_rebase_anchor: [u8; SyntheticBaseStaticServerData::REBASE_ANCHOR_LAYOUT_OFFSET
+        - 2 * size_of::<UnicodeString>()],
+    rebase_anchor: usize,
+    _padding_to_windows_directory_string: [u8;
+        SyntheticBaseStaticServerData::WINDOWS_DIRECTORY_STRING_LAYOUT_OFFSET
+            - SyntheticBaseStaticServerData::REBASE_ANCHOR_LAYOUT_OFFSET
+            - size_of::<usize>()],
+    windows_directory_string: [u8;
+        SyntheticBaseStaticServerData::SYSTEM_DIRECTORY_STRING_LAYOUT_OFFSET
+            - SyntheticBaseStaticServerData::WINDOWS_DIRECTORY_STRING_LAYOUT_OFFSET],
+    system_directory_string: [u8; SyntheticBaseStaticServerData::SYSTEM_DIRECTORY_STRING_BYTES],
 }
+
+impl SyntheticBaseStaticServerData {
+    const REBASE_ANCHOR_LAYOUT_OFFSET: usize = 0x9e8;
+    const WINDOWS_DIRECTORY_STRING_LAYOUT_OFFSET: usize = 0xa00;
+    const SYSTEM_DIRECTORY_STRING_LAYOUT_OFFSET: usize = 0xa40;
+    const SYSTEM_DIRECTORY_STRING_BYTES: usize = 0x40;
+    const WINDOWS_DIRECTORY_OFFSET: usize = core::mem::offset_of!(Self, windows_directory);
+    const SYSTEM_DIRECTORY_OFFSET: usize = core::mem::offset_of!(Self, system_directory);
+    const REBASE_ANCHOR_OFFSET: usize = core::mem::offset_of!(Self, rebase_anchor);
+    const WINDOWS_DIRECTORY_STRING_OFFSET: usize =
+        core::mem::offset_of!(Self, windows_directory_string);
+    const SYSTEM_DIRECTORY_STRING_OFFSET: usize =
+        core::mem::offset_of!(Self, system_directory_string);
+
+    fn windows_directory_address(base: usize) -> Result<usize, PeImageAccessError> {
+        checked_add(base, Self::WINDOWS_DIRECTORY_OFFSET)
+    }
+
+    fn system_directory_address(base: usize) -> Result<usize, PeImageAccessError> {
+        checked_add(base, Self::SYSTEM_DIRECTORY_OFFSET)
+    }
+
+    fn rebase_anchor_address(base: usize) -> Result<usize, PeImageAccessError> {
+        checked_add(base, Self::REBASE_ANCHOR_OFFSET)
+    }
+
+    fn windows_directory_string_address(base: usize) -> Result<usize, PeImageAccessError> {
+        checked_add(base, Self::WINDOWS_DIRECTORY_STRING_OFFSET)
+    }
+
+    fn system_directory_string_address(base: usize) -> Result<usize, PeImageAccessError> {
+        checked_add(base, Self::SYSTEM_DIRECTORY_STRING_OFFSET)
+    }
+}
+
+const _: () = assert!(size_of::<SyntheticReadOnlySharedMemory>() <= WINDOWS_SHARED_SECTION_SIZE);
 
 const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-core-apiquery-l1-1-0", "ntdll.dll"),
@@ -533,7 +681,7 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-core-heap-l2-1-0", "kernelbase.dll"),
     ("api-ms-win-core-interlocked-l1-1-1", "kernelbase.dll"),
     ("api-ms-win-core-io-l1-1-0", "kernelbase.dll"),
-    ("api-ms-win-core-io-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-io-l1-1-1", "kernel32.dll"),
     ("api-ms-win-core-job-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-largeinteger-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-libraryloader-l1-1-1", "kernelbase.dll"),
@@ -638,7 +786,7 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-eventing-consumer-l1-1-0", "sechost.dll"),
     ("api-ms-win-eventing-consumer-l1-1-1", "sechost.dll"),
     ("api-ms-win-eventing-controller-l1-1-0", "sechost.dll"),
-    ("api-ms-win-eventing-provider-l1-1-0", "advapi32.dll"),
+    ("api-ms-win-eventing-provider-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-security-audit-l1-1-0", "sechost.dll"),
     ("api-ms-win-security-audit-l1-1-1", "sechost.dll"),
     ("api-ms-win-security-appcontainer-l1-1-0", "kernelbase.dll"),
@@ -658,137 +806,14 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-service-winsvc-l1-1-0", "sechost.dll"),
     ("ext-ms-win-appcompat-apphelp-l1-1-2", "apphelp.dll"),
     ("ext-ms-win-authz-context-l1-1-0", "authz.dll"),
-    ("ext-ms-win-core-winrt-remote-l1-1-0", "rpcrtremote.dll"),
-    ("ext-ms-win-oobe-query-l1-1-0", "kernelbase.dll"),
+    ("ext-ms-win-core-winrt-remote-l1-1-0", ""),
+    ("ext-ms-win-oobe-query-l1-1-0", ""),
     (
         "ext-ms-win-packagevirtualizationcontext-l1-1-0",
-        "kernelbase.dll",
+        "daxexec.dll",
     ),
     ("ext-ms-win-rpc-ssl-l1-1-0", "rpcrtremote.dll"),
 ];
-
-fn build_api_set_namespace() -> Result<Vec<u8>, PeImageAccessError> {
-    let mut mappings = API_SET_MAPPINGS.to_vec();
-    mappings.sort_by_key(|mapping| mapping.0);
-
-    let count = mappings.len();
-    let entry_offset = size_of::<ApiSetNamespace>();
-    let value_offset = checked_add(
-        entry_offset,
-        checked_mul(count, size_of::<ApiSetNamespaceEntry>())?,
-    )?;
-    let strings_offset = checked_add(
-        value_offset,
-        checked_mul(count, size_of::<ApiSetValueEntry>())?,
-    )?;
-    let mut string_data = Vec::new();
-    let mut entries = Vec::with_capacity(count);
-    let mut values = Vec::with_capacity(count);
-    let mut hashes = Vec::with_capacity(count);
-
-    for (index, (contract, host_dll)) in mappings.iter().enumerate() {
-        let name = utf16_bytes(contract)?;
-        let host = utf16_bytes(host_dll)?;
-        let name_offset = checked_add(strings_offset, string_data.len())?;
-        string_data.extend_from_slice(&name);
-        let host_offset = checked_add(strings_offset, string_data.len())?;
-        string_data.extend_from_slice(&host);
-        let value_entry_offset = checked_add(
-            value_offset,
-            checked_mul(index, size_of::<ApiSetValueEntry>())?,
-        )?;
-        entries.push(ApiSetNamespaceEntry {
-            flags: API_SET_NAMESPACE_ENTRY_FLAGS,
-            name_offset: to_u32(name_offset)?,
-            name_length: to_u32(name.len())?,
-            hashed_length: to_u32(
-                api_set_hashed_name_len(contract)
-                    .checked_mul(size_of::<u16>())
-                    .ok_or(PeImageAccessError::AddressOverflow)?,
-            )?,
-            value_offset: to_u32(value_entry_offset)?,
-            value_count: 1,
-        });
-        values.push(ApiSetValueEntry {
-            flags: 0,
-            name_offset: 0,
-            name_length: 0,
-            value_offset: to_u32(host_offset)?,
-            value_length: to_u32(host.len())?,
-        });
-        hashes.push(ApiSetHashEntry {
-            hash: api_set_hash(contract),
-            index: to_u32(index)?,
-        });
-    }
-
-    let hash_offset =
-        checked_add(strings_offset, string_data.len())?.next_multiple_of(size_of::<u32>());
-    let size = checked_add(
-        hash_offset,
-        checked_mul(count, size_of::<ApiSetHashEntry>())?,
-    )?;
-    if size > MAX_API_SET_NAMESPACE_SIZE {
-        return Err(PeImageAccessError::AddressOverflow);
-    }
-    hashes.sort_by_key(|entry| (entry.hash, entry.index));
-
-    let namespace = ApiSetNamespace {
-        version: API_SET_NAMESPACE_VERSION,
-        size: to_u32(size)?,
-        flags: 0,
-        count: to_u32(count)?,
-        entry_offset: to_u32(entry_offset)?,
-        hash_offset: to_u32(hash_offset)?,
-        hash_factor: API_SET_NAMESPACE_HASH_FACTOR,
-    };
-
-    let mut bytes = Vec::with_capacity(size);
-    append_struct(&mut bytes, &namespace);
-    for entry in &entries {
-        append_struct(&mut bytes, entry);
-    }
-    for value in &values {
-        append_struct(&mut bytes, value);
-    }
-    bytes.extend_from_slice(&string_data);
-    bytes.resize(hash_offset, 0);
-    for hash in &hashes {
-        append_struct(&mut bytes, hash);
-    }
-    debug_assert_eq!(bytes.len(), size);
-    Ok(bytes)
-}
-
-fn append_struct<T: IntoBytes + Immutable>(bytes: &mut Vec<u8>, value: &T) {
-    bytes.extend_from_slice(value.as_bytes());
-}
-
-fn utf16_bytes(value: &str) -> Result<Vec<u8>, PeImageAccessError> {
-    let mut bytes = Vec::with_capacity(
-        value
-            .len()
-            .checked_mul(size_of::<u16>())
-            .ok_or(PeImageAccessError::AddressOverflow)?,
-    );
-    for unit in value.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
-    Ok(bytes)
-}
-
-fn api_set_hashed_name_len(name: &str) -> usize {
-    name.rfind('-').unwrap_or(name.len())
-}
-
-fn api_set_hash(name: &str) -> u32 {
-    name[..api_set_hashed_name_len(name)]
-        .bytes()
-        .fold(0, |hash, byte| {
-            hash.wrapping_mul(API_SET_NAMESPACE_HASH_FACTOR)
-                .wrapping_add(u32::from(byte.to_ascii_lowercase()))
-        })
-}
 
 fn checked_add(left: usize, right: usize) -> Result<usize, PeImageAccessError> {
     left.checked_add(right)
@@ -823,9 +848,8 @@ fn load_ntdll<Platform: crate::ShimPlatform, FS: crate::ShimFS>(
     platform: &'static Platform,
     fs: Arc<FS>,
     page_manager: &crate::WindowsPageManager<Platform>,
-    ntdll_paths: &[&str],
 ) -> Result<Option<LoadedNtDll>, WindowsLoadError> {
-    for path in ntdll_paths {
+    for path in NTDLL_PATHS {
         match load_image_with_writable_sections(
             fs.clone(),
             path,
@@ -1047,6 +1071,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> PeImageMapper<'_, Platform, FS> 
         self.pages.insert(start..end, protect);
         Ok(())
     }
+
+    fn protect_and_record_pages(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: Protection,
+    ) -> Result<(), PeImageAccessError> {
+        protect_pages(self.page_manager, address, len, prot)?;
+        self.record_pages(address, len, page_protection_from_loader_protection(prot))
+    }
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, Platform, FS> {
@@ -1096,8 +1130,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, 
                 .ok_or(PeImageAccessError::MemoryAccess)?;
             written += chunk;
         }
-        protect_pages(self.page_manager, address, len, *prot)?;
-        self.record_pages(address, len, page_protection_from_loader_protection(*prot))
+        self.protect_and_record_pages(address, len, *prot)
     }
 
     fn map_file(
@@ -1126,8 +1159,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, 
                 .ok_or(PeImageAccessError::MemoryAccess)?;
             read += n;
         }
-        protect_pages(self.page_manager, address, len, *prot)?;
-        self.record_pages(address, len, page_protection_from_loader_protection(*prot))
+        self.protect_and_record_pages(address, len, *prot)
     }
 
     fn protect(
@@ -1136,8 +1168,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, 
         len: usize,
         prot: &Protection,
     ) -> Result<(), Self::Error> {
-        protect_pages(self.page_manager, address, len, *prot)?;
-        self.record_pages(address, len, page_protection_from_loader_protection(*prot))
+        self.protect_and_record_pages(address, len, *prot)
     }
 }
 
@@ -1244,33 +1275,93 @@ fn page_range(address: usize, len: usize) -> Result<(usize, usize), PeImageAcces
     Ok((start, end - start))
 }
 
-fn dos_image_path(path: &str) -> String {
-    let mut dos_path = String::from(r"\??\C:");
+fn win32_image_path(path: &str) -> String {
+    let mut win32_path = String::from("C:");
     if !path.starts_with('/') && !path.starts_with('\\') {
-        dos_path.push('\\');
+        win32_path.push('\\');
     }
     for ch in path.chars() {
-        dos_path.push(if ch == '/' { '\\' } else { ch });
+        win32_path.push(if ch == '/' { '\\' } else { ch });
     }
+    win32_path
+}
+
+fn dos_image_path(path: &str) -> String {
+    let mut dos_path = String::from(r"\??\");
+    dos_path.push_str(&win32_image_path(path));
     dos_path
 }
 
-fn write_process_parameter_string<Platform: RawPointerProvider>(
-    process_parameter_tail: &mut usize,
-    string: &Utf16StringBuffer,
-) -> Result<UnicodeString, PeImageAccessError> {
-    let buffer = *process_parameter_tail;
-    crate::write_slice::<Platform, _>(buffer, &string.units)
-        .ok_or(PeImageAccessError::MemoryAccess)?;
-    *process_parameter_tail = (*process_parameter_tail)
-        .checked_add(usize::from(string.maximum_length))
-        .ok_or(PeImageAccessError::AddressOverflow)?;
-    Ok(UnicodeString {
-        length: string.length,
-        maximum_length: string.maximum_length,
-        padding_0: [0; 4],
-        buffer,
-    })
+fn windows_command_line(image_path: &str, argv: &[CString]) -> String {
+    let mut command_line = String::new();
+    if let Some(arg0) = argv.first() {
+        push_windows_quoted_arg(&mut command_line, &cstring_to_string(arg0));
+    } else {
+        push_windows_quoted_arg(&mut command_line, image_path);
+    }
+    for arg in argv.iter().skip(1) {
+        command_line.push(' ');
+        push_windows_quoted_arg(&mut command_line, &cstring_to_string(arg));
+    }
+    command_line
+}
+
+fn push_windows_quoted_arg(command_line: &mut String, arg: &str) {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        command_line.push_str(arg);
+        return;
+    }
+
+    command_line.push('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            for _ in 0..=backslashes * 2 {
+                command_line.push('\\');
+            }
+            command_line.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                command_line.push('\\');
+            }
+            command_line.push(ch);
+            backslashes = 0;
+        }
+    }
+    for _ in 0..backslashes * 2 {
+        command_line.push('\\');
+    }
+    command_line.push('"');
+}
+
+fn windows_environment_block(envp: &[CString]) -> Vec<u16> {
+    let mut variables = envp.iter().map(cstring_to_string).collect::<Vec<_>>();
+    variables.sort_by(|left, right| {
+        left.bytes()
+            .map(|byte| byte.to_ascii_uppercase())
+            .cmp(right.bytes().map(|byte| byte.to_ascii_uppercase()))
+    });
+
+    let mut block = Vec::new();
+    for variable in variables {
+        block.extend(variable.encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    if envp.is_empty() {
+        block.push(0);
+    }
+    block
+}
+
+fn cstring_to_string(value: &CString) -> String {
+    match core::str::from_utf8(value.as_bytes()) {
+        Ok(value) => String::from(value),
+        Err(_) => String::from_utf8_lossy(value.as_bytes()).into_owned(),
+    }
 }
 
 struct InitialProcessHeaps {
@@ -1288,6 +1379,22 @@ fn initial_process_heaps_array(peb_ptr: usize) -> Result<InitialProcessHeaps, Pe
     Ok(InitialProcessHeaps {
         address,
         maximum_number_of_heaps: maximum_number_of_heaps.trunc(),
+    })
+}
+
+fn write_tail_utf16_string<Platform: RawPointerProvider>(
+    tail: &mut usize,
+    string: &Utf16StringBuffer,
+) -> Result<UnicodeString, PeImageAccessError> {
+    let buffer = *tail;
+    crate::write_slice::<Platform, _>(buffer, &string.units)
+        .ok_or(PeImageAccessError::MemoryAccess)?;
+    *tail = checked_add(*tail, usize::from(string.maximum_length))?;
+    Ok(UnicodeString {
+        length: string.length,
+        maximum_length: string.maximum_length,
+        padding_0: [0; 4],
+        buffer,
     })
 }
 
@@ -1343,6 +1450,10 @@ mod tests {
 
     use alloc::{string::String, vec, vec::Vec};
     use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+    use litebox_common_windows::loader::{
+        ApiSetHashEntry, ApiSetNamespace, ApiSetNamespaceEntry, ApiSetValueEntry,
+        MAX_API_SET_NAMESPACE_SIZE, api_set_hash,
+    };
 
     use super::*;
     use crate::nt_types::{ProcessEnvironmentBlock, ThreadEnvironmentBlock, UnicodeString};
@@ -1401,32 +1512,8 @@ mod tests {
         };
     }
 
-    impl ApiSetValueEntry {
-        fn parse(bytes: &[u8], offset: usize) -> Option<Self> {
-            Some(Self::read_from_prefix(bytes.get(offset..)?).ok()?.0)
-        }
-
-        fn name(self, bytes: &[u8]) -> Option<String> {
-            read_utf16_string(bytes, self.name_offset, self.name_length)
-        }
-
-        fn value(self, bytes: &[u8]) -> Option<String> {
-            read_utf16_string(bytes, self.value_offset, self.value_length)
-        }
-    }
-
-    impl ApiSetHashEntry {
-        fn parse(bytes: &[u8], offset: usize) -> Option<Self> {
-            Some(Self::read_from_prefix(bytes.get(offset..)?).ok()?.0)
-        }
-    }
-
     fn table_offset(base: u32, index: u32, entry_size: usize) -> Option<usize> {
         (base as usize).checked_add((index as usize).checked_mul(entry_size)?)
-    }
-
-    fn checked_table_end(base: u32, count: u32, entry_size: usize) -> Option<usize> {
-        table_offset(base, count, entry_size)
     }
 
     fn read_utf16_string(bytes: &[u8], offset: u32, len: u32) -> Option<String> {
@@ -1445,140 +1532,116 @@ mod tests {
         Some(String::from_utf16_lossy(&units))
     }
 
-    impl ApiSetNamespaceEntry {
-        fn parse(bytes: &[u8], offset: usize) -> Option<Self> {
-            Some(Self::read_from_prefix(bytes.get(offset..)?).ok()?.0)
-        }
-
-        fn name(self, bytes: &[u8]) -> Option<String> {
-            read_utf16_string(bytes, self.name_offset, self.name_length)
-        }
-
-        fn value(self, bytes: &[u8], index: u32) -> Option<ApiSetValueEntry> {
-            if index >= self.value_count {
-                return None;
-            }
-            ApiSetValueEntry::parse(
-                bytes,
-                table_offset(self.value_offset, index, size_of::<ApiSetValueEntry>())?,
-            )
-        }
+    fn parse_api_set_value_entry(bytes: &[u8], offset: usize) -> Option<ApiSetValueEntry> {
+        Some(
+            ApiSetValueEntry::read_from_prefix(bytes.get(offset..)?)
+                .ok()?
+                .0,
+        )
     }
 
-    impl ApiSetNamespace {
-        fn parse(bytes: &[u8]) -> Option<Self> {
-            let namespace = Self::read_from_prefix(bytes).ok()?.0;
-            let size = namespace.size as usize;
-            if size != bytes.len()
-                || !(size_of::<Self>()..=MAX_API_SET_NAMESPACE_SIZE).contains(&size)
-            {
-                return None;
-            }
-            if checked_table_end(
+    fn api_set_value_entry_value(entry: ApiSetValueEntry, bytes: &[u8]) -> Option<String> {
+        read_utf16_string(bytes, entry.value_offset, entry.value_length)
+    }
+
+    fn api_set_value_entry_name(entry: ApiSetValueEntry, bytes: &[u8]) -> Option<String> {
+        read_utf16_string(bytes, entry.name_offset, entry.name_length)
+    }
+
+    fn parse_api_set_hash_entry(bytes: &[u8], offset: usize) -> Option<ApiSetHashEntry> {
+        Some(
+            ApiSetHashEntry::read_from_prefix(bytes.get(offset..)?)
+                .ok()?
+                .0,
+        )
+    }
+
+    fn parse_api_set_namespace_entry(bytes: &[u8], offset: usize) -> Option<ApiSetNamespaceEntry> {
+        Some(
+            ApiSetNamespaceEntry::read_from_prefix(bytes.get(offset..)?)
+                .ok()?
+                .0,
+        )
+    }
+
+    fn api_set_namespace_entry_name(entry: ApiSetNamespaceEntry, bytes: &[u8]) -> Option<String> {
+        read_utf16_string(bytes, entry.name_offset, entry.name_length)
+    }
+
+    fn api_set_namespace_entry_value(
+        entry: ApiSetNamespaceEntry,
+        bytes: &[u8],
+        index: u32,
+    ) -> Option<ApiSetValueEntry> {
+        if index >= entry.value_count {
+            return None;
+        }
+        parse_api_set_value_entry(
+            bytes,
+            table_offset(entry.value_offset, index, size_of::<ApiSetValueEntry>())?,
+        )
+    }
+
+    fn parse_api_set_namespace(bytes: &[u8]) -> Option<ApiSetNamespace> {
+        let namespace = ApiSetNamespace::read_from_prefix(bytes).ok()?.0;
+        let size = namespace.size as usize;
+        if size != bytes.len()
+            || !(size_of::<ApiSetNamespace>()..=MAX_API_SET_NAMESPACE_SIZE).contains(&size)
+        {
+            return None;
+        }
+        if table_offset(
+            namespace.entry_offset,
+            namespace.count,
+            size_of::<ApiSetNamespaceEntry>(),
+        )? > size
+        {
+            return None;
+        }
+        if table_offset(
+            namespace.hash_offset,
+            namespace.count,
+            size_of::<ApiSetHashEntry>(),
+        )? > size
+        {
+            return None;
+        }
+        Some(namespace)
+    }
+
+    fn api_set_namespace_entry(
+        namespace: ApiSetNamespace,
+        bytes: &[u8],
+        index: u32,
+    ) -> Option<ApiSetNamespaceEntry> {
+        if index >= namespace.count {
+            return None;
+        }
+        parse_api_set_namespace_entry(
+            bytes,
+            table_offset(
                 namespace.entry_offset,
-                namespace.count,
+                index,
                 size_of::<ApiSetNamespaceEntry>(),
-            )? > size
-            {
-                return None;
-            }
-            if checked_table_end(
-                namespace.hash_offset,
-                namespace.count,
-                size_of::<ApiSetHashEntry>(),
-            )? > size
-            {
-                return None;
-            }
-            Some(namespace)
-        }
-
-        fn entry(self, bytes: &[u8], index: u32) -> Option<ApiSetNamespaceEntry> {
-            if index >= self.count {
-                return None;
-            }
-            ApiSetNamespaceEntry::parse(
-                bytes,
-                table_offset(self.entry_offset, index, size_of::<ApiSetNamespaceEntry>())?,
-            )
-        }
-
-        fn hash_entry(self, bytes: &[u8], index: u32) -> Option<ApiSetHashEntry> {
-            if index >= self.count {
-                return None;
-            }
-            ApiSetHashEntry::parse(
-                bytes,
-                table_offset(self.hash_offset, index, size_of::<ApiSetHashEntry>())?,
-            )
-        }
+            )?,
+        )
     }
 
-    fn dump_api_set_entries(bytes: &[u8], namespace: ApiSetNamespace) {
-        std::println!("entries:");
-        for index in 0..namespace.count {
-            let entry = namespace.entry(bytes, index).expect("namespace entry");
-            std::println!(
-                "  {index:04} name={} flags={:#x} hashed_len={} values={}",
-                entry
-                    .name(bytes)
-                    .unwrap_or_else(|| String::from("<invalid>")),
-                entry.flags,
-                entry.hashed_length,
-                entry.value_count
-            );
-            for value_index in 0..entry.value_count {
-                let value = entry.value(bytes, value_index).expect("namespace value");
-                let name = value.name(bytes).unwrap_or_default();
-                let value_name = value
-                    .value(bytes)
-                    .unwrap_or_else(|| String::from("<invalid>"));
-                std::println!(
-                    "       [{value_index}] name={} value={} flags={:#x}",
-                    if name.is_empty() { "<default>" } else { &name },
-                    value_name,
-                    value.flags
-                );
-            }
+    fn api_set_namespace_hash_entry(
+        namespace: ApiSetNamespace,
+        bytes: &[u8],
+        index: u32,
+    ) -> Option<ApiSetHashEntry> {
+        if index >= namespace.count {
+            return None;
         }
+        parse_api_set_hash_entry(
+            bytes,
+            table_offset(namespace.hash_offset, index, size_of::<ApiSetHashEntry>())?,
+        )
     }
 
-    fn dump_api_set_hash_entries(bytes: &[u8], namespace: ApiSetNamespace) {
-        std::println!("hash entries:");
-        for index in 0..namespace.count {
-            let entry = namespace.hash_entry(bytes, index).expect("hash entry");
-            std::println!(
-                "  {index:04} hash={:#010x} index={}",
-                entry.hash,
-                entry.index
-            );
-        }
-    }
-
-    fn dump_api_set_namespace(label: &str, ptr: usize, bytes: &[u8]) {
-        let api_set_map = ApiSetNamespace::parse(bytes).expect("valid API_SET_NAMESPACE");
-        std::println!("{label}");
-        std::println!(
-            "API_SET_NAMESPACE ptr={:#x} len={:#x} ({})",
-            ptr,
-            bytes.len(),
-            bytes.len()
-        );
-        std::println!("     version: {:#010x}", api_set_map.version);
-        std::println!("        size: {:#010x}", api_set_map.size);
-        std::println!("       flags: {:#010x}", api_set_map.flags);
-        std::println!("       count: {:#010x}", api_set_map.count);
-        std::println!("entry_offset: {:#010x}", api_set_map.entry_offset);
-        std::println!(" hash_offset: {:#010x}", api_set_map.hash_offset);
-        std::println!(" hash_factor: {:#010x}", api_set_map.hash_factor);
-        std::println!();
-        dump_api_set_entries(bytes, api_set_map);
-        std::println!();
-        dump_api_set_hash_entries(bytes, api_set_map);
-        std::println!();
-    }
-
-    fn dump_host_api_set_namespace_impl() {
+    fn host_api_set_namespace_bytes() -> Vec<u8> {
         let peb = unsafe {
             // SAFETY: `RtlGetCurrentPeb` returns the current process PEB pointer on Windows.
             RtlGetCurrentPeb().as_ref()
@@ -1601,43 +1664,183 @@ mod tests {
             // host API-set namespace is immutable process-wide data owned by ntdll.
             core::slice::from_raw_parts(peb.api_set_map as *const u8, size)
         };
-        dump_api_set_namespace("Host API_SET_NAMESPACE", peb.api_set_map, bytes);
+        bytes.to_vec()
+    }
+
+    fn api_set_default_value(bytes: &[u8], contract: &str) -> Option<String> {
+        let namespace = parse_api_set_namespace(bytes)?;
+        for index in 0..namespace.count {
+            let entry = api_set_namespace_entry(namespace, bytes, index)?;
+            if api_set_namespace_entry_name(entry, bytes)?.eq_ignore_ascii_case(contract) {
+                let value = api_set_namespace_entry_value(entry, bytes, 0)?;
+                return api_set_value_entry_value(value, bytes);
+            }
+        }
+        None
+    }
+
+    fn assert_api_set_hash_table(bytes: &[u8]) {
+        let namespace = parse_api_set_namespace(bytes).expect("valid API_SET_NAMESPACE");
+        let mut previous = None;
+        for hash_index in 0..namespace.count {
+            let hash_entry =
+                api_set_namespace_hash_entry(namespace, bytes, hash_index).expect("hash entry");
+            let entry = api_set_namespace_entry(namespace, bytes, hash_entry.index)
+                .expect("hash entry target");
+            let name = api_set_namespace_entry_name(entry, bytes).expect("hash entry target name");
+            let expected_hash = api_set_hash(&name);
+            assert_eq!(hash_entry.hash, expected_hash, "hash for {name}");
+            if let Some((previous_hash, previous_index)) = previous {
+                assert!(
+                    (previous_hash, previous_index) <= (hash_entry.hash, hash_entry.index),
+                    "API-set hash table is not sorted"
+                );
+            }
+            previous = Some((hash_entry.hash, hash_entry.index));
+        }
+    }
+
+    fn dump_api_set_entries(bytes: &[u8], namespace: ApiSetNamespace) {
+        std::println!("entries:");
+        for index in 0..namespace.count {
+            let entry = api_set_namespace_entry(namespace, bytes, index).expect("namespace entry");
+            std::println!(
+                "  {index:04} name={} flags={:#x} hashed_len={} values={}",
+                api_set_namespace_entry_name(entry, bytes)
+                    .unwrap_or_else(|| String::from("<invalid>")),
+                entry.flags,
+                entry.hashed_length,
+                entry.value_count
+            );
+            for value_index in 0..entry.value_count {
+                let value = api_set_namespace_entry_value(entry, bytes, value_index)
+                    .expect("namespace value");
+                let name = api_set_value_entry_name(value, bytes).unwrap_or_default();
+                let value_name = api_set_value_entry_value(value, bytes)
+                    .unwrap_or_else(|| String::from("<invalid>"));
+                std::println!(
+                    "       [{value_index}] name={} value={} flags={:#x}",
+                    if name.is_empty() { "<default>" } else { &name },
+                    value_name,
+                    value.flags
+                );
+            }
+        }
+    }
+
+    fn dump_api_set_hash_entries(bytes: &[u8], namespace: ApiSetNamespace) {
+        std::println!("hash entries:");
+        for index in 0..namespace.count {
+            let entry = api_set_namespace_hash_entry(namespace, bytes, index).expect("hash entry");
+            std::println!(
+                "  {index:04} hash={:#010x} index={}",
+                entry.hash,
+                entry.index
+            );
+        }
+    }
+
+    fn dump_api_set_namespace(api_set_map: ApiSetNamespace, bytes: &[u8], label: &str) {
+        std::println!("{label}");
+        std::println!("API_SET_NAMESPACE len={:#x}", bytes.len(),);
+        std::println!("     version: {:#010x}", api_set_map.version);
+        std::println!("        size: {:#010x}", api_set_map.size);
+        std::println!("       flags: {:#010x}", api_set_map.flags);
+        std::println!("       count: {:#010x}", api_set_map.count);
+        std::println!("entry_offset: {:#010x}", api_set_map.entry_offset);
+        std::println!(" hash_offset: {:#010x}", api_set_map.hash_offset);
+        std::println!(" hash_factor: {:#010x}", api_set_map.hash_factor);
+        std::println!();
+        dump_api_set_entries(bytes, api_set_map);
+        std::println!();
+        dump_api_set_hash_entries(bytes, api_set_map);
+        std::println!();
     }
 
     #[test]
     fn dump_host_api_set_namespace() {
-        dump_host_api_set_namespace_impl();
-
-        let namespace = build_api_set_namespace().expect("LiteBox API_SET_NAMESPACE builds");
-        dump_api_set_namespace(
-            "LiteBox synthetic API_SET_NAMESPACE",
-            namespace.as_ptr() as usize,
-            &namespace,
-        );
+        let host_bytes = host_api_set_namespace_bytes();
+        let host = parse_api_set_namespace(&host_bytes).expect("valid host API_SET_NAMESPACE");
+        dump_api_set_namespace(host, &host_bytes, "host");
     }
 
-    #[allow(clippy::similar_names)]
+    #[test]
+    fn api_set_namespace_matches_host_invariants() {
+        let host_bytes = host_api_set_namespace_bytes();
+        let host = parse_api_set_namespace(&host_bytes).expect("valid host API_SET_NAMESPACE");
+        let synthetic_bytes =
+            build_api_set_namespace(API_SET_MAPPINGS).expect("LiteBox API_SET_NAMESPACE builds");
+        let synthetic =
+            parse_api_set_namespace(&synthetic_bytes).expect("valid synthetic API_SET_NAMESPACE");
+
+        assert_eq!(synthetic.version, host.version);
+        assert_eq!(synthetic.hash_factor, host.hash_factor);
+        assert_eq!(synthetic.flags, 0);
+        assert_api_set_hash_table(&host_bytes);
+        assert_api_set_hash_table(&synthetic_bytes);
+
+        let mut host_checked = 0;
+        let mut host_mismatches = Vec::new();
+        for &(contract, expected_host) in API_SET_MAPPINGS {
+            let synthetic_host = api_set_default_value(&synthetic_bytes, contract);
+            assert_eq!(
+                synthetic_host.as_deref(),
+                Some(expected_host),
+                "synthetic mapping for {contract}"
+            );
+            if let Some(host_value) = api_set_default_value(&host_bytes, contract) {
+                if !host_value.eq_ignore_ascii_case(expected_host) {
+                    host_mismatches.push(std::format!(
+                        "{contract}: expected {expected_host}, got {host_value}"
+                    ));
+                }
+                host_checked += 1;
+            }
+        }
+        assert!(
+            host_mismatches.is_empty(),
+            "host API-set mapping mismatches:\n{}",
+            host_mismatches.join("\n")
+        );
+        assert!(
+            host_checked >= 3,
+            "expected at least three synthetic API-set contracts on the host, found {host_checked}"
+        );
+
+        for (contract, expected_host) in [
+            ("api-ms-win-core-rtlsupport-l1-1-0", "ntdll.dll"),
+            ("api-ms-win-core-file-l1-2-3", "kernelbase.dll"),
+            ("api-ms-win-eventing-consumer-l1-1-0", "sechost.dll"),
+        ] {
+            assert_eq!(
+                api_set_default_value(&synthetic_bytes, contract).as_deref(),
+                Some(expected_host),
+                "synthetic mapping for {contract}"
+            );
+        }
+    }
+
     #[test]
     fn prints_created_teb_host_diff() {
-        let created = created_process_environment_snapshot();
-        let host_teb = host_teb_snapshot();
-        let host_teb_address = host_teb_address();
-        let host_peb_address = host_peb_address();
+        let synthetic = created_process_environment_snapshot();
+        let current_teb = host_teb_snapshot();
+        let teb_self = host_teb_address();
+        let peb_address = host_peb_address();
 
-        assert_eq!(created.teb.nt_tib.self_pointer, created.environment.teb);
-        assert_eq!(host_teb.nt_tib.self_pointer, host_teb_address);
+        assert_eq!(synthetic.teb.nt_tib.self_pointer, synthetic.environment.teb);
+        assert_eq!(current_teb.nt_tib.self_pointer, teb_self);
         assert_eq!(
-            created.teb.process_environment_block,
-            created.environment.peb
+            synthetic.teb.process_environment_block,
+            synthetic.environment.peb
         );
-        assert_eq!(host_teb.process_environment_block, host_peb_address);
-        assert_eq!(host_teb.client_id, host_client_id());
+        assert_eq!(current_teb.process_environment_block, peb_address);
+        assert_eq!(current_teb.client_id, host_client_id());
 
         print_diff_header("synthetic TEB vs host TEB");
         print_diff_fields!(
             "TEB.NtTib",
-            created.teb.nt_tib,
-            host_teb.nt_tib,
+            synthetic.teb.nt_tib,
+            current_teb.nt_tib,
             [
                 exception_list,
                 stack_base,
@@ -1650,8 +1853,8 @@ mod tests {
         );
         print_diff_fields!(
             "TEB",
-            created.teb,
-            host_teb,
+            synthetic.teb,
+            current_teb,
             [
                 environment_pointer,
                 client_id,
@@ -1784,11 +1987,13 @@ mod tests {
         assert_eq!(created.peb.image_base_address, created.image_base_address);
         assert_eq!(
             created.peb.read_only_static_server_data,
-            created.peb.read_only_shared_memory_base + WINDOWS_STATIC_SERVER_DATA_TABLE_OFFSET
+            created.peb.read_only_shared_memory_base
+                + SyntheticReadOnlySharedMemory::STATIC_SERVER_DATA_TABLE_OFFSET
         );
         assert_eq!(
             base_static_server_data,
-            created.peb.read_only_shared_memory_base + WINDOWS_BASE_STATIC_SERVER_DATA_OFFSET
+            created.peb.read_only_shared_memory_base
+                + SyntheticReadOnlySharedMemory::BASE_STATIC_SERVER_DATA_OFFSET
         );
         assert_ne!(host_peb.image_base_address, 0);
 
@@ -1914,6 +2119,29 @@ mod tests {
     }
 
     #[test]
+    fn process_parameters_include_argv_and_environment() {
+        let created = created_process_environment_snapshot();
+
+        // `RTL_USER_PROCESS_PARAMETERS.CommandLine` stores the original command line for
+        // `CommandLineToArgvW`, and the environment is a sorted UTF-16 `name=value\0...\0\0`
+        // block as documented for `GetEnvironmentStringsW`.
+        assert_eq!(
+            decode_guest_unicode_string(created.process_parameters.command_line),
+            "test.exe \"arg with space\" \"quote\\\"arg\""
+        );
+        assert_ne!(created.process_parameters.environment, 0);
+        assert_eq!(
+            read_guest_utf16_units(
+                created.process_parameters.environment,
+                usize::try_from(created.process_parameters.environment_size)
+                    .expect("environment size fits usize")
+                    / size_of::<u16>(),
+            ),
+            utf16_environment_units(&["a=one", "B=two", "c=three"])
+        );
+    }
+
+    #[test]
     fn ntdll_exports_finds_ki_user_inverted_function_table() {
         let ntdll = ntdll_module_base();
         let loaded_ntdll = loaded_module_image(ntdll);
@@ -1984,6 +2212,7 @@ mod tests {
         environment: WindowsProcessEnvironment,
         peb: ProcessEnvironmentBlock,
         teb: ThreadEnvironmentBlock,
+        process_parameters: RtlUserProcessParameters,
         image_base_address: usize,
     }
 
@@ -1996,22 +2225,56 @@ mod tests {
         let image = loaded_module_image(application_module_base());
 
         let image_base_address = image.mapping.base_addr;
+        let argv = [
+            CString::new("test.exe").expect("valid argv[0]"),
+            CString::new("arg with space").expect("valid argv[1]"),
+            CString::new("quote\"arg").expect("valid argv[2]"),
+        ];
+        let envp = [
+            CString::new("c=three").expect("valid envp[0]"),
+            CString::new("B=two").expect("valid envp[1]"),
+            CString::new("a=one").expect("valid envp[2]"),
+        ];
         let environment = loader
-            .create_process_environment(
-                &image.parsed,
+            .create_process_environment(ProcessEnvironmentInput {
+                image: &image.parsed,
                 image_base_address,
-                "test.exe",
-                TEST_STACK_BASE,
-                TEST_STACK_TOP,
-            )
+                image_path: "test.exe",
+                argv: &argv,
+                envp: &envp,
+                stack_base: TEST_STACK_BASE,
+                stack_allocation_top: TEST_STACK_TOP,
+            })
             .expect("failed to create synthetic Windows process environment");
+        let peb = read_guest_value::<ProcessEnvironmentBlock>(environment.peb);
 
         CreatedProcessEnvironmentSnapshot {
-            peb: read_guest_value(environment.peb),
+            process_parameters: read_guest_value(peb.process_parameters),
+            peb,
             teb: read_guest_value(environment.teb),
             environment,
             image_base_address,
         }
+    }
+
+    fn read_guest_utf16_units(address: usize, units: usize) -> Vec<u16> {
+        let ptr =
+            <crate::tests::TestPlatform as RawPointerProvider>::RawConstPointer::<u16>::from_usize(
+                address,
+            );
+        ptr.to_owned_slice(units)
+            .expect("guest UTF-16 block is readable")
+            .to_vec()
+    }
+
+    fn utf16_environment_units(vars: &[&str]) -> Vec<u16> {
+        let mut units = Vec::new();
+        for var in vars {
+            units.extend(var.encode_utf16());
+            units.push(0);
+        }
+        units.push(0);
+        units
     }
 
     fn print_field_diff<T>(field: &str, synthetic: T, host: T)
@@ -2181,7 +2444,7 @@ mod tests {
     }
 
     unsafe fn read_host_value<T: Copy>(address: *const T) -> T {
-        // SAFETY: The caller guarantees `address` points into a live host PEB/TEB object.
+        // SAFETY: The caller guarantees `address` points into live host loader/PEB/TEB state.
         unsafe { core::ptr::read_volatile(address) }
     }
 
@@ -2243,7 +2506,10 @@ mod tests {
             mapping: MappingInfo {
                 base_addr,
                 image_size: parsed.image_size(),
-                entry_point: base_addr,
+                mapping_size: parsed.image_size(),
+                entry_point: base_addr
+                    .checked_add(parsed.entry_point_rva())
+                    .expect("module entry point address fits usize"),
             },
             pages: RangeMap::new(),
             parsed,

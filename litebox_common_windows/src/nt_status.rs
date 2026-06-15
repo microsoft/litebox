@@ -87,6 +87,7 @@ impl NtStatus {
                 "STATUS_WAIT_3: Caller specified WaitAny and one of the dispatcher objects was set"
             }
             0x00000102 => "STATUS_TIMEOUT: The given timeout interval expired",
+            0x00000103 => "STATUS_PENDING: The operation that was requested is pending completion",
             0x00010001 => "DBG_EXCEPTION_HANDLED: Exception handled by debugger",
             0x00010002 => "DBG_CONTINUE: Continue from exception",
             0x40000000 => "STATUS_OBJECT_NAME_EXISTS: The object name already exists",
@@ -209,6 +210,9 @@ impl NtStatus {
 
     /// STATUS_SUCCESS
     pub const SUCCESS: Self = Self::from_raw(0x00000000);
+
+    /// STATUS_PENDING
+    pub const PENDING: Self = Self::from_raw(0x00000103);
 
     /// STATUS_WAIT_1
     pub const WAIT_1: Self = Self::from_raw(0x00000001);
