@@ -189,37 +189,58 @@ def find_rust_function_bounds(
     return (fn_start, fn_end + 1)
 
 
-def resolve_file_path(file_path: str) -> str | None:
+def find_source_root(start_dir: Path) -> Path | None:
+    """Find the nearest enclosing repo root from the current working tree."""
+    for directory in (start_dir, *start_dir.parents):
+        if (directory / ".jj").is_dir() or (directory / ".git").exists():
+            return directory
+    return None
+
+
+def source_rooted_path(path: Path, source_root: Path) -> Path | None:
+    """Return canonical path if it is inside source_root."""
+    try:
+        root = source_root.resolve(strict=True)
+        candidate = path.resolve(strict=True)
+    except OSError:
+        return None
+    if candidate == root or root in candidate.parents:
+        return candidate
+    return None
+
+
+def resolve_file_path(file_path: str, source_root: Path) -> Path | None:
     """
     Resolve a file path, handling both absolute and relative paths.
 
-    For relative paths, tries to find the file by searching cwd and parent directories.
+    For relative paths, tries cwd and parents up to the source root.
 
-    Returns the resolved absolute path, or None if file not found.
+    Returns the resolved absolute path if it exists under the source root.
     """
-    # If it's already an absolute path and exists, return it
-    if os.path.isabs(file_path) and os.path.exists(file_path):
-        return file_path
+    requested_path = Path(file_path)
 
-    # Build list of directories to search: cwd and parent directories
-    search_dirs = []
+    if requested_path.is_absolute():
+        try:
+            resolved_path = requested_path.resolve(strict=True)
+        except OSError:
+            return None
+        return source_rooted_path(resolved_path, source_root)
 
-    # Start from current working directory and go up
-    cwd = os.getcwd()
-    search_dirs.append(cwd)
-    parent = cwd
-    for _ in range(5):  # Check up to 5 levels up
-        parent = os.path.dirname(parent)
-        if parent and parent != "/":
-            search_dirs.append(parent)
-        else:
+    cwd = Path.cwd().resolve()
+    search_dirs = [cwd]
+    for parent in cwd.parents:
+        search_dirs.append(parent)
+        if parent == source_root:
             break
 
-    # Try each search directory
     for base_dir in search_dirs:
-        candidate = os.path.join(base_dir, file_path)
-        if os.path.exists(candidate):
-            return candidate
+        try:
+            candidate = (base_dir / requested_path).resolve(strict=True)
+        except OSError:
+            continue
+        source_path = source_rooted_path(candidate, source_root)
+        if source_path:
+            return source_path
 
     return None
 
@@ -235,7 +256,11 @@ def get_snippet():
     if not file_path:
         return jsonify({"error": "No file specified", "lines": [], "target_line": line})
 
-    resolved_path = resolve_file_path(file_path)
+    source_root = app.config.get("SOURCE_ROOT")
+    if not source_root:
+        return jsonify({"error": "Source root not found", "lines": [], "target_line": line})
+
+    resolved_path = resolve_file_path(file_path, source_root)
     if not resolved_path:
         return jsonify({"error": "File not found", "lines": [], "target_line": line})
 
@@ -244,7 +269,7 @@ def get_snippet():
             all_lines = f.readlines()
 
         # Use Rust function finder for .rs files, otherwise fall back to context
-        if resolved_path.endswith(".rs"):
+        if resolved_path.suffix == ".rs":
             start, end = find_rust_function_bounds(all_lines, line, max_lines=100)
         else:
             # Fall back to simple context for non-Rust files
@@ -271,9 +296,14 @@ def main():
     """Main entry point."""
     args = parse_args()
     app.config["LOCK_FILE_PATH"] = args.file
+    app.config["SOURCE_ROOT"] = find_source_root(Path.cwd().resolve())
 
     print(f"🔒 Lock Viewer starting on http://localhost:{args.port}")
     print(f"   Reading events from: {args.file}")
+    if app.config["SOURCE_ROOT"]:
+        print(f"   Source root: {app.config['SOURCE_ROOT']}")
+    else:
+        print("   Source root: not found; source snippets disabled")
 
     app.run(host="127.0.0.1", port=args.port, debug=False)
 
