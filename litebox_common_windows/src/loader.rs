@@ -161,19 +161,69 @@ pub struct ApiSetHashEntry {
     pub index: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiSetMapping<'a> {
+    /// API-set contract name, such as `api-ms-win-core-file-l1-2-3`.
+    pub contract: &'a str,
+    /// Host DLL name used as the default namespace value for the contract.
+    pub host_dll: &'a str,
+    /// Optional exact contract prefix used when computing the namespace hash.
+    pub hashed_prefix: Option<&'a str>,
+}
+
+impl<'a> ApiSetMapping<'a> {
+    /// Creates a mapping whose hash prefix is derived by trimming the last dash suffix.
+    #[must_use]
+    pub const fn new(contract: &'a str, host_dll: &'a str) -> Self {
+        Self {
+            contract,
+            host_dll,
+            hashed_prefix: None,
+        }
+    }
+
+    /// Creates a mapping with an explicit hash prefix for contracts that do not follow the
+    /// usual version-suffix naming pattern.
+    #[must_use]
+    pub const fn with_hashed_prefix(
+        contract: &'a str,
+        host_dll: &'a str,
+        hashed_prefix: &'a str,
+    ) -> Self {
+        Self {
+            contract,
+            host_dll,
+            hashed_prefix: Some(hashed_prefix),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ApiSetNamespaceBuildError {
     #[error("API-set namespace field overflow")]
     Overflow,
     #[error("API-set namespace is too large")]
     TooLarge,
+    #[error("API-set namespace mapping has an invalid hashed prefix")]
+    InvalidHashedPrefix,
 }
 
 pub fn build_api_set_namespace(
     mappings: &[(&str, &str)],
 ) -> Result<Vec<u8>, ApiSetNamespaceBuildError> {
+    let mappings = mappings
+        .iter()
+        .map(|&(contract, host_dll)| ApiSetMapping::new(contract, host_dll))
+        .collect::<Vec<_>>();
+    build_api_set_namespace_from_mappings(&mappings)
+}
+
+/// Builds an API-set namespace from mappings that can carry explicit hash prefixes.
+pub fn build_api_set_namespace_from_mappings(
+    mappings: &[ApiSetMapping<'_>],
+) -> Result<Vec<u8>, ApiSetNamespaceBuildError> {
     let mut mappings = mappings.to_vec();
-    mappings.sort_by_key(|mapping| mapping.0);
+    mappings.sort_by(|left, right| left.contract.cmp(right.contract));
 
     let count = mappings.len();
     let entry_offset = size_of::<ApiSetNamespace>();
@@ -190,7 +240,16 @@ pub fn build_api_set_namespace(
     let mut values = Vec::with_capacity(count);
     let mut hashes = Vec::with_capacity(count);
 
-    for (index, (contract, host_dll)) in mappings.iter().enumerate() {
+    for (index, mapping) in mappings.iter().enumerate() {
+        let contract = mapping.contract;
+        let host_dll = mapping.host_dll;
+        let hashed_prefix = mapping
+            .hashed_prefix
+            .unwrap_or_else(|| &contract[..api_set_hashed_name_len(contract)]);
+        if !hashed_prefix.is_ascii() || !contract.starts_with(hashed_prefix) {
+            return Err(ApiSetNamespaceBuildError::InvalidHashedPrefix);
+        }
+
         let name = utf16_bytes(contract)?;
         let host = utf16_bytes(host_dll)?;
         let name_offset = api_set_checked_add(strings_offset, string_data.len())?;
@@ -205,11 +264,7 @@ pub fn build_api_set_namespace(
             flags: API_SET_NAMESPACE_ENTRY_FLAGS,
             name_offset: api_set_to_u32(name_offset)?,
             name_length: api_set_to_u32(name.len())?,
-            hashed_length: api_set_to_u32(
-                api_set_hashed_name_len(contract)
-                    .checked_mul(size_of::<u16>())
-                    .ok_or(ApiSetNamespaceBuildError::Overflow)?,
-            )?,
+            hashed_length: api_set_to_u32(utf16_byte_len(hashed_prefix)?)?,
             value_offset: api_set_to_u32(value_entry_offset)?,
             value_count: 1,
         });
@@ -221,7 +276,7 @@ pub fn build_api_set_namespace(
             value_length: api_set_to_u32(host.len())?,
         });
         hashes.push(ApiSetHashEntry {
-            hash: api_set_hash(contract),
+            hash: api_set_hash_prefix(hashed_prefix),
             index: api_set_to_u32(index)?,
         });
     }
@@ -266,12 +321,16 @@ pub fn build_api_set_namespace(
 
 #[must_use]
 pub fn api_set_hash(name: &str) -> u32 {
-    name[..api_set_hashed_name_len(name)]
-        .bytes()
-        .fold(0, |hash, byte| {
-            hash.wrapping_mul(API_SET_NAMESPACE_HASH_FACTOR)
-                .wrapping_add(u32::from(byte.to_ascii_lowercase()))
-        })
+    api_set_hash_prefix(&name[..api_set_hashed_name_len(name)])
+}
+
+/// Computes the API-set hash for an already selected contract prefix.
+#[must_use]
+pub fn api_set_hash_prefix(prefix: &str) -> u32 {
+    prefix.bytes().fold(0, |hash, byte| {
+        hash.wrapping_mul(API_SET_NAMESPACE_HASH_FACTOR)
+            .wrapping_add(u32::from(byte.to_ascii_lowercase()))
+    })
 }
 
 fn api_set_hashed_name_len(name: &str) -> usize {
@@ -289,6 +348,14 @@ fn utf16_bytes(value: &str) -> Result<Vec<u8>, ApiSetNamespaceBuildError> {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
     Ok(bytes)
+}
+
+fn utf16_byte_len(value: &str) -> Result<usize, ApiSetNamespaceBuildError> {
+    value
+        .encode_utf16()
+        .count()
+        .checked_mul(size_of::<u16>())
+        .ok_or(ApiSetNamespaceBuildError::Overflow)
 }
 
 fn api_set_checked_add(left: usize, right: usize) -> Result<usize, ApiSetNamespaceBuildError> {

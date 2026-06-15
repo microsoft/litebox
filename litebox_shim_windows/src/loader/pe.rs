@@ -1452,7 +1452,7 @@ mod tests {
     use litebox::platform::{RawConstPointer as _, RawPointerProvider};
     use litebox_common_windows::loader::{
         ApiSetHashEntry, ApiSetNamespace, ApiSetNamespaceEntry, ApiSetValueEntry,
-        MAX_API_SET_NAMESPACE_SIZE, api_set_hash,
+        MAX_API_SET_NAMESPACE_SIZE, api_set_hash_prefix,
     };
 
     use super::*;
@@ -1688,7 +1688,8 @@ mod tests {
             let entry = api_set_namespace_entry(namespace, bytes, hash_entry.index)
                 .expect("hash entry target");
             let name = api_set_namespace_entry_name(entry, bytes).expect("hash entry target name");
-            let expected_hash = api_set_hash(&name);
+            let expected_hash = api_set_hash_with_hashed_length(&name, entry.hashed_length)
+                .expect("valid API-set hashed length");
             assert_eq!(hash_entry.hash, expected_hash, "hash for {name}");
             if let Some((previous_hash, previous_index)) = previous {
                 assert!(
@@ -1698,6 +1699,16 @@ mod tests {
             }
             previous = Some((hash_entry.hash, hash_entry.index));
         }
+    }
+
+    fn api_set_hash_with_hashed_length(name: &str, hashed_length: u32) -> Option<u32> {
+        let code_unit_bytes = u32::try_from(size_of::<u16>()).ok()?;
+        if !name.is_ascii() || !hashed_length.is_multiple_of(code_unit_bytes) {
+            return None;
+        }
+        let hashed_units = usize::try_from(hashed_length / code_unit_bytes).ok()?;
+        let prefix = name.get(..hashed_units)?;
+        Some(api_set_hash_prefix(prefix))
     }
 
     fn dump_api_set_entries(bytes: &[u8], namespace: ApiSetNamespace) {
