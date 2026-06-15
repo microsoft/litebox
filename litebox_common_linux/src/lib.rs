@@ -3143,7 +3143,10 @@ pub const EFLAGS_DF: usize = 0x400;
 
 #[cfg(target_arch = "x86_64")]
 mod arch {
-    pub const USER_ADDR_END: usize = 0x0000_8000_0000_0000;
+    // User returns must not target the null-guard region.
+    pub const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
+    // Exclusive upper bound; the final low-canonical page is reserved as a guard page.
+    pub const USER_ADDR_END: usize = 0x0000_7fff_ffff_f000;
     pub const USER_CS: usize = 0x33;
     pub const USER_DS: usize = 0x2b;
     pub const EFLAGS_CF: usize = 1 << 0;
@@ -3171,16 +3174,17 @@ mod arch {
 }
 
 impl PtRegs {
-    /// Returns whether `rip` and `rsp` are low-canonical user return addresses.
+    /// Returns whether `rip` and `rsp` are in the x86_64 Linux user address range.
     #[cfg(target_arch = "x86_64")]
     #[must_use]
     pub fn has_user_return_addresses(&self) -> bool {
-        self.rip < arch::USER_ADDR_END && self.rsp < arch::USER_ADDR_END
+        (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.rip)
+            && (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.rsp)
     }
 
     /// Sanitizes CPU state and normalizes the context to the x86_64 Linux user ABI.
     ///
-    /// Returns `false` if `rip` or `rsp` are not low-canonical user addresses.
+    /// Returns `false` if `rip` or `rsp` are outside the x86_64 Linux user address range.
     /// On success, privileged or unsafe RFLAGS bits are cleared, the fixed
     /// RFLAGS bit is set, interrupts are enabled, and the user CS/SS selectors
     /// are set to the x86_64 Linux ABI values.
