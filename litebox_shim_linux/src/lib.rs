@@ -3842,20 +3842,37 @@ impl<FS: ShimFS> Task<FS> {
 
     fn is_pre_exec_syscall_for_task(&self, ctx: &litebox_common_linux::ExecutionContext) -> bool {
         use ::syscalls::Sysno;
+        use litebox::fs::OFlags;
 
+        // Only a *blocking* read on an inherited synchronizing fd
+        // (Unix socket / broker socketpair / broker pipe) can deadlock
+        // against a vfork-parked parent.  A non-blocking read returns
+        // EAGAIN immediately whether the parent has written or not, so
+        // it is safe to leave in the pre-exec allowlist — and forcing
+        // commit_delayed_fork for it adds full snapshot/restore latency
+        // that the PFLG.nonblock_fork tests are designed to detect.
         let parent_synchronizing_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read)) && {
             let files = self.files.borrow();
             let rds = files.raw_descriptor_store.read();
-            rds.fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
-                .is_ok()
-                || rds
-                    .fd_from_raw_integer::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
-                        ctx.rdi,
-                    )
-                    .is_ok()
-                || rds
-                    .fd_from_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(ctx.rdi)
-                    .is_ok()
+            let dt = self.global.litebox.descriptor_table();
+            let is_blocking_unix = rds
+                .fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
+                .ok()
+                .and_then(|fd| dt.with_entry(&fd, |sock| sock.get_status()))
+                .is_some_and(|flags| !flags.contains(OFlags::NONBLOCK));
+            let is_blocking_socketpair = rds
+                .fd_from_raw_integer::<syscalls::broker_socketpair::BrokerSocketPairSubsystem>(
+                    ctx.rdi,
+                )
+                .ok()
+                .and_then(|fd| dt.with_entry(&fd, |sock| sock.get_status()))
+                .is_some_and(|flags| !flags.contains(OFlags::NONBLOCK));
+            let is_blocking_pipe = rds
+                .fd_from_raw_integer::<syscalls::broker_pipe::BrokerPipeSubsystem>(ctx.rdi)
+                .ok()
+                .and_then(|fd| dt.with_entry(&fd, |pipe| pipe.get_status()))
+                .is_some_and(|flags| !flags.contains(OFlags::NONBLOCK));
+            is_blocking_unix || is_blocking_socketpair || is_blocking_pipe
         };
         Self::is_pre_exec_syscall_impl(ctx, parent_synchronizing_read)
     }
@@ -3868,8 +3885,8 @@ impl<FS: ShimFS> Task<FS> {
 
         let nr = ctx.orig_rax;
 
-        // A blocking read from an inherited Unix socket, broker socketpair, or
-        // broker pipe is real post-fork work, not fork/exec bookkeeping.  In
+        // A *blocking* read from an inherited Unix socket, broker socketpair,
+        // or broker pipe is real post-fork work, not fork/exec bookkeeping.  In
         // particular, bash's `make_child()` creates a sync pipe before fork,
         // then has the child `read(pipe_read_end, 1)` while the parent writes
         // the sync byte once it has set the child's process group.  Under
@@ -3878,6 +3895,13 @@ impl<FS: ShimFS> Task<FS> {
         // the sync byte and the child would block forever.  Force delayed-fork
         // migration in this case so the parent resumes and the synchronization
         // can complete.
+        //
+        // Non-blocking reads (`O_NONBLOCK` set) are excluded by the caller in
+        // `is_pre_exec_syscall_for_task` — they return EAGAIN immediately
+        // whether or not the parent has written, so they can stay pre-exec
+        // without deadlocking.  Forcing commit_delayed_fork on them would add
+        // unnecessary snapshot/restore latency (the `PFLG.nonblock_fork.*`
+        // tests are designed to catch exactly that regression).
         if parent_synchronizing_read {
             return false;
         }
