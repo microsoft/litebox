@@ -22,6 +22,8 @@ const UDP_RECVFROM_REMOTE_ADDR: HandlerToken<(), BLOut> =
 const UDP_TRUNCATION: HandlerToken<(), BLOut> = HandlerToken::new("broker_listener.udp_truncation");
 const RAW_ICMP_ECHO: HandlerToken<(), RawOut> = HandlerToken::new("broker_listener.raw_icmp_echo");
 const DNS_RESOLVE: HandlerToken<(), DnsOut> = HandlerToken::new("broker_listener.dns_resolve");
+const DNS_RESOLVE_CNAME_HEAVY: HandlerToken<(), DnsOut> =
+    HandlerToken::new("broker_listener.dns_resolve_cname_heavy");
 
 #[derive(Serialize, Deserialize, Debug)]
 struct BLOut {
@@ -756,12 +758,12 @@ fn dns_probe_server() -> Ipv4Addr {
         .unwrap_or_else(|| Ipv4Addr::new(10, 0, 0, 1))
 }
 
-fn raw_dns_probe() -> String {
+fn raw_dns_probe_for(hostname: &str) -> String {
     let server = dns_probe_server();
     let mut query = vec![
         0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
-    for label in ["api", "github", "com"] {
+    for label in hostname.split('.') {
         query.push(label.len() as u8);
         query.extend_from_slice(label.as_bytes());
     }
@@ -779,9 +781,28 @@ fn raw_dns_probe() -> String {
     }
     let mut response = [0u8; 512];
     match socket.recv_from(&mut response) {
-        Ok((n, peer)) => format!("ok bytes={n} peer={peer}"),
+        Ok((n, peer)) => {
+            let flags = if n >= 4 {
+                u16::from_be_bytes([response[2], response[3]])
+            } else {
+                0
+            };
+            let answer_count = if n >= 8 {
+                u16::from_be_bytes([response[6], response[7]])
+            } else {
+                0
+            };
+            format!(
+                "ok host={hostname} bytes={n} peer={peer} tc={} answers={answer_count}",
+                flags & 0x0200 != 0
+            )
+        }
         Err(e) => format!("recv_from failed: {e}"),
     }
+}
+
+fn raw_dns_probe() -> String {
+    raw_dns_probe_for("api.github.com")
 }
 
 async fn handle_dns_resolve(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<DnsOut, HandlerError> {
@@ -826,6 +847,48 @@ async fn handle_dns_resolve(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<DnsO
     })
 }
 
+async fn handle_dns_resolve_cname_heavy(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DnsOut, HandlerError> {
+    let hostnames = [
+        "update.code.visualstudio.com",
+        "vscode.download.prss.microsoft.com",
+        "marketplace.visualstudio.com",
+        "vscode-sync.trafficmanager.net",
+        "global.rel.tunnels.api.visualstudio.com",
+    ];
+    let mut remote_addrs = Vec::new();
+    for hostname in hostnames {
+        let raw_dns = raw_dns_probe_for(hostname);
+        if !raw_dns.starts_with("ok ") {
+            let resolv_conf = std::fs::read_to_string("/etc/resolv.conf")
+                .unwrap_or_else(|e| format!("<read /etc/resolv.conf failed: {e}>"));
+            return Err(HandlerError(format!(
+                "{hostname} raw DNS probe failed: {raw_dns}; resolv.conf={resolv_conf:?}"
+            )));
+        }
+        remote_addrs.push(raw_dns);
+
+        let addrs: Vec<String> = (hostname, 443)
+            .to_socket_addrs()
+            .map_err(|e| HandlerError(format!("getaddrinfo {hostname}: {e}")))?
+            .map(|addr| addr.to_string())
+            .collect();
+        if addrs.is_empty() {
+            return Err(HandlerError(format!(
+                "getaddrinfo {hostname} returned no addresses"
+            )));
+        }
+        remote_addrs.push(format!("{hostname}={}", addrs.join(",")));
+    }
+
+    Ok(DnsOut {
+        localhost_addrs: Vec::new(),
+        remote_addrs,
+    })
+}
+
 pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
     register_handler!(LISTEN_BASIC, handle_listen_basic);
     register_handler!(CONNECT_BASIC, handle_connect_basic);
@@ -833,6 +896,7 @@ pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
     register_handler!(UDP_TRUNCATION, handle_udp_truncation);
     register_handler!(RAW_ICMP_ECHO, handle_raw_icmp_echo);
     register_handler!(DNS_RESOLVE, handle_dns_resolve);
+    register_handler!(DNS_RESOLVE_CNAME_HEAVY, handle_dns_resolve_cname_heavy);
     reg.single_agent_handler_test(
         "broker_listener",
         "listen_basic",
@@ -898,6 +962,14 @@ pub(crate) fn register_broker_listener_tests(reg: &mut Registry<'_>) {
                 out.remote_addrs.join(",")
             ))
         },
+    );
+    reg.single_agent_handler_test(
+        "broker_listener",
+        "dns_resolve_cname_heavy",
+        "BL.dns_resolve_cname_heavy.pie-glibc.dpg1",
+        AgentName::Dpg1,
+        &DNS_RESOLVE_CNAME_HEAVY,
+        |out| Ok(format!("remote={}", out.remote_addrs.join(";"))),
     );
     reg.single_agent_handler_test(
         "broker_listener",
